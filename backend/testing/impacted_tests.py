@@ -25,6 +25,11 @@ Contract
 * The impacted set is:
     - every directly changed/added ``backend/testing/test_*.py`` that exists on
       disk (this is what makes a PR's OWN new tests run), PLUS
+    - the existing conventional ``backend/testing/test_<module>.py`` for each
+      directly changed top-level ``backend/app/<module>.py`` module. This keeps
+      a conflict-resolution edit's same-module test within the bounded,
+      attributed selector set even when that test uses no import that the
+      reverse-dependency scan can observe, PLUS
     - for each changed ``backend/app/<...>.py``, every ``backend/testing/
       test_*.py`` that references that module. Both import forms
       (``import app.foo``, ``from app.foo import x``, ``from app import foo``,
@@ -143,6 +148,10 @@ _DEFAULT_REPO_ROOT = os.path.normpath(
 # A changed backend app module: capture the dotted-path remainder after
 # ``backend/app/`` so ``backend/app/routers/agent.py`` -> ``routers/agent``.
 _APP_PY_RE = re.compile(r"^backend/app/(.+)\.py$")
+# The former merge-resolution lane selected only top-level app modules via this
+# convention. Keep that coverage in the shared attributed resolver, rather than
+# re-running the same test file through a raw exit-code lane.
+_CONVENTIONAL_APP_PY_RE = re.compile(r"^backend/app/([A-Za-z0-9_]+)\.py$")
 # A backend test file, by the pytest ``test_`` collection convention.
 _TEST_PY_RE = re.compile(r"^backend/testing/test_[A-Za-z0-9_]+\.py$")
 
@@ -390,6 +399,18 @@ def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]
     return compiled
 
 
+def load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]":
+    """Public accessor for the compiled drift-sentinel surface manifest.
+
+    Thin wrapper around :func:`_load_surface_manifest` so a non-testing
+    production script (e.g. ``scripts/static_release_guard.py``) can reuse the
+    same compiled ``(glob_regex, [sentinel_path, ...])`` pairs that drive the
+    merge-time impacted-test selector, instead of re-deriving its own
+    prefix/glob list that can silently drift out of sync with this manifest.
+    """
+    return _load_surface_manifest(repo_root)
+
+
 def _sentinel_exists(sentinel: str, repo_root: str) -> bool:
     """Whether a registered sentinel exists on disk (harness-layout aware).
 
@@ -457,7 +478,8 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     that a bounded selection (the merge gate caps the run) keeps the tests most
     likely to catch a contract break on the changed surface:
 
-    * tier -1: directly changed/added ``test_*.py`` files (the PR's own tests);
+    * tier -1: directly changed/added ``test_*.py`` files and conventional
+      ``test_<module>.py`` files for directly changed top-level app modules;
     * tier 0..MAX_HOPS: test files that reference a closure module (a changed
       module or a transitive importer of one), ordered by the minimum import-hop
       distance from a changed module — hop 0 references a changed module
@@ -472,7 +494,7 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     changed_list = list(changed_paths)
     testing_dir = os.path.join(repo_root, "backend", "testing")
     initial_changed_modules: "list[str]" = []
-    directly_changed_tests: "list[str]" = []
+    priority_tests: "set[str]" = set()
 
     for raw in changed_list:
         path = raw.strip()
@@ -483,17 +505,20 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
             # disk, so a deletion doesn't select a vanished file). It ranks at
             # tier -1, ahead of any reference-matched file.
             if os.path.isfile(os.path.join(repo_root, path)):
-                directly_changed_tests.append(path)
+                priority_tests.add(path)
             continue
+        conventional = _CONVENTIONAL_APP_PY_RE.match(path)
+        if conventional:
+            test_path = f"backend/testing/test_{conventional.group(1)}.py"
+            if os.path.isfile(os.path.join(repo_root, test_path)):
+                priority_tests.add(test_path)
         dotted = app_module_for_path(path)
         if dotted is not None:
             initial_changed_modules.append(dotted)
 
     ranked: "list[tuple[int, int, int, int, str]]" = []
     emitted: "set[str]" = set()
-    for path in directly_changed_tests:
-        if path in emitted:
-            continue
+    for path in sorted(priority_tests):
         emitted.add(path)
         ranked.append((-1, 0, 0, 0, path))
 

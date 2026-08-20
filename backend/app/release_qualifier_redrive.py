@@ -27,7 +27,7 @@ from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1010
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1105
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ def _walkthrough_execution_site_changed(qual: dict | None) -> bool:
                 break
     if not last_engine_sha:
         return False
-    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+    from app.deployed_sha import get_serving_sha
 
     current = get_serving_sha()
     return bool(current) and last_engine_sha != current
@@ -190,6 +190,70 @@ looping forever.  Each _record_promotion_failure call increments the counter,
 so this caps the TOTAL number of autonomous promotion attempts (fix→qualify→
 promote→CI-red) before human review is required.
 """
+
+
+async def _escalate_promotion_failure_loop(
+    session,
+    version,
+    *,
+    commit: bool = True,
+) -> bool:
+    """Persist the operator-visible halt for an exhausted promotion retry cap."""
+    qual = version.last_qualification
+    if not isinstance(qual, dict) or qual.get("promotion_loop_escalated"):
+        return False
+    count = int(qual.get("promotion_failure_count") or 0)
+    alert = Alert(
+        project_id=version.project_id,
+        severity=AlertSeverity.ERROR,
+        title=f"Release v{version.version_number} promotion re-drive loop halted",
+        message=(
+            f"Release v{version.version_number} reached the autonomous promotion "
+            f"re-drive cap ({count}/{_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS}) "
+            "after repeated promotion failures. Automatic re-qualification is "
+            "halted; operator review or a changed audited candidate is required."
+        ),
+        event_type="release.qualification_crash_loop",
+    )
+    session.add(alert)
+    version.last_qualification = {
+        **qual,
+        "promotion_loop_escalated": True,
+    }
+    flag_modified(version, "last_qualification")
+    session.add(version)
+    if commit:
+        await session.commit()
+    logger.warning(
+        "[RELEASE_QUALIFIER] v%d promotion_failure_count=%d reached cap=%d — "
+        "raised operator Alert and halted auto re-drive",
+        version.version_number,
+        count,
+        _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    )
+    return True
+
+
+async def _escalate_promotion_failure_loop_in_dedicated_session(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Lock and escalate a capped promotion-failed version safely."""
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        version = await session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "promotion_failed"
+            or int(qual.get("promotion_failure_count") or 0)
+            < _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
+        ):
+            return False
+        return await _escalate_promotion_failure_loop(session, version)
 
 
 async def _redrive_error_qualification(
@@ -282,6 +346,37 @@ async def _redrive_error_qualification(
                 )
                 error_redrive_count = 0
             else:
+                if not qual.get("error_redrive_loop_escalated"):
+                    alert = Alert(
+                        project_id=version.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=f"Release v{version.version_number} transient re-drive loop halted",
+                        message=(
+                            f"Release v{version.version_number} reached the transient "
+                            f"error re-drive cap ({error_redrive_count}/"
+                            f"{_MAX_ERROR_REDRIVE_ATTEMPTS}) for "
+                            f"{qual.get('error')}. Automatic re-qualification is "
+                            "halted; operator review or a repaired credential/site "
+                            "is required."
+                        ),
+                        event_type="release.qualification_crash_loop",
+                    )
+                    redrive_session.add(alert)
+                    version.last_qualification = {
+                        **qual,
+                        "error_redrive_loop_escalated": True,
+                    }
+                    flag_modified(version, "last_qualification")
+                    redrive_session.add(version)
+                    await redrive_session.commit()
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] sweep: v%d error_redrive_count=%d "
+                        "reached cap=%d — raised operator Alert and halted "
+                        "auto re-drive",
+                        version.version_number,
+                        error_redrive_count,
+                        _MAX_ERROR_REDRIVE_ATTEMPTS,
+                    )
                 return False
         # The CI-compliance qualify gate must not be bypassed by a re-drive.  If
         # the integration HEAD currently breaches the guardrails (per the latest

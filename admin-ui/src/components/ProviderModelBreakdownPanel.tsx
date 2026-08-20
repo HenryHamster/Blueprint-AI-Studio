@@ -67,7 +67,7 @@ function ModelSummary({ rows }: { rows: BreakdownRow[] }) {
   return (
     <div
       data-testid="provider-model-summary"
-      className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-neutral-950/30 sm:grid-cols-4"
+      className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-shell/30 sm:grid-cols-4"
     >
       <div className="border-r border-b border-neutral-800/60 px-2.5 py-2 sm:border-b-0">
         <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Rows</div>
@@ -148,7 +148,7 @@ function QuarantineBadge({
             {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={() => setConfirming(false)}
-              className="text-ui-xs px-1.5 py-0.5 rounded bg-neutral-700/50 text-neutral-400 hover:bg-neutral-700 transition-colors"
+              className="text-ui-xs px-1.5 py-0.5 rounded bg-workbench-layer/50 text-neutral-400 hover:bg-workbench-hover transition-colors"
             >
               Cancel
             </button>
@@ -157,7 +157,7 @@ function QuarantineBadge({
           // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={() => setConfirming(true)}
-            className="text-ui-xs px-1.5 py-0.5 rounded bg-neutral-700/50 text-neutral-400 hover:text-orange-300 hover:bg-orange-500/20 transition-colors"
+            className="text-ui-xs px-1.5 py-0.5 rounded bg-workbench-layer/50 text-neutral-400 hover:text-orange-300 hover:bg-orange-500/20 transition-colors"
           >
             Clear quarantine
           </button>
@@ -224,7 +224,7 @@ export function ProviderModelBreakdownPanel({
         <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
           Provider / Model Breakdown
         </h2>
-        <div className="bg-neutral-900/50 border border-red-500/30 rounded-lg px-3 py-2 text-ui-md text-red-300">
+        <div className="bg-workbench-base/50 border border-red-500/30 rounded-lg px-3 py-2 text-ui-md text-red-300">
           Could not load the provider/model breakdown — the endpoint is unreachable. Retrying…
         </div>
       </section>
@@ -268,7 +268,7 @@ export function ProviderModelBreakdownPanel({
           onClick={() => setHideSingleAccount(v => !v)}
           className={`text-ui-xs px-1.5 py-0.5 rounded border transition-colors ${
             hideSingleAccount
-              ? 'bg-neutral-700/50 text-neutral-300 border-neutral-600/50'
+              ? 'bg-workbench-layer/50 text-neutral-300 border-neutral-600/50'
               : 'text-neutral-500 border-neutral-800/50 hover:text-neutral-300'
           }`}
         >
@@ -279,12 +279,12 @@ export function ProviderModelBreakdownPanel({
       {visible.length === 0 ? (
         <div
           data-testid="provider-model-empty-filter"
-          className="rounded-lg border border-neutral-800/50 bg-neutral-900/50 px-3 py-4 text-center text-xs text-neutral-500"
+          className="rounded-lg border border-neutral-800/50 bg-workbench-base/50 px-3 py-4 text-center text-xs text-neutral-500"
         >
           No multi-account provider/model rows in this window.
         </div>
       ) : (
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
           {visible.map(row => {
@@ -308,10 +308,10 @@ export function ProviderModelBreakdownPanel({
                   </div>
                 </div>
                 {expanded && row.accounts && row.accounts.length > 0 && (
-                  <div className="px-3 pb-3 pt-1 bg-neutral-950/40">
+                  <div className="px-3 pb-3 pt-1 bg-workbench-shell/40">
                     <div className="space-y-1.5">
                       {row.accounts.map(acct => (
-                        <div key={acct.account_id} className="rounded border border-neutral-800/50 bg-neutral-900/60 px-2.5 py-1.5">
+                        <div key={acct.account_id} className="rounded border border-neutral-800/50 bg-workbench-base/60 px-2.5 py-1.5">
                           <div className="flex items-center gap-2 flex-wrap">
                             <span className="text-ui-sm font-medium text-neutral-300">
                               {labelFor(acct.account_id)}
@@ -366,7 +366,7 @@ export function ProviderModelBreakdownPanel({
               return [
                 <tr
                   key={key}
-                  className="cursor-pointer hover:bg-neutral-800/20 transition-colors"
+                  className="cursor-pointer hover:bg-workbench-hover/20 transition-colors"
                   onClick={() => setExpandedKey(expanded ? null : key)}
                 >
                   <td className="px-3 py-2">
@@ -384,10 +384,10 @@ export function ProviderModelBreakdownPanel({
                 </tr>,
                 expanded && row.accounts && row.accounts.length > 0 && (
                   <tr key={`${key}__expand`}>
-                    <td colSpan={5} className="px-3 pb-3 pt-1 bg-neutral-950/40">
+                    <td colSpan={5} className="px-3 pb-3 pt-1 bg-workbench-shell/40">
                       <div className="space-y-1.5">
                         {row.accounts.map(acct => (
-                          <div key={acct.account_id} className="rounded border border-neutral-800/50 bg-neutral-900/60 px-2.5 py-1.5">
+                          <div key={acct.account_id} className="rounded border border-neutral-800/50 bg-workbench-base/60 px-2.5 py-1.5">
                             <div className="flex items-center gap-2 flex-wrap">
                               <span className="text-ui-sm font-medium text-neutral-300">
                                 {labelFor(acct.account_id)}

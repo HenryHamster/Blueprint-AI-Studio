@@ -4208,6 +4208,60 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByTestId('criterion-row-k3')).toBeInTheDocument();
     });
 
+    it('surfaces and lets the project owner edit the candidate authorship budget', async () => {
+      const coverage: api.VersionCriterionCoverage = {
+        total: 1,
+        covered: 0,
+        partial: 0,
+        uncovered: 1,
+        criteria: [{
+          criterion_key: 'c-operator-authorship',
+          text: 'The candidate contains no operator-authored commits across its complete release range.',
+          coverage: 'uncovered',
+          evidence_count: 0,
+          evidence_contract: {
+            type: 'operator_authored_commits',
+            predicate: { max_count: 0 },
+          },
+        }],
+      };
+      vi.mocked(api.updateAcceptanceCriterionEvidenceContract).mockResolvedValue({
+        criterion_key: 'c-operator-authorship',
+        evidence_contract: { type: 'operator_authored_commits', predicate: { max_count: 2 } },
+      });
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: [{ task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null }],
+          criterion_coverage: coverage,
+          last_qualification: makeQualification({
+            sub_scores: {
+              audit: 0.9,
+              test_erosion: 0.9,
+              candidate_operator_authorship: {
+                status: 'blocked',
+                count: 1,
+                max_count: 0,
+                reason: 'candidate_operator_authored_count_exceeds_contract',
+              },
+            },
+          }),
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      expect(screen.getByTestId('candidate-operator-authorship-gate')).toHaveTextContent('blocked');
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      fireEvent.click(await screen.findByTestId('edit-authorship-budget-c-operator-authorship'));
+      fireEvent.change(screen.getByLabelText('Maximum operator-authored commits'), { target: { value: '2' } });
+      fireEvent.click(screen.getByText('save'));
+
+      await waitFor(() => expect(api.updateAcceptanceCriterionEvidenceContract).toHaveBeenCalledWith(
+        'proj-1',
+        'c-operator-authorship',
+        { type: 'operator_authored_commits', predicate: { max_count: 2 } },
+      ));
+    });
+
     it('renders inactive criterion audit rows from current_version criterion_coverage when active total is zero', async () => {
       const coverage: api.VersionCriterionCoverage = {
         total: 0,
@@ -4870,6 +4924,37 @@ describe('VersionLifecyclePanel', () => {
         />
       );
       expect(screen.queryByTestId('hotfix-remediation-panel')).not.toBeInTheDocument();
+    });
+
+    it('shows hotfix remediation panel for a detected deployed-gate latch without infra incapacity', () => {
+      const latchedVersion = makeCurrentVersion({
+        phase: 'stabilize',
+        active_candidate_sha: 'abc1234567890',
+        last_qualification: makeQualification({
+          status: 'not_promoted',
+          blocker: 'candidate_operator_authorship_nonzero',
+          is_permanent_gate_incapacity: false,
+        }),
+        gate_latch: {
+          gate: 'candidate_operator_authorship_nonzero',
+          compare_range: 'deadbeef...abc1234567890',
+          message:
+            'v7 is blocked by gate candidate_operator_authorship_nonzero, but the candidate modifies its deployed implementation: backend/app/release_commit_authorship.py. Compare range deadbeef...abc1234567890. This repair cannot clear the gate from inside the qualifier; use the approved release-machinery hotfix lane.',
+          detected_at: '2026-08-19T00:00:00Z',
+        },
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: latchedVersion })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('hotfix-remediation-panel')).toBeInTheDocument();
+      expect(screen.getByText(/Gate latched: candidate_operator_authorship_nonzero/)).toBeInTheDocument();
+      expect(screen.getByTestId('hotfix-open-btn')).toBeInTheDocument();
     });
 
     it('does not show hotfix panel without a projectId', () => {

@@ -121,7 +121,7 @@ async def test_preflight_governed_breach_updates_json_source_and_ledger_together
     governed module is never granted a larger ceiling by the self-heal.
     """
     qualifier_content = "line\n" * 10400
-    qualifier_source = "_MODULE_SIZE_GOVERNANCE_CAP: int = 10649\n"
+    qualifier_source = "_MODULE_SIZE_GOVERNANCE_CAP: int = 10900\n"
     caps = json.loads(_CAPS_JSON)
     caps["backend"]["release_qualifier.py"] = 10300
     caps_json = json.dumps(caps, indent=2) + "\n"
@@ -145,16 +145,16 @@ async def test_preflight_governed_breach_updates_json_source_and_ledger_together
         )
 
     assert verdict == "bumped"
-    assert "10300 -> 10649" in reason
+    assert "10300 -> 10900" in reason
     upserts = mock_commit.call_args.kwargs["upserts"]
     repaired_caps = json.loads(upserts[_CAPS_JSON_PATH])
-    assert repaired_caps["backend"]["release_qualifier.py"] == 10649
-    assert "_MODULE_SIZE_GOVERNANCE_CAP: int = 10649" in upserts[
+    assert repaired_caps["backend"]["release_qualifier.py"] == 10900
+    assert "_MODULE_SIZE_GOVERNANCE_CAP: int = 10900" in upserts[
         "backend/app/release_qualifier.py"
     ]
     repaired_ledger = json.loads(upserts["backend/testing/cap_bump_history.json"])
     record = repaired_ledger["history"]["backend"]["release_qualifier.py"][-1]
-    assert (record["old_cap"], record["new_cap"]) == (10300, 10649)
+    assert (record["old_cap"], record["new_cap"]) == (10300, 10900)
 
 
 @pytest.mark.asyncio

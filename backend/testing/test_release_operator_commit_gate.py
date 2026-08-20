@@ -5,6 +5,7 @@ from __future__ import annotations
 from app import release_scoring as rs
 from app.release_commit_authorship import (
     AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+    default_authorship_evidence_contract,
 )
 
 
@@ -72,6 +73,24 @@ _ZERO_BUDGET_CATEGORY = {
         "predicate": {"max_count": 0},
     },
 }
+
+
+def test_undeclared_authorship_budget_is_surfaced_to_the_operator():
+    """The product default is a real contract, so the gate no longer stays inert."""
+    category = {
+        "category_key": "c-operator-authorship",
+        "evidence_contract": default_authorship_evidence_contract(),
+    }
+    gate = rs.evaluate_candidate_operator_authorship_gate(
+        _candidate_record(_receipt(1)),
+        _measurement(_receipt(1)),
+        [category],
+    )
+
+    assert category["evidence_contract"]["predicate"]["max_count"] == 0
+    assert gate["status"] == "blocked"
+    assert gate["max_count"] == 0
+    assert _score(gate)["blocker"] == "candidate_operator_authorship_nonzero"
 
 
 def test_candidate_zero_operator_commits_passes():

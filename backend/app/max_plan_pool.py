@@ -22,6 +22,12 @@ from app.field_encryption import decrypt_field
 from app.max_plan_project_state import reconcile_project_state
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import UsageSnapshot, merge_settings
+from app.rate_limit_cooldown import (
+    _QUARANTINE_COOLDOWN_SECONDS,  # noqa: F401 - re-exported for test_max_plan_pool.py
+    _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,  # noqa: F401 - re-exported for test_max_plan_pool.py
+    _REGRESSION_COOLDOWN_SECONDS,
+    cooldown_seconds_for_info as _cooldown_seconds_for_info,
+)
 from app.providers.openai import (
     codex_oauth_refresh_serialization_reason as _codex_oauth_refresh_serialization_reason,
     codex_oauth_requires_refresh_probe as _codex_oauth_requires_refresh_probe,  # noqa: F401 - compatibility re-export
@@ -1476,6 +1482,47 @@ async def load_max_plan_pool():
         )
 
 
+_POOL_REFRESH_INTERVAL_SECONDS = 300
+
+
+async def max_plan_pool_refresh_service() -> None:
+    """Reconcile this process's pool cache on instances that are not leader.
+
+    ``load_max_plan_pool`` is the only path that rebuilds ``active_tasks``
+    from durable task state, and it ran periodically ONLY inside the
+    leader-gated orchestrator cycle. Non-leader instances loaded the pool
+    once at startup and never refreshed it, so their per-account
+    ``active_tasks`` could only ratchet upward: every dispatch increments
+    it, while the release path floors at ``max(db_count, cached - 1)`` and
+    so never recovers a slot leaked by a task that terminated without
+    firing the in-memory release callback.
+
+    That divergence is not cosmetic. ``_account_state_for_model`` returns
+    "probing" for every model whose cooldown has elapsed, and a probing
+    account is selectable only while ``active_tasks == 0`` -- the probe is
+    deliberately serialized to one task. Once the leaked counter passes
+    zero for every account, that instance rejects every candidate with
+    "cooldown elapsed, probe already in flight" and answers runner pulls
+    with ``no_eligible_account``. It never recovers on its own, because
+    clearing a cooldown requires running the very task it is refusing to
+    dispatch. Observed 2026-08-20: the leader reconciled to 0 active tasks
+    every 300s while the HTTP instance served a stale 17 and starved the
+    whole fleet.
+
+    The rebuild reads account and task state and rewrites only this
+    process's in-memory caches, so it is safe on every instance.
+    """
+
+    while True:
+        try:
+            await asyncio.sleep(_POOL_REFRESH_INTERVAL_SECONDS)
+            await load_max_plan_pool()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[POOL-REFRESH] Pool reconciliation failed: %s", exc)
+
+
 _DAILY_WINDOW_SECONDS = 24 * 60 * 60
 
 
@@ -1584,11 +1631,6 @@ def _project_at_cap(acct: dict, project_id: str | None) -> str | None:
     return None
 
 
-_QUOTA_EXHAUSTED_COOLDOWN_SECONDS = 24 * 60 * 60  # flat 24h for billing walls
-_QUARANTINE_COOLDOWN_SECONDS = (
-    15 * 60
-)  # flat 15-min recheck for confidence-gated quarantine
-_REGRESSION_COOLDOWN_SECONDS = 6 * 60 * 60  # flat 6h reprobe for regression quarantine
 QUARANTINE_CONSECUTIVE_N = 3  # consecutive qualifying failures to trip the quarantine
 QUARANTINE_CONFIDENCE_THRESHOLD = 0.8  # minimum per-record confidence to count
 _QUARANTINE_ELIGIBLE_CLASSES = frozenset(
@@ -1617,34 +1659,6 @@ def _serialize_disabled_model_info(info: dict) -> dict:
     if isinstance(stats, dict):
         out["regression_stats"] = dict(stats)
     return out
-
-
-def _cooldown_seconds_for_info(info: dict) -> int:
-    """Compute remaining-effective cooldown window (seconds) for a disabled_models entry.
-
-    Rules:
-    - kind="quota_exhausted" → flat 24h. These are billing walls; the
-      exponential-backoff curve doesn't apply because the error doesn't
-      resolve on clock.
-    - kind="regression" → flat 6h reprobe. Regression triggers on slow
-      drift in success rate; a short cooldown would keep cycling the
-      bad combination.
-    - Otherwise exponential: min(30 * 2^(hits-1), 240) minutes.
-    - Server-provided retry_after_seconds is treated as a floor — we never
-      shorten below it, and we never extend below the exponential value.
-    """
-    if info.get("kind") == "quota_exhausted":
-        return _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
-    if info.get("kind") == "quarantine":
-        return _QUARANTINE_COOLDOWN_SECONDS
-    if info.get("kind") == "regression":
-        return _REGRESSION_COOLDOWN_SECONDS
-    hits = info.get("hits", 1)
-    exponential = min(30 * (2 ** (hits - 1)), 240) * 60
-    hint = info.get("retry_after_seconds")
-    if isinstance(hint, (int, float)) and hint > exponential:
-        return int(hint)
-    return exponential
 
 
 def _check_quarantine_trigger(account_id: str) -> bool:
@@ -5605,9 +5619,10 @@ async def disable_account_model(
         if kind != "quota_exhausted" and _check_quarantine_trigger(acct_id):
             for m in cascade:
                 dm[m]["kind"] = "quarantine"
+            effective_cooldown = _cooldown_seconds_for_info(dm[primary_key])
             logger.warning(
                 f"[POOL] Account {acct['name']} quarantine triggered: last {QUARANTINE_CONSECUTIVE_N} "
-                f"high-confidence failures — {_QUARANTINE_COOLDOWN_SECONDS // 60}min recheck cooldown"
+                f"high-confidence failures — {effective_cooldown // 60}min recheck cooldown"
             )
 
         _stage_rate_limit_mutation(

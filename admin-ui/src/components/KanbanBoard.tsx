@@ -389,7 +389,7 @@ export function KanbanBoard({
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden md:hidden">
         {/* Horizontal-scrollable tab bar: column tabs overflow on narrow viewports to keep wrapper in-bounds */}
         <div
-          className="flex flex-nowrap gap-1 overflow-x-auto pb-2 sticky top-0 z-20 bg-neutral-950 px-2 pt-2 shrink-0 min-w-0 max-w-full"
+          className="flex flex-nowrap gap-1 overflow-x-auto pb-2 sticky top-0 z-20 bg-workbench-shell px-2 pt-2 shrink-0 min-w-0 max-w-full"
           data-viewport-allow-overflow
           data-viewport-allow-truncation
         >
@@ -402,12 +402,12 @@ export function KanbanBoard({
                 onClick={() => setActiveColumnId(col.id)}
                 className={`flex items-center gap-1.5 px-3 rounded-lg text-xs font-semibold whitespace-nowrap min-h-[44px] shrink-0 transition-colors ${
                   isActive
-                    ? 'bg-neutral-700 text-neutral-100'
-                    : 'bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                    ? 'bg-workbench-layer text-neutral-100'
+                    : 'bg-workbench-base text-neutral-400 hover:text-neutral-200'
                 }`}
               >
                 <span>{col.label}</span>
-                <span className={`text-ui-sm px-1.5 py-0.5 rounded-full ${isActive ? 'bg-neutral-600 text-neutral-200' : 'bg-neutral-800 text-neutral-500'}`}>
+                <span className={`text-ui-sm px-1.5 py-0.5 rounded-full ${isActive ? 'bg-workbench-card text-neutral-200' : 'bg-workbench-panel text-neutral-500'}`}>
                   {count}
                 </span>
               </button>
@@ -475,7 +475,7 @@ export function KanbanBoard({
                   </button>
                 )}
                 {columnTasks.length === 0 && !loading && (
-                  <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
+                  <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-lg bg-workbench-base/20">
                     {hasActiveFilters ? 'No tasks match filters' : 'No tasks'}
                   </div>
                 )}
@@ -497,7 +497,7 @@ export function KanbanBoard({
                   <span title={`Sorted: ${SORT_LABELS[sortBy]}`} className="text-neutral-600 flex items-center">
                     <ArrowDownUp className="w-3 h-3" />
                   </span>
-                  <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+                  <span className="text-ui-sm bg-workbench-panel text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
                     {columnTasks.length}
                   </span>
                   {!readOnly && isArchivable && columnTasks.length > 0 && (

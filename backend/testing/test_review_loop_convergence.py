@@ -96,20 +96,81 @@ def _history_attempt(
     )
 
 
+def _targeted_attempt(
+    project_id: uuid.UUID,
+    *,
+    task_type: str,
+    status: TaskStatus,
+    iteration: int,
+    original_task_id: uuid.UUID,
+    base_sha: str,
+    head_sha: str,
+    pr_number: int = 17224,
+) -> Task:
+    """Build a realistic modern review/fix row with an exact-target receipt.
+
+    Unlike ``_history_attempt`` (legacy-shaped, no ``review_target`` /
+    ``fix_target``), this exercises the same production identity path
+    (``review_cap_generation_identity``) a real row takes: a fix row carries
+    ``fix_target``; a review row carries ``review_target`` plus a durable
+    REQUEST_CHANGES ``review_history`` entry proving the exact pair reviewed.
+    """
+    task = make_task(
+        project_id=project_id,
+        status=status,
+        payloads=[
+            {
+                "type": task_type,
+                "pr_number": pr_number,
+                "original_task_id": str(original_task_id),
+            }
+        ],
+    )
+    target = {
+        "project_id": str(project_id),
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    review_loop: dict = {
+        "iteration": iteration,
+        "original_task_id": str(original_task_id),
+    }
+    if task_type == "fix":
+        review_loop["fix_target"] = target
+    else:
+        review_loop["review_target"] = target
+        review_loop["review_history"] = [
+            {
+                "review_task_id": str(task.id),
+                "target_verified_by_backend": True,
+                "verdict": "REQUEST_CHANGES",
+                "reviewed_base_sha": base_sha,
+                "reviewed_head_sha": head_sha,
+            }
+        ]
+    task.context = {"review_loop": review_loop}
+    return task
+
+
 def test_cross_episode_abandon_candidate_counts_cancelled_superseded_history():
-    """The PR identity carries burden across episodes and cancelled tasks."""
+    """The PR identity carries burden across episodes and cancelled tasks,
+    through the same exact-target identity path production rows take (not
+    the legacy per-task-id fallback ``_history_attempt`` rows fall into)."""
     from app.review_loop_convergence import build_cross_episode_abandon_candidate
 
     project_id = uuid.uuid4()
     first_episode = uuid.uuid4()
     superseded_episode = uuid.uuid4()
     attempts = [
-        _history_attempt(
+        _targeted_attempt(
             project_id,
             task_type="review" if index < 4 else "fix",
             status=TaskStatus.CANCELLED if index in (1, 5, 8) else TaskStatus.COMPLETED,
             iteration=index + 1 if index < 6 else (index - 5 if index < 8 else 4),
             original_task_id=first_episode if index < 6 else superseded_episode,
+            base_sha=f"base-{index}",
+            head_sha=f"head-{index}",
         )
         for index in range(10)
     ]
@@ -146,13 +207,17 @@ def test_cross_episode_abandon_candidate_does_not_flag_converging_pr():
     assert build_cross_episode_abandon_candidate(attempts) is None
 
 
-def test_cross_episode_abandon_ignores_stale_and_parallel_observation_rows():
+def test_cross_episode_abandon_ignores_parallel_observation_rows():
+    """Parallel-observation fan-out (agent-reported ``review_was_parallelized``)
+    is not a work receipt and must never count toward the census — unlike a
+    supersede-discarded review, which now does (see the sibling test below).
+    """
     from app.review_loop_convergence import build_cross_episode_abandon_candidate
 
     project_id = uuid.uuid4()
     episode = uuid.uuid4()
     rows = []
-    for index in range(20):
+    for index in range(10):
         task = _history_attempt(
             project_id,
             task_type="review",
@@ -160,17 +225,148 @@ def test_cross_episode_abandon_ignores_stale_and_parallel_observation_rows():
             iteration=index + 1,
             original_task_id=episode,
         )
+        task.context = {**(task.context or {}), "review_was_parallelized": True}
+        rows.append(task)
+
+    assert build_cross_episode_abandon_candidate(rows, threshold=1) is None
+
+
+def test_cross_episode_abandon_counts_supersede_discarded_generations():
+    """A review discarded as stale after a supersede/retarget still ran a
+    real agent that produced a REQUEST_CHANGES verdict against an exact
+    (base, head) pair before the live target moved out from under it — this
+    is precisely the burn the cross-episode census exists to catch, so it
+    must add to (not vanish from) the count.
+
+    This reproduces BP defect: before the fix, ``build_cross_episode_abandon_
+    candidate`` only ever consulted ``actioned_review_cap_tasks`` on the
+    ordinary cap-counting population, which ``task_counts_toward_review_cap``
+    excludes stale-target rows from by design — so this exact history
+    produced ``cycles=0`` and never returned a candidate, no matter how many
+    times the PR was supersede/retargeted.
+    """
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    rows = []
+    for index in range(10):
+        task = _targeted_attempt(
+            project_id,
+            task_type="review",
+            status=TaskStatus.COMPLETED,
+            iteration=index + 1,
+            original_task_id=episode,
+            base_sha=f"stale-base-{index}",
+            head_sha=f"stale-head-{index}",
+        )
         task.context = {
             **(task.context or {}),
-            **(
-                {"_review_stale_target": True}
-                if index % 2 == 0
-                else {"review_was_parallelized": True}
-            ),
+            "_review_stale_head": True,
+            "_review_stale_target": True,
+        }
+        rows.append(task)
+
+    candidate = build_cross_episode_abandon_candidate(rows, threshold=10)
+    assert candidate is not None
+    assert candidate["cycles"] == 10
+    assert candidate["burden"] == 10
+
+
+def test_cross_episode_abandon_excludes_infra_class_stale_discards():
+    """A stale-flagged row whose ``failure_category`` is infra-class (e.g. an
+    admin-cancel supersede that tore the task down before any agent ran)
+    never executed review/fix work at all, so it must not be counted as a
+    discarded generation — counting it would charge the PR for an operator's
+    housekeeping cancel rather than burned agent work.
+    """
+    from app.failure_classification import ADMIN_CANCEL
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    rows = []
+    for index in range(10):
+        task = _targeted_attempt(
+            project_id,
+            task_type="review",
+            status=TaskStatus.CANCELLED,
+            iteration=index + 1,
+            original_task_id=episode,
+            base_sha=f"infra-base-{index}",
+            head_sha=f"infra-head-{index}",
+        )
+        task.context = {
+            **(task.context or {}),
+            "_review_stale_head": True,
+            "_review_stale_target": True,
+            "failure_category": ADMIN_CANCEL,
         }
         rows.append(task)
 
     assert build_cross_episode_abandon_candidate(rows, threshold=1) is None
+
+
+def test_cross_episode_abandon_combines_actioned_and_discarded_generations():
+    """N actioned generations plus M supersede-discarded generations, where
+    N alone is strictly under threshold but N+M reaches it, must return the
+    abandon candidate.
+
+    Reproduces the defect end to end: prior to the fix, a chain could sit
+    forever below threshold by burning actioned generations up to N and then
+    padding out the rest of its history with supersede-discarded reviews,
+    since only ``actioned`` fed ``cycles``.
+    """
+    from app.review_loop_convergence import (
+        CROSS_EPISODE_ABANDON_THRESHOLD,
+        build_cross_episode_abandon_candidate,
+    )
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    actioned_count = CROSS_EPISODE_ABANDON_THRESHOLD - 6
+    discarded_count = 6
+    assert actioned_count < CROSS_EPISODE_ABANDON_THRESHOLD <= actioned_count + discarded_count
+
+    attempts = [
+        _targeted_attempt(
+            project_id,
+            task_type="fix",
+            status=TaskStatus.COMPLETED,
+            iteration=index + 1,
+            original_task_id=episode,
+            base_sha=f"actioned-base-{index}",
+            head_sha=f"actioned-head-{index}",
+        )
+        for index in range(actioned_count)
+    ]
+    for index in range(discarded_count):
+        discarded = _targeted_attempt(
+            project_id,
+            task_type="review",
+            status=TaskStatus.COMPLETED,
+            iteration=actioned_count + index + 1,
+            original_task_id=episode,
+            base_sha=f"discarded-base-{index}",
+            head_sha=f"discarded-head-{index}",
+        )
+        discarded.context = {
+            **(discarded.context or {}),
+            "_review_stale_head": True,
+            "_review_stale_target": True,
+        }
+        attempts.append(discarded)
+
+    # Sanity: N actioned generations alone must not already reach threshold —
+    # otherwise this test would pass even without the discarded rows counting.
+    only_actioned = build_cross_episode_abandon_candidate(
+        attempts[:actioned_count]
+    )
+    assert only_actioned is None
+
+    candidate = build_cross_episode_abandon_candidate(attempts)
+    assert candidate is not None
+    assert candidate["cycles"] == actioned_count + discarded_count == CROSS_EPISODE_ABANDON_THRESHOLD
 
 
 def test_cross_episode_threshold_matches_rollup_review_cap():

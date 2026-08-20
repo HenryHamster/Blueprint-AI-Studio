@@ -1074,6 +1074,8 @@ def _structured_review_verdict(task: "Task") -> tuple[str, str, str] | None:  # 
 
 def review_cap_generation_identity(
     task: "Task",  # type: ignore[name-defined]  # noqa: F821
+    *,
+    count_stale_discards: bool = False,
 ) -> tuple[object, ...] | None:
     """Return the actioned generation charged to the review/fix cap.
 
@@ -1082,10 +1084,26 @@ def review_cap_generation_identity(
     * a structured REQUEST_CHANGES review and the fix it launches share the
       same exact target key and therefore consume one unit together;
     * parallel reviewers of that same target collapse to the same unit;
-    * APPROVE-only, stale-target, and target-mismatched reviews consume none;
+    * APPROVE-only and target-mismatched reviews consume none;
     * mechanical conflict/CI fixes remain bounded independently; and
     * old unstructured rows retain a task-id fallback so legacy chains cannot
       become unbounded merely because they predate exact-target receipts.
+
+    ``count_stale_discards`` (default ``False``) selects which of two
+    disjoint populations this returns identities for. By default a
+    stale-target discard (``_review_stale_head`` / ``_review_stale_target`` —
+    a review/fix whose recorded target no longer matches the PR's live head
+    because a supersede/retarget landed while it was in flight or awaiting
+    action) returns ``None``, exactly as before: the ORDINARY per-chain/lane
+    cap must not penalise a chain for a verdict it could not act on. When
+    ``True`` — used only by the PR-lifetime cross-episode census in
+    :func:`app.review_loop_convergence.build_cross_episode_abandon_candidate`
+    — the function returns identities *only* for those stale-target rows,
+    using the exact same target/verdict extraction below, so a supersede-
+    discarded generation collapses on the (base, head) pair the agent
+    actually reviewed instead of over- or under-counting duplicate discards
+    of one superseded generation. The two populations never overlap, so a
+    caller may safely combine both counts without double-counting a row.
     """
 
     payload = task.first_payload or {}
@@ -1093,7 +1111,10 @@ def review_cap_generation_identity(
     if task_type not in ("review", "fix"):
         return None
     context = task.context or {}
-    if context.get("_review_stale_head") or context.get("_review_stale_target"):
+    is_stale_discard = bool(
+        context.get("_review_stale_head") or context.get("_review_stale_target")
+    )
+    if is_stale_discard != count_stale_discards:
         return None
     loop = context.get("review_loop")
     loop = loop if isinstance(loop, dict) else {}
@@ -1167,17 +1188,26 @@ def review_cap_generation_identity(
 
 def actioned_review_cap_tasks(
     tasks: "list[Task]",  # type: ignore[name-defined]  # noqa: F821
+    *,
+    count_stale_discards: bool = False,
 ) -> list["Task"]:  # type: ignore[name-defined]  # noqa: F821
     """Collapse eligible task rows into actioned review/fix generations.
 
     The returned representative rows are used for both global and lane counts,
     keeping those two views on the same unit. Prefer a fix row when a review and
     its fix share a target because the fix is the concrete patch action.
+
+    ``count_stale_discards`` is forwarded to
+    :func:`review_cap_generation_identity` unchanged — see its docstring. Pass
+    ``True`` only to collapse a population already filtered down to
+    stale-target discards; the default collapses ordinary actioned rows.
     """
 
     by_generation: dict[tuple[object, ...], "Task"] = {}  # type: ignore[name-defined]  # noqa: F821
     for task in tasks:
-        identity = review_cap_generation_identity(task)
+        identity = review_cap_generation_identity(
+            task, count_stale_discards=count_stale_discards
+        )
         if identity is None:
             continue
         prior = by_generation.get(identity)

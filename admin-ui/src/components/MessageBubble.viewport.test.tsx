@@ -266,7 +266,7 @@ describe('MessageBubble — viewport regression', () => {
     const innerBubble = host.querySelector('[data-testid="message-bubble"] > div > div');
     expect(innerBubble?.className).toContain('rounded-md');
     expect(innerBubble?.className).toContain('px-3');
-    expect(innerBubble?.className).not.toContain('rounded-2xl');
+    expect(innerBubble?.className).not.toContain('rounded-lg');
     expect(innerBubble?.className).not.toContain('0_6px_24px');
   });
 });

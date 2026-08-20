@@ -278,6 +278,51 @@ async def test_merge_pull_request_conflict(mocker):
 
 
 @pytest.mark.asyncio
+async def test_merge_pull_request_refuses_operator_pat_by_default(mocker):
+    """fix(release): an operator-PAT-sourced token must never merge silently.
+
+    The resolver's last fallback hands callers the operator's own PAT, and
+    merging with it mints a commit GitHub attributes to the operator for what
+    is really automated pipeline work. Every automated merge lane must be
+    refused by default; no GitHub write I/O may run.
+    """
+    from app.github import merge_pull_request
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+
+    result = await merge_pull_request(
+        "ghp_operatorPersonalAccessToken0000", "owner", "repo", 42
+    )
+
+    assert result["merged"] is False
+    assert result.get("pat_fallback_blocked") is True
+    mock_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_merge_pull_request_allows_operator_pat_when_explicitly_opted_in(
+    mocker,
+):
+    """An explicit human/operator-triggered merge lane may opt into a PAT."""
+    from app.github import merge_pull_request
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+    mock_request.return_value = MockResponse(200, {"sha": "abc123", "merged": True})
+
+    result = await merge_pull_request(
+        "ghp_operatorPersonalAccessToken0000",
+        "owner",
+        "repo",
+        42,
+        allow_changes_requested=True,
+        allow_operator_pat=True,
+    )
+
+    assert result["merged"] is True
+    mock_request.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_reopen_pull_request_success(mocker):
     """reopen_pull_request() returns True on a 200 response."""
     from app.github import reopen_pull_request
@@ -4593,6 +4638,86 @@ async def test_commit_file_changes_delete_uses_sha_null(mocker):
     # The deleted path is an explicit null-sha entry (Git Data API deletion).
     assert "backend/alembic/versions/0137_new.py" in entries
     assert entries["backend/alembic/versions/0137_new.py"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_dangling_commit_reuses_blobs_and_moves_no_ref(mocker):
+    """The narrow-hotfix primitive commits EXISTING blobs and updates no ref."""
+    from app.github import create_dangling_commit_from_blob_refs
+
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(200, {"tree": {"sha": "basetree"}}),  # get-commit
+            MockResponse(201, {"sha": "newtree"}),  # create-tree
+            MockResponse(201, {"sha": "newcommit"}),  # create-commit
+        ],
+    )
+    sha = await create_dangling_commit_from_blob_refs(
+        "t",
+        "o",
+        "r",
+        base_ref="d" * 40,
+        tree_entries=[
+            {
+                "path": "backend/app/release_scoring.py",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "existing-blob",
+            }
+        ],
+        message="narrow",
+    )
+    assert sha == "newcommit"
+    # No blob was created: the content is referenced by its existing SHA.
+    assert not [
+        c for c in req.call_args_list if str(c.args[1]).endswith("/git/blobs")
+    ]
+    tree_json = req.call_args_list[1].kwargs["json"]
+    assert tree_json["base_tree"] == "basetree"
+    assert tree_json["tree"][0]["sha"] == "existing-blob"
+    commit_json = req.call_args_list[2].kwargs["json"]
+    assert commit_json["parents"] == ["d" * 40]
+    # Exactly three calls — no PATCH of any ref.
+    assert len(req.call_args_list) == 3
+    assert not [c for c in req.call_args_list if c.args[0] == "PATCH"]
+
+
+@pytest.mark.asyncio
+async def test_create_dangling_commit_refuses_empty_tree_result(mocker):
+    """A tree identical to the base ships nothing — refuse instead of no-op."""
+    from app.github import (
+        DanglingCommitUnchangedError,
+        create_dangling_commit_from_blob_refs,
+    )
+
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(200, {"tree": {"sha": "basetree"}}),
+            MockResponse(201, {"sha": "basetree"}),  # unchanged tree
+        ],
+    )
+    with pytest.raises(DanglingCommitUnchangedError):
+        await create_dangling_commit_from_blob_refs(
+            "t",
+            "o",
+            "r",
+            base_ref="d" * 40,
+            tree_entries=[
+                {"path": "a.py", "mode": "100644", "type": "blob", "sha": "b1"}
+            ],
+            message="narrow",
+        )
+    # Stopped before create-commit.
+    assert len(req.call_args_list) == 2
+
+    with pytest.raises(DanglingCommitUnchangedError):
+        await create_dangling_commit_from_blob_refs(
+            "t", "o", "r", base_ref="d" * 40, tree_entries=[], message="narrow"
+        )
 
 
 @pytest.mark.asyncio

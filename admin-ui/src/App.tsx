@@ -62,6 +62,7 @@ import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useStrategicLiveness } from './hooks/useStrategicLiveness';
 import { useStrategicSession } from './hooks/useStrategicSession';
 import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
+import type { StrategicChatLiveState } from './utils/strategicSessionLive';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
@@ -69,6 +70,7 @@ import { useStrategicContextNavigation } from './hooks/useStrategicContextNaviga
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { useVersionLifecycle, hasVersionLifecycleData } from './hooks/useVersionLifecycle';
 import { type StrategicAccountSpendStatus, type StrategicStateAttentionItem, type StrategicStateResponse } from './strategicStateApi';
+import type { ConversationWorkdayStatus } from './utils/conversationWorkdayStatus';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
@@ -176,9 +178,12 @@ export default function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
   const pipelineContextRequestRef = useRef(0);
-  // Dedup guard: track the last lastCycleCompletion object we toasted for so a
-  // WS reconnect that re-emits the same event doesn't fire a second toast.
-  const lastCycleCompletionToastRef = useRef<typeof s.lastCycleCompletion>(null);
+  // Dedup guard: track the identity of the last completion we toasted for so a
+  // WS reconnect or durable read-model poll that re-surfaces the same terminal
+  // receipt doesn't fire a second toast. Keyed on cycle_id + status rather
+  // than object identity: upstream state merges can rebuild the receipt as an
+  // equal-but-fresh object on every poll, and identity dedup re-toasts each one.
+  const lastCycleCompletionToastKeyRef = useRef<string | null>(null);
   const { lastCycleCompletion: cycleCompletion, addToast, handleViewLogs: openTaskDetailDrawer } = s;
   const handleOpenTaskDetails = useCallback((task: Task) => {
     pipelineContextRequestRef.current += 1;
@@ -187,8 +192,13 @@ export default function App() {
   }, [openTaskDetailDrawer]);
   useEffect(() => {
     if (!cycleCompletion) return;
-    if (cycleCompletion === lastCycleCompletionToastRef.current) return;
-    lastCycleCompletionToastRef.current = cycleCompletion;
+    // A receipt without a cycle_id cannot be semantically deduped; it falls
+    // back to once-per-object (the effect only re-runs on identity change).
+    const toastKey = cycleCompletion.cycle_id
+      ? `${cycleCompletion.cycle_id}:${cycleCompletion.status ?? ''}`
+      : null;
+    if (toastKey !== null && toastKey === lastCycleCompletionToastKeyRef.current) return;
+    lastCycleCompletionToastKeyRef.current = toastKey;
     if (shouldSuppressCompletionToast(
       cycleCompletion.status,
       cycleCompletion.failure_reason,
@@ -505,7 +515,7 @@ export default function App() {
   const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
   const {
     strategicWorkbenchState, strategicInteractionMode, strategicSessionActive,
-    strategicSessionStatus, strategicSessionState, strategicSessionReason,
+    strategicSessionState,
     residentStrategicSessionRunners, strategicSessionSelectedRunnerId,
     savingStrategicWorkbench, strategicSessionBusy, persistStrategicWorkbench,
     handleSelectStrategicRunner, handleStartStrategicSession, handleStopStrategicSession,
@@ -523,6 +533,15 @@ export default function App() {
   // of running its own independent timer (eliminating the duplicate assembly).
   const strategicPollEpochRef = useRef(0);
   const [strategicPollEpoch, setStrategicPollEpoch] = useState(0);
+  // The single reconciled Workday status, reported up from MessagesPanel
+  // (which owns the conversation data it is derived from) so the header's
+  // StrategicSessionControl renders the same readout as the utility bar
+  // instead of deriving its own from raw session-lifecycle fields.
+  const [conversationWorkdayStatus, setConversationWorkdayStatus] = useState<ConversationWorkdayStatus | null>(null);
+  // The in-flight Chat-turn affordance, reported up from MessagesPanel from the
+  // same live transcript the thread renders, so the header shows the operator
+  // that a reply is on its way instead of nothing at all in Chat mode.
+  const [strategicChatLiveState, setStrategicChatLiveState] = useState<StrategicChatLiveState | null>(null);
   useEffect(() => {
     if (strategicReadModel.data) {
       strategicPollEpochRef.current += 1;
@@ -811,7 +830,13 @@ export default function App() {
     });
   }, [s.selectedProjectAccess.canOperateProject, s.setConfirmDialog, s.handleBulkArchiveColumn]);
   const handleBoardDirectionClick = useCallback((dirId: string) => {
-    setResearchBrowserDirectionId(dirId);
+    // Citation links (MarkdownContentInner -> onOpenDirection) pass the bare 8-hex
+    // id that citationLinks.ts deliberately strips of its `d-` prefix, while board
+    // clicks (TaskCard -> onDirectionClick) already pass the full `d-xxxxxxxx` id
+    // that ResearchBrowser's directionFilter compares against finding.direction_id.
+    // Normalize here so both callers land on the canonical scoped id.
+    const normalized = dirId.startsWith('d-') ? dirId : `d-${dirId}`;
+    setResearchBrowserDirectionId(normalized);
     s.setShowResearchBrowser(true);
   }, [setResearchBrowserDirectionId, s.setShowResearchBrowser]);
   const handleClearWaveDeps = useMemo(() => {
@@ -1021,13 +1046,13 @@ export default function App() {
 
   const pipelineSurfaceActions = (
     <>
-      <span className="hidden items-center rounded-md border border-neutral-800 bg-neutral-950/80 px-2.5 py-1.5 text-xs text-neutral-500 md:inline-flex">
+      <span className="hidden items-center rounded-md border border-neutral-800 bg-workbench-shell/80 px-2.5 py-1.5 text-xs text-neutral-500 md:inline-flex">
         {filteredTasks.length}/{s.tasks.length}
       </span>
       <button
         type="button"
         onClick={() => { void s.fetchTasks(); }}
-        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
+        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9"
       >
         Refresh
       </button>
@@ -1035,7 +1060,7 @@ export default function App() {
         <button
           type="button"
           onClick={s.openNewTaskModal}
-          className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
+          className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9"
         >
           New task
         </button>
@@ -1089,7 +1114,7 @@ export default function App() {
             className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
               s.compactMode
                 ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
-                : 'border-neutral-800/50 bg-neutral-900/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+                : 'border-neutral-800/50 bg-workbench-base/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
             }`}
           >
             <LayoutList className="h-3.5 w-3.5" />
@@ -1104,7 +1129,7 @@ export default function App() {
             className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
               s.selectionMode
                 ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
-                : 'border-neutral-800/50 bg-neutral-900/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+                : 'border-neutral-800/50 bg-workbench-base/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
             }`}
           >
             <CheckSquare className="h-3.5 w-3.5" />
@@ -1120,7 +1145,7 @@ export default function App() {
   );
   if (s.authLoading) {
     return (
-      <div className="h-screen flex items-center justify-center bg-neutral-950 text-neutral-400">
+      <div className="h-screen flex items-center justify-center bg-workbench-shell text-neutral-400">
         <Activity className="w-5 h-5 animate-spin" />
       </div>
     );
@@ -1128,13 +1153,13 @@ export default function App() {
 
   if (!s.user) {
     return (
-      <div className="h-screen flex items-center justify-center bg-neutral-950">
-        <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-8 text-center max-w-sm">
+      <div className="h-screen flex items-center justify-center bg-workbench-shell">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg p-8 text-center max-w-sm">
           <h1 className="text-lg font-semibold text-neutral-100 mb-2">Blueprint</h1>
           <p className="text-xs text-neutral-500 mb-6">Sign in with your Google account to continue</p>
           <button
             onClick={() => signInWithGoogle().catch(e => s.setError(String(e)))}
-            className="bg-white hover:bg-neutral-200 text-neutral-950 px-6 py-2 rounded text-sm font-semibold transition-colors w-full"
+            className="bg-white hover:bg-workbench-hover text-neutral-950 px-6 py-2 rounded text-sm font-semibold transition-colors w-full"
           >
             Sign in with Google
           </button>
@@ -1146,8 +1171,8 @@ export default function App() {
 
   if (s.accessDenied) {
     return (
-      <div className="h-screen flex items-center justify-center bg-neutral-950">
-        <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-8 text-center max-w-sm">
+      <div className="h-screen flex items-center justify-center bg-workbench-shell">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg p-8 text-center max-w-sm">
           <h1 className="text-lg font-semibold text-neutral-100 mb-2">Access Denied</h1>
           <p className="text-xs text-neutral-500 mb-4">
             Your account ({s.user.email}) is not authorized to access Blueprint.
@@ -1155,7 +1180,7 @@ export default function App() {
           <p className="text-xs text-neutral-600 mb-6">Contact an administrator to request access.</p>
           <button
             onClick={() => { void signOut(); }}
-            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 px-6 py-2 rounded text-sm font-medium transition-colors w-full"
+            className="bg-workbench-panel hover:bg-workbench-hover text-neutral-200 px-6 py-2 rounded text-sm font-medium transition-colors w-full"
           >
             Sign out
           </button>
@@ -1166,7 +1191,7 @@ export default function App() {
 
   if (s.userRole === null) {
     return (
-      <div className="h-screen flex items-center justify-center bg-neutral-950 text-neutral-400">
+      <div className="h-screen flex items-center justify-center bg-workbench-shell text-neutral-400">
         <Activity className="w-5 h-5 animate-spin" />
       </div>
     );
@@ -1179,7 +1204,7 @@ export default function App() {
     <TaskCapabilitiesProvider contract={s.taskCapabilityContract}>
     <div className="flex min-h-screen flex-col bg-[#08090b] text-neutral-200 font-sans md:h-screen md:overflow-hidden">
       {s.refreshing && (
-        <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
+        <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-workbench-panel overflow-hidden">
           <div className="h-full w-2/5 bg-cyan-400" style={{ animation: 'progress-slide 1.2s ease-in-out infinite' }} />
         </div>
       )}
@@ -1267,18 +1292,8 @@ export default function App() {
       ) : (
         <WorkbenchFrame>
       <BoardDataReadyReporter activeTab={activeTab} initialLoading={boardInitialLoading} refreshing={boardRefreshing} fetchEpoch={boardDataEpoch} />
-      {s.showUserManagement && s.userRole === 'admin' ? (
-        <Suspense fallback={null}>
-        <UserManagement
-          users={s.allowedUsers}
-          currentUserEmail={s.user?.email || ''}
-          onAdd={s.addAllowedUser}
-          onUpdateRole={s.updateAllowedUserRole}
-          onRemove={s.removeAllowedUser}
-          onClose={() => s.setShowUserManagement(false)}
-        />
-        </Suspense>
-      ) : activeTab === 'chat' ? (
+      {visitedTabs.has('chat') && (
+        <div className={messagesPanelOpen && !(s.showUserManagement && s.userRole === 'admin') ? 'contents' : 'hidden'}>
         <WorkbenchSurface
           title="Strategic"
           showTitle={false}
@@ -1288,9 +1303,9 @@ export default function App() {
                 currentMode={strategicInteractionMode === 'continuous' ? 'continuous' : 'chat'}
                 saving={savingStrategicWorkbench}
                 sessionActive={strategicSessionActive}
-                sessionStatus={strategicSessionStatus}
                 sessionState={strategicSessionState}
-                sessionReason={strategicSessionReason}
+                workdayStatus={conversationWorkdayStatus}
+                chatLiveState={strategicChatLiveState}
                 sessionBusy={strategicSessionBusy}
                 sessionRunners={residentStrategicSessionRunners}
                 sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
@@ -1303,7 +1318,7 @@ export default function App() {
               <button
                   type="button"
                   onClick={openStrategicContextWorkspace}
-                  className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 lg:hidden"
+                  className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-workbench-shell px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9 lg:hidden"
                   title="Open Strategic context"
                   aria-label="Open Strategic context"
                 >
@@ -1316,8 +1331,8 @@ export default function App() {
                 aria-pressed={!chatRailCollapsed}
                 className={`hidden min-h-11 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-xs font-semibold transition-colors sm:min-h-9 lg:inline-flex ${
                   chatRailCollapsed
-                    ? 'border-neutral-800 bg-neutral-950 text-neutral-300 hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100'
-                    : 'border-neutral-700 bg-neutral-800/90 text-neutral-100'
+                    ? 'border-neutral-800 bg-workbench-shell text-neutral-300 hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100'
+                    : 'border-neutral-700 bg-workbench-panel/90 text-neutral-100'
                 }`}
                 title={chatRailCollapsed ? 'Show context panel' : 'Hide context panel'}
                 aria-label={chatRailCollapsed ? 'Show context panel' : 'Hide context panel'}
@@ -1335,9 +1350,11 @@ export default function App() {
             main={(
               <Suspense fallback={<WorkspaceSkeleton />}>
               <MessagesPanel
+                active={messagesPanelOpen}
                 selectedProjectId={s.selectedProjectId}
                 canOperateProject={s.selectedProjectAccess.canOperateProject}
                 githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
+                onOpenDirection={handleBoardDirectionClick}
                 defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
                 variant="page"
                 filterChrome="minimal"
@@ -1346,6 +1363,9 @@ export default function App() {
                 onMessageCountChange={handleMessageCountChange}
                 onOpenTask={handleViewTask}
                 notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+                onWorkdayStatusChange={setConversationWorkdayStatus}
+                strategicSessionTranscript={s.strategicSessionTranscript}
+                onChatLiveStateChange={setStrategicChatLiveState}
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
@@ -1409,7 +1429,20 @@ export default function App() {
             railCollapsed={chatRailCollapsed}
           />
         </WorkbenchSurface>
-      ) : activeTab === 'project' ? (
+        </div>
+      )}
+      {s.showUserManagement && s.userRole === 'admin' ? (
+        <Suspense fallback={null}>
+        <UserManagement
+          users={s.allowedUsers}
+          currentUserEmail={s.user?.email || ''}
+          onAdd={s.addAllowedUser}
+          onUpdateRole={s.updateAllowedUserRole}
+          onRemove={s.removeAllowedUser}
+          onClose={() => s.setShowUserManagement(false)}
+        />
+        </Suspense>
+      ) : activeTab === 'chat' ? null : activeTab === 'project' ? (
         <ErrorBoundary level="panel">
           <Suspense fallback={<WorkspaceSkeleton />}>
           <ProjectWorkspace
@@ -1642,7 +1675,7 @@ export default function App() {
                 type="button"
                 data-viewport-allow-small-target
                 onClick={openTrackedTaskStreams}
-                className="rounded border border-neutral-800 bg-neutral-950/70 px-1.5 text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100"
+                className="rounded border border-neutral-800 bg-workbench-shell/70 px-1.5 text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100"
                 title="Open tracked task streams in Pipeline"
               >
                 tracking {s.trackedTaskIds.size}

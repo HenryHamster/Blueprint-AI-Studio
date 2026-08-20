@@ -39,7 +39,7 @@ export function DirectionsQuickLinks({
           return acc;
         }, {});
         const capBarColors: Record<string, string> = {
-          working: 'bg-emerald-500', partial: 'bg-amber-500', planned: 'bg-neutral-600',
+          working: 'bg-emerald-500', partial: 'bg-amber-500', planned: 'bg-workbench-card',
         };
         const modelEmpty = !hasPurpose && capabilities.length === 0 && gaps.length === 0;
         if (modelEmpty) return null;
@@ -47,7 +47,7 @@ export function DirectionsQuickLinks({
         <div className="mb-5">
           <button
             onClick={() => setActiveTab('problem-model')}
-            className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
+            className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-workbench-hover/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
           >
             <ChevronRight className="w-3.5 h-3.5 text-cyan-500/60 group-hover:text-cyan-400 transition-colors" />
             <span className="text-xs font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
@@ -69,7 +69,7 @@ export function DirectionsQuickLinks({
           </button>
           {capabilities.length > 0 && (
             <div className="px-1.5 mt-0.5">
-              <div className="flex h-1.5 rounded-full overflow-hidden bg-neutral-800 mb-1">
+              <div className="flex h-1.5 rounded-full overflow-hidden bg-workbench-panel mb-1">
                 {(['working', 'partial', 'planned'] as const).map(status => {
                   const count = statusCounts[status] || 0;
                   if (count === 0) return null;
@@ -88,7 +88,7 @@ export function DirectionsQuickLinks({
         <div className="mb-5">
           <button
             onClick={() => setActiveTab('running-update')}
-            className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
+            className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-workbench-hover/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
           >
             <ChevronRight className="w-3.5 h-3.5 text-emerald-500/60 group-hover:text-emerald-400 transition-colors" />
             <span className="text-xs font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
@@ -119,7 +119,7 @@ export function DirectionsQuickLinks({
         <div className="mb-5">
           <button
             onClick={() => setActiveTab('design-doc')}
-            className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
+            className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-workbench-hover/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors min-h-[44px] md:min-h-auto"
           >
             <ChevronRight className="w-3.5 h-3.5 text-purple-500/60 group-hover:text-purple-400 transition-colors" />
             <span className="text-xs font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">

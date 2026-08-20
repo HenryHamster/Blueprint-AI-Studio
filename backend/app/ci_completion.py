@@ -53,6 +53,7 @@ from app.ci_merge_helpers import (  # noqa: F401
     _review_not_required,
     arm_ci_wait,
     effective_pr_number,
+    locally_refused_merge_status,
     revoke_review_authority_for_active_fix,
 )
 from app.models import Task, TaskStatus, _utcnow
@@ -607,7 +608,7 @@ async def _attempt_merge_with_retry_and_escalation(
     _upd: dict | None = None
     if (
         not merge_result.get("merged")
-        and not merge_result.get("review_veto")
+        and not locally_refused_merge_status(merge_result, ci_pr_number)
         and not _in_progress
     ):
         try:
@@ -672,10 +673,9 @@ async def _attempt_merge_with_retry_and_escalation(
     task = fresh_task
     ci_loop = (task.context or {}).get("review_loop", {})
 
-    if merge_result.get("review_veto"):
-        task.latest_status_message = (
-            f"Merge held — GitHub has outstanding changes requested on PR #{ci_pr_number}"
-        )[:500]
+    _local_refusal = locally_refused_merge_status(merge_result, ci_pr_number)
+    if _local_refusal:
+        task.latest_status_message = _local_refusal[:500]
         session.add(task)
         return False
     if merge_result.get("merged"):
@@ -918,17 +918,17 @@ async def _attempt_merge_with_retry_and_escalation(
                         if orig.status == TaskStatus.EVALUATING and not (
                             orig.context or {}
                         ).get("review_loop", {}).get("ci_waiting"):
-                            if (
-                                not _orig_is_custom_staged_rollup
-                                or _terminal_rollup_merge
-                            ):
-                                orig.status = TaskStatus.COMPLETED
-                                orig.latest_status_message = "Rollup PR merged"
-                            else:
-                                orig.latest_status_message = (
-                                    f"Rollup PR merged into {ci_base}; awaiting "
-                                    "downstream landing"
-                                )
+                            # Terminal stamp + ghost-success deliverable guard (PR #17480 class).
+                            from app.rollup_deliverable_guard import finalize_rollup_parent_after_merge
+
+                            await finalize_rollup_parent_after_merge(
+                                orig, orig_project, _orig_session,
+                                terminal=not _orig_is_custom_staged_rollup or _terminal_rollup_merge,
+                                base_branch=ci_base, pr_number=ci_pr_number,
+                                github_credentials=(gh_token, owner, repo),
+                                ci_loop=ci_loop, merge_task=task,
+                                source="ci_completion.original_merge_success",
+                            )
                         _orig_session.add(orig)
                         await _orig_session.commit()
                         # Refresh the direction's research-history merge counts:
@@ -1733,9 +1733,9 @@ async def _attempt_merge_with_retry_and_escalation(
                         ci_base,
                         fix_prompt=rebase_prompt,
                         original_task_id=ci_orig_id,
-                        # Phase 2d: post-APPROVE — review approved + CI passed
-                        # but merge rejected. Rebase fix must cold-provision
-                        # (release-on-APPROVE).
+                        # Phase 2d post-APPROVE: approved + CI passed, merge rejected — a
+                        # pure rebase (conflict-only reason), and it must cold-provision.
+                        fix_reason="merge_conflict",
                         suppress_warm_handoff=True,
                     )
                     if fix_task:

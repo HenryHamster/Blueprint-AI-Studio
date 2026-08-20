@@ -14,6 +14,7 @@ by the gate and harness.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -22,6 +23,13 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from testing.fixgate_attribution import (
+    JUnitReport,
+    _normalize_failure_detail,
+    attribute_failure_maps,
+    classify_verification,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if not (_REPO_ROOT / "check").exists() and Path("/repo/check").exists():
@@ -228,6 +236,117 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
     assert "[check] PASS" not in combined
 
 
+def test_merge_affected_backend_tests_run_through_the_attributed_lane(
+    tmp_path: Path,
+) -> None:
+    """A conflict-style same-module test is attributed, not raw-exit blocked."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scripts = repo / "scripts"
+    backend = repo / "backend"
+    (backend / "app").mkdir(parents=True)
+    (backend / "testing").mkdir(parents=True)
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "impacted_tests.py",
+        backend / "testing" / "impacted_tests.py",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py",
+        backend / "testing" / "fixgate_attribution.py",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "scripts" / "backend_verification_guard.py",
+        scripts / "backend_verification_guard.py",
+    )
+    (scripts / "backend-test-route.sh").write_text(
+        "select_backend_test_route() { printf '%s\n' --postgres; }\n",
+        encoding="utf-8",
+    )
+    (scripts / "emit_failure_junit.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "import sys",
+                "Path(sys.argv[1]).write_text('<testsuite><testcase classname=\"testing.test_merge_affected\" name=\"test_preexisting_failure\"><failure>inherited</failure></testcase></testsuite>', encoding='utf-8')",
+                "raise SystemExit(1)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    harness = scripts / "test-backend.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\n"
+        "exec python3 scripts/emit_failure_junit.py \"$BLUEPRINT_VERIFICATION_JUNIT\"\n",
+        encoding="utf-8",
+    )
+    harness.chmod(harness.stat().st_mode | stat.S_IXUSR)
+    (backend / "app" / "changed.py").write_text("VALUE = 1\n", encoding="utf-8")
+    # No import of app.changed: this must be selected by the retained
+    # same-module convention, not by reverse-dependency inference.
+    (backend / "testing" / "test_changed.py").write_text(
+        "def test_preexisting_failure():\n    assert True\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "branch", "automain")
+    (backend / "app" / "changed.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    fragment = (
+        _REPO_ROOT / "agent" / "src" / "prompts" / "check_backend_verification.sh"
+    ).read_text(encoding="utf-8")
+    for token, value in {
+        "@DIR_RE@": "backend",
+        "@PYTHON_PATH_RE@": r"^backend/.*\.py$",
+        "@TEST_PATH_RE@": r"^backend/(testing|tests)/test_.*\.py$",
+        "@SELECTOR_PREFIX_RE@": "backend/",
+        "@DIR@": "backend",
+        "@HARNESS@": "scripts/test-backend.sh",
+    }.items():
+        fragment = fragment.replace(token, value)
+    gate = repo / "attributed-merge-gate.sh"
+    gate.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        "FAILED=()\n"
+        "BASE=automain\n"
+        "_VERIFY_TASK_ID=merge-attribution\n"
+        "_VERIFY_RECEIPT=\"$WORKSPACE/receipt.json\"\n"
+        "_VERIFY_HARNESS_RECEIPT=\"$WORKSPACE/harness-receipt.json\"\n"
+        "_VERIFY_CAPABILITY_RECEIPT=\"$WORKSPACE/capability-receipt.txt\"\n"
+        "CHANGED='backend/app/changed.py'\n"
+        + fragment
+        + "\nif ! declare -p FAILED | grep -q '=()$'; then exit 1; fi\n",
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"ruff\" ]; then exit 0; fi\n"
+        f"exec {sys.executable} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ | {"WORKSPACE": str(repo), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    result = subprocess.run(
+        ["bash", str(gate)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "state=preexisting_test_failure" in result.stdout
+    receipt = json.loads((repo / "receipt.json").read_text(encoding="utf-8"))
+    assert receipt["pytest"]["selectors"] == ["testing/test_changed.py"]
+    assert receipt["pytest"]["suppressed_failures"]
+
+
 def test_off_image_pgserver_route_wins_without_baked_paths(tmp_path: Path) -> None:
     """An importable pgserver package is a real route, not a Docker fallback."""
     pg_bin = tmp_path / "pg-bin"
@@ -288,3 +407,209 @@ def test_backend_route_stays_fail_closed_without_a_runtime(tmp_path: Path) -> No
 
     assert result.returncode != 0
     assert result.stdout == ""
+
+
+def _failure_report(key: str, detail: str = "boom", *, skipped: bool = False) -> JUnitReport:
+    test_key = key.rsplit("::", 1)[0]
+    return JUnitReport(
+        failures={} if skipped else {key: detail},
+        test_routes={test_key},
+        skipped_routes={test_key} if skipped else set(),
+    )
+
+
+def test_normalize_strips_pytest_asyncio_task_counter() -> None:
+    """A pytest-asyncio internal Task-<n> counter is process-wide and
+    monotonically increasing, so the identical failure names a different
+    counter value on every run (baseline vs current or rerun vs rerun) even
+    though the test's own behavior never changed. It must not defeat
+    attribution."""
+    detail = "future = <Task finished name='Task-4898' coro=<foo() done>>"
+    other = "future = <Task finished name='Task-7290' coro=<foo() done>>"
+    assert _normalize_failure_detail(detail, tree_root=None) == _normalize_failure_detail(
+        other, tree_root=None
+    )
+
+
+def test_normalize_strips_truncated_coroutine_repr_checkout_path() -> None:
+    """A coroutine/Task repr truncates its embedded source path with a
+    leading '...' once the qualname exceeds Python's repr budget, so the
+    full-path checkout-root replace never matches it. The truncated prefix
+    still differs between the current checkout and a freshly extracted
+    baseline temp dir purely by directory name, not by test behavior."""
+    current = "coro=<f() done...space/agent/backend/testing/test_x.py:16451>"
+    baseline = "coro=<f() done...main-check2/backend/testing/test_x.py:16451>"
+    assert _normalize_failure_detail(current, tree_root=None) == _normalize_failure_detail(
+        baseline, tree_root=None
+    )
+
+
+def test_normalize_preserves_a_genuinely_different_line_number() -> None:
+    """The truncated-path normalization must only erase the checkout-name
+    noise before '/backend/', not the file:line suffix that would signal a
+    real code change."""
+    current = "coro=<f() done...space/agent/backend/testing/test_x.py:100>"
+    baseline = "coro=<f() done...main-check2/backend/testing/test_x.py:200>"
+    assert _normalize_failure_detail(current, tree_root=None) != _normalize_failure_detail(
+        baseline, tree_root=None
+    )
+
+
+def test_attribute_failure_maps_suppresses_task_counter_only_difference() -> None:
+    """End-to-end: a failure identical except for the pytest-asyncio Task
+    counter and the truncated checkout path must be classified as
+    pre-existing (suppressed), not a new failure introduced by this diff."""
+    key = "backend/testing/test_strategic_spawning.py::test_x::failure"
+    current = {
+        key: "future = <Task finished name='Task-4898' "
+        "coro=<x() done...space/agent/backend/testing/test_x.py:16451>>"
+    }
+    baseline = {
+        key: "future = <Task finished name='Task-7290' "
+        "coro=<x() done...main-check2/backend/testing/test_x.py:16451>>"
+    }
+    attribution = attribute_failure_maps(current, baseline)
+
+    assert attribution.new_failures == {}
+    assert key in attribution.suppressed_failures
+
+
+def test_attributed_gate_blocks_a_failure_introduced_by_the_diff() -> None:
+    key = "backend/testing/test_changed.py::test_new::failure"
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures={key: "introduced"},
+        current_report=_failure_report(key, "introduced"),
+        baseline_report=JUnitReport(test_routes={"backend/testing/test_changed.py::test_new"}),
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == {key: "introduced"}
+
+
+def test_attributed_gate_blocks_when_a_baseline_failure_disappears() -> None:
+    key = "backend/testing/test_old.py::test_existing::failure"
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures={},
+        current_report=JUnitReport(test_routes={"backend/testing/test_other.py::test_ok"}),
+        baseline_report=_failure_report(key),
+    )
+
+    assert outcome["state"] == "baseline_failure_disappeared"
+    assert outcome["blocking"] is True
+    assert key in outcome["disappeared_failures"]
+
+
+def test_attributed_gate_blocks_when_a_baseline_failure_becomes_skipped() -> None:
+    key = "backend/testing/test_old.py::test_existing::failure"
+    current = _failure_report(key, skipped=True)
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_failures={},
+        current_report=current,
+        baseline_report=_failure_report(key),
+    )
+
+    assert outcome["state"] == "baseline_failure_skipped"
+    assert outcome["blocking"] is True
+    assert key in outcome["skipped_failures"]
+
+
+def test_attributed_gate_names_unavailable_baseline_and_blocks(tmp_path: Path) -> None:
+    """The retained shell seam receives a named fail-closed attribution state."""
+    junit = tmp_path / "current.xml"
+    junit.write_text(
+        '<testsuite><testcase classname="testing.test_x" name="test_x" /></testsuite>',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "scripts" / "backend_verification_guard.py"),
+            "--base",
+            "missing-base",
+            "--repo-root",
+            str(tmp_path),
+            "--current-junit",
+            str(junit),
+            "--current-exit-code",
+            "0",
+            "--route=--sandbox-postgres",
+            "--harness",
+            "scripts/test-backend.sh",
+            "testing/test_x.py",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0  # the shell consumes the JSON verdict
+    verdict = json.loads(result.stdout)
+    assert verdict["state"] == "baseline_unavailable"
+    assert verdict["blocking"] is True
+    assert "cannot resolve base ref" in verdict["error"]
+
+
+def test_uuid_bearing_baseline_failure_is_attributed_preexisting() -> None:
+    """A run-generated UUID in a traceback must not defeat baseline suppression.
+
+    backend/app/task_completion.py emits a diagnostic that embeds the current
+    task's UUID (e.g. ``f"... for task {task_id_str}: {chain_exc}"``). The UUID
+    is generated fresh on every run, so an identical pre-existing failure can
+    never byte-match across a baseline/current comparison unless the UUID
+    token itself is normalized away, exactly like the existing Task-<n> and
+    truncated-checkout-path normalizations above.
+    """
+    key = (
+        "backend/testing/test_strategic_spawning.py"
+        "::test_architecture_cycle_operator_wake_reaches_phase2_after_marker_cleared"
+        "::error"
+    )
+    current_detail = _normalize_failure_detail(
+        "[DESIGN DOC] Failed to chain Phase 2 for task "
+        "3fa85f64-5717-4562-b3fc-2c963f66afa6: PendingRollbackError",
+        tree_root=None,
+    )
+    baseline_detail = _normalize_failure_detail(
+        "[DESIGN DOC] Failed to chain Phase 2 for task "
+        "9c858901-8a57-4791-81fe-4c455b099bc9: PendingRollbackError",
+        tree_root=None,
+    )
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_failures={key: current_detail},
+        current_report=_failure_report(key, current_detail),
+        baseline_report=_failure_report(key, baseline_detail),
+    )
+
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["blocking"] is False
+    assert outcome["new_failures"] == {}
+
+
+def test_normalize_uuid_does_not_erase_a_genuinely_different_failure_reason() -> None:
+    """UUID normalization must be scoped to the UUID token only.
+
+    A failure that differs in its non-UUID content (a different exception
+    type) is a genuinely different failure and must still be reported as new,
+    even though both details also happen to embed a run-unique UUID.
+    """
+    current = _normalize_failure_detail(
+        "[DESIGN DOC] Failed to chain Phase 2 for task "
+        "3fa85f64-5717-4562-b3fc-2c963f66afa6: PendingRollbackError",
+        tree_root=None,
+    )
+    baseline = _normalize_failure_detail(
+        "[DESIGN DOC] Failed to chain Phase 2 for task "
+        "9c858901-8a57-4791-81fe-4c455b099bc9: KeyError",
+        tree_root=None,
+    )
+    assert current != baseline

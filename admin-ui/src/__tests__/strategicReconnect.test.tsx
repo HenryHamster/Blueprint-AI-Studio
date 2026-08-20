@@ -100,4 +100,61 @@ describe('Strategic reconnect projection', () => {
       status_message: 'Created one durable direction.',
     });
   });
+
+  it('keeps_receipt_identity_stable_across_repeated_idle_polls', () => {
+    // The durable read model repolls on an interval while the strategist is
+    // idle. Each poll used to rebuild the terminal receipt as an equal-but-
+    // fresh object, which re-fired every consumer effect keyed on it — the
+    // operator saw the same "Strategic cycle failed: reaper_stall..." toast
+    // once per poll, forever, until the page was reloaded.
+    const failedCycle = makeCycle({
+      outcome: 'stalled_phase2',
+      has_active_task: false,
+      failure_reason: 'reaper_stall: cycle in phase2 >3h with no completion',
+    });
+    const strategicReadModelRef = { current: makeState(null, failedCycle) };
+    const { result } = renderHook(() => useLogViewer({
+      fetchTasksRef: { current: vi.fn() },
+      setDeployState: vi.fn(),
+      selectedProjectId: null,
+      realtimeWsEnabled: false,
+      strategicReadModelRef,
+      canViewProject: true,
+    }));
+
+    act(() => { result.current.projectStrategicState(strategicReadModelRef.current); });
+    const firstReceipt = result.current.lastCycleCompletion;
+    expect(firstReceipt).toMatchObject({
+      cycle_id: 'cycle-reconnect',
+      status: 'FAILED',
+      failure_reason: 'reaper_stall: cycle in phase2 >3h with no completion',
+    });
+
+    // Two more polls delivering the same durable state, each as a fresh
+    // response object (the fetch layer never reuses references).
+    act(() => { result.current.projectStrategicState(makeState(null, makeCycle({
+      outcome: 'stalled_phase2',
+      has_active_task: false,
+      failure_reason: 'reaper_stall: cycle in phase2 >3h with no completion',
+    }))); });
+    act(() => { result.current.projectStrategicState(makeState(null, makeCycle({
+      outcome: 'stalled_phase2',
+      has_active_task: false,
+      failure_reason: 'reaper_stall: cycle in phase2 >3h with no completion',
+    }))); });
+
+    expect(result.current.lastCycleCompletion).toBe(firstReceipt);
+
+    // A genuinely different terminal state must still replace the receipt.
+    act(() => { result.current.projectStrategicState(makeState(null, makeCycle({
+      id: 'cycle-next',
+      outcome: 'completed',
+      has_active_task: false,
+    }))); });
+    expect(result.current.lastCycleCompletion).not.toBe(firstReceipt);
+    expect(result.current.lastCycleCompletion).toMatchObject({
+      cycle_id: 'cycle-next',
+      status: 'completed',
+    });
+  });
 });

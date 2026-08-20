@@ -220,7 +220,7 @@ function CircuitBreakerPill({ state }: { state: string }) {
     HALF_OPEN: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
   };
   return (
-    <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded font-mono ${styles[state] ?? 'bg-neutral-700 text-neutral-400'}`}>
+    <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded font-mono ${styles[state] ?? 'bg-workbench-layer text-neutral-400'}`}>
       {state}
     </span>
   );
@@ -380,7 +380,7 @@ function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
                     isActive
                       ? 'bg-emerald-400 border-emerald-400 ring-2 ring-emerald-400/30'
                       : isPast
-                      ? 'bg-neutral-600 border-neutral-600'
+                      ? 'bg-workbench-card border-neutral-600'
                       : 'bg-transparent border-neutral-600'
                   }`}
                 />
@@ -396,7 +396,7 @@ function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
                 </span>
               </div>
               {i < LIFECYCLE_STEPS.length - 1 && (
-                <div className={`flex-1 h-px mx-0.5 ${i < activeStep ? 'bg-neutral-600' : 'bg-neutral-800'}`} />
+                <div className={`flex-1 h-px mx-0.5 ${i < activeStep ? 'bg-workbench-card' : 'bg-workbench-panel'}`} />
               )}
             </div>
           );
@@ -459,7 +459,7 @@ function StrategicLifecycleIndicator({ debug }: { debug: StrategicDebug }) {
               <div className="flex flex-col items-center shrink-0">
                 <div className={`w-2 h-2 rounded-full border transition-colors ${
                   isActive ? 'bg-cyan-400 border-cyan-400 ring-2 ring-cyan-400/30'
-                  : isPast ? 'bg-neutral-600 border-neutral-600' : 'bg-transparent border-neutral-600'
+                  : isPast ? 'bg-workbench-card border-neutral-600' : 'bg-transparent border-neutral-600'
                 }`} />
                 <span className={`text-ui-xs mt-0.5 leading-tight text-center whitespace-nowrap ${
                   isActive ? 'text-cyan-400 font-semibold' : 'text-neutral-600'
@@ -469,7 +469,7 @@ function StrategicLifecycleIndicator({ debug }: { debug: StrategicDebug }) {
                 </span>
               </div>
               {i < LIFECYCLE_STEPS.length - 1 && (
-                <div className={`flex-1 h-px mx-0.5 ${i < activeStep ? 'bg-neutral-600' : 'bg-neutral-800'}`} />
+                <div className={`flex-1 h-px mx-0.5 ${i < activeStep ? 'bg-workbench-card' : 'bg-workbench-panel'}`} />
               )}
             </div>
           );
@@ -920,7 +920,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason, projectRo
 
       {expanded && (
         // eslint-disable-next-line viewport/no-fixed-width -- dropdown drawer; max-w-[calc(100vw-1rem)] caps mobile width
-        <div className="absolute top-full mt-2 right-0 w-96 max-w-[calc(100vw-1rem)] bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
+        <div className="absolute top-full mt-2 right-0 w-96 max-w-[calc(100vw-1rem)] bg-workbench-base border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline — Tactical · Strategic · Architecture</h3>
             <span className="flex items-center gap-1.5">
@@ -957,7 +957,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason, projectRo
               const strategic = strategicData[p.project_id];
               const access = resolveAccess(undefined, projectRoles[p.project_id]);
               return (
-              <div key={p.project_id} className="mb-3 last:mb-0 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
+              <div key={p.project_id} className="mb-3 last:mb-0 bg-workbench-shell border border-neutral-800 rounded-lg p-3">
                 {/* Header */}
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-medium text-neutral-200 truncate max-w-[200px]">{p.project_name}</span>
@@ -969,7 +969,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason, projectRo
                       className={`text-ui-sm font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors ${
                         p.autonomous_enabled
                           ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
-                          : 'bg-neutral-800 text-neutral-500 hover:bg-neutral-700'
+                          : 'bg-workbench-panel text-neutral-500 hover:bg-workbench-hover'
                       } ${toggling === p.project_id ? 'opacity-50' : ''}`}
                     >
                       {p.autonomous_enabled ? 'Enabled' : 'Disabled'}
@@ -978,7 +978,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason, projectRo
                     <span className={`text-ui-sm font-semibold uppercase tracking-wider px-2 py-0.5 rounded ${
                       p.autonomous_enabled
                         ? 'bg-emerald-500/10 text-emerald-400'
-                        : 'bg-neutral-800 text-neutral-500'
+                        : 'bg-workbench-panel text-neutral-500'
                     }`}>
                       {p.autonomous_enabled ? 'Enabled' : 'Disabled'}
                     </span>
@@ -1035,7 +1035,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason, projectRo
                       /{p.rate_limit}
                       {p.rate_limit_source === 'project_override' && (
                         <span
-                          className="ml-1 px-1 rounded text-ui-xs bg-neutral-700 text-neutral-300"
+                          className="ml-1 px-1 rounded text-ui-xs bg-workbench-layer text-neutral-300"
                           title={`Project override (fleet default: ${p.fleet_default_rate_limit ?? '?'})`}
                         >
                           override

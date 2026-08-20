@@ -95,11 +95,6 @@ export interface CodeChangeTaskOpts {
    *  fix→verify→push loop that previously shipped blind and re-failed in CI.
    *  Empty/undefined for non-ci_failure tasks. */
   ciFailureSelectors?: string[];
-  /** True when this fix resolved a base-branch merge conflict. Forwarded to the
-   *  generated ./check so it verifies the affected backend test files under
-   *  Postgres before ./pr open can push (closes the conflict-resolution verify
-   *  loop). Unset for non-conflict fixes. See buildMergeVerifyBlock. */
-  mergeVerify?: boolean;
   /** A declared `visual` acceptance-evidence requirement (component + viewport
    *  width) for this task. Forwarded to writeCodeChangeHelpers so the generated
    *  ./check captures the component's viewport screenshot at the declared width
@@ -537,7 +532,6 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     buildConfig: opts.buildConfig,
     taskCapability: opts.taskCapability,
     ciFailureSelectors: opts.ciFailureSelectors,
-    mergeVerify: opts.mergeVerify,
     visualAcceptance: opts.visualAcceptance,
   });
 

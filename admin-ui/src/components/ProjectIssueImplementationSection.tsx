@@ -69,7 +69,7 @@ export function ProjectIssueImplementationSection({
       {/* Repository info */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Repository</h3>
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center gap-2">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg px-4 py-3 flex items-center gap-2">
           <span className="text-xs text-neutral-400">Repository</span>
           <span className="text-xs text-neutral-100 font-mono ml-auto">
             {githubOwner && githubRepo ? `${githubOwner}/${githubRepo}` : '—'}
@@ -83,13 +83,13 @@ export function ProjectIssueImplementationSection({
         <p className="text-ui-md text-neutral-600 mb-3">
           When enabled, Blueprint automatically spawns an implementation task when a GitHub issue is labeled with the trigger label.
         </p>
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
           <span className="text-xs text-neutral-300">Enable issue-to-implementation</span>
           {/* reason: dense-UI toggle (h-5 w-9) — operator-density convention for settings panels */}
           <button
             data-viewport-allow-small-target
             onClick={() => setEnabled(v => !v)}
-            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-workbench-layer'}`}
           >
             <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
           </button>
@@ -107,7 +107,7 @@ export function ProjectIssueImplementationSection({
           value={triggerLabel}
           onChange={e => setTriggerLabel(e.target.value)}
           placeholder="auto:implement"
-          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono workbench-focus"
         />
       </div>
 
@@ -117,7 +117,7 @@ export function ProjectIssueImplementationSection({
         <p className="text-ui-md text-neutral-600 mb-3">
           Implementation PRs are based on the project's integration branch. Change it in the Integration Branch section.
         </p>
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center gap-2">
+        <div className="bg-workbench-base border border-neutral-800 rounded-lg px-4 py-3 flex items-center gap-2">
           <span className="text-xs text-neutral-400">Integration branch</span>
           <span className="text-xs text-neutral-100 font-mono ml-auto">{baseBranchDisplay}</span>
         </div>
@@ -129,7 +129,7 @@ export function ProjectIssueImplementationSection({
         <select
           value={defaultEffort}
           onChange={e => setDefaultEffort(e.target.value as 'low' | 'medium' | 'high')}
-          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs workbench-focus"
         >
           <option value="low">Low</option>
           <option value="medium">Medium</option>
@@ -149,7 +149,7 @@ export function ProjectIssueImplementationSection({
               max={10}
               value={maxPerHour}
               onChange={e => setMaxPerHour(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs workbench-focus"
             />
           </div>
           <div>
@@ -160,7 +160,7 @@ export function ProjectIssueImplementationSection({
               max={5}
               value={maxConcurrent}
               onChange={e => setMaxConcurrent(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs workbench-focus"
             />
           </div>
         </div>
@@ -171,7 +171,7 @@ export function ProjectIssueImplementationSection({
         <button
           onClick={handleSave}
           disabled={saving}
-          className="inline-flex items-center justify-center min-h-[44px] bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
+          className="inline-flex items-center justify-center min-h-[44px] bg-workbench-layer hover:bg-workbench-hover text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
         >
           {saving ? 'Saving...' : 'Save Issue Implementation Config'}
         </button>

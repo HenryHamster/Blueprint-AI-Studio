@@ -2447,6 +2447,10 @@ async def _check_and_trigger_rollup(
                     original_prompt=cand["original_prompt"],
                     fix_prompt=fix_prompt,
                     original_task_id=str(child.id),
+                    # Conflict-only provenance (see review-fix.ts
+                    # CONFLICT_ONLY_FIX_REASONS): only the "fix" branch above is
+                    # purely a rebase job; the review branch carries real work.
+                    fix_reason=("merge_conflict" if spawn_type == "fix" else ""),
                 )
                 if review_task and review_task.id != child.id:
                     respawned += 1
@@ -5713,6 +5717,13 @@ async def _check_and_trigger_rollup(
                             target_branch,
                             fix_prompt=fix_prompt,
                             original_task_id=str(parent.id),
+                            # Conflict-only provenance: the agent stale-premise exit may
+                            # complete this task without running Claude when the PR is
+                            # already clean. Only safe because resolving the conflict
+                            # IS the whole job here (review-fix.ts CONFLICT_ONLY_FIX_REASONS).
+                            fix_reason=(
+                                "update_branch_failed" if _ms == "behind" else "merge_conflict"
+                            ),
                         )
                         if fix_task:
                             logger.error(

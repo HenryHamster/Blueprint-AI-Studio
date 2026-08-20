@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy.exc
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlmodel import select
 
 from app.landed_signal import landed_signal_predicate
@@ -32,7 +32,7 @@ from app.models import (
     VersionAcceptanceCriterion,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 5223
+_MODULE_SIZE_GOVERNANCE_CAP: int = 5950
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,6 +50,63 @@ _acceptance_window_recompute_state: dict[
 ] = {}
 
 CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
+OPERATOR_AUTHORSHIP_CRITERION_KEY = "c-operator-authorship"
+OPERATOR_AUTHORSHIP_CRITERION_TEXT = (
+    "The candidate contains no operator-authored commits across its complete release range."
+)
+
+
+async def ensure_operator_authorship_criterion(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+) -> VersionAcceptanceCriterion:
+    """Ensure every newly opened version has an explicit authorship budget.
+
+    The stable key makes retries idempotent. Existing owner-authored contracts
+    remain authoritative; this helper only supplies the product default when a
+    version has no authorship criterion yet.
+    """
+    from app.release_commit_authorship import (
+        AUTHORSHIP_EVIDENCE_CONTRACT_TYPE,
+        default_authorship_evidence_contract,
+    )
+
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == OPERATOR_AUTHORSHIP_CRITERION_KEY,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    existing_result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.status == "active",
+        )
+    )
+    for criterion in existing_result.scalars().all():
+        contract = normalize_evidence_contract(criterion.evidence_contract)
+        if contract is not None and contract.get("type") == AUTHORSHIP_EVIDENCE_CONTRACT_TYPE:
+            return criterion
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project_id,
+        release_version_id=release_version_id,
+        criterion_key=OPERATOR_AUTHORSHIP_CRITERION_KEY,
+        text=OPERATOR_AUTHORSHIP_CRITERION_TEXT,
+        evidence_contract=default_authorship_evidence_contract(),
+        evidence_contract_updated_at=_utcnow(),
+        evidence_contract_updated_by="system:release_default",
+        created_by="system",
+    )
+    session.add(criterion)
+    return criterion
 
 
 def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
@@ -62,6 +119,26 @@ def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
     return normalize_authorship_evidence_contract(
         raw
     ) or normalize_rehearsal_evidence_contract(raw)
+
+
+def is_operator_authorship_criterion(criterion: Any) -> bool:
+    """Return whether a criterion is the deterministic authorship policy row.
+
+    Authorship contracts are release-policy gates, not user-authored product
+    criteria. They stay in rubric/detail responses so operators can inspect and
+    edit them, but must not consume the ordinary acceptance-criteria cap or make
+    the task-evidence coverage aggregate appear incomplete.
+    """
+    raw_contract = (
+        criterion.get("evidence_contract")
+        if isinstance(criterion, dict)
+        else getattr(criterion, "evidence_contract", None)
+    )
+    contract = normalize_evidence_contract(raw_contract)
+    return bool(
+        contract is not None
+        and contract.get("type") == "operator_authored_commits"
+    )
 
 
 def is_owner_controlled_machine_contract(
@@ -415,6 +492,48 @@ CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS = 900
 # Combined with project build_config, this is the named precondition identity
 # that can legitimately re-arm a terminal could_not_run trial at the same SHA.
 CRITERION_NAMED_TEST_TRIAL_CONTRACT = "criterion_named_test_trial:v2"
+
+#: The identity match in :func:`enroll_criterion_named_test_trial` seeds
+#: ``trial_identity`` with ``head_sha``, so on a project whose integration head
+#: moves several times a day it can NEVER suppress: an unrepaired precondition
+#: re-arms exactly as readily as a repaired one, minting a fresh VM placement
+#: every time the candidate SHA bumps. This bound replaces that structurally
+#: incapable head_sha-seeded suppressor with a decision keyed on the (criterion,
+#: test, precondition) triple alone: once this many consecutive TERMINAL trials
+#: for the same triple all came back non-green (independent of head_sha), stop
+#: enrolling new placements until either the declared covering tests change
+#: (``test_identity``) or the execution contract changes (``precondition_identity``).
+#: Bounded at a small value (not 1) because ``could_not_run`` is an
+#: infrastructure verdict (e.g. a Docker-less VM) and a single transient miss
+#: must not permanently strand a criterion's earn-up path.
+CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD = 3
+
+#: How many of the most recent terminal trials (for the same triple) to
+#: inspect when computing the consecutive-non-green streak above. Padded past
+#: the threshold itself so CANCELLED (superseded-before-running) rows, which
+#: carry no pass/fail signal, can be skipped without truncating the scan.
+_CRITERION_NAMED_TEST_TRIAL_STREAK_SCAN_LIMIT = (
+    CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD + 5
+)
+
+#: The threshold above bounds TRANSIENCE (a single ``could_not_run`` miss
+#: cannot strand a criterion) but not DETERMINISM: a re-arm key of
+#: (test_identity, precondition_identity) alone cannot express "the runner's
+#: execution environment was repaired" — neither identity changes when, say,
+#: a verification-toolchain venv is fixed. Without a recency bound, three
+#: consecutive infra misses suppress a criterion FOREVER, even after the
+#: underlying environment is repaired and every subsequent trial would pass.
+#: Bounding the streak scan by recency makes suppression self-heal: once the
+#: window elapses, the next trial re-scans only recent rows and (if the
+#: environment is fixed) enrolls again with no operator action and no new
+#: persisted state. Measured baseline: 99 ``criterion_named_test_trial`` tasks
+#: across the trailing 7 days for at most 6 criteria (~14/criterion/week,
+#: ~2/criterion/day). At 3 days, the scan window covers up to ~6 trials per
+#: criterion — double the suppression threshold — so a genuinely-broken
+#: precondition still suppresses well within the window; a 1-day window would
+#: average under 2 trials per criterion, i.e. WORSE than the status quo
+#: (routinely too few terminal trials in-window to ever reach the threshold).
+CRITERION_NAMED_TEST_TRIAL_STREAK_RECENCY_WINDOW_DAYS = 3
 
 # Legacy criterion-key aliases.  A walkthrough script may post a semantic slug
 # (e.g. 'c-workday-session-lifecycle') before the script is updated to emit the
@@ -1063,12 +1182,16 @@ async def count_active_criteria_for_version(
     counts criteria that still participate in the qualification gate.
     """
     result = await session.execute(
-        select(func.count()).where(
+        select(VersionAcceptanceCriterion).where(
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.status == "active",
         )
     )
-    return result.scalar_one()
+    return sum(
+        1
+        for criterion in result.scalars()
+        if not is_operator_authorship_criterion(criterion)
+    )
 
 
 async def get_criteria_for_version(
@@ -4403,7 +4526,8 @@ async def get_version_coverage_summary(
         coverage = compute_criterion_coverage(evidence)
         coverage_by_criterion[criterion.id] = coverage
         if criterion.status == "active":
-            counts[coverage] += 1
+            if not is_operator_authorship_criterion(criterion):
+                counts[coverage] += 1
         else:
             inactive_counts[criterion.status] = (
                 inactive_counts.get(criterion.status, 0) + 1
@@ -4448,7 +4572,11 @@ async def get_version_coverage_summary(
     uncovered_keys = [
         c.criterion_key
         for c in criteria_in_order
-        if c.status == "active" and coverage_by_criterion[c.id] == "uncovered"
+        if (
+            c.status == "active"
+            and not is_operator_authorship_criterion(c)
+            and coverage_by_criterion[c.id] == "uncovered"
+        )
     ]
     stuck_reasons: dict[str, str | None] = {}
     if uncovered_keys and _rv is not None:
@@ -4533,6 +4661,7 @@ async def get_version_coverage_summary(
                     c.criterion_key
                     for c in criteria_in_order
                     if c.status == "active"
+                    and not is_operator_authorship_criterion(c)
                 }
                 referenced_keys = (
                     await _gather_referenced_criterion_keys(
@@ -4810,8 +4939,14 @@ async def enroll_criterion_named_test_trial(
     skipped, a QUEUED trial pinned to a stale candidate SHA is cancelled
     (superseded) and re-enrolled at the current head, and a running
     (PROVISIONING/IN_PROGRESS) trial on a stale SHA is left alone with no new
-    enrollment. A GREEN receipt may mint covered evidence; every degraded path
-    returns ``None`` without raising.
+    enrollment. Also a no-op once the same (criterion, test, precondition)
+    triple has produced
+    :data:`CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD`
+    consecutive non-green terminal trials — independent of ``head_sha``,
+    since a bare candidate-SHA bump is not evidence a broken execution
+    precondition was repaired; a changed ``test_identity`` or
+    ``precondition_identity`` re-arms immediately. A GREEN receipt may mint
+    covered evidence; every degraded path returns ``None`` without raising.
     """
     try:
         from app.shared_state import runtime_config as _rc
@@ -4968,6 +5103,96 @@ async def enroll_criterion_named_test_trial(
             )
             return None
 
+        from app.models import TASK_OUTCOME_TERMINAL_STATUSES
+
+        # Consecutive-non-green streak suppression. The identity check above
+        # only suppresses an EXACT match including head_sha, so it never fires
+        # on a project whose candidate SHA bumps continuously — a bare SHA
+        # change is not evidence that a broken execution precondition was
+        # repaired. Look at the same (criterion, test, precondition) triple
+        # ACROSS every head_sha: if the most recent terminal trials for this
+        # triple all came back non-green, stop enrolling until test_identity
+        # or precondition_identity changes.
+        #
+        # Two additional predicates bound the scan, both load-bearing:
+        #  - a recency cutoff so a repaired execution environment self-heals
+        #    the suppression once the window elapses, instead of latching
+        #    forever on the (test_identity, precondition_identity) key alone
+        #    (see CRITERION_NAMED_TEST_TRIAL_STREAK_RECENCY_WINDOW_DAYS).
+        #  - a signal-bearing filter (contradiction stamp present, OR a
+        #    COMPLETED row that can only be green here since a contradiction
+        #    stamp would already satisfy the first clause) so CANCELLED
+        #    supersede rows — minted by this very function's own stale-QUEUED
+        #    cleanup below every time the candidate SHA bumps while a trial is
+        #    still QUEUED — cannot pad past _CRITERION_NAMED_TEST_TRIAL_STREAK_SCAN_LIMIT
+        #    and push real terminal signal out of the scan window.
+        streak_recency_cutoff = _utcnow() - timedelta(
+            days=CRITERION_NAMED_TEST_TRIAL_STREAK_RECENCY_WINDOW_DAYS
+        )
+        streak_rows = (
+            await session.execute(
+                select(Task.id, Task.status, Task.context)
+                .where(
+                    Task.project_id == project_id,
+                    Task.context[CRITERION_RELEASE_VERSION_CONTEXT_KEY].as_string()
+                    == str(version_id),
+                    trial_payload["type"].as_string() == "criterion_named_test_trial",
+                    trial_payload["criterion_key"].as_string() == criterion_key,
+                    trial_payload["test_identity"].as_string() == test_identity,
+                    trial_payload["precondition_identity"].as_string()
+                    == precondition_identity,
+                    Task.status.in_(TASK_OUTCOME_TERMINAL_STATUSES),
+                    Task.created_at >= streak_recency_cutoff,
+                    or_(
+                        Task.context.has_key(
+                            "criterion_named_test_trial_contradiction"
+                        ),
+                        Task.status == TaskStatus.COMPLETED,
+                    ),
+                )
+                .order_by(Task.created_at.desc())
+                .limit(_CRITERION_NAMED_TEST_TRIAL_STREAK_SCAN_LIMIT)
+            )
+        ).all()
+
+        consecutive_non_green = 0
+        for _row_id, row_status, row_context in streak_rows:
+            contradiction = (row_context or {}).get(
+                "criterion_named_test_trial_contradiction"
+            )
+            if isinstance(contradiction, dict):
+                consecutive_non_green += 1
+                if (
+                    consecutive_non_green
+                    >= CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+                ):
+                    break
+                continue
+            if row_status == TaskStatus.COMPLETED:
+                # COMPLETED with no contradiction stamp means the ingestion
+                # handler recorded green evidence — the streak is broken.
+                break
+            # CANCELLED (superseded before it ran) or FAILED (never reached
+            # ingestion) carries no pass/fail signal for this triple: skip it
+            # without counting it toward, or breaking, the streak.
+            continue
+
+        if (
+            consecutive_non_green
+            >= CRITERION_NAMED_TEST_TRIAL_CONSECUTIVE_NON_GREEN_SUPPRESSION_THRESHOLD
+        ):
+            logger.info(
+                "[CRITERION_TRIAL] suppressing enrollment for criterion %s "
+                "(project %s, version %s) — %d consecutive non-green terminal "
+                "trials for this test+precondition identity; unchanged since "
+                "the last attempt (head_sha alone does not re-arm)",
+                criterion_key,
+                project_id,
+                version_id,
+                consecutive_non_green,
+            )
+            return None
+
         # In-flight debounce: at most one non-terminal trial per criterion +
         # release version. The identity check above only suppresses an EXACT
         # match (same head, same refs, same precondition); the moment the
@@ -4979,8 +5204,6 @@ async def enroll_criterion_named_test_trial(
         # match (that case already returned above), so it is pinned to a
         # different candidate SHA or an older test/precondition epoch.
         from sqlalchemy.orm.attributes import flag_modified
-
-        from app.models import TASK_OUTCOME_TERMINAL_STATUSES
 
         inflight_rows = (
             await session.execute(

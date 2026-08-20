@@ -1416,6 +1416,35 @@ class TestBlockerExecutionSite:
             == rs.EXECUTION_SITE_DEPLOYED
         )
 
+    def test_candidate_authorship_blockers_are_deployed_site(self):
+        """The authorship validator (count + evidence-contract checks) runs in
+        the DEPLOYED backend against release_commit_authorship.py's measurement
+        predicate. Despite the ``candidate_`` name prefix, re-cutting the
+        candidate never clears either blocker — only a deploy or the hotfix
+        lane does — so both must be classified deployed-side, not
+        candidate-side, or an operator-facing alert would tell them an
+        automain-only fix takes effect before it is deployed.
+        """
+        assert (
+            rs.blocker_execution_site("candidate_operator_authorship_nonzero")
+            == rs.EXECUTION_SITE_DEPLOYED
+        )
+        assert (
+            rs.blocker_execution_site(
+                "candidate_operator_authorship_evidence_missing"
+            )
+            == rs.EXECUTION_SITE_DEPLOYED
+        )
+        # The clearing paths remain valid non-promotional entries even though
+        # the site flipped — HARD_GATE_CLEARING_PATHS is keyed on the blocker
+        # code, independent of BLOCKER_EXECUTION_SITE.
+        for code in (
+            "candidate_operator_authorship_nonzero",
+            "candidate_operator_authorship_evidence_missing",
+        ):
+            evidence = rs.HARD_GATE_CLEARING_PATHS[code]["evidence"]
+            assert "promot" not in evidence.lower(), code
+
     def test_criterion_coverage_gate_is_deployed_side(self):
         """Coverage is rendered and its evidence is minted by deployed code.
 
@@ -1471,8 +1500,7 @@ class TestBlockerExecutionSite:
     def test_none_and_unknown_return_none(self):
         assert rs.blocker_execution_site(None) is None
         assert rs.blocker_execution_site("") is None
-        # A force-promote / unclassified sentinel is deliberately unclassified.
-        assert rs.blocker_execution_site("qualification_superseded") is None
+        assert rs.blocker_execution_site("qualification_superseded") == rs.EXECUTION_SITE_DEPLOYED
         assert rs.blocker_execution_site("some_future_blocker") is None
 
     def test_every_compute_composite_blocker_code_is_classified(self):
@@ -1480,8 +1508,25 @@ class TestBlockerExecutionSite:
         # execution-site — a new blocker without a classification is a bug.
         import re
 
-        src = (Path(rs.__file__)).read_text()
-        emitted = set(re.findall(r'blocker = "([a-z_]+)"', src))
+        source_paths = (
+            "release_scoring.py",
+            "release_qualifier.py",
+            "release_qualifier_sweep.py",
+            "release_qualifier_audit.py",
+            "release_reconciliation.py",
+            "release_stall_alerts.py",
+        )
+        emitted = {
+            code
+            for filename in source_paths
+            for pattern in (
+                r'blocker\s*=\s*["\']([a-z0-9_]+)["\']',
+                r'["\']blocker["\']\s*:\s*["\']([a-z0-9_]+)["\']',
+            )
+            for code in re.findall(
+                pattern, Path(rs.__file__).with_name(filename).read_text()
+            )
+        }
         assert emitted, "expected to find blocker assignments in release_scoring"
         for code in emitted:
             assert rs.blocker_execution_site(code) is not None, code
@@ -1506,8 +1551,15 @@ class TestBlockerExecutionSite:
         # qualifier after base scoring, so the reverse vocabulary check must
         # include both execution sites.
         sources = [
-            Path(rs.__file__).read_text(),
-            Path(rs.__file__).with_name("release_qualifier.py").read_text(),
+            Path(rs.__file__).with_name(filename).read_text()
+            for filename in (
+                "release_scoring.py",
+                "release_qualifier.py",
+                "release_qualifier_sweep.py",
+                "release_qualifier_audit.py",
+                "release_reconciliation.py",
+                "release_stall_alerts.py",
+            )
         ]
         emitted = {
             code
@@ -1536,7 +1588,10 @@ class TestBlockerExecutionSite:
         assert "next qualification" in candidate_label
         # No blocker / unclassified → no label.
         assert rs.blocker_execution_site_label(None) is None
-        assert rs.blocker_execution_site_label("qualification_superseded") is None
+        assert (
+            rs.blocker_execution_site_label("qualification_superseded")
+            == rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
+        )
 
 
 # ---------------------------------------------------------------------------

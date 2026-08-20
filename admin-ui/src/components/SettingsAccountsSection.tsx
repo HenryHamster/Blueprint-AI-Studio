@@ -348,20 +348,20 @@ function AccountRow({
   const autoDisableAfter = account.auto_disable_after_rate_limits ?? null;
 
   return (
-    <div className={`bg-neutral-900 rounded-lg p-3 border ${isRateLimited ? 'border-amber-900/60' : account.disabled_reason ? 'border-red-900/60' : 'border-neutral-800'}`}>
+    <div className={`bg-workbench-base rounded-lg p-3 border ${isRateLimited ? 'border-amber-900/60' : account.disabled_reason ? 'border-red-900/60' : 'border-neutral-800'}`}>
       <div className="flex items-center gap-3">
         <button
           onClick={() => run('toggle', () => onToggleAccount(account.id, !account.enabled))}
           disabled={isBusy}
           data-viewport-allow-small-target
-          className={`w-2.5 h-2.5 rounded-full shrink-0 disabled:opacity-50 ${busy === 'toggle' ? 'animate-pulse ' : ''}${isRateLimited ? 'bg-amber-500' : account.enabled ? 'bg-emerald-500' : 'bg-neutral-600'}`}
+          className={`w-2.5 h-2.5 rounded-full shrink-0 disabled:opacity-50 ${busy === 'toggle' ? 'animate-pulse ' : ''}${isRateLimited ? 'bg-amber-500' : account.enabled ? 'bg-emerald-500' : 'bg-workbench-card'}`}
           title={isRateLimited ? 'Rate-limited' : account.enabled ? 'Enabled (click to disable)' : 'Disabled (click to enable)'}
         />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 min-w-0 flex-wrap">
             <div className="text-sm text-neutral-200 truncate">{account.name}</div>
-            <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700">{account.provider}</span>
-            <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">{account.auth_mode}</span>
+            <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-400 border border-neutral-700">{account.provider}</span>
+            <span className="text-ui-sm uppercase tracking-wide px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-500 border border-neutral-700">{account.auth_mode}</span>
             {(dailyCap !== null || concurrentCap !== null || autoDisableAfter !== null) && (
               <span className="text-ui-sm px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50" title="Usage caps configured">
                 {dailyCap !== null && <>{dailyCount}/{dailyCap} today</>}
@@ -506,15 +506,20 @@ function AccountRow({
       {isRateLimited && (
         <div className="mt-2 pt-2 border-t border-neutral-800/50">
           {disabledModels.map(([model, info]) => {
-            const cooldownMin = Math.min(30 * Math.pow(2, (info.hits - 1)), 240);
             const disabledAt = info.at ? parseTimestamp(info.at) : null;
-            const recoveryAt = disabledAt ? new Date(disabledAt.getTime() + cooldownMin * 60000) : null;
+            const recoveryAt = disabledAt && typeof info.cooldown_seconds === 'number'
+              ? new Date(disabledAt.getTime() + info.cooldown_seconds * 1000)
+              : null;
             const remaining = recoveryAt ? Math.max(0, Math.round((recoveryAt.getTime() - now) / 60000)) : null;
+            const isQuota = info.kind === 'quota_exhausted';
             const shortModel = model.replace('claude-', '').replace('-4-6', '');
+            const durLabel = remaining === null || remaining <= 0
+              ? 'recovering'
+              : isQuota ? '24h quota' : `${remaining}m left`;
             return (
               <div key={model} className="flex items-center justify-between text-ui-md text-amber-400/80">
                 <span className="font-mono">{shortModel} <span className="text-amber-500/60">hit #{info.hits}</span></span>
-                <span className="text-amber-500/60">{remaining !== null && remaining > 0 ? `${remaining}m left` : 'recovering'}</span>
+                <span className="text-amber-500/60">{durLabel}</span>
               </div>
             );
           })}
@@ -541,7 +546,7 @@ function AccountRow({
                 value={capDraft.daily_task_cap}
                 placeholder="unlimited"
                 onChange={e => setCapDraft({ ...capDraft, daily_task_cap: e.target.value })}
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus"
               />
             </label>
             <label className="block">
@@ -552,7 +557,7 @@ function AccountRow({
                 value={capDraft.max_concurrent_tasks}
                 placeholder="unlimited"
                 onChange={e => setCapDraft({ ...capDraft, max_concurrent_tasks: e.target.value })}
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus"
               />
             </label>
             <label className="block">
@@ -563,7 +568,7 @@ function AccountRow({
                 value={capDraft.auto_disable_after_rate_limits}
                 placeholder="off"
                 onChange={e => setCapDraft({ ...capDraft, auto_disable_after_rate_limits: e.target.value })}
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus"
               />
             </label>
           </div>
@@ -583,7 +588,7 @@ function AccountRow({
                 });
                 setExpandedAccountCaps(null);
               }}
-              className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-ui-md py-1 px-3 rounded border border-neutral-700"
+              className="bg-workbench-panel hover:bg-workbench-hover text-neutral-200 text-ui-md py-1 px-3 rounded border border-neutral-700"
             >
               Save caps
             </button>
@@ -696,10 +701,10 @@ function AccountEditForm({
     return payload;
   };
 
-  const inputCls = 'w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600';
+  const inputCls = 'w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus';
 
   return (
-    <div className="mt-2 pt-3 border-t border-neutral-800/60 bg-neutral-950/40 rounded-lg p-3 space-y-3">
+    <div className="mt-2 pt-3 border-t border-neutral-800/60 bg-workbench-shell/40 rounded-lg p-3 space-y-3">
       <div className="text-ui-sm font-semibold text-neutral-300 uppercase tracking-wider">Edit account</div>
       <div>
         <div className="text-ui-sm text-neutral-500 mb-1 uppercase">Name</div>
@@ -800,15 +805,15 @@ function AccountEditForm({
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
         <label className="block">
           <div className="text-ui-sm text-neutral-500 mb-1">Tasks/day</div>
-          <input aria-label="Tasks per day cap" type="number" min={1} value={dailyTaskCap} placeholder="unlimited" onChange={e => setDailyTaskCap(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
+          <input aria-label="Tasks per day cap" type="number" min={1} value={dailyTaskCap} placeholder="unlimited" onChange={e => setDailyTaskCap(e.target.value)} className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus" />
         </label>
         <label className="block">
           <div className="text-ui-sm text-neutral-500 mb-1">Max concurrent</div>
-          <input aria-label="Max concurrent cap" type="number" min={1} value={maxConcurrent} placeholder="unlimited" onChange={e => setMaxConcurrent(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
+          <input aria-label="Max concurrent cap" type="number" min={1} value={maxConcurrent} placeholder="unlimited" onChange={e => setMaxConcurrent(e.target.value)} className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus" />
         </label>
         <label className="block">
           <div className="text-ui-sm text-neutral-500 mb-1">Auto-disable</div>
-          <input aria-label="Auto-disable cap" type="number" min={1} value={autoDisable} placeholder="off" onChange={e => setAutoDisable(e.target.value)} className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600" />
+          <input aria-label="Auto-disable cap" type="number" min={1} value={autoDisable} placeholder="off" onChange={e => setAutoDisable(e.target.value)} className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus" />
         </label>
       </div>
       <div className="flex items-center gap-2 pt-1">
@@ -830,7 +835,7 @@ function AccountEditForm({
 function renderGuideText(text: string) {
   return text.split(/(`[^`]+`)/g).map((part, idx) => (
     part.startsWith('`') && part.endsWith('`')
-      ? <code key={idx} className="text-cyan-300 bg-neutral-900 px-1 rounded">{part.slice(1, -1)}</code>
+      ? <code key={idx} className="text-cyan-300 bg-workbench-base px-1 rounded">{part.slice(1, -1)}</code>
       : <span key={idx}>{part}</span>
   ));
 }
@@ -914,7 +919,7 @@ function AccountAddForm({
   const disabled = missing.length > 0;
 
   return (
-    <div className="mt-4 bg-neutral-900 border border-neutral-800 rounded-lg p-4 space-y-3">
+    <div className="mt-4 bg-workbench-base border border-neutral-800 rounded-lg p-4 space-y-3">
       <div className="text-xs font-semibold text-neutral-200 uppercase tracking-wider">New account</div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
         <div>
@@ -922,7 +927,7 @@ function AccountAddForm({
           <select
             value={newAccountProvider}
             onChange={e => setNewAccountProvider(e.target.value as ProviderName)}
-            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus"
           >
             {providerNames.map(providerName => (
               <option key={providerName} value={providerName}>{providerName}</option>
@@ -934,7 +939,7 @@ function AccountAddForm({
           <select
             value={newAccountAuthMode}
             onChange={e => setNewAccountAuthMode(e.target.value as AuthMode)}
-            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus"
           >
             {authModes.map(mode => (
               <option key={mode} value={mode}>{mode}</option>
@@ -943,7 +948,7 @@ function AccountAddForm({
         </div>
       </div>
       {guide && (
-        <div className="bg-neutral-950 border border-neutral-800 rounded-lg p-3 flex gap-2">
+        <div className="bg-workbench-shell border border-neutral-800 rounded-lg p-3 flex gap-2">
           <HelpCircle className="w-4 h-4 text-cyan-400/80 shrink-0 mt-0.5" />
           <div className="min-w-0 flex-1">
             <div className="text-xs text-neutral-300">{guide.summary}</div>
@@ -961,7 +966,7 @@ function AccountAddForm({
           value={newAccountName}
           onChange={e => setNewAccountName(e.target.value)}
           placeholder="e.g. my-claude-max"
-          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus"
         />
       </div>
       {requiredMetadataFields.length > 0 && (
@@ -975,7 +980,7 @@ function AccountAddForm({
                   value={newAccountProviderMetadata[field] ?? ''}
                   onChange={e => setNewAccountProviderMetadata({ ...newAccountProviderMetadata, [field]: e.target.value })}
                   placeholder={hint?.placeholder ?? field}
-                  className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                  className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm workbench-focus"
                 />
                 {hint && <div className="text-ui-sm text-neutral-600 mt-0.5">{hint.label}</div>}
               </div>
@@ -992,10 +997,10 @@ function AccountAddForm({
               onChange={e => setNewAccountToken(e.target.value)}
               rows={4}
               placeholder={`Paste ${secretLabel} or upload a .json file below`}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
+              className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono resize-none workbench-focus"
             />
             <label className="flex items-center gap-2 text-ui-md text-neutral-500 hover:text-neutral-300 cursor-pointer transition-colors">
-              <span className="inline-flex items-center gap-1 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 hover:bg-neutral-700">
+              <span className="inline-flex items-center gap-1 bg-workbench-panel border border-neutral-700 rounded px-2 py-1 hover:bg-workbench-hover">
                 <FileDown className="w-3 h-3" /> Upload .json file
               </span>
               <input
@@ -1023,7 +1028,7 @@ function AccountAddForm({
             onChange={e => setNewAccountToken(e.target.value)}
             placeholder={secretLabel}
             type="password"
-            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 font-mono"
+            className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono workbench-focus"
           />
         )}
       </div>
@@ -1041,7 +1046,7 @@ function AccountAddForm({
             onChange={e => setNewAccountClaudeConfigJson(e.target.value)}
             rows={2}
             placeholder='{"onboardingAccepted": true}'
-            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
+            className="w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono resize-none workbench-focus"
           />
         </div>
       )}
@@ -1054,7 +1059,7 @@ function AccountAddForm({
         Usage limits (optional)
       </button>
       {showAddAccountCaps && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 bg-workbench-shell border border-neutral-800 rounded-lg p-3">
           <label className="block">
             <div className="text-ui-sm text-neutral-500 mb-1 flex items-center gap-1">
               Tasks/day
@@ -1068,7 +1073,7 @@ function AccountAddForm({
               value={newAccountDailyTaskCap ?? ''}
               onChange={e => setNewAccountDailyTaskCap(e.target.value ? parseInt(e.target.value, 10) : null)}
               placeholder="unlimited"
-              className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus"
             />
           </label>
           <label className="block">
@@ -1084,7 +1089,7 @@ function AccountAddForm({
               value={newAccountMaxConcurrentTasks ?? ''}
               onChange={e => setNewAccountMaxConcurrentTasks(e.target.value ? parseInt(e.target.value, 10) : null)}
               placeholder="unlimited"
-              className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus"
             />
           </label>
           <label className="block">
@@ -1100,7 +1105,7 @@ function AccountAddForm({
               value={newAccountAutoDisableAfterRateLimits ?? ''}
               onChange={e => setNewAccountAutoDisableAfterRateLimits(e.target.value ? parseInt(e.target.value, 10) : null)}
               placeholder="off"
-              className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-full bg-workbench-base border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono workbench-focus"
             />
           </label>
         </div>
@@ -1192,14 +1197,14 @@ export function SettingsAccountsSection({
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">GitHub</h3>
         {githubAccount ? (
-          <div className="flex items-center gap-2 bg-neutral-900 rounded-lg p-3 border border-neutral-800">
+          <div className="flex items-center gap-2 bg-workbench-base rounded-lg p-3 border border-neutral-800">
             <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
             <span className="text-sm text-neutral-200">Connected: <span className="font-mono">{githubAccount}</span></span>
           </div>
         ) : (
           <button
             onClick={onConnectGitHub}
-            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-neutral-700 flex items-center gap-2"
+            className="bg-workbench-panel hover:bg-workbench-hover text-neutral-300 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-neutral-700 flex items-center gap-2"
           >
             <GitBranch className="w-3.5 h-3.5" /> Connect GitHub
           </button>
@@ -1213,7 +1218,7 @@ export function SettingsAccountsSection({
           const available = maxPlanAccounts.filter(a => a.enabled && !Object.keys(a.disabled_models || {}).length).length;
           const warn = available < total;
           return (
-            <div className={`flex items-center justify-between text-xs mb-3 px-3 py-2 rounded-lg border ${warn ? 'bg-amber-950/30 border-amber-900/50 text-amber-400' : 'bg-neutral-900 border-neutral-800 text-neutral-400'}`}>
+            <div className={`flex items-center justify-between text-xs mb-3 px-3 py-2 rounded-lg border ${warn ? 'bg-amber-950/30 border-amber-900/50 text-amber-400' : 'bg-workbench-base border-neutral-800 text-neutral-400'}`}>
               <span>Pool: <span className={warn ? 'text-amber-300 font-medium' : 'text-neutral-200 font-medium'}>{available}/{total}</span> available</span>
               {warn && <span className="text-amber-500 text-ui-md">degraded</span>}
             </div>
@@ -1244,7 +1249,7 @@ export function SettingsAccountsSection({
         {!showAddAccountForm ? (
         <button
           onClick={() => setShowAddAccountForm(true)}
-          className="mt-4 w-full flex items-center justify-center gap-2 bg-neutral-900 hover:bg-neutral-800 border border-dashed border-neutral-700 text-neutral-400 text-xs min-h-[44px] py-2.5 px-4 rounded-lg transition-colors"
+          className="mt-4 w-full flex items-center justify-center gap-2 bg-workbench-base hover:bg-workbench-hover border border-dashed border-neutral-700 text-neutral-400 text-xs min-h-[44px] py-2.5 px-4 rounded-lg transition-colors"
         >
             <Plus className="w-3.5 h-3.5" /> Add account
           </button>

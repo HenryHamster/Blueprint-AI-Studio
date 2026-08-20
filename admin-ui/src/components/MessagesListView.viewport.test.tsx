@@ -326,6 +326,111 @@ describe('MessagesListView — viewport regression', () => {
     });
   });
 
+  test('anchors an opened conversation at the newest message without a timed re-pin loop', async () => {
+    const messages = Array.from({ length: 50 }, (_, index) => makeMsg({
+      id: `settle-${index + 1}`,
+      sequence: index + 1,
+      from_type: index % 2 ? 'strategic' : 'user',
+      content: index === 49
+        ? 'Newest message anchor target — dynamically measured markdown row. '.repeat(15)
+        : `Conversation message ${index + 1}`,
+      surface: 'conversation',
+    }));
+
+    await renderView(baseProps({ presentation: 'conversation', messages }));
+
+    const findScrollEl = () =>
+      host?.querySelector<HTMLElement>('[data-testid="strategic-conversation-column"] .custom-scrollbar') ?? null;
+    await vi.waitFor(() => expect(findScrollEl()).toBeTruthy());
+    const el = findScrollEl()!;
+
+    // The settle loop hides the list synchronously on mount and only reveals
+    // it once row measurements have converged — it must never be visible
+    // before the very first settle frame has had a chance to run.
+    expect(getComputedStyle(el).visibility).toBe('hidden');
+
+    await vi.waitFor(() => {
+      expect(getComputedStyle(el).visibility).not.toBe('hidden');
+    }, { timeout: 2000, interval: 5 });
+
+    // Pinned to the last row once revealed — no mid-history landing.
+    expect(el.scrollTop + el.clientHeight).toBeGreaterThanOrEqual(el.scrollHeight - 4);
+
+    // A fixed 500ms re-pin window would keep re-issuing scrollToRow well
+    // after reveal even though content never changes again. The
+    // settle-detection loop stops as soon as two consecutive frames agree,
+    // so scrollTop must stay put well past that old deadline.
+    const settledScrollTop = el.scrollTop;
+    await new Promise(resolve => setTimeout(resolve, 700));
+    expect(el.scrollTop).toBe(settledScrollTop);
+  });
+
+  test('returning to chat (navigationEpoch bump) re-anchors to the newest message even after scroll drift', async () => {
+    const messages = Array.from({ length: 30 }, (_, index) => makeMsg({
+      id: `epoch-${index + 1}`,
+      sequence: index + 1,
+      from_type: index % 2 ? 'strategic' : 'user',
+      content: `Conversation message ${index + 1}`,
+      surface: 'conversation',
+    }));
+
+    await renderView(baseProps({ presentation: 'conversation', messages, navigationEpoch: 1 }));
+
+    const findScrollEl = () =>
+      host?.querySelector<HTMLElement>('[data-testid="strategic-conversation-column"] .custom-scrollbar') ?? null;
+    await vi.waitFor(() => expect(findScrollEl()).toBeTruthy());
+    let el = findScrollEl()!;
+    await vi.waitFor(() => expect(getComputedStyle(el).visibility).not.toBe('hidden'));
+    expect(el.scrollTop + el.clientHeight).toBeGreaterThanOrEqual(el.scrollHeight - 4);
+
+    // Simulate the operator having scrolled away from the bottom before
+    // switching to another tab — the chat surface stays mounted (hidden)
+    // rather than unmounting, so nothing else would reset this.
+    el.scrollTop = 0;
+
+    // Returning to chat bumps navigationEpoch. Even though the message set
+    // is unchanged, the settle loop must re-run and re-anchor deterministically
+    // rather than trusting whatever scroll position the hidden ancestor kept.
+    await act(async () => {
+      root?.render(<MessagesListView {...baseProps({ presentation: 'conversation', messages, navigationEpoch: 2 })} />);
+    });
+
+    await vi.waitFor(() => {
+      el = findScrollEl()!;
+      expect(el.scrollTop + el.clientHeight).toBeGreaterThanOrEqual(el.scrollHeight - 4);
+    }, { timeout: 2000, interval: 5 });
+  });
+
+  test('conversation mode renders an unread boundary divider and dismisses it via onDismissDivider', async () => {
+    const older = makeMsg({
+      id: 'unread-old', sequence: 1, content: 'already seen',
+      created_at: new Date(1_000_000).toISOString(), surface: 'conversation',
+    });
+    const newer = makeMsg({
+      id: 'unread-new', sequence: 2, content: 'freshly arrived',
+      created_at: new Date(5_000_000).toISOString(), surface: 'conversation',
+    });
+    const onDismissDivider = vi.fn();
+    await renderView(baseProps({
+      presentation: 'conversation',
+      messages: [older, newer],
+      dividerTime: 2_000_000,
+      onDismissDivider,
+    }));
+
+    const marker = await vi.waitFor(() => {
+      const el = host?.querySelector('[data-divider-marker]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    expect(marker.textContent).toContain('NEW since');
+
+    const dismissButton = marker.querySelector('button');
+    expect(dismissButton).toBeTruthy();
+    act(() => { dismissButton?.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    expect(onDismissDivider).toHaveBeenCalledTimes(1);
+  });
+
   test('scrollToBottom scrolls to the last row via list API', async () => {
     const messages = Array.from({ length: 10 }, (_, index) => makeMsg({
       id: `scroll-test-${index + 1}`,

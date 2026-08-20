@@ -29,7 +29,7 @@ export function FailureTaxonomyBreakdown({
           const cat = tax.categories[k];
           if (!cat) return null;
           const isDominant = tax.dominant_category === k;
-          const base = TAXONOMY_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+          const base = TAXONOMY_COLORS[k] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
           const cls = isDominant ? `${base} ring-1 ring-current` : base;
           const stroke = TAXONOMY_STROKE[k] ?? '#a3a3a3';
           const taxSpark = taxSparkMap[k] ?? [];

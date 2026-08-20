@@ -1230,11 +1230,18 @@ async def raise_stalled_trial_notice(
     min_n = thresholds.get("min_n_per_arm")
     without_assigned = arm_comp.get("without_assigned")
 
+    if is_holdback_fraction_verdict_pinned(entry.get("verdict")):
+        remedy = (
+            f"— fraction is pinned by the {entry.get('verdict')} verdict; "
+            f"re-declare the verdict via PATCH /api/admin/agent/projects/{{id}}/declare-capability-verdict"
+        )
+    else:
+        remedy = "— raise holdback_fraction or extend trial window"
     content = (
         f"[CAPABILITY-TRIAL] {cap_name} stalled: holdback arm cannot reach min_n at current accrual "
         f"(holdback_fraction={holdback_fraction} without_assigned={without_assigned} min_n={min_n} "
         f"with_7d={with_7d} without_7d={without_7d} window_days={window_days}) "
-        f"— raise holdback_fraction or extend trial window"
+        f"{remedy}"
     )
     session.add(
         await build_project_message(
@@ -1528,6 +1535,26 @@ async def persist_accrual_projections_in_transaction(
             raise
 
 
+_HOLDBACK_PINNING_REJECT_VERDICTS = ("reject", "no_effect", "KILL")
+
+
+def is_holdback_fraction_verdict_pinned(verdict: str | None) -> bool:
+    """Return True when ``verdict`` short-circuits the holdback fraction.
+
+    A durable ``adopt``/``reject``/``no_effect``/``KILL`` verdict pins the
+    effective holdback fraction to 0.0 or 1.0 regardless of the
+    runtime-config default (see :func:`get_effective_holdback_fraction`).
+    Any other verdict (``continue-trial``, missing, etc.) leaves the
+    runtime-config default in effect.
+    """
+    from app.capability_registry import _CAPABILITY_ADOPT_VERDICTS
+
+    return (
+        verdict in _CAPABILITY_ADOPT_VERDICTS
+        or verdict in _HOLDBACK_PINNING_REJECT_VERDICTS
+    )
+
+
 def get_effective_holdback_fraction(
     verdicts: Any,
     cap_name: str,
@@ -1548,6 +1575,6 @@ def get_effective_holdback_fraction(
     resolution = resolve_capability_enablement(verdicts, cap_name)
     if resolution["enabled"]:
         return 0.0
-    if resolution["verdict"] in ("reject", "no_effect", "KILL"):
+    if resolution["verdict"] in _HOLDBACK_PINNING_REJECT_VERDICTS:
         return 1.0
     return default_fraction

@@ -196,6 +196,30 @@ describe('useLogViewer strategist events', () => {
     return ws;
   }
 
+  it('stamps each strategic_session delta with the project it arrived under', async () => {
+    // The transcript buffer is hook-global and cleared by a project-switch
+    // EFFECT, which runs after render. Stamping the project at append time is
+    // what lets consumers scope the buffer synchronously, so a previous
+    // project's deltas can never render against a new project's messages.
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    const ws = await connect(result);
+
+    act(() => {
+      ws.emit({
+        event: 'strategic_session',
+        data: { project_id: 'proj-live', session_id: 'sess-1', seq: 1, kind: 'message', text: 'hello' },
+      });
+    });
+
+    expect(result.current.lv.strategicSessionTranscript).toHaveLength(1);
+    expect(result.current.lv.strategicSessionTranscript[0]).toMatchObject({
+      project_id: 'proj-live',
+      session_id: 'sess-1',
+      kind: 'message',
+      text: 'hello',
+    });
+  });
+
   it('connects the selected project websocket without opening logs or tracking a task', async () => {
     const { result } = setup({ selectedProjectId: 'proj-live' });
     await act(async () => {

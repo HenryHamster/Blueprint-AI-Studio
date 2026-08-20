@@ -51,7 +51,7 @@ export function PendingConfirmationsSection({
   canOperateProject = false,
   onResolved,
   addToast,
-  className = 'rounded-lg border border-neutral-800 bg-neutral-950/40 p-3',
+  className = 'rounded-lg border border-neutral-800 bg-workbench-shell/40 p-3',
   testId = 'pending-confirmations',
 }: PendingConfirmationsSectionProps) {
   const [resolvedIds, setResolvedIds] = useState<Set<string>>(() => new Set());

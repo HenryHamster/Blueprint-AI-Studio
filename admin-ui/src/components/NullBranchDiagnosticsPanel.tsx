@@ -60,7 +60,7 @@ export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnostic
       </div>
 
       {projects.length > 0 && (
-        <div className="mt-1 bg-neutral-900 border border-amber-900/40 rounded-lg p-3 text-xs space-y-2">
+        <div className="mt-1 bg-workbench-base border border-amber-900/40 rounded-lg p-3 text-xs space-y-2">
           <div className="flex items-center gap-1.5 mb-2">
             <AlertTriangle className="w-3 h-3 text-amber-400" />
             <span className="text-amber-400 font-medium">
@@ -80,7 +80,7 @@ export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnostic
                 {onConfigure && (
                   <button
                     onClick={() => onConfigure(project.id)}
-                    className="px-2 min-h-[44px] rounded text-ui-sm font-medium bg-neutral-800 border border-neutral-700 text-neutral-300 hover:bg-neutral-700 transition-colors"
+                    className="px-2 min-h-[44px] rounded text-ui-sm font-medium bg-workbench-panel border border-neutral-700 text-neutral-300 hover:bg-workbench-hover transition-colors"
                   >
                     Configure
                   </button>
@@ -108,7 +108,7 @@ export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnostic
             {selfRepoSkipped.length} self-repo skipped (intentional)
           </button>
           {selfRepoExpanded && (
-            <div className="mt-1 bg-neutral-900 border border-neutral-800 rounded-lg p-2 text-xs space-y-1">
+            <div className="mt-1 bg-workbench-base border border-neutral-800 rounded-lg p-2 text-xs space-y-1">
               {selfRepoSkipped.map(project => (
                 <div key={project.id} className="flex items-center gap-2 text-neutral-500">
                   <span className="font-medium text-neutral-400">{project.name}</span>

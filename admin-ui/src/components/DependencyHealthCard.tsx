@@ -51,7 +51,7 @@ export function DependencyHealthCard({ data }: { data?: DependencyHealthSignals 
   );
 
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
       <div className="flex items-center gap-2 mb-2">
         <GitBranch className="w-3.5 h-3.5 text-amber-400 shrink-0" />
         <h3 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest">Dependency Health</h3>

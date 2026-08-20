@@ -25,7 +25,11 @@ from app.models import (
     ResidualCaseStatus,
     ReleaseVersion,
 )
-from app.capability_trial_verdict import LANE_PILOT_ASSIGNMENT_KEY, LANE_PILOT_CAP_NAME
+from app.capability_trial_verdict import (
+    LANE_PILOT_ASSIGNMENT_KEY,
+    LANE_PILOT_CAP_NAME,
+    evaluate_trial_verdict,
+)
 from app.routers.admin_analytics import _derive_completed_at
 from app.routers.admin_digest import _compute_digest
 from app.digest_metrics import (
@@ -1997,6 +2001,68 @@ async def test_digest_project_filter(client: AsyncClient, db_session):
     titles = [c["title"] for c in data["recent_completions"]]
     assert "Task A" in titles
     assert "Task B" not in titles
+
+
+@pytest.mark.asyncio
+async def test_digest_response_omits_per_task_at_all_four_reconciliation_keys(
+    client: AsyncClient, db_session
+):
+    """per_task has no readers on the live digest path and was serialized four
+    times over: nested under effort_model_efficiency (twice) and re-exposed
+    top-level (twice). It must be stripped at all four response sites while
+    every scalar the EffortEfficiencyPanel/trust-indicator reads survives, and
+    the four response KEYS themselves must remain present."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "high"}],
+            context={"pr_merged": True},
+            provider="anthropic",
+            model="claude-opus-4-8",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 1000,
+                "llm_call_count": 1,
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    body_text = response.text
+    data = response.json()
+
+    # The four keys must still be present.
+    assert "cost_telemetry_reconciliation" in data
+    assert "cost_telemetry_reconciliation_provider_reported" in data
+    assert "cost_telemetry_reconciliation" in data["effort_model_efficiency"]
+    assert (
+        "cost_telemetry_reconciliation_provider_reported"
+        in data["effort_model_efficiency"]
+    )
+
+    top_level = data["cost_telemetry_reconciliation"]
+    nested = data["effort_model_efficiency"]["cost_telemetry_reconciliation"]
+    assert top_level is not None
+    assert "per_task" not in top_level
+    assert "per_task" not in nested
+    # Scalars the trust indicator reads survive byte-identical.
+    assert top_level["task_count"] == 1
+    assert top_level["within_tolerance"] is True
+    assert top_level == nested
+
+    # per_task must not appear anywhere in the serialized response, not just
+    # under the reconciliation keys we know about.
+    assert "per_task" not in body_text, (
+        "per_task string leaked into the digest response somewhere"
+    )
 
 
 @pytest.mark.asyncio
@@ -9868,7 +9934,68 @@ async def test_compute_trial_arm_accumulation_intent_to_treat(db_session):
     assert accum["without_succ"] == 1
     assert accum["with_rate"] == round(2 / 3, 2)
     assert accum["without_rate"] == 0.5
-    assert accum["lift"] == round(round(2 / 3, 2) - 0.5, 2)
+    # Lift is computed from the UNROUNDED rates (2/3 - 0.5 = 0.1666...), not from the
+    # rounded display rates (round(0.67 - 0.5, 2) = 0.17) — quantizing before
+    # subtracting can shift a verdict-deciding lift by up to 0.01.
+    assert accum["lift"] == pytest.approx(2 / 3 - 0.5)
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_accumulation_quantized_lift_does_not_falsely_adopt(db_session):
+    """A rounded-rate lift of exactly 0.05 (the adopt threshold) must not adopt when
+    the true (unrounded) lift is below threshold — this is the exact quantization
+    failure mode that let diagnostics_after_edit adopt on a lift that never cleared
+    the bar: with_rate 2/30 rounds to 0.07, without_rate 1/41 rounds to 0.02, so the
+    rounded difference is 0.05, but the true difference is ~0.0423."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = _utcnow() - timedelta(days=1)
+
+    def _task(arm: bool, succeeded: bool):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=created,
+            context={
+                "_repo_map_arm": arm,
+                "_had_repo_map": arm,
+                "_first_attempt_succeeded": succeeded,
+            },
+        )
+
+    with_n, with_succ = 30, 2
+    without_n, without_succ = 41, 1
+    tasks = (
+        [_task(True, i < with_succ) for i in range(with_n)]
+        + [_task(False, i < without_succ) for i in range(without_n)]
+    )
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    accum = await compute_trial_arm_accumulation(
+        db_session,
+        project_id=project.id,
+        context_key="_had_repo_map",
+        assignment_key="_repo_map_arm",
+    )
+    assert accum["with_rate"] == 0.07
+    assert accum["without_rate"] == 0.02
+    # The rounded rates differ by exactly the adopt threshold...
+    assert round(accum["with_rate"] - accum["without_rate"], 2) == 0.05
+    # ...but the true lift is below it, and that is what must be reported/decided on.
+    assert accum["lift"] == pytest.approx(with_succ / with_n - without_succ / without_n)
+    assert accum["lift"] < 0.05
+
+    verdict = evaluate_trial_verdict(
+        lift=accum["lift"],
+        n_with=accum["with_n"],
+        n_without=accum["without_n"],
+    )
+    assert verdict["verdict"] != "adopt"
 
 
 @pytest.mark.asyncio
@@ -10471,6 +10598,131 @@ async def test_digest_exposes_accrual_projection_for_assignment_trial(db_session
     stored = project.capability_adoption_verdicts["repo_map"]
     assert "accrual_projection" in stored
     assert stored["accrual_projection"]["window_days"] == 7
+
+
+@pytest.mark.asyncio
+async def test_digest_accrual_projection_uses_effective_verdict_pinned_holdback(
+    db_session,
+):
+    """A decided no_effect verdict pins the effective holdback fraction to 1.0 —
+    the digest must report THAT, not the raw runtime-config default, and the
+    alternative-projection basis must use the without-arm's real throughput
+    instead of silently going null."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A decided no_effect verdict — the guard in record_trial_verdict must
+    # preserve this across the digest's re-evaluation (no _had_repo_map data
+    # below means the fresh recompute is continue-trial/insufficient_data,
+    # which cannot overwrite a decided verdict).
+    project.capability_adoption_verdicts = {
+        "repo_map": {
+            "verdict": "no_effect",
+            "verdict_reason": "futility_bound_reached",
+            "lift": 0.01,
+            "n_with": 90,
+            "n_without": 90,
+            "thresholds": {"min_n_per_arm": 30},
+            "arm_composition": {"with_assigned": 90, "without_assigned": 90},
+        }
+    }
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Recent WITHOUT-arm assignment volume so the without-daily rate is non-zero
+    # (the runtime-config default of 0.1 would instead force the WITH-arm branch,
+    # whose with_7d is 0 here, driving every alternative projection to null).
+    tasks = [
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_repo_map_arm": False},
+            created_at=_utcnow() - timedelta(days=1),
+        )
+        for _ in range(14)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+    verdicts = result["capability_adoption_verdicts"]
+
+    repo_map = verdicts["repo_map"]
+    assert repo_map["verdict"] == "no_effect"  # decided verdict survived
+    proj = repo_map["accrual_projection"]
+    assert proj["holdback_fraction"] == 1.0
+    assert proj["without_7d"] == 14
+    # Both arms already past min_n=30 -> 0.0 days remaining at every fraction,
+    # not null — proves the without-daily basis was actually used.
+    assert proj["alternative_projections"] == {"0.1": 0.0, "0.3": 0.0, "0.5": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_digest_accrual_projection_adopt_verdict_holdback_is_zero(db_session):
+    """A decided adopt verdict pins the effective holdback fraction to 0.0."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.capability_adoption_verdicts = {
+        "repo_map": {
+            "verdict": "adopt",
+            "verdict_reason": "sufficient_data",
+            "lift": 0.08,
+            "n_with": 50,
+            "n_without": 50,
+            "thresholds": {"min_n_per_arm": 30},
+            "arm_composition": {"with_assigned": 50, "without_assigned": 50},
+        }
+    }
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+    verdicts = result["capability_adoption_verdicts"]
+
+    repo_map = verdicts["repo_map"]
+    assert repo_map["verdict"] == "adopt"
+    assert repo_map["accrual_projection"]["holdback_fraction"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_digest_accrual_projection_undecided_verdict_uses_runtime_config_default(
+    db_session,
+):
+    """An undecided (continue-trial) trial still uses the runtime-config default,
+    unaffected by the verdict-pinning resolution."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    tasks = [
+        _arm_task(
+            project.id,
+            had_repo_map=True,
+            first_attempt_succeeded=True,
+            days_ago=1,
+            idx=i,
+        )
+        for i in range(3)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+    verdicts = result["capability_adoption_verdicts"]
+
+    repo_map = verdicts["repo_map"]
+    assert repo_map["verdict"] == "continue-trial"
+    # Undecided verdict falls through to the runtime-config default for this cap.
+    from app.shared_state import runtime_config as _rc
+
+    expected_default = float(_rc.get("repo_map_holdback_fraction", 0.0))
+    assert repo_map["accrual_projection"]["holdback_fraction"] == expected_default
 
 
 @pytest.mark.asyncio

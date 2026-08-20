@@ -43,7 +43,7 @@ describe('WorkbenchLayout viewport regression', () => {
         >
           <WorkbenchSplit
             main={(
-              <div className="min-h-0 rounded-md border border-neutral-800 bg-[#10151c] p-3 text-sm text-neutral-200">
+              <div className="min-h-0 rounded-md border border-neutral-800 bg-workbench-layer p-3 text-sm text-neutral-200">
                 Main work area
               </div>
             )}

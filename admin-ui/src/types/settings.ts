@@ -233,7 +233,22 @@ export interface MaxPlanAccount {
   auth_mode: AuthMode;
   provider_metadata?: ProviderMetadata;
   rl_hit_count?: number;
-  disabled_models?: Record<string, { hits: number; at: string | null }>;
+  disabled_models?: Record<string, {
+    hits: number;
+    at: string | null;
+    kind?: 'rate_limit' | 'quota_exhausted' | 'regression' | 'quarantine';
+    provider?: string;
+    retry_after_seconds?: number;
+    /** Authoritative cooldown-window length in seconds, from app.rate_limit_cooldown.cooldown_seconds_for_info. */
+    cooldown_seconds?: number;
+    regression_stats?: {
+      account_rate: number;
+      project_median: number;
+      sample_size: number;
+      distinct_accounts: number;
+      started_at?: string;
+    };
+  }>;
   daily_task_cap?: number | null;
   max_concurrent_tasks?: number | null;
   auto_disable_after_rate_limits?: number | null;

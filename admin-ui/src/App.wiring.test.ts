@@ -17,14 +17,30 @@ describe('App workbench wiring', () => {
 
     expect(control).toContain("currentMode={strategicInteractionMode === 'continuous' ? 'continuous' : 'chat'}");
     expect(control).toContain('sessionActive={strategicSessionActive}');
-    expect(control).toContain('sessionStatus={strategicSessionStatus}');
     expect(control).toContain('sessionState={strategicSessionState}');
+    expect(control).toContain('workdayStatus={conversationWorkdayStatus}');
     expect(control).toContain('sessionRunners={residentStrategicSessionRunners}');
     expect(control).toContain('sessionSelectedRunnerId={strategicSessionSelectedRunnerId}');
     expect(control).toContain('onSelectRunner={handleSelectStrategicRunner}');
     expect(control).toContain('onStartSession={handleStartStrategicSession}');
     expect(control).toContain('onStopSession={handleStopStrategicSession}');
     expect(control).toContain('onModeChange={setStrategicInteractionMode}');
+  });
+
+  test('feeds the header status readout from the same computation MessagesPanel reports up, not a second local one', () => {
+    expect(appSource).toContain('const [conversationWorkdayStatus, setConversationWorkdayStatus] = useState<ConversationWorkdayStatus | null>(null);');
+    expect(appSource).toMatch(/<MessagesPanel[\s\S]*onWorkdayStatusChange=\{setConversationWorkdayStatus\}/);
+  });
+
+  test('threads the live strategist transcript into chat and its derived state back to the header', () => {
+    // The incremental delivery path is only useful if BOTH ends are wired: the
+    // hook's transcript buffer must reach the conversation surface, and the
+    // in-flight state it derives must reach the header affordance. A dangling
+    // end on either side is exactly the dead last mile this replaces.
+    expect(appSource).toMatch(/<MessagesPanel[\s\S]*strategicSessionTranscript=\{s\.strategicSessionTranscript\}/);
+    expect(appSource).toMatch(/<MessagesPanel[\s\S]*onChatLiveStateChange=\{setStrategicChatLiveState\}/);
+    const control = appSource.match(/<StrategicSessionControl[\s\S]*?\/>/)?.[0] ?? '';
+    expect(control).toContain('chatLiveState={strategicChatLiveState}');
   });
 
   test('wires the real Strategic MessagesPanel to the context workspace opener', () => {
@@ -89,5 +105,17 @@ describe('App workbench wiring', () => {
     expect(appSource).toContain('<BoardDataReadyReporter activeTab={activeTab} initialLoading={boardInitialLoading} refreshing={boardRefreshing} fetchEpoch={boardDataEpoch} />');
     expect(appSource).toMatch(/if \(targetEpochRef\.current !== null && fetchEpoch >= targetEpochRef\.current\) \{[\s\S]*reportUiLoadTiming\(activeTab, Math\.round\(performance\.now\(\) - navigationStartRef\.current\), 'board_data_ready'\)/);
     expect(appSource).toMatch(/navigationStartRef\.current = performance\.now\(\);[\s\S]*reportedRef\.current = false;[\s\S]*targetEpochRef\.current = fetchEpoch \+ 1;/);
+  });
+
+  test('normalizes direction citation ids to the d- prefixed form the research journal scopes on', () => {
+    const handler = appSource.match(/const handleBoardDirectionClick = useCallback\([\s\S]*?\}, \[setResearchBrowserDirectionId, s\.setShowResearchBrowser\]\);/)?.[0] ?? '';
+
+    expect(handler).toContain("const normalized = dirId.startsWith('d-') ? dirId : `d-${dirId}`;");
+    expect(handler).toContain('setResearchBrowserDirectionId(normalized);');
+    expect(handler).toContain('s.setShowResearchBrowser(true);');
+    // Board clicks (TaskCard) and citation clicks (MarkdownContentInner) both route
+    // through this single handler, so both converge on the same normalized id.
+    expect(appSource).toContain('onOpenDirection={handleBoardDirectionClick}');
+    expect(appSource).toContain('onDirectionClick: handleBoardDirectionClick,');
   });
 });

@@ -55,7 +55,7 @@ const TOOLTIP_STYLE = {
 };
 
 function Skeleton({ className = '' }: { className?: string }) {
-  return <div className={`animate-pulse bg-neutral-800/60 rounded ${className}`} />;
+  return <div className={`animate-pulse bg-workbench-panel/60 rounded ${className}`} />;
 }
 
 export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | null; loading: boolean }) {
@@ -68,11 +68,11 @@ export function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurem
       {loading ? (
         <Skeleton className="h-40 w-full" />
       ) : data == null || rate == null ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
           No medium-scope task data yet
         </div>
       ) : (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 space-y-4">
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 space-y-4">
           {/* Headline rate */}
           <div className="flex flex-wrap items-center gap-4 min-w-0">
             <div className="min-w-0">

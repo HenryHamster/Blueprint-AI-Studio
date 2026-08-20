@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
-import type { ResidentSession, ResidentTurnResult } from '../providers/resident-session.js';
+import type {
+  ResidentSession, ResidentSessionEvent, ResidentTurnResult,
+} from '../providers/resident-session.js';
 import type { ForegroundResidentAdapter } from '../providers/foreground-resident.js';
 import {
   _typedFastInternals,
@@ -88,6 +90,7 @@ describe('typed Fast local receipt fence', () => {
       start: () => ({
         isAlive: () => true,
         sendTurn: () => new Promise<never>(() => {}),
+        onEvent: () => undefined,
         close,
       } as unknown as ResidentSession),
     };
@@ -314,5 +317,165 @@ describe('typed Fast local receipt fence', () => {
       )).toThrow(/delegate through Workday task tooling/);
     }
     expect(performance.now() - started).toBeLessThan(250);
+  });
+});
+
+describe('ForegroundTypedController — observational event seam', () => {
+  const cleanResult: ResidentTurnResult = {
+    resultText: '', accumulatedTurnText: '', interrupted: false,
+    timedOut: false, hardTimedOut: false, appliedStrategicOp: false,
+    sawToolUse: false, sentOperatorMessage: false, operatorReply: null,
+    processGone: false, ttftMs: null, turnMs: 1, toolCallCount: 0,
+    totalToolCallDurationMs: 0, meanInterTokenMs: null, inputTokens: 1,
+    providerFailed: false, failureCategory: null,
+  };
+
+  /** One adapter that records every session it starts so a test can drive that
+   *  exact generation's stream, including after replaceAfterCrash(). */
+  const recordingAdapter = (): {
+    adapter: ForegroundResidentAdapter;
+    sessions: Array<{
+      emit: (ev: ResidentSessionEvent) => void;
+      close: () => void;
+      alive: () => boolean;
+    }>;
+  } => {
+    const sessions: Array<{
+      emit: (ev: ResidentSessionEvent) => void;
+      close: () => void;
+      alive: () => boolean;
+    }> = [];
+    const adapter: ForegroundResidentAdapter = {
+      id: 'recording',
+      validation: 'qualified',
+      start: () => {
+        const listeners: Array<(ev: ResidentSessionEvent) => void> = [];
+        let alive = true;
+        const handle = {
+          emit: (ev: ResidentSessionEvent) => { for (const fn of listeners) fn(ev); },
+          close: () => { alive = false; },
+          alive: () => alive,
+        };
+        sessions.push(handle);
+        return {
+          sendTurn: () => Promise.resolve(cleanResult),
+          interrupt: () => undefined,
+          onEvent: (cb) => { listeners.push(cb); },
+          touch: () => undefined,
+          waitForIdle: () => Promise.resolve(),
+          close: () => { alive = false; },
+          sessionId: () => null,
+          isAlive: () => alive,
+          exitCode: () => null,
+        } satisfies ResidentSession;
+      },
+    };
+    return { adapter, sessions };
+  };
+
+  it('delivers text, tool and activity events from the started session', () => {
+    const { adapter, sessions } = recordingAdapter();
+    const controller = new ForegroundTypedController({ adapter });
+    const seen: ResidentSessionEvent[] = [];
+    controller.onEvent((ev) => { seen.push(ev); });
+    try {
+      controller.ensureStarted();
+      sessions[0].emit({ kind: 'text', text: 'Hello ' });
+      sessions[0].emit({ kind: 'tool', toolName: 'Bash', text: 'ls -1' });
+      sessions[0].emit({ kind: 'activity', activity: { kind: 'action', text: 'Read foo.ts' } });
+      expect(seen).toEqual([
+        { kind: 'text', text: 'Hello ' },
+        { kind: 'tool', toolName: 'Bash', text: 'ls -1' },
+        { kind: 'activity', activity: { kind: 'action', text: 'Read foo.ts' } },
+      ]);
+    } finally {
+      controller.close();
+    }
+  });
+
+  it('re-attaches the subscription to the replacement session after a crash', () => {
+    const { adapter, sessions } = recordingAdapter();
+    const controller = new ForegroundTypedController({ adapter });
+    const texts: string[] = [];
+    controller.onEvent((ev) => { if (ev.kind === 'text' && ev.text) texts.push(ev.text); });
+    try {
+      controller.ensureStarted();
+      sessions[0].emit({ kind: 'text', text: 'first' });
+      controller.replaceAfterCrash();
+      expect(sessions).toHaveLength(2);
+      sessions[1].emit({ kind: 'text', text: 'second' });
+      // The replacement streams; a mid-turn crash never silently stops delivery.
+      expect(texts).toEqual(['first', 'second']);
+    } finally {
+      controller.close();
+    }
+  });
+
+  it('drops late events from a closed session so they cannot be attributed to its replacement', () => {
+    const { adapter, sessions } = recordingAdapter();
+    const controller = new ForegroundTypedController({ adapter });
+    const texts: string[] = [];
+    controller.onEvent((ev) => { if (ev.kind === 'text' && ev.text) texts.push(ev.text); });
+    try {
+      controller.ensureStarted();
+      controller.replaceAfterCrash();
+      // Child stdout can drain after close(); this belongs to the dead generation.
+      sessions[0].emit({ kind: 'text', text: 'stale-tail' });
+      sessions[1].emit({ kind: 'text', text: 'fresh' });
+      expect(texts).toEqual(['fresh']);
+    } finally {
+      controller.close();
+    }
+  });
+
+  it('suppresses the private readiness probe so no probe delta reaches a subscriber', async () => {
+    const { adapter, sessions } = recordingAdapter();
+    const probing: ForegroundResidentAdapter = {
+      ...adapter,
+      start: (opts) => {
+        const session = adapter.start(opts);
+        const handle = sessions[sessions.length - 1];
+        return {
+          ...session,
+          sendTurn: (textOrBlocks, sendOpts) => {
+            // The probe's own reply text arrives on the stream before it resolves.
+            handle.emit({ kind: 'text', text: 'READY' });
+            return session.sendTurn(textOrBlocks, sendOpts);
+          },
+        } satisfies ResidentSession;
+      },
+    };
+    const controller = new ForegroundTypedController({ adapter: probing });
+    const seen: ResidentSessionEvent[] = [];
+    controller.onEvent((ev) => { seen.push(ev); });
+    try {
+      await controller.ensureReady();
+      expect(seen).toEqual([]);
+      // Suppression is scoped to the probe only: normal turns still stream.
+      sessions[0].emit({ kind: 'text', text: 'operator-visible' });
+      expect(seen).toEqual([{ kind: 'text', text: 'operator-visible' }]);
+    } finally {
+      controller.close();
+    }
+  });
+
+  it('never lets a throwing subscriber fail the turn', async () => {
+    const { adapter, sessions } = recordingAdapter();
+    const controller = new ForegroundTypedController({ adapter });
+    const seen: string[] = [];
+    controller.onEvent(() => { throw new Error('viewer exploded'); });
+    controller.onEvent((ev) => { if (ev.kind === 'text' && ev.text) seen.push(ev.text); });
+    try {
+      const turn = controller.dispatch(
+        { claim_id: 'c', message_ids: ['m'], idempotency_key: 'k' },
+        'Answer the operator.',
+      );
+      expect(() => { sessions[0].emit({ kind: 'text', text: 'still streams' }); }).not.toThrow();
+      const settled = await turn;
+      expect(settled.result.providerFailed).toBe(false);
+      expect(seen).toEqual(['still streams']);
+    } finally {
+      controller.close();
+    }
   });
 });

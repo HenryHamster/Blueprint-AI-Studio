@@ -123,7 +123,7 @@ export function SrCatchRateHealthBanner({
     ? 'border-red-800/40 bg-red-950/20 text-red-300'
     : isAmber
       ? 'border-amber-800/40 bg-amber-950/20 text-amber-300'
-      : 'border-neutral-700 bg-neutral-900/50 text-neutral-400';
+      : 'border-neutral-700 bg-workbench-base/50 text-neutral-400';
   const iconColor = isRed ? 'text-red-400' : isAmber ? 'text-amber-400' : 'text-neutral-500';
 
   let ageText = '';

@@ -747,6 +747,7 @@ async def test_project_and_task_updates_remain_available_during_merge_transport(
     ("response_kind", "expected_state"),
     [
         ("rate_limit", "known_not_sent"),
+        ("pat_fallback_blocked", "known_not_sent"),
         ("http_409", "submission_rejected"),
         ("http_405", "submission_rejected"),
         ("http_405_missing_merged", "ambiguous"),
@@ -806,6 +807,18 @@ async def test_definitive_merge_transport_outcomes_terminalize_and_unfence(
         rate_limit = HTTPException(status_code=429, detail="rate limited before PUT")
         rate_limit.merge_not_attempted = True
         merge_call.side_effect = rate_limit
+    elif response_kind == "pat_fallback_blocked":
+        # Refused locally before any PUT: the only credential resolvable for
+        # this lane was the operator's own PAT. Nothing was sent, so the ledger
+        # must read known_not_sent — never submission_rejected (a receipt
+        # claiming GitHub rejected a request that never existed) and never
+        # ambiguous (which would fence the task for reconciliation).
+        merge_call.return_value = {
+            "merged": False,
+            "conflict": False,
+            "pat_fallback_blocked": True,
+            "message": "refusing to merge with an operator PAT credential",
+        }
     elif response_kind == "http_409":
         merge_call.return_value = {
             "merged": False,

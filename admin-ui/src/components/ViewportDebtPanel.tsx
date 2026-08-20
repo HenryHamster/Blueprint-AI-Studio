@@ -90,7 +90,7 @@ function renderDebtRow(row: ViewportDebtRow) {
     .replace(/^admin-ui\/src\/components\//, '')
     .replace(/\.tsx$/, '');
   return (
-    <tr key={row.component} className="hover:bg-neutral-800/20 transition-colors">
+    <tr key={row.component} className="hover:bg-workbench-hover/20 transition-colors">
       <td
         className="px-3 py-1.5 font-mono text-neutral-300 min-w-0 max-w-[160px] truncate"
         title={row.component}
@@ -211,11 +211,11 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
     <section data-testid="viewport-debt-panel" className="mt-4">
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">
         Viewport Debt
-        <span className="ml-2 bg-neutral-700/40 text-neutral-300 text-ui-sm font-semibold px-1.5 py-0.5 rounded-full normal-case tracking-normal">
+        <span className="ml-2 bg-workbench-layer/40 text-neutral-300 text-ui-sm font-semibold px-1.5 py-0.5 rounded-full normal-case tracking-normal">
           {totalRowCount}
         </span>
       </h2>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {data.coverage_summary && (
           <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-neutral-800/50">
             <span className="text-ui-md text-neutral-400 flex-1 min-w-0">
@@ -245,7 +245,7 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
               className={`min-h-[44px] min-w-[44px] px-3 text-ui-sm font-medium rounded transition-colors ${
                 showUntestedOnly
                   ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                  : 'bg-neutral-800/50 text-neutral-400 border border-neutral-700/50 hover:text-neutral-200'
+                  : 'bg-workbench-panel/50 text-neutral-400 border border-neutral-700/50 hover:text-neutral-200'
               }`}
               aria-label="Toggle untested-only filter"
             >
@@ -269,7 +269,7 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
           {visibleOptOutRows.map((row) => renderMobileDebtRow(row))}
           {visibleUntestedRows.length > 0 && (
             <>
-              <div className="px-3 py-1.5 text-ui-sm uppercase tracking-wider text-neutral-500 bg-neutral-900/40 border-t border-neutral-800/50">
+              <div className="px-3 py-1.5 text-ui-sm uppercase tracking-wider text-neutral-500 bg-workbench-base/40 border-t border-neutral-800/50">
                 Untested (no viewport test)
               </div>
               {visibleUntestedRows.map((row) => renderMobileDebtRow(row))}
@@ -300,7 +300,7 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
                 <tr className="border-t border-neutral-800/50">
                   <td
                     colSpan={9}
-                    className="px-3 py-1.5 text-ui-sm uppercase tracking-wider text-neutral-500 bg-neutral-900/40"
+                    className="px-3 py-1.5 text-ui-sm uppercase tracking-wider text-neutral-500 bg-workbench-base/40"
                   >
                     Untested (no viewport test)
                   </td>

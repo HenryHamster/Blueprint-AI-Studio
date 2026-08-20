@@ -11,6 +11,7 @@ import re
 import tempfile
 import warnings
 from pathlib import Path
+from testing.fixgate_attribution import format_offender_marker
 
 BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
@@ -55,7 +56,7 @@ def test_durations_values_are_numeric() -> None:
     bad = {k: v for k, v in data.items() if not isinstance(v, (int, float))}
     assert not bad, (
         f"backend/.test_durations has {len(bad)} non-numeric value(s). "
-        f"First offenders: {dict(list(bad.items())[:5])}"
+        f"First offenders: {dict(list(bad.items())[:5])}" + "\n" + format_offender_marker(str(offender) for offender in bad)
     )
 
 
@@ -66,7 +67,7 @@ def test_durations_key_format() -> None:
     assert not bad, (
         f"backend/.test_durations has {len(bad)} key(s) with unexpected format. "
         f"Expected 'testing/test_<name>.py::<node_id>'. "
-        f"First offenders: {bad[:5]}"
+        f"First offenders: {bad[:5]}" + "\n" + format_offender_marker(str(offender) for offender in bad)
     )
 
 
@@ -143,6 +144,8 @@ def test_durations_coverage_fraction_within_threshold() -> None:
         f"({len(covered)}/{len(all_test_files)}), below the {MIN_COVERAGE_FRACTION:.0%} threshold. "
         f"Regenerate via scripts/store-backend-durations.sh. "
         f"Uncovered files ({len(uncovered)}): {uncovered[:10]}"
+        + "\n"
+        + format_offender_marker(uncovered)
     )
 
 
@@ -160,6 +163,10 @@ _DEGENERATE_WARN_THRESHOLD = 5
 # can produce 400-600s entries. 60s is well above any legitimate single-test cost in
 # this suite (next-longest real test is ~27s) and well below the fixture-attribution range.
 _IMPLAUSIBLE_OUTLIER_CAP = 60.0
+_IN_BAND_SETUP_MIN = 15.0
+_IN_BAND_SETUP_MAX = 21.1
+_IN_BAND_SETUP_MIN_COUNT = 100
+_IN_BAND_SETUP_GAP_MAX = 27.5
 
 
 def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
@@ -268,7 +275,7 @@ def test_durations_no_implausible_outliers() -> None:
 
     When pytest-split runs tests in batches with Docker+Postgres, Postgres cold-start
     time (~400-600s) is charged to the first test in the batch.  These outlier values
-    corrupt shard balancing: the affected test looks 30-100× more expensive than it is,
+    corrupt shard balancing: the affected test looks 30-100x more expensive than it is,
     causing CI to under-fill the shard that contains it.
 
     Any duration above _IMPLAUSIBLE_OUTLIER_CAP (60s) is a misattribution artifact.
@@ -286,7 +293,35 @@ def test_durations_no_implausible_outliers() -> None:
         f"to the first test in a batch rather than real test cost.\n"
         f"Offending entries: {dict(list(outliers.items())[:5])}\n"
         f"Fix: strip entries > {_IMPLAUSIBLE_OUTLIER_CAP}s then recommit, or regenerate "
-        f"via scripts/batch-store-durations.sh (which caps automatically)."
+        f"via scripts/batch-store-durations.sh (which caps automatically)." + "\n" + format_offender_marker(str(offender) for offender in outliers)
+    )
+
+
+def test_durations_no_in_band_setup_attribution() -> None:
+    """Reject the measured 15-21s setup-cost plateau before it skews shards.
+
+    The plateau is distinct from a single extreme outlier: it is a dense band
+    followed by a diagnostic gap, so every affected test can look plausible in
+    isolation while collectively taking most of the shard weight.
+    """
+    data = _load_durations()
+    band = {
+        key
+        for key, value in data.items()
+        if _IN_BAND_SETUP_MIN <= value < _IN_BAND_SETUP_MAX
+    }
+    if len(band) < _IN_BAND_SETUP_MIN_COUNT:
+        return
+    has_following_observation = any(
+        _IN_BAND_SETUP_MAX <= value <= _IN_BAND_SETUP_GAP_MAX
+        for value in data.values()
+    )
+    assert has_following_observation, (
+        f"backend/.test_durations contains {len(band)} entries in the "
+        f"{_IN_BAND_SETUP_MIN:g}-{_IN_BAND_SETUP_MAX:g}s setup-attribution band "
+        f"with no observations through {_IN_BAND_SETUP_GAP_MAX:g}s. "
+        "Strip these entries and regenerate via scripts/batch-store-durations.sh."
+        + "\n" + format_offender_marker(sorted(band))
     )
 
 
@@ -375,7 +410,7 @@ def test_durations_no_stale_entries() -> None:
         f"Stale entries ({min(len(stale), 10)} of {len(stale)} shown): "
         f"{stale[:10]}\n"
         f"Fix: remove these entries from backend/.test_durations, or regenerate "
-        f"via scripts/store-backend-durations.sh."
+        f"via scripts/store-backend-durations.sh." + "\n" + format_offender_marker(str(offender) for offender in stale)
     )
 
 
@@ -386,11 +421,9 @@ def test_durations_no_stale_entries() -> None:
 
 def _write_tmp_py(content: str) -> Path:
     """Write Python source to a temporary file and return its Path."""
-    tf = tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False)
-    tf.write(content)
-    tf.flush()
-    tf.close()
-    return Path(tf.name)
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tf:
+        tf.write(content)
+        return Path(tf.name)
 
 
 def test_extract_valid_test_ids_top_level_sync_functions() -> None:
@@ -582,3 +615,93 @@ def test_staleness_detection_split_file_stale_in_original() -> None:
 
     assert "test_moved_to_new_file" not in valid_ids
     assert "test_remaining" in valid_ids
+
+
+def test_in_band_setup_thresholds_match_durations_quality() -> None:
+    """
+    _IN_BAND_SETUP_MIN/MAX/MIN_COUNT/GAP_MAX here must match the authoritative
+    definitions in scripts/durations_quality.py.  Same standalone cross-check
+    rationale as test_outlier_cap_matches_durations_quality: this guard runs
+    under --noconftest where scripts/ is not importable, so drift between the
+    two files would otherwise go undetected.
+
+    If this test fails, update the local literals above to match
+    scripts/durations_quality.py.
+    """
+    quality_path = _resolve_quality_path()
+    assert quality_path is not None, (
+        "Cannot locate scripts/durations_quality.py. "
+        "Tried: "
+        + str(BACKEND_ROOT.parent / "scripts" / "durations_quality.py")
+        + " (local) and /repo/scripts/durations_quality.py (Docker mount)."
+    )
+
+    names = {
+        "IN_BAND_SETUP_MIN": _IN_BAND_SETUP_MIN,
+        "IN_BAND_SETUP_MAX": _IN_BAND_SETUP_MAX,
+        "IN_BAND_SETUP_MIN_COUNT": _IN_BAND_SETUP_MIN_COUNT,
+        "IN_BAND_SETUP_GAP_MAX": _IN_BAND_SETUP_GAP_MAX,
+    }
+    tree = ast.parse(quality_path.read_text())
+    canonical = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in names
+            and isinstance(node.value, ast.Constant)
+        ):
+            canonical[node.targets[0].id] = node.value.value
+
+    missing = names.keys() - canonical.keys()
+    assert not missing, (
+        f"scripts/durations_quality.py is missing assignment(s) for: {sorted(missing)}"
+        + "\n" + format_offender_marker(sorted(missing))
+    )
+    for name, local_value in names.items():
+        assert canonical[name] == local_value, (
+            f"In-band setup threshold mismatch: scripts/durations_quality.py "
+            f"defines {name} = {canonical[name]}, but this guard uses "
+            f"_{name} = {local_value}. Update the local literal to match."
+            + "\n" + format_offender_marker([name])
+        )
+
+
+def test_in_band_setup_gap_max_is_derived_from_observed_data() -> None:
+    """
+    _IN_BAND_SETUP_GAP_MAX must bound the real gap boundary observed in
+    backend/.test_durations, not just a hand-snapshotted number.
+
+    Loads scripts/durations_quality.py::derive_in_band_setup_gap_max (via
+    importlib, same pattern test_shard_balance.py uses for
+    impute_missing_mean) and computes the smallest duration actually observed
+    at or above IN_BAND_SETUP_MAX in the committed data. The pinned
+    _IN_BAND_SETUP_GAP_MAX must be >= that derived value, so regenerating
+    backend/.test_durations with a real "next observation" surfaces a failing
+    assertion here instead of silently requiring a hand-edited constant.
+    """
+    quality_path = _resolve_quality_path()
+    assert quality_path is not None, (
+        "Cannot locate scripts/durations_quality.py. "
+        "Tried: "
+        + str(BACKEND_ROOT.parent / "scripts" / "durations_quality.py")
+        + " (local) and /repo/scripts/durations_quality.py (Docker mount)."
+    )
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("durations_quality", quality_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    data = _load_durations()
+    derived_gap_max = module.derive_in_band_setup_gap_max(data)
+
+    assert derived_gap_max <= _IN_BAND_SETUP_GAP_MAX, (
+        f"_IN_BAND_SETUP_GAP_MAX ({_IN_BAND_SETUP_GAP_MAX}) is smaller than the "
+        f"real gap boundary derived from backend/.test_durations "
+        f"({derived_gap_max}) — the pinned literal has drifted below the data "
+        f"it is meant to bound. Update _IN_BAND_SETUP_GAP_MAX (and "
+        f"IN_BAND_SETUP_GAP_MAX in scripts/durations_quality.py) to match."
+    )

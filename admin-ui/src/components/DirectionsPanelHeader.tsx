@@ -50,7 +50,7 @@ export function DirectionsPanelHeader({
       case 'oversized':
         return 'bg-red-950/60 text-red-400 border-red-900/50';
       default:
-        return 'bg-neutral-950/60 text-neutral-400 border-neutral-900/50';
+        return 'bg-workbench-shell/60 text-neutral-400 border-neutral-900/50';
     }
   };
   if (!showTitle && !showCycleControls && !showTabs) return null;
@@ -97,7 +97,7 @@ export function DirectionsPanelHeader({
             type="button"
             onClick={() => triggerCycle('full')}
             title="Run full cycle (Phase 1 then chains to Phase 2)"
-            className="inline-flex items-center gap-1 text-xs px-2 py-1.5 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800/60 transition-colors min-h-[44px] md:min-h-auto"
+            className="inline-flex items-center gap-1 text-xs px-2 py-1.5 rounded border border-neutral-700 text-neutral-300 hover:bg-workbench-hover/60 transition-colors min-h-[44px] md:min-h-auto"
           >
             <Zap className="w-3 h-3" /> Full cycle
           </button>

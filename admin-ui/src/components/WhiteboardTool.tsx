@@ -957,7 +957,7 @@ export default function WhiteboardTool({ projectId, tool, readOnly }: ToolCompon
             role="radio"
             aria-checked={mode === 'select'}
             onClick={() => setMode('select')}
-            className={`min-h-[44px] rounded px-2 py-1 text-xs transition-colors ${mode === 'select' ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200'}`}
+            className={`min-h-[44px] rounded px-2 py-1 text-xs transition-colors ${mode === 'select' ? 'bg-workbench-layer text-neutral-100' : 'text-neutral-400 hover:text-neutral-200'}`}
           >
             Select
           </button>
@@ -966,13 +966,13 @@ export default function WhiteboardTool({ projectId, tool, readOnly }: ToolCompon
             role="radio"
             aria-checked={mode === 'draw'}
             onClick={() => setMode('draw')}
-            className={`min-h-[44px] rounded px-2 py-1 text-xs transition-colors ${mode === 'draw' ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200'}`}
+            className={`min-h-[44px] rounded px-2 py-1 text-xs transition-colors ${mode === 'draw' ? 'bg-workbench-layer text-neutral-100' : 'text-neutral-400 hover:text-neutral-200'}`}
           >
             Draw
           </button>
         </div>
 
-        <span className="mx-0.5 h-5 w-px bg-neutral-700" aria-hidden="true" />
+        <span className="mx-0.5 h-5 w-px bg-workbench-layer" aria-hidden="true" />
 
         {/* Color palette (draw) */}
         <div className="flex items-center gap-0.5" role="radiogroup" aria-label="Stroke color">
@@ -1003,7 +1003,7 @@ export default function WhiteboardTool({ projectId, tool, readOnly }: ToolCompon
               role="radio"
               onClick={() => setLineWidth(w)}
               className={`flex h-7 w-7 items-center justify-center rounded border transition-colors ${
-                w === lineWidth ? 'border-white bg-neutral-700' : 'border-neutral-600 hover:border-neutral-400'
+                w === lineWidth ? 'border-white bg-workbench-layer' : 'border-neutral-600 hover:border-neutral-400'
               }`}
             >
               <span
@@ -1014,7 +1014,7 @@ export default function WhiteboardTool({ projectId, tool, readOnly }: ToolCompon
           ))}
         </div>
 
-        <span className="mx-0.5 h-5 w-px bg-neutral-700" aria-hidden="true" />
+        <span className="mx-0.5 h-5 w-px bg-workbench-layer" aria-hidden="true" />
 
         {/* Insert actions */}
         <button
@@ -1039,7 +1039,7 @@ export default function WhiteboardTool({ projectId, tool, readOnly }: ToolCompon
           + Document
         </button>
 
-        <span className="mx-0.5 h-5 w-px bg-neutral-700" aria-hidden="true" />
+        <span className="mx-0.5 h-5 w-px bg-workbench-layer" aria-hidden="true" />
 
         {/* Zoom controls */}
         <div className="flex items-center gap-0.5" aria-label="Zoom controls">
@@ -1069,7 +1069,7 @@ export default function WhiteboardTool({ projectId, tool, readOnly }: ToolCompon
           </button>
         </div>
 
-        <span className="mx-0.5 h-5 w-px bg-neutral-700" aria-hidden="true" />
+        <span className="mx-0.5 h-5 w-px bg-workbench-layer" aria-hidden="true" />
 
         {/* Clear */}
         <button
@@ -1274,7 +1274,7 @@ function CanvasNodeView({
     <div
       className={`pointer-events-auto absolute flex flex-col overflow-hidden rounded border ${
         selected ? 'border-indigo-400 ring-1 ring-indigo-400/50' : 'border-neutral-600'
-      } bg-neutral-900/90 shadow-lg`}
+      } bg-workbench-base/90 shadow-lg`}
       style={{ left: node.x, top: node.y, width: node.w, height: node.h }}
       onPointerDown={e => {
         // Interacting with a node must never start a surface pan or clear the
@@ -1291,7 +1291,7 @@ function CanvasNodeView({
       {/* Drag handle / header */}
       <div
         data-node-handle="body"
-        className={`flex items-center justify-between gap-1 border-b border-neutral-700 bg-neutral-800/80 px-1.5 py-0.5 text-ui-sm uppercase tracking-wide text-neutral-400 ${
+        className={`flex items-center justify-between gap-1 border-b border-neutral-700 bg-workbench-panel/80 px-1.5 py-0.5 text-ui-sm uppercase tracking-wide text-neutral-400 ${
           interactive ? 'cursor-move' : ''
         }`}
       >

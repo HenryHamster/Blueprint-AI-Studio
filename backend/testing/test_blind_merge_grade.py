@@ -221,6 +221,9 @@ async def _seed_for_finalize(
         merge_grade_task_id = str(mg_task.id)
 
     version.goal = goal
+    _live_rubric_snapshot, _live_rubric_lifecycle = (
+        await rq._snapshot_qualification_rubric(db_session, version)
+    )
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _candidate_sha,
@@ -231,9 +234,13 @@ async def _seed_for_finalize(
         "smoketest_task_id": str(smoke_task.id),
         "challenge_task_id": None,
         "merge_grade_task_id": merge_grade_task_id,
-        # Empty rubric snapshot so _resolve_launched_rubric succeeds in tests
-        # that don't seed a merge_grade task payload with categories.
-        "rubric_snapshot": [],
+        # Mirror the version's CURRENT active rubric — open_version seeds a
+        # default operator-authorship criterion, so a hardcoded empty snapshot
+        # would make _finalize_qualification short-circuit at the bounded
+        # rubric-drift guard before the merge-grade behavior under test runs.
+        "rubric_snapshot": _live_rubric_snapshot,
+        "rubric_fingerprint": rq._rubric_fingerprint(_live_rubric_snapshot),
+        "rubric_lifecycle_snapshot": _live_rubric_lifecycle,
     }
     db_session.add(version)
     await db_session.commit()

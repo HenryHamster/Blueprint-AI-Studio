@@ -57,7 +57,7 @@ function SerialLogBlock({ log, taskId, vmInstanceId }: { log: string | null; tas
         <span className="text-neutral-400 font-medium">Serial console</span>
         {displayLog && <span className="text-neutral-600">{byteCount.toLocaleString()} B</span>}
         {liveResult && (
-          <span className={`px-1.5 py-0.5 rounded text-ui-sm font-semibold ${liveResult.source === 'live' ? 'bg-emerald-900/40 text-emerald-400' : 'bg-neutral-800 text-neutral-400'}`}>
+          <span className={`px-1.5 py-0.5 rounded text-ui-sm font-semibold ${liveResult.source === 'live' ? 'bg-emerald-900/40 text-emerald-400' : 'bg-workbench-panel text-neutral-400'}`}>
             {liveResult.source}
           </span>
         )}
@@ -88,7 +88,7 @@ function SerialLogBlock({ log, taskId, vmInstanceId }: { log: string | null; tas
       </div>
       {fetchError && <p className="text-red-400 mb-1">{fetchError}</p>}
       {displayLog ? (
-        <pre className="text-neutral-300 whitespace-pre-wrap break-words bg-neutral-950/60 rounded p-2 max-h-48 overflow-y-auto custom-scrollbar font-mono border border-neutral-800">{displayLog}</pre>
+        <pre className="text-neutral-300 whitespace-pre-wrap break-words bg-workbench-shell/60 rounded p-2 max-h-48 overflow-y-auto custom-scrollbar font-mono border border-neutral-800">{displayLog}</pre>
       ) : (
         <p className="text-neutral-600 italic">No serial log captured</p>
       )}
@@ -110,7 +110,7 @@ export function TaskErrorLogsPanel({ errorLogs }: { errorLogs: string }) {
       {/* eslint-disable-next-line viewport/min-touch-target -- dense drawer content */}
       <button
         onClick={handleCopy}
-        className="absolute top-3 right-3 z-10 p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-900/80 hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400"
+        className="absolute top-3 right-3 z-10 p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity bg-workbench-base/80 hover:bg-workbench-hover text-neutral-400 hover:text-emerald-400"
         title="Copy full error logs"
       >
         {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
@@ -193,7 +193,7 @@ export function TaskDiagnosticsPanel({ task }: { task: Task }) {
   const c = ctx ?? {};
 
   return (
-    <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 mb-2">
+    <div className="bg-workbench-base/50 rounded-lg border border-neutral-800 mb-2">
       {/* reason: collapsible section header; text-xs py-2 single-row height matches drawer density convention */}
       <button
         data-viewport-allow-small-target
@@ -214,7 +214,7 @@ export function TaskDiagnosticsPanel({ task }: { task: Task }) {
           {task.status_log && task.status_log.length > 0 && (
             <div className="text-xs">
               <p className="text-neutral-400 font-medium mb-1.5">Recent status log</p>
-              <div className="space-y-0.5 max-h-32 overflow-y-auto custom-scrollbar bg-neutral-950/60 rounded p-2 border border-neutral-800">
+              <div className="space-y-0.5 max-h-32 overflow-y-auto custom-scrollbar bg-workbench-shell/60 rounded p-2 border border-neutral-800">
                 {task.status_log.slice(-20).reverse().map((entry, i) => (
                   <div key={i} className="flex items-start gap-2 font-mono">
                     <span className="text-neutral-600 shrink-0">{String(entry.t).slice(11, 19)}</span>
@@ -228,7 +228,7 @@ export function TaskDiagnosticsPanel({ task }: { task: Task }) {
           {toolTrace && toolTrace.length > 0 && (
             <div className="text-xs">
               <p className="text-neutral-400 font-medium mb-1.5">Tool trace (last {Math.min(toolTrace.length, 30)} of {toolTrace.length})</p>
-              <div className="bg-neutral-950/60 rounded p-2 max-h-40 overflow-y-auto custom-scrollbar border border-neutral-800">
+              <div className="bg-workbench-shell/60 rounded p-2 max-h-40 overflow-y-auto custom-scrollbar border border-neutral-800">
                 <ToolTraceTail entries={toolTrace} />
               </div>
             </div>

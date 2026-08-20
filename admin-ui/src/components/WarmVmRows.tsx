@@ -214,7 +214,7 @@ export function WarmPoolScopeRow({ projects, allowlist, busy, onEnable, onDisabl
           onChange={(e) => setSelected(e.target.value)}
           disabled={busy || candidates.length === 0}
           data-testid="warm-pool-scope-select"
-          className="bg-neutral-800 border border-neutral-700 rounded px-1.5 py-0.5 text-ui-sm text-neutral-200 max-w-[180px] disabled:opacity-50"
+          className="bg-workbench-panel border border-neutral-700 rounded px-1.5 py-0.5 text-ui-sm text-neutral-200 max-w-[180px] disabled:opacity-50"
         >
           <option value="">{candidates.length === 0 ? 'all projects scoped' : 'Select project…'}</option>
           {candidates.map((p) => (
@@ -252,7 +252,7 @@ export function WarmPoolScopeRow({ projects, allowlist, busy, onEnable, onDisabl
                 disabled={busy}
                 data-testid={`warm-pool-disable-${id}`}
                 className={
-                  'bg-neutral-700/40 border border-neutral-600/40 text-neutral-300 hover:bg-neutral-700/60' +
+                  'bg-workbench-layer/40 border border-neutral-600/40 text-neutral-300 hover:bg-workbench-hover/60' +
                   ' text-ui-sm font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
                   (busy ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer')
                 }
@@ -445,7 +445,7 @@ export function ChainFunnelRow({ funnel }: { funnel: ChainContinuityFunnelSnapsh
 
 export function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: string) => void }) {
   const hbAge = ageSecs(vm.last_heartbeat);
-  const aliveDot = vm.is_alive ? 'bg-emerald-400' : 'bg-neutral-600';
+  const aliveDot = vm.is_alive ? 'bg-emerald-400' : 'bg-workbench-card';
   const cur = vm.current_task;
 
   return (
@@ -519,7 +519,7 @@ export function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId
 
 export function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: string) => void }) {
   const hbAge = ageSecs(vm.last_heartbeat);
-  const aliveDot = vm.is_alive ? 'bg-emerald-400' : 'bg-neutral-600';
+  const aliveDot = vm.is_alive ? 'bg-emerald-400' : 'bg-workbench-card';
   const cur = vm.current_task;
 
   return (

@@ -3151,7 +3151,7 @@ async def test_finalize_new_candidate_sha_writes_new_dimension_rows(
     sha_2 = "b" * 40
     version.last_qualification = {
         "status": "pending",
-        **_EMPTY_RUBRIC_PROJECTION,
+        **(await _live_rubric_projection(db_session, version)),
         "candidate_sha": sha_2,
         "ci_green": True,
         "smoketest_enabled": True,

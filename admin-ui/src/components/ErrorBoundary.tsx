@@ -43,8 +43,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
     if (level === 'app') {
       return (
-        <div data-error-boundary-fallback className="min-h-screen bg-neutral-950 flex items-center justify-center p-8">
-          <div className="max-w-md w-full bg-neutral-900 border border-red-900/50 rounded-lg p-6 text-center">
+        <div data-error-boundary-fallback className="min-h-screen bg-workbench-shell flex items-center justify-center p-8">
+          <div className="max-w-md w-full bg-workbench-base border border-red-900/50 rounded-lg p-6 text-center">
             <AlertTriangle className="w-12 h-12 text-red-400 mx-auto mb-4" />
             <h1 className="text-xl font-semibold text-neutral-200 mb-2">Something went wrong</h1>
             <p className="text-sm text-neutral-400 mb-4">{this.state.error.message}</p>

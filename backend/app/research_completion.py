@@ -102,8 +102,10 @@ from app.research_finding_challenge_history import (
     consume_finding_challenge_record as _consume_finding_challenge_record,
 )
 from app.research_sibling_dependencies import (  # noqa: F401 — re-exported private helpers
+    DUPLICATE_FINDING_DROP_KEY as _DUPLICATE_FINDING_DROP_KEY,
     _wire_research_sibling_edges,
     converge_spawn_batch_foundations,
+    drop_replay_duplicate_children,
 )
 from app.models import (
     TASK_ORIGINATION_PLAN,
@@ -306,6 +308,10 @@ _SCOPE_AWARE_EFFORT_TYPES = frozenset(
 # PR is confirmed as squash-landed (commit message reference found), skip
 # re-checking on subsequent cycles — the landing is permanent.
 _SQUASH_LANDED_CONFIRMED_PARENT_IDS: set[str] = set()
+
+# Bounded skip-receipt ledger on the parent context: one entry per duplicate
+# finding child dropped at spawn (batch convergence or replay boundary).
+_DUPLICATE_FINDING_SKIP_LIMIT = 20
 
 # Max memo tasks spawned per research cycle for dropped findings. Independent
 # of the implementation-task spawn cap (_DEGRADED_SPAWN_CAP / batch cap): memos
@@ -3390,6 +3396,10 @@ async def _handle_research_completion(
                     Task.project_id == task.project_id,
                     Task.created_at >= ninety_days_ago,
                 )
+                # Newest-first: without an order_by the 500-row cap truncates
+                # ARBITRARY rows on busy projects, silently dropping the newest
+                # tasks — the exact ones a replay must dedup against.
+                .order_by(Task.created_at.desc())
                 .limit(500)
             )
         )
@@ -5410,6 +5420,11 @@ async def _handle_research_completion(
             payloads=[finding_payload],
             previous_error_fingerprint=_prev_fp_col,
             criterion_ids=_spawn_criterion_ids,
+            # Parent-scoped finding claim: the ux_task_active_idempotency_key
+            # partial-unique index makes a concurrent same-parent duplicate for
+            # this finding physically impossible while a sibling is active;
+            # commit_or_handle_duplicate_research_spawn absorbs the collision.
+            idempotency_key=f"research-finding:{task.project_id}:{task.id}:{fhash}",
             context={
                 "research_task_id": str(task.id),
                 "parent_research_task_id": str(task.id),
@@ -6800,7 +6815,44 @@ async def _handle_research_completion(
     # reaper's Step 15 sweep converges them after the fact. See
     # converge_spawn_batch_foundations — it reuses the SAME predicate and the SAME
     # apply-with-guards helper as the reaper sweep, so the two paths can never drift.
+    # Identical-finding_hash dependents are DROPPED from the batch there (same
+    # finding = duplicate, not foundation); publish a skip receipt for each drop —
+    # a silent drop is as bad as a duplicate.
+    _pre_converge_children = list(child_tasks)
     converge_spawn_batch_foundations(child_tasks, existing_tasks)
+    _converge_dropped = [
+        row
+        for row in _pre_converge_children
+        if str(row.id) not in {str(child.id) for child in child_tasks}
+    ]
+    if _converge_dropped:
+        _impl_spawned = max(0, _impl_spawned - len(_converge_dropped))
+        _dup_skips = list(
+            _local_parent_context.get("research_duplicate_finding_skips") or []
+        )
+        for _dropped_child in _converge_dropped:
+            _drop_marker = (_dropped_child.context or {}).get(
+                _DUPLICATE_FINDING_DROP_KEY
+            ) or {}
+            _dup_skips.append(
+                {
+                    "finding_hash": (_dropped_child.context or {}).get(
+                        "finding_hash"
+                    ),
+                    "surviving_task_id": _drop_marker.get("surviving_task_id"),
+                    "stage": "spawn_batch_convergence",
+                    "at": _utcnow().isoformat(),
+                }
+            )
+        _local_parent_context["research_duplicate_finding_skips"] = _dup_skips[
+            -_DUPLICATE_FINDING_SKIP_LIMIT:
+        ]
+        _local_parent_message = (
+            f"{(_local_parent_message or '').rstrip()} Skipped "
+            f"{len(_converge_dropped)} duplicate finding child(ren) already "
+            "covered by an identical existing task."
+        ).strip()
+    _duplicate_sibling_skips = len(_converge_dropped)
 
     # Challenge verdicts are consumed inside the spawn loop, after the branch
     # snapshot above. Reconcile those direct Task-context mutations so the stale
@@ -6843,6 +6895,20 @@ async def _handle_research_completion(
         _prior_delivery_children,
         salvaged_at=_utcnow().isoformat(),
     )
+
+    # Same-parent sibling dedup under the held lock — see
+    # drop_replay_duplicate_children for the replay-duplicate semantics and
+    # the skip-receipt contract.
+    child_tasks, _boundary_drop_count = drop_replay_duplicate_children(
+        task,
+        child_tasks,
+        _auxiliary_tasks,
+        _prior_delivery_children,
+        skip_limit=_DUPLICATE_FINDING_SKIP_LIMIT,
+    )
+    if _boundary_drop_count:
+        _impl_spawned = max(0, _impl_spawned - _boundary_drop_count)
+        _duplicate_sibling_skips += _boundary_drop_count
 
     # Publish the fully-wired batch and parent EVALUATING flip atomically.
     for _new_task in (*child_tasks, *_auxiliary_tasks):
@@ -6946,6 +7012,7 @@ async def _handle_research_completion(
         low_actionability_deferred=_low_actionability_deferred,
         degradation_gate_deferred=_degradation_gate_deferred,
         batch_cap_deferred=_batch_cap_deferred,
+        duplicate_sibling_skips=_duplicate_sibling_skips,
     )
 
     # Assemble the candidate set now, but do NOT snapshot child status yet.

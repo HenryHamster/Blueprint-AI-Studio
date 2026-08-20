@@ -914,7 +914,7 @@ _DEFAULT_CHECK = _BLUEPRINT_ROOT / "scripts" / "check-default.sh"
 
 def _render_backend_verification_fragment() -> str:
     """Render the backend verification fragment for the tracked developer gate."""
-    return (
+    rendered = (
         _BACKEND_VERIFICATION_FRAGMENT.read_text(encoding="utf-8")
         .replace("@TASK_ID@", "6867e9ef-f0d6-41cb-8b9d-1be50b02c806")
         .replace("@DIR@", "backend")
@@ -925,6 +925,19 @@ def _render_backend_verification_fragment() -> str:
         .replace("@BASE@", "$BASE")
         .rstrip("\n")
     )
+    # The tracked developer gate lives beside scripts/verification_receipt.py,
+    # so it invokes the CLI unconditionally and keeps no inline fallback copy;
+    # the readability-guarded inline writer exists only for foreign workspaces
+    # the fragment is emitted into (both halves pinned by
+    # scripts/test_verification_receipt.py::test_the_backend_lane_cli_is_what_the_gates_invoke).
+    start = rendered.index("          # Prefer the Blueprint-repo-local writer")
+    tail_marker = '          if [ "$_verification_receipt_written" = "1" ]; then\n'
+    end = rendered.index(tail_marker, start) + len(tail_marker)
+    invocation = re.search(
+        r"python3 scripts/verification_receipt\.py backend-pytest[^\n]*?(?=; then)",
+        rendered[start:end],
+    ).group(0)
+    return rendered[:start] + f"          if {invocation}; then\n" + rendered[end:]
 
 
 def _read_packer_hcl() -> str:
@@ -2145,7 +2158,10 @@ class TestProjectVerificationRuntimeContract:
                 "PostgreSQL runtime unavailable",
                 "no impacted pytest file/node",
                 "_VERIFY_RECEIPT",
-                "postgres_sidecar",
+                # The postgres-sidecar receipt itself: both scripts must merge
+                # it through the shared writer (whose own source carries the
+                # "postgres_sidecar" key, asserted in contract_sources below).
+                "python3 scripts/verification_receipt.py backend-pytest",
             ):
                 assert required in script, f"{label} missing fail-closed token {required}"
             for forbidden in ("--standalone --no-postgres", "GATE-ENVIRONMENT"):
@@ -2157,7 +2173,17 @@ class TestProjectVerificationRuntimeContract:
         helper = (_BLUEPRINT_ROOT / "scripts" / "backend-test-route.sh").read_text(
             encoding="utf-8"
         )
-        contract_sources = (rendered_fragment, tracked, helper)
+        # The receipt writer is a real, lintable, directly tested helper the
+        # fragment invokes -- not another multi-line heredoc inside generated
+        # shell -- so the receipt half of the contract lives in its source.
+        receipt_writer = (_BLUEPRINT_ROOT / "scripts" / "verification_receipt.py").read_text(
+            encoding="utf-8"
+        )
+        contract_sources = (rendered_fragment, tracked, helper, receipt_writer)
+        for source in (rendered_fragment, tracked):
+            assert (
+                "python3 scripts/verification_receipt.py backend-pytest" in source
+            ), "backend lane must merge its receipt through the shared writer"
         for required in (
             "python3 -m ruff check --select E,F,W --ignore E501",
             "USE_TEST_POSTGRES=true bash",

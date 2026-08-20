@@ -11,6 +11,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 import app.size_limit_policy as slp
 from app.size_limit_policy import bump_size_limit
 from testing import check_size_limits as csl
@@ -28,10 +30,10 @@ def _write_lines(path: str, n: int) -> None:
         f.write("\n")
 
 
-def _build_repo(tmp_path, *, backend=None, agent=None, frontend=None):
+def _build_repo(tmp_path, *, backend=None, agent=None, frontend=None, scripts=None):
     """Create a fake repo tree + a module_size_limits.json.
 
-    Each of backend/agent/frontend is a dict ``{rel_path: (line_count, cap)}``.
+    Each of backend/agent/frontend/scripts is a dict ``{rel_path: (line_count, cap)}``.
     If a section is None its source tree is NOT created (to exercise skips), but
     the JSON still lists it. Returns (repo_root, json_path).
     """
@@ -42,11 +44,13 @@ def _build_repo(tmp_path, *, backend=None, agent=None, frontend=None):
         "backend": repo / "backend" / "app",
         "agent": repo / "agent" / "src",
         "frontend": repo / "admin-ui" / "src",
+        "scripts": repo / "scripts",
     }
     for section, spec in (
         ("backend", backend),
         ("agent", agent),
         ("frontend", frontend),
+        ("scripts", scripts),
     ):
         limits[section] = {}
         if spec is None:
@@ -152,6 +156,47 @@ def test_absent_tree_section_skipped_not_errored(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "[skip] agent" in out
     assert "[skip] frontend" in out
+
+
+def test_scripts_section_resolves_root_and_scans_py_files(tmp_path):
+    # scripts/ mirrors backend/agent/frontend/testing: resolve_section_root
+    # resolves it to <repo>/scripts, and a breach in a .py file under it is
+    # detected exactly like any other governed section.
+    repo, jp = _build_repo(
+        tmp_path,
+        backend={"ok.py": (50, 100)},
+        scripts={"big.py": (120, 100), "ok.py": (50, 100)},
+    )
+    assert csl.resolve_section_root("scripts", repo) == os.path.join(repo, "scripts")
+    assert csl._SECTION_SCAN["scripts"] == ((".py",), csl._no_exclusion)
+    assert _run(jp, repo, "--sections", "scripts") == 1
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_scripts_section_scoping_isolated_from_other_sections(tmp_path):
+    # A breach confined to scripts/ must not leak into backend's result, and
+    # scoping to backend must not hide the scripts breach.
+    repo, jp = _build_repo(
+        tmp_path,
+        backend={"ok.py": (50, 100)},
+        scripts={"big.py": (200, 100)},
+    )
+    assert _run(jp, repo, "--sections", "backend") == 0
+    assert _run(jp, repo, "--sections", "scripts") == 1
+
+
+def test_scripts_fix_adds_cap_for_uncapped_file_at_policy_value(tmp_path):
+    # --fix on scripts/ adds a new cap for an oversized, uncapped .py file at
+    # the same canonical policy headroom used for backend/agent/frontend.
+    repo, jp = _build_repo(tmp_path, scripts={"ok.py": (50, 100)})
+    _write_lines(str(tmp_path / "repo" / "scripts" / "huge.py"), 1600)
+
+    assert _run(jp, repo, "--fix", "--sections", "scripts") == 0
+
+    data = json.loads(_read(jp))
+    assert data["scripts"]["huge.py"] == csl.recommended_cap_for_line_count(1600)
+    assert data["scripts"]["ok.py"] == 100
+    assert _run(jp, repo, "--sections", "scripts") == 0
 
 
 def test_default_sections_check_all(tmp_path):
@@ -684,8 +729,9 @@ def test_fix_chronic_git_read_failure_refuses_bump(tmp_path, capsys, mocker):
     )
 
 
-def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker):
+def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker, monkeypatch):
     """--force-chronic grants operator-approved bump even for chronic offenders."""
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, "henry")
     from datetime import datetime, timedelta, timezone
 
     from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
@@ -718,6 +764,45 @@ def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker):
     assert data["backend"]["chronic.py"] == bump_size_limit(1720)
     # Should label it as operator-approved, not a silent bump.
     assert "chronic" in out.lower()
+
+
+def test_force_chronic_without_operator_approval_env_is_refused(tmp_path, capsys, mocker):
+    """The chronic bypass must not be reachable from inside a task.
+
+    Before 2026-08-20 ``--force-chronic`` was self-service: an autonomous auto-fix
+    task ran it and raised ci_completion.py 3100 -> 3600 on its seventh bump
+    (PR #17587, reverted) -- exactly the move test_ci_compliance_gate.py pins as
+    forbidden. The approval now has to arrive from outside the process.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
+
+    repo, jp = _build_repo(tmp_path, backend={"chronic.py": (1720, 1600)})
+
+    def _rec(old, new, days_ago):
+        date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return BumpRecord(
+            commit_sha=f"sha{days_ago}", commit_date=date, old_cap=old, new_cap=new
+        )
+
+    history = [
+        _rec(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _rec(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _rec(1400, 1600, 30),
+    ]
+
+    with mocker.patch(
+        "app.size_limit_policy.parse_bump_history", return_value=history
+    ):
+        rc = _run(jp, repo, "--fix", "--force-chronic", "--sections", "backend")
+
+    err = capsys.readouterr().err
+    assert rc == 1, "an unapproved chronic bypass must fail closed"
+    assert csl._OPERATOR_APPROVAL_ENV in err, err
+    assert json.loads(_read(jp))["backend"]["chronic.py"] == 1600, (
+        "the cap must be left exactly as it was"
+    )
 
 
 def test_coverage_threshold_in_sync_with_test_invariants():
@@ -1556,3 +1641,151 @@ def test_fix_records_bump_then_check_accepts_raise(tmp_path, capsys, mocker):
     )
     mocker.patch("app.size_limit_policy._CAP_BUMP_HISTORY_LEDGER_PATH", ledger_path)
     assert _run(jp, repo, "--sections", "backend") == 0
+
+
+# ---------------------------------------------------------------------------
+# Governance-cap single-sourcing: resolve_effective_cap folds a source-declared
+# *_SIZE_GOVERNANCE_CAP into the breach test itself, instead of only being
+# read on the --fix auto-bump path. Regression coverage for the enforcement
+# gap: a file between its governance cap and a looser JSON cap, or a governed
+# file with no JSON entry at all, previously raised nothing.
+# ---------------------------------------------------------------------------
+
+
+def _write_governed_module(path: str, total_lines: int, governance_cap: int) -> None:
+    """Write a syntactically-valid Python module declaring a governance cap.
+
+    The first physical line is the ``_MODULE_SIZE_GOVERNANCE_CAP`` assignment
+    the AST-based discovery in ``app.size_limit_policy`` looks for; the rest
+    are padding comments so the file lands at exactly ``total_lines``.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [f"_MODULE_SIZE_GOVERNANCE_CAP: int = {governance_cap}\n"]
+    while len(lines) < total_lines:
+        lines.append(f"# pad {len(lines)}\n")
+    with open(path, "w") as f:
+        f.writelines(lines[:total_lines])
+
+
+def test_effective_cap_is_tighter_of_json_and_governance(tmp_path):
+    """A governed module whose JSON cap is LOOSER than its governance cap is
+    judged against the governance cap, not the JSON cap."""
+    repo, jp = _build_repo(tmp_path, backend={})
+    module_path = os.path.join(repo, "backend", "app", "governed_loose.py")
+    _write_governed_module(module_path, total_lines=120, governance_cap=100)
+    data = json.loads(_read(jp))
+    data["backend"]["governed_loose.py"] = 150  # looser than the governance cap
+    with open(jp, "w") as f:
+        json.dump(data, f)
+
+    rec = csl.classify_size_record(
+        "governed_loose.py", 120, 150, "backend", repo_root=repo
+    )
+    assert rec["effective_cap"] == 100
+    assert rec["cap"] == 150
+    assert rec["breach"] is True
+
+    # Same conclusion through the real checker path (evaluate -> main).
+    checked, _skipped = csl.evaluate(data, ["backend"], repo)
+    matches = [r for r in checked["backend"] if r["rel"] == "governed_loose.py"]
+    assert len(matches) == 1
+    assert matches[0]["breach"] is True
+    assert _run(jp, repo, "--sections", "backend") == 1
+
+
+def test_governed_module_with_no_json_entry_breach_via_evaluate(tmp_path):
+    """A governed module with NO JSON cap entry is still enforced — one line
+    over its governance cap is a breach, caught by evaluate()/main(), not just
+    invisible because it was never listed in module_size_limits.json."""
+    repo, jp = _build_repo(tmp_path, backend={})
+    module_path = os.path.join(repo, "backend", "app", "governed_uncapped.py")
+    _write_governed_module(module_path, total_lines=51, governance_cap=50)
+    data = json.loads(_read(jp))
+
+    checked, _skipped = csl.evaluate(data, ["backend"], repo)
+    matches = [r for r in checked["backend"] if r["rel"] == "governed_uncapped.py"]
+    assert len(matches) == 1
+    assert matches[0]["breach"] is True
+    assert matches[0]["effective_cap"] == 50
+    assert matches[0]["count"] == 51
+
+    assert _run(jp, repo, "--sections", "backend") == 1
+
+
+def test_governed_module_exactly_at_cap_passes(tmp_path):
+    """A governed module sitting exactly at its governance cap is clean —
+    whether or not it also has a JSON entry."""
+    repo, jp = _build_repo(tmp_path, backend={})
+    module_path = os.path.join(repo, "backend", "app", "governed_at_cap.py")
+    _write_governed_module(module_path, total_lines=50, governance_cap=50)
+    data = json.loads(_read(jp))
+
+    checked, _skipped = csl.evaluate(data, ["backend"], repo)
+    matches = [r for r in checked["backend"] if r["rel"] == "governed_at_cap.py"]
+    assert len(matches) == 1
+    assert matches[0]["breach"] is False
+    assert matches[0]["effective_cap"] == 50
+
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_ungoverned_release_surface_module_fails_with_named_file(tmp_path, capsys):
+    """A new backend/app/release_*.py (or acceptance_*.py, or
+    approved_pr_stranding.py) module that declares no governance cap fails the
+    checker and names the missing declaration — this is exactly how the
+    surface reopened after growth was first bounded (a new file, not a grown
+    one)."""
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (10, 100)})
+    release_module = os.path.join(
+        repo, "backend", "app", "release_newly_added.py"
+    )
+    os.makedirs(os.path.dirname(release_module), exist_ok=True)
+    with open(release_module, "w") as f:
+        f.write("x = 1\n")
+
+    assert csl.find_ungoverned_release_surface_modules(repo) == [
+        "release_newly_added.py"
+    ]
+
+    assert _run(jp, repo, "--sections", "backend") == 1
+    out = capsys.readouterr().out
+    assert "[ungoverned] backend/release_newly_added.py" in out
+    assert "no declared _MODULE_SIZE_GOVERNANCE_CAP" in out
+
+    # Declaring the cap clears the failure (module now governed).
+    _write_governed_module(release_module, total_lines=1, governance_cap=1)
+    assert csl.find_ungoverned_release_surface_modules(repo) == []
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+# Zero-headroom escape hatch: --fix/--force-chronic cannot bump a module
+# already beyond its own governance cap; the checker must refuse cleanly.
+def _build_zero_headroom_governed_module(tmp_path, name: str):
+    repo, jp = _build_repo(tmp_path, backend={})
+    _write_governed_module(os.path.join(repo, "backend", "app", name), total_lines=110, governance_cap=100)
+    data = json.loads(_read(jp))
+    data["backend"][name] = 100
+    with open(jp, "w") as f:
+        json.dump(data, f)
+    return repo, jp
+
+
+@pytest.mark.parametrize("extra_args", [(), ("--force-chronic",)])
+def test_fix_refuses_zero_headroom_governed_module_without_crash(tmp_path, capsys, mocker, extra_args, monkeypatch):
+    """--force-chronic waives the chronic gate, not the governance ceiling."""
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, "henry")
+    repo, jp = _build_zero_headroom_governed_module(tmp_path, "governed_over.py")
+    with mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[]):
+        rc = _run(jp, repo, "--fix", *extra_args, "--sections", "backend")  # AssertionError here IS the defect
+    out = capsys.readouterr().out
+    assert rc == 1 and "governed_over.py is already 110 lines, beyond its governing cap 100" in out, out
+    assert json.loads(_read(jp))["backend"]["governed_over.py"] == 100
+
+
+def test_report_mode_zero_headroom_breach_names_paired_raise_not_fix(tmp_path, capsys):
+    """Check mode names the paired-raise remedy, never RECOMMENDS --fix/--force-chronic."""
+    repo, jp = _build_zero_headroom_governed_module(tmp_path, "governed_over_rpt.py")
+    rc = _run(jp, repo, "--sections", "backend")
+    out = capsys.readouterr().out
+    assert rc == 1 and "backend/app/governed_over_rpt.py" in out and "module_size_limits.json" in out
+    assert "Run with --fix to bump the breached caps" not in out and "use --force-chronic" not in out

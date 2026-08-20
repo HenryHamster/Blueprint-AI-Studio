@@ -21,10 +21,20 @@ _VERIFY_TASK_ID="${TASK_ID:-local-developer}"
 _VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"
 _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_${_VERIFY_TASK_ID}.json"
 _VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${_VERIFY_TASK_ID}"
-if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT"; then
+# Warm VMs reuse /tmp, so a prior task's per-lane suppression receipts would be
+# attributed to this run. Clear them exactly as the verification receipts above.
+BLUEPRINT_GUARD_SUPPRESSION_DIR="/tmp/guard_suppression_receipts_${_VERIFY_TASK_ID}"
+export BLUEPRINT_GUARD_SUPPRESSION_DIR
+if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_CAPABILITY_RECEIPT" \
+  || ! rm -rf "$BLUEPRINT_GUARD_SUPPRESSION_DIR"; then
   echo "[check] unable to remove prior verification receipt(s) — refusing to run" >&2
   exit 1
 fi
+# Every attributed lane merges its own structured block into this one sidecar.
+# Exporting the resolved path is what keeps a guard from re-deriving the task
+# identity and disagreeing with the gate that already resolved it.
+BLUEPRINT_VERIFICATION_RECEIPT="$_VERIFY_RECEIPT"
+export BLUEPRINT_VERIFICATION_RECEIPT
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
 # Sanity: make sure we're in a git repo. Without this, the diff commands
@@ -217,11 +227,25 @@ if touches "admin-ui/"; then
   fi
   # Use typecheck-only on agent VMs: vite build is OOM-killed (exit 137) under
   # memory cgroup constraints. tsc -b --noEmit catches all type errors; the
-  # full vite bundle runs in CI after ./pr open.
-  run "admin-ui typecheck" bash -c 'cd "admin-ui" && npm run typecheck'
+  # full vite bundle runs in CI after ./pr open. The build half is attributed
+  # against an isolated base checkout through the shared base-attribution guard,
+  # so inherited type errors warn-pass while newly introduced ones still block;
+  # unavailable attribution is fail-closed. The test-file half keeps its
+  # existing shrink-only baseline gate.
+  run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
+  run "admin-ui typecheck (test files)" bash -c 'cd "admin-ui" && node scripts/typecheck-tests-baseline.mjs'
+  # The viewport-coverage invariants are NOT run as a separate step here:
+  # admin-ui/src/test/viewport-coverage.test.ts asserts all five and is part of
+  # the unit config's include, so the attributed vitest lane below covers them.
   if [ "$WITH_TESTS" = "1" ]; then
     run "admin-ui vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
   fi
+  # NOTE: the browser-mode `--suite admin-ui-viewport` lane deliberately does
+  # NOT run here. This default gate is the true-developer-checkout path and has
+  # no Playwright Chromium bootstrap and no VIEWPORT_CAPTURE_SKIPPED escape, so
+  # arming a fail-closed browser lane would hard-block every developer without
+  # a downloaded browser. The generated task gate (which does bootstrap
+  # Chromium) and CI's frontend-viewport job own browser verification.
 fi
 
 if touches "agent/"; then
@@ -239,7 +263,8 @@ if touches "agent/"; then
       echo "[check] no changed JS/TS files in agent, skipping lint"
     fi
   fi
-  run "agent build" bash -c 'cd "agent" && npm run build'
+  # agent's npm run build IS tsc --noEmit; route it through the same guard.
+  run "agent tsc (attributed)" python3 scripts/typecheck_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"
   if [ "$WITH_TESTS" = "1" ]; then
     run "agent vitest (attributed)" python3 scripts/vitest_verification_guard.py --suite agent --base "$BASE" --repo-root "$WORKSPACE"
   fi
@@ -389,9 +414,16 @@ if touches "backend/"; then
             --current-exit-code "$_verification_exit" --route="$_verification_postgres_flag" \
             --harness "$_VERIFICATION_HARNESS" "${_verification_selector_args[@]}")
         else
-          _verification_attribution='{"state":"execution_failure","blocking":true,"new_failures":{}}'
+          _verification_attribution='{"state":"attribution_unavailable","blocking":true,"error":"current JUnit report missing after targeted harness"}'
         fi
         echo "[check] backend verification attribution: $_verification_attribution"
+        # A run with many suppressed baseline failures (each carrying a full
+        # traceback) can make this blob large enough to blow the OS argv-size
+        # limit (E2BIG / "Argument list too long") if passed as a literal CLI
+        # argument below. Persist it to a file and pass the PATH instead so
+        # receipt-writing scales with suppressed-failure count, not argv size.
+        _verification_attribution_file="$_verification_attribution_dir/attribution.json"
+        printf '%s' "$_verification_attribution" >"$_verification_attribution_file"
         _verification_state=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","attribution_unavailable"))' 2>/dev/null || printf attribution_unavailable)
         _verification_tests=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for _ in ET.parse(sys.argv[1]).getroot().iter("testcase")))' "$_verification_current_junit" 2>/dev/null || printf 0)
         _verification_skipped=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for c in ET.parse(sys.argv[1]).getroot().iter("testcase") if c.find("skipped") is not None))' "$_verification_current_junit" 2>/dev/null || printf 0)
@@ -401,7 +433,7 @@ if touches "backend/"; then
         if [ "$_verification_state" = "passed" ] || [ "$_verification_state" = "preexisting_test_failure" ]; then
           echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK — state=$_verification_state"
           _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
-          if python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; out,task,directory,harness,selectors,attribution,junit=sys.argv[1:]; d=json.loads(attribution); root=ET.parse(junit).getroot(); cases=list(root.iter("testcase")); skipped=sum(1 for c in cases if c.find("skipped") is not None); failed=sum(1 for c in cases if c.find("failure") is not None or c.find("error") is not None); payload={"version":1,"task_id":task,"directory":directory,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash "+harness+" <impacted-selectors>","harness":harness,"selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"state":d["state"],"current_exit_code":int(d.get("current_exit_code",0)),"tests":len(cases),"skipped":skipped,"failures":failed,"new_failures":d.get("new_failures",{}),"suppressed_failures":d.get("suppressed_failures",{}),"disappeared_failures":d.get("disappeared_failures",{}),"skipped_failures":d.get("skipped_failures",{}),"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_VERIFY_RECEIPT" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$_VERIFICATION_HARNESS" "$_verification_selectors_json" "$_verification_attribution" "$_verification_current_junit"; then
+          if python3 scripts/verification_receipt.py backend-pytest --receipt "$_VERIFY_RECEIPT" --task-id "$_VERIFY_TASK_ID" --directory "$_VERIFICATION_DIR" --harness "$_VERIFICATION_HARNESS" --selectors-json "$_verification_selectors_json" --attribution-file "$_verification_attribution_file" --junit "$_verification_current_junit"; then
             echo "[check] verification receipt: $_VERIFY_RECEIPT"
           else
             echo "[check] required backend verification FAILED — could not write attribution receipt"
@@ -428,6 +460,11 @@ if touches "golden_tasks/"; then
   done
 fi
 
+
+# Merge every lane's suppression receipt into one cross-lane aggregate. Purely
+# additive bookkeeping: it never contributes to FAILED.
+python3 scripts/guard_suppression_receipt.py aggregate \
+  --out "$BLUEPRINT_GUARD_SUPPRESSION_DIR/aggregate.json" || true
 
 if [ ${#FAILED[@]} -eq 0 ]; then
   echo ""

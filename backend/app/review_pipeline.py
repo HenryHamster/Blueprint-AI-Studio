@@ -52,8 +52,6 @@ from app.issue_ledger import (
     build_issue_ledger,
     ensure_issue_ids,
 )
-from app.module_finding_chain import MODULE_FINDING_CHAIN_ESCALATION_KEY
-
 # Pure, side-effect-free review-loop heuristics live in review_heuristics; they
 # are re-exported here so existing callers/tests that import them from
 # app.review_pipeline keep working unchanged.
@@ -883,44 +881,41 @@ async def _surface_module_finding_chain_escalation(
     candidate: dict[str, object],
     session: AsyncSession,
 ) -> None:
-    """Surface a recurring concern without blocking the current PR's fix."""
-    from sqlalchemy.orm.attributes import flag_modified
+    """Surface a recurring concern without blocking the current PR's fix.
 
+    This raises a task-linked operator Alert only; it does not gate or
+    redirect the current request-changes cycle, which still spawns its
+    ordinary fix task.
+    """
     target = original_task or source_task
-    marker = {
-        **candidate,
-        "pr_number": pr_number,
-        "recorded_at": _utcnow().isoformat(),
-    }
-    target_ctx = dict(target.context or {})
-    target_ctx[MODULE_FINDING_CHAIN_ESCALATION_KEY] = marker
-    target.context = target_ctx
-    flag_modified(target, "context")
-    session.add(target)
-    if source_task.id != target.id:
-        source_ctx = dict(source_task.context or {})
-        source_ctx[MODULE_FINDING_CHAIN_ESCALATION_KEY] = marker
-        source_task.context = source_ctx
-        flag_modified(source_task, "context")
-        session.add(source_task)
 
     try:
         from app.alert_dispatch import _maybe_create_escalation_alert
 
+        occurrence_count = int(
+            candidate.get("verified_occurrences") or candidate["occurrences"]
+        )
         await _maybe_create_escalation_alert(
             target,
             session,
             pr_number=pr_number,
             reason="module-finding-chain",
-            iteration=int(
-                candidate.get("verified_occurrences") or candidate["occurrences"]
-            ),
+            iteration=occurrence_count,
             detail=(
                 f"Recurring concern in {candidate['file_path']} across "
                 f"{candidate['occurrences']} merged PR(s); current fix continues."
             ),
+            # Scoped by concern + occurrence count, NOT the PR number: a new
+            # PR re-raising the same concern with no new merged occurrence
+            # must stay suppressed, while a genuinely new merged occurrence
+            # (higher count) or a second distinct concern on the same PR
+            # (different file_path/finding_key) must each get their own alert.
+            dedupe_scope=(
+                f"{candidate['file_path']} "
+                f"(finding {candidate['finding_key'][:8]}, occurrence {occurrence_count})"
+            ),
         )
-    except Exception as exc:  # noqa: BLE001 — marker remains durable
+    except Exception as exc:  # noqa: BLE001 — best-effort alert only
         logger.warning(
             "[PIPELINE] Failed to create module-finding-chain alert for PR #%s: %s",
             pr_number,

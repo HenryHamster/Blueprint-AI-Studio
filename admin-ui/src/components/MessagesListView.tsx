@@ -10,6 +10,7 @@ import { MessagesSummaryCard } from './MessagesSummaryCard';
 import { type MessageSummaryCounts } from './useMessageList';
 import { type TemporaryMutes } from './temporaryMutes';
 import { preserveScrollAnchorAfterPrepend } from '../utils/conversationScrollAnchor';
+import { parseTimestamp } from '../utils/time';
 
 type BubbleProps = Omit<MessageBubbleProps, 'msg' | 'faded' | 'readOnly' | 'replyTarget'>;
 
@@ -372,7 +373,7 @@ function TriageRow({
     return (
       <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 overflow-hidden rounded-md border border-neutral-800 bg-workbench-layer">
-          <div className="flex min-h-[44px] items-center bg-workbench-layer transition-colors hover:bg-neutral-900/70">
+          <div className="flex min-h-[44px] items-center bg-workbench-layer transition-colors hover:bg-workbench-hover/70">
             <button
               onClick={() => setRoutineExpanded(e => !e)}
               className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
@@ -418,7 +419,7 @@ function TriageRow({
                                     key={shortLabel}
                                     onClick={() => addTemporaryMute(eventType, ms)}
                                     title={title}
-                                    className={`text-ui-md px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
+                                    className={`text-ui-md px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-workbench-panel text-neutral-300 hover:bg-workbench-hover'}`}
                                   >
                                     {shortLabel}
                                   </button>
@@ -457,7 +458,7 @@ function TriageRow({
     return (
       <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 pb-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer">
-          <div className="flex items-center gap-2 bg-neutral-900/30 px-3 py-2">
+          <div className="flex items-center gap-2 bg-workbench-base/30 px-3 py-2">
             <button
               onClick={() => setExpandedGroupKeys(prev => {
                 const next = new Set(prev);
@@ -492,7 +493,7 @@ function TriageRow({
               if (next.has(digestKey)) next.delete(digestKey); else next.add(digestKey);
               return next;
             })}
-            className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/30 text-left"
+            className="w-full flex items-center gap-2 px-3 py-2 bg-workbench-base/30 text-left"
           >
             <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
             <span className="text-xs text-neutral-500 font-medium">{row.count} stale routine{summary ? ` · ${summary}` : ''}</span>
@@ -739,6 +740,10 @@ export interface MessagesListViewProps {
   loadingOlderTriageMessages?: boolean;
   onLoadOlderTriageMessages?: () => void;
   conversationListRef?: RefObject<ConversationListImperativeApi | null>;
+  /** Bumped whenever the operator returns to chat (an inactive → active transition).
+   *  Drives a deterministic re-anchor to the newest message / unread boundary in
+   *  conversation mode instead of relying on browser-preserved scroll of a hidden ancestor. */
+  navigationEpoch?: number;
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
   dividerDismissedRef: RefObject<boolean>;
@@ -832,6 +837,7 @@ type ConversationRow =
   | { kind: 'loading' }
   | { kind: 'empty' }
   | { kind: 'divider'; label: string }
+  | { kind: 'unread_divider'; label: string }
   | { kind: 'message'; message: ProjectMessage };
 
 interface ConversationRowData {
@@ -841,6 +847,7 @@ interface ConversationRowData {
   highlightedMessageId?: string | null;
   loadingOlderConversationMessages?: boolean;
   onLoadOlder: () => void;
+  onDismissDivider: () => void;
 }
 
 function ConversationRowView({
@@ -853,6 +860,7 @@ function ConversationRowView({
   highlightedMessageId,
   loadingOlderConversationMessages,
   onLoadOlder,
+  onDismissDivider,
 }: RowComponentProps<ConversationRowData>) {
   const row = rows[index];
   return (
@@ -864,7 +872,7 @@ function ConversationRowView({
               type="button"
               onClick={onLoadOlder}
               disabled={loadingOlderConversationMessages}
-              className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+              className="min-h-11 rounded-md border border-neutral-800 bg-workbench-shell/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
             >
               {loadingOlderConversationMessages ? 'Loading older messages…' : 'Load older messages'}
             </button>
@@ -878,6 +886,25 @@ function ConversationRowView({
           </div>
         )}
         {row.kind === 'divider' && <TimeDividerRow label={row.label} className="my-1" />}
+        {row.kind === 'unread_divider' && (
+          <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-ui-md text-blue-300/70">
+            <div className="flex-1 border-t border-blue-500/40" />
+            <div className="flex items-center gap-2 whitespace-nowrap font-medium">
+              <span className="flex items-center gap-1">
+                <ChevronUp className="w-3 h-3" />
+                NEW since {row.label}
+              </span>
+              <button
+                onClick={onDismissDivider}
+                className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[44px] md:min-h-[28px] flex items-center"
+                title="Mark all caught up and dismiss this divider"
+              >
+                All caught up
+              </button>
+            </div>
+            <div className="flex-1 border-t border-blue-500/40" />
+          </div>
+        )}
         {row.kind === 'message' && (
           <MessageBubble
             msg={row.message}
@@ -905,14 +932,24 @@ function ConversationVirtualList({
   loadingOlderConversationMessages,
   onLoadOlderConversationMessages,
   conversationListRef,
+  dividerTime,
+  onDismissDivider,
+  navigationEpoch = 0,
 }: MessagesListViewProps) {
   const listRef = useListRef(null);
+  // Owns the visibility toggle for the settle-detection anchor loop below.
+  // A plain ref to a wrapper div (rather than the react-window-owned
+  // listRef's element) so the hook's returned value is never mutated.
+  const listWrapperRef = useRef<HTMLDivElement | null>(null);
   const rowHeight = useDynamicRowHeight({ defaultRowHeight: 96 });
   const renderedRangeRef = useRef({ startIndex: -1, stopIndex: -1 });
   const olderHistoryIntentRef = useRef(false);
-  const initialBottomAnchorRef = useRef<number | null>(null);
+  const initialBottomAnchorRef = useRef(false);
   const initialBottomAnchorFrameRef = useRef<number | null>(null);
-  const initialBottomAnchoredRef = useRef(false);
+  // Tracks which navigation epoch the settle-to-bottom loop last ran for, so
+  // returning to chat (a new epoch, same message set) re-anchors deterministically
+  // instead of relying on browser-preserved scroll position of a hidden ancestor.
+  const anchoredEpochRef = useRef<number | null>(null);
   const autoLoadingOlderRef = useRef(false);
   const pendingNavigationRef = useRef<{
     index: number;
@@ -930,21 +967,42 @@ function ConversationVirtualList({
     if (loading) next.push({ kind: 'loading' });
     else if (messages.length === 0) next.push({ kind: 'empty' });
     else {
+      const unreadSince = dividerTime;
+      const unreadMessageId = unreadSince
+        ? messages.find(m => m.created_at && parseTimestamp(m.created_at).getTime() > unreadSince)?.id ?? null
+        : null;
       for (const item of insertTimeDividers(messages)) {
-        if (item.kind === 'divider') next.push({ kind: 'divider', label: item.label });
-        else next.push({ kind: 'message', message: item.msg });
+        if (item.kind === 'divider') { next.push({ kind: 'divider', label: item.label }); continue; }
+        if (unreadSince && unreadMessageId && item.msg.id === unreadMessageId) {
+          next.push({ kind: 'unread_divider', label: formatTimestamp(unreadSince) });
+        }
+        next.push({ kind: 'message', message: item.msg });
       }
     }
     return next;
-  }, [hasOlderConversationMessages, loading, messages]);
+  }, [hasOlderConversationMessages, loading, messages, dividerTime]);
+
+  // Always holds the latest rows so the settle loop below (whose closure is
+  // created once per anchor cycle) never scrolls to an index computed from a
+  // stale, since-shrunk row count — e.g. switching conversations mid-loop.
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  // Cancels the initial settle-anchor loop (if running) and reveals the list.
+  // Shared by explicit navigation and by any operator scroll/touch/key intent.
+  const stopInitialAnchor = useCallback(() => {
+    initialBottomAnchorRef.current = false;
+    if (initialBottomAnchorFrameRef.current != null) {
+      window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
+      initialBottomAnchorFrameRef.current = null;
+    }
+    const wrapper = listWrapperRef.current;
+    if (wrapper) wrapper.style.visibility = 'visible';
+  }, []);
 
   useImperativeHandle(conversationListRef, () => ({
     scrollToMessage: (messageId: string) => {
-      initialBottomAnchorRef.current = null;
-      if (initialBottomAnchorFrameRef.current != null) {
-        window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
-        initialBottomAnchorFrameRef.current = null;
-      }
+      stopInitialAnchor();
       const index = rows.findIndex(row => row.kind === 'message' && row.message.id === messageId);
       if (index < 0 || !listRef.current) return Promise.resolve(false);
       const rendered = renderedRangeRef.current;
@@ -968,7 +1026,7 @@ function ConversationVirtualList({
       if (lastIndex < 0 || !listRef.current) return;
       listRef.current?.scrollToRow({ index: lastIndex, align: 'end', behavior: 'instant' });
     },
-  }), [conversationListRef, listRef, rows]);
+  }), [conversationListRef, listRef, rows, stopInitialAnchor]);
 
   const handleLoadOlder = useCallback(() => {
     const element = listRef.current?.element;
@@ -1025,13 +1083,6 @@ function ConversationVirtualList({
     const element = listRef.current?.element;
     if (!element) return;
     let touchY: number | null = null;
-    const stopInitialAnchor = () => {
-      initialBottomAnchorRef.current = null;
-      if (initialBottomAnchorFrameRef.current != null) {
-        window.cancelAnimationFrame(initialBottomAnchorFrameRef.current);
-        initialBottomAnchorFrameRef.current = null;
-      }
-    };
     const onWheel = (event: WheelEvent) => {
       stopInitialAnchor();
       olderHistoryIntentRef.current = event.deltaY < 0;
@@ -1061,37 +1112,68 @@ function ConversationVirtualList({
       element.removeEventListener('wheel', onWheel);
       element.removeEventListener('keydown', onKeyDown);
     };
-  }, [listRef]);
+  }, [listRef, stopInitialAnchor]);
 
-  // Dynamic markdown rows are measured after their first paint. A single
-  // scroll-to-last call can therefore use stale estimates and leave a newly
-  // opened conversation in the middle. Keep the initial viewport pinned to the
-  // latest row briefly while measurements settle, stopping immediately on any
-  // operator scroll intent.
+  // Dynamic markdown rows are measured after their first paint, so a single
+  // scroll-to-last call uses stale estimates and lands mid-history. Instead of
+  // pinning visibly for a fixed wall-clock window (which produces a visible
+  // scroll correction on every open), keep the list hidden and re-issue
+  // scrollToRow each frame until two consecutive frames produce no further
+  // scrollTop change (measurements have settled), then reveal it — the
+  // correction happens off-screen. A frame cap is a safety fallback only,
+  // not the primary stop condition. Any operator scroll/touch/key intent
+  // cancels the loop and reveals immediately (see stopInitialAnchor).
+  //
+  // Gated per navigationEpoch (not a one-shot latch): the chat surface stays
+  // mounted behind a display:none wrapper across tab switches, so returning
+  // to chat with the same message set must still re-run this loop rather
+  // than trusting whatever scroll position the hidden ancestor happened to
+  // retain — that behavior is browser-dependent and untested.
   useEffect(() => {
     if (messages.length === 0) {
-      initialBottomAnchorRef.current = null;
-      initialBottomAnchoredRef.current = false;
+      initialBottomAnchorRef.current = false;
+      anchoredEpochRef.current = null;
       return;
     }
-    if (initialBottomAnchorRef.current != null || initialBottomAnchoredRef.current) return;
-    initialBottomAnchoredRef.current = true;
-    initialBottomAnchorRef.current = performance.now() + 500;
-    const pinToLatest = () => {
-      const until = initialBottomAnchorRef.current;
-      if (until == null || performance.now() >= until) {
-        initialBottomAnchorRef.current = null;
-        initialBottomAnchorFrameRef.current = null;
-        return;
-      }
-      const lastIndex = rows.length - 1;
+    if (anchoredEpochRef.current === navigationEpoch) return;
+    anchoredEpochRef.current = navigationEpoch;
+    initialBottomAnchorRef.current = true;
+    const MAX_SETTLE_FRAMES = 30;
+    const STABLE_FRAMES_TARGET = 2;
+    const wrapper = listWrapperRef.current;
+    if (wrapper) wrapper.style.visibility = 'hidden';
+    let lastScrollTop: number | null = null;
+    let stableFrames = 0;
+    let frame = 0;
+    const settle = () => {
+      // The anchor can be canceled (messages cleared, an explicit
+      // navigation, or an operator scroll intent) between frames while this
+      // closure still holds a stale row count — bail before touching the
+      // list rather than scrolling to an index that may no longer exist.
+      if (!initialBottomAnchorRef.current) return;
+      const lastIndex = rowsRef.current.length - 1;
       if (lastIndex >= 0) {
         listRef.current?.scrollToRow({ index: lastIndex, align: 'end', behavior: 'instant' });
       }
-      initialBottomAnchorFrameRef.current = window.requestAnimationFrame(pinToLatest);
+      frame += 1;
+      const scrollTop = listRef.current?.element?.scrollTop ?? null;
+      if (scrollTop != null && scrollTop === lastScrollTop) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+      }
+      lastScrollTop = scrollTop;
+      if (stableFrames >= STABLE_FRAMES_TARGET || frame >= MAX_SETTLE_FRAMES) {
+        initialBottomAnchorRef.current = false;
+        initialBottomAnchorFrameRef.current = null;
+        const w = listWrapperRef.current;
+        if (w) w.style.visibility = 'visible';
+        return;
+      }
+      initialBottomAnchorFrameRef.current = window.requestAnimationFrame(settle);
     };
-    initialBottomAnchorFrameRef.current = window.requestAnimationFrame(pinToLatest);
-  }, [listRef, messages.length, rows.length]);
+    initialBottomAnchorFrameRef.current = window.requestAnimationFrame(settle);
+  }, [listRef, messages.length, rows.length, navigationEpoch]);
 
   useEffect(() => {
     if (!loadingOlderConversationMessages) autoLoadingOlderRef.current = false;
@@ -1104,32 +1186,36 @@ function ConversationVirtualList({
     highlightedMessageId,
     loadingOlderConversationMessages,
     onLoadOlder: handleLoadOlder,
+    onDismissDivider,
   }), [
     bubbleProps,
     handleLoadOlder,
     highlightedMessageId,
     loadingOlderConversationMessages,
     messagesById,
+    onDismissDivider,
     rows,
   ]);
 
   return (
     <div className="relative mx-auto w-full max-w-[940px] flex-1 overflow-hidden bg-workbench-base" data-testid="strategic-conversation-column">
-      <List
-        rowCount={rows.length}
-        rowComponent={ConversationRowView}
-        rowProps={rowProps}
-        rowHeight={rowHeight}
-        overscanCount={6}
-        listRef={listRef}
-        defaultHeight={600}
-        className="h-full custom-scrollbar overflow-y-auto"
-        onRowsRendered={handleConversationRowsRendered}
-      />
+      <div ref={listWrapperRef} className="h-full">
+        <List
+          rowCount={rows.length}
+          rowComponent={ConversationRowView}
+          rowProps={rowProps}
+          rowHeight={rowHeight}
+          overscanCount={6}
+          listRef={listRef}
+          defaultHeight={600}
+          className="h-full custom-scrollbar overflow-y-auto"
+          onRowsRendered={handleConversationRowsRendered}
+        />
+      </div>
       {showScrollDown && (
         <button
           onClick={scrollToBottom}
-          className="absolute bottom-24 left-1/2 flex min-h-11 min-w-11 -translate-x-1/2 items-center justify-center rounded-full border border-neutral-700 bg-neutral-900 p-2 text-neutral-400 shadow-lg transition-colors hover:bg-neutral-800 hover:text-neutral-200"
+          className="absolute bottom-24 left-1/2 flex min-h-11 min-w-11 -translate-x-1/2 items-center justify-center rounded-full border border-neutral-700 bg-workbench-base p-2 text-neutral-400 shadow-lg transition-colors hover:bg-workbench-hover hover:text-neutral-200"
           aria-label="Scroll to latest message"
         >
           <ArrowDown className="h-4 w-4" />
@@ -1301,7 +1387,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
             type="button"
             onClick={() => onLoadOlderTriageMessages?.()}
             disabled={!!loadingOlderTriageMessages}
-            className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+            className="min-h-11 rounded-md border border-neutral-800 bg-workbench-shell/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
           >
             {loadingOlderTriageMessages ? 'Loading older messages…' : 'Load older messages'}
           </button>
@@ -1321,7 +1407,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
       {showScrollDown && (
         <button
           onClick={handleTriageScrollToBottom}
-          className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
+          className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-workbench-panel border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
           aria-label="Scroll to latest message"
         >
           <ArrowDown className="w-4 h-4" />

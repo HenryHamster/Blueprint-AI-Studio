@@ -50,7 +50,11 @@ vi.mock('../utils/test-runners.js', async (importOriginal) => {
 
 vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/test-fix-loop.js')>();
-  return { ...actual, testFixLoop: vi.fn() };
+  return {
+    ...actual,
+    captureTestBaseline: vi.fn().mockResolvedValue(null),
+    testFixLoop: vi.fn(),
+  };
 });
 
 vi.mock('fs', () => ({
@@ -62,7 +66,7 @@ vi.mock('fs', () => ({
 import { handleVerifyTests } from './verify-tests.js';
 import { persistAndPostStatus, execFileAsync } from '../index.js';
 import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes, discoverDocumentedCommands } from '../utils/test-runners.js';
-import { testFixLoop } from '../utils/test-fix-loop.js';
+import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 // Must match process.env.AGENT_WORKSPACE so describeRunnerDirectory (which reads
 // that env var at module load time in test-runners.ts) strips the right prefix.
 const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
@@ -127,6 +131,43 @@ describe('handleVerifyTests', () => {
     // The no-op-build tests override this per-case.
     vi.mocked(discoverDocumentedCommands).mockReturnValue([]);
     vi.mocked(execFileAsync).mockResolvedValue('');
+    vi.mocked(captureTestBaseline).mockResolvedValue(null);
+  });
+
+  it('passes the merge gate when every detected failure is present on the base ref', async () => {
+    const inheritedFailure = 'agent/src/handlers/verify-tests.test.ts::inherited failure';
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(captureTestBaseline).mockResolvedValue(new Set([inheritedFailure]));
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+      if (cmd !== 'git') return Promise.resolve('');
+      const gitArgs = args as string[];
+      if (gitArgs[0] === 'rev-parse' && gitArgs.includes('HEAD')) return Promise.resolve('head-sha');
+      if (gitArgs.includes('--name-only')) return Promise.resolve('agent/src/handlers/verify-tests.test.ts');
+      if (gitArgs.includes('--unified=0')) return Promise.resolve('');
+      return Promise.resolve('base-sha');
+    });
+
+    await handleVerifyTests('base-attributed', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    expectCalledWith(captureTestBaseline,
+      null,
+      expect.anything(),
+      undefined,
+      ['agent/src/handlers/verify-tests.test.ts'],
+    );
+    const checkoutCalls = vi.mocked(execFileAsync).mock.calls
+      .filter(([cmd, args]) => cmd === 'git' && args[0] === 'checkout')
+      .map(([, args]) => args);
+    expect(checkoutCalls).toEqual([
+      ['checkout', '--force', '--detach', 'origin/main'],
+      ['checkout', '--force', '--detach', 'head-sha'],
+    ]);
+    expect(vi.mocked(testFixLoop).mock.calls[0][5]).toEqual(new Set([inheritedFailure]));
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(true);
+    expect(lastPostedPayload().status).toBe('COMPLETED');
   });
 
   it('passing suite → COMPLETED with detected=true, passed=true', async () => {
@@ -1280,7 +1321,9 @@ describe('handleVerifyTests — diff-aware runner filtering', () => {
       ['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
       expect.objectContaining({ cwd: '/tmp/workspace' }),
     );
-    expect(revParseCalls).toBe(2);
+    // Two calls establish origin/main for the diff; the restoration guard then
+    // pins the PR head before it captures the base failure set.
+    expect(revParseCalls).toBe(3);
     expect(runnersUsed()).toEqual([BACKEND_RUNNER.label]);
   });
 

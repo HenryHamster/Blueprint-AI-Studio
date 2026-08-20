@@ -24,6 +24,7 @@ from app.models import (
     MessageSurface,
     MessageType,
     Project,
+    ProjectEfficiencySnapshot,
     ProjectMember,
     ProjectMessage,
     QualificationDimensionResult,
@@ -3790,6 +3791,63 @@ async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
         data["merged_work_origination"]["cohort_created_at_floor"]
         == "2026-08-08T06:59:00+00:00"
     )
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_history_omits_per_task_but_keeps_scalars(
+    client: AsyncClient, db_session
+):
+    """A pre-#17540 persisted row still carries per_task in its stored blob
+    (the write-side pop in #17540 only stops NEW rows from getting it). The
+    served history entry must project it away at the response boundary
+    without mutating the stored row, while every scalar the panel reads
+    survives byte-identical."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-eff-pertask")
+    token = create_agent_token(str(task.id), "agent-vm-eff-pertask")
+
+    reconciliation = {
+        "total_cost_snapshot_path": 50.0,
+        "total_cost_direct_path": 50.0,
+        "within_tolerance": True,
+        "task_count": 2,
+        "per_task": [
+            {"task_id": "abc", "cost_usd": 25.0},
+            {"task_id": "def", "cost_usd": 25.0},
+        ],
+    }
+    snapshot = ProjectEfficiencySnapshot(
+        project_id=project.id,
+        captured_at=datetime.now(timezone.utc),
+        metric_def_version="v1",
+        blob={
+            "cost_per_merged_pr": 12.5,
+            "serving_sha": "deadbeef",
+            "cost_telemetry_reconciliation": reconciliation,
+        },
+    )
+    db_session.add(snapshot)
+    await db_session.commit()
+
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    history = res.json()["data"]["history"]
+    assert len(history) == 1
+    served_reconciliation = history[0]["cost_telemetry_reconciliation"]
+    assert "per_task" not in served_reconciliation, (
+        "per_task must be stripped from the served history entry"
+    )
+    assert served_reconciliation["total_cost_snapshot_path"] == 50.0
+    assert served_reconciliation["within_tolerance"] is True
+    assert served_reconciliation["task_count"] == 2
+    assert history[0]["cost_per_merged_pr"] == 12.5
+    assert history[0]["serving_sha"] == "deadbeef"
+
+    # The stored row itself must not have been mutated by the serve path.
+    stored = await db_session.get(ProjectEfficiencySnapshot, snapshot.id)
+    assert "per_task" in stored.blob["cost_telemetry_reconciliation"]
 
 
 @pytest.mark.asyncio

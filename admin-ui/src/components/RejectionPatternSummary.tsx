@@ -12,7 +12,7 @@ export function RejectionPatternSummary({ digest }: { digest: DigestData | null 
         {rps.top_notes.map((note, i) => (
           <div
             key={i}
-            className="flex items-start gap-2 text-xs bg-neutral-900/50 border border-neutral-800/50 px-2 py-1.5 rounded"
+            className="flex items-start gap-2 text-xs bg-workbench-base/50 border border-neutral-800/50 px-2 py-1.5 rounded"
           >
             <span className="shrink-0 text-ui-xs font-semibold px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20 tabular-nums">
               ×{note.count}

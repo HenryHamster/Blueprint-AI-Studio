@@ -73,7 +73,7 @@ const SOURCE_KIND_STYLES: Record<string, { bg: string; text: string; icon: typeo
   design: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-300', icon: FileCode, label: 'Design' },
   web_research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-300', icon: Globe, label: 'Web Research' },
   compute_experiment: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-300', icon: Cpu, label: 'Compute' },
-  unknown: { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: HelpCircle, label: 'Unknown' },
+  unknown: { bg: 'bg-workbench-control/10 border-neutral-500/20', text: 'text-neutral-400', icon: HelpCircle, label: 'Unknown' },
 };
 
 /** Selectable origins for the filter control (order matters for the segmented control). */
@@ -201,7 +201,7 @@ function OriginProvenanceDetail({
   const sidecarTaskId = challenge && typeof challenge.sidecar_task_id === 'string' ? challenge.sidecar_task_id : null;
 
   return (
-    <div className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-ui-md space-y-1.5">
+    <div className="rounded border border-neutral-800 bg-workbench-base/40 px-2 py-1.5 text-ui-md space-y-1.5">
       <div className="flex items-center gap-1.5 flex-wrap">
         <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Finding origin</div>
         <OriginBadge doc={doc} />
@@ -315,7 +315,7 @@ function ProbeDetail({ verdict }: { verdict: KnowledgeForwardQualityVerdict | nu
     !!grounding && grounding.file_citations > 0 && grounding.grounded < grounding.file_citations;
 
   return (
-    <div className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-ui-md space-y-1.5">
+    <div className="rounded border border-neutral-800 bg-workbench-base/40 px-2 py-1.5 text-ui-md space-y-1.5">
       <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Acceptance probes</div>
       {grounding && grounding.file_citations > 0 && (
         <div className="space-y-1">
@@ -375,7 +375,7 @@ function ComputeRunProvenanceDetail({
   const location = backend ? computeJobExecutionLocation(backend) : null;
 
   return (
-    <div className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-ui-md space-y-1">
+    <div className="rounded border border-neutral-800 bg-workbench-base/40 px-2 py-1.5 text-ui-md space-y-1">
       <div className="flex items-center gap-1.5 flex-wrap">
         <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Run provenance</div>
         <EvidenceTierBadge tier={doc.evidence_tier} />
@@ -562,7 +562,7 @@ function ViewableMediaInline({
       src={signedUrl}
       alt={label}
       onError={handleMediaError}
-      className="max-h-48 w-full rounded border border-neutral-800 bg-neutral-950/45 object-contain"
+      className="max-h-48 w-full rounded border border-neutral-800 bg-workbench-shell/45 object-contain"
     />
   );
 }
@@ -675,7 +675,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   return (
     <div className="fixed inset-0 z-50 flex">
       <div className="flex-1 bg-black/40" onClick={onClose} />
-      <div className="w-full max-w-[600px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl">
+      <div className="w-full max-w-[600px] bg-workbench-shell border-l border-neutral-800 flex flex-col shadow-2xl">
         {/* Header */}
         <div className="flex justify-between items-center p-4 border-b border-neutral-800 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -718,7 +718,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <OriginBadge doc={selected} />
                 <LifecycleBadge status={selected.lifecycle_status} />
                 {selected.authoring_branch && selected.head_sha && (
-                  <span className="px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 font-mono">
+                  <span className="px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-400 font-mono">
                     {selected.authoring_branch}@{selected.head_sha}
                   </span>
                 )}
@@ -760,7 +760,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
               {(selected.tags ?? []).length > 0 && (
                 <div className="flex flex-wrap gap-1">
                   {selected.tags.map(t => (
-                    <span key={t} className="text-ui-sm px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">#{t}</span>
+                    <span key={t} className="text-ui-sm px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-400">#{t}</span>
                   ))}
                 </div>
               )}
@@ -869,7 +869,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                     </span>
                   )}
                   {tagFilter && (
-                    <span className="flex items-center gap-1 text-ui-sm bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded">
+                    <span className="flex items-center gap-1 text-ui-sm bg-workbench-panel border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded">
                       #{tagFilter}
                       {/* reason: clear-tag-filter chip control; w-2.5 h-2.5 icon inline in chip */}
                       <button data-viewport-allow-small-target onClick={() => setFilter('tagFilter', null)} className="text-neutral-500 hover:text-neutral-200"><X className="w-2.5 h-2.5" /></button>
@@ -883,7 +883,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                     </span>
                   )}
                   {lifecycleFilter && (
-                    <span className="flex items-center gap-1 text-ui-sm bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded">
+                    <span className="flex items-center gap-1 text-ui-sm bg-workbench-panel border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded">
                       lifecycle: {lifecycleFilter}
                       {/* reason: clear-lifecycle-filter chip control; w-2.5 h-2.5 icon inline in chip */}
                       <button data-viewport-allow-small-target onClick={() => setFilter('lifecycleFilter', null)} className="text-neutral-500 hover:text-neutral-200"><X className="w-2.5 h-2.5" /></button>
@@ -898,7 +898,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                   value={search}
                   onChange={e => setFilter('search', e.target.value)}
                   placeholder="Search title, summary, body, topic, tags..."
-                  className="w-full bg-neutral-900 border border-neutral-800 rounded pl-8 pr-3 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                  className="w-full bg-workbench-base border border-neutral-800 rounded pl-8 pr-3 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 workbench-focus"
                 />
               </div>
               {/* Source-kind (origin) filter — scope the library to a single producing task type. */}
@@ -908,7 +908,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <button
                   data-viewport-allow-small-target
                   onClick={() => setFilter('sourceKindFilter', null)}
-                  className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border transition-colors ${sourceKindFilter === null ? 'bg-neutral-700 border-neutral-600 text-neutral-100' : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                  className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border transition-colors ${sourceKindFilter === null ? 'bg-workbench-layer border-neutral-600 text-neutral-100' : 'bg-workbench-base border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
                 >All</button>
                 {SOURCE_KIND_OPTIONS.map(kind => {
                   const style = SOURCE_KIND_STYLES[kind];
@@ -920,7 +920,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                       data-viewport-allow-small-target
                       key={kind}
                       onClick={() => setFilter('sourceKindFilter', active ? null : kind)}
-                      className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border inline-flex items-center gap-1 transition-colors ${active ? `${style.bg} ${style.text} border-current` : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                      className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border inline-flex items-center gap-1 transition-colors ${active ? `${style.bg} ${style.text} border-current` : 'bg-workbench-base border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
                     >
                       <Icon className="w-2.5 h-2.5 shrink-0" />
                       {style.label}
@@ -935,7 +935,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <button
                   data-viewport-allow-small-target
                   onClick={() => setFilter('challengeStateFilter', null)}
-                  className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border transition-colors ${challengeStateFilter === null ? 'bg-neutral-700 border-neutral-600 text-neutral-100' : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                  className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border transition-colors ${challengeStateFilter === null ? 'bg-workbench-layer border-neutral-600 text-neutral-100' : 'bg-workbench-base border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
                 >All</button>
                 {CHALLENGE_STATE_OPTIONS.map(state => {
                   const style = CHALLENGE_STATE_STYLES[state];
@@ -947,7 +947,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                       data-viewport-allow-small-target
                       key={state}
                       onClick={() => setFilter('challengeStateFilter', active ? null : state)}
-                      className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border inline-flex items-center gap-1 transition-colors ${active ? `${style.bg} ${style.text} border-current` : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                      className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border inline-flex items-center gap-1 transition-colors ${active ? `${style.bg} ${style.text} border-current` : 'bg-workbench-base border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
                       title={style.tooltip}
                     >
                       <Icon className="w-2.5 h-2.5 shrink-0" />
@@ -963,7 +963,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <button
                   data-viewport-allow-small-target
                   onClick={() => setFilter('lifecycleFilter', null)}
-                  className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border transition-colors ${lifecycleFilter === null ? 'bg-neutral-700 border-neutral-600 text-neutral-100' : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                  className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border transition-colors ${lifecycleFilter === null ? 'bg-workbench-layer border-neutral-600 text-neutral-100' : 'bg-workbench-base border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
                 >All</button>
                 {LIFECYCLE_OPTIONS.map(state => {
                   const style = LIFECYCLE_STYLES[state];
@@ -974,7 +974,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                       data-viewport-allow-small-target
                       key={state}
                       onClick={() => setFilter('lifecycleFilter', active ? null : state)}
-                      className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border inline-flex items-center gap-1 transition-colors ${active ? `${style.bg} ${style.text} border-current` : 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
+                      className={`text-ui-xs uppercase tracking-wider px-1.5 py-0.5 rounded border inline-flex items-center gap-1 transition-colors ${active ? `${style.bg} ${style.text} border-current` : 'bg-workbench-base border-neutral-800 text-neutral-500 hover:text-neutral-300'}`}
                       title={style.tooltip}
                     >
                       {style.label}
@@ -1017,7 +1017,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                       openDoc(doc);
                     }
                   }}
-                  className="w-full cursor-pointer text-left bg-neutral-900/50 border border-neutral-800 rounded-lg px-3 py-2.5 hover:bg-neutral-800/40 transition-colors"
+                  className="w-full cursor-pointer text-left bg-workbench-base/50 border border-neutral-800 rounded-lg px-3 py-2.5 hover:bg-workbench-hover/40 transition-colors"
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-medium text-neutral-200 flex-1 truncate">{doc.title}</span>
@@ -1064,7 +1064,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                       data-viewport-allow-small-target
                       key={t}
                       onClick={e => { e.stopPropagation(); setFilter('tagFilter', t); }}
-                      className="text-ui-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 hover:bg-neutral-700 transition-colors"
+                      className="text-ui-xs px-1.5 py-0.5 rounded bg-workbench-panel text-neutral-400 hover:bg-workbench-hover transition-colors"
                     >#{t}</button>
                   ))}
                 </div>

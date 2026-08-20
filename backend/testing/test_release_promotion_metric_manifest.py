@@ -29,6 +29,7 @@ import datetime as _dt
 
 from app import release_readiness
 from app.release_readiness import PROMOTION_READINESS_METRIC_MANIFEST
+from testing.fixgate_attribution import format_offender_marker
 
 _CONDITIONAL_FIELDS = frozenset()
 
@@ -77,7 +78,7 @@ def test_every_emitted_field_has_a_recorded_consumer_or_retirement():
     assert not undeclared, (
         "These compute_promotion_readiness fields are emitted but have no entry in "
         "PROMOTION_READINESS_METRIC_MANIFEST. Add each with a named ground_truth + "
-        f"consumer, or a pending/retired annotation: {sorted(undeclared)}"
+        f"consumer, or a pending/retired annotation: {sorted(undeclared)}" + "\n" + format_offender_marker(str(offender) for offender in undeclared)
     )
 
 
@@ -92,7 +93,7 @@ def test_no_stale_consumer_manifest_entries():
     assert not stale, (
         "These manifest keys claim an active consumer but are no longer emitted "
         "by compute_promotion_readiness. Mark them retired (reason + date) or "
-        f"remove the consumer record: {sorted(stale)}"
+        f"remove the consumer record: {sorted(stale)}" + "\n" + format_offender_marker(str(offender) for offender in stale)
     )
 
 

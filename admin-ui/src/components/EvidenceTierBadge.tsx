@@ -22,7 +22,7 @@ const TIER_CONFIG: Record<EvidenceTier, {
   },
   backfilled: {
     label: 'Backfilled',
-    cls: 'bg-neutral-800 border-neutral-700 text-neutral-400',
+    cls: 'bg-workbench-panel border-neutral-700 text-neutral-400',
     Icon: HelpCircle,
     tooltip: 'Metrics present without direct execution evidence',
   },
@@ -40,7 +40,7 @@ const TIER_CONFIG: Record<EvidenceTier, {
   },
   uncovered: {
     label: 'Self-reported',
-    cls: 'bg-neutral-800 border-neutral-700 text-neutral-500',
+    cls: 'bg-workbench-panel border-neutral-700 text-neutral-500',
     Icon: XCircle,
     tooltip: 'No execution evidence — result is self-reported',
   },

@@ -845,7 +845,11 @@ describe('buildCodeChangeHelperGuidance', () => {
     const intro = checkIntroOf(g);
     // The generated ./check runs npx vitest run (= npm run test:run) on every
     // admin-ui invocation — assert the intro reflects this accurately.
-    expect(intro).toContain('npm run test:viewport');
+    // The viewport lane no longer shells out to `npm run test:viewport` (which
+    // chained the whole unit suite ahead of the browser run); it routes through
+    // the shared per-identity attributor instead.
+    expect(intro).not.toContain('npm run test:viewport');
+    expect(intro).toContain('scripts/vitest_verification_guard.py');
     expect(intro).toMatch(/npx vitest run|npm run test:run/);
     // Must NOT contain the false claim that the unit suite is skipped.
     expect(intro).not.toMatch(/not the .*test:run/);

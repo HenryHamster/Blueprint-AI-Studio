@@ -716,16 +716,17 @@ async def run_request_changes(
         # post-commit sweep free to retry the idempotent spawn.
         await session.commit()
 
-    # Cross-PR recurring-concern escalation is advisory to this PR: the marker
-    # and alert route a durable design decision, while this request-changes
-    # cycle continues to receive its ordinary fix task.
-    chain_candidate = await find_and_mark_chain_escalation(
+    # Cross-PR recurring-concern escalation is advisory to this PR: it raises
+    # a task-linked operator Alert, while this request-changes cycle still
+    # continues to receive its ordinary fix task. A PR can raise more than one
+    # distinct concern past threshold, so every candidate surfaces.
+    chain_candidates = await find_and_mark_chain_escalation(
         session,
         project_id=task.project_id,
         issues=issues,
         authoritative_files=_pr_files,
     )
-    if chain_candidate is not None:
+    for chain_candidate in chain_candidates:
         await _surface_module_finding_chain_escalation(
             task,
             _orig if original_task_id else None,

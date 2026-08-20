@@ -51,6 +51,13 @@ HOTFIX_ELIGIBLE_MODULES: frozenset[str] = frozenset(
         "backend/app/acceptance_gate.py",
         "backend/app/category_verdict_ledger.py",
         "backend/app/qualification_state_resolver.py",
+        # The latch alert and its operator-facing delivery path must be
+        # repairable through the lane they recommend.  These files are the
+        # complete production surface of the shipped latch-announcement fix.
+        "backend/app/release_stall_alerts.py",
+        "backend/app/release_gate_latch.py",
+        "backend/app/message_audience.py",
+        "backend/app/project_message_creation.py",
         # The scope validator itself must be hotfixable so the channel can
         # repair its own authorization surface.
         "backend/app/hotfix_policy.py",
@@ -75,6 +82,7 @@ HOTFIX_ELIGIBLE_MODULES: frozenset[str] = frozenset(
 _HOTFIX_RELEASE_TEST_PREFIX = "backend/testing/test_release_"
 _HOTFIX_RELEASE_TEST_SUFFIX = ".py"
 _HOTFIX_RELEASE_TEST_HELPER = "backend/testing/_release_qualifier_testhelpers.py"
+_HOTFIX_INVARIANT_TEST = "backend/testing/test_invariants.py"
 
 MAIN_PY_PATH = "backend/app/main.py"
 _MIGRATIONS_PREFIX = "backend/alembic/versions/"
@@ -87,7 +95,7 @@ def _is_bounded_release_test_path(path: str) -> bool:
     return (
         path.startswith(_HOTFIX_RELEASE_TEST_PREFIX)
         and path.endswith(_HOTFIX_RELEASE_TEST_SUFFIX)
-    ) or path == _HOTFIX_RELEASE_TEST_HELPER
+    ) or path in {_HOTFIX_RELEASE_TEST_HELPER, _HOTFIX_INVARIANT_TEST}
 
 
 @dataclass(frozen=True)

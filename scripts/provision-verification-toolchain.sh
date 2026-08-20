@@ -11,6 +11,12 @@ if [ "${1:-}" = "--verify" ]; then
 fi
 MANIFEST="${1:-$(dirname "$0")/verification-toolchain.json}"
 VENV="${2:-$HOME/.blueprint/verification-toolchain/venv}"
+# Optional: a requirements file (e.g. backend/requirements.txt) to install
+# BEFORE the pinned manifest packages, so a from-scratch venv (bare runners)
+# carries the same backend runtime deps a packer-baked venv gets from its own
+# separate `pip install -r backend/requirements.txt` step. Installed first so
+# the manifest pins below win any version overlap.
+REQUIREMENTS="${3:-}"
 
 if [ ! -r "$MANIFEST" ]; then
   echo "VERIFICATION_TOOLCHAIN_MISSING: manifest is not readable: $MANIFEST" >&2
@@ -77,6 +83,16 @@ if [ "$VERIFY_ONLY" != "1" ] && [ ! -x "$VENV/bin/python" ]; then
     exit 1
   }
 fi
+if [ "$VERIFY_ONLY" != "1" ] && [ -n "$REQUIREMENTS" ]; then
+  if [ ! -r "$REQUIREMENTS" ]; then
+    echo "VERIFICATION_TOOLCHAIN_PROVISION_FAILED: requirements file is not readable: $REQUIREMENTS" >&2
+    exit 1
+  fi
+  "$VENV/bin/python" -m pip install --disable-pip-version-check --no-input --requirement "$REQUIREMENTS" || {
+    echo "VERIFICATION_TOOLCHAIN_PROVISION_FAILED: pip could not install the requirements file" >&2
+    exit 1
+  }
+fi
 if [ "$VERIFY_ONLY" != "1" ]; then
   "$VENV/bin/python" -m pip install --disable-pip-version-check --no-input --requirement "$REQUIREMENTS_FILE" || {
     echo "VERIFICATION_TOOLCHAIN_PROVISION_FAILED: pip could not install the pinned manifest packages" >&2
@@ -89,8 +105,20 @@ if [ -z "$POSTGRES_BIN" ] || [ ! -x "$POSTGRES_BIN/initdb" ]; then
   echo "VERIFICATION_TOOLCHAIN_MISSING: pgserver-search did not provide a usable PostgreSQL bindir" >&2
   exit 1
 fi
+# Importing the pinned tools alone proves nothing about whether this venv can
+# actually run a backend migration: alembic/env.py does `from sqlmodel import
+# SQLModel` at module scope (line 7) and `from app.models import *` (line 12),
+# neither of which is a manifest pin — they come from backend/requirements.txt.
+# A venv that only has the 6 manifest packages passes the narrower import list
+# below but dies inside alembic before collecting a single test. Prove the
+# same surface the packer-baked venv proves inline (fastapi, asyncpg) plus the
+# sqlmodel import env.py performs directly.
 "$VENV/bin/python" -c 'import alembic, mypy, pgserver, pytest, ruff, sqlalchemy' || {
   echo "VERIFICATION_TOOLCHAIN_MISSING: pinned ruff, mypy, pytest, pgserver, alembic, or sqlalchemy import failed" >&2
+  exit 1
+}
+"$VENV/bin/python" -c 'import asyncpg, fastapi, sqlmodel' || {
+  echo "VERIFICATION_TOOLCHAIN_MISSING: sqlmodel, fastapi, or asyncpg import failed - this venv cannot run backend/alembic/env.py; supply a requirements file to the provisioner" >&2
   exit 1
 }
 # `import`ing a package only proves the library is on sys.path; it says nothing

@@ -11,7 +11,7 @@ export interface MessagesBatchActionBarProps {
  */
 export function MessagesBatchActionBar({ selectedCount, batchCreating, onCreateDirections }: MessagesBatchActionBarProps) {
   return (
-    <div className="px-4 md:px-6 py-2 border-t border-neutral-800 bg-neutral-900 flex items-center gap-3 shrink-0">
+    <div className="px-4 md:px-6 py-2 border-t border-neutral-800 bg-workbench-base flex items-center gap-3 shrink-0">
       <span className="text-xs text-neutral-400">{selectedCount} selected</span>
       <button
         onClick={onCreateDirections}

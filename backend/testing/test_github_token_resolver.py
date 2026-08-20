@@ -710,3 +710,90 @@ async def test_forget_project_repo_drops_the_stale_mapping(db_session, token_env
         "this id would reach into a repo the project no longer owns"
     )
     assert str(project.id) not in resolver._project_mint_locks
+
+
+# ---------------------------------------------------------------------------
+# Merge-credential classification: an automated merge must never silently use
+# the operator's own PAT (fix(release): pipeline merges attributed to the
+# operator's PAT)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_credential_does_not_silently_fall_back_to_operator_pat(
+    db_session, monkeypatch
+):
+    """A merge call site must be able to detect and refuse a PAT-sourced token.
+
+    ``get_github_token_for_task`` resolves App discovery, then the stored
+    installation id, then — as a last resort — the user's own PAT, and hands
+    all three back through the SAME ``(token, owner, repo)`` tuple. That is
+    fine for the ~60 read-only callers, but it is exactly the bug this task
+    fixes for a MERGE: a squash-merge authenticated with the operator's PAT
+    mints a commit GitHub attributes to the operator, even though no operator
+    actually did the work (see release_commit_authorship.py, which counts
+    commits by GitHub author identity).
+
+    ``is_operator_pat_token`` is the production guard
+    ``github_pulls.merge_pull_request`` — the single choke point every
+    automated merge call site (release promotion, CI-completion, rollup
+    management) and every explicit human/operator merge lane goes through —
+    now checks by default before submitting a merge. This test drives the
+    resolver down its real PAT-fallback branch (App discovery unavailable, no
+    stored installation id) and proves the token it hands back is correctly
+    classified as operator-owned, while a genuine App/installation token is
+    not misclassified (which would block legitimate automated merges).
+    """
+    import app.github as github
+    import app.github_token_resolver as resolver
+    from app.github_token_resolver import (
+        get_github_token_for_task,
+        is_operator_pat_token,
+    )
+
+    _, task = await _make_task(
+        db_session,
+        owner="acme",
+        repo="pat-only",
+        user_id="u-pat-only",
+        integration=UserIntegration(
+            user_id="u-pat-only",
+            github_pat="encrypted-ref",
+        ),
+    )
+    project_id = str(task.project_id)
+
+    async def app_discovery_unavailable(owner, repo):
+        return None
+
+    async def fake_get_user_secret(ref):
+        assert ref == "encrypted-ref"
+        return "ghp_operatorPersonalAccessToken0000"
+
+    monkeypatch.setattr(
+        github, "get_repo_installation_token", app_discovery_unavailable
+    )
+    monkeypatch.setattr(resolver, "decrypt_field", lambda value: value)
+    monkeypatch.setattr(resolver, "get_user_secret", fake_get_user_secret)
+
+    try:
+        token, owner, repo = await get_github_token_for_task(task.id, db_session)
+        assert (owner, repo) == ("acme", "pat-only")
+        assert token == "ghp_operatorPersonalAccessToken0000"
+
+        # The resolver's plain tuple contract deliberately does NOT flag the
+        # credential kind (the ~60 non-merge callers must stay untouched) — a
+        # merge call site has to classify it itself before authorizing a merge.
+        assert is_operator_pat_token(token) is True
+    finally:
+        resolver._github_token_cache.pop(project_id, None)
+        resolver.forget_project_repo(project_id)
+
+    # A real App/installation-minted token (ghs_/ghu_) must NOT be
+    # misclassified as an operator PAT, or every legitimate automated merge
+    # would also be refused.
+    assert is_operator_pat_token("ghs_installationMintedToken12345") is False
+    assert is_operator_pat_token("ghu_userToServerToken1234567890") is False
+    assert is_operator_pat_token("github_pat_fineGrained1234567890") is True
+    assert is_operator_pat_token(None) is False
+    assert is_operator_pat_token("") is False

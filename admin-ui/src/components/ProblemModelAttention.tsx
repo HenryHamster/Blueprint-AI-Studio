@@ -112,7 +112,7 @@ function PendingItemRow({
               setDismissing(true);
               try { await onDismiss(answer.trim() || undefined); } finally { setDismissing(false); }
             }}
-            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 transition disabled:opacity-50"
+            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-neutral-700 bg-workbench-panel/50 text-neutral-400 hover:bg-workbench-hover hover:text-neutral-100 transition disabled:opacity-50"
             style={{ minWidth: 44 }}
             title="Mark as resolved without action"
           >
@@ -134,7 +134,7 @@ function PendingItemRow({
                 onChange={(e) => setAnswer(e.target.value)}
                 placeholder={pending.type === 'major_decision' ? 'Enter your answer…' : 'Add a note (optional)…'}
                 rows={2}
-                className="flex-1 text-xs bg-neutral-800 border border-neutral-700 rounded px-2 py-1.5 text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none focus:border-emerald-700"
+                className="flex-1 text-xs bg-workbench-panel border border-neutral-700 rounded px-2 py-1.5 text-neutral-200 placeholder-neutral-600 resize-none workbench-focus"
               />
               <button
                 type="button"

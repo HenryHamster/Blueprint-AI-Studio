@@ -186,7 +186,7 @@ function WebhookDeliveryHealthCard({
             ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-200'
             : healthSummary.tone === 'amber'
               ? 'border-amber-500/30 bg-amber-950/20 text-amber-200'
-              : 'border-neutral-700 bg-neutral-900 text-neutral-300'
+              : 'border-neutral-700 bg-workbench-base text-neutral-300'
       }`}
     >
       <div className="flex items-center gap-2">
@@ -195,12 +195,12 @@ function WebhookDeliveryHealthCard({
             deliveryError
               ? 'bg-red-400'
               : loading
-                ? 'bg-neutral-500'
+                ? 'bg-workbench-control'
                 : healthSummary.tone === 'emerald'
                   ? 'bg-emerald-400'
                   : healthSummary.tone === 'amber'
                     ? 'bg-amber-400'
-                    : 'bg-neutral-400'
+                    : 'bg-workbench-control'
           }`}
         />
         <span className="font-medium">
@@ -277,7 +277,7 @@ function DeadLetterPanel({
 
   if (loading) {
     return (
-      <div className="mt-3 rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-ui-md text-neutral-500">
+      <div className="mt-3 rounded-lg border border-neutral-700 bg-workbench-base px-3 py-2 text-ui-md text-neutral-500">
         Loading dead-lettered notifications...
       </div>
     );
@@ -308,7 +308,7 @@ function DeadLetterPanel({
         {deadLetters.map(dl => (
           <div
             key={dl.id}
-            className="flex items-center justify-between gap-2 rounded bg-neutral-900/60 px-2 py-1.5"
+            className="flex items-center justify-between gap-2 rounded bg-workbench-base/60 px-2 py-1.5"
           >
             <div className="min-w-0">
               <div className="text-xs text-neutral-300 truncate">{dl.event_type}</div>
@@ -321,7 +321,7 @@ function DeadLetterPanel({
             <button
               onClick={() => handleRedrive(dl.id)}
               disabled={redrivingIds.has(dl.id)}
-              className="flex items-center gap-1 shrink-0 min-h-[44px] bg-neutral-700 hover:bg-neutral-600 disabled:opacity-30 disabled:cursor-not-allowed text-neutral-200 text-xs py-1 px-2 rounded transition-colors border border-neutral-600"
+              className="flex items-center gap-1 shrink-0 min-h-[44px] bg-workbench-layer hover:bg-workbench-hover disabled:opacity-30 disabled:cursor-not-allowed text-neutral-200 text-xs py-1 px-2 rounded transition-colors border border-neutral-600"
             >
               <RefreshCw className={`w-3 h-3 ${redrivingIds.has(dl.id) ? 'animate-spin' : ''}`} />
               Re-drive
@@ -339,7 +339,7 @@ function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean
     <button
       data-viewport-allow-small-target
       onClick={() => onChange(!enabled)}
-      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-workbench-layer'}`}
     >
       <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
     </button>
@@ -426,14 +426,14 @@ export function SettingsNotificationsSection({
                 const v = parseFloat(e.target.value);
                 onUpdateDailyCostCeiling(isNaN(v) || v <= 0 ? 0 : v);
               }}
-              className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-32 bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono workbench-focus"
             />
             <p className="text-ui-md text-neutral-600 mt-1">
               {dailyCostCeilingUsd === 0 ? 'No ceiling — pipeline runs without a daily cost limit.' : `Pipeline will raise a warning alert (and send a notification, if enabled) when daily spend exceeds $${dailyCostCeilingUsd}. Autonomous tasks keep running.`}
             </p>
           </>
         ) : (
-          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-400 w-32 font-mono">
+          <div className="bg-workbench-base border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-400 w-32 font-mono">
             {dailyCostCeilingUsd === 0 ? 'Disabled' : `$${dailyCostCeilingUsd}`}
           </div>
         )}
@@ -450,9 +450,9 @@ export function SettingsNotificationsSection({
               onChange={e => setUrlDraft(e.target.value)}
               onBlur={handleUrlBlur}
               placeholder="https://hooks.slack.com/services/..."
-              className={`w-full bg-neutral-950 border rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 ${
-                !urlIsValid ? 'border-red-600 text-red-400' : 'border-neutral-700 text-neutral-100'
-              }`}
+              className={`w-full bg-workbench-shell border rounded-lg px-3 py-2 text-base md:text-sm ${
+ !urlIsValid ? 'border-red-600 text-red-400' : 'border-neutral-700 text-neutral-100'
+ } workbench-focus`}
             />
             {!urlIsValid && (
               <p className="text-ui-md text-red-400 mt-1">URL must start with http:// or https://</p>
@@ -460,7 +460,7 @@ export function SettingsNotificationsSection({
             <p className="text-ui-md text-neutral-600 mt-1">POST requests with JSON payloads will be sent to this URL</p>
           </>
         ) : (
-          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500">
+          <div className="bg-workbench-base border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500">
             {webhookUrl ? (
               <span className="font-mono text-neutral-400">{webhookUrl.replace(/^(https?:\/\/[^/]+).*/, '$1/...')}</span>
             ) : (
@@ -524,10 +524,10 @@ export function SettingsNotificationsSection({
               const v = parseInt(e.target.value);
               if (!isNaN(v) && v >= 0 && v <= 3600) onUpdateThrottleSeconds(v);
             }}
-            className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            className="w-32 bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono workbench-focus"
           />
         ) : (
-          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-400 w-32 font-mono">
+          <div className="bg-workbench-base border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-400 w-32 font-mono">
             {throttleSeconds}s
           </div>
         )}
@@ -539,7 +539,7 @@ export function SettingsNotificationsSection({
           <button
             disabled={!webhookUrl || testStatus === 'sending'}
             onClick={handleSendTest}
-            className="flex items-center gap-2 min-h-[44px] bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700"
+            className="flex items-center gap-2 min-h-[44px] bg-workbench-panel hover:bg-workbench-hover disabled:opacity-30 disabled:cursor-not-allowed text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700"
           >
             <Send className="w-3.5 h-3.5" />
             {testStatus === 'sending' ? 'Sending...' : 'Send Test Notification'}

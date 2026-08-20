@@ -134,7 +134,7 @@ export function SrDiagnosticsStack({
                         .map(([layer, cnt]) => (
                           <span
                             key={layer}
-                            className="inline-flex items-center gap-0.5 text-ui-xs px-1.5 py-0.5 rounded border bg-neutral-500/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
+                            className="inline-flex items-center gap-0.5 text-ui-xs px-1.5 py-0.5 rounded border bg-workbench-control/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
                           >
                             <span className="truncate">{layer}</span>
                             <span className="shrink-0">×{cnt}</span>
@@ -182,7 +182,7 @@ export function SrDiagnosticsStack({
               const delta = fp.sr_catch_rate_delta_vs_project_mean;
               const deltaColor = delta == null ? '' : delta >= 0 ? 'text-emerald-400' : 'text-red-400';
               return (
-                <div key={fp.fingerprint} className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-md">
+                <div key={fp.fingerprint} className="bg-workbench-base/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-md">
                   <div className="flex items-center gap-2 mb-0.5">
                     <span className="font-mono text-neutral-400 text-ui-sm">{fp.fingerprint.slice(0, 12)}…</span>
                     <span className="text-neutral-600 text-ui-sm">n={fp.sample_size}</span>

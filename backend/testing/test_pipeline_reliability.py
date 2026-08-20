@@ -174,6 +174,14 @@ async def _run_one_cycle(mocker):
     Patches asyncio.sleep to raise CancelledError, which the worker loop
     catches and uses to break cleanly.
     """
+    # anyio's asyncio backend does `sleep = asyncio.sleep` at module level
+    # and is imported lazily on first use. If that first import happens
+    # while asyncio.sleep is patched below, anyio permanently binds the
+    # raising mock for the rest of the pytest process — any later code
+    # that touches httpx/httpcore then dies with CancelledError at its
+    # first checkpoint. Force the import now, with the real sleep.
+    import anyio._backends._asyncio  # noqa: F401
+
     mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
     with contextlib.suppress(asyncio.CancelledError):
         await _orch_module.orchestrator_worker()
@@ -1941,6 +1949,23 @@ async def test_ci_polling_merged_pr_marks_completed(orch_db, mocker):
             "mergeable": None,
         },
     )
+    # _apply_ci_merged_landed_signal stamps the PR's changed files at landing
+    # (acceptance_gate.stamp_pr_changed_files_at_landing → app.github.get_pr_files,
+    # imported at call time). Left unmocked, the test reaches the live GitHub
+    # API from inside the patched-sleep window and dies with CancelledError
+    # before the COMPLETED commit.
+    mocker.patch(
+        "app.github.get_pr_files",
+        return_value=[
+            {
+                "filename": "app/x.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "changes": 1,
+            }
+        ],
+    )
 
     await _run_one_cycle(mocker)
 
@@ -2866,6 +2891,116 @@ async def test_ci_polling_rollup_parent_stays_evaluating_on_conflict_fix(
         "never pre-emptively when spawning a conflict fix"
     )
     spawn_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_conflict_fix_spawn_binds_immutable_fix_target(
+    orch_db,
+    mocker,
+):
+    """The conflict-fix spawn must pass ``fix_target`` (live PR base/head) and
+    ``reviewed_head_sha`` to ``_spawn_pipeline_task``.
+
+    Regression (incident 2026-08-19, PR #17480): the CI monitor spawned
+    conflict fixes with neither argument, so the spawned fix's ``review_loop``
+    carried no immutable target and ``review_claim_fence`` cancelled it at
+    claim time with "fix has no immutable assigned target" — every
+    orchestrator-spawned conflict fix died in seconds and the conflicting PR
+    wedged permanently.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="Conflict Fix Target Binding", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "conflicting pr task",
+                "branch": "feat/conflicted",
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 3088,
+                "branch": "feat/conflicted",
+                "base_branch": "main",
+                "original_task_id": None,
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            },
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    ci_task.context = {
+        **ci_task.context,
+        "review_loop": {
+            **ci_task.context["review_loop"],
+            "original_task_id": str(ci_task.id),
+        },
+    }
+    session.add(ci_task)
+    await session.commit()
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "dirty",
+            "head": {"sha": "livehead3088"},
+            "base": {"sha": "livebase3088"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "in_progress", "details": []}),
+    )
+    fake_fix = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "resolving conflicts", "pr_number": 3088}],
+        status=TaskStatus.QUEUED,
+    )
+    session.add(fake_fix)
+    await session.commit()
+    await session.refresh(fake_fix)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(fake_fix, True)),
+    )
+
+    await _run_one_cycle(mocker)
+
+    spawn_mock.assert_called_once()
+    spawn_kwargs = spawn_mock.call_args.kwargs
+    assert spawn_kwargs.get("fix_target") == {
+        "project_id": str(project.id),
+        "pr_number": 3088,
+        "base_sha": "livebase3088",
+        "head_sha": "livehead3088",
+    }, (
+        f"conflict-fix spawn must bind fix_target to the exact live PR "
+        f"base/head so review_claim_fence admits the fix instead of "
+        f"cancelling it ('fix has no immutable assigned target'); "
+        f"got kwargs={spawn_kwargs!r}"
+    )
+    assert spawn_kwargs.get("reviewed_head_sha") == "livehead3088", (
+        f"reviewed_head_sha must also be stamped as the fence's fallback "
+        f"admission path when base_sha is unavailable; got kwargs={spawn_kwargs!r}"
+    )
 
 
 @pytest.mark.asyncio

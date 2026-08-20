@@ -18,6 +18,7 @@ from app.message_convergence import (
     RESOLVED_STATUS,
     NEEDS_ACTION_MESSAGE_TYPES,
     CONVERSATIONAL_DECAY_MESSAGE_TYPES,
+    SYSTEM_AUTHORED_FROM_TYPES,
 )
 from app.models import (
     Direction,
@@ -285,6 +286,15 @@ def test_derive_needs_action_false_when_resolved():
 def test_derive_needs_action_false_for_conversational_types():
     assert derive_needs_action(_msg(MessageType.NOTE, "open")) is False
     assert derive_needs_action(_msg(MessageType.FEEDBACK, "open")) is False
+
+
+def test_system_authored_from_types_includes_strategic():
+    # Agent-filed BUG_REPORT/BLOCKER rows are authored via
+    # strategic_completion.py with from_type="strategic". They must be
+    # eligible for the same closing sweeps as "system"/"agent" rows —
+    # otherwise they fall into a from_type no sweep predicate ever selects
+    # and stay OPEN forever.
+    assert SYSTEM_AUTHORED_FROM_TYPES == frozenset({"system", "agent", "strategic"})
 
 
 def test_mark_message_resolved_stamps_audit_trail():

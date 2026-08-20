@@ -57,7 +57,7 @@ function SpawnSignalBadges({ task }: { task: Task }) {
       {autoDecomposed && (
         <span
           title="Finding was auto-decomposed by co-change clustering"
-          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
+          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-workbench-layer/30 border-neutral-600/30 text-neutral-400"
         >
           auto-split
         </span>
@@ -65,7 +65,7 @@ function SpawnSignalBadges({ task }: { task: Task }) {
       {mediumExploration && (
         <span
           title="Medium-scope task kept despite low confidence as an exploration bypass"
-          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
+          className="inline-flex items-center text-ui-sm font-medium border px-1.5 py-0.5 rounded bg-workbench-layer/30 border-neutral-600/30 text-neutral-400"
         >
           explore
         </span>
@@ -101,8 +101,8 @@ function FixLoopBadge({ summary }: { summary: FixLoopSummary[] }) {
     <>
       {sorted.map((entry) => {
         const colorClass = entry.last_exit_reason
-          ? (EXIT_REASON_COLORS[entry.last_exit_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30')
-          : 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+          ? (EXIT_REASON_COLORS[entry.last_exit_reason] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30')
+          : 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
         const label = entry.last_exit_reason?.startsWith('divergence_')
           ? `${entry.loop} div`
           : `${entry.loop} ×${entry.iterations}`;
@@ -314,7 +314,7 @@ function HighlightText({ text, query }: { text: string; query?: string }) {
   return (
     <>
       {text.slice(0, idx)}
-      <mark className="bg-amber-500/30 text-amber-200 rounded-sm px-0.5">{text.slice(idx, idx + query.length)}</mark>
+      <mark className="bg-amber-500/30 text-amber-200 rounded px-0.5">{text.slice(idx, idx + query.length)}</mark>
       {text.slice(idx + query.length)}
     </>
   );
@@ -411,7 +411,7 @@ export function useDurationStats(projectId?: string): DurationStats {
 }
 
 export function getHeartbeatStatus(lastHeartbeat?: string) {
-  if (!lastHeartbeat) return { color: 'bg-neutral-600', text: 'No heartbeat' };
+  if (!lastHeartbeat) return { color: 'bg-workbench-card', text: 'No heartbeat' };
 
   const diffMinutes = Math.max(0, (new Date().getTime() - parseTimestamp(lastHeartbeat).getTime()) / 60000);
   if (diffMinutes < 2) return { color: 'bg-emerald-500', text: 'Healthy (< 2m)' };
@@ -425,7 +425,7 @@ export function TaskTypeBadge({ taskType, expanded }: { taskType?: TaskType; exp
   // since they are presentation the backend contract does not carry.
   const { getLabel } = useTaskCapabilities();
   if (!taskType) return null;
-  const style = TASK_TYPE_STYLES[taskType] ?? { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: Hash, label: taskType };
+  const style = TASK_TYPE_STYLES[taskType] ?? { bg: 'bg-workbench-control/10 border-neutral-500/20', text: 'text-neutral-400', icon: Hash, label: taskType };
   const Icon = style.icon;
   const label = getLabel(taskType);
   return (
@@ -456,7 +456,7 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
               <span className={`inline-block text-ui-xs uppercase px-1 rounded mr-1 border ${
                 f.finding_challenge.agreement === 'agrees' ? 'bg-emerald-900/30 text-emerald-500 border-emerald-700/30' :
                 f.finding_challenge.agreement === 'disagrees' ? 'bg-red-900/30 text-red-400 border-red-700/30' :
-                'bg-neutral-800 text-neutral-500 border-neutral-700/30'
+                'bg-workbench-panel text-neutral-500 border-neutral-700/30'
               }`} title={f.finding_challenge.reason}>
                 {f.finding_challenge.agreement === 'agrees' ? '✓ confirmed' :
                  f.finding_challenge.agreement === 'disagrees' ? '✗ challenged' :
@@ -519,7 +519,7 @@ function ErrorLogsBlock({ errorLogs }: { errorLogs: string }) {
       {/* eslint-disable-next-line viewport/min-touch-target -- dense toolbar */}
       <button
         onClick={(e) => { e.stopPropagation(); handleCopy(); }}
-        className="absolute top-2 right-2 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-900/80 hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400"
+        className="absolute top-2 right-2 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity bg-workbench-base/80 hover:bg-workbench-hover text-neutral-400 hover:text-emerald-400"
         title="Copy full error logs"
       >
         {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
@@ -760,7 +760,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           onCtrlClick(task.id);
         }
       }}
-      className={`relative group bg-neutral-900 rounded-lg border border-l-4 ${borderColor} transition-shadow outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 ${compact ? 'p-2' : 'px-3 py-2.5'} ${task.status === 'CANCELLED' ? 'opacity-60' : ''} ${isChild ? 'border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-y-neutral-800 border-r-neutral-800 shadow-sm hover:shadow-md hover:border-y-neutral-700 hover:border-r-neutral-700'}`}
+      className={`relative group bg-workbench-base rounded-lg border border-l-4 ${borderColor} transition-shadow outline-none ${compact ? 'p-2' : 'px-3 py-2.5'} ${task.status === 'CANCELLED' ? 'opacity-60' : ''} ${isChild ? 'border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-y-neutral-800 border-r-neutral-800 shadow-sm hover:shadow-md hover:border-y-neutral-700 hover:border-r-neutral-700'} workbench-focus`}
     >
       <div className="flex items-start gap-2 mb-1.5">
         <div className="flex-1 min-w-0">
@@ -774,7 +774,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 title="Approve"
                 onClick={(e) => { e.stopPropagation(); onApprove(task.id); }}
                 disabled={!!actionLoading}
-                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
+                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-workbench-panel hover:bg-workbench-hover text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
               >
                 <CheckCircle className="w-3.5 h-3.5" />
               </button>
@@ -784,7 +784,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 title={cancelTitle}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
                 disabled={!!actionLoading}
-                className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
+                className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-workbench-panel hover:bg-workbench-hover text-neutral-400 hover:text-neutral-100'}`}
               >
                 <XCircle className="w-3.5 h-3.5" />
               </button>
@@ -794,7 +794,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 title="Retry"
                 onClick={(e) => { e.stopPropagation(); onRetry(task.id); }}
                 disabled={!!actionLoading}
-                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
+                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-workbench-panel hover:bg-workbench-hover text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
               </button>
@@ -804,7 +804,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 title={confirmAction === 'archive' ? `Confirm archive (${confirmCountdown}s)` : archiveTitle}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('archive', () => onArchive(task.id)); }}
                 disabled={!!actionLoading}
-                className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
+                className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-workbench-panel hover:bg-workbench-hover text-neutral-400 hover:text-neutral-100'}`}
               >
                 <Archive className="w-3.5 h-3.5" />
               </button>
@@ -813,7 +813,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               <button
                 title="Duplicate task"
                 onClick={(e) => { e.stopPropagation(); onDuplicate(task); }}
-                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
+                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-workbench-panel hover:bg-workbench-hover text-neutral-400 hover:text-neutral-100 transition-colors min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
               >
                 <Copy className="w-3.5 h-3.5" />
               </button>
@@ -835,7 +835,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <Shield className="w-3 h-3" />Approval
           </span>
         )}
-        <span className={`text-ui-sm px-1.5 py-0.5 rounded font-mono ${attemptNumber > 1 ? 'bg-neutral-800 text-neutral-300' : 'bg-neutral-800/50 text-neutral-500'}`}>
+        <span className={`text-ui-sm px-1.5 py-0.5 rounded font-mono ${attemptNumber > 1 ? 'bg-workbench-panel text-neutral-300' : 'bg-workbench-panel/50 text-neutral-500'}`}>
           #{attemptNumber}
         </span>
         {task.fix_loop_summary && task.fix_loop_summary.length > 0 && (
@@ -852,7 +852,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); onDirectionClick(directionId); }}
-              className="inline-flex items-center gap-0.5 text-ui-sm text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
+              className="inline-flex items-center gap-0.5 text-ui-sm text-neutral-500 hover:text-neutral-200 hover:bg-workbench-hover rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
               title={directionTooltip}
             >
               <Compass className="w-3 h-3" />
@@ -909,7 +909,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           if (landedOnIntegration === false || nonMergeReason) {
             return (
               <span
-                className="inline-flex items-center text-ui-sm font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-neutral-500/10 border-neutral-500/20 text-neutral-400"
+                className="inline-flex items-center text-ui-sm font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border bg-workbench-control/10 border-neutral-500/20 text-neutral-400"
                 title={nonMergeReason ? `Completed without merge: ${nonMergeReason}` : 'PR closed without merge'}
               >
                 <X className="w-3 h-3 mr-1 shrink-0" />
@@ -982,8 +982,8 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       {task.status === 'IN_PROGRESS' && task.latest_status_message && (
         <div className="flex items-center gap-1.5 mb-1.5">
           <span className="relative flex h-1.5 w-1.5 shrink-0">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-neutral-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-neutral-500" />
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-workbench-control opacity-75" />
+            <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-workbench-control" />
           </span>
           <span className="text-ui-md text-neutral-400 truncate">{parsePhase(task.latest_status_message)}</span>
         </div>
@@ -1004,7 +1004,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       )}
 
       {!compact && task.latest_status_message ? (
-        <div className="bg-neutral-950 text-neutral-400 text-ui-md rounded-lg mb-2 border border-neutral-800/50 font-mono">
+        <div className="bg-workbench-shell text-neutral-400 text-ui-md rounded-lg mb-2 border border-neutral-800/50 font-mono">
           <button
             data-viewport-allow-small-target
             onClick={() => setStatusExpanded(!statusExpanded)}
@@ -1201,7 +1201,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           {task.status !== 'QUEUED' && onTrack ? (
             <button
               onClick={(e) => { e.stopPropagation(); onTrack(task); }}
-              className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors text-ui-sm min-h-[44px] sm:min-h-auto ${isTracked ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800'}`}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors text-ui-sm min-h-[44px] sm:min-h-auto ${isTracked ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30' : 'text-neutral-500 hover:text-neutral-300 hover:bg-workbench-hover'}`}
               title={isTracked ? 'Tracking live' : 'Track task'}
             >
               <Radio className="w-3 h-3" />
@@ -1226,20 +1226,20 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           </button>
           {!showChangesForm ? (
             <div className="flex gap-2">
-              <button onClick={() => setShowChangesForm(true)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-2 min-h-[44px] rounded-md text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
+              <button onClick={() => setShowChangesForm(true)} className="flex-1 bg-workbench-panel hover:bg-workbench-hover text-neutral-300 border border-neutral-700 py-2 min-h-[44px] rounded-md text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
                 <RotateCcw className="w-3.5 h-3.5" /> Request Changes
               </button>
-              <button title={confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Reject — cancels this task without merging the PR'} onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`px-3 py-2 min-h-[44px] rounded-md text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800/50 hover:bg-neutral-700 text-neutral-500 border-neutral-700'}`}>
+              <button title={confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Reject — cancels this task without merging the PR'} onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`px-3 py-2 min-h-[44px] rounded-md text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-workbench-panel/50 hover:bg-workbench-hover text-neutral-500 border-neutral-700'}`}>
                 {confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Reject'}
               </button>
             </div>
           ) : (
-            <div className="flex flex-col gap-2 bg-neutral-800/50 rounded-md p-2 border border-neutral-700">
+            <div className="flex flex-col gap-2 bg-workbench-panel/50 rounded-md p-2 border border-neutral-700">
               <textarea
                 value={changesFeedback}
                 onChange={e => setChangesFeedback(e.target.value)}
                 placeholder="Describe what needs to change..."
-                className="w-full bg-neutral-900 border border-neutral-700 rounded text-xs text-neutral-200 p-2 resize-none focus:outline-none focus:border-neutral-500 placeholder-neutral-600"
+                className="w-full bg-workbench-base border border-neutral-700 rounded text-xs text-neutral-200 p-2 resize-none placeholder-neutral-600 workbench-focus"
                 rows={3}
               />
               <div className="flex gap-2">
@@ -1275,16 +1275,16 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               <textarea
                 value={editPrompt}
                 onChange={e => setEditPrompt(e.target.value)}
-                className={`w-full bg-neutral-950 text-neutral-100 rounded px-2 py-1.5 text-xs resize-y focus:outline-none focus:ring-1 focus:ring-blue-500/50 min-h-[80px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'}`}
+                className={`w-full bg-workbench-shell text-neutral-100 rounded px-2 py-1.5 text-xs resize-y min-h-[80px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'} workbench-focus`}
               />
               <div className="flex gap-1.5">
                 <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
                   disabled={!!actionLoading || editPrompt.trim() === ''}
-                  className={`flex-1 border py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 min-h-[44px] sm:min-h-auto ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                  className={`flex-1 border py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 min-h-[44px] sm:min-h-auto ${editPrompt.trim() === '' ? 'bg-workbench-panel text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
                   {actionLoading === 'edit' && <Activity className="w-3 h-3 animate-spin" />}Save
                 </button>
                 <button onClick={() => { setEditing(false); setEditPrompt(task.description || ''); }}
-                  className="px-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1 rounded text-xs transition-colors min-h-[44px] sm:min-h-auto">
+                  className="px-2 bg-workbench-panel hover:bg-workbench-hover text-neutral-400 border border-neutral-700 py-1 rounded text-xs transition-colors min-h-[44px] sm:min-h-auto">
                   Cancel
                 </button>
               </div>
@@ -1293,7 +1293,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           <div className="mt-2" ref={overflowMenuRef}>
             <button
               onClick={() => setShowOverflowMenu(v => !v)}
-              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
+              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-workbench-hover transition-colors min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
               title="More actions"
             >
               <MoreHorizontal className="w-3.5 h-3.5" />
@@ -1303,13 +1303,13 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 <button onClick={() => { if (task.failure_class === 'CODE_ERROR') { setEditing(true); setShowOverflowMenu(false); } else { onRetry(task.id); setShowOverflowMenu(false); } }} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 min-h-[44px] sm:min-h-auto ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
                   {actionLoading === 'retry' ? <Activity className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} {task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class] ? FAILURE_CLASS_CONFIG[task.failure_class].retryLabel : 'Retry'}
                 </button>
-                <button onClick={() => { setEditing(true); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 min-h-[44px] sm:min-h-auto ${actionLoading ? 'opacity-50 pointer-events-none cursor-not-allowed' : ''}`} title="Edit prompt">
+                <button onClick={() => { setEditing(true); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 bg-workbench-panel hover:bg-workbench-hover text-neutral-300 border border-neutral-700 min-h-[44px] sm:min-h-auto ${actionLoading ? 'opacity-50 pointer-events-none cursor-not-allowed' : ''}`} title="Edit prompt">
                   <Pencil className="w-3 h-3" />
                 </button>
-                <button onClick={() => { handleDestructiveClick('dismiss', () => { onDismiss(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={dismissTitle}>
+                <button onClick={() => { handleDestructiveClick('dismiss', () => { onDismiss(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-workbench-panel hover:bg-workbench-hover text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={dismissTitle}>
                   {actionLoading === 'dismiss' ? <Activity className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
                 </button>
-                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={archiveTitle}>
+                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-workbench-panel hover:bg-workbench-hover text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={archiveTitle}>
                   {actionLoading === 'archive' ? <Activity className="w-3 h-3 animate-spin" /> : <Archive className="w-3 h-3" />}{confirmAction === 'archive' ? ` (${confirmCountdown}s)` : ''}
                 </button>
               </div>
@@ -1323,17 +1323,17 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 <textarea
                   value={editPrompt}
                   onChange={e => setEditPrompt(e.target.value)}
-                  className={`w-full bg-neutral-950 text-neutral-100 rounded px-2 py-1.5 text-xs resize-y focus:outline-none focus:ring-1 focus:ring-blue-500/50 min-h-[120px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'}`}
+                  className={`w-full bg-workbench-shell text-neutral-100 rounded px-2 py-1.5 text-xs resize-y min-h-[120px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'} workbench-focus`}
                 />
                 <div className="text-ui-sm text-neutral-500">{editPrompt.length} characters</div>
                 <div className="flex gap-2">
                   <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
                     disabled={!!actionLoading || editPrompt.trim() === ''}
-                    className={`flex-1 border py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                    className={`flex-1 border py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${editPrompt.trim() === '' ? 'bg-workbench-panel text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
                     {actionLoading === 'edit' && <Activity className="w-3.5 h-3.5 animate-spin" />}Save
                   </button>
                   <button onClick={() => { setEditing(false); setEditPrompt(task.description || ''); }}
-                    className="px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1.5 rounded text-xs transition-colors">
+                    className="px-3 bg-workbench-panel hover:bg-workbench-hover text-neutral-400 border border-neutral-700 py-1.5 rounded text-xs transition-colors">
                     Cancel
                   </button>
                 </div>
@@ -1344,14 +1344,14 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                   <button onClick={() => onRetry(task.id)} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
                     {actionLoading === 'retry' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />} Retry
                   </button>
-                  <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+                  <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-workbench-panel hover:bg-workbench-hover text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
                     <Pencil className="w-3.5 h-3.5" /> Edit
                   </button>
-                  <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={dismissTitle}>
+                  <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-workbench-panel hover:bg-workbench-hover text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={dismissTitle}>
                     {actionLoading === 'dismiss' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
                   </button>
                 </div>
-                <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border min-h-[44px] sm:min-h-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border min-h-[44px] sm:min-h-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-workbench-panel hover:bg-workbench-hover text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
                   {actionLoading === 'archive' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
                   {confirmAction === 'archive' ? `Click again to archive (${confirmCountdown}s)` : 'Archive'}
                 </button>

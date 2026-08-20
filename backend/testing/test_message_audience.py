@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from testing.fixgate_attribution import format_offender_marker
+
 import ast
 import os
 from textwrap import dedent
@@ -395,6 +397,8 @@ def test_all_alert_policy_event_types_have_registry_entry_or_explicit_audience()
         + "\n\nAdd each to _EVENT_AUDIENCE_REGISTRY in backend/app/message_audience.py "
         "or set an explicit ``audience`` on its AlertEventPolicy in "
         "backend/app/alert_policy.py."
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -440,6 +444,8 @@ def test_runner_health_alert_event_constants_are_registered():
     assert not missing, (
         "Runner health alert event types missing from the audience registry: "
         + ", ".join(sorted(missing))
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -464,6 +470,8 @@ def test_conversation_event_types_surface_drift_guard():
         + "\n".join(f"  - {et!r}" for et in sorted(missing))
         + "\n\nAdd each to _EVENT_AUDIENCE_REGISTRY in "
         "backend/app/message_audience.py."
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -524,6 +532,8 @@ def test_operator_visible_undotted_event_types_not_conversational_must_be_explic
         "backend/app/project_message_creation.py (conversational) or add to "
         "_NON_CONVERSATIONAL_OPERATOR_LEDGER_TYPES in this test (intentionally "
         "non-conversational)."
+        + "\n"
+        + format_offender_marker(missing)
     )
 
     # Sanity-check: every allowlist entry is registered and operator-visible.
@@ -696,7 +706,10 @@ def test_logical_event_pairs_have_consistent_audiences():
         + "\n\nFix by aligning the audience in one or both registries in "
         "backend/app/message_audience.py, then update _LOGICAL_EVENT_PAIRS if "
         "the events are no longer equivalent."
+        + "\n"
+        + format_offender_marker(mismatched)
     )
+
 
 
 def test_logical_event_pairs_are_registered_in_their_respective_tables():
@@ -711,13 +724,20 @@ def test_logical_event_pairs_are_registered_in_their_respective_tables():
     unknown: list[str] = []
     for internal_key, webhook_key in pairs.items():
         if internal_key not in internal_registry:
-            unknown.append(f"  internal key {internal_key!r} not in _EVENT_AUDIENCE_REGISTRY")
+            unknown.append(
+                f"  internal key {internal_key!r} not in _EVENT_AUDIENCE_REGISTRY"
+            )
         if webhook_key not in webhook_keys:
-            unknown.append(f"  webhook key {webhook_key!r} not in _WEBHOOK_EVENT_AUDIENCE")
+            unknown.append(
+                f"  webhook key {webhook_key!r} not in _WEBHOOK_EVENT_AUDIENCE"
+            )
     assert not unknown, (
         "_LOGICAL_EVENT_PAIRS references keys absent from their registry:\n"
         + "\n".join(unknown)
+        + "\n"
+        + format_offender_marker(unknown)
     )
+
 
 
 def _get_all_webhook_event_keys() -> set[str]:
@@ -751,7 +771,10 @@ def test_valid_notification_events_all_present_in_webhook_registry():
         "operator has enabled it.\n\n"
         "Fix: add each missing event to _WEBHOOK_EVENT_AUDIENCE in "
         "backend/app/message_audience.py with its intended audience classification."
+        + "\n"
+        + format_offender_marker(missing)
     )
+
 
 
 # ── Strategist reply audience contract ──────────────────────────────────
@@ -1595,6 +1618,8 @@ def test_no_operator_visible_emitter_bypasses_audience_gate():
         "(stamp_message_audience/route_event). Every operator-reaching emitter must "
         "be stamped so a fail-closed audience classification is guaranteed:\n"
         + "\n".join(all_offenders)
+        + "\n"
+        + format_offender_marker(all_offenders)
     )
 
 
@@ -2229,6 +2254,8 @@ def test_alert_scan_resolve_module_constant_picks_first_assignment():
     assert not offenders, (
         "'pr_merged' (first assignment) IS registered — expected no offenders, "
         "got: " + "\n".join(offenders)
+        + "\n"
+        + format_offender_marker(offenders)
     )
 
 
@@ -2297,6 +2324,8 @@ def test_no_alert_constructor_uses_unregistered_event_type():
         "the alert will silently disappear from the operator UI.\n"
         "Fix: add each event_type to _EVENT_AUDIENCE_REGISTRY with its intended audience:\n"
         + "\n".join(all_offenders)
+        + "\n"
+        + format_offender_marker(all_offenders)
     )
 
 
@@ -2340,6 +2369,8 @@ def test_no_alert_constructor_bypasses_event_type_gate():
         "without an event_type will be silently excluded from the operator badge/preview. "
         "Fix by adding event_type=<registered_key> to the Alert(...) call (register the "
         "key in message_audience.py if needed):\n" + "\n".join(all_offenders)
+        + "\n"
+        + format_offender_marker(all_offenders)
     )
 
 
@@ -2675,6 +2706,8 @@ def test_operator_visible_message_audience_filter_call_sites_updated():
         "(fail-closed, no NULL pass-through), not operator_visible_audience_filter "
         "(which retains NULL for Task.context):\n"
         + "\n".join(offenders)
+        + "\n"
+        + format_offender_marker(offenders)
     )
 
 
@@ -2718,6 +2751,8 @@ def test_projectmessage_table_args_include_audience_index():
     assert "ix_projectmessage_context_audience" in index_names, (
         "ProjectMessage.__table_args__ must include ix_projectmessage_context_audience; "
         f"found: {sorted(index_names)}"
+        + "\n"
+        + format_offender_marker(index_names)
     )
 
 
@@ -2972,6 +3007,8 @@ def test_no_operator_reply_resolves_to_non_operator_audience():
         "Fix: default event_type to 'question_answer' (OPERATOR_FYI) when reply_to is "
         "present, or use another registered operator-visible event_type explicitly:\n"
         + "\n".join(all_offenders)
+        + "\n"
+        + format_offender_marker(all_offenders)
     )
 
 
@@ -3558,4 +3595,6 @@ def test_no_event_type_invocation_uses_unregistered_event_type():
         "validates the event_type at runtime before passing it through the "
         "stamp gate:\n"
         + "\n".join(all_offenders)
+        + "\n"
+        + format_offender_marker(all_offenders)
     )

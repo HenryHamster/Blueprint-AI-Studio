@@ -666,6 +666,31 @@ async def get_version_lifecycle(
                     project_id,
                 )
 
+        # Detected deployed-gate latch (additive, read-only). Reuses the Alert row
+        # the reaper sweep already persisted when a blocked candidate carries the
+        # repair to the DEPLOYED implementation of its own blocking gate — a
+        # cleanly-run qualification returning a scoring blocker never sets
+        # is_permanent_gate_incapacity (that flag only fires on a same-signature
+        # INFRA-error streak), so this is the only signal that surfaces the
+        # hotfix lane for a latched scoring gate. Best-effort: a failure here
+        # must never break the lifecycle read.
+        gate_latch: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            try:
+                from app.release_gate_latch import (  # noqa: PLC0415
+                    resolve_active_gate_latch_alert,
+                )
+
+                gate_latch = await resolve_active_gate_latch_alert(
+                    session, open_row.id
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] gate latch resolve failed "
+                    "for project %s; serving lifecycle without the signal",
+                    project_id,
+                )
+
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
             merged_count = await count_merged_since(
@@ -905,6 +930,13 @@ async def get_version_lifecycle(
                 # Already resolved above so qualification_state sub_scores could
                 # be patched to match — both surfaces share one source of truth.
                 "dimension_states": _open_dim_states,
+                # Detected deployed-gate latch (additive; nullable). Distinct from
+                # last_qualification.is_permanent_gate_incapacity: that flag only
+                # fires on a same-signature INFRA-error streak, so a clean
+                # qualification blocked by a scoring gate the candidate itself
+                # repairs (in the DEPLOYED module) would otherwise never reveal
+                # the hotfix lane. See app.release_gate_latch.
+                "gate_latch": gate_latch,
             }
 
         history_rows = (

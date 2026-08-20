@@ -187,7 +187,7 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
         Warm Reuse vs Cost / Merged PR
         {driftReadout}
       </h2>
-      <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3">
+      <div className="bg-workbench-base border border-neutral-800 rounded-lg p-3">
         <ResponsiveContainer width="100%" height={200}>
           <LineChart data={merged} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
             <CartesianGrid stroke={GRID_COLOR} vertical={false} />

@@ -113,7 +113,7 @@ export function RecentErrorsWidget() {
     return (
       <section aria-label="Recent orchestrator errors">
         <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 h-14 animate-pulse" />
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 h-14 animate-pulse" />
       </section>
     );
   }
@@ -123,7 +123,7 @@ export function RecentErrorsWidget() {
       <section aria-label="Recent orchestrator errors">
         <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
         <div
-          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
+          className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
           role="status"
         >
           <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
@@ -141,7 +141,7 @@ export function RecentErrorsWidget() {
       <section aria-label="Recent orchestrator errors">
         <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
         <div
-          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2"
+          className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2"
           role="status"
         >
           <CheckCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
@@ -159,12 +159,12 @@ export function RecentErrorsWidget() {
   return (
     <section aria-label="Recent orchestrator errors">
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Orchestrator Errors</h2>
-      <div className="bg-neutral-900/50 border border-red-500/30 rounded-lg overflow-hidden">
+      <div className="bg-workbench-base/50 border border-red-500/30 rounded-lg overflow-hidden">
         <div className="flex items-center">
           <button
             type="button"
             onClick={() => setExpanded(e => !e)}
-            className="flex-1 px-3 py-2 flex items-center gap-2 text-left hover:bg-neutral-900/80 focus:outline-none focus:bg-neutral-900/80"
+            className="flex-1 px-3 py-2 flex items-center gap-2 text-left hover:bg-workbench-hover/80 focus:bg-workbench-base/80 workbench-focus"
             aria-expanded={expanded}
             aria-controls="orchestrator-errors-list"
           >
@@ -186,7 +186,7 @@ export function RecentErrorsWidget() {
             type="button"
             onClick={(e) => { e.stopPropagation(); acknowledgeAll(); }}
             title="Acknowledge all errors"
-            className="px-2 py-2 text-neutral-400 hover:text-emerald-400 transition-colors focus:outline-none"
+            className="px-2 py-2 text-neutral-400 hover:text-emerald-400 transition-colors workbench-focus"
           >
             <EyeOff className="w-4 h-4" />
           </button>
@@ -195,7 +195,7 @@ export function RecentErrorsWidget() {
             type="button"
             onClick={(e) => { e.stopPropagation(); copyAll(); }}
             title="Copy all errors to clipboard"
-            className="px-2 py-2 text-neutral-400 hover:text-neutral-100 transition-colors focus:outline-none"
+            className="px-2 py-2 text-neutral-400 hover:text-neutral-100 transition-colors workbench-focus"
           >
             {copied
               ? <Check className="w-4 h-4 text-emerald-400" />
@@ -213,7 +213,7 @@ export function RecentErrorsWidget() {
               return (
                 <li
                   key={bucketId}
-                  className="px-3 py-2 hover:bg-neutral-900/80 focus-within:bg-neutral-900/80"
+                  className="px-3 py-2 hover:bg-workbench-hover/80 focus-within:bg-workbench-base/80"
                   onMouseEnter={() => setHoveredBucket(bucketId)}
                   onMouseLeave={() => setHoveredBucket(null)}
                   onFocus={() => setHoveredBucket(bucketId)}
@@ -247,7 +247,7 @@ export function RecentErrorsWidget() {
                     </span>
                   </div>
                   {isHovered && bucket.sample_message && (
-                    <pre className="mt-2 text-ui-sm text-neutral-400 bg-neutral-950/60 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-32">
+                    <pre className="mt-2 text-ui-sm text-neutral-400 bg-workbench-shell/60 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-32">
                       {bucket.sample_message}
                     </pre>
                   )}

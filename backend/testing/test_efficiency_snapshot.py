@@ -1063,6 +1063,22 @@ async def test_efficiency_snapshot_service_only_starts_on_leader():
 
 
 @pytest.mark.asyncio
+async def test_efficiency_snapshot_service_ticks_immediately_after_start():
+    """A newly elected worker must repair a stale series without an hour wait."""
+    import inspect
+
+    from app import lifecycle
+
+    source = inspect.getsource(lifecycle)
+    service = source[source.index("async def _efficiency_snapshot_service") :]
+    service = service[: service.index("efficiency_snapshot_task =")]
+    assert service.index("while True:") < service.index("try:")
+    assert service.index("except Exception as scan_exc") < service.index(
+        "await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_efficiency_axes_endpoint_returns_shape(client: AsyncClient, db_session):
     project = make_project(design_doc={})
     db_session.add(project)
@@ -1083,6 +1099,8 @@ async def test_efficiency_axes_endpoint_returns_shape(client: AsyncClient, db_se
     assert "axes" in data
     assert "baseline_captured_at" in data
     assert "last_snapshot_at" in data
+    assert data["cohort_task_count"] == 1
+    assert data["cohort_capped"] is False
     for axis in ALL_AXES:
         assert axis in data["axes"]
         entry = data["axes"][axis]
@@ -3469,6 +3487,66 @@ def test_compute_llm_cost_breakdown_approximate_priced():
     assert "openai:gpt-5.3-codex-spark" in result["approximate_priced_combos"]
     assert "openai:gpt-5.3-codex-spark" not in result["unpriced_combos"]
     assert result["unpriced_combos"] == []
+
+
+def test_effort_model_coverage_is_spend_weighted_with_run_fraction_secondary():
+    """A high-token unpriced run must dominate the honesty headline.
+
+    The run-count fraction remains available as a diagnostic, but the surfaced
+    coverage must follow estimated spend so a 1M-token blind spot is not read as
+    the same risk as a 1K-token blind spot.
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    priced_input = 1_000
+    priced_output = 100
+    unpriced_input = 1_000_000
+    unpriced_output = 100_000
+    priced_input_rate, priced_output_rate = LLM_TOKEN_PRICING[
+        ("anthropic", "claude-sonnet-4-6")
+    ]
+    priced_cost = priced_input * priced_input_rate + priced_output * priced_output_rate
+    estimated_unpriced = (
+        unpriced_input * UNPRICED_FALLBACK_INPUT_RATE
+        + unpriced_output * UNPRICED_FALLBACK_OUTPUT_RATE
+    )
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "medium"}],
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": priced_input,
+                "total_output_tokens": priced_output,
+                "llm_call_count": 1,
+            },
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "effort": "medium"}],
+            provider="fakeprovider",
+            model="mystery-model",
+            api_call_summary={
+                "total_input_tokens": unpriced_input,
+                "total_output_tokens": unpriced_output,
+                "llm_call_count": 1,
+            },
+        ),
+    ]
+
+    totals = compute_effort_model_efficiency(tasks)["totals"]
+
+    assert totals["task_coverage_fraction"] == 0.5
+    assert totals["unpriced_coverage_fraction"] == round(
+        priced_cost / (priced_cost + estimated_unpriced), 4
+    )
+    assert totals["unpriced_coverage_fraction"] != totals["task_coverage_fraction"]
+    assert totals["unpriced_input_tokens"] == unpriced_input
+    assert totals["estimated_unpriced_cost_usd"] == round(estimated_unpriced, 6)
 
 
 def test_compute_llm_cost_breakdown_merge_rate_and_cost_per_merge():
@@ -12325,6 +12403,68 @@ async def test_write_snapshot_writes_to_efficiency_table(db_session):
     assert rows[0].blob["captured_at"] == snap["captured_at"]
     assert rows[0].metric_def_version == METRIC_DEF_VERSION
     assert rows[0].blob[AXIS_COST_PER_MERGED_PR] == snap[AXIS_COST_PER_MERGED_PR]
+
+
+@pytest.mark.asyncio
+async def test_cost_telemetry_reconciliation_omits_per_task_but_keeps_scalars(db_session):
+    """_compute_cost_telemetry_reconciliation must not persist the row-per-task
+    ``per_task`` detail into the snapshot blob — it has no readers on the
+    snapshot-history path (see admin_digest.py for the live-recompute consumer
+    that still gets per_task) and dominates the persisted blob's size. The
+    scalars the drift alert depends on (absolute_delta, tolerance, task_count,
+    within_tolerance) must still be present.
+    """
+    from app.efficiency_snapshot import _compute_cost_telemetry_reconciliation
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_merged_task(project.id)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    reconciliation = _compute_cost_telemetry_reconciliation([task])
+    assert reconciliation is not None
+    assert "per_task" not in reconciliation, (
+        "per_task must be stripped before the reconciliation enters the "
+        "persisted snapshot blob"
+    )
+    for scalar in ("absolute_delta", "tolerance", "task_count", "within_tolerance"):
+        assert scalar in reconciliation, f"drift-alert scalar {scalar!r} must survive"
+    assert reconciliation["task_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="project_efficiency_snapshot dual-write uses Postgres ON CONFLICT",
+)
+async def test_persisted_snapshot_blob_excludes_reconciliation_per_task(db_session):
+    """The persisted project_efficiency_snapshot blob's cost_telemetry_reconciliation
+    block must not carry per_task — regression test for the 8 MB unread-field cut.
+    """
+    from app.project_telemetry import read_recent_efficiency_snapshots
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_merged_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    rows = await read_recent_efficiency_snapshots(db_session, project.id)
+    assert len(rows) == 1
+    reconciliation = rows[0].blob.get("cost_telemetry_reconciliation")
+    assert reconciliation is not None, "task has priced provider/model, reconciliation must run"
+    assert "per_task" not in reconciliation
+    assert "task_count" in reconciliation
 
 
 @pytest.mark.asyncio

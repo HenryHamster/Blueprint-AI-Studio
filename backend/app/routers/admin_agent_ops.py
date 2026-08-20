@@ -850,19 +850,17 @@ class AgentAnnotation(BaseModel):
     severity: str | None = None  # low/medium/high (for issues)
     # size_breach fields — programmatic signal from a test-invariant failure.
     # Server bumps the limit (policy-driven, not agent-judgment) and returns
-    # new_limit; the agent applies it to module_size_limits.json and commits.
-    # A governed file also receives ``governing_cap_repair`` directing the
-    # paired source-constant edit required in that same task.
-    # For chronic offenders the server refuses the silent bump and returns
-    # is_chronic=True without new_limit; pass force_chronic_override=True with
-    # explicit operator approval to grant the bump anyway.
+    # new_limit, plus ``governing_cap_repair`` naming the paired source-constant
+    # edit a governed file needs in that same task. Chronic offenders get
+    # is_chronic=True and NO new_limit: decompose, or raise a blocker.
+    # force_chronic_override is the OPERATOR-approval bypass and is refused
+    # here -- this route takes an agent task JWT, so there is no operator on it
+    # and honouring the flag lets an agent grant itself the bypass.
     file_path: str | None = None
     current_size: int | None = None
     change_summary: str | None = None
     section: str = "backend"  # which module_size_limits.json section the file lives in
-    force_chronic_override: bool = (
-        False  # operator-approval bypass for chronic offenders
-    )
+    force_chronic_override: bool = False  # refused on this route; see above
 
 
 _ANNOTATION_TYPE_MAP = {
@@ -960,9 +958,10 @@ async def agent_annotate(
             file_path.strip(),
             current_size,
             payload.section,
-            override_chronic=payload.force_chronic_override,
+            # Never payload-driven: an agent token carries no operator approval.
+            override_chronic=False,
         )
-        if verdict["is_chronic"] and not payload.force_chronic_override:
+        if verdict["is_chronic"]:
             content = (
                 f"Size breach (chronic offender): {file_path} grew to {current_size} lines. "
                 f"{verdict['reason']} Change: {change_summary.strip()}"
@@ -975,6 +974,7 @@ async def agent_annotate(
                 "is_chronic": True,
                 "bump_count": verdict["bump_count"],
                 "change_summary": change_summary.strip(),
+                "force_chronic_override_refused": payload.force_chronic_override,
             }
         else:
             new_limit = verdict["suggested_new_limit"]
@@ -1063,6 +1063,7 @@ async def agent_annotate(
         if ctx.get("is_chronic"):
             response["is_chronic"] = True
             response["bump_count"] = ctx["bump_count"]
+            response["force_chronic_override_refused"] = ctx["force_chronic_override_refused"]
     return response
 
 

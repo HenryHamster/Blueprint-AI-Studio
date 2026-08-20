@@ -217,7 +217,7 @@ export function RuntimeAccountsPanel({
                 key={shortcut.section}
                 type="button"
                 onClick={() => onOpenRuntimeSettingsSection?.(shortcut.section)}
-                className="inline-flex min-h-11 items-center rounded-md border border-neutral-800 bg-neutral-950/60 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-8 sm:text-xs"
+                className="inline-flex min-h-11 items-center rounded-md border border-neutral-800 bg-workbench-shell/60 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-8 sm:text-xs"
                 title={shortcut.title}
               >
                 {shortcut.label}
@@ -229,7 +229,7 @@ export function RuntimeAccountsPanel({
                 aria-label="Usage window"
                 value={windowHours}
                 onChange={event => setWindowHours(Number(event.target.value))}
-                className="min-h-11 rounded border border-neutral-700 bg-neutral-900 px-2 text-sm text-neutral-300 focus:border-neutral-500 focus:outline-none sm:min-h-8 sm:text-xs"
+                className="min-h-11 rounded border border-neutral-700 bg-workbench-base px-2 text-sm text-neutral-300 sm:min-h-8 sm:text-xs workbench-focus"
               >
                 {WINDOW_OPTIONS.map(option => (
                   <option key={option.value} value={option.value}>{option.label}</option>

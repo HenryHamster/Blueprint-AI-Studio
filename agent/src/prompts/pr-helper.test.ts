@@ -401,6 +401,83 @@ exit 0
     expect(result.stderr).toContain(competingSha);
   });
 
+  /** Overwrite setupPushRace's git so the second ls-remote reports a checkpoint tip. */
+  const setupOwnCheckpointRace = (
+    dir: string,
+    realFs: typeof import('node:fs'),
+    taskId: string,
+    expectedSha: string,
+    tipSha: string,
+    localSha: string,
+    tipSubject: string,
+  ): void => {
+    setupPushRace(dir, realFs, taskId, expectedSha, tipSha, localSha);
+    realFs.writeFileSync(`${dir}/bin/git`, `#!/bin/sh
+STATE="${dir}/ls-remote-count"
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\n' 'src/app.ts'; exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
+  *"ls-remote --heads origin refs/heads/blueprint/${taskId}"*)
+    N=$(cat "$STATE" 2>/dev/null || printf '0'); N=$((N + 1)); printf '%s' "$N" > "$STATE"
+    if [ "$N" = 1 ]; then printf '%s\t%s\n' '${expectedSha}' 'refs/heads/blueprint/${taskId}';
+    else printf '%s\t%s\n' '${tipSha}' 'refs/heads/blueprint/${taskId}'; fi
+    exit 0 ;;
+  *"push --force-with-lease=refs/heads/blueprint/${taskId}:${expectedSha}"*)
+    printf '%s\n' ' ! [rejected] HEAD -> blueprint/${taskId} (stale info)' >&2; exit 1 ;;
+  *"push --force-with-lease=refs/heads/blueprint/${taskId}:${tipSha}"*) exit 0 ;;
+  *"show -s --format=%s ${tipSha}"*) printf '%s\n' '${tipSubject}'; exit 0 ;;
+  *"rev-parse HEAD"*) printf '%s\n' '${localSha}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  };
+
+  it("adopts this task's own unshipped-work checkpoint as the lease authority", async () => {
+    // Regression: the remote tip is the checkpoint THIS task wrote on an earlier
+    // attempt's fail-closed path. Treating it as a competing writer stranded
+    // finished, check-passing work forever (NeurIPS 37eea260, df1c89d0,
+    // 9884994c, 0396aaee). Publication is the step that retires the checkpoint.
+    const taskId = 'task-own-ckpt';
+    const expectedSha = 'a'.repeat(40);
+    const checkpointSha = 'd'.repeat(40);
+    const localSha = 'b'.repeat(40);
+    const script = writeScript({ taskId, workBranch: `blueprint/${taskId}`, baseBranch: 'main', owner: 'acme', repo: 'repo', testsOnMainBranch: false });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      setupOwnCheckpointRace(
+        dir, realFs, taskId, expectedSha, checkpointSha, localSha,
+        `blueprint-checkpoint: preserve unshipped task ${taskId}`,
+      );
+    });
+
+    expect(result.stdout).toContain("is this task's own unshipped-work checkpoint");
+    expect(result.stdout).toContain(checkpointSha);
+    expect(result.stderr).not.toContain('remote branch advanced to a competing SHA');
+    expect(result.status).toBe(0);
+  });
+
+  it("refuses a checkpoint tip belonging to a different task", async () => {
+    // The adoption is keyed on THIS task's id, not the checkpoint prefix: another
+    // task's checkpoint is still a competing writer and must fail closed.
+    const taskId = 'task-foreign-ckpt';
+    const expectedSha = 'a'.repeat(40);
+    const foreignSha = 'e'.repeat(40);
+    const localSha = 'b'.repeat(40);
+    const script = writeScript({ taskId, workBranch: `blueprint/${taskId}`, baseBranch: 'main', owner: 'acme', repo: 'repo', testsOnMainBranch: false });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      setupOwnCheckpointRace(
+        dir, realFs, taskId, expectedSha, foreignSha, localSha,
+        'blueprint-checkpoint: preserve unshipped task some-other-task',
+      );
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('remote branch advanced to a competing SHA');
+    expect(result.stderr).toContain(foreignSha);
+    expect(result.stdout).not.toContain("is this task's own unshipped-work checkpoint");
+  });
+
   it('surfaces the GATE-ENVIRONMENT marker after a passing ./check test', async () => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const markerPath = '/tmp/check_gate_env_task-lts-2.txt';
@@ -706,17 +783,46 @@ esac
     realFs.rmSync('/tmp/pr_url_task-nojq-1', { force: true });
   });
 
+  // Read the REAL shared multi-lane receipt writer, so tests that install it
+  // exercise the same projection the VM runs rather than a stand-in.
+  const readReceiptWriterSource = async (): Promise<string> => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const realUrl = await vi.importActual<typeof import('node:url')>('node:url');
+    const repoRoot = realPath.resolve(
+      realPath.dirname(realUrl.fileURLToPath(import.meta.url)),
+      '..', '..', '..',
+    );
+    return realFs.readFileSync(
+      realPath.join(repoRoot, 'scripts', 'verification_receipt.py'),
+      'utf8',
+    );
+  };
+
+  const installReceiptWriter = (
+    dir: string,
+    rfs: typeof import('node:fs'),
+    source: string,
+  ): void => {
+    rfs.mkdirSync(`${dir}/scripts`, { recursive: true });
+    rfs.writeFileSync(`${dir}/scripts/verification_receipt.py`, source);
+  };
+
   const assertSuppressedBaselineReceipt = async (
     receiptShape: 'writer-shaped nested' | 'legacy flat',
+    withWriter = false,
   ): Promise<void> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
-    const taskId = receiptShape === 'writer-shaped nested'
+    const suffix = withWriter ? '-writer' : '';
+    const taskId = (receiptShape === 'writer-shaped nested'
       ? 'task-suppressed-baseline-nested-1'
-      : 'task-suppressed-baseline-legacy-1';
+      : 'task-suppressed-baseline-legacy-1') + suffix;
     const receiptPath = `/tmp/project_verification_receipt_${taskId}.json`;
     const bodyPath = `/tmp/pr_body_${taskId}`;
+    const gatePayloadPath = `/tmp/pr_gate_payload_${taskId}.json`;
     realFs.rmSync(receiptPath, { force: true });
     realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
 
     const suppressedFailures = {
       'backend/testing/test_z.py::test_inherited::failure': {
@@ -771,6 +877,7 @@ esac
       testsOnMainBranch: false,
     });
 
+    const writerSource = withWriter ? await readReceiptWriterSource() : '';
     const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
       const bin = `${dir}/bin`;
       rfs.mkdirSync(bin, { recursive: true });
@@ -778,6 +885,412 @@ esac
         receiptPath,
         JSON.stringify(receipt),
       );
+      if (withWriter) {
+        installReceiptWriter(dir, rfs, writerSource);
+      }
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/${taskId}"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat > ${gatePayloadPath}; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) cat > ${bodyPath}; [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    }, { TASK_ID: taskId });
+
+    expect(result.status).toBe(0);
+    const body = JSON.parse(realFs.readFileSync(bodyPath, 'utf8')) as { body: string };
+    expect(body.body).toContain('- Status: passed');
+    expect(body.body).toContain('### Suppressed baseline failures');
+    expect(body.body).toContain('`backend/testing/test_a.py::test_older::error`: RuntimeError: baseline-only issue');
+    expect(body.body).toContain('`backend/testing/test_z.py::test_inherited::failure`: AssertionError: inherited failure');
+    expect(body.body.indexOf('test_a.py')).toBeLessThan(body.body.indexOf('test_z.py'));
+    expect(body.body).toContain('<!-- /blueprint:local-gate -->');
+
+    const gatePayload = JSON.parse(realFs.readFileSync(gatePayloadPath, 'utf8')) as {
+      publication_gate_receipt: Record<string, unknown>;
+    };
+    expect(gatePayload.publication_gate_receipt).toMatchObject({
+      attribution_state: 'preexisting_test_failure',
+      suppressed_failures: suppressedFailures,
+      new_failures: {},
+      disappeared_failures: {},
+      skipped_failures: {},
+    });
+
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+    realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
+  };
+
+  it.each(['writer-shaped nested', 'legacy flat'] as const)(
+    'surfaces suppressed baseline failures from a %s receipt in the local-gate PR section',
+    (shape) => assertSuppressedBaselineReceipt(shape),
+  );
+
+  // Backward compatibility: a sidecar carrying only the legacy single-lane
+  // blocks must render and project EXACTLY as it did before the multi-lane
+  // projection existed, even in a repo that ships the shared writer.
+  it.each(['writer-shaped nested', 'legacy flat'] as const)(
+    'renders a %s single-lane receipt unchanged when the shared multi-lane writer is present',
+    (shape) => assertSuppressedBaselineReceipt(shape, true),
+  );
+
+  // The defect this closes: only the targeted backend lane's suppressions ever
+  // reached the PR body and the durable receipt, so a publication forgiven by
+  // the static-corpus / Vitest / typecheck lanes read as fully clean.
+  it('names every attributed lane\'s suppressed failures in the PR body and the durable receipt', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const taskId = 'task-suppressed-baseline-multilane-1';
+    const receiptPath = `/tmp/project_verification_receipt_${taskId}.json`;
+    const bodyPath = `/tmp/pr_body_${taskId}`;
+    const gatePayloadPath = `/tmp/pr_gate_payload_${taskId}.json`;
+    for (const file of [receiptPath, bodyPath, gatePayloadPath]) {
+      realFs.rmSync(file, { force: true });
+    }
+
+    const lane = (name: string, state: string, suppressed: Record<string, unknown>) => ({
+      lane: name,
+      state,
+      blocking: false,
+      new_failures: {},
+      suppressed_failures: suppressed,
+      disappeared_failures: {},
+      skipped_failures: {},
+      recorded_at: '2026-08-19T00:00:00+00:00',
+    });
+    const receipt = {
+      version: 1,
+      task_id: taskId,
+      directory: '.',
+      pytest: {
+        state: 'preexisting_test_failure',
+        new_failures: {},
+        suppressed_failures: {
+          'backend/testing/test_a.py::test_a::failure': { detail: 'backend inherited' },
+        },
+        disappeared_failures: {},
+        skipped_failures: {},
+      },
+      lanes: {
+        'backend-pytest': lane('backend-pytest', 'preexisting_test_failure', {
+          'backend/testing/test_a.py::test_a::failure': { detail: 'backend inherited' },
+        }),
+        'static-corpus': lane('static-corpus', 'preexisting_test_failure', {
+          'backend/testing/test_b.py::test_b::error': { detail: 'corpus inherited' },
+        }),
+        'vitest:admin-ui': lane('vitest:admin-ui', 'preexisting_test_failure', {
+          'src/components/Foo.test.tsx::renders::failure': { detail: 'vitest inherited' },
+        }),
+        'typecheck:agent': lane('typecheck:agent', 'clean', {}),
+      },
+    };
+
+    const writerSource = await readReceiptWriterSource();
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      installReceiptWriter(dir, rfs, writerSource);
+      rfs.writeFileSync(receiptPath, JSON.stringify(receipt));
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat > ${gatePayloadPath}; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) cat > ${bodyPath}; [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    }, { TASK_ID: taskId });
+
+    expect(result.status).toBe(0);
+    const body = (JSON.parse(realFs.readFileSync(bodyPath, 'utf8')) as { body: string }).body;
+    expect(body).toContain('### Suppressed baseline failures');
+    // Each identity is attributed to the lane that forgave it.
+    expect(body).toContain('- lane `backend-pytest` (state: preexisting_test_failure)');
+    expect(body).toContain('  - `backend/testing/test_a.py::test_a::failure`: backend inherited');
+    expect(body).toContain('- lane `static-corpus` (state: preexisting_test_failure)');
+    expect(body).toContain('  - `backend/testing/test_b.py::test_b::error`: corpus inherited');
+    expect(body).toContain('- lane `vitest:admin-ui` (state: preexisting_test_failure)');
+    expect(body).toContain('  - `src/components/Foo.test.tsx::renders::failure`: vitest inherited');
+    // A lane that suppressed nothing does not clutter the section.
+    expect(body).not.toContain('typecheck:agent');
+
+    const gatePayload = JSON.parse(realFs.readFileSync(gatePayloadPath, 'utf8')) as {
+      publication_gate_receipt: Record<string, unknown>;
+    };
+    expect(gatePayload.publication_gate_receipt).toMatchObject({
+      attribution_state:
+        'backend-pytest=preexisting_test_failure; static-corpus=preexisting_test_failure; '
+        + 'typecheck:agent=clean; vitest:admin-ui=preexisting_test_failure',
+      suppressed_failures: {
+        '[backend-pytest] backend/testing/test_a.py::test_a::failure': { detail: 'backend inherited' },
+        '[static-corpus] backend/testing/test_b.py::test_b::error': { detail: 'corpus inherited' },
+        '[vitest:admin-ui] src/components/Foo.test.tsx::renders::failure': { detail: 'vitest inherited' },
+      },
+      new_failures: {},
+      disappeared_failures: {},
+      skipped_failures: {},
+    });
+
+    for (const file of [receiptPath, bodyPath, gatePayloadPath, `/tmp/pr_url_${taskId}`]) {
+      realFs.rmSync(file, { force: true });
+    }
+  });
+
+  // ── Cross-lane guard-suppressions aggregate ─────────────────────────────────
+  // scripts/guard_suppression_receipt.py aggregate merges every guard lane's
+  // suppression receipt (static, vitest, typecheck, viewport, backend pytest)
+  // into one file. pr-helper.ts's build_guard_suppressions_aggregate and
+  // persist_guard_suppressions both shell out to that CLI at the cwd-relative
+  // scripts/guard_suppression_receipt.py, so the setup copies the real script
+  // into the tmp workspace and seeds per-lane receipts in a directory pinned by
+  // BLUEPRINT_GUARD_SUPPRESSION_DIR. Both halves therefore run for real
+  // (python3, real execution): aggregate merges the lanes, project writes the
+  // durable guard_suppressions key. The node-rendered markdown section is covered end-to-end
+  // in guard-suppressions-pr-section.test.ts instead: this suite's top-level
+  // `vi.mock('fs', ...)` stubs readFileSync to '', which blanks the base64
+  // embed the same way it already does for the sr/screenshots renderers (see
+  // the "decodes + invokes the screenshots renderer" test below, which only
+  // checks the generated decode/invoke wiring for the same reason).
+  it('persists the cross-lane guard-suppressions aggregate onto the heartbeat payload', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const taskId = 'task-guard-suppressions-1';
+    const aggregatePath = `/tmp/guard_suppression_aggregate_${taskId}.json`;
+    const receiptDir = `/tmp/guard_suppression_receipts_${taskId}`;
+    const receiptScriptPath = new URL(
+      '../../../scripts/guard_suppression_receipt.py',
+      import.meta.url,
+    ).pathname;
+    const bodyPath = `/tmp/pr_body_${taskId}`;
+    const gatePayloadPath = `/tmp/pr_gate_payload_${taskId}.json`;
+    realFs.rmSync(receiptDir, { recursive: true, force: true });
+    realFs.rmSync(aggregatePath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+
+    const emptyBucket = { entries: {}, observed_count: 0, recorded_count: 0, truncated: false };
+    const laneReceipts: Record<string, unknown> = {
+      static: {
+        version: 1,
+        lane: 'static',
+        task_id: taskId,
+        state: 'passed',
+        recorded_at: '2026-08-19T00:00:00+00:00',
+        buckets: { suppressed: emptyBucket, disappeared: emptyBucket, skipped: emptyBucket },
+      },
+      vitest: {
+        version: 1,
+        lane: 'vitest',
+        task_id: taskId,
+        state: 'preexisting_test_failure',
+        recorded_at: '2026-08-19T00:00:00+00:00',
+        buckets: {
+          // observed_count > recorded entries: the producer capped this bucket,
+          // and the durable receipt must not look complete.
+          suppressed: {
+            entries: { 'vitest::flaky::test': { detail: 'AssertionError: inherited', reason: 'baseline' } },
+            observed_count: 4,
+            recorded_count: 1,
+            truncated: false,
+          },
+          disappeared: emptyBucket,
+          skipped: emptyBucket,
+        },
+      },
+      // The viewport lane's capture-skipped branch records its only identity in
+      // `skipped` — a suppressed-only projection would drop it entirely.
+      viewport: {
+        version: 1,
+        lane: 'viewport',
+        task_id: taskId,
+        state: 'capture_skipped',
+        recorded_at: '2026-08-19T00:00:00+00:00',
+        buckets: {
+          suppressed: emptyBucket,
+          disappeared: emptyBucket,
+          skipped: {
+            entries: { 'admin-ui/src/components/Foo.tsx': { detail: 'chromium unavailable' } },
+            observed_count: 1,
+            recorded_count: 1,
+            truncated: false,
+          },
+        },
+      },
+    };
+
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      // The emitter/projector the generated script shells out to is resolved
+      // cwd-relative; copy the real one in so both halves execute for real.
+      rfs.mkdirSync(`${dir}/scripts`, { recursive: true });
+      rfs.copyFileSync(receiptScriptPath, `${dir}/scripts/guard_suppression_receipt.py`);
+      rfs.mkdirSync(receiptDir, { recursive: true });
+      for (const [lane, record] of Object.entries(laneReceipts)) {
+        rfs.writeFileSync(`${receiptDir}/lane_${lane}.json`, JSON.stringify(record));
+      }
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/${taskId}"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat > ${gatePayloadPath}; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) cat > ${bodyPath}; [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    }, { TASK_ID: taskId, BLUEPRINT_GUARD_SUPPRESSION_DIR: receiptDir });
+
+    expect(result.status).toBe(0);
+
+    const body = JSON.parse(realFs.readFileSync(bodyPath, 'utf8')) as { body: string };
+    expect(body.body).toContain('<!-- /blueprint:local-gate -->');
+
+    // The aggregate half ran for real: every seeded lane is merged into one file.
+    const aggregate = JSON.parse(realFs.readFileSync(aggregatePath, 'utf8')) as {
+      lanes: Record<string, unknown>;
+    };
+    expect(Object.keys(aggregate.lanes).sort()).toEqual(['static', 'viewport', 'vitest']);
+
+    const gatePayload = JSON.parse(realFs.readFileSync(gatePayloadPath, 'utf8')) as {
+      publication_gate_receipt: { guard_suppressions?: Record<string, unknown> };
+    };
+    expect(gatePayload.publication_gate_receipt.guard_suppressions).toEqual({
+      static: {
+        state: 'passed',
+        suppressed: {},
+        suppressed_observed_count: 0,
+        suppressed_truncated: false,
+      },
+      vitest: {
+        state: 'preexisting_test_failure',
+        suppressed: { 'vitest::flaky::test': 'AssertionError: inherited' },
+        suppressed_observed_count: 4,
+        // Producer capped the bucket: observed_count outruns the recorded entries.
+        suppressed_truncated: true,
+      },
+      viewport: {
+        state: 'capture_skipped',
+        suppressed: {},
+        suppressed_observed_count: 0,
+        suppressed_truncated: false,
+        // A suppressed-only projection would have dropped this lane's only content.
+        skipped: { 'admin-ui/src/components/Foo.tsx': 'chromium unavailable' },
+        skipped_observed_count: 1,
+        skipped_truncated: false,
+      },
+    });
+
+    realFs.rmSync(receiptDir, { recursive: true, force: true });
+    realFs.rmSync(aggregatePath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+    realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
+  });
+
+  it('leaves the PR body and publication verdict unchanged when no guard-suppressions aggregate exists', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const taskId = 'task-guard-suppressions-absent-1';
+    const aggregatePath = `/tmp/guard_suppression_aggregate_${taskId}.json`;
+    const bodyPath = `/tmp/pr_body_${taskId}`;
+    realFs.rmSync(aggregatePath, { force: true });
+    realFs.rmSync(bodyPath, { force: true });
+
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
       rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
@@ -814,22 +1327,12 @@ esac
 
     expect(result.status).toBe(0);
     const body = JSON.parse(realFs.readFileSync(bodyPath, 'utf8')) as { body: string };
-    expect(body.body).toContain('- Status: passed');
-    expect(body.body).toContain('### Suppressed baseline failures');
-    expect(body.body).toContain('`backend/testing/test_a.py::test_older::error`: RuntimeError: baseline-only issue');
-    expect(body.body).toContain('`backend/testing/test_z.py::test_inherited::failure`: AssertionError: inherited failure');
-    expect(body.body.indexOf('test_a.py')).toBeLessThan(body.body.indexOf('test_z.py'));
+    expect(body.body).not.toContain('blueprint:guard-suppressions');
     expect(body.body).toContain('<!-- /blueprint:local-gate -->');
 
-    realFs.rmSync(receiptPath, { force: true });
     realFs.rmSync(bodyPath, { force: true });
     realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
-  };
-
-  it.each(['writer-shaped nested', 'legacy flat'] as const)(
-    'surfaces suppressed baseline failures from a %s receipt in the local-gate PR section',
-    assertSuppressedBaselineReceipt,
-  );
+  });
 
   // ── Zero-effective-diff guard ────────────────────────────────────────────────
   // A rebased/superseded branch can be commits-ahead by SHA yet net to ZERO
@@ -1527,6 +2030,34 @@ describe('writePrHelper — generated script content', () => {
       "sed '/<!-- blueprint:screenshots -->/,/<!-- \\/blueprint:screenshots -->/d'",
     );
     expect(script).toContain('BODY=$(printf \'%s\\n\\n%s\' "$BODY" "$SHOTS_SECTION")');
+  });
+
+  it('wires the cross-lane guard-suppressions aggregate: builds it, decodes + invokes the renderer, and persists it to the gate receipt', () => {
+    writePrHelper({
+      taskId: 'task-guard-static-1',
+      workBranch: 'blueprint/task-guard-static-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    // Merges every guard lane's receipt via the shared CLI (as a plain
+    // subprocess call, not an embedded heredoc — see CLAUDE.md).
+    expect(script).toContain('python3 scripts/guard_suppression_receipt.py aggregate --task-id "task-guard-static-1" --out "$GUARD_SUPPRESSIONS_AGGREGATE"');
+    expect(script).toContain('GUARD_SUPPRESSIONS_AGGREGATE="/tmp/guard_suppression_aggregate_task-guard-static-1.json"');
+    // Decodes the embedded renderer and runs it against the aggregate.
+    expect(script).toContain('base64 -d > /tmp/guard_suppressions_section_task-guard-static-1.js');
+    expect(script).toContain('node /tmp/guard_suppressions_section_task-guard-static-1.js "$aggregate_file"');
+    // Persists the same bounded aggregate onto the durable gate receipt so it
+    // reaches task.context via the heartbeat payload.
+    expect(script).toContain('"guard_suppressions"');
+    expect(script).toContain('persist_guard_suppressions');
+    // Section is appended alongside (not instead of) the existing suppressed
+    // baseline section — both fold into the one <!-- blueprint:local-gate -->
+    // block.
+    expect(script).toContain('GATE_SECTION=$(printf \'%s\n%s\' "$GATE_SECTION" "$GUARD_SUPPRESSIONS_SECTION")');
   });
 
   it('emits the mandatory test gate for self-repo automain task PR (baseBranch=automain, promotionTarget=main)', () => {

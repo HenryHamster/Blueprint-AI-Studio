@@ -42,7 +42,7 @@ from app.models import (
     get_task_lifetime_attempt_ordinal,
 )
 from app.auth import create_agent_token, create_vm_scoped_token
-from app.schemas import AgentStatusPayload
+from app.schemas import AgentStatusPayload, PublicationGateReceipt
 from app.routers.agent_status import _is_task_llm_auth_hard_disable
 from app.task_capabilities import TaskType, task_type_catalog
 from app.time_utils import _utcnow
@@ -1441,6 +1441,7 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
         "authoritative_ci_required": False,
         "recorded_at": "2026-08-11T00:00:00Z",
     }
+    normalized_receipt = dict(receipt)
     resp = await client.post(
         "/api/agent/heartbeat",
         json={
@@ -1453,7 +1454,7 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
     assert resp.status_code == 200
 
     await db_session.refresh(task)
-    assert (task.context or {}).get("publication_gate_receipt") == receipt
+    assert (task.context or {}).get("publication_gate_receipt") == normalized_receipt
     # Non-terminal: the task keeps running on the same VM.
     assert task.status == TaskStatus.IN_PROGRESS
     assert task.vm_instance_id == "agent-vm-gate-receipt"
@@ -1463,7 +1464,7 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
 
     # A later gate run overwrites the receipt: the latest verdict is the
     # authoritative one.
-    passed = {**receipt, "status": "passed", "exit_code": 0}
+    passed = {**normalized_receipt, "status": "passed", "exit_code": 0}
     resp = await client.post(
         "/api/agent/heartbeat",
         json={"task_id": str(task.id), "publication_gate_receipt": passed},
@@ -1472,7 +1473,9 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
     assert resp.status_code == 200
     await db_session.refresh(task)
     assert (task.context or {}).get("publication_gate_receipt") == passed
-    assert (task.context or {}).get("publication_gate_receipt_history") == [receipt]
+    assert (task.context or {}).get("publication_gate_receipt_history") == [
+        normalized_receipt
+    ]
 
     # A malformed receipt is dropped, never partially persisted, and never
     # 422s the heartbeat itself.
@@ -1480,14 +1483,44 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
         "/api/agent/heartbeat",
         json={
             "task_id": str(task.id),
-            "publication_gate_receipt": {"status": "failed"},
+            "publication_gate_receipt": {
+                **passed,
+                "new_failures": "not-a-dict",
+            },
         },
         headers=headers,
     )
     assert resp.status_code == 200
     await db_session.refresh(task)
     assert (task.context or {}).get("publication_gate_receipt") == passed
-    assert (task.context or {}).get("publication_gate_receipt_history") == [receipt]
+    assert (task.context or {}).get("publication_gate_receipt_history") == [
+        normalized_receipt
+    ]
+
+
+def test_publication_gate_receipt_schema_bounds_attribution():
+    base = {
+        "status": "failed",
+        "command": "./check test",
+        "timeout_seconds": 600,
+        "hard_timeout_seconds": 1800,
+        "elapsed_seconds": 42,
+        "deadline_extended": False,
+        "exit_code": 23,
+        "authoritative_ci_required": False,
+        "recorded_at": "2026-08-11T00:00:00Z",
+    }
+    from app.task_blocked import sanitize_publication_gate_receipt
+
+    assert (
+        sanitize_publication_gate_receipt(PublicationGateReceipt(**base).model_dump())
+        == base
+    )
+    with pytest.raises(ValueError, match="String should have at most 4000 characters"):
+        PublicationGateReceipt(
+            **base,
+            attribution_state="s" * 4001,
+        )
 
 
 @pytest.mark.asyncio
@@ -21938,6 +21971,7 @@ async def _seed_qualifier_children(
     from app.release_qualifier import (
         _qualification_contract_fingerprint,
         _rubric_fingerprint,
+        _snapshot_qualification_rubric,
     )
     audit_task = Task(
         project_id=project.id,
@@ -21964,20 +21998,23 @@ async def _seed_qualifier_children(
     await db_session.refresh(audit_task)
     await db_session.refresh(smoke_task)
 
-    rubric_fingerprint = _rubric_fingerprint([])
+    rubric_snapshot, rubric_lifecycle_snapshot = await _snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = _rubric_fingerprint(rubric_snapshot)
     version.last_qualification = {
         "status": "pending",
         # Real run_qualification always stamps the launched rubric projection;
         # #15102 made _finalize_qualification resolve it first and short-circuit
-        # to rubric_provenance_unknown when it is absent. Seed the empty
-        # projection so the infra-failure child path is reached as in prod.
-        "rubric_snapshot": [],
+        # to rubric_provenance_unknown when it is absent. Mirror the active
+        # release rubric so the infra-failure child path is reached as in prod.
+        "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
         "contract_fingerprint": _qualification_contract_fingerprint(
             version.goal or "", rubric_fingerprint
         ),
         "version_goal": version.goal or "",
-        "rubric_lifecycle_snapshot": [],
+        "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",
@@ -22271,6 +22308,7 @@ async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
     from app.release_qualifier import (
         _qualification_contract_fingerprint,
         _rubric_fingerprint,
+        _snapshot_qualification_rubric,
     )
     from app.models import ReleaseVersion, Artifact, ArtifactType
 
@@ -22392,20 +22430,23 @@ async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
     await db_session.commit()
     await db_session.refresh(smoke_task)
 
-    rubric_fingerprint = _rubric_fingerprint([])
+    rubric_snapshot, rubric_lifecycle_snapshot = await _snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = _rubric_fingerprint(rubric_snapshot)
     version.last_qualification = {
         "status": "pending",
         # Real run_qualification always stamps the launched rubric projection;
         # #15102 made _finalize_qualification resolve it first and short-circuit
-        # to rubric_provenance_unknown when it is absent. Seed the empty
-        # projection so the infra-failure child path is reached as in prod.
-        "rubric_snapshot": [],
+        # to rubric_provenance_unknown when it is absent. Mirror the active
+        # release rubric so the archival-artifact path is reached as in prod.
+        "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
         "contract_fingerprint": _qualification_contract_fingerprint(
             version.goal or "", rubric_fingerprint
         ),
         "version_goal": version.goal or "",
-        "rubric_lifecycle_snapshot": [],
+        "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
         "candidate_sha": candidate_sha,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",

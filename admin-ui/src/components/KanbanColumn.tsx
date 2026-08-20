@@ -37,7 +37,7 @@ function FailureClassBreakdown({ tasks }: { tasks: Task[] }) {
         return (
           <div
             key={failureClass}
-            className={`text-ui-xs px-1.5 py-0.5 rounded-sm font-medium whitespace-nowrap ${config?.color ?? 'bg-neutral-700/50 text-neutral-400'}`}
+            className={`text-ui-xs px-1.5 py-0.5 rounded font-medium whitespace-nowrap ${config?.color ?? 'bg-workbench-layer/50 text-neutral-400'}`}
             title={config?.hint ?? failureClass}
           >
             {count} {config?.label ?? failureClass}
@@ -130,7 +130,7 @@ export function SortableCard({
     <div
       ref={setNodeRef}
       style={style}
-      className={`relative group ${isOverlay ? 'shadow-2xl ring-1 ring-amber-500/50 rounded-xl' : ''}`}
+      className={`relative group ${isOverlay ? 'shadow-2xl ring-1 ring-amber-500/50 rounded-lg' : ''}`}
     >
       {!readOnly && selectionMode && (
         <div className="absolute top-2 left-2 z-10">
@@ -274,7 +274,7 @@ export function ColumnArchiveButton({
 
   const stateClass = confirming
     ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30'
-    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50';
+    : 'text-neutral-500 hover:text-neutral-300 hover:bg-workbench-hover/50';
 
   return (
     <>
@@ -447,7 +447,7 @@ export function KanbanColumn({
         </button>
       )}
       {columnTasks.length === 0 && !loading && (
-        <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
+        <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-lg bg-workbench-base/20">
           {hasActiveFilters ? 'No tasks match filters' : 'No tasks'}
         </div>
       )}
@@ -459,15 +459,15 @@ export function KanbanColumn({
       {showResizeHandle && prevColId && (
         <div
           onMouseDown={(e) => handleResizeStart(prevColId, e)}
-          className="w-1 shrink-0 cursor-col-resize group/resize flex items-center justify-center hover:bg-neutral-700/50 rounded transition-colors self-stretch"
+          className="w-1 shrink-0 cursor-col-resize group/resize flex items-center justify-center hover:bg-workbench-hover/50 rounded transition-colors self-stretch"
           title="Drag to resize"
         >
-          <div className="w-0.5 h-8 bg-neutral-700 group-hover/resize:bg-neutral-500 rounded-full transition-colors" />
+          <div className="w-0.5 h-8 bg-workbench-layer group-hover/resize:bg-workbench-control rounded-full transition-colors" />
         </div>
       )}
       <div
         id={`kanban-col-${col.id}`}
-        className={`flex-shrink-0 flex flex-col bg-neutral-900/50 rounded-xl border border-neutral-800/50 overflow-hidden ${
+        className={`flex-shrink-0 flex flex-col bg-workbench-base/50 rounded-lg border border-neutral-800/50 overflow-hidden ${
           isCollapsed ? 'w-10' : colWidth ? 'p-3' : 'flex-1 min-w-[280px] max-w-[520px] p-3'
         }`}
         style={!isCollapsed && colWidth ? { width: colWidth } : undefined}
@@ -478,11 +478,11 @@ export function KanbanColumn({
           <button
             onClick={() => toggleCollapse(col.id)}
             title={`Expand ${col.label}`}
-            className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
+            className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-workbench-hover/50 transition-colors"
           >
             <ChevronRight className="w-3.5 h-3.5" />
           </button>
-          <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-1.5 py-0.5 rounded-full font-medium border border-neutral-700">
+          <span className="text-ui-sm bg-workbench-panel text-neutral-300 px-1.5 py-0.5 rounded-full font-medium border border-neutral-700">
             {columnTasks.length}
           </span>
           <span
@@ -505,14 +505,14 @@ export function KanbanColumn({
 
         {/* Expanded content */}
         <div className={`flex flex-col flex-1 overflow-hidden ${isCollapsed ? 'hidden' : ''}`}>
-          <div className="sticky top-0 z-10 bg-neutral-900/95 backdrop-blur-sm pb-2 -mx-1 px-1 space-y-1.5 mb-3">
+          <div className="sticky top-0 z-10 bg-workbench-base/95 backdrop-blur-sm pb-2 -mx-1 px-1 space-y-1.5 mb-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-1">
                 <button
                   data-viewport-allow-small-target
                   onClick={() => toggleCollapse(col.id)}
                   title={`Collapse ${col.label}`}
-                  className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
+                  className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-workbench-hover/50 transition-colors"
                 >
                   <ChevronLeft className="w-3.5 h-3.5" />
                 </button>
@@ -529,7 +529,7 @@ export function KanbanColumn({
                 <span title={`Sorted: ${SORT_LABELS[sortBy]}`} className="text-neutral-600 flex items-center">
                   <ArrowDownUp className="w-3 h-3" />
                 </span>
-                <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+                <span className="text-ui-sm bg-workbench-panel text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
                   {columnTasks.length}
                 </span>
                 {!readOnly && isArchivable && columnTasks.length > 0 && (

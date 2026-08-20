@@ -17,11 +17,11 @@ const MATURITY_MODE_STYLES: Record<string, string> = {
   audit: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
   fundamentals: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
   ship: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
-  pause: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+  pause: 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30',
 };
 
 function Skeleton({ className = '' }: { className?: string }) {
-  return <div className={`animate-pulse bg-neutral-800/60 rounded ${className}`} />;
+  return <div className={`animate-pulse bg-workbench-panel/60 rounded ${className}`} />;
 }
 
 // ---------- component ----------
@@ -34,7 +34,7 @@ export function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[
       {loading || rows === null ? (
         <Skeleton className="h-16 w-full" />
       ) : rows.length === 0 ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
           No audits have run yet
         </div>
       ) : (
@@ -42,12 +42,12 @@ export function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[
           {rows.map(row => {
             const scoreColor = row.score >= 70 ? 'bg-emerald-500' : row.score >= 40 ? 'bg-amber-500' : 'bg-red-500';
             const modeStyle = row.recommended_mode
-              ? (MATURITY_MODE_STYLES[row.recommended_mode] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30')
+              ? (MATURITY_MODE_STYLES[row.recommended_mode] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30')
               : null;
             const isExpanded = expandedId === row.system_id;
             const hasIssues = (row.top_issues ?? []).length > 0;
             return (
-              <div key={row.system_id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+              <div key={row.system_id} className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
                 <div className="flex items-center gap-2">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1.5">
@@ -59,7 +59,7 @@ export function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[
                       )}
                     </div>
                     <div className="flex items-center gap-2">
-                      <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden">
+                      <div className="flex-1 h-1.5 rounded-full bg-workbench-panel overflow-hidden">
                         <div className={`h-full rounded-full ${scoreColor}`} style={{ width: `${row.score}%` }} />
                       </div>
                       <span className="shrink-0 text-ui-sm font-mono text-neutral-400">{row.score}</span>

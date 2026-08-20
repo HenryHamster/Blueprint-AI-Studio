@@ -20,7 +20,6 @@ from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 from app.blocked_task_unblock_sweeps import (
     _BLOCKED_ESCALATE_AFTER,
     _BLOCKED_ESCALATED_PARK,
-    _BLOCKED_ESCALATED_RECHECK_MAX,
     _BLOCKED_OPTIMISTIC_RETRY_CAP,
     _BLOCKED_PARKED_REEVAL_CAP,
     _BLOCKED_PARKED_REEVAL_INTERVAL,
@@ -687,6 +686,29 @@ async def sweep_stalled_strategic_cycles(
                         f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
                         f"but linked task {linked_task_id} has fresh "
                         f"heartbeat ({hb}) — skipping stall declaration"
+                    )
+                    continue
+                # A QUEUED/PROVISIONING phase task has no running agent and so
+                # cannot heartbeat: after a rate-limit requeue the previous
+                # run's heartbeat is gone and this branch used to fall straight
+                # through to force-terminate a task that was actively
+                # recovering (sc-93fd806a: killed 60s into PROVISIONING).
+                # ``updated_at`` advances on every lifecycle write — requeue,
+                # claim, provision — so a recent row touch means recovery is
+                # in flight, not a stall. IN_PROGRESS stays heartbeat-governed
+                # above so a zombie agent is still reaped.
+                if (
+                    linked_task.status
+                    in (TaskStatus.QUEUED, TaskStatus.PROVISIONING)
+                    and linked_task.updated_at is not None
+                    and linked_task.updated_at >= hb_cutoff
+                ):
+                    logger.info(
+                        f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
+                        f"but linked task {linked_task_id} is "
+                        f"{linked_task.status} with recent lifecycle "
+                        f"activity ({linked_task.updated_at}) — recovery in "
+                        f"flight, skipping stall declaration"
                     )
                     continue
                 from app.failure_classification import (
@@ -2228,15 +2250,6 @@ _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE = (
 )
 # Compatibility name used by existing diagnostics/tests.
 _STRATEGIC_CYCLE_STALL_ALERT_TITLE = _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE
-_STRATEGIC_CYCLE_TERMINAL_OUTCOMES = (
-    "completed",
-    "failed_phase1",
-    "failed_phase2",
-    "failed_phase2_spawn",
-    "stalled_phase1",
-    "stalled_phase2",
-    "thinker_artifacts_missing",
-)
 
 
 def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime | None:
@@ -2262,10 +2275,11 @@ def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime 
 async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     """Detect a halted strategic loop and route one operator-visible alert.
 
-    A terminal StrategicCycle completion is the liveness receipt. A recent
+    A phase-2 StrategicCycle completion is the liveness receipt. A recent
     ``_strategic_no_delta_skips`` entry is the explicit healthy-idle receipt;
     it suppresses the alert even though no new cycle row was created. An
-    active/incomplete cycle is deliberately not evidence of liveness.
+    active/incomplete cycle, or phase-1-only completion, is deliberately not
+    evidence of full-cycle liveness.
     """
     from app.models import Alert, AlertSeverity, Project, StrategicCycle
     from app.shared_state import runtime_config as _runtime_config
@@ -2306,17 +2320,18 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     if not candidate_ids:
         return 0
 
-    # Only terminal cycle receipts count. A recently-started row that never
-    # reached a completion timestamp is exactly what this detector surfaces.
-    completion_expr = func.coalesce(
-        StrategicCycle.phase2_completed_at, StrategicCycle.phase1_completed_at
-    )
+    # Only the phase-2 completion receipt counts. Phase 1 can complete while
+    # phase 2 later stalls; using phase1_completed_at here would incorrectly
+    # make that halted full cycle look healthy for another starvation window.
     completion_rows = (
         await session.execute(
-            select(StrategicCycle.project_id, func.max(completion_expr))
+            select(
+                StrategicCycle.project_id,
+                func.max(StrategicCycle.phase2_completed_at),
+            )
             .where(
                 StrategicCycle.project_id.in_(candidate_ids),
-                StrategicCycle.outcome.in_(_STRATEGIC_CYCLE_TERMINAL_OUTCOMES),
+                StrategicCycle.phase2_completed_at.is_not(None),
             )
             .group_by(StrategicCycle.project_id)
         )
@@ -2934,6 +2949,7 @@ from app.reaper_bug_message_sweeps import (  # noqa: E402
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
     sweep_deliver_task_wakes,
+    sweep_fail_stranded_pending_conversation_messages,
     sweep_resolve_open_owned_bug_messages,
     sweep_resolve_stale_open_bug_messages,
     sweep_wake_delivery_stall_alerts,
@@ -4591,6 +4607,7 @@ __all__ = [
     "sweep_decay_stale_open_bug_messages",
     "sweep_decay_stale_unlinked_blocker_messages",
     "STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS",
+    "sweep_fail_stranded_pending_conversation_messages",
     "sweep_deliver_task_wakes",
     "sweep_resolve_open_owned_bug_messages",
     "sweep_resolve_stale_open_bug_messages",

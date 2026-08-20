@@ -73,10 +73,10 @@ export function SavedViewsTabStrip({
                   <MoreVertical className="w-3.5 h-3.5" />
                 </button>
                 {openKebabId === tab.id && (
-                  <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
+                  <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] bg-workbench-base border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
                     <button
                       onClick={() => tab.view && onRenameView(tab.view)}
-                      className="w-full flex items-center gap-2 px-3 py-2 text-xs text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px]"
+                      className="w-full flex items-center gap-2 px-3 py-2 text-xs text-neutral-300 hover:bg-workbench-hover transition-colors min-h-[44px]"
                     >
                       <Pencil className="w-3 h-3" />
                       Rename

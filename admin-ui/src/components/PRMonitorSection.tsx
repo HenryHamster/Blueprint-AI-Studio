@@ -36,13 +36,13 @@ const PR_STATUS_COLORS: Record<string, string> = {
   PROVISIONING: 'bg-blue-500/20 text-blue-400',
   IN_PROGRESS: 'bg-emerald-500/20 text-emerald-400',
   EVALUATING: 'bg-amber-500/20 text-amber-400',
-  COMPLETED: 'bg-neutral-500/20 text-neutral-400',
+  COMPLETED: 'bg-workbench-control/20 text-neutral-400',
   FAILED: 'bg-red-500/20 text-red-400',
-  CANCELLED: 'bg-neutral-500/20 text-neutral-500',
+  CANCELLED: 'bg-workbench-control/20 text-neutral-500',
 };
 
 function SkeletonRow() {
-  return <div className="animate-pulse bg-neutral-800/60 rounded h-10 w-full" />;
+  return <div className="animate-pulse bg-workbench-panel/60 rounded h-10 w-full" />;
 }
 
 export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget, onSpawnFixTask, stale, degraded }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null; onSpawnFixTask?: (pr: OpenPR) => void; stale?: boolean; degraded?: boolean }) {
@@ -91,17 +91,17 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
       </div>
       {expanded && (
         !hasProject ? (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">Select a project</div>
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">Select a project</div>
         ) : loading ? (
           <div className="space-y-2"><SkeletonRow /><SkeletonRow /></div>
         ) : visiblePRs.length === 0 ? (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
             {hasOutage ? 'GitHub unreachable' : 'No open PRs'}
           </div>
         ) : (
           <div className="space-y-1.5 max-h-[400px] overflow-y-auto custom-scrollbar">
             {visiblePRs.map(pr => (
-              <div key={pr.pr_number} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
+              <div key={pr.pr_number} className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-2.5">
                 <div className="flex items-start gap-2">
                   <div className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${pr.is_orphaned ? 'bg-red-400' : 'bg-emerald-400'}`} />
                   <div className="flex-1 min-w-0">
@@ -127,8 +127,8 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
                     ) : (
                       <div className="mt-1.5 space-y-1">
                         {pr.tasks.map(t => {
-                          const typeCls = TASK_TYPE_COLORS[t.task_type] ?? 'bg-neutral-500/20 text-neutral-400';
-                          const statusCls = PR_STATUS_COLORS[t.task_status] ?? 'bg-neutral-500/20 text-neutral-500';
+                          const typeCls = TASK_TYPE_COLORS[t.task_type] ?? 'bg-workbench-control/20 text-neutral-400';
+                          const statusCls = PR_STATUS_COLORS[t.task_status] ?? 'bg-workbench-control/20 text-neutral-500';
                           const fullTask = tasksById.get(t.task_id);
                           const row = (
                             <div className="flex items-center gap-1.5 flex-wrap">
@@ -144,7 +144,7 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
                             <button
                               key={t.task_id}
                               onClick={() => onViewTask(fullTask)}
-                              className="w-full text-left hover:bg-neutral-800/40 rounded px-1 -mx-1 py-0.5 transition-colors"
+                              className="w-full text-left hover:bg-workbench-hover/40 rounded px-1 -mx-1 py-0.5 transition-colors"
                             >
                               {row}
                             </button>

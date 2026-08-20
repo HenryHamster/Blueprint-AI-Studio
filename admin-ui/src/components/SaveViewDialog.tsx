@@ -21,7 +21,7 @@ export function SaveViewDialog({ open, mode, name, description, error, summaryTe
       <div
         role="dialog"
         aria-label={mode === 'rename' ? 'Rename saved view' : 'Save current filters as a view'}
-        className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[min(420px,90vw)] bg-neutral-900 border border-neutral-700 rounded-xl shadow-2xl p-4 space-y-3"
+        className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[min(420px,90vw)] bg-workbench-base border border-neutral-700 rounded-lg shadow-2xl p-4 space-y-3"
       >
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold text-neutral-100">
@@ -39,7 +39,7 @@ export function SaveViewDialog({ open, mode, name, description, error, summaryTe
             onChange={e => { onNameChange(e.target.value); }}
             onKeyDown={e => { if (e.key === 'Enter') onCommit(); if (e.key === 'Escape') onClose(); }}
             placeholder="e.g. Unresolved BLOCKERs"
-            className="mt-1 w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+            className="mt-1 w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs placeholder-neutral-600 workbench-focus"
             autoFocus
           />
         </label>
@@ -51,11 +51,11 @@ export function SaveViewDialog({ open, mode, name, description, error, summaryTe
             onChange={e => onDescriptionChange(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter') onCommit(); if (e.key === 'Escape') onClose(); }}
             placeholder="What is this view for?"
-            className="mt-1 w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+            className="mt-1 w-full bg-workbench-shell border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs placeholder-neutral-600 workbench-focus"
           />
         </label>
         {mode === 'create' && summaryText && (
-          <div className="text-ui-md text-neutral-500 bg-neutral-950/50 border border-neutral-800/60 rounded-md px-3 py-2">
+          <div className="text-ui-md text-neutral-500 bg-workbench-shell/50 border border-neutral-800/60 rounded-md px-3 py-2">
             <span className="text-neutral-400">Saving:</span>{' '}
             {summaryText}
           </div>

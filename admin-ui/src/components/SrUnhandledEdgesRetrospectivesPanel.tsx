@@ -164,7 +164,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
           <select
             value={taskTypeFilter}
             onChange={e => setTaskTypeFilter(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300 text-ui-sm"
+            className="bg-workbench-base border border-neutral-700 rounded px-1 py-0.5 text-neutral-300 text-ui-sm"
             aria-label="Filter by task type"
           >
             <option value="">All types</option>
@@ -217,10 +217,10 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
       )}
 
       {loading ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 h-14 animate-pulse" />
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 h-14 animate-pulse" />
       ) : fetchError ? (
         <div
-          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
+          className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
           role="status"
         >
           <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
@@ -230,7 +230,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
       ) : items.length === 0 ? (
         (taskTypeFilter || blindSpotFilter || casePatternFilter) ? (
           <div
-            className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
+            className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
             role="status"
             data-testid="sr-unhandled-edges-empty"
           >
@@ -250,7 +250,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
           </div>
         ) : (
           <div
-            className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2"
+            className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2"
             role="status"
             data-testid="sr-unhandled-edges-empty"
           >
@@ -278,7 +278,7 @@ function SrUnhandledEdgesRow({ task, onClick }: { task: SrUnhandledEdgesTask; on
   return (
     // eslint-disable-next-line viewport/min-touch-target -- dense row, consistent with SrMissedRetrospective
     <div
-      className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm cursor-pointer hover:border-neutral-600"
+      className="bg-workbench-base/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm cursor-pointer hover:border-neutral-600"
       onClick={onClick}
       role="button"
       tabIndex={0}
@@ -313,7 +313,7 @@ function SrUnhandledEdgesRow({ task, onClick }: { task: SrUnhandledEdgesTask; on
       {expanded && task.unhandled_edges.length > 0 && (
         <div className="mt-1.5 pl-4 flex flex-col gap-1">
           {task.unhandled_edges.map((edge: SrUnhandledEdge, i: number) => (
-            <div key={i} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
+            <div key={i} className="rounded border border-neutral-800/60 bg-workbench-shell/50 p-1.5">
               <div className="mb-1 text-neutral-400 font-medium">{edge.case}</div>
               {edge.blind_spot && <div className="text-neutral-500 text-ui-xs">{edge.blind_spot}</div>}
               {edge.origin && <div className="text-neutral-600 text-ui-xs">source: {edge.origin}</div>}

@@ -8,7 +8,6 @@ Run with: pytest testing/test_invariants.py -v --noconftest
 """
 
 import ast
-import json
 import io
 import os
 import re
@@ -22,6 +21,8 @@ from functools import cache
 from pathlib import Path
 
 import pytest
+
+from testing.fixgate_attribution import format_offender_marker
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
@@ -528,6 +529,8 @@ def test_progression_never_gates_on_criterion_coverage():
         "in release_scoring.compute_composite), not as a precondition for cutting "
         "a version or retiring a direction. A pre-qualification coverage gate is "
         "what deadlocked v25. Violations:\n  " + "\n  ".join(violations)
+        + "\n"
+        + format_offender_marker(violations)
     )
 
 def test_all_admin_routes_require_auth():
@@ -614,6 +617,8 @@ def test_all_admin_routes_require_auth():
         + "\n".join(f"  - {r}" for r in sorted(offenders))
         + "\n\nIf a route is intentionally public, add it to public_allowlist "
         "with a reviewed justification."
+        + "\n"
+        + format_offender_marker(offenders)
     )
 
 def test_get_metrics_reader_routes_are_explicit_read_only_allowlisted(monkeypatch):
@@ -719,11 +724,21 @@ def test_get_metrics_reader_routes_are_get_only_and_allowlisted():
             f"  - {', '.join(sorted(route.methods or []))} {route.path}"
             for route in sorted(metrics_routes, key=lambda route: route.path)
         )
+        + "\n"
+        + format_offender_marker(
+            f"{', '.join(sorted(route.methods or []))} {route.path}"
+            for route in sorted(metrics_routes, key=lambda route: route.path)
+        )
     )
     assert all((route.methods or set()) == {"GET"} for route in metrics_routes), (
         "Routes using get_metrics_reader must be GET-only:\n"
         + "\n".join(
             f"  - {', '.join(sorted(route.methods or []))} {route.path}"
+            for route in sorted(metrics_routes, key=lambda route: route.path)
+        )
+        + "\n"
+        + format_offender_marker(
+            f"{', '.join(sorted(route.methods or []))} {route.path}"
             for route in sorted(metrics_routes, key=lambda route: route.path)
         )
     )
@@ -1106,6 +1121,8 @@ class TestSchemaRevisionSync:
         assert not errors, (
             "Migration chain invariant violations detected:\n"
             + "\n".join(f"  • {e}" for e in errors)
+            + "\n"
+            + format_offender_marker(errors)
         )
 
     def test_task_context_size_constraint_exists_in_migration(self):
@@ -1203,7 +1220,7 @@ class TestSchemaRevisionSync:
         ]
         assert not leaked, "Tracked helper or backup files found:\n  " + "\n  ".join(
             leaked
-        )
+        ) + "\n" + format_offender_marker(str(offender) for offender in leaked)
 
     def test_repo_root_self_review_outputs_are_ignored_and_untracked(self):
         """Repo-root self_review_*.json output must be gitignored and untracked.
@@ -1275,7 +1292,7 @@ class TestSchemaRevisionSync:
         ]
         assert not leaked_root, (
             "Tracked repo-root self_review_*.json files found:\n  "
-            + "\n  ".join(leaked_root)
+            + "\n  ".join(leaked_root) + "\n" + format_offender_marker(str(offender) for offender in leaked_root)
         )
 
     def test_schema_gate_raises_on_mismatch(self):
@@ -1355,8 +1372,11 @@ class TestSchemaRevisionSync:
         # the CI invariant and the runtime guard reason about filename-vs-
         # revision desync with identical parsing.
         mismatches = find_filename_revision_mismatches(sources)
-        assert not mismatches, "Migration revision mismatches:\n  " + "\n  ".join(
-            mismatches
+        assert not mismatches, (
+            "Migration revision mismatches:\n  "
+            + "\n  ".join(mismatches)
+            + "\n"
+            + format_offender_marker(mismatches)
         )
 
     def test_rollup_guard_uses_combined_chain_check(self):
@@ -1518,6 +1538,8 @@ class TestSchemaRevisionSync:
             "ALLOWED_BACKMERGE_GITHUB_HELPERS deliberately, with a justification that it "
             "cannot push a renumber to the live integration branch, and preserve the "
             "runtime guards in test_hotfix_backmerge.py."
+            + "\n"
+            + format_offender_marker(unexpected)
         )
 
         # Guard the guard: an accidental "allow everything" (empty-set) regression
@@ -1604,6 +1626,8 @@ class TestSchemaRevisionSync:
             "ROLLUP staging-branch reconcile in rollup_management, which must stay there. "
             "If you genuinely need a new helper, add it to ALLOWED_PLANNER_GITHUB_HELPERS "
             "deliberately, with a justification that it cannot push to a branch."
+            + "\n"
+            + format_offender_marker(unexpected)
         )
 
     def test_migration_chain_is_linear(self):
@@ -1643,6 +1667,8 @@ class TestSchemaRevisionSync:
         assert not unparseable, (
             "Migration files with no parseable revision identifier:\n  "
             + "\n  ".join(sorted(unparseable))
+            + "\n"
+            + format_offender_marker(unparseable)
         )
 
         # No two files may declare the same Alembic revision id — that is the
@@ -1650,6 +1676,8 @@ class TestSchemaRevisionSync:
         assert not duplicates, (
             "Duplicate Alembic revision identifier(s) across migration files: "
             + ", ".join(sorted(set(duplicates)))
+            + "\n"
+            + format_offender_marker(duplicates)
         )
 
         # Every down_revision must point to a revision that exists (or None for the root)
@@ -1660,12 +1688,14 @@ class TestSchemaRevisionSync:
         ]
         assert not missing_parents, "Broken migration chain:\n  " + "\n  ".join(
             missing_parents
-        )
+        ) + "\n" + format_offender_marker(str(offender) for offender in missing_parents)
 
         # Exactly one root (down_revision=None) and one head (no one points to it)
         roots = [r for r, d in chain.items() if d is None]
         assert len(roots) == 1, (
             f"Expected exactly 1 root migration, found {len(roots)}: {roots}"
+            + "\n"
+            + format_offender_marker(roots)
         )
 
         heads = find_heads(chain)
@@ -1787,6 +1817,11 @@ class TestSchemaRevisionSync:
             "bug class that silently dropped 0612b. "
             f"guard-only={sorted(guard_set - invariant_set)} "
             f"invariant-only={sorted(invariant_set - guard_set)}"
+            + "\n"
+            + format_offender_marker(
+                [*(f"guard-only:{item}" for item in guard_set - invariant_set),
+                 *(f"invariant-only:{item}" for item in invariant_set - guard_set)]
+            )
         )
         # The non-numeric-prefix migration that used to be dropped must be in
         # both enumerations.
@@ -1873,7 +1908,7 @@ class TestSchemaRevisionSync:
             "structural head or when migrations are numbered out of chain order.\n"
             "Violations:\n" + "\n".join(violations) + "\n\n"
             "Ensure every revision is numerically greater than its down_revision, "
-            "and the numeric-maximum revision is the true structural head."
+            "and the numeric-maximum revision is the true structural head." + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
     def test_model_columns_covered_by_migrations(self):
@@ -1986,7 +2021,7 @@ class TestSchemaRevisionSync:
             "Columns defined on models but missing from alembic migrations:\n"
             + "\n".join(f"  - {t}.{c}" for t, c in missing)
             + "\n\nAdd a migration for each missing column, or the backend will "
-            "crash on startup with UndefinedColumnError."
+            "crash on startup with UndefinedColumnError." + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
         # Facade completeness: ``app.models`` is the canonical import surface for
@@ -2015,6 +2050,8 @@ class TestSchemaRevisionSync:
             "re-exported by app.models, so `from app.models import <name>` "
             "breaks and the table vanishes from SQLModel.metadata):\n"
             + "\n".join(f"  - {n}" for n in facade_missing)
+            + "\n"
+            + format_offender_marker(facade_missing)
         )
 
     def test_migration_column_types_match_models(self):
@@ -2322,7 +2359,7 @@ class TestSchemaRevisionSync:
             + "\n\nFor datetime columns: use sa.DateTime(timezone=True) when the model "
             "uses NaiveUTCDateTime, or add a corrective ALTER COLUMN migration.\n"
             "Do NOT add new entries to _pre_convention_notz in this test — fix the "
-            "migration instead."
+            "migration instead." + "\n" + format_offender_marker(str(offender) for offender in mismatches)
         )
 
     def test_model_indexes_covered_by_migrations(self):
@@ -2501,7 +2538,7 @@ class TestSchemaRevisionSync:
             "Indexes defined on models but missing from alembic migrations:\n"
             + "\n".join(missing)
             + "\n\nAdd an op.create_index call to a migration for each missing "
-            "index, or queries will silently fall back to sequential scans."
+            "index, or queries will silently fall back to sequential scans." + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
     def test_pending_guards_are_eventually_resolved(self):
@@ -2685,7 +2722,7 @@ class TestSchemaRevisionSync:
             "Migrations with non-substantive downgrade() bodies:\n  "
             + "\n  ".join(offenders)
             + "\n\nEither implement a real rollback or `raise NotImplementedError(...)` "
-            "to mark the migration as intentionally irreversible."
+            "to mark the migration as intentionally irreversible." + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
     def test_no_new_unguarded_duplicate_indexes_across_migrations(self):
@@ -2801,6 +2838,8 @@ class TestSchemaRevisionSync:
             + "\n\nUse op.create_index(..., if_not_exists=True) or raw SQL "
             "'CREATE INDEX IF NOT EXISTS' for any migration that re-asserts "
             "an index name an earlier migration already created."
+            + "\n"
+            + format_offender_marker(violations)
         )
 
     def test_duplicate_index_epoch_ordering(self):
@@ -2884,7 +2923,7 @@ class TestSchemaRevisionSync:
             + "\n\nInside the `if bind.dialect.name == \"postgresql\":` branch, "
             'emit `op.execute("COMMIT")` BEFORE the first CREATE/DROP INDEX '
             "CONCURRENTLY statement (see alembic 0489 / 0450 for the pattern), "
-            "or wrap the CONCURRENTLY DDL in `with op.get_context().autocommit_block():`."
+            "or wrap the CONCURRENTLY DDL in `with op.get_context().autocommit_block():`." + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
     def test_migrations_do_not_import_candidate_side_app_symbols(self):
@@ -2949,7 +2988,7 @@ class TestSchemaRevisionSync:
             "replayed by the serving engine during qualification, which may not "
             "have candidate-side app symbols.  Make these migrations self-contained "
             "(inline the needed logic, as 0609 demonstrates):\n  "
-            + "\n  ".join(violations)
+            + "\n  ".join(violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
 # ── Chain-invariant detector self-certification (seeded bad fixtures) ────────
@@ -3044,6 +3083,8 @@ class TestChainInvariantSeedFixtures:
         no_errors = validate_standalone_chain(sources, expected_schema_revision="0003")
         assert not no_errors, (
             f"validate_standalone_chain reported errors for correct revision '0003': {no_errors}"
+            + "\n"
+            + format_offender_marker(no_errors)
         )
 
     def test_gapped_linear_chain_validates_clean(self):
@@ -3066,6 +3107,8 @@ class TestChainInvariantSeedFixtures:
         assert not errors, (
             "validate_standalone_chain incorrectly rejected a gapped-but-linear "
             f"chain (0354->0365); errors: {errors}"
+            + "\n"
+            + format_offender_marker(errors)
         )
 
     def test_validate_standalone_chain_aggregates_all_detectors(self):
@@ -3747,7 +3790,7 @@ class TestPreMergeDualHeadGuardCoverage:
             "integration/promotion branch — add its (file, function) to "
             "TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES with a documented "
             "reason.\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
     def test_premerge_helper_whole_function_exemptions_are_not_blanket_trust_zones(
@@ -4538,7 +4581,7 @@ class TestMergePrimitiveLock:
             f"{', '.join(sorted(unregistered_merge_issuers))}.\n"
             f"Add each function name to _MERGE_NAMES so that all its call sites "
             f"receive guard-coverage checking. Without registration, call sites "
-            f"escape the coverage scan and can slip through unguarded."
+            f"escape the coverage scan and can slip through unguarded." + "\n" + format_offender_marker(str(offender) for offender in unregistered_merge_issuers)
         )
 
     def test_no_raw_merge_endpoint_calls_outside_helper_layer(self):
@@ -4595,7 +4638,7 @@ class TestMergePrimitiveLock:
             "(merge_pull_request from github_pulls.py). "
             "Calling the endpoint directly bypasses guard coverage and can slip "
             "through unguarded.\n"
-            "Fix by importing and calling the appropriate primitive instead."
+            "Fix by importing and calling the appropriate primitive instead." + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
     def test_scan_detects_multiline_raw_merge_rest_endpoint(self):
@@ -4957,7 +5000,7 @@ class TestOperatorMessageArmingGateCoverage:
             "the site is intentionally exempt — add its (file, function) to "
             "TestOperatorMessageArmingGateCoverage._EXEMPT_SITES with a documented "
             "reason.\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
 # ── Security Scanner Integrity ──────────────────────────────────────────────
@@ -4985,7 +5028,7 @@ class TestSecurityIntegrity:
             "prompt_leak",
         }
         missing = required - categories
-        assert not missing, f"Missing security pattern categories: {missing}"
+        assert not missing, f"Missing security pattern categories: {missing}" + "\n" + format_offender_marker(str(offender) for offender in missing)
 
     def test_high_severity_patterns_exist(self):
         """Must have high-severity patterns for critical injection types."""
@@ -4994,6 +5037,13 @@ class TestSecurityIntegrity:
         high_patterns = [p for p in INJECTION_PATTERNS if p["severity"] == "high"]
         assert len(high_patterns) >= 10, (
             f"Only {len(high_patterns)} high-severity patterns — expected at least 10"
+            + "\n"
+            + format_offender_marker(
+                f"{pattern.get('category')}:{pattern.get('description')}".replace(
+                    "\n", " "
+                )
+                for pattern in high_patterns
+            )
         )
 
 # ── Dialect-resolution footgun guard ───────────────────────────────────────
@@ -5036,7 +5086,7 @@ class TestNoRawBindDialectIdiom:
             "Resolve the dialect via app.database.resolve_dialect_name(session) "
             "instead — a None-bind async session silently defaults to Postgres "
             "and emits Postgres-only SQL on SQLite (incident PR #7099).\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
     def test_no_two_line_bind_dialect_split(self):
@@ -5087,7 +5137,7 @@ class TestNoRawBindDialectIdiom:
             "`.dialect` is read later is the same None-bind footgun in disguise "
             "(incident PR #7099). Resolve the dialect via "
             "app.database.resolve_dialect_name(session) instead.\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
 class TestNoUnguardedPostgresJsonOp:
@@ -5191,7 +5241,7 @@ class TestNoUnguardedPostgresJsonOp:
             "branch the Postgres-only path behind it (see account-health fix), "
             "falling back to a portable `func.json_extract(...)` predicate on "
             "SQLite (see landed_signal / agent_warm_continuity).\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
     def test_scanner_flags_injected_unguarded_op(self):
@@ -5328,7 +5378,7 @@ class TestBaseBranchFallback:
         assert not offenders, (
             "Found hardcoded branch fallbacks in backend/app/.\n"
             "Replace defensive 'main' defaults with project-aware resolution.\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
     def test_no_hardcoded_branch_in_task_display_strings(self):
@@ -5358,7 +5408,7 @@ class TestBaseBranchFallback:
             "in backend/app/.\n"
             "Interpolate branch values from the resolved per-task variable (e.g. base_branch)\n"
             "instead of embedding literal 'main...' or 'main -> automain'.\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
 class TestBranchLiteralComplianceScanner:
@@ -5481,7 +5531,7 @@ class TestStagingBranchClassification:
             "Found hardcoded staging-prefix startswith calls in backend/app/.\n"
             "Replace with project.is_staging_branch(branch) or\n"
             "project.staging_branch_prefixes for per-project prefix resolution.\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
 # ── Deployment State Model ──────────────────────────────────────────────────
@@ -5495,6 +5545,11 @@ class TestDeploymentStateModel:
         actual = {s.value for s in DeploymentStatus}
         assert expected == actual, (
             f"DeploymentStatus values changed: expected {expected}, got {actual}"
+            + "\n"
+            + format_offender_marker(
+                [*(f"expected:{item}" for item in expected),
+                 *(f"actual:{item}" for item in actual)]
+            )
         )
 
 # ── Agent Model Forward Compatibility ───────────────────────────────────────
@@ -5607,7 +5662,7 @@ class TestAgentRouterInvariants:
             "Only _terminated_task_ids is permitted as a task-ID-keyed dict. "
             "See PR #6038: dead caches are latent footguns. The DB recheck is the "
             "authoritative gate — caching 'known active' tasks risks stale "
-            "authorization of deleted/terminal tasks."
+            "authorization of deleted/terminal tasks." + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
 # -- Direction Lifecycle Regression Guards --
@@ -5693,6 +5748,8 @@ class TestDirectionLifecycleInvariants:
             "The 'auto_completed' string literal is missing from the research pipeline modules "
             f"({', '.join(os.path.basename(p) for p in candidate_paths)}). "
             "Auto-completion logic was silently removed in PR #832 and must not be removed again."
+            + "\n"
+            + format_offender_marker(candidate_paths)
         )
 
     def test_direction_cap_enforced_in_post(self):
@@ -5730,7 +5787,7 @@ class TestDirectionLifecycleInvariants:
                     bad.append(f"{os.path.basename(path)}:{lineno} uses default {m.group(1)!r} (want 10)")
         assert not bad, (
             "max_active_directions read-sites have wrong fallback defaults "
-            f"(registry declares 10): {bad}"
+            f"(registry declares 10): {bad}" + "\n" + format_offender_marker(str(offender) for offender in bad)
         )
 
 # ── Module Size Guardrails ─────────────────────────────────────────────────
@@ -5753,6 +5810,7 @@ _SIZE_LIMITS = _load_size_limits()
 MODULE_SIZE_LIMITS = _SIZE_LIMITS["backend"]
 AGENT_SIZE_LIMITS = _SIZE_LIMITS["agent"]
 TESTING_SIZE_LIMITS = _SIZE_LIMITS.get("testing", {})
+SCRIPTS_SIZE_LIMITS = _SIZE_LIMITS.get("scripts", {})
 
 def _size_breach_message(
     rel_path: str, count: int, limit: int, module_kind: str
@@ -5863,7 +5921,7 @@ class TestBackendModuleSizeGuardrails:
                 for r, actual, cap, allowed in stale
             )
             + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
-            "and commit the updated module_size_limits.json."
+            "and commit the updated module_size_limits.json." + "\n" + format_offender_marker(str(offender) for offender in stale)
         )
 
 _AGENT_SRC_ROOT = (
@@ -6067,7 +6125,105 @@ class TestTestFileSizeGuardrails:
                 for r, actual, cap, allowed in stale
             )
             + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
+            "and commit the updated module_size_limits.json." + "\n" + format_offender_marker(str(offender) for offender in stale)
+        )
+
+def _resolve_scripts_root() -> str | None:
+    """Resolve the repo's scripts/ directory across both test layouts.
+
+    The CI shard containers mount the backend at /app and the full repo at
+    /repo, so ``../../scripts`` relative to testing/ does not exist there —
+    /repo/scripts is the canonical location (same convention as
+    ``_script_test_harness``). Local checkouts resolve the sibling path.
+    When CI is set and neither candidate exists the guardrail must HARD-FAIL,
+    not skip: a silently unresolvable scripts/ tree would blind every scripts
+    cap in module_size_limits.json.
+    """
+    candidates = (
+        os.path.join("/repo", "scripts"),
+        os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
+        ),
+    )
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+_SCRIPTS_ROOT = _resolve_scripts_root()
+
+
+def _require_scripts_root() -> str:
+    if _SCRIPTS_ROOT is None:
+        if os.environ.get("CI"):
+            pytest.fail(
+                "scripts/ directory is unavailable (checked /repo/scripts and "
+                "the repo-relative sibling); the CI harness must mount the "
+                "repo at /repo so scripts size caps stay enforced"
+            )
+        pytest.skip("scripts/ directory not available in this environment")
+    return _SCRIPTS_ROOT
+
+class TestScriptsModuleSizeGuardrails:
+    """Loose upper bounds for scripts/ files to catch runaway growth.
+
+    scripts/ holds release-critical logic (static_release_guard.py,
+    test-backend.sh's Python helpers) but sat outside size-limit governance
+    entirely. Every key in the ``scripts`` section of module_size_limits.json
+    is enforced automatically — adding a key to the JSON is sufficient.
+    """
+
+    def _check_scripts_file(self, relative_path: str) -> None:
+        max_lines = SCRIPTS_SIZE_LIMITS[relative_path]
+        path = os.path.join(_require_scripts_root(), relative_path)
+        assert os.path.isfile(path), _stale_size_cap_message(relative_path, "scripts")
+        with open(path, encoding="utf-8") as f:
+            count = len(f.readlines())
+        assert count <= max_lines, _size_breach_message(
+            relative_path, count, max_lines, "scripts"
+        )
+
+    @pytest.mark.parametrize("relative_path", sorted(SCRIPTS_SIZE_LIMITS))
+    def test_scripts_file_within_limit(self, relative_path):
+        """Every key in the ``scripts`` section of module_size_limits.json is
+        enforced automatically — adding a key to the JSON is sufficient to
+        enforce its cap, with no per-file test method to maintain."""
+        self._check_scripts_file(relative_path)
+
+    def test_no_stale_scripts_caps(self):
+        """Caps must remain close enough to actual file sizes to catch real growth.
+
+        A cap that has drifted to 3x+ the actual file size (typical after a
+        monolith is split) is no longer a meaningful guardrail. This test
+        enforces that every scripts cap stays within max(actual + 500, actual * 2).
+
+        Remedy: tighten the cap in module_size_limits.json under 'scripts' to
+        match the policy value returned by ``check_size_limits.py --fix`` for
+        the breaching entry. Do NOT modify this test to raise the threshold.
+        """
+        stale = []
+        scripts_root = _require_scripts_root()
+        for rel_path, cap in SCRIPTS_SIZE_LIMITS.items():
+            abs_path = os.path.join(scripts_root, rel_path)
+            if not os.path.exists(abs_path):
+                continue
+            with open(abs_path, encoding="utf-8") as fh:
+                actual = len(fh.readlines())
+            allowed_cap = max(actual + 500, actual * 2)
+            if cap > allowed_cap:
+                stale.append((rel_path, actual, cap, allowed_cap))
+        assert not stale, (
+            f"{len(stale)} scripts cap(s) have drifted far above actual file size "
+            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
+            "the file grows to an unreasonable size:\n\n"
+            + "\n".join(
+                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
+                for r, actual, cap, allowed in stale
+            )
+            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
             "and commit the updated module_size_limits.json."
+            + "\n" + format_offender_marker(r for r, _actual, _cap, _allowed in stale)
         )
 
 
@@ -6094,9 +6250,7 @@ def _missing_cap_message(offenders: list, section: str) -> str:
         f"  - {rel} has {count} lines (threshold: {_COVERAGE_THRESHOLD})"
         for rel, count in offenders
     )
-    offender_marker = "BLUEPRINT_OFFENDERS: " + json.dumps(
-        sorted(rel for rel, _count in offenders), separators=(",", ":")
-    )
+    offender_marker = format_offender_marker(rel for rel, _count in offenders)
     return (
         f"{len(offenders)} source file(s) exceed {_COVERAGE_THRESHOLD} lines "
         f"with NO cap entry under '{section}' in "
@@ -6206,6 +6360,12 @@ class TestSizeGuardrailCoverage:
         )
         assert not offenders, _missing_cap_message(offenders, "testing")
 
+    def test_scripts_no_uncapped_large_file(self):
+        offenders = _scan_uncapped(
+            _require_scripts_root(), SCRIPTS_SIZE_LIMITS, (".py",), lambda _rel: False
+        )
+        assert not offenders, _missing_cap_message(offenders, "scripts")
+
 # ── LLM Token Pricing Coverage ──────────────────────────────────────────────
 
 class TestLLMTokenPricingCoverage:
@@ -6247,7 +6407,7 @@ class TestLLMTokenPricingCoverage:
             + "\n\nAdd entries to LLM_TOKEN_PRICING in backend/app/efficiency_snapshot.py "
             "for each missing (provider, model) combo. Source rates from official "
             "provider pricing pages; preview/beta models without published rates "
-            "should be priced at the closest GA-tier equivalent with a clarifying comment."
+            "should be priced at the closest GA-tier equivalent with a clarifying comment." + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
 # ── Failure Classification Taxonomy ────────────────────────────────────────
@@ -6476,7 +6636,7 @@ class TestPromptVocabularyParity:
 
         backend_cats = frozenset(_REVIEW_CATEGORIES.keys()) - {"other"}
         issues = _check_sr_category_parity(AGENT_SELF_REVIEW_CATEGORIES, backend_cats)
-        assert not issues, "\n".join(issues)
+        assert not issues, "\n".join(issues) + "\n" + format_offender_marker(issues)
 
     def test_agent_categories_match_prompt_source(self):
         """Parsed prompt.ts categories must exactly match AGENT_SELF_REVIEW_CATEGORIES.
@@ -6503,6 +6663,8 @@ class TestPromptVocabularyParity:
         assert not issues, (
             "AGENT_SELF_REVIEW_CATEGORIES mirror has drifted from agent/src/prompt.ts:\n"
             + "\n".join(issues)
+            + "\n"
+            + format_offender_marker(issues)
         )
 
 class TestSrCategoryParityHelper:
@@ -6691,7 +6853,7 @@ class TestPlaybookLearningFacadeCompat:
             "app.playbook_learning re-exports a shadow copy instead of the "
             "canonical app.playbook_storage object for: "
             f"{mismatched}. The facade must re-export by identity "
-            "(`from app.playbook_storage import <name>`), not redefine."
+            "(`from app.playbook_storage import <name>`), not redefine." + "\n" + format_offender_marker(str(offender) for offender in mismatched)
         )
 
     def test_lifecycle_shim_symbols_are_canonical_storage_objects(self):
@@ -6712,7 +6874,7 @@ class TestPlaybookLearningFacadeCompat:
         assert not mismatched, (
             "app.playbook_lifecycle re-exports a shadow copy instead of the "
             "canonical app.playbook_storage object for: "
-            f"{mismatched}. The shim must re-export by identity, not redefine."
+            f"{mismatched}. The shim must re-export by identity, not redefine." + "\n" + format_offender_marker(str(offender) for offender in mismatched)
         )
 
     def test_shim_and_facade_do_not_redefine_lifecycle_helpers(self):
@@ -6740,7 +6902,7 @@ class TestPlaybookLearningFacadeCompat:
             "redefined (not re-exported) in the shim/facade — this re-introduces "
             "a dead twin that can drift from the canonical implementation. "
             "Re-export it via `from app.playbook_storage import <name>` instead.\n"
-            "Offenders:\n" + "\n".join(offenders)
+            "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
         )
 
 # ── edges_considered Schema Invariants ────────────────────────────────────────
@@ -6824,7 +6986,7 @@ class TestEdgesConsideredInvariants:
         missing_keys = EXPECTED_KEYS - result.keys()
         assert not missing_keys, (
             f"_compute_edges_considered_metrics return dict is missing keys: {sorted(missing_keys)}. "
-            "Update this test and the frontend reader together when changing the return shape."
+            "Update this test and the frontend reader together when changing the return shape." + "\n" + format_offender_marker(str(offender) for offender in missing_keys)
         )
 
     def test_entry_handled_field_is_read_correctly(self):
@@ -7042,7 +7204,7 @@ def _check_lock_invariant(
         + "\n".join(violations)
         + f"\n\nRoute new {attr_name} writes through {helper_name}() "
         "(task_locking.py). Counts may only be lowered after migrating a site "
-        "to the canonical helper, never raised."
+        "to the canonical helper, never raised." + "\n" + format_offender_marker(str(offender) for offender in violations)
     )
 
 
@@ -7080,13 +7242,13 @@ class TestGodColumnDualWrittenKeysReserved:
         missing_reserved = self._DUAL_WRITTEN_KV_KEYS - _RESERVED_DESIGN_DOC_KEYS
         assert not missing_reserved, (
             "dual-written telemetry keys missing from _RESERVED_DESIGN_DOC_KEYS "
-            f"(would consume agent write budget): {sorted(missing_reserved)}"
+            f"(would consume agent write budget): {sorted(missing_reserved)}" + "\n" + format_offender_marker(str(offender) for offender in missing_reserved)
         )
 
         missing_telemetry = self._DUAL_WRITTEN_KV_KEYS - TELEMETRY_KEYS
         assert not missing_telemetry, (
             "dual-written telemetry keys missing from TELEMETRY_KEYS: "
-            f"{sorted(missing_telemetry)}"
+            f"{sorted(missing_telemetry)}" + "\n" + format_offender_marker(str(offender) for offender in missing_telemetry)
         )
 
         prematurely_stripped = (
@@ -7095,7 +7257,7 @@ class TestGodColumnDualWrittenKeysReserved:
         assert not prematurely_stripped, (
             "keys in _TELEMETRY_MIGRATED_KEYS would be stripped from design_doc, "
             "breaking older serving engines mid-cutover: "
-            f"{sorted(prematurely_stripped)}"
+            f"{sorted(prematurely_stripped)}" + "\n" + format_offender_marker(str(offender) for offender in prematurely_stripped)
         )
 
 # ── Directions Lock Invariant ─────────────────────────────────────────────────
@@ -7174,7 +7336,7 @@ class TestDirectionsLockAssignmentGuard:
             "  (a) Migrate the write to with_directions_locked() (in task_locking.py) and "
             "lower the count in lock_assignment_baseline.json, or\n"
             "  (b) Restore the surrounding project_lock / with_for_update / "
-            "lock_project_or_429 call that was accidentally removed."
+            "lock_project_or_429 call that was accidentally removed." + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
 class TestResearchCompletionDirectionsLocked:
@@ -7262,7 +7424,7 @@ class TestRuntimeConfigProjectBranchBypasses:
 
         assert not violations, (
             "Direct _runtime_config.get(...) project-branch reads found outside the allowlist:\n"
-            + "\n".join(violations)
+            + "\n".join(violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
 # ── Vision Lock Invariant ─────────────────────────────────────────────────────
@@ -7329,7 +7491,7 @@ class TestBasebranchMainFallbackInvariant:
             "  from app.shared_state import get_project_integration_branch\n"
             "  base_branch = (payload.get('base_branch')\n"
             "      or get_project_integration_branch(project))\n"
-            "See shared_state.get_project_integration_branch for the fallback ordering."
+            "See shared_state.get_project_integration_branch for the fallback ordering." + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
 class TestVisionLockInvariant:
@@ -7441,7 +7603,7 @@ class TestDesignDocLockAssignmentGuard:
             "  (a) Migrate the write to with_design_doc_locked() (in task_locking.py) and "
             "lower the count in lock_assignment_baseline.json, or\n"
             "  (b) Restore the surrounding project_lock / with_for_update / "
-            "lock_project_or_429 call that was accidentally removed."
+            "lock_project_or_429 call that was accidentally removed." + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
 # ── Vision Lock Assignment Guard ──────────────────────────────────────────────
@@ -7502,7 +7664,7 @@ class TestVisionLockAssignmentGuard:
             "  (a) Migrate the write to with_vision_locked() (in task_locking.py) and "
             "lower the count in lock_assignment_baseline.json, or\n"
             "  (b) Restore the surrounding project_lock / with_for_update / "
-            "lock_project_or_429 call that was accidentally removed."
+            "lock_project_or_429 call that was accidentally removed." + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
 # ── Behind-Recovery update_branch Guard ──────────────────────────────────────
@@ -7764,6 +7926,8 @@ class TestBehindRecoveryUpdateBranchGuard:
             "pr_is_not_behind short-circuit. See the docstring on "
             "TestBehindRecoveryUpdateBranchGuard for how to add an "
             "_ALLOWLIST entry if the caller is genuinely not behind-recovery."
+            + "\n"
+            + format_offender_marker(violations)
         )
 
     def test_known_guarded_sites_are_detected(self):
@@ -7805,7 +7969,7 @@ class TestBehindRecoveryUpdateBranchGuard:
         assert not missing, (
             "Positive-sanity check failed — the AST walk did not detect "
             "known-guarded sites in: " + ", ".join(sorted(missing)) + ".\n"
-            "guarded_keys=" + ", ".join(sorted(guarded_keys))
+            "guarded_keys=" + ", ".join(sorted(guarded_keys)) + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
         # At least three guarded call sites must be present (1 in
@@ -7880,7 +8044,7 @@ class TestBehindRecoveryUpdateBranchGuard:
 
         assert not unresolved, (
             "Pending behind-recovery guard fix(es) not yet applied: "
-            + ", ".join(unresolved)
+            + ", ".join(unresolved) + "\n" + format_offender_marker(str(offender) for offender in unresolved)
         )
 
 # ── BuildConfig Schema Coverage ───────────────────────────────────────────────
@@ -7922,7 +8086,7 @@ class TestBuildConfigSchemaCoverage:
             "build_config keys read by Project properties but not declared in "
             "BuildConfig schema (they will be silently stripped on save):\n"
             + "\n".join(f"  - {k}" for k in sorted(undeclared))
-            + "\n\nAdd each missing key to BuildConfig in backend/app/schemas.py."
+            + "\n\nAdd each missing key to BuildConfig in backend/app/schemas.py." + "\n" + format_offender_marker(str(offender) for offender in undeclared)
         )
 
 class TestVmCostRateConsolidation:
@@ -8109,6 +8273,11 @@ class TestPrMergedLandedWriterAllowlist:
                 + "\n".join(f"  - {p}" for p in stale_entries)
                 if stale_entries
                 else ""
+            )
+            + "\n"
+            + format_offender_marker(
+                [*(f"new:{item}" for item in new_writers),
+                 *(f"stale:{item}" for item in stale_entries)]
             )
         )
 
@@ -8466,7 +8635,7 @@ class TestTypedMockAssertConvention:
             "``expectLastCalledWith`` / ``expectNotCalledWith`` from "
             "``agent/src/utils/typed-mock-call.ts`` instead (or, if the function "
             "genuinely cannot be typed, add it to ``_TYPED_MOCK_EXEMPT`` with a "
-            "reason):\n" + "\n".join(all_offenders)
+            "reason):\n" + "\n".join(all_offenders) + "\n" + format_offender_marker(str(offender) for offender in all_offenders)
         )
 
     def test_typed_mock_scanner_detects_injected_regression(self):
@@ -9046,7 +9215,7 @@ class TestAgentEnvFailureSignatureParity:
         assert not missing, (
             "agent/src/utils/test-runners.ts matchesEnvironmentFailureSignature "
             "is missing pattern(s) that mirror backend _AGENT_VM_PATTERNS: "
-            f"{missing}. Add the missing patterns to keep the two banks in sync."
+            f"{missing}. Add the missing patterns to keep the two banks in sync." + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
     def test_extract_env_failure_region_raises_on_missing_anchor(self):
@@ -9089,6 +9258,11 @@ class TestAgentTestRunnerTableParity:
             f"  families in fixture but missing from table: {sorted(missing)}\n"
             f"  families in table but absent from fixture:  {sorted(extra)}\n"
             "Update AGENT_TEST_RUNNER_COMMANDS in backend/testing/test_invariants.py."
+            + "\n"
+            + format_offender_marker(
+                [*(f"missing:{item}" for item in missing),
+                 *(f"extra:{item}" for item in extra)]
+            )
         )
 
     def test_table_has_nonempty_command_for_every_fixture_family(self):
@@ -9112,7 +9286,7 @@ class TestAgentTestRunnerTableParity:
         assert not missing, (
             "AGENT_TEST_RUNNER_COMMANDS is missing a non-empty command for "
             "detectable fixture family/families:\n" + "\n".join(missing) + "\n"
-            "Add the family→command entry in backend/testing/test_invariants.py."
+            "Add the family→command entry in backend/testing/test_invariants.py." + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
     def test_fixture_families_are_unambiguous(self):
@@ -9135,6 +9309,8 @@ class TestAgentTestRunnerTableParity:
             "Fixture names detectable family/families with no table entry: "
             f"{unknown}. Every detectable family must map to exactly one command "
             "in AGENT_TEST_RUNNER_COMMANDS."
+            + "\n"
+            + format_offender_marker(unknown)
         )
 
     @staticmethod
@@ -9277,7 +9453,7 @@ class TestAgentTestRunnerSourceParity:
             + "\n".join(missing)
             + "\n\nThe agent detector drifted from AGENT_TEST_RUNNER_COMMANDS. "
             "Reconcile agent/src/utils/test-runners.ts and the table in "
-            "backend/testing/test_invariants.py."
+            "backend/testing/test_invariants.py." + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
     def test_agent_emits_shell_script_runner(self):
@@ -9374,6 +9550,8 @@ class TestAgentTestRunnerSourceParity:
             f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
             "Add the new family/command to the table in "
             "backend/testing/test_invariants.py (and the shared fixture)."
+            + "\n"
+            + format_offender_marker(orphans)
         )
 
     def test_agent_generic_fallback_runners_are_all_in_table(self):
@@ -9399,6 +9577,8 @@ class TestAgentTestRunnerSourceParity:
             f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
             "Add the new family/command to the table in "
             "backend/testing/test_invariants.py (and the shared fixture)."
+            + "\n"
+            + format_offender_marker(orphans)
         )
 
     def test_agent_core_root_runners_are_all_in_table(self):
@@ -9428,6 +9608,8 @@ class TestAgentTestRunnerSourceParity:
             f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
             "Add the new family/command to the table in "
             "backend/testing/test_invariants.py (and the shared fixture)."
+            + "\n"
+            + format_offender_marker(orphans)
         )
 
     def test_agent_nested_package_runners_are_all_in_table(self):
@@ -9449,6 +9631,8 @@ class TestAgentTestRunnerSourceParity:
             f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
             "Add the new family/command to the table in "
             "backend/testing/test_invariants.py (and the shared fixture)."
+            + "\n"
+            + format_offender_marker(orphans)
         )
 
     def test_classifier_missing_command_requires_adjacency(self):
@@ -9661,7 +9845,7 @@ class TestAgentTestRunnerSourceParity:
             f"families: {missing}. The no-CI gate's runner detection can still "
             "launch these ecosystems, so dropping their failure signature re-opens "
             "the merge-unverified fall-open. Restore the line-anchored, non-zero "
-            "signature(s) in hasRealFailureEvidence."
+            "signature(s) in hasRealFailureEvidence." + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
         # The count-summary signatures MUST keep a non-zero guard so a zero-count
@@ -9753,7 +9937,7 @@ class TestAgentTestRunnerSourceParity:
             f"families: {missing}. The no-CI gate's runner detection can still "
             "launch these ecosystems, so dropping their all-skip signature re-opens "
             "the false-'verified' fall-open (an all-skipped suite recorded as a "
-            "verified pass). Restore the line-anchored all-skip signature(s)."
+            "verified pass). Restore the line-anchored all-skip signature(s)." + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
         # The aggregate-family detection MUST compare total === skip (not a bare
@@ -9940,7 +10124,7 @@ def test_unverified_reason_labels_backend_covers_all_keys():
     missing = _UNVERIFIED_REASON_KEYS - set(_UNVERIFIED_REASON_LABELS)
     assert not missing, (
         "backend _UNVERIFIED_REASON_LABELS (app/alert_dispatch.py) is missing "
-        f"labels for emitted reason keys: {sorted(missing)}"
+        f"labels for emitted reason keys: {sorted(missing)}" + "\n" + format_offender_marker(str(offender) for offender in missing)
     )
 
 def test_unverified_reason_labels_frontend_backend_parity():
@@ -9965,11 +10149,20 @@ def test_unverified_reason_labels_frontend_backend_parity():
         "(app/alert_dispatch._UNVERIFIED_REASON_LABELS) must label the same keys. "
         f"frontend-only={sorted(frontend_keys - backend_keys)} "
         f"backend-only={sorted(backend_keys - frontend_keys)}"
+        + "\n"
+        + format_offender_marker(
+            [*(f"frontend-only:{key}" for key in frontend_keys - backend_keys),
+             *(f"backend-only:{key}" for key in backend_keys - frontend_keys)]
+        )
     )
     # And both must cover the full canonical emitted set.
     assert _UNVERIFIED_REASON_KEYS <= frontend_keys, (
         "frontend reason-label map missing canonical keys: "
         f"{sorted(_UNVERIFIED_REASON_KEYS - frontend_keys)}"
+        + "\n"
+        + format_offender_marker(
+            f"missing:{key}" for key in _UNVERIFIED_REASON_KEYS - frontend_keys
+        )
     )
 
 # Canonical set of degraded no-CI reasons that escalate to ERROR severity.
@@ -10003,7 +10196,7 @@ def test_unverified_reason_severity_covers_all_keys():
         "no-CI reason severity map (_UNVERIFIED_REASON_SEVERITY in "
         "app/alert_dispatch.py) is missing severity entries for emitted reason keys: "
         f"{sorted(missing)}. Every canonical reason must have an explicit severity "
-        "classification (ERROR for degraded environment/setup failures, WARNING for benign)."
+        "classification (ERROR for degraded environment/setup failures, WARNING for benign)." + "\n" + format_offender_marker(str(offender) for offender in missing)
     )
 
 def test_unverified_reason_severity_degraded_are_error():
@@ -10261,7 +10454,7 @@ def test_all_load_only_projection_sites_require_raiseload():
         "Projection contract violated: the following load_only()/defer() calls "
         "omit raiseload=True. Add raiseload=True to each site so that accessing "
         "an un-projected column raises synchronously at test time instead of "
-        "triggering a MissingGreenlet 500 in production.\n" + "\n".join(violations)
+        "triggering a MissingGreenlet 500 in production.\n" + "\n".join(violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
     )
 
 def test_stall_alert_functions_reachable_from_canonical_import_path():
@@ -10331,7 +10524,163 @@ def test_stall_alert_functions_reachable_from_canonical_import_path():
         "  (b) the 'from app.release_stall_alerts import ...' block in "
         "release_qualifier.py (for check functions re-exported for callers).\n\n"
         "Unreachable functions:\n" + "\n".join(f"  {f}" for f in unreachable)
+        + "\n"
+        + format_offender_marker(unreachable)
     )
+
+
+def test_release_blocker_codes_are_classified_and_scannable():
+    """Every persisted release blocker is in the latch inventory and map."""
+    app_dir = BACKEND_ROOT / "app"
+    source_names = {
+        "release_scoring.py",
+        "release_qualifier.py",
+        "release_qualifier_sweep.py",
+        "release_qualifier_audit.py",
+        "release_reconciliation.py",
+        "release_stall_alerts.py",
+    }
+    # The latch registry lives in release_gate_latch.py (extracted from
+    # release_stall_alerts.py so that module stays inside its size cap).
+    latch_source = (app_dir / "release_gate_latch.py").read_text(encoding="utf-8")
+    # Scope to the _GATE_SOURCES tuple itself — the file also carries a
+    # separate _SUPPLEMENTAL_GATE_IMPLEMENTING_PATHS map naming predicate
+    # modules (e.g. release_commit_authorship.py) that are deliberately NOT
+    # members of this literal-scan registry, so scanning the whole file would
+    # conflate the two mechanisms.
+    gate_sources_block = re.search(
+        r'_GATE_SOURCES = \((.*?)\n\)', latch_source, re.DOTALL
+    )
+    assert gate_sources_block is not None, "_GATE_SOURCES tuple not found"
+    registry_names = set(
+        re.findall(r'backend/app/(release_[a-z_]+\.py)', gate_sources_block.group(1))
+    )
+    assert registry_names == source_names, (
+        "release latch source inventory drifted: "
+        f"expected {sorted(source_names)}, found {sorted(registry_names)}"
+        + "\n" + format_offender_marker(
+            sorted(registry_names.symmetric_difference(source_names))
+        )
+    )
+
+    blocker_pattern = re.compile(
+        r'(?:\bblocker\s*=\s*|["\']blocker["\']\s*:\s*)'
+        r'["\']([a-z0-9_]+)["\']'
+    )
+    emitted = {
+        code
+        for name in source_names
+        for code in blocker_pattern.findall(
+            (app_dir / name).read_text(encoding="utf-8")
+        )
+    }
+    scoring_source = (app_dir / "release_scoring.py").read_text(encoding="utf-8")
+    classified = set(
+        re.findall(
+            r'^[ \t]*["\']([a-z0-9_]+)["\']:[ \t]*EXECUTION_SITE_',
+            scoring_source,
+            re.MULTILINE,
+        )
+    )
+    missing = sorted(emitted - classified)
+    assert not missing, (
+        "release blocker codes are emitted outside the scoring module but lack "
+        f"execution-site classification: {missing}"
+        + "\n" + format_offender_marker(missing)
+    )
+
+
+def test_latch_implicated_paths_are_hotfix_eligible():
+    """The latch detector's repair surface must fit its approved hotfix lane."""
+    from app import hotfix_policy
+
+    # These are the production paths changed by the shipped latch-announcement
+    # repair.  Keep this explicit: widening the hotfix lane is an authorization
+    # change and must be visible in this invariant's reviewable inventory.
+    latch_support_paths = {
+        "backend/app/message_audience.py",
+        "backend/app/project_message_creation.py",
+        "backend/app/release_stall_alerts.py",
+        "backend/app/release_gate_latch.py",
+    }
+    _latch_paths_missing = sorted(latch_support_paths - hotfix_policy.HOTFIX_ELIGIBLE_MODULES)
+    assert latch_support_paths <= hotfix_policy.HOTFIX_ELIGIBLE_MODULES, (
+        "latch repair paths missing from HOTFIX_ELIGIBLE_MODULES: "
+        f"{_latch_paths_missing}"
+        + "\n" + format_offender_marker(_latch_paths_missing)
+    )
+
+    # The standalone invariant is the one non-release test that the gate fix
+    # itself may need to change; verify the bounded companion exception covers
+    # it without making the general test tree eligible.
+    verdict = hotfix_policy.evaluate_hotfix_scope(
+        sorted(latch_support_paths | {"backend/testing/test_invariants.py"})
+    )
+    assert verdict.eligible, (
+        "latch repair plus its invariant must be hotfix-eligible: "
+        f"{verdict.offending_files} ({verdict.reason})"
+    )
+    assert not hotfix_policy.evaluate_hotfix_scope(
+        ["backend/testing/test_message_audience.py"]
+    ).eligible, "unbounded backend tests must remain outside the hotfix lane"
+
+
+def test_narrow_repair_scope_isolates_the_repair_from_a_wide_candidate():
+    """The lane's ACTUAL input — not a hand-written path set — must be narrow.
+
+    ``evaluate_hotfix_scope`` was never the defect: it was fed the whole
+    promotion-target..integration compare, so in the exact situation the lane
+    exists for (a latched gate whose repair integration already carries) it
+    always saw hundreds of product files.  This pins the repaired input path:
+    the union of the NAMED repair commits' own diffs is what gets scope-checked.
+    """
+    import asyncio
+
+    from app import hotfix_narrow_candidate
+
+    repair = "a" * 40
+    unrelated = "b" * 40
+    per_commit = {
+        repair: [
+            {"filename": "backend/app/release_stall_alerts.py", "patch": "@@\n+x\n"},
+            {"filename": "backend/testing/test_invariants.py", "patch": "@@\n+y\n"},
+        ],
+        # The same integration branch also carries 400 unrelated product files.
+        unrelated: [
+            {"filename": f"backend/app/product_{i}.py", "patch": None}
+            for i in range(400)
+        ],
+    }
+
+    async def _fake_compare(token, owner, repo, base_ref, head_ref, project_id=None):
+        return list(per_commit[head_ref])
+
+    import app.github_refs as _refs
+
+    original = _refs.get_changed_files_with_patches_between_refs
+    _refs.get_changed_files_with_patches_between_refs = _fake_compare
+    try:
+        narrow = asyncio.run(
+            hotfix_narrow_candidate.narrow_repair_scope("t", "o", "r", [repair])
+        )
+        wide = asyncio.run(
+            hotfix_narrow_candidate.narrow_repair_scope(
+                "t", "o", "r", [repair, unrelated]
+            )
+        )
+    finally:
+        _refs.get_changed_files_with_patches_between_refs = original
+
+    assert narrow["status"] == "eligible", narrow["reason"]
+    assert narrow["changed_files"] == [
+        "backend/app/release_stall_alerts.py",
+        "backend/testing/test_invariants.py",
+    ]
+    # Naming a commit that carries unrelated product code still fails CLOSED —
+    # the narrow lane changes the INPUT, never the authorization predicate.
+    assert wide["status"] == "scope_rejected"
+    assert "backend/app/product_0.py" in wide["offending_files"]
+
 
 def test_summarize_release_artifacts_callers_always_pass_project():
     """Every call to summarize_release_artifacts in backend/app/ passes project=.
@@ -10398,7 +10747,7 @@ def test_summarize_release_artifacts_callers_always_pass_project():
         "serving-status divergence across surfaces. Pass project=<project_row> at "
         "each site (or project=None if the call is known-safe and intentional — but "
         "prefer the explicit keyword so the invariant stays informative).\n"
-        + "\n".join(violations)
+        + "\n".join(violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
     )
 
 def test_serving_status_reads_route_through_aggregate():
@@ -10453,7 +10802,7 @@ def test_serving_status_reads_route_through_aggregate():
         "importing ``version_serving_summary`` from ``release_artifacts``.  "
         "Duplicate definitions diverge from the aggregate-first algorithm and "
         "cause serving-status inconsistency across UI/CLI/strategist surfaces.\n"
-        + "\n".join(duplicates)
+        + "\n".join(duplicates) + "\n" + format_offender_marker(str(offender) for offender in duplicates)
     )
 
 # ---------------------------------------------------------------------------
@@ -10500,7 +10849,7 @@ def test_dropped_dead_orm_columns_absent_from_models():
     assert not violations, (
         "Dead ORM columns were re-introduced in models.py.\n"
         "These columns have no live readers and were dropped in migration 0300.\n"
-        + "\n".join(violations)
+        + "\n".join(violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
     )
 
 def test_dropped_dead_orm_columns_write_sites_removed():
@@ -10532,7 +10881,7 @@ def test_dropped_dead_orm_columns_write_sites_removed():
     assert not violations, (
         "Write sites for dead ORM columns were reintroduced.\n"
         "These columns have no live readers and were dropped in migration 0300.\n"
-        + "\n".join(violations)
+        + "\n".join(violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
     )
 
 def test_authorized_test_deletion_allowlist_is_sealed():
@@ -10719,14 +11068,14 @@ def test_main_py_admin_endpoints_auth_and_401_path():
         "dependency (get_current_user or get_current_user_optional):\n"
         + "\n".join(f"  - {p}" for p in sorted(missing_auth))
         + "\n\nAdd Depends(get_current_user) or Depends(get_current_user_optional) "
-        "to the handler signature."
+        "to the handler signature." + "\n" + format_offender_marker(str(offender) for offender in missing_auth)
     )
     assert not missing_401, (
         "The following /api/admin/ endpoints in main.py use get_current_user_optional "
         "but have no explicit raise HTTPException(status_code=401) path:\n"
         + "\n".join(f"  - {p}" for p in sorted(missing_401))
         + "\n\nWhen current_user is None the endpoint must raise HTTPException(status_code=401). "
-        "Add a 401 path or add the endpoint to OPTIONAL_401_ALLOWLIST with justification."
+        "Add a 401 path or add the endpoint to OPTIONAL_401_ALLOWLIST with justification." + "\n" + format_offender_marker(str(offender) for offender in missing_401)
     )
 
 def test_deleted_test_file_classification_fails_open_without_genuine_erosion():
@@ -10851,6 +11200,10 @@ def test_task_type_evaluation_registry_is_consistent():
         assert cap.evaluation in valid_evaluation_keys, (
             f"TaskCapability {cap.id} has invalid evaluation {cap.evaluation!r}. "
             f"Must be one of: {valid_evaluation_keys}"
+            + "\n"
+            + format_offender_marker(
+                [f"{cap.id}:invalid-evaluation:{cap.evaluation}"]
+            )
         )
 
     # Check 3: Lock the per-type strategy assignment (spec freeze for every-PR visibility)
@@ -10998,6 +11351,8 @@ def test_ci_wait_arm_literals_costamp_pr_number():
         "through ci_merge_helpers.arm_ci_wait(review_loop, pr_number=..., "
         "now_iso=...) which co-stamps pr_number + ci_wait_started and asserts "
         "pr_number is non-None."
+        + "\n"
+        + format_offender_marker(offenders)
     )
 
 # ---------------------------------------------------------------------------
@@ -11027,8 +11382,10 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         "release_hotfix_promotion.py:hotfix_promote_current_version",
         # The scope preview mirrors hotfix_promote_current_version's SHA reads
         # exactly (same live=True for both integration HEAD and promotion-target
-        # HEAD) — the diff is meaningless if the SHAs are stale.
-        "release_hotfix_promotion.py:check_hotfix_scope_preview",
+        # HEAD) — the diff is meaningless if the SHAs are stale.  It lives in
+        # hotfix_narrow_candidate.py (release_hotfix_promotion.py re-exports it)
+        # to keep that module inside its declared governance cap.
+        "hotfix_narrow_candidate.py:check_hotfix_scope_preview",
         "release_qualifier.py:hotfix_promote_current_version",
         # The scope preview mirrors hotfix_promote_current_version's SHA reads
         # exactly (same live=True for both integration HEAD and promotion-target
@@ -11128,7 +11485,7 @@ def test_get_branch_sha_live_true_is_allowlisted():
         "a reviewed SHA-critical read (records a promoted/merged SHA, pins the "
         "canonical candidate/base SHA, or anchors a branch create). If genuinely "
         "SHA-critical, add '<file>:<function>' to _LIVE_REF_READ_ALLOWLIST with a "
-        "justification; otherwise drop live=True (cached is the safe default)."
+        "justification; otherwise drop live=True (cached is the safe default)." + "\n" + format_offender_marker(str(offender) for offender in offenders)
     )
 
 def test_get_branch_sha_live_guard_scanner_flags_injected_site():
@@ -11358,7 +11715,7 @@ def test_string_patch_targets_resolve():
         f"String patch targets that do not resolve ({len(failures)} offender(s)):\n"
         + "\n".join(sorted(failures))
         + "\n\nFix: rename the patch target string to match the current symbol name, "
-        "or remove the test if the functionality was deleted."
+        "or remove the test if the functionality was deleted." + "\n" + format_offender_marker(str(offender) for offender in failures)
     )
 
 def test_string_patch_target_scanner_self_tests():
@@ -11760,6 +12117,8 @@ def test_patched_app_symbols_have_production_call_sites():
         "dead patch line — it neutralises nothing.\n"
         "  3. If the symbol is genuinely reached by dynamic dispatch this AST scan "
         "cannot see, add it to _VACUOUS_MOCK_ALLOWLIST **with a reason**."
+        + "\n"
+        + format_offender_marker(failures)
     )
 
 def test_vacuous_mock_guard_scanner_self_tests():
@@ -11958,7 +12317,7 @@ def test_redundant_create_true_patches_flagged():
         + "\n\ncreate=True is a no-op when the attribute exists and silently masks "
         "future renames/removals of that symbol. Fix: drop the create=True keyword "
         "so the patch resolves against the real attribute (and is then covered by "
-        "test_string_patch_targets_resolve)."
+        "test_string_patch_targets_resolve)." + "\n" + format_offender_marker(str(offender) for offender in offenders)
     )
 
 def test_redundant_create_true_scanner_self_test():
@@ -12176,7 +12535,7 @@ class TestRouteContractOwnership:
             "Route contract violations detected. Each endpoint's response-shape "
             "contract must live in its registered owner file "
             "(see backend/testing/route_contract_owners.json).\n"
-            + "\n".join(f"  • {v}" for v in violations)
+            + "\n".join(f"  • {v}" for v in violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
     def test_route_contract_owners_are_valid(self):
@@ -12206,6 +12565,8 @@ class TestRouteContractOwnership:
         assert not errors, (
             "Route contract ownership registry has invalid entries:\n"
             + "\n".join(f"  • {e}" for e in errors)
+            + "\n"
+            + format_offender_marker(errors)
         )
 
     def test_route_contract_registry_is_populated(self):
@@ -12474,7 +12835,7 @@ def test_no_deprecated_datetime_utcnow_calls():
         f"Found datetime.utcnow() calls in {len(violating_files)} app/ file(s).\n"
         "Replace each with _utcnow() from app.time_utils — it returns a UTC-aware\n"
         "datetime and avoids the Python 3.12 DeprecationWarning.\n\n"
-        "Offending files:\n" + "\n".join(violating_files)
+        "Offending files:\n" + "\n".join(violating_files) + "\n" + format_offender_marker(str(offender) for offender in violating_files)
     )
 
 def test_spawn_budget_partition_is_exhaustive():
@@ -12498,7 +12859,7 @@ def test_spawn_budget_partition_is_exhaustive():
     overlap = initiative & servicing
     assert not overlap, (
         f"initiative and servicing partitions overlap: {sorted(overlap)}. "
-        "Each task type must be in exactly one partition."
+        "Each task type must be in exactly one partition." + "\n" + format_offender_marker(str(offender) for offender in overlap)
     )
 
     # Exhaustive: union covers all task types with no gaps
@@ -12507,12 +12868,17 @@ def test_spawn_budget_partition_is_exhaustive():
     missing = all_types - union
     assert not missing, (
         f"task types missing from both partitions: {sorted(missing)}. "
-        "All task types must be classified as either initiative or servicing."
+        "All task types must be classified as either initiative or servicing." + "\n" + format_offender_marker(str(offender) for offender in missing)
     )
 
     # Verify union exactly equals all types (redundant but explicit check)
     assert union == all_types, (
         f"partition union {sorted(union)} != all task types {sorted(all_types)}"
+        + "\n"
+        + format_offender_marker(
+            [*(f"union-only:{item}" for item in union - all_types),
+             *(f"all-types-only:{item}" for item in all_types - union)]
+        )
     )
 
 def test_orchestrator_health_task_type_vocab_is_registry_known():
@@ -12542,7 +12908,7 @@ def test_orchestrator_health_task_type_vocab_is_registry_known():
         assert not unknown, (
             f"{set_name} contains unregistered task type(s): "
             f"{sorted(unknown)}.  Either add the type to TaskType in task_capabilities.py "
-            "or remove the stale literal from the frozenset."
+            "or remove the stale literal from the frozenset." + "\n" + format_offender_marker(str(offender) for offender in unknown)
         )
 
 def test_orchestrator_health_vocab_guard_catches_injected_fake_type():
@@ -12612,7 +12978,7 @@ def test_mock_patch_targets_resolve():
         "impacted-test selector happens to include the patching file.\n"
         "Fix: update the patch target string to the current module.attribute path.\n\n"
         + "\n".join(sorted(failures)[:50])
-        + ("" if len(failures) <= 50 else f"\n... and {len(failures) - 50} more")
+        + ("" if len(failures) <= 50 else f"\n... and {len(failures) - 50} more") + "\n" + format_offender_marker(str(offender) for offender in failures)
     )
 
 def test_acceptance_window_evidence_call_site_wired():
@@ -12913,7 +13279,7 @@ def test_all_backend_test_files_collect_without_error():
         "(ImportError, NameError, or other module-level error):\n"
         + "\n".join(error_lines[:30])
         + "\n\nFull output tail:\n"
-        + "\n".join(all_output.splitlines()[-40:])
+        + "\n".join(all_output.splitlines()[-40:]) + "\n" + format_offender_marker(str(offender) for offender in error_lines)
     )
 
 
@@ -12988,7 +13354,7 @@ def test_no_set_derived_word_tokens_in_durable_writes():
         "produces scrambled text when tokens are later re-joined with ' '.join(...).\n"
         "Replace list(set(...)) with sorted(set(...)) to fix the ordering, or\n"
         "use a different dedup approach that preserves insertion order.\n\n"
-        "Offending files:\n" + "\n".join(violating_files)
+        "Offending files:\n" + "\n".join(violating_files) + "\n" + format_offender_marker(str(offender) for offender in violating_files)
     )
 
 
@@ -13091,7 +13457,7 @@ def test_no_set_ordered_tokens_in_human_readable_text():
         "Python set iteration order is non-deterministic — serializing a bare set into\n"
         "human-readable text produces scrambled output across runs (the rev-1367 bug).\n"
         "Fix: wrap the set in sorted(...) before joining, e.g. ', '.join(sorted(set(...))).\n\n"
-        "Offending sites:\n" + "\n".join(violations)
+        "Offending sites:\n" + "\n".join(violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
     )
 
 
@@ -13126,15 +13492,15 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5426): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5436): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5463): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5473): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 7146): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 7156): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 1256): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1278): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1384): "parse_problem_model(…) validated pydantic model_dump",
+        ("reaper_sweeps.py", 1406): "parse_problem_model(…) validated pydantic model_dump",
         # admin_projects.py: validated.model_dump()
         (
             "routers/admin_projects.py",
@@ -13153,19 +13519,19 @@ class TestProblemModelWritePathInvariants:
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 1965): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2392): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2842): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2956): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3213): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 1966): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2393): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2843): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2957): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3214): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4887): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4888): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4915): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4916): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5455): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5456): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5538): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5539): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):
@@ -13221,7 +13587,7 @@ class TestProblemModelWritePathInvariants:
             + "\n".join(
                 f"  {rel}:{ln} ({discovered.get((rel, ln), '?')})"
                 for (rel, ln) in sorted(missing)
-            )
+            ) + "\n" + format_offender_marker(str(offender) for offender in missing)
         )
 
         # Warn about stale allowlist entries (sites that no longer exist)
@@ -13229,7 +13595,7 @@ class TestProblemModelWritePathInvariants:
         assert not stale, (
             f"{len(stale)} SAFE_SITES entry/entries no longer found in the codebase. "
             "Remove or update these stale allowlist entries:\n"
-            + "\n".join(f"  {rel}:{ln}" for (rel, ln) in sorted(stale))
+            + "\n".join(f"  {rel}:{ln}" for (rel, ln) in sorted(stale)) + "\n" + format_offender_marker(str(offender) for offender in stale)
         )
 
 
@@ -13310,7 +13676,7 @@ def test_design_doc_size_limit_catches_are_loud():
         "unnoticed — the exact failure class that produced the rev-1367 problem-model "
         "wipe. Add a ``logger.warning`` (with project_id + exception detail) to each "
         "handler before its fallthrough logic.\n\n"
-        + "\n".join(silent_handlers)
+        + "\n".join(silent_handlers) + "\n" + format_offender_marker(str(offender) for offender in silent_handlers)
     )
 
 
@@ -13399,7 +13765,7 @@ def test_no_callers_pass_raise_on_size_limit_false():
         "writes must fail loudly. Remove the argument (the default is True) or "
         "add the call site to the allowlist in this test with a reviewed "
         "rationale.\n\n"
-        + "\n".join(offenders)
+        + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
     )
 
 
@@ -13485,6 +13851,8 @@ def test_no_duplicate_test_ids_across_backend_modules() -> None:
         + "\n".join(errors)
         + "\n\nRemove the duplicate from the base or the companion — both files "
         "must not define the same test function or class name."
+        + "\n"
+        + format_offender_marker(errors)
     )
 
 
@@ -13657,7 +14025,7 @@ def test_no_absolute_datetime_literals_in_freshness_graded_fixtures():
         "future promotion attributable to no diff.\n\n"
         "Replace each with _utcnow().isoformat() so the fixture stays inside the "
         "freshness window on every promotion date:\n\n"
-        + "\n".join(all_violations)
+        + "\n".join(all_violations) + "\n" + format_offender_marker(str(offender) for offender in all_violations)
     )
 
 
@@ -13745,6 +14113,79 @@ def test_every_script_test_is_discovered_or_has_a_written_exemption():
     assert set(exemptions) <= on_disk, (
         "CI script exemptions name missing files: "
         + ", ".join(sorted(set(exemptions) - on_disk))
+        + "\n"
+        + format_offender_marker(
+            f"missing-script:{name}" for name in set(exemptions) - on_disk
+        )
+    )
+
+
+def _ci_workflow_path() -> Path:
+    """Resolve the CI workflow in both the CI mount and local checkout."""
+    candidates = (
+        Path("/repo/.github/workflows/ci.yml"),
+        BACKEND_ROOT.parent / ".github" / "workflows" / "ci.yml",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    pytest.fail(".github/workflows/ci.yml is unavailable; roster cannot be reconciled")
+
+
+def _parse_ci_runner_script_suite(workflow: Path) -> tuple[str, ...]:
+    """Parse the hardcoded file list of ci.yml's 'Runner-script suite' step.
+
+    This step is a third, independent roster of scripts test files (alongside
+    scripts/test-backend.sh's discovery glob and
+    backend/testing/test_scripts_test_lane.py's discovery glob): it is a
+    workflow file, an operator-only surface this repo cannot edit, so a stray
+    or renamed entry here can only be caught by reading it, never fixed here.
+    """
+    source = workflow.read_text(encoding="utf-8")
+    match = re.search(
+        r"name: Runner-script suite \(scripts/\).*?python -m pytest \\\n"
+        r"(?P<body>.*?)\n\s*-v --tb=short",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None, (
+        f"{workflow} must define the 'Runner-script suite (scripts/)' step "
+        "with its hardcoded pytest file list"
+    )
+    entries = []
+    for raw_line in match.group("body").splitlines():
+        line = raw_line.strip().rstrip("\\").strip()
+        if not line:
+            continue
+        entries.append(line)
+    assert entries, f"{workflow} Runner-script suite step must list at least one file"
+    return tuple(entries)
+
+
+def test_ci_runner_script_suite_names_only_files_that_exist_on_disk():
+    """ci.yml's hardcoded scripts roster cannot silently rot out of sync.
+
+    ci.yml cannot be edited from this repo (operator-only surface), so this
+    check is read-only reconciliation: it proves every file the workflow
+    names still exists at the path it names, catching a rename or deletion
+    that the workflow step itself would only surface as a CI failure days
+    later.
+    """
+    workflow = _ci_workflow_path()
+    entries = _parse_ci_runner_script_suite(workflow)
+    repo_root = workflow.parent.parent.parent
+    scripts_root = repo_root / "scripts"
+
+    missing = [
+        entry
+        for entry in entries
+        if not (scripts_root / entry).resolve().is_file()
+    ]
+    assert not missing, (
+        "ci.yml Runner-script suite names file(s) that do not exist on disk: "
+        + ", ".join(missing)
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -13943,6 +14384,8 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
     assert not missing, (
         "Docker-less standalone execution omitted non-exempt discovered entries: "
         + ", ".join(missing)
+        + "\n"
+        + format_offender_marker(missing)
     )
 
     # Explicit interpreter selection is fail-closed: host venv residue must
@@ -13992,7 +14435,535 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         "classified scripts/test_*.py files contain no discoverable pytest or "
         "unittest tests: "
         + ", ".join(execution_residue)
+        + "\n"
+        + format_offender_marker(execution_residue)
     )
+
+
+def _standalone_script_roster_paths(harness: Path) -> set[Path]:
+    """Reconstruct the harness's own dynamic scripts/test_*.py discovery.
+
+    The standalone lane does not enumerate its scripts corpus in a literal
+    list: it globs ``CI_SCRIPT_TEST_DISCOVERY_GLOB`` under the scripts test
+    root and then drops entries whose capability is absent from *this*
+    invocation.  Capability-based omissions are deliberately ignored here —
+    every file the lane can execute in any invocation (Docker present or not)
+    must carry offender identities, so the guard's coverage does not silently
+    shrink on a Docker-less VM.
+    """
+
+    discovery_globs, _exemptions = _parse_script_test_roster(harness)
+    script_root = harness.parent
+    assert script_root.is_dir(), (
+        f"scripts test root is unavailable at {script_root}; the standalone "
+        "offender roster cannot be resolved"
+    )
+    return {
+        path
+        for discovery_glob in discovery_globs
+        for path in script_root.glob(discovery_glob)
+        if path.is_file()
+    }
+
+
+def _standalone_infra_roster_paths(harness: Path) -> set[Path]:
+    """Reconstruct the harness's own dynamic infra test discovery.
+
+    The infra corpus is discovered exactly like the scripts corpus -- the same
+    ``CI_SCRIPT_TEST_DISCOVERY_GLOB`` under each ``INFRA_TEST_ROOTS`` entry --
+    but it carries no capability exemption axis: every discovered file always
+    runs. Resolving it here keeps the offender roster the same size as the
+    corpus the lane actually executes, so an infra collection guard cannot
+    lose its identity marker unnoticed.
+    """
+
+    source = harness.read_text(encoding="utf-8")
+    match = re.search(
+        r"^INFRA_TEST_ROOTS=\((?P<body>.*?)(?:\n\)|\))",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"{harness} must define INFRA_TEST_ROOTS"
+    roots: list[str] = []
+    for raw_line in match.group("body").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        values = shlex.split(line, comments=True)
+        assert len(values) == 1, f"infra root entry must be one shell word: {line!r}"
+        roots.append(values[0])
+    assert roots, f"{harness} must list at least one INFRA_TEST_ROOTS entry"
+
+    discovery_globs, _exemptions = _parse_script_test_roster(harness)
+    repo_root = harness.parent.parent
+    return {
+        path
+        for root in roots
+        for discovery_glob in discovery_globs
+        for path in (repo_root / root).glob(discovery_glob)
+        if path.is_file()
+    }
+
+
+def _canonical_roster_identity(path: Path, harness: Path) -> str:
+    """Name a roster member the way the harness's own inventory names it.
+
+    The two halves of the roster live under different roots, and in the Docker
+    standalone lane those roots are different mounts: the backend half is
+    resolved under ``BACKEND_ROOT`` (``/app``) while the scripts half comes
+    from the harness itself (``/repo/scripts``).  Relativizing everything
+    against a single root therefore raises ``ValueError`` on one half.
+    Relativize per root instead, producing the same ``backend/<rel>`` and
+    ``scripts/<rel>`` identities the harness emits in its inventory.
+    """
+
+    for root, prefix in ((BACKEND_ROOT, "backend"), (harness.parent.parent, "")):
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        return f"{prefix}/{relative.as_posix()}" if prefix else relative.as_posix()
+    try:
+        relative = path.relative_to(harness.parent)
+    except ValueError:
+        return path.as_posix()
+    return f"{harness.parent.name}/{relative.as_posix()}"
+
+
+def _standalone_backend_roster_paths(harness: Path) -> set[Path]:
+    """Read the full standalone corpus from its shell-harness owner.
+
+    All three parts of the lane are covered: the literal ``testing/test_*.py``
+    block, the dynamically discovered ``scripts/test_*.py`` corpus, and the
+    infra corpus that the same lane appends.  A roster that cannot be resolved
+    fails closed rather than silently scanning a subset.
+    """
+
+    source = harness.read_text(encoding="utf-8")
+    match = re.search(r"STANDALONE_ARGS=\(\n(?P<body>.*?)\n    \)", source, re.DOTALL)
+    assert match is not None, "standalone harness must declare STANDALONE_ARGS"
+    roster = {
+        BACKEND_ROOT / entry
+        for entry in re.findall(
+            r"^\s*(testing/test_[A-Za-z0-9_]+\.py)", match.group("body"), re.MULTILINE
+        )
+    }
+    roster |= _standalone_script_roster_paths(harness)
+    roster |= _standalone_infra_roster_paths(harness)
+    missing = sorted(str(path) for path in roster if not path.is_file())
+    assert not missing, (
+        "standalone offender roster names files that are not on disk: "
+        + ", ".join(missing)
+        + "\n"
+        + format_offender_marker(missing)
+    )
+    assert roster, "standalone offender roster resolved to no files"
+    return roster
+
+
+def _collection_names_in_function(function: ast.AST) -> set[str]:
+    """Return local names whose values are collection-shaped in a guard."""
+
+    names: set[str] = set()
+    collection_literals = (
+        ast.Dict,
+        ast.DictComp,
+        ast.GeneratorExp,
+        ast.List,
+        ast.ListComp,
+        ast.Set,
+        ast.SetComp,
+    )
+    collection_factories = {"dict", "frozenset", "list", "set", "sorted", "tuple"}
+    for node in ast.walk(function):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            is_collection = (
+                isinstance(value, collection_literals)
+                or (
+                    isinstance(value, ast.Call)
+                    and (
+                        (
+                            isinstance(value.func, ast.Name)
+                            and value.func.id in collection_factories
+                        )
+                        or (
+                            isinstance(value.func, ast.Attribute)
+                            and value.func.attr in {"items", "keys", "values"}
+                        )
+                    )
+                )
+                or (
+                    isinstance(value, ast.BinOp)
+                    and isinstance(value.op, (ast.BitAnd, ast.BitOr, ast.Sub))
+                )
+            )
+            if is_collection:
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else (node.target,)
+                )
+                names.update(
+                    target.id for target in targets if isinstance(target, ast.Name)
+                )
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"add", "append", "extend", "update"}
+            and isinstance(node.func.value, ast.Name)
+        ):
+            names.add(node.func.value.id)
+        elif (
+            isinstance(node, ast.Assert)
+            and isinstance(node.test, ast.UnaryOp)
+            and isinstance(node.test.op, ast.Not)
+            and isinstance(node.test.operand, ast.Name)
+        ):
+            # The dominant "no violations found" idiom in this module's guards
+            # is ``assert not <name>, <message>``. The name's value may come
+            # from an arbitrary helper call (not just a literal/factory/
+            # comprehension assignment matched above) — a collection-shaped
+            # name reaching a bare ``assert not`` still identifies a set of
+            # offenders, so it belongs in the offender-identity surface too.
+            names.add(node.test.operand.id)
+    return names
+
+
+def _module_level_functions(tree: ast.AST) -> dict[str, ast.AST]:
+    """Index a module's own function definitions by name."""
+
+    return {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _has_offender_marker(
+    node: ast.AST,
+    helpers: dict[str, ast.AST] | None = None,
+    _seen: frozenset[str] = frozenset(),
+) -> bool:
+    """Report whether a diagnostic attaches a machine-readable identity.
+
+    A diagnostic may build its prose by handing the offender collection to a
+    same-module helper.  That helper's returned message is what the failure
+    actually renders, so the marker it emits counts — the check follows the
+    call instead of treating the delegating site as unmarked.
+    """
+
+    helpers = helpers or {}
+    for candidate in ast.walk(node):
+        if not isinstance(candidate, ast.Call) or not isinstance(
+            candidate.func, ast.Name
+        ):
+            continue
+        name = candidate.func.id
+        if name == "format_offender_marker":
+            return True
+        helper = helpers.get(name)
+        if helper is None or name in _seen:
+            continue
+        # Names the helper binds to a marker, so a returned message that
+        # interpolates one of them still carries the identity.
+        marker_names = {
+            target.id
+            for child in ast.walk(helper)
+            if isinstance(child, ast.Assign)
+            and _has_offender_marker(child.value, helpers, _seen | {name})
+            for target in child.targets
+            if isinstance(target, ast.Name)
+        }
+        for child in ast.walk(helper):
+            if not isinstance(child, ast.Return) or child.value is None:
+                continue
+            if _has_offender_marker(child.value, helpers, _seen | {name}):
+                return True
+            if any(
+                isinstance(inner, ast.Name)
+                and isinstance(inner.ctx, ast.Load)
+                and inner.id in marker_names
+                for inner in ast.walk(child.value)
+            ):
+                return True
+    return False
+
+
+def _standalone_failure_message(node: ast.AST) -> ast.AST | None:
+    """Return the diagnostic expression attached to a standalone failure."""
+
+    if isinstance(node, ast.Assert):
+        return node.msg
+    if (
+        isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "AssertionError"
+        and node.exc.args
+    ):
+        return node.exc.args[0]
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "pytest"
+        and node.func.attr == "fail"
+        and node.args
+    ):
+        return node.args[0]
+    return None
+
+
+def _rendered_collection_names(
+    message: ast.AST,
+    collection_names: set[str],
+    helpers: dict[str, ast.AST] | None = None,
+) -> set[str]:
+    """Find offender collections a diagnostic is derived from.
+
+    A count-only ``len(<collection>)`` counts, because a shifting count is
+    exactly what byte-for-byte comparison charges as a newly introduced
+    failure.  So does a collection handed to a same-module helper, because
+    that helper builds the message the failure renders.
+    """
+
+    helpers = helpers or {}
+    renderers = {
+        "dumps",
+        "format",
+        "format_offender_marker",
+        "join",
+        "len",
+        "repr",
+        "sorted",
+        "str",
+    }
+    rendered: set[str] = set()
+    parents: dict[int, ast.AST] = {}
+    nodes = list(ast.walk(message))
+    for parent in nodes:
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    for node in nodes:
+        if not (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in collection_names
+        ):
+            continue
+        child: ast.AST = node
+        parent = parents.get(id(child))
+        while parent is not None:
+            if isinstance(parent, ast.FormattedValue):
+                rendered.add(node.id)
+                break
+            if isinstance(parent, ast.Call):
+                if isinstance(parent.func, ast.Name):
+                    call_name = parent.func.id
+                elif isinstance(parent.func, ast.Attribute):
+                    call_name = parent.func.attr
+                else:
+                    call_name = None
+                # A same-module helper handed the collection builds the very
+                # message this failure renders, so the diagnostic is derived
+                # from the offender set even though nothing is interpolated
+                # here. Any other call is a unit under test being fed a
+                # fixture, not a rendering of offenders.
+                if call_name in renderers or call_name in helpers:
+                    rendered.add(node.id)
+                break
+            child = parent
+            parent = parents.get(id(child))
+        else:
+            rendered.add(node.id)
+    return rendered
+
+
+def test_standalone_corpus_set_guards_emit_offender_identity():
+    """Collection diagnostics in the harness roster retain stable identities.
+
+    The individual sites are resolved from the whole roster the standalone
+    lane executes -- the literal backend block *and* its dynamically
+    discovered scripts corpus -- then inspected at their assertion/raise node.
+    An unrelated formatter elsewhere in the module cannot satisfy this check:
+    every failure derived from an offender collection must attach its own
+    stable identity, either inline or through the same-module helper that
+    builds its message.
+    """
+
+    harness = _script_test_harness()
+    roster_paths = _standalone_backend_roster_paths(harness)
+    unmarked: list[str] = []
+    for path in sorted(roster_paths):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        helpers = _module_level_functions(tree)
+        for function in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        ):
+            collection_names = _collection_names_in_function(function)
+            for failure in ast.walk(function):
+                message = _standalone_failure_message(failure)
+                if message is None:
+                    continue
+                rendered = _rendered_collection_names(
+                    message, collection_names, helpers
+                )
+                if rendered and not _has_offender_marker(message, helpers):
+                    unmarked.append(
+                        f"{_canonical_roster_identity(path, harness)}"
+                        f"::{function.name}:"
+                        f"{failure.lineno}:{','.join(sorted(rendered))}"
+                    )
+
+    assert not unmarked, (
+        "Standalone collection guards must append format_offender_marker() at "
+        "each collection failure site: "
+        + ", ".join(unmarked)
+        + "\n"
+        + format_offender_marker(str(offender) for offender in unmarked)
+    )
+
+
+def test_standalone_offender_roster_covers_the_harness_inventory():
+    """The scanned roster is never narrower than the lane the harness runs.
+
+    The corpus the standalone lane executes includes a dynamically discovered
+    scripts/ half.  Deriving the offender-identity roster from the literal
+    STANDALONE_ARGS block alone left those files unscanned, so the roster is
+    resolved from the harness's own discovery policy and checked against the
+    machine-readable inventory the harness emits.
+    """
+
+    harness = _script_test_harness()
+    repo_root = harness.parent.parent
+    roster = {
+        _canonical_roster_identity(path, harness)
+        for path in _standalone_backend_roster_paths(harness)
+    }
+
+    inventory = subprocess.run(
+        # --no-postgres keeps the inventory a pure roster read: the emitter
+        # runs before any test runtime, so no database is started for it.
+        [
+            "bash",
+            str(harness),
+            "--standalone",
+            "--no-postgres",
+            "--standalone-inventory",
+        ],
+        cwd=repo_root / "backend",
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert inventory.returncode == 0, inventory.stdout + inventory.stderr
+    entries = {
+        line.split("=", 1)[1].split("::", 1)[0]
+        for line in inventory.stdout.splitlines()
+        if line.startswith("BLUEPRINT_STANDALONE_CORPUS_ENTRY=")
+    }
+    assert entries, "harness emitted no standalone corpus inventory entries"
+    uncovered = sorted(entries - roster)
+    assert not uncovered, (
+        "standalone corpus entries the offender-identity guard never scans: "
+        + ", ".join(uncovered)
+        + "\n"
+        + format_offender_marker(uncovered)
+    )
+
+    # Capability-exempt entries are dropped from a Docker-less invocation but
+    # still execute where the capability exists, so the scanned roster must not
+    # shrink with them.
+    _discovery_globs, exemptions = _parse_script_test_roster(harness)
+    unscanned_exempt = sorted(
+        f"scripts/{name}"
+        for name in exemptions
+        if (repo_root / "scripts" / name).is_file()
+        and f"scripts/{name}" not in roster
+    )
+    assert not unscanned_exempt, (
+        "capability-exempt scripts tests must still be scanned for offender "
+        "identities: "
+        + ", ".join(unscanned_exempt)
+        + "\n"
+        + format_offender_marker(unscanned_exempt)
+    )
+
+
+def _unmarked_sites_in_source(source: str) -> list[str]:
+    """Run the offender-identity detector over one module's source."""
+
+    tree = ast.parse(source)
+    helpers = _module_level_functions(tree)
+    sites: list[str] = []
+    for function in (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    ):
+        collection_names = _collection_names_in_function(function)
+        for failure in ast.walk(function):
+            message = _standalone_failure_message(failure)
+            if message is None:
+                continue
+            rendered = _rendered_collection_names(message, collection_names, helpers)
+            if rendered and not _has_offender_marker(message, helpers):
+                sites.append(f"{function.name}:{','.join(sorted(rendered))}")
+    return sorted(sites)
+
+
+def test_offender_identity_detector_charges_counts_and_follows_helpers():
+    """The detector's two documented blind spots stay closed.
+
+    A count-only diagnostic is exactly the shape byte-for-byte comparison
+    charges as newly introduced when the count shifts, and a message built by
+    a same-module helper is marked (or left unmarked) by that helper rather
+    than by its call site.  A literal fixture handed to the unit under test is
+    not an offender set and must not be charged.
+    """
+
+    source = "\n".join(
+        (
+            "def _marked_message(offenders):",
+            "    marker = format_offender_marker(str(x) for x in offenders)",
+            '    return f"bad: {offenders}" + marker',
+            "",
+            "",
+            "def _unmarked_message(offenders):",
+            '    return f"bad: {offenders}"',
+            "",
+            "",
+            "def test_count_only():",
+            '    offenders = [name for name in ("a", "b")]',
+            '    assert len(offenders) == 0, f"{len(offenders)} offenders"',
+            "",
+            "",
+            "def test_delegates_to_marked_helper():",
+            '    offenders = [name for name in ("a", "b")]',
+            "    assert not offenders, _marked_message(offenders)",
+            "",
+            "",
+            "def test_delegates_to_unmarked_helper():",
+            '    offenders = [name for name in ("a", "b")]',
+            "    assert not offenders, _unmarked_message(offenders)",
+            "",
+            "",
+            "def test_fixture_is_not_an_offender_set():",
+            '    fixture = {"history": []}',
+            '    assert compute(fixture) == 1.0, f"got {compute(fixture)}"',
+        )
+    )
+
+    assert _unmarked_sites_in_source(source) == [
+        "test_count_only:offenders",
+        "test_delegates_to_unmarked_helper:offenders",
+    ]
+
 
 
 def test_every_test_module_has_executing_tests_or_an_explicit_zero_test_marker():
@@ -14002,9 +14973,19 @@ def test_every_test_module_has_executing_tests_or_an_explicit_zero_test_marker()
     declared_roots = {
         root.relative_to(harness.parent.parent).as_posix() for root in roots
     }
-    assert {"scripts", "backend/testing"} <= declared_roots, (
-        "CI_TEST_MODULE_ROOTS must cover both scripts/ and backend/testing/: "
+    assert {
+        "scripts",
+        "backend/testing",
+        "infra/db_recovery",
+        "infra/livekit/tests",
+    } <= declared_roots, (
+        "CI_TEST_MODULE_ROOTS must cover scripts/, backend/testing/, "
+        "infra/db_recovery/, and infra/livekit/tests/: "
         + ", ".join(sorted(declared_roots))
+        + "\n"
+        + format_offender_marker(
+            f"declared-root:{root}" for root in declared_roots
+        )
     )
     dark_modules = [
         path.relative_to(harness.parent.parent).as_posix()
@@ -14018,7 +14999,7 @@ def test_every_test_module_has_executing_tests_or_an_explicit_zero_test_marker()
         "test modules with zero executing tests must be removed or carry a "
         "reviewable '# blueprint-test-module: intentional-zero-tests -- reason' "
         "marker: "
-        + ", ".join(dark_modules)
+        + ", ".join(dark_modules) + "\n" + format_offender_marker(str(offender) for offender in dark_modules)
     )
 
 

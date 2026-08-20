@@ -110,6 +110,11 @@ function strategicCycleCompletionFromDurableState(cycle: StrategicStateCycle): S
 export interface StrategicSessionDelta {
   /** Local monotonic id for stable React keys (the wire has no unique id). */
   id: number;
+  /** Project this delta was received under, stamped client-side at append time.
+   *  The wire payload is project-scoped by the WS channel but does not repeat
+   *  the id; recording it lets consumers scope the buffer to the currently
+   *  selected project without waiting for the project-switch clear effect. */
+  project_id?: string;
   session_id?: string;
   task_id?: string;
   seq?: number;
@@ -274,7 +279,7 @@ export function useLogViewer({
       // The durable cycle is authoritative for status and every field it
       // exposes. Preserve only receipt details that the read model cannot
       // represent, such as the live challenge summary and direction ids.
-      return {
+      const next = {
         ...durableCompletion,
         ...(previous.staged_count !== undefined ? { staged_count: previous.staged_count } : {}),
         ...(previous.updated_count !== undefined ? { updated_count: previous.updated_count } : {}),
@@ -288,6 +293,18 @@ export function useLogViewer({
           ? { strategic_judgment_challenge: previous.strategic_judgment_challenge }
           : {}),
       };
+      // Identity-preserve when nothing changed: this runs on every durable
+      // read-model poll while the strategist is idle, and returning a fresh
+      // but equal object each tick re-fires every downstream effect keyed on
+      // the receipt (the failure toast among them) once per poll, forever.
+      const keys = new Set([
+        ...Object.keys(previous),
+        ...Object.keys(next),
+      ]) as Set<keyof StrategicCycleCompletion>;
+      for (const key of keys) {
+        if (previous[key] !== next[key]) return next;
+      }
+      return previous;
     });
   }, []);
   const gatedTypesRefreshSeqRef = useRef(0);
@@ -707,6 +724,7 @@ export function useLogViewer({
         if (text || status) {
           const delta: StrategicSessionDelta = {
             id: ++_sessionDeltaIdCounter,
+            project_id: selectedProjectIdRef.current ?? undefined,
             session_id: msg.data?.session_id,
             task_id: msg.data?.task_id,
             seq: msg.data?.seq,

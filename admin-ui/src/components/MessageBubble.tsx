@@ -42,7 +42,7 @@ export const TYPE_CONFIG: Record<string, { icon: typeof MessageSquare; color: st
   FEEDBACK:   { icon: MessageSquare,  color: 'text-purple-400',  label: 'Feedback',   bubbleBg: 'bg-purple-950/40 border-purple-800/40' },
   BUG_REPORT: { icon: Bug,           color: 'text-red-400',     label: 'Bug',        bubbleBg: 'bg-red-950/50 border-red-800/50' },
   BLOCKER:    { icon: AlertTriangle,  color: 'text-amber-400',   label: 'Blocker',    bubbleBg: 'bg-amber-950/50 border-amber-700/50' },
-  NOTE:       { icon: StickyNote,     color: 'text-neutral-400',  label: 'Note',       bubbleBg: 'bg-neutral-900/60 border-neutral-800/50' },
+  NOTE:       { icon: StickyNote,     color: 'text-neutral-400',  label: 'Note',       bubbleBg: 'bg-workbench-base/60 border-neutral-800/50' },
 };
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -118,7 +118,7 @@ const CITATION_BADGE_CONFIG: Record<CitationState, { label: string; container: s
   },
   indeterminate: {
     label: 'citations could not be verified',
-    container: 'border-neutral-500/30 bg-neutral-500/10',
+    container: 'border-neutral-500/30 bg-workbench-control/10',
     labelText: 'text-neutral-300',
     refText: 'text-neutral-200/80',
   },
@@ -139,7 +139,7 @@ function StaleCitationBadge({ msg }: { msg: ProjectMessage }) {
 
   const cfg = CITATION_BADGE_CONFIG[state];
   return (
-    <div className={`mt-2 inline-flex max-w-full flex-col gap-1 rounded-xl border px-2.5 py-2 ${cfg.container}`}>
+    <div className={`mt-2 inline-flex max-w-full flex-col gap-1 rounded-lg border px-2.5 py-2 ${cfg.container}`}>
       <span className={`inline-flex items-center gap-1 text-ui-md font-semibold ${cfg.labelText}`}>
         <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
         {cfg.label}
@@ -160,15 +160,15 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
   const severity = context.severity as string | undefined;
   if (severity === 'high') badges.push({ label: 'High', className: 'text-red-400 bg-red-500/10 border-red-500/30' });
   else if (severity === 'medium') badges.push({ label: 'Medium', className: 'text-amber-400 bg-amber-500/10 border-amber-500/30' });
-  else if (severity === 'low') badges.push({ label: 'Low', className: 'text-neutral-500 bg-neutral-500/10 border-neutral-600/30' });
+  else if (severity === 'low') badges.push({ label: 'Low', className: 'text-neutral-500 bg-workbench-control/10 border-neutral-600/30' });
 
   const annotationType = context.annotation_type as string | undefined;
   if (annotationType === 'vision') badges.push({ label: 'Vision', className: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30' });
   else if (annotationType === 'issue') badges.push({ label: 'Issue', className: 'text-red-400 bg-red-500/10 border-red-500/30' });
-  else if (annotationType === 'comment') badges.push({ label: 'Comment', className: 'text-neutral-400 bg-neutral-500/10 border-neutral-600/30' });
+  else if (annotationType === 'comment') badges.push({ label: 'Comment', className: 'text-neutral-400 bg-workbench-control/10 border-neutral-600/30' });
 
   const taskType = context.task_type as string | undefined;
-  if (taskType) badges.push({ label: taskType, className: 'text-neutral-500 bg-neutral-500/10 border-neutral-600/30' });
+  if (taskType) badges.push({ label: taskType, className: 'text-neutral-500 bg-workbench-control/10 border-neutral-600/30' });
 
   const source = context.source as string | undefined;
   if (source === 'research_zero_children') badges.push({ label: 'No findings', className: 'text-amber-400 bg-amber-500/10 border-amber-500/30' });
@@ -208,6 +208,8 @@ export interface MessageBubbleProps {
   selectMode: boolean;
   selectedIds: Set<string>;
   onOpenTask?: (taskId: string) => void;
+  onOpenDirection?: (directionId: string) => void;
+  githubRepo?: string | null;
   onToggleSelect: (msgId: string) => void;
   onCreateDirection: (msg: ProjectMessage) => void;
   onCreateInvestigation: (msg: ProjectMessage) => void;
@@ -234,6 +236,8 @@ export const MessageBubble = memo(function MessageBubble({
   selectMode,
   selectedIds,
   onOpenTask,
+  onOpenDirection,
+  githubRepo,
   onToggleSelect,
   onCreateDirection,
   onCreateInvestigation,
@@ -360,7 +364,7 @@ export const MessageBubble = memo(function MessageBubble({
               <button
                 onClick={() => onReply({ id: msg.id, content: msg.content, from: formatChatFromType(msg), message_type: msg.message_type, status: msg.status })}
                 title="Reply"
-                className="absolute -right-1 -top-3 flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-2 text-neutral-600 opacity-40 transition-colors hover:text-neutral-300 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-600 md:opacity-0 md:group-hover:opacity-100"
+                className="absolute -right-1 -top-3 flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-2 text-neutral-600 opacity-40 transition-colors hover:text-neutral-300 focus-visible:opacity-100 md:opacity-0 md:group-hover:opacity-100 workbench-focus"
               >
                 <Reply className="w-3.5 h-3.5" />
               </button>
@@ -372,7 +376,7 @@ export const MessageBubble = memo(function MessageBubble({
           ? userMsg
             ? 'rounded-md border border-neutral-700/60 bg-[#10161f] px-3 py-2 shadow-[0_1px_0_rgba(255,255,255,0.035)]'
             : 'rounded-md border border-transparent bg-transparent px-0.5 py-0.5'
-          : `rounded-2xl border px-4 py-3 ${config.bubbleBg} ${
+          : `rounded-lg border px-4 py-3 ${config.bubbleBg} ${
             msg.message_type === 'BLOCKER' ? 'border-amber-600/60 ring-1 ring-amber-500/20' :
             msg.message_type === 'BUG_REPORT' ? 'border-red-700/60' : ''
           }`
@@ -401,7 +405,7 @@ export const MessageBubble = memo(function MessageBubble({
           )}
           {/* One canonical reply quote for durable and legacy reply projections. */}
           {replyPreviewText && (
-            <div className="mb-1 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
+            <div className="mb-1 px-2 py-1 border-l-2 border-neutral-700/50 rounded bg-workbench-panel/30">
               {legacyReplyLabel && <p className="text-ui-md text-neutral-500 mb-0.5">{legacyReplyLabel}</p>}
               <p className="text-ui-md text-neutral-500 truncate">{replyPreviewText}</p>
             </div>
@@ -409,11 +413,11 @@ export const MessageBubble = memo(function MessageBubble({
           {/* Content */}
           {userMsg ? (
             <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
-              <MarkdownContent content={msg.content} />
+              <MarkdownContent content={msg.content} onOpenTask={onOpenTask} onOpenDirection={onOpenDirection} githubRepo={githubRepo} />
             </div>
           ) : (
             <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
-              <MarkdownContent content={msg.content} />
+              <MarkdownContent content={msg.content} onOpenTask={onOpenTask} onOpenDirection={onOpenDirection} githubRepo={githubRepo} />
             </div>
           )}
           {msg.context.attachments && Array.isArray(msg.context.attachments) && msg.context.attachments.length > 0 && (
@@ -464,9 +468,19 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         )}
 
+        {/* Stranded-send failure (distinct from a genuine resolution — the
+            operator's message never reached a runner) */}
+        {msg.status === 'resolved' && msg.handling_state === 'failed' && (
+          <div className={`mt-1 ${userMsg ? 'mr-2' : 'ml-2'} px-2.5 py-1 rounded border border-red-800/50 bg-red-950/30`}>
+            <p className="text-ui-md text-red-300/90">
+              <span className="font-medium">Delivery failed:</span> {msg.resolution || 'no runner claimed this message'}
+            </p>
+          </div>
+        )}
+
         {/* Resolution (for resolved messages) */}
-        {msg.status === 'resolved' && msg.resolution && (
-          <div className={`mt-1 ${userMsg ? 'mr-2' : 'ml-2'} px-2.5 py-1 ${chatMode ? 'rounded border border-neutral-800/70 bg-neutral-900/40' : 'rounded-lg bg-neutral-800/50 border border-neutral-700/30'}`}>
+        {msg.status === 'resolved' && msg.handling_state !== 'failed' && msg.resolution && (
+          <div className={`mt-1 ${userMsg ? 'mr-2' : 'ml-2'} px-2.5 py-1 ${chatMode ? 'rounded border border-neutral-800/70 bg-workbench-base/40' : 'rounded-lg bg-workbench-panel/50 border border-neutral-700/30'}`}>
             <p className="text-ui-md text-neutral-500">
               <span className="text-emerald-500/70 font-medium">Resolved:</span> {msg.resolution}
             </p>
@@ -514,7 +528,7 @@ export const MessageBubble = memo(function MessageBubble({
               </button>
             )}
             {actionMode === 'full' && investigatingId === msg.id && (
-              <div className="flex items-center gap-1 bg-neutral-900 border border-neutral-700 rounded-lg px-2 py-1 ml-1">
+              <div className="flex items-center gap-1 bg-workbench-base border border-neutral-700 rounded-lg px-2 py-1 ml-1">
                 <span className="text-xs text-neutral-400 whitespace-nowrap">Spawn investigation?</span>
                 <button
                   onClick={() => onCreateInvestigation(msg)}

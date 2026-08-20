@@ -336,6 +336,7 @@ from app.reaper_sweeps import (
     sweep_auto_resolve_answered_messages,
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
+    sweep_fail_stranded_pending_conversation_messages,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
@@ -2489,6 +2490,37 @@ async def reaper_service():
                             session.add(task)
                             await _maybe_create_failure_alert(task, session)
 
+                            # A pipeline review/fix task reaped to terminal
+                            # FAILED never reports agent status (so the
+                            # agent-status failure propagation never runs) and
+                            # is deliberately skipped by the resurrection
+                            # sweep (review/fix + pr_number must re-drive from
+                            # current GitHub state). Without a producer here,
+                            # the EVALUATING original parked with
+                            # review_loop.ci_waiting falsy sits outside every
+                            # recovery surface and its PR strands un-reviewed
+                            # indefinitely (incident 2026-08-19, review task
+                            # 20712c3f, AGENT_TIMEOUT). Re-arm the canonical
+                            # _pr_state_check_pending consumer on the original
+                            # — bounded, with an operator-facing WHY on
+                            # exhaustion. Best-effort: never let the re-arm
+                            # break this row's terminal classification.
+                            try:
+                                from app.reaper_pipeline_rearm import (
+                                    rearm_pr_state_check_for_dead_pipeline_task,
+                                )
+
+                                await rearm_pr_state_check_for_dead_pipeline_task(
+                                    task, session, failure_class
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    f"[REAPER] pipeline re-arm failed for dead "
+                                    f"task {task.id} — original may need "
+                                    f"manual re-review",
+                                    exc_info=True,
+                                )
+
                             await broadcast_to_project(
                                 str(task.project_id),
                                 "task_updated",
@@ -3607,6 +3639,32 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         "[REAPER] Consumed message attachment retirement sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 25: Stranded conversation message failure sweep — age out
+                # unclaimed PENDING conversation-surface messages (no runner ever
+                # claimed them, e.g. the selected runner is dead) after a bounded
+                # window so the operator gets a terminal, visible 'failed' state
+                # instead of silent, permanent PENDING. Claimed messages are left
+                # to conversation_coordinator's lease-expiry/reclaim path.
+                _mark_reaper_progress()
+                try:
+                    _stranded_failed = await sweep_fail_stranded_pending_conversation_messages(
+                        session, now
+                    )
+                    if _stranded_failed:
+                        logger.info(
+                            "[REAPER] Step 25: failed %d stranded pending "
+                            "conversation message(s)",
+                            _stranded_failed,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Stranded-conversation-message fail sweep error: %s",
                         e,
                         exc_info=True,
                     )

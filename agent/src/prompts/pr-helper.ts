@@ -47,6 +47,28 @@ function loadScreenshotsSectionScriptB64(): string {
   }
 }
 
+// Same pattern for the cross-lane guard-suppressions renderer: a real,
+// lintable/testable file on disk, base64-embedded into the generated ./pr.
+// Renders the <!-- blueprint:guard-suppressions --> block from the aggregate
+// `scripts/guard_suppression_receipt.py aggregate --out` writes, so a reviewer
+// sees every lane's suppressions (not just the backend pytest lane's) in one
+// place at the merge gate.
+const _GUARD_SUPPRESSIONS_SECTION_SCRIPT_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+  'guard-suppressions-pr-section.js',
+);
+function loadGuardSuppressionsSectionScriptB64(): string {
+  try {
+    return Buffer.from(
+      fs.readFileSync(_GUARD_SUPPRESSIONS_SECTION_SCRIPT_PATH, 'utf8'),
+    ).toString('base64');
+  } catch {
+    return '';
+  }
+}
+
 export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   // Idempotent push + PR creation/update. Runs a bounded ./check gate first:
@@ -55,6 +77,7 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   // pick up the URL without re-querying GitHub.
   const _SR_SECTION_SCRIPT_B64 = loadSrSectionScriptB64();
   const _SCREENSHOTS_SECTION_SCRIPT_B64 = loadScreenshotsSectionScriptB64();
+  const _GUARD_SUPPRESSIONS_SECTION_SCRIPT_B64 = loadGuardSuppressionsSectionScriptB64();
   const agentTokenFn = agentTokenShellFn();
   const githubTokenFn = githubTokenShellFn();
   const jsonStrFn = jsonStrShellFn();
@@ -267,6 +290,8 @@ GATE_DEADLINE_EXTENDED=false
 _VERIFY_TASK_ID="\${TASK_ID:-${cfg.taskId}}"
 _VERIFY_RECEIPT="/tmp/project_verification_receipt_\${_VERIFY_TASK_ID}.json"
 SUPPRESSED_BASELINE_SECTION=""
+GUARD_SUPPRESSIONS_AGGREGATE="/tmp/guard_suppression_aggregate_${cfg.taskId}.json"
+GUARD_SUPPRESSIONS_SECTION=""
 
 # A successful backend verification can rely on failures inherited from the
 # base branch. Surface those exact structured failure identities in the PR
@@ -278,7 +303,75 @@ render_suppressed_baseline_section() {
   if [ ! -s "$receipt_file" ] || ! command -v python3 >/dev/null 2>&1; then
     return 0
   fi
+  # Blueprint's own repo carries the shared multi-lane receipt writer, which
+  # renders EVERY attributed lane's suppressions (each identity attributed to
+  # the lane that forgave it). A stack without that writer only ever produces
+  # the legacy single-lane sidecar, so it falls through to the reader below.
+  if [ -r scripts/verification_receipt.py ] \\
+    && python3 scripts/verification_receipt.py render-suppressed --receipt "$receipt_file" 2>/dev/null; then
+    return 0
+  fi
   python3 -c 'import json,sys; payload=json.load(open(sys.argv[1],encoding="utf-8")); pytest=payload.get("pytest"); d=pytest.get("suppressed_failures") if isinstance(pytest,dict) and "suppressed_failures" in pytest else payload.get("suppressed_failures"); lines=["### Suppressed baseline failures"]+["- {}{}{}: {}".format(chr(96),k,chr(96),v.get("detail","") if isinstance(v,dict) else v) for k,v in sorted(d.items())] if isinstance(d,dict) and d else []; print("\\n".join(lines),end="") if lines else None' "$receipt_file" 2>/dev/null || true
+}
+
+# Copy the same structured attribution that the PR-body renderer reads into
+# the durable gate receipt. This is a projection, not a second attribution
+# calculation; malformed or incomplete sidecars simply leave the legacy
+# nine-key receipt unchanged.
+persist_verification_attribution() {
+  if [ ! -s "$_VERIFY_RECEIPT" ] || ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  # Same split as the PR-body renderer: the shared writer folds every lane's
+  # structured maps into the receipt's closed shape (identities namespaced by
+  # lane, attribution_state naming each lane's own state). Stacks without it
+  # keep the legacy single-lane projection below.
+  if [ -r scripts/verification_receipt.py ] \\
+    && python3 scripts/verification_receipt.py project-attribution --gate "$GATE_RECEIPT_FILE" --receipt "$_VERIFY_RECEIPT" 2>/dev/null; then
+    return 0
+  fi
+  python3 -c 'import json,sys; gate_path,verification_path=sys.argv[1:]; gate=json.load(open(gate_path,encoding="utf-8")); payload=json.load(open(verification_path,encoding="utf-8")); pytest=payload.get("pytest"); data=pytest if isinstance(pytest,dict) and "state" in pytest else payload; keys=("new_failures","suppressed_failures","disappeared_failures","skipped_failures"); attrs={"attribution_state":data["state"],**{key:data.get(key,{}) for key in keys}} if isinstance(data,dict) and isinstance(data.get("state"),str) and all(isinstance(data.get(key,{}),dict) for key in keys) else {}; gate.update(attrs); open(gate_path,"w",encoding="utf-8").write(json.dumps(gate,separators=(",",":"))+"\\n")' "$GATE_RECEIPT_FILE" "$_VERIFY_RECEIPT" 2>/dev/null || true
+}
+
+# Merge every guard lane's suppression receipt (static, vitest, typecheck,
+# viewport, backend pytest — see scripts/guard_suppression_receipt.py) into one
+# aggregate file. Fail-open via the CLI's own contract: a write error there
+# warns on stderr and still exits 0, so this call never affects GATE_STATUS.
+build_guard_suppressions_aggregate() {
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -f scripts/guard_suppression_receipt.py ]; then
+    return 0
+  fi
+  python3 scripts/guard_suppression_receipt.py aggregate --task-id "${cfg.taskId}" --out "$GUARD_SUPPRESSIONS_AGGREGATE" >/dev/null 2>&1 || true
+}
+
+# Human-readable projection of the aggregate for the PR body: per lane, the
+# state it resolved to and the suppression identities it relied on. Absent or
+# malformed aggregates render nothing (renderer no-ops on its own).
+render_guard_suppressions_section() {
+  local aggregate_file="$1"
+  if [ ! -s "$aggregate_file" ] || [ -z '${_GUARD_SUPPRESSIONS_SECTION_SCRIPT_B64}' ] || ! command -v node >/dev/null 2>&1; then
+    return 0
+  fi
+  printf '%s' '${_GUARD_SUPPRESSIONS_SECTION_SCRIPT_B64}' | base64 -d > /tmp/guard_suppressions_section_${cfg.taskId}.js
+  node /tmp/guard_suppressions_section_${cfg.taskId}.js "$aggregate_file" 2>/dev/null || true
+  rm -f /tmp/guard_suppressions_section_${cfg.taskId}.js
+}
+
+# Copy the same bounded cross-lane aggregate into the durable gate receipt
+# under "guard_suppressions" so it survives on task.context next to the
+# existing pytest-only attribution keys. All three buckets
+# (suppressed/disappeared/skipped) plus each bucket's producer-side
+# observed_count/truncated are carried, so the durable surface can never look
+# complete when the producer already capped it. The projection itself lives in
+# guard_suppression_receipt.py (project_for_gate_receipt) where it is unit
+# tested, per the generated-shell rules in CLAUDE.md. Projection only — the
+# backend's sanitize_publication_gate_receipt applies the authoritative
+# bound/truncation; a malformed aggregate simply leaves the key out.
+persist_guard_suppressions() {
+  if [ ! -s "$GUARD_SUPPRESSIONS_AGGREGATE" ] || ! command -v python3 >/dev/null 2>&1 || [ ! -f scripts/guard_suppression_receipt.py ]; then
+    return 0
+  fi
+  python3 scripts/guard_suppression_receipt.py project --aggregate "$GUARD_SUPPRESSIONS_AGGREGATE" --gate-receipt "$GATE_RECEIPT_FILE" >/dev/null 2>&1 || true
 }
 
 write_gate_receipt() {
@@ -290,32 +383,30 @@ write_gate_receipt() {
   recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf '{"status":"%s","command":"%s","timeout_seconds":%s,"hard_timeout_seconds":%s,"elapsed_seconds":%s,"deadline_extended":%s,"exit_code":%s,"authoritative_ci_required":%s,"recorded_at":"%s"}\n' \
     "$status" "$GATE_COMMAND" "$GATE_TIMEOUT_SECONDS" "$GATE_HARD_TIMEOUT_SECONDS" "$GATE_ELAPSED_SECONDS" "$GATE_DEADLINE_EXTENDED" "$exit_code" "$fallback" "$recorded_at" > "$GATE_RECEIPT_FILE"
+  persist_verification_attribution
+  build_guard_suppressions_aggregate
+  persist_guard_suppressions
   SUPPRESSED_BASELINE_SECTION=""
+  GUARD_SUPPRESSIONS_SECTION=""
   case "$status" in
     passed*) SUPPRESSED_BASELINE_SECTION=$(render_suppressed_baseline_section "$_VERIFY_RECEIPT") ;;
   esac
+  GUARD_SUPPRESSIONS_SECTION=$(render_guard_suppressions_section "$GUARD_SUPPRESSIONS_AGGREGATE")
+  GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+    '<!-- blueprint:local-gate -->' \
+    '### Local publication gate' \
+    "- Status: $status" \
+    "- Command: $GATE_COMMAND" \
+    "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
+    "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
+    "- Exit code: $exit_code; authoritative CI required: $fallback")
   if [ -n "$SUPPRESSED_BASELINE_SECTION" ]; then
-    GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
-      '<!-- blueprint:local-gate -->' \
-      '### Local publication gate' \
-      "- Status: $status" \
-      "- Command: $GATE_COMMAND" \
-      "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
-      "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
-      "- Exit code: $exit_code; authoritative CI required: $fallback" \
-      "$SUPPRESSED_BASELINE_SECTION" \
-      '<!-- /blueprint:local-gate -->')
-  else
-    GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
-      '<!-- blueprint:local-gate -->' \
-      '### Local publication gate' \
-      "- Status: $status" \
-      "- Command: $GATE_COMMAND" \
-      "- Deadlines: soft \${GATE_TIMEOUT_SECONDS}s; hard \${GATE_HARD_TIMEOUT_SECONDS}s (absolute ceiling 1800s)" \
-      "- Elapsed: \${GATE_ELAPSED_SECONDS}s; soft deadline extended: $GATE_DEADLINE_EXTENDED" \
-      "- Exit code: $exit_code; authoritative CI required: $fallback" \
-      '<!-- /blueprint:local-gate -->')
+    GATE_SECTION=$(printf '%s\n%s' "$GATE_SECTION" "$SUPPRESSED_BASELINE_SECTION")
   fi
+  if [ -n "$GUARD_SUPPRESSIONS_SECTION" ]; then
+    GATE_SECTION=$(printf '%s\n%s' "$GATE_SECTION" "$GUARD_SUPPRESSIONS_SECTION")
+  fi
+  GATE_SECTION=$(printf '%s\n%s' "$GATE_SECTION" '<!-- /blueprint:local-gate -->')
 }
 
 # A blocked gate normally exits before any PR body exists, so the bounded
@@ -631,6 +722,32 @@ TASK_ID="${cfg.taskId}"
 # writer.  Snapshot the exact remote SHA once, reconcile a lost response only
 # when remote == our HEAD, and otherwise fail closed on any competing advance.
 _PR_REMOTE_REF="refs/heads/${cfg.workBranch}"
+# This task's own unshipped-work checkpoint subject (task-checkpoint.ts
+# writes it verbatim).  A tip carrying THIS subject is state we authored on
+# an earlier attempt's fail-closed path; prepareTaskWorkBranch already
+# restored it into this working tree and publication is documented to be
+# what replaces it.  It is recovery state of ours, not a competing writer.
+_PR_CHECKPOINT_SUBJECT="blueprint-checkpoint: preserve unshipped task ${cfg.taskId}"
+_PR_CHECKPOINT_ADOPTED=0
+_pr_tip_is_own_checkpoint() {
+  # $1 = the SHA ls-remote just reported for this branch.  True only when
+  # that commit is this task's own checkpoint.  Read it locally when the
+  # object is already present (prepareTaskWorkBranch fetched the checkpoint
+  # it restored); otherwise fetch only the branch tip, preserving the
+  # clone's existing shallow/full shape so the pending push is unaffected.
+  [ -n "$1" ] || return 1
+  _PR_PROBE_REF=refs/remotes/origin/_pr_lease_probe
+  if ! git cat-file -e "$1^{commit}" 2>/dev/null; then
+    if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+      git fetch --no-tags --quiet --depth=1 origin "+$_PR_REMOTE_REF:$_PR_PROBE_REF" 2>/dev/null || return 1
+    else
+      git fetch --no-tags --quiet origin "+$_PR_REMOTE_REF:$_PR_PROBE_REF" 2>/dev/null || return 1
+    fi
+    git cat-file -e "$1^{commit}" 2>/dev/null || return 1
+  fi
+  _PR_PROBE_SUBJECT=$(git show -s --format=%s "$1" 2>/dev/null || true)
+  [ "$_PR_PROBE_SUBJECT" = "$_PR_CHECKPOINT_SUBJECT" ]
+}
 _PR_EXPECTED_QUERY=$(git ls-remote --heads origin "$_PR_REMOTE_REF" 2>/tmp/pr_ls_remote.log)
 _PR_EXPECTED_QUERY_STATUS=$?
 if [ "$_PR_EXPECTED_QUERY_STATUS" -ne 0 ]; then
@@ -664,6 +781,20 @@ for attempt in 1 2 3; do
     break
   fi
   if [ "$_PR_OBSERVED_REMOTE_SHA" != "$_PR_EXPECTED_REMOTE_SHA" ]; then
+    # Our own checkpoint is not a competing writer.  Publication is the step
+    # that retires it, so refusing here strands finished, check-passing work
+    # on a branch nothing else will ever publish (NeurIPS 37eea260, df1c89d0,
+    # 9884994c and 0396aaee each blocked permanently this way).  Adopt it as
+    # the lease authority exactly ONCE per invocation, and only when the tip
+    # carries THIS task's checkpoint subject: a genuine third-party writer
+    # still cannot walk the lease forward one race at a time.
+    if [ "$_PR_CHECKPOINT_ADOPTED" = "0" ] && _pr_tip_is_own_checkpoint "$_PR_OBSERVED_REMOTE_SHA"; then
+      _PR_CHECKPOINT_ADOPTED=1
+      _PR_EXPECTED_REMOTE_SHA="$_PR_OBSERVED_REMOTE_SHA"
+      _PR_LEASE="--force-with-lease=$_PR_REMOTE_REF:$_PR_EXPECTED_REMOTE_SHA"
+      echo "[pr] remote tip $_PR_OBSERVED_REMOTE_SHA is this task's own unshipped-work checkpoint; adopting it as the lease authority and retrying."
+      continue
+    fi
     echo "[pr] remote branch advanced to a competing SHA; refusing to overwrite it." >&2
     echo "[pr] expected: \${_PR_EXPECTED_REMOTE_SHA:-<absent>}" >&2
     echo "[pr] observed: \${_PR_OBSERVED_REMOTE_SHA:-<absent>}" >&2

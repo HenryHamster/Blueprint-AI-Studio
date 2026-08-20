@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,13 @@ class _HotfixPromoteRequest(BaseModel):
     # The operator's DECLARED scope — cross-checked/audited against the actual
     # diff, NEVER the authorization source (the diff allowlist is).
     scope_modules: List[str] = Field(default_factory=list)
+    # NARROW lane: the commits (already in the integration branch's history) that
+    # together constitute the repair.  When supplied, the lane scope-checks and
+    # ships ONLY those commits' own file set, materialized on top of the
+    # promotion target — instead of everything integration has accumulated since
+    # the last promotion.  Still not an authorization source: the same
+    # fail-closed allowlist runs over the resulting diff.
+    repair_commit_shas: List[str] = Field(default_factory=list)
     # The operator must affirm they understand the self-reference gap: the fix
     # stays inert until the deploy lands the promoted content.
     ack_inert_until_deploy: bool = False
@@ -45,9 +52,15 @@ async def trigger_hotfix_promote(
     AUDIT/scoring gate ONLY — CI and promote()'s merge-time migration-chain
     backstop still gate the merge.
 
+    ``repair_commit_shas`` selects the NARROW lane: name the commits that are the
+    repair and the lane materializes a machinery-only candidate from just those
+    commits' files on top of the promotion target, instead of refusing because
+    integration has accumulated unrelated work since the last promotion.
+
     OWNER-only.  ``reason`` is mandatory (it is the audit justification) and
     ``ack_inert_until_deploy`` must be true.  Maps: scope_rejected → 400 (with the
-    offending files), no_open_version → 404, promotion_check_wait → 409.
+    offending files), no_effective_change → 400, no_open_version → 404,
+    promotion_check_wait → 409, diff/content/commit failures → 502.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
@@ -72,6 +85,7 @@ async def trigger_hotfix_promote(
         actor=str(current_user["user_id"]),
         reason=body.reason.strip(),
         scope_modules=list(body.scope_modules),
+        repair_commit_shas=list(body.repair_commit_shas),
     )
     await session.commit()
     status = result.get("status")
@@ -85,6 +99,26 @@ async def trigger_hotfix_promote(
                 ),
                 "offending_files": result.get("offending_files") or [],
             },
+        )
+    if status == "no_effective_change":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "Hotfix refused — the named repair commits change nothing "
+                    "relative to the promotion target: "
+                    + str(result.get("reason") or "")
+                ),
+                "offending_files": [],
+            },
+        )
+    if status in ("diff_unavailable", "content_unavailable", "commit_failed"):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Hotfix could not resolve or materialize the named repair "
+                f"({status}): " + str(result.get("reason") or "")
+            ),
         )
     if status == "no_open_version":
         raise HTTPException(
@@ -107,6 +141,7 @@ async def trigger_hotfix_promote(
 async def get_hotfix_scope_preview(
     project_id: uuid.UUID,
     candidate_sha: str | None = None,
+    repair_commit_shas: List[str] | None = Query(default=None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -117,17 +152,26 @@ async def get_hotfix_scope_preview(
     changed files between the promotion target and the candidate, and the specific
     files (if any) that would be rejected.  The optional ``candidate_sha`` query
     parameter pins the check to a specific commit; when omitted the integration
-    branch HEAD is used (same default as ``POST /promote/hotfix``).
+    branch HEAD is used (same default as ``POST /promote/hotfix``).  Repeating the
+    ``repair_commit_shas`` parameter previews the NARROW lane instead: the union
+    of those commits' own diffs — exactly what ``POST /promote/hotfix`` would
+    materialize and ship.
 
     Maps: no_open_version → 404, no_credentials/sha_error → 503.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
+    # Unit tests call this coroutine directly, where an omitted query parameter
+    # arrives as FastAPI's default marker rather than a list.
+    _repair_shas = (
+        list(repair_commit_shas) if isinstance(repair_commit_shas, list) else []
+    )
     result = await release_qualifier.check_hotfix_scope_preview(
         session,
         project_id,
         candidate_sha=candidate_sha,
+        repair_commit_shas=_repair_shas,
     )
     status = result.get("status")
     if status == "no_open_version":

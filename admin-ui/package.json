@@ -12,7 +12,7 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:unit": "vitest run",
-    "test:viewport": "vitest run && node scripts/check-viewport-coverage.js && vitest run --config vitest.viewport.config.ts",
+    "test:viewport": "node scripts/check-viewport-coverage.js && vitest run --config vitest.viewport.config.ts",
     "test:viewport:capture": "vitest run --config vitest.viewport.capture.config.ts"
   },
   "dependencies": {

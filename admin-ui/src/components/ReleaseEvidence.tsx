@@ -28,7 +28,7 @@ export function ReleaseEvidencePanel({ evidence }: { evidence?: LiveReleaseEvide
   const status = evidence.aggregate_serving_status ?? null;
   return (
     <div
-      className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-ui-md space-y-1"
+      className="rounded border border-neutral-800 bg-workbench-base/40 px-2 py-1.5 text-ui-md space-y-1"
       data-testid="release-evidence-panel"
     >
       <div className="flex items-center gap-1.5 text-ui-sm uppercase tracking-wide text-neutral-500">

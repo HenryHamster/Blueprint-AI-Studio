@@ -24,7 +24,7 @@ const STATUS_FILTERS: { value: StatusFilter; label: string }[] = [
 
 function statusPillClass(status: string): string {
   if (status === 'open') return 'bg-amber-900/40 text-amber-300 border-amber-700/50';
-  if (status === 'dismissed') return 'bg-neutral-800/60 text-neutral-400 border-neutral-700/50';
+  if (status === 'dismissed') return 'bg-workbench-panel/60 text-neutral-400 border-neutral-700/50';
   return 'bg-emerald-900/40 text-emerald-300 border-emerald-700/50';
 }
 
@@ -125,8 +125,8 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
               onClick={() => setStatusFilter(f.value)}
               className={`rounded border px-2 py-0.5 text-ui-sm font-medium transition-colors ${
                 statusFilter === f.value
-                  ? 'border-neutral-500 bg-neutral-700 text-neutral-100'
-                  : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-300'
+                  ? 'border-neutral-500 bg-workbench-layer text-neutral-100'
+                  : 'border-neutral-700 bg-workbench-base text-neutral-400 hover:border-neutral-600 hover:text-neutral-300'
               }`}
             >
               {f.label}
@@ -136,7 +136,7 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
           <button
             type="button"
             onClick={() => void load()}
-            className="ml-auto rounded border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-ui-sm text-neutral-400 hover:border-neutral-600 hover:text-neutral-300"
+            className="ml-auto rounded border border-neutral-700 bg-workbench-base px-2 py-0.5 text-ui-sm text-neutral-400 hover:border-neutral-600 hover:text-neutral-300"
             disabled={loading}
           >
             {loading ? '…' : 'Refresh'}
@@ -158,7 +158,7 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
             {entries.map(entry => (
               <div
                 key={entry.id}
-                className="workbench-card rounded border border-neutral-700/60 bg-neutral-900/60 px-3 py-2"
+                className="workbench-card rounded border border-neutral-700/60 bg-workbench-base/60 px-3 py-2"
               >
                 <div className="flex min-w-0 flex-wrap items-start gap-2">
                   <span
@@ -166,7 +166,7 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
                   >
                     {entry.status}
                   </span>
-                  <span className="shrink-0 rounded border border-neutral-700/60 bg-neutral-800/60 px-1.5 py-0.5 font-mono text-ui-xs text-neutral-400">
+                  <span className="shrink-0 rounded border border-neutral-700/60 bg-workbench-panel/60 px-1.5 py-0.5 font-mono text-ui-xs text-neutral-400">
                     {entry.kind}
                   </span>
                   <span className="min-w-0 flex-1 truncate text-ui-sm text-neutral-200" title={entry.title}>
@@ -191,7 +191,7 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
                           value={dismissReason}
                           onChange={e => setDismissReason(e.target.value)}
                           placeholder="Dismiss reason…"
-                          className="min-w-0 flex-1 rounded border border-neutral-600 bg-neutral-800 px-2 py-1 text-ui-sm text-neutral-200 placeholder-neutral-600 focus:border-neutral-400 focus:outline-none"
+                          className="min-w-0 flex-1 rounded border border-neutral-600 bg-workbench-panel px-2 py-1 text-ui-sm text-neutral-200 placeholder-neutral-600 workbench-focus"
                           onKeyDown={e => {
                             if (e.key === 'Enter') void handleDismiss(entry.id);
                             if (e.key === 'Escape') { setDismissingId(null); setDismissReason(''); }
@@ -222,7 +222,7 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
                         <button
                           type="button"
                           onClick={() => setDismissingId(entry.id)}
-                          className="rounded border border-neutral-700 bg-neutral-800 px-2 py-0.5 text-ui-sm text-neutral-400 hover:border-neutral-600 hover:text-neutral-300"
+                          className="rounded border border-neutral-700 bg-workbench-panel px-2 py-0.5 text-ui-sm text-neutral-400 hover:border-neutral-600 hover:text-neutral-300"
                         >
                           Dismiss
                         </button>

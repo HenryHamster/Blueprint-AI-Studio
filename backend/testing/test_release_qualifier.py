@@ -50,6 +50,59 @@ def test_candidate_authorship_gate_uses_full_range_and_contract_tolerance():
     assert dirty["blocker"] == "candidate_operator_authorship_nonzero"
 
 
+def test_candidate_authorship_gate_reports_provenance_and_honors_resolved_range():
+    """A version with no stored base_sha (write-once, best-effort at open
+    time) must not permanently latch the gate. The qualifier derives a base
+    and passes it via ``resolved_range``; the gate validates against that
+    range, not the still-null stored column, and reports the provenance."""
+    version = {"base_sha": None, "candidate_sha": "b" * 40}
+    derived_base = "a" * 40
+    categories = [_authorship_category(max_count=0)]
+
+    gate = rs.evaluate_candidate_operator_authorship_gate(
+        version,
+        _measurement(derived_base, "b" * 40, 0),
+        categories,
+        resolved_range=(derived_base, "b" * 40),
+    )
+
+    assert gate["status"] == "passed"
+    assert gate["range"] == {"base_sha": derived_base, "head_sha": "b" * 40}
+    assert gate["base_sha_provenance"] == "derived"
+
+
+def test_candidate_authorship_gate_reports_stored_provenance_when_base_is_stored():
+    candidate = _candidate()
+    gate = rs.evaluate_candidate_operator_authorship_gate(
+        candidate, _measurement("a" * 40, "b" * 40, 0), [_authorship_category(max_count=0)]
+    )
+
+    assert gate["base_sha_provenance"] == "stored"
+
+
+def test_candidate_authorship_gate_names_the_reason_when_base_cannot_be_derived():
+    """Derivation failure must block with a distinct reason, not the generic
+    'evidence missing' blocker a permanently-null base could never clear."""
+    version = {"base_sha": None, "candidate_sha": "b" * 40}
+    measurement = {
+        "state": "unresolved",
+        "count": None,
+        "offenders": [],
+        "range": {"base_sha": None, "head_sha": "b" * 40},
+        "reason": "base_sha_unset_v9_github_credentials_unavailable",
+    }
+
+    gate = rs.evaluate_candidate_operator_authorship_gate(
+        version, measurement, [_authorship_category(max_count=0)],
+        resolved_range=(None, "b" * 40),
+    )
+
+    assert gate["status"] == "unresolved"
+    assert gate["blocker"] == "candidate_operator_authorship_evidence_missing"
+    assert gate["reason"] == "base_sha_unset_v9_github_credentials_unavailable"
+    assert gate["base_sha_provenance"] == "unavailable"
+
+
 def test_every_hard_promotion_gate_has_a_non_promotional_clearing_path():
     """A new hard gate must declare how a future action can clear it.
 

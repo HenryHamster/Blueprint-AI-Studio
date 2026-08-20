@@ -169,6 +169,26 @@ async def test_cancelled_terminal_dispatch_rejection_is_once_per_head(
     assert len(redispatch_calls) == 1
 
 
+async def _age_automain_head_marker(db_session, project_id, head_sha, *, seconds):
+    """Seed the head-stability marker as if ``head_sha`` settled ``seconds`` ago."""
+    from datetime import timedelta
+
+    from app.project_telemetry import upsert_telemetry
+    from app.release_qualifier_sweep import _AUTOMAIN_HEAD_FIRST_SEEN_KEY
+    from app.time_utils import _utcnow
+
+    await upsert_telemetry(
+        db_session,
+        project_id,
+        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+        {
+            "head_sha": head_sha,
+            "first_seen_at": (_utcnow() - timedelta(seconds=seconds)).isoformat(),
+        },
+    )
+    await db_session.commit()
+
+
 @pytest.mark.asyncio
 async def test_advanced_not_promoted_authorship_candidate_redrives(db_session, mocker):
     """An advanced candidate invalidates the old SHA's authorship blocker."""
@@ -176,7 +196,7 @@ async def test_advanced_not_promoted_authorship_candidate_redrives(db_session, m
     from app.release_qualifier_sweep import _fire_auto_triggered_qualification
 
     shared_state.runtime_config["auto_qualification_triggers"] = "on"
-    _, version = await _make_project_and_version(db_session, phase="stabilize")
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.last_qualification = {
         "status": "not_promoted",
         "blocker": "prior_operator_authorship_nonzero",
@@ -187,6 +207,11 @@ async def test_advanced_not_promoted_authorship_candidate_redrives(db_session, m
     }
     db_session.add(version)
     await db_session.commit()
+    # The new head has been quiet past the debounce window, so the redrive
+    # semantics under test (stale-blocker invalidation) are what decides.
+    await _age_automain_head_marker(
+        db_session, project.id, "new-automain-candidate", seconds=31 * 60
+    )
     mocker.patch(
         "app.release_readiness.compute_promotion_ci_green_gate",
         new=AsyncMock(
@@ -234,3 +259,167 @@ async def test_same_not_promoted_sha_never_churns(db_session, mocker):
         version.id, session_factory=_shared_session_factory(db_session)
     ) is False
     run_mock.assert_not_awaited()
+
+
+def _not_promoted_version_kwargs(candidate_sha: str) -> dict:
+    return {
+        "status": "not_promoted",
+        "blocker": "below_threshold",
+        "candidate_sha": candidate_sha,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fresh_automain_head_holds_quiet_window(db_session, mocker):
+    """A just-advanced head must NOT immediately re-fire qualification.
+
+    Per-delta audit-spam regression: every merge to automain used to re-fire
+    qualification (and an opus audit pair) instantly.  The first sweep that
+    observes a new head records it and holds; only a settled head fires.
+    """
+    from app import shared_state
+    from app.project_telemetry import read_telemetry
+    from app.release_qualifier_sweep import (
+        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+        _fire_auto_triggered_qualification,
+    )
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = _not_promoted_version_kwargs("old-candidate")
+    db_session.add(version)
+    await db_session.commit()
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={"gate_state": "green", "head_sha": "fresh-new-head"}
+        ),
+    )
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    assert await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is False
+    run_mock.assert_not_awaited()
+    marker = await read_telemetry(
+        db_session, project.id, _AUTOMAIN_HEAD_FIRST_SEEN_KEY
+    )
+    assert marker["head_sha"] == "fresh-new-head"
+    assert marker["first_seen_at"]
+
+
+@pytest.mark.asyncio
+async def test_head_move_restarts_quiet_window(db_session, mocker):
+    """Another merge during the window restarts it for the newest head."""
+    from app import shared_state
+    from app.project_telemetry import read_telemetry
+    from app.release_qualifier_sweep import (
+        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+        _fire_auto_triggered_qualification,
+    )
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = _not_promoted_version_kwargs("old-candidate")
+    db_session.add(version)
+    await db_session.commit()
+    # An OLDER head settled long ago — but automain has since moved again.
+    await _age_automain_head_marker(
+        db_session, project.id, "previous-head", seconds=31 * 60
+    )
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={"gate_state": "green", "head_sha": "even-newer-head"}
+        ),
+    )
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    assert await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is False
+    run_mock.assert_not_awaited()
+    marker = await read_telemetry(
+        db_session, project.id, _AUTOMAIN_HEAD_FIRST_SEEN_KEY
+    )
+    assert marker["head_sha"] == "even-newer-head"
+
+
+@pytest.mark.asyncio
+async def test_live_audit_pair_defers_auto_fire(db_session, mocker):
+    """A running release_audit/challenge lane blocks stacking a second pair."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = _not_promoted_version_kwargs("old-candidate")
+    db_session.add(version)
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="live audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-live-audit",
+            status=TaskStatus.IN_PROGRESS,
+        )
+    )
+    await db_session.commit()
+    # Head fully settled — without the live-lane skip this WOULD fire.
+    await _age_automain_head_marker(
+        db_session, project.id, "settled-head", seconds=31 * 60
+    )
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={"gate_state": "green", "head_sha": "settled-head"}
+        ),
+    )
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    assert await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is False
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_head_marker_failure_degrades_to_legacy_fire(db_session, mocker):
+    """Telemetry unavailability must never suppress qualification (fail-open
+    to the legacy fire-immediately behavior, not fail-closed on the debounce)."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+    _, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = _not_promoted_version_kwargs("old-candidate")
+    db_session.add(version)
+    await db_session.commit()
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={"gate_state": "green", "head_sha": "fresh-new-head"}
+        ),
+    )
+    mocker.patch(
+        "app.project_telemetry.read_telemetry",
+        new=AsyncMock(side_effect=RuntimeError("telemetry down")),
+    )
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    assert await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is True
+    run_mock.assert_awaited_once()

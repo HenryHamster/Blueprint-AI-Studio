@@ -883,8 +883,8 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     const send = el.querySelector<HTMLButtonElement>('button[aria-label="Send message"]')!;
     await waitFor(() => expect(send.disabled).toBe(false));
     fireEvent.click(send);
-    await waitFor(() => expect(el.querySelector('button[aria-label="Retry message"]')).toBeTruthy());
-    fireEvent.click(el.querySelector('button[aria-label="Retry message"]')!);
+    // The dropped send — and its stale-attachment-receipt recovery — both
+    // happen automatically now, without any operator click on "Retry message".
     await waitFor(() => expect(messageBodies).toHaveLength(3), { timeout: 5000 });
 
     expect(uploadReceiptCount).toBe(2);
@@ -1085,10 +1085,15 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     const { container } = render(
       <MessagesPanel selectedProjectId="proj-abandon" addToast={addToast} onMessageCountChange={() => {}} filterChrome="minimal" />,
     );
-    const abandon = await waitFor(() => container.querySelector('button') && [...container.querySelectorAll('button')]
-      .find(button => button.textContent?.trim() === 'Abandon pending message'));
-    expect(abandon).toBeTruthy();
-    fireEvent.click(abandon!);
+    // waitFor only retries on THROW — a falsy return resolves immediately, so
+    // the find() must be asserted inside the callback to actually wait.
+    const abandon = await waitFor(() => {
+      const button = [...container.querySelectorAll('button')]
+        .find(candidate => candidate.textContent?.trim() === 'Abandon pending message');
+      expect(button).toBeTruthy();
+      return button!;
+    });
+    fireEvent.click(abandon);
     await waitFor(() => expect(sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-abandon')).toBeNull());
     expect((container.querySelector('textarea') as HTMLTextAreaElement).readOnly).toBe(false);
     expect(addToast).toHaveBeenCalledWith('Pending message abandoned after confirming it was not accepted.', 'info');

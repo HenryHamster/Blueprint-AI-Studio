@@ -59,7 +59,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
       data-task-id={task.id}
       onClick={() => onViewLogs(task)}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onViewLogs(task); } }}
-      className={`flex min-h-[44px] w-full min-w-0 cursor-pointer items-center gap-2 rounded-md border bg-[#10151c] px-2.5 py-1.5 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900 md:min-h-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'}`}
+      className={`flex min-h-[44px] w-full min-w-0 cursor-pointer items-center gap-2 rounded-md border bg-workbench-layer px-2.5 py-1.5 text-left transition-colors hover:border-neutral-600 hover:bg-workbench-hover md:min-h-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'}`}
       title={`${task.title}\n${task.status} • ${task.task_type || 'create'}${blockerTooltip ? `\n${blockerTooltip}` : ''}\nClick to view logs`}
     >
       {/* Status dot */}
@@ -270,9 +270,9 @@ function TreeBranch({
       {depth > 0 && (
         <div className="absolute left-0 top-0 bottom-0 flex items-start" style={{ width: 20 }}>
           {/* Vertical line */}
-          <div className={`absolute left-[9px] top-0 w-px bg-neutral-700 ${isLast ? 'h-[20px]' : 'h-full'}`} />
+          <div className={`absolute left-[9px] top-0 w-px bg-workbench-layer ${isLast ? 'h-[20px]' : 'h-full'}`} />
           {/* Horizontal line to node */}
-          <div className="absolute left-[9px] top-[20px] h-px w-[11px] bg-neutral-700" />
+          <div className="absolute left-[9px] top-[20px] h-px w-[11px] bg-workbench-layer" />
         </div>
       )}
 
@@ -488,8 +488,8 @@ function RootGroup({
   return (
     <div
       className={isSynthetic
-        ? 'rounded-md border border-dashed border-neutral-700/60 bg-[#10151c] p-3'
-        : 'rounded-md border border-neutral-800 bg-[#10151c] p-3'}
+        ? 'rounded-md border border-dashed border-neutral-700/60 bg-workbench-layer p-3'
+        : 'rounded-md border border-neutral-800 bg-workbench-layer p-3'}
     >
       {/* Group header — double-click to archive */}
       <div className="group flex w-full items-center justify-between px-0.5">
@@ -570,7 +570,7 @@ function RootGroup({
               {failedInGroup}
             </span>
           )}
-          <span className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 text-ui-sm font-medium text-neutral-300">
+          <span className="rounded border border-neutral-700 bg-workbench-base px-1.5 py-0.5 text-ui-sm font-medium text-neutral-300">
             {completedInGroup}/{totalInGroup - cancelledInGroup} done
           </span>
         </div>
@@ -589,7 +589,7 @@ function RootGroup({
           { count: completedInGroup, color: taskStatusDotColor('COMPLETED') },
         ].filter(s => s.count > 0);
         return (
-          <div className="mt-2 flex h-1 w-full overflow-hidden rounded-full bg-neutral-900">
+          <div className="mt-2 flex h-1 w-full overflow-hidden rounded-full bg-workbench-base">
             {segments.map((s, i) => (
               <div
                 key={i}
@@ -732,7 +732,7 @@ export function PipelineView({ tasks, loading, onViewLogs, hasActiveFilters, onN
     return ids;
   }, [visibleForest, taskMap]);
 
-  const btnClass = 'px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors';
+  const btnClass = 'px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-workbench-base border border-neutral-800 rounded transition-colors';
 
   return (
     <div className="flex-1 overflow-y-auto overflow-x-auto pb-4 custom-scrollbar">
@@ -765,7 +765,7 @@ export function PipelineView({ tasks, loading, onViewLogs, hasActiveFilters, onN
             )}
             {onArchiveGroup && donePipelineIds.length > 0 && (
               <button
-                className="min-h-[44px] min-w-[44px] flex items-center justify-center gap-1 px-2 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors"
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center gap-1 px-2 text-xs text-neutral-500 hover:text-neutral-300 bg-workbench-base border border-neutral-800 rounded transition-colors"
                 onClick={() => onArchiveGroup(donePipelineIds)}
               >
                 <Archive className="w-3 h-3" />
@@ -775,7 +775,7 @@ export function PipelineView({ tasks, loading, onViewLogs, hasActiveFilters, onN
           </div>
         )}
         {visibleForest.length === 0 && (
-          <div className="text-center text-neutral-600 text-xs py-16 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
+          <div className="text-center text-neutral-600 text-xs py-16 border border-dashed border-neutral-800 rounded-lg bg-workbench-base/20">
             {loading
               ? 'Loading tasks...'
               : hasActiveFilters

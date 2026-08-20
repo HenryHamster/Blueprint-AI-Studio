@@ -9,7 +9,7 @@ export function OpenResidualCasesSection({ digest }: { digest: DigestData | null
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Open Residual Cases</h2>
       <div className="space-y-2">
         {groups.map((group) => (
-          <div key={group.error_class} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2">
+          <div key={group.error_class} className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-2">
             <div className="flex items-center justify-between mb-1 text-xs">
               <span className="font-semibold text-neutral-300">{group.error_class} · {group.count}</span>
               <span className="text-neutral-500">{group.most_recent_at ? `latest ${timeAgo(group.most_recent_at)}` : 'no timestamp'}</span>

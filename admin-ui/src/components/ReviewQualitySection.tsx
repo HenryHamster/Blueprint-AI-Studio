@@ -40,7 +40,7 @@ function FixIterationBreakdown({ trends }: { trends: SrTrendWithFixIterations | 
           return (
             <span
               key={bucket}
-              className="inline-flex items-center gap-1.5 text-ui-sm font-semibold px-2 py-0.5 rounded border bg-neutral-500/10 text-neutral-300 border-neutral-700/40"
+              className="inline-flex items-center gap-1.5 text-ui-sm font-semibold px-2 py-0.5 rounded border bg-workbench-control/10 text-neutral-300 border-neutral-700/40"
               title={enoughSignal ? `n=${sampleCount}` : 'insufficient signal (<5 qualifying tasks)'}
             >
               fix-{bucket}
@@ -240,7 +240,7 @@ export function ReviewQualitySection({
       <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
       <div className="flex flex-wrap gap-3">
         {digest?.review_accuracy?.precision != null && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
             <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">Precision</p>
             <p className={`text-xl font-bold font-mono ${digest.review_accuracy.precision >= 0.8 ? 'text-emerald-400' : digest.review_accuracy.precision >= 0.6 ? 'text-amber-400' : 'text-red-400'}`}>
               {Math.round(digest.review_accuracy.precision * 100)}%
@@ -249,7 +249,7 @@ export function ReviewQualitySection({
           </div>
         )}
         {digest?.review_accuracy?.recall != null && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
             <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">Recall</p>
             <p className={`text-xl font-bold font-mono ${digest.review_accuracy.recall >= 0.8 ? 'text-emerald-400' : digest.review_accuracy.recall >= 0.6 ? 'text-amber-400' : 'text-red-400'}`}>
               {Math.round(digest.review_accuracy.recall * 100)}%
@@ -258,7 +258,7 @@ export function ReviewQualitySection({
           </div>
         )}
         {digest?.self_review_effectiveness?.with_self_review_approval_rate != null && (
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
+          <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
             <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Approval Lift</p>
             {(() => {
               const sre = digest.self_review_effectiveness ?? {};
@@ -306,7 +306,7 @@ export function ReviewQualitySection({
                   ? 'text-amber-400'
                   : 'text-red-400';
           return (
-            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[200px]">
+            <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[200px]">
               <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Self-Fix Path</p>
               <div className="space-y-0.5">
                 <div className="flex items-baseline justify-between gap-3">
@@ -339,7 +339,7 @@ export function ReviewQualitySection({
         })()}
         {digest?.self_review_prediction_accuracy?.prediction_hit_rate != null && (
           <div
-            className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+            className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
             title="SR Prediction Hit Rate: share of issues flagged by SR that the reviewer LLM also flagged. This is inter-agent agreement against the reviewer LLM, not human validation."
           >
             <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Prediction Hit</p>
@@ -363,7 +363,7 @@ export function ReviewQualitySection({
           ].filter(Boolean).join('\n');
           return (
             <div
-              className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
+              className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
               title={tooltip}
               data-testid="sr-self-flagged-unresolved-tile"
             >
@@ -396,7 +396,7 @@ export function ReviewQualitySection({
           ].filter(Boolean).join('\n');
           return (
             <div
-              className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+              className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
               title={tooltip}
             >
               <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">RR vs Test Signal</p>
@@ -419,7 +419,7 @@ export function ReviewQualitySection({
             : undefined;
           return (
             <div
-              className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+              className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
               title={tooltip}
             >
               <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">SR Skip Rate</p>
@@ -446,7 +446,7 @@ export function ReviewQualitySection({
           ].join('\n');
           return (
             <div
-              className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+              className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
               title={tooltip}
               data-testid="sr-disallowed-blind-spot-tile"
             >
@@ -479,7 +479,7 @@ export function ReviewQualitySection({
           const color = worstRate <= 0.05 ? 'text-emerald-400' : worstRate <= 0.1 ? 'text-amber-400' : 'text-red-400';
           return (
             <div
-              className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
+              className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
               title={['SR False Attestation (SR passed but CI failed):', ...tooltipLines].join('\n')}
               data-testid="sr-false-attestation-tile"
             >
@@ -535,7 +535,7 @@ export function ReviewQualitySection({
               <span>{srTrendDrilldownOpen ? 'Hide' : 'Investigate'} regression ({cats.join(', ')})</span>
             </button>
             {srTrendDrilldownOpen && (
-              <div className="bg-neutral-900/60 border border-neutral-700/40 rounded-lg px-3 py-2 text-xs text-neutral-300 flex flex-col gap-1.5">
+              <div className="bg-workbench-base/60 border border-neutral-700/40 rounded-lg px-3 py-2 text-xs text-neutral-300 flex flex-col gap-1.5">
                 {srTrendDrilldownLoading && <span className="text-neutral-500">Loading…</span>}
                 {!srTrendDrilldownLoading && srTrendDrilldownRows.length === 0 && <span className="text-neutral-500">No contributing tasks found.</span>}
                 {!srTrendDrilldownLoading && srTrendDrilldownRows.map(row => (

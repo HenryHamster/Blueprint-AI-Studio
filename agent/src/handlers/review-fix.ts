@@ -1334,18 +1334,11 @@ export async function handleFix(
   statusRef.value = `Rebasing onto ${baseBranch}...`;
   sendLog(ws, `Rebasing ${branch} onto origin/${baseBranch}...\n`);
   let hasConflicts = false;
-  // True when the rebase onto base hit conflicts (the agent integrated a
-  // moving base and a resolution was required). Threaded into ./check as
-  // mergeVerify so the gate runs the affected backend test files under Postgres
-  // before ./pr open can push — catching a silent drop / vintage skew the
-  // standalone gate would miss.
-  let conflictResolutionOccurred = false;
   try {
     git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`]);
     git(['rebase', `origin/${baseBranch}`]);
     sendLog(ws, `Rebase successful\n`);
   } catch {
-    conflictResolutionOccurred = true;
     sendLog(ws, `Rebase had conflicts — Claude will resolve them\n`);
     // Abort the failed rebase so Claude can handle it with a merge strategy
     try { git(['rebase', '--abort']); } catch { /* ignore */ }
@@ -1540,6 +1533,24 @@ export async function handleFix(
   // but our rebase came up clean and no markers are present, re-query GitHub directly
   // and pivot Claude's plan to whatever is actually blocking the PR now.
   const promptMentionsConflicts = /merge conflicts?|conflict markers|rebase.*resolve/i.test(prompt);
+  // Positive evidence that conflict resolution was this task's ENTIRE job.
+  // The obsolete-exit below completes the task without running Claude, so it
+  // destroys any other work the prompt demanded. `promptMentionsConflicts` is
+  // prose matching and cannot carry that weight: a prompt merely REFERRING to
+  // a conflict ("an operator resolved the merge conflict") matches it.
+  // Regression 2026-08-20: operator fix task 10384f8e was scoped to three BP-
+  // review issue ids, said a conflict had already been resolved, hit a clean
+  // PR, and was voided with all three findings untouched.
+  //
+  // `fix_reason` is the backend's structured spawn reason
+  // (review_pipeline.py `_spawn_pipeline_task`). Absent it, assume the task
+  // has real work: running Claude on an already-clean PR wastes a little
+  // spend, whereas voiding a task discards work with no trace.
+  const CONFLICT_ONLY_FIX_REASONS = new Set(['merge_conflict', 'update_branch_failed']);
+  const carriesReviewIssueIds = /\bBP-[0-9a-f]{12}\b/.test(prompt);
+  const conflictOnlyTask =
+    CONFLICT_ONLY_FIX_REASONS.has(fixReason ?? '') && !carriesReviewIssueIds;
+
   if (promptMentionsConflicts && !hasConflicts) {
     sendLog(ws, `Prompt claims conflicts but rebase was clean — verifying PR state against GitHub...\n`);
     let currentMergeable: boolean | null | undefined;
@@ -1580,6 +1591,18 @@ export async function handleFix(
         `${failedList}\n\n` +
         `Investigate each failing check's logs (use the GitHub API or the details URL above) and fix the underlying ` +
         `build/lint/test errors. Do NOT hunt for conflict markers — there are none.\n\n` +
+        basePrompt;
+    } else if (currentMergeable === true && failedChecks.length === 0 && !conflictOnlyTask) {
+      // Conflicts gone and CI green, but this task was not spawned solely to
+      // resolve a conflict. Drop the stale premise and run the real work.
+      sendLog(ws, `PR #${prNumber} has no conflicts and no failing checks, but this task is not conflict-only (fix_reason=${fixReason ?? 'absent'}, review_issue_ids=${carriesReviewIssueIds}) — running it instead of completing it as obsolete.\n`);
+      enrichedPrompt =
+        `## Stale-premise notice\n` +
+        `The conflict premise in this prompt is stale: PR #${prNumber} now rebases cleanly onto ` +
+        `${baseBranch} and no CI checks are failing. Do NOT hunt for conflict markers — there are none.\n\n` +
+        `That does NOT make this task obsolete. Carry out the work the prompt below actually asks for. ` +
+        `If it names specific review findings (BP- issue ids), fix exactly those and nothing else. ` +
+        `Only if there is genuinely nothing left to do should you report that.\n\n` +
         basePrompt;
     } else if (currentMergeable === true && failedChecks.length === 0) {
       // No conflicts, no CI failures. Task is obsolete. Complete cleanly without running Claude.
@@ -1944,11 +1967,6 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     // non-ci_failure fixes (ciFailureSelectors is [] unless fixReason ===
     // 'ci_failure'), so review-feedback fixes keep the existing gate untouched.
     ciFailureSelectors,
-    // Conflict-resolution closed-loop verify: when this fix integrated a moving
-    // base and resolved conflicts (or is an explicit merge_conflict fix), ./check
-    // runs the affected backend test files under Postgres so a bad resolution
-    // fails the gate before ./pr open can push (see buildMergeVerifyBlock).
-    mergeVerify: conflictResolutionOccurred || fixReason === 'merge_conflict',
   });
 
 }

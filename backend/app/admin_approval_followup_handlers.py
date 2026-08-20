@@ -171,6 +171,7 @@ async def handle_rollup_pr_approval(
                 project_id=str(_project_id),
                 expected_head_sha=expected_head_sha,
                 allow_changes_requested=True,
+                allow_operator_pat=True,
             )
 
         from app.review_policy_merge import attempt_explicit_human_merge
@@ -477,6 +478,7 @@ async def merge_critical_pr(
                 project_id=str(_project_id),
                 expected_head_sha=expected_head_sha,
                 allow_changes_requested=True,
+                allow_operator_pat=True,
             )
 
         from app.review_policy_merge import attempt_explicit_human_merge

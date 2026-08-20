@@ -4082,6 +4082,7 @@ class MessageHandlingState(str, Enum):
     CLAIMED = "claimed"
     RESPONDED = "responded"
     SUPERSEDED = "superseded"
+    FAILED = "failed"
 
 
 class ProjectMessage(SQLModel, table=True):
@@ -4232,7 +4233,7 @@ class ProjectMessage(SQLModel, table=True):
             name="chk_projectmessage_surface",
         ),
         CheckConstraint(
-            "handling_state IN ('pending','claimed','responded','superseded')",
+            "handling_state IN ('pending','claimed','responded','superseded','failed')",
             name="chk_projectmessage_handling_state",
         ),
         CheckConstraint(
@@ -6547,9 +6548,10 @@ class MaxPlanAccount(SQLModel, table=True):
         """Return True if any model is still in rate-limit cooldown from persisted state.
 
         Reads self.rate_limit_state (JSONB, populated by _persist_rate_limit_state
-        in max_plan_pool). Inlines the same cooldown-window math as
-        max_plan_pool._cooldown_seconds_for_info to avoid a circular import
-        (max_plan_pool imports models).
+        in max_plan_pool). Uses the same cooldown-window math as
+        max_plan_pool via app.rate_limit_cooldown, the single source of
+        truth shared by both modules — no import cycle, since
+        rate_limit_cooldown has no dependency on models or max_plan_pool.
 
         at_time: reference timestamp for the check. Pass the failure instant so
         reaper lag between failure and classification cannot cause a missed
@@ -6557,6 +6559,8 @@ class MaxPlanAccount(SQLModel, table=True):
 
         Returns False on any parse failure.
         """
+        from app.rate_limit_cooldown import cooldown_seconds_for_info
+
         try:
             dm = (self.rate_limit_state or {}).get("disabled_models") or {}
             if not dm:
@@ -6574,20 +6578,7 @@ class MaxPlanAccount(SQLModel, table=True):
                         at_dt = at_dt.replace(tzinfo=None)
                 except (ValueError, TypeError):
                     continue
-                # Mirror max_plan_pool._cooldown_seconds_for_info inline.
-                kind = info.get("kind")
-                if kind == "quota_exhausted":
-                    cooldown = 24 * 3600
-                elif kind == "quarantine":
-                    cooldown = 15 * 60
-                elif kind == "regression":
-                    cooldown = 6 * 3600
-                else:
-                    hits = info.get("hits", 1)
-                    cooldown = min(30 * (2 ** (hits - 1)), 240) * 60
-                    hint = info.get("retry_after_seconds")
-                    if isinstance(hint, (int, float)) and hint > cooldown:
-                        cooldown = int(hint)
+                cooldown = cooldown_seconds_for_info(info)
                 if (now - at_dt).total_seconds() < cooldown:
                     return True
             return False

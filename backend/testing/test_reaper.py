@@ -6224,6 +6224,131 @@ async def test_step7_stalled_cycle_live_task_not_declared_stalled(
 
 
 @pytest.mark.asyncio
+async def test_step7_requeued_phase_task_with_recent_activity_not_reaped(
+    reaper_db, mocker
+):
+    """A rate-limit-requeued phase task mid-recovery must not be force-killed.
+
+    sc-93fd806a: the phase2 resident session hit a provider 429 session limit,
+    self-requeued (FAILED -> PROVISIONING -> QUEUED -> PROVISIONING), and 60
+    seconds later the stall sweep force-terminated it — the requeue cleared
+    ``last_heartbeat`` and a QUEUED/PROVISIONING task has no agent to
+    heartbeat, so the NULL-heartbeat path fell straight through to the kill.
+    A recent ``updated_at`` (every lifecycle write advances it) is the
+    liveness signal for that window.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2-requeued",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.PROVISIONING,
+        last_heartbeat=None,
+        latest_status_message="Rate Limit — requeued",
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 0
+    assert task.status == TaskStatus.PROVISIONING, (
+        "a requeued phase task with recent lifecycle activity is recovering, "
+        "not stalled — the reaper must not force-terminate it"
+    )
+    assert cycle.outcome == "phase2_running"
+    assert cycle.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_step7_wedged_queued_phase_task_without_activity_still_reaped(
+    reaper_db, mocker
+):
+    """The recent-activity skip must not shield a genuinely wedged QUEUED task.
+
+    Mutation guard for the requeue exemption above: a phase task that has sat
+    QUEUED with no heartbeat AND no lifecycle write for hours is the exact
+    wedge the stall sweep exists to converge.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2-wedged",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    # Force updated_at into the past (bypassing the onupdate hook): the task
+    # row has not been touched since long before the liveness window.
+    from sqlalchemy import update as _sa_update
+
+    await reaper_db.execute(
+        _sa_update(Task)
+        .where(Task.id == task.id)
+        .values(updated_at=_utcnow() - timedelta(hours=2))
+    )
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 1
+    assert task.status == TaskStatus.FAILED
+    assert cycle.outcome == "stalled_phase2"
+    assert cycle.failure_reason == (
+        "reaper_stall: cycle in phase2 >3h with no completion"
+    )
+
+
+@pytest.mark.asyncio
 async def test_step7_reconciles_already_terminal_task_while_pipeline_paused(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
@@ -14207,12 +14332,13 @@ async def _make_bug_message(
     msg_type=MessageType.BUG_REPORT,
     status="open",
     context=None,
+    from_type="system",
 ):
     """Create a ProjectMessage of bug-class type and flush it."""
     msg = ProjectMessage(
         project_id=project.id,
         message_type=msg_type,
-        from_type="system",
+        from_type=from_type,
         content="Test bug report",
         status=status,
         context=context or {},
@@ -15019,6 +15145,38 @@ async def test_sweep_decay_stale_open_bug_messages_decays_unowned_blocker(reaper
 
 
 @pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_decays_unowned_strategic_bug_report(
+    reaper_db,
+):
+    """An OPEN unowned strategist-filed (from_type='strategic') BUG_REPORT older
+    than the threshold is auto-decayed like a 'system'/'agent' one — agent-filed
+    bug reports authored via strategic_completion.py must not be permanently
+    invisible to this sweep."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 1)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="strategic",
+        content="old unowned strategist-filed bug report",
+        status="open",
+        context={},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
 async def test_sweep_decay_stale_open_bug_messages_skips_recent(reaper_db):
     """A BUG_REPORT younger than the threshold is left open."""
     project = await _make_project(reaper_db)
@@ -15379,10 +15537,12 @@ async def test_converge_refuses_cycle(reaper_db, _no_broadcast):
 
 @pytest.mark.asyncio
 async def test_spawn_converge_within_batch_genuine_duplicate(reaper_db):
-    """(a) Two just-spawned siblings that are genuine duplicates (shared finding
-    origin) — even though they share the one research parent — are serialized: the
-    later child is wired to depend on the earlier (canonical) one at spawn."""
+    """(a) Two just-spawned siblings with an identical finding origin are the
+    SAME finding, not a foundation pair — serializing the later one produced
+    rebase-then-duplicate PRs, so it is DROPPED from the batch instead, stamped
+    with the surviving sibling for the caller's skip receipt."""
     from app.research_completion import converge_spawn_batch_foundations
+    from app.research_sibling_dependencies import DUPLICATE_FINDING_DROP_KEY
 
     project = await _make_project(reaper_db)
     research_parent = _uuid_mod.uuid4()
@@ -15405,14 +15565,55 @@ async def test_spawn_converge_within_batch_genuine_duplicate(reaper_db):
         status=TaskStatus.QUEUED,
     )
 
-    wired = converge_spawn_batch_foundations([canonical, dependent], [])
+    batch = [canonical, dependent]
+    wired = converge_spawn_batch_foundations(batch, [])
 
-    assert [t.id for t in wired] == [dependent.id]
-    assert str(canonical.id) in [str(d) for d in dependent.depends_on]
+    assert wired == []
+    assert [t.id for t in batch] == [canonical.id]
+    assert not dependent.depends_on
     assert not canonical.depends_on
-    assert dependent.context.get("_foundation_converged", {}).get(
-        "foundation_id"
-    ) == str(canonical.id)
+    marker = dependent.context[DUPLICATE_FINDING_DROP_KEY]
+    assert marker["surviving_task_id"] == str(canonical.id)
+    assert marker["finding_hash"] == "spawnhash00000001"
+
+
+@pytest.mark.asyncio
+async def test_spawn_drops_duplicate_finding_child_vs_active_task(reaper_db):
+    """A just-spawned child whose finding_hash matches an already-active task is
+    dropped from the batch — the active task IS the finding's implementation, so
+    serializing behind it only manufactures a duplicate PR after rebase."""
+    from app.research_completion import converge_spawn_batch_foundations
+    from app.research_sibling_dependencies import DUPLICATE_FINDING_DROP_KEY
+
+    project = await _make_project(reaper_db)
+    active = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/a.py"],
+        parent=_uuid_mod.uuid4(),
+        ctx={"finding_hash": "activehash0000001"},
+        created_at=_utcnow() - timedelta(hours=1),
+        status=TaskStatus.IN_PROGRESS,
+    )
+    child = await _conv_task(
+        reaper_db,
+        project,
+        files=["backend/app/b.py"],
+        parent=_uuid_mod.uuid4(),
+        ctx={"finding_hash": "activehash0000001"},
+        created_at=_utcnow(),
+        status=TaskStatus.QUEUED,
+    )
+
+    batch = [child]
+    wired = converge_spawn_batch_foundations(batch, [active])
+
+    assert wired == []
+    assert batch == []
+    assert not child.depends_on
+    assert child.context[DUPLICATE_FINDING_DROP_KEY]["surviving_task_id"] == str(
+        active.id
+    )
 
 
 @pytest.mark.asyncio
@@ -15597,6 +15798,32 @@ async def test_open_owned_resolves_when_direction_completed(reaper_db):
     assert msg.resolved_at is not None
     assert msg.context.get("_owned_auto_resolved_at") is not None
     assert msg.context.get("_owned_auto_resolution") == msg.resolution
+
+
+@pytest.mark.asyncio
+async def test_open_owned_resolves_strategic_authored_bug_report(reaper_db):
+    """A strategist-filed (from_type='strategic') BUG_REPORT — the shape produced
+    by strategic_completion.py for agent-filed bug reports — resolves on owner
+    success the same as a 'system'/'agent'-authored one. Without 'strategic' in
+    SYSTEM_AUTHORED_FROM_TYPES this row would never be selected by any sweep."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-done-strategic", status="completed"
+    )
+    msg = await _make_bug_message(
+        reaper_db,
+        project,
+        context={"direction_id": "d-done-strategic"},
+        from_type="strategic",
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "d-done-strategic" in (msg.resolution or "")
+    assert msg.resolved_at is not None
 
 
 @pytest.mark.asyncio
@@ -15920,6 +16147,41 @@ async def test_stale_open_bug_resolves_when_citations_absent(reaper_db, monkeypa
     assert msg.context.get("_stale_auto_resolution") == msg.resolution
     assert msg.context.get("_stale_auto_citation_signal") == absent_signal
     assert "_owned_auto_resolution" not in msg.context
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_resolves_strategic_authored_when_citations_absent(
+    reaper_db, monkeypatch
+):
+    """A strategist-filed (from_type='strategic') bug message whose citations
+    re-validate as ABSENT on HEAD is resolved the same as a 'system'/'agent'
+    one — strategic-authored rows must be selected by this sweep too."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(
+        reaper_db, project, context={"source": "x"}, from_type="strategic"
+    )
+
+    async def _absent(_session, _project, _content, *, structured_context=None):
+        return {
+            "citation_state": "absent",
+            "broken_refs": ["app/gone.py"],
+            "ungrounded_refs": ["app/gone.py:vanished"],
+        }
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _absent, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _absent,
+        raising=False,
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "stale" in (msg.resolution or "").lower()
+    assert msg.resolved_at is not None
 
 
 @pytest.mark.asyncio
@@ -18094,6 +18356,236 @@ async def test_reaper_closes_pr_when_infra_retry_budget_exhausted(
 
     assert t.status == TaskStatus.FAILED
     mock_close.assert_called_once()
+
+
+# ── Terminal pipeline-death re-arm (incident 2026-08-19, review 20712c3f) ───
+# A review task reaped to terminal FAILED (AGENT_TIMEOUT) never reports agent
+# status and is skipped by the resurrection sweep, so without a producer the
+# EVALUATING original parked with review_loop.ci_waiting falsy strands its PR
+# un-reviewed indefinitely. The reaper's terminal branch must stage
+# _pr_state_check_pending on the original — bounded, with an operator-facing
+# WHY on exhaustion.
+
+
+def _make_dead_review_chain(project, pr_number: int, *, orig_ctx_extra=None):
+    """Return (original EVALUATING create task, doomed review task).
+
+    The review task has a stale heartbeat, empty logs, and attempt_count high
+    enough to exhaust any AGENT_TIMEOUT budget, so the reaper takes the
+    terminal-FAIL branch (not the retry branch). It has NO PULL_REQUEST
+    artifact, so the open-PR handoff never applies (reviews don't author PRs).
+    """
+    orig_ctx = {
+        "review_loop": {
+            "pr_number": pr_number,
+            "iteration": 2,
+            "max_iterations": 12,
+            "branch": f"blueprint/task-{pr_number}",
+            "base_branch": "main",
+            # ci_waiting falsy → outside the CI monitor poll set and the
+            # review-wait backstop: exactly the stranded park.
+            "ci_waiting": False,
+        },
+    }
+    if orig_ctx_extra:
+        orig_ctx.update(orig_ctx_extra)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.EVALUATING,
+        context=orig_ctx,
+    )
+    review = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "prompt": "Review the PR",
+            }
+        ],
+        vm_instance_id=f"vm-review-{pr_number}",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=8,  # ≥ any AGENT_TIMEOUT budget → terminal, not retry
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        context={},
+    )
+    return original, review
+
+
+def _wire_review_to_original(review: Task, original: Task) -> None:
+    review.payloads = [dict(review.payloads[0], original_task_id=str(original.id))]
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_agent_timeout_review_rearms_original_pr_check(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A review reaped to terminal FAILED (AGENT_TIMEOUT) must re-arm the
+    canonical _pr_state_check_pending consumer on its EVALUATING original so
+    the PR gets reviewed again — instead of stranding it indefinitely."""
+    import app.failure_classification as fc
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+
+    project = await _make_project(reaper_db)
+    original, review = _make_dead_review_chain(project, pr_number=30001)
+    reaper_db.add(original)
+    await reaper_db.commit()
+    await reaper_db.refresh(original)
+    _wire_review_to_original(review, original)
+    reaper_db.add(review)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(review)
+    await reaper_db.refresh(original)
+
+    assert review.status == TaskStatus.FAILED, "review must reach terminal-fail"
+    assert (review.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+    octx = original.context or {}
+    assert octx.get("_pr_state_check_pending") is True, (
+        "terminal review death must stage the canonical PR re-drive marker "
+        "on the EVALUATING original"
+    )
+    assert octx.get("_pipeline_terminal_rearm_count") == 1
+    assert original.status == TaskStatus.EVALUATING, (
+        "the original stays parked; the eval-sweep consumer owns the re-drive"
+    )
+    msg = original.latest_status_message or ""
+    assert "#30001" in msg and "re-armed" in msg.lower(), (
+        f"re-arm must surface WHY on the original, got: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_rearm_skips_non_evaluating_original(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A COMPLETED original (rollup child — re-driven by rollup convergence)
+    must NOT be touched by the terminal re-arm, and the reap must not crash."""
+    import app.failure_classification as fc
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+
+    project = await _make_project(reaper_db)
+    original, review = _make_dead_review_chain(project, pr_number=30002)
+    original.status = TaskStatus.COMPLETED
+    reaper_db.add(original)
+    await reaper_db.commit()
+    await reaper_db.refresh(original)
+    _wire_review_to_original(review, original)
+    reaper_db.add(review)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(review)
+    await reaper_db.refresh(original)
+
+    assert review.status == TaskStatus.FAILED
+    octx = original.context or {}
+    assert "_pr_state_check_pending" not in octx
+    assert "_pipeline_terminal_rearm_count" not in octx
+    assert original.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_rearm_cap_exhausted_emits_operator_why(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """With the re-arm budget already spent, another terminal review death must
+    NOT re-arm again (no infinite respawn loop) and must surface an explicit
+    operator-facing reason + failure alert on the original instead of silently
+    parking it."""
+    import app.failure_classification as fc
+    from app.reaper_pipeline_rearm import (
+        PIPELINE_TERMINAL_REARM_CAP,
+        PIPELINE_TERMINAL_REARM_COUNT_KEY,
+        PIPELINE_TERMINAL_REARM_EXHAUSTED_KEY,
+    )
+
+    # Literal pin: the automatic re-review budget is a bounded small constant.
+    assert PIPELINE_TERMINAL_REARM_CAP == 2
+
+    mocker.patch.object(
+        fc,
+        "classify_failure_with_confidence",
+        return_value=fc.FailureClassification(
+            failure_class="AGENT_TIMEOUT", confidence=0.9
+        ),
+    )
+    # Re-patch over the fixture's alert mock so this test can inspect calls.
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    original, review = _make_dead_review_chain(
+        project,
+        pr_number=30003,
+        orig_ctx_extra={
+            PIPELINE_TERMINAL_REARM_COUNT_KEY: PIPELINE_TERMINAL_REARM_CAP
+        },
+    )
+    reaper_db.add(original)
+    await reaper_db.commit()
+    await reaper_db.refresh(original)
+    _wire_review_to_original(review, original)
+    reaper_db.add(review)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(review)
+    await reaper_db.refresh(original)
+
+    assert review.status == TaskStatus.FAILED
+    octx = original.context or {}
+    assert "_pr_state_check_pending" not in octx, (
+        "exhausted budget must stop the re-arm — no unbounded respawn loop"
+    )
+    assert octx.get(PIPELINE_TERMINAL_REARM_COUNT_KEY) == (
+        PIPELINE_TERMINAL_REARM_CAP
+    ), "exhaustion must not keep incrementing the counter"
+    exhausted = octx.get(PIPELINE_TERMINAL_REARM_EXHAUSTED_KEY)
+    assert isinstance(exhausted, dict), (
+        "exhaustion must stamp operator-facing provenance on the original"
+    )
+    assert exhausted.get("pr_number") == 30003
+    assert exhausted.get("failure_class") == "AGENT_TIMEOUT"
+    assert exhausted.get("dead_task_id") == str(review.id)
+    msg = original.latest_status_message or ""
+    assert "exhausted" in msg.lower() and "operator" in msg.lower(), (
+        f"exhaustion must emit WHY on the original, got: {msg!r}"
+    )
+    # A failure alert must be raised FOR THE ORIGINAL (the dead review gets
+    # its own alert from the ordinary terminal path).
+    original_alert_calls = [
+        c
+        for c in alert_mock.await_args_list
+        if c.args and getattr(c.args[0], "id", None) == original.id
+    ]
+    assert original_alert_calls, "exhaustion must raise an alert on the original"
+    alert_snippet = original_alert_calls[0].args[2] if len(
+        original_alert_calls[0].args
+    ) > 2 else original_alert_calls[0].kwargs.get("error_snippet", "")
+    assert "exhausted" in (alert_snippet or "").lower()
 
 
 # ── Fleet-scan cadence gates and limits (Part A) ────────────────────────────

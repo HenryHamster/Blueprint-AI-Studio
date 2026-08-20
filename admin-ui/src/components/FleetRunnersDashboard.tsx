@@ -58,7 +58,7 @@ function FleetSummaryCard({ data }: { data: FleetHealthSummaryResponse }) {
   const hasCritical = data.offline > 0 || data.low_disk > 0 || lowMemory > 0;
 
   return (
-    <div className="bg-neutral-900/60 border border-neutral-800/60 rounded-lg p-4">
+    <div className="bg-workbench-base/60 border border-neutral-800/60 rounded-lg p-4">
       <div className="flex items-center gap-2 mb-3">
         {hasCritical ? (
           <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
@@ -132,7 +132,7 @@ function RunnerCard({ runner }: { runner: FleetRunner }) {
 
   return (
     <div
-      className={`bg-neutral-900/50 border rounded-lg p-3 flex flex-col gap-2 ${statusBorderColor(status)}`}
+      className={`bg-workbench-base/50 border rounded-lg p-3 flex flex-col gap-2 ${statusBorderColor(status)}`}
     >
       {/* Header row */}
       <div className="flex items-start gap-2">
@@ -247,7 +247,7 @@ export function FleetRunnersDashboard() {
   }, [refreshKey]);
 
   return (
-    <div className="flex flex-col h-full overflow-hidden bg-neutral-950">
+    <div className="flex flex-col h-full overflow-hidden bg-workbench-shell">
       {/* Page header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-800/60 shrink-0">
         <div className="flex items-center gap-2">
@@ -284,12 +284,12 @@ export function FleetRunnersDashboard() {
 
         {loading && !data ? (
           <div className="space-y-4">
-            <div className="h-24 bg-neutral-900/50 border border-neutral-800/40 rounded-lg animate-pulse" />
+            <div className="h-24 bg-workbench-base/50 border border-neutral-800/40 rounded-lg animate-pulse" />
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
               {[...Array(4)].map((_, i) => (
                 <div
                   key={i}
-                  className="h-32 bg-neutral-900/50 border border-neutral-800/40 rounded-lg animate-pulse"
+                  className="h-32 bg-workbench-base/50 border border-neutral-800/40 rounded-lg animate-pulse"
                 />
               ))}
             </div>

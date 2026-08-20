@@ -14,8 +14,13 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app import github, hotfix_policy, release_version
+from app import github, hotfix_narrow_candidate, hotfix_policy, release_version
 from app.database import AsyncSessionLocal
+# Moved out to keep this module inside its governance cap; re-exported so
+# ``release_qualifier.check_hotfix_scope_preview`` keeps resolving unchanged.
+from app.hotfix_narrow_candidate import (  # noqa: F401
+    check_hotfix_scope_preview as check_hotfix_scope_preview,
+)
 from app.models import Project
 from app.time_utils import _utcnow
 _MODULE_SIZE_GOVERNANCE_CAP: int = 537
@@ -63,6 +68,7 @@ async def _hotfix_promote_locked(
     scope_modules: list[str] | None,
     diff_file_list: list[str],
     prior_deployed_sha: str | None,
+    repair_commit_shas: list[str] | None = None,
 ) -> dict[str, Any]:
     """Lock + HOTFIX-promote an open version on a dedicated session (no audit).
 
@@ -114,6 +120,9 @@ async def _hotfix_promote_locked(
         # its promised audit trail if the request session dies after promotion.
         "hotfix_promote_diff_file_list": list(diff_file_list),
         "hotfix_promote_prior_deployed_sha": prior_deployed_sha,
+        # Narrow lane only: the operator-named repair commits this candidate was
+        # materialized from (empty when the whole candidate diff was shipped).
+        "hotfix_promote_repair_commit_shas": list(repair_commit_shas or []),
         "started_at": now.isoformat(),
         "finalized_at": now.isoformat(),
     }
@@ -148,6 +157,7 @@ async def _hotfix_promote_in_dedicated_session(
     scope_modules: list[str] | None,
     diff_file_list: list[str],
     prior_deployed_sha: str | None,
+    repair_commit_shas: list[str] | None = None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Run HOTFIX-promote on a DEDICATED session (mirrors the force-promote path).
@@ -170,6 +180,7 @@ async def _hotfix_promote_in_dedicated_session(
                 scope_modules,
                 diff_file_list,
                 prior_deployed_sha,
+                repair_commit_shas,
             )
         except Exception:
             try:
@@ -203,6 +214,7 @@ async def _record_hotfix_audit_trail(
     scope_modules: list[str] | None,
     diff_file_list: list[str] | None,
     prior_deployed_sha: str | None,
+    repair_commit_shas: list[str] | None = None,
     record_debt: bool = True,
     record_alert: bool = True,
 ) -> None:
@@ -242,6 +254,9 @@ async def _record_hotfix_audit_trail(
         "scope_modules": _scope_modules,
         "diff_file_list": _diff_files,
         "prior_deployed_sha": prior_deployed_sha,
+        # WHICH commits the operator asserted were the repair (narrow lane);
+        # ``diff_file_list`` above is WHICH files actually shipped.
+        "repair_commit_shas": list(repair_commit_shas or []),
     }
     if record_debt:
         await arecord_completion_debt(
@@ -303,6 +318,7 @@ async def hotfix_promote_current_version(
     actor: str | None = None,
     reason: str | None = None,
     scope_modules: list[str] | None = None,
+    repair_commit_shas: list[str] | None = None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Operator HOTFIX-PROMOTE the project's open version — a NARROW force-promote.
@@ -320,6 +336,18 @@ async def hotfix_promote_current_version(
     scope rejection it returns ``{"status": "scope_rejected", ...}`` WITHOUT
     cutting any branch.  On success it re-enters ``promote()`` in a DEDICATED
     session and records a durable audit trail (completion debt + Alert).
+
+    ``repair_commit_shas`` selects the NARROW lane (knowledge 0cee18f3): instead
+    of scope-checking (and shipping) everything integration accumulated since the
+    last promotion — which in a real latch is hundreds of product files and is
+    therefore ALWAYS rejected — the operator names the commits that constitute
+    the repair.  Those commits' OWN diffs are scope-checked by the SAME
+    fail-closed predicate, and an eligible repair is materialized as a new commit
+    on top of the promotion target carrying only those files.  The materialized
+    SHA is then scope-checked AGAIN through the ordinary compare below, so
+    authorization still derives from the actual diff of what ships.  CI is
+    resolved against the CONTENT source (the repair commit that was actually
+    built and tested); the promotion PR then runs its own CI on the narrow branch.
     """
     version = await release_version.current_open_version(session, project_id)
     if version is None:
@@ -351,6 +379,35 @@ async def hotfix_promote_current_version(
         return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
     if not prior_deployed_sha:
         return {"status": "sha_error", "detail": "empty promotion-target sha"}
+
+    # NARROW lane: materialize a machinery-only candidate from the named repair
+    # commits before the ordinary compare below re-verifies what will ship.
+    ci_ref = candidate_sha
+    _repair_shas = list(repair_commit_shas or [])
+    if _repair_shas:
+        narrow = await hotfix_narrow_candidate.materialize_narrow_hotfix_candidate(
+            token,
+            owner,
+            repo,
+            prior_deployed_sha=prior_deployed_sha,
+            repair_commit_shas=_repair_shas,
+            content_ref=candidate_sha,
+            project_id=str(project_id),
+        )
+        if narrow.get("status") != "materialized":
+            logger.warning(
+                "[RELEASE_QUALIFIER] HOTFIX-PROMOTE narrow lane REFUSED: project %s "
+                "repair=%s status=%s — %s",
+                project_id,
+                [sha[:8] for sha in _repair_shas],
+                narrow.get("status"),
+                narrow.get("reason"),
+            )
+            return narrow
+        # CI ran on the repair commit's own tree, never on the just-created
+        # narrow object; resolve it against that content source.
+        ci_ref = narrow["content_ref"]
+        candidate_sha = narrow["candidate_sha"]
 
     # Compute the candidate's ACTUAL changed files (a GitHub compare) — the WHOLE
     # safety of the lane.  NEVER trust the operator-declared scope_modules as the
@@ -400,7 +457,7 @@ async def hotfix_promote_current_version(
         )
     )
     # Explicitly resolve CI before opening the PR — the bypass skips AUDIT only.
-    ci_green, ci_resolution = await _rq._resolve_ci_at_finalize(session, version, candidate_sha)
+    ci_green, ci_resolution = await _rq._resolve_ci_at_finalize(session, version, ci_ref)
     ci_required = _rq._ci_required_for_finalize(project, ci_resolution)
     if ci_required and not ci_green:
         logger.warning(
@@ -431,6 +488,7 @@ async def hotfix_promote_current_version(
         scope_modules=scope_modules,
         diff_file_list=changed_files,
         prior_deployed_sha=prior_deployed_sha,
+        repair_commit_shas=_repair_shas,
         session_factory=session_factory,
     )
     if result.get("status") in _HOTFIX_PROMOTE_ATTEMPTED_STATUSES:
@@ -443,95 +501,6 @@ async def hotfix_promote_current_version(
             scope_modules=scope_modules,
             diff_file_list=changed_files,
             prior_deployed_sha=prior_deployed_sha,
+            repair_commit_shas=_repair_shas,
         )
     return result
-
-
-async def check_hotfix_scope_preview(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    candidate_sha: str | None = None,
-) -> dict[str, Any]:
-    """Read-only preview: report whether the current open version's candidate diff
-    is hotfix-eligible WITHOUT promoting.
-
-    Returns a dict with keys:
-      ``status``         — one of 'eligible', 'ineligible', 'no_open_version',
-                           'no_credentials', 'sha_error', 'diff_unavailable'
-      ``eligible``       — bool (present when status is 'eligible' or 'ineligible')
-      ``changed_files``  — list of all changed file paths (present on success)
-      ``offending_files``— list of paths that failed the scope check (empty if eligible)
-      ``reason``         — human-readable verdict string (present on success)
-      ``candidate_sha``  — resolved candidate SHA (present on success)
-      ``prior_deployed_sha`` — promotion-target HEAD SHA (present on success)
-
-    This shares the credential-resolution and diff-fetch logic with
-    ``hotfix_promote_current_version`` but makes NO mutations: no branch is cut,
-    no PR is opened, no audit trail is written.
-    """
-    version = await release_version.current_open_version(session, project_id)
-    if version is None:
-        return {"status": "no_open_version"}
-    project = await session.get(Project, project_id)
-    if project is None:
-        return {"status": "no_open_version"}
-    _rq = _release_qualifier()
-    resolved = await _rq._resolve_github_with_session(session, project)
-    if resolved is None:
-        return {"status": "no_credentials"}
-    token, owner, repo = resolved
-    integration_branch, promotion_target = _rq._lts_branch_names(project)
-    if not candidate_sha:
-        try:
-            candidate_sha = await github.get_branch_sha(
-                token, owner, repo, integration_branch, live=True
-            )
-        except Exception as exc:  # noqa: BLE001
-            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
-    if not candidate_sha:
-        return {"status": "sha_error", "detail": "empty candidate sha"}
-    try:
-        prior_deployed_sha = await github.get_branch_sha(
-            token, owner, repo, promotion_target, live=True
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
-    if not prior_deployed_sha:
-        return {"status": "sha_error", "detail": "empty promotion-target sha"}
-
-    from app import github_refs
-
-    changed = await github_refs.get_changed_files_with_patches_between_refs(
-        token, owner, repo, prior_deployed_sha, candidate_sha, project_id=str(project_id)
-    )
-    if changed is None:
-        return {
-            "status": "diff_unavailable",
-            "eligible": False,
-            "changed_files": [],
-            "offending_files": [],
-            "reason": (
-                "could not resolve the candidate diff against the promotion target "
-                "(GitHub compare failed)"
-            ),
-            "candidate_sha": candidate_sha,
-            "prior_deployed_sha": prior_deployed_sha,
-        }
-    changed_files = [f["filename"] for f in changed]
-    main_py_patch = next(
-        (f.get("patch") for f in changed if f["filename"] == hotfix_policy.MAIN_PY_PATH),
-        None,
-    )
-    verdict = hotfix_policy.evaluate_hotfix_scope(
-        changed_files, main_py_patch=main_py_patch
-    )
-    return {
-        "status": "eligible" if verdict.eligible else "ineligible",
-        "eligible": verdict.eligible,
-        "changed_files": changed_files,
-        "offending_files": verdict.offending_files,
-        "reason": verdict.reason,
-        "candidate_sha": candidate_sha,
-        "prior_deployed_sha": prior_deployed_sha,
-    }

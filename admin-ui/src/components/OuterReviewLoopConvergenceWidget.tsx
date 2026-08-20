@@ -188,7 +188,7 @@ function getTrendBucketSummary(bucket: OuterLoopConvergenceTrendBucket): string 
 
 function StatCard({ value, label, color }: { value: string; label: string; color?: string }) {
   return (
-    <div className="bg-neutral-900/60 rounded-lg p-3 border border-neutral-800 flex flex-col gap-1 min-w-0">
+    <div className="bg-workbench-base/60 rounded-lg p-3 border border-neutral-800 flex flex-col gap-1 min-w-0">
       <span className={`text-lg font-bold leading-none ${color ?? 'text-neutral-100'}`}>{value}</span>
       <span className="text-ui-sm text-neutral-500 truncate">{label}</span>
     </div>
@@ -210,7 +210,7 @@ function MetricChip({
   onClick?: () => void;
   active?: boolean;
 }) {
-  const toneCls = tone ?? 'bg-neutral-800 text-neutral-300 border-neutral-700';
+  const toneCls = tone ?? 'bg-workbench-panel text-neutral-300 border-neutral-700';
   const content = (
     <>
       {label}
@@ -257,7 +257,7 @@ function IterDistBar({ dist }: { dist: Record<string, number> }) {
             // `gap-0.5` (6px total) would otherwise overflow `w-full` by 6px at
             // narrow viewports. Allowing flex-shrink lets the bars absorb the
             // gap so the row fits exactly without clipping.
-            className={`${colors[i]} rounded-sm`}
+            className={`${colors[i]} rounded`}
             style={{ width: `${Math.max(pct, 2)}%`, height: `${Math.max((pct / 100) * 16, 2)}px` }}
           />
         );
@@ -435,11 +435,11 @@ function ChainDrillDownPanel({
     return () => { panelMountedRef.current = false; };
   }, [fetchChains]);
 
-  const reasonCls = TERMINAL_OUTCOME_TONES[reason] ?? INCIDENCE_TONES[reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  const reasonCls = TERMINAL_OUTCOME_TONES[reason] ?? INCIDENCE_TONES[reason] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
   const reasonLabel = TERMINAL_OUTCOME_LABELS[reason] ?? reason.replace(/_/g, ' ');
 
   return (
-    <div className="mt-2 bg-neutral-900/80 rounded-lg border border-neutral-700 p-3">
+    <div className="mt-2 bg-workbench-base/80 rounded-lg border border-neutral-700 p-3">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-ui-sm font-semibold uppercase tracking-wide text-neutral-400">PR chains</span>
@@ -459,13 +459,13 @@ function ChainDrillDownPanel({
       {!loading && !error && chains.length > 0 && (
         <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto pr-1">
           {chains.map((c, i) => (
-            <div key={c.pr_number ?? `chain-${i}`} className="bg-neutral-800/60 rounded p-2 flex flex-col gap-0.5 min-w-0">
+            <div key={c.pr_number ?? `chain-${i}`} className="bg-workbench-panel/60 rounded p-2 flex flex-col gap-0.5 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-ui-md text-neutral-200 font-medium">
                   {c.pr_number != null ? `PR #${c.pr_number}` : 'no PR'}
                 </span>
                 {c.terminal_reason && (
-                  <span className={`text-ui-sm px-1 py-0.5 rounded border ${TERMINAL_OUTCOME_TONES[c.terminal_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}>
+                  <span className={`text-ui-sm px-1 py-0.5 rounded border ${TERMINAL_OUTCOME_TONES[c.terminal_reason] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30'}`}>
                     {TERMINAL_OUTCOME_LABELS[c.terminal_reason] ?? c.terminal_reason.replace(/_/g, ' ')}
                   </span>
                 )}

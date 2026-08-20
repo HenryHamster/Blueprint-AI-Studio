@@ -2764,7 +2764,7 @@ async def test_strategic_session_endpoint_resumes_persisted_state_and_outputs(
         from_type="strategic",
         content="Watch the local Strategic runner registration path.",
         status="open",
-        context={"event_type": "strategic_reply"},
+        context={"event_type": "question_answer"},
     )
     latest_cycle = StrategicCycle(
         id="sc-session",
@@ -2828,6 +2828,9 @@ async def test_strategic_session_conversation_marks_more_history(
             from_type="user" if index % 2 == 0 else "strategic",
             content=f"session row {index:02d}",
             created_at=base_time + timedelta(minutes=index),
+            context=(
+                None if index % 2 == 0 else {"event_type": "question_answer"}
+            ),
         )
         for index in range(21)
     ]
@@ -2861,6 +2864,7 @@ async def test_strategic_session_includes_requested_older_message_once(
         content="older targeted question",
         status="open",
         created_at=base_time,
+        context={"event_type": "question_answer"},
     )
     newer_messages = [
         ProjectMessage(
@@ -2871,6 +2875,9 @@ async def test_strategic_session_includes_requested_older_message_once(
             from_type="user" if index % 2 == 0 else "strategic",
             content=f"newer session row {index:02d}",
             created_at=base_time + timedelta(minutes=index + 1),
+            context=(
+                None if index % 2 == 0 else {"event_type": "question_answer"}
+            ),
         )
         for index in range(20)
     ]
@@ -2937,6 +2944,7 @@ async def test_strategic_session_conversation_filters_routine_before_limit(
             from_type="strategic",
             content="strategic replies with the current plan",
             created_at=base_time + timedelta(minutes=1),
+            context={"event_type": "question_answer"},
         ),
     ]
     routine_messages = [
@@ -3139,6 +3147,7 @@ async def test_strategic_conversation_endpoint_returns_cursor_page(
             from_type="user" if i % 2 == 0 else "strategic",
             content=f"conv row {i:02d}",
             created_at=base_time + timedelta(minutes=i),
+            context=(None if i % 2 == 0 else {"event_type": "question_answer"}),
         )
         for i in range(3)
     ]
@@ -3277,6 +3286,7 @@ async def test_strategic_conversation_after_sequence_closes_realtime_gap(
             message_type=MessageType.NOTE,
             from_type="strategic",
             content=f"gap {index}",
+            context={"event_type": "question_answer"},
         )
         for index in range(1, 6)
     ])
@@ -3380,6 +3390,7 @@ async def test_strategic_conversation_endpoint_passes_include_message_id(
         from_type="strategic",
         content="older targeted message",
         created_at=base_time,
+        context={"event_type": "question_answer"},
     )
     newer_messages = [
         ProjectMessage(
@@ -3390,6 +3401,7 @@ async def test_strategic_conversation_endpoint_passes_include_message_id(
             from_type="user" if i % 2 == 0 else "strategic",
             content=f"newer row {i:02d}",
             created_at=base_time + timedelta(minutes=i + 1),
+            context=(None if i % 2 == 0 else {"event_type": "question_answer"}),
         )
         for i in range(5)
     ]
@@ -3418,6 +3430,7 @@ async def test_strategic_conversation_etag_revalidates_and_binds_pinned_message(
         project_id=project.id, sequence=1, surface=MessageSurface.CONVERSATION,
         message_type=MessageType.NOTE,
         from_type="strategic", content="pinned older", created_at=base_time,
+        context={"event_type": "question_answer"},
     )
     recent_messages = [
         ProjectMessage(
@@ -3425,6 +3438,7 @@ async def test_strategic_conversation_etag_revalidates_and_binds_pinned_message(
             surface=MessageSurface.CONVERSATION, message_type=MessageType.NOTE,
             from_type="strategic", content=f"recent {i}",
             created_at=base_time + timedelta(minutes=i + 1),
+            context={"event_type": "question_answer"},
         )
         for i in range(25)
     ]
@@ -3505,6 +3519,7 @@ async def test_strategic_conversation_stamps_delivered_at_on_rest_load(
         content="strategist reply",
         created_at=base_time,
         delivered_at=None,
+        context={"event_type": "question_answer"},
     )
     system_msg = ProjectMessage(
         project_id=project.id,
@@ -3515,6 +3530,7 @@ async def test_strategic_conversation_stamps_delivered_at_on_rest_load(
         content="system note",
         created_at=base_time + timedelta(seconds=10),
         delivered_at=None,
+        context={"event_type": "failure_alert"},
     )
     user_msg = ProjectMessage(
         project_id=project.id,
@@ -3566,6 +3582,7 @@ async def test_strategic_conversation_does_not_stamp_outside_window(
             content=f"msg {i:02d}",
             created_at=base_time + timedelta(minutes=i),
             delivered_at=None,
+            context={"event_type": "question_answer"},
         )
         for i in range(21)
     ]
@@ -3595,13 +3612,29 @@ async def test_strategic_conversation_stamp_is_idempotent(
     """Repeated GET calls do not overwrite an already-set delivered_at."""
     project = await _make_project(db_session)
     base_time = _utcnow() - timedelta(minutes=5)
-    msg = ProjectMessage(
+    question = ProjectMessage(
         project_id=project.id,
         sequence=1,
         surface=MessageSurface.CONVERSATION,
         message_type=MessageType.NOTE,
+        from_type="user",
+        content="the operator question this reply answers",
+        created_at=base_time,
+    )
+    db_session.add(question)
+    await db_session.commit()
+    await db_session.refresh(question)
+    msg = ProjectMessage(
+        project_id=project.id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
         from_type="strategic",
         content="already delivered",
+        # A proven reply (reply_to_message_id at a same-project human row) is
+        # what real Strategic replies carry — strategic_conversation_predicate
+        # is fail-closed and excludes an unproven bare "strategic" row.
+        reply_to_message_id=question.id,
         created_at=base_time,
         delivered_at=None,
     )

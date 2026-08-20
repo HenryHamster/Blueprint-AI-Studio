@@ -270,7 +270,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
         role="dialog"
         aria-modal="true"
         aria-label={`Preview: ${displayName}`}
-        className="flex max-h-[calc(100vh-32px)] max-w-[min(90vw,960px)] flex-col overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900 shadow-2xl shadow-black/50"
+        className="flex max-h-[calc(100vh-32px)] max-w-[min(90vw,960px)] flex-col overflow-hidden rounded-lg border border-neutral-700 bg-workbench-base shadow-2xl shadow-black/50"
         onKeyDown={handleKeyDown}
       >
         {/* Header */}
@@ -283,7 +283,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
             type="button"
             onClick={onClose}
             aria-label="Close preview"
-            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md border border-neutral-700 bg-neutral-800 text-neutral-400 transition-colors hover:border-neutral-600 hover:text-neutral-100 md:min-h-8 md:min-w-8"
+            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md border border-neutral-700 bg-workbench-panel text-neutral-400 transition-colors hover:border-neutral-600 hover:text-neutral-100 md:min-h-8 md:min-w-8"
           >
             <X className="h-4 w-4" aria-hidden="true" />
           </button>
@@ -297,7 +297,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
               onClick={applyRotate}
               disabled={editBusy || cropMode}
               aria-label="Rotate image 90 degrees"
-              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700 disabled:opacity-40"
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-workbench-panel px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-workbench-hover disabled:opacity-40"
             >
               <RotateCw className="h-4 w-4" aria-hidden="true" />
               Rotate
@@ -308,7 +308,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
                 onClick={toggleCropMode}
                 disabled={editBusy}
                 aria-label="Crop image"
-                className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700 disabled:opacity-40"
+                className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-workbench-panel px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-workbench-hover disabled:opacity-40"
               >
                 <Crop className="h-4 w-4" aria-hidden="true" />
                 Crop
@@ -330,7 +330,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
                   onClick={toggleCropMode}
                   disabled={editBusy}
                   aria-label="Cancel crop"
-                  className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-300 transition-colors hover:border-neutral-600 hover:bg-neutral-700 disabled:opacity-40"
+                  className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-workbench-panel px-3 text-sm text-neutral-300 transition-colors hover:border-neutral-600 hover:bg-workbench-hover disabled:opacity-40"
                 >
                   <X className="h-4 w-4" aria-hidden="true" />
                   Cancel
@@ -343,7 +343,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
               onClick={() => edit?.onReplace()}
               disabled={editBusy}
               aria-label="Replace image"
-              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700 disabled:opacity-40"
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-workbench-panel px-3 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-workbench-hover disabled:opacity-40"
             >
               <RefreshCw className="h-4 w-4" aria-hidden="true" />
               Replace
@@ -353,7 +353,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
               onClick={() => edit?.onRemove()}
               disabled={editBusy}
               aria-label="Remove image"
-              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-300 transition-colors hover:border-red-700/60 hover:text-red-300 disabled:opacity-40"
+              className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 bg-workbench-panel px-3 text-sm text-neutral-300 transition-colors hover:border-red-700/60 hover:text-red-300 disabled:opacity-40"
             >
               <Trash2 className="h-4 w-4" aria-hidden="true" />
               Remove
@@ -424,7 +424,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
                 href={openInTabUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700"
+                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-workbench-panel px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-workbench-hover"
               >
                 <ExternalLink className="h-4 w-4" />
                 Open in new tab
@@ -434,7 +434,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
               <button
                 type="button"
                 onClick={() => triggerDownload(downloadBlob, displayName)}
-                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700"
+                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-workbench-panel px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-workbench-hover"
               >
                 <Download className="h-4 w-4" />
                 Download
@@ -445,7 +445,7 @@ export function AttachmentPreviewModal({ attachment, open, onClose, edit, onPrev
                 download={displayName}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-neutral-700"
+                className="inline-flex items-center gap-2 rounded-md border border-neutral-700 bg-workbench-panel px-3 py-1.5 text-sm text-neutral-200 transition-colors hover:border-neutral-600 hover:bg-workbench-hover"
               >
                 <Download className="h-4 w-4" />
                 Download

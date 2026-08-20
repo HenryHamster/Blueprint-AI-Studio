@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import type { ResidentSession } from '../providers/resident-session.js';
+import type { ResidentSession, ResidentSessionEvent } from '../providers/resident-session.js';
 import {
   createForegroundResidentProfile,
   FAST_TYPED_TOOL_NAMES,
@@ -173,6 +173,18 @@ export class ForegroundTypedController {
   private profile: ForegroundResidentProfile | null = null;
   private tool: ProvisionedCallResidentTool | null = null;
   private session: ResidentSession | null = null;
+  /** Observational subscribers to the child's parsed provider stream. Registered
+   *  once by the caller and re-attached to every session this controller starts,
+   *  so a mid-turn crash replacement never silently stops streaming. */
+  private readonly eventListeners: Array<(ev: ResidentSessionEvent) => void> = [];
+  /** Each spawned child gets a distinct listener epoch. A closed child's stdout
+   *  can drain after close(), and those late events must never be attributed to
+   *  the replacement session's turn. */
+  private sessionEventEpoch = 0;
+  /** The private READY probe is not operator-visible work: no delta from it may
+   *  reach a subscriber. Scoped around the probe turn rather than trusted to
+   *  its prompt. */
+  private suppressEvents = false;
 
   constructor(private readonly options: ForegroundTypedControllerOptions) {
     this.runtimeDir = fs.mkdtempSync(path.join(options.runtimeRoot ?? os.tmpdir(), 'blueprint-typed-fast-'));
@@ -183,6 +195,27 @@ export class ForegroundTypedController {
 
   isAlive(): boolean { return this.session?.isAlive() === true; }
   interrupt(): void { this.session?.interrupt(); }
+
+  /**
+   * Subscribe to the child's parsed stream events (assistant text deltas, tool
+   * calls, activity one-liners, provider errors). Purely observational: a
+   * throwing subscriber can never fail the turn or change what is persisted.
+   * Registered subscriptions survive `ensureStarted`, `ensureReady` and
+   * `replaceAfterCrash` — every session this controller starts is bound.
+   */
+  onEvent(cb: (ev: ResidentSessionEvent) => void): void { this.eventListeners.push(cb); }
+
+  private bindSessionEvents(target: ResidentSession): void {
+    const epoch = ++this.sessionEventEpoch;
+    target.onEvent((ev) => {
+      if (epoch !== this.sessionEventEpoch) return;
+      if (this.suppressEvents) return;
+      for (const listener of [...this.eventListeners]) {
+        // Streaming is observational only; a broken viewer must never fail a turn.
+        try { listener(ev); } catch { /* observational only */ }
+      }
+    });
+  }
 
   ensureStarted(): void {
     if (this.session?.isAlive()) return;
@@ -207,6 +240,7 @@ export class ForegroundTypedController {
       model: this.options.model,
       effort: this.options.effort,
     });
+    this.bindSessionEvents(this.session);
   }
 
   /**
@@ -226,6 +260,7 @@ export class ForegroundTypedController {
       }, TYPED_FAST_READINESS_TIMEOUT_MS);
     });
     let result: Awaited<ReturnType<ResidentSession['sendTurn']>>;
+    this.suppressEvents = true;
     try {
       result = await Promise.race([
         session.sendTurn(
@@ -235,6 +270,7 @@ export class ForegroundTypedController {
         readinessTimeout,
       ]);
     } finally {
+      this.suppressEvents = false;
       // The Promise executor above assigns this synchronously; retain the null
       // guard for defensive cleanup if that construction ever changes.
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
@@ -320,6 +356,9 @@ export class ForegroundTypedController {
   close(): void { this.closeSessionOnly(); removeQuietly(this.runtimeDir); }
 
   private closeSessionOnly(): void {
+    // Invalidate the listener epoch BEFORE closing: child stdout can drain after
+    // close(), and those late events must not enter the next session's stream.
+    this.sessionEventEpoch += 1;
     try { this.session?.close(); } catch { /* replacement proceeds */ }
     this.session = null;
     if (this.profile) {

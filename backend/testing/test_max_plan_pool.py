@@ -1629,7 +1629,14 @@ class TestQuarantineTrigger:
             await disable_account_model(acct_id, OPUS, kind="rate_limit")
         assert acct["disabled_models"][OPUS].get("kind") != "quarantine"
 
-    async def test_quarantine_cooldown_is_short_flat(self):
+    async def test_quarantine_cooldown_is_a_floor_not_a_ceiling(self):
+        # A single disable_account_model call leaves hits=1, whose exponential
+        # (30min) already exceeds the flat quarantine recheck (15min). The
+        # quarantine cooldown must never come out BELOW that exponential —
+        # it is a floor for early-curve accounts, not a ceiling that shortens
+        # a later hit's longer backoff. Regression coverage for the bug where
+        # kind="quarantine" discarded hits-based exponential entirely and
+        # collapsed a multi-hour backoff to a flat 15min re-probe loop.
         acct_id = "a"
         acct = _acct(id=acct_id)
         _account_by_id[acct_id] = acct
@@ -1644,9 +1651,49 @@ class TestQuarantineTrigger:
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(acct_id, OPUS, kind="rate_limit")
         assert acct["disabled_models"][OPUS]["kind"] == "quarantine"
+        assert acct["disabled_models"][OPUS]["hits"] == 1
         assert (
-            _cooldown_seconds_for_info(acct["disabled_models"][OPUS])
-            == _QUARANTINE_COOLDOWN_SECONDS
+            _cooldown_seconds_for_info(acct["disabled_models"][OPUS]) == 30 * 60
+        )
+
+    def test_quarantine_cooldown_never_below_exponential_for_higher_hits(self):
+        # Direct unit check across a range of hit counts: quarantine must
+        # equal max(flat 15min floor, exponential for that hit count), never
+        # the flat value alone once the exponential overtakes it.
+        for hits, expected_exponential_minutes in (
+            (1, 30),
+            (2, 60),
+            (3, 120),
+            (4, 240),
+            (5, 240),
+        ):
+            cooldown = _cooldown_seconds_for_info(
+                {"hits": hits, "kind": "quarantine"}
+            )
+            assert cooldown == max(
+                _QUARANTINE_COOLDOWN_SECONDS, expected_exponential_minutes * 60
+            )
+            assert cooldown >= _QUARANTINE_COOLDOWN_SECONDS
+
+    def test_quarantine_cooldown_composes_with_server_hint(self):
+        """A quarantined entry must never shorten below a larger server-provided
+        retry_after_seconds hint — all three floors (flat 15min, exponential,
+        hint) compose as a single max, they don't short-circuit each other."""
+        # hits=1 → exponential=30min=1800s, quarantine floor=15min=900s.
+        # A 4h hint (the provider max, see providers/base._RETRY_HINT_MAX_SECONDS)
+        # must win over both.
+        assert (
+            _cooldown_seconds_for_info(
+                {"hits": 1, "kind": "quarantine", "retry_after_seconds": 4 * 3600}
+            )
+            == 4 * 3600
+        )
+        # A hint smaller than the exponential is ignored, same as non-quarantine.
+        assert (
+            _cooldown_seconds_for_info(
+                {"hits": 1, "kind": "quarantine", "retry_after_seconds": 60}
+            )
+            == 30 * 60
         )
 
     async def test_quota_exhausted_not_overridden_by_quarantine(self):
@@ -6185,3 +6232,133 @@ class TestGetMeterReliabilityStats:
         finally:
             pool_mod._usage_persist_failing_accounts.clear()
             pool_mod._usage_persist_failing_accounts.update(original_failing)
+
+
+class TestNonLeaderPoolRefresh:
+    """The pool reconciliation must run wherever dispatch decisions are made.
+
+    Regression for the 2026-08-20 fleet wedge: ``load_max_plan_pool`` is the
+    only path that rebuilds ``active_tasks`` from durable task state, and its
+    periodic invocation lived exclusively inside the leader-gated orchestrator
+    cycle. The HTTP instance that answers runner pulls is usually NOT the
+    leader, so its counter only ever ratcheted upward until every account
+    failed the ``probing and active_tasks == 0`` gate and every pull returned
+    ``no_eligible_account`` -- unrecoverable, because clearing a cooldown
+    requires running the task the instance is refusing to dispatch.
+    """
+
+    async def test_refresh_service_reconciles_once_per_interval(self):
+        import app.max_plan_pool as pool_mod
+
+        loads = 0
+        sleeps = []
+
+        async def _fake_load():
+            nonlocal loads
+            loads += 1
+            if loads >= 3:
+                raise asyncio.CancelledError
+
+        async def _fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        with patch.object(pool_mod, "load_max_plan_pool", _fake_load), patch.object(
+            pool_mod.asyncio, "sleep", _fake_sleep
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await pool_mod.max_plan_pool_refresh_service()
+
+        assert loads == 3
+        # Pinned literal, not the constant under test: a cadence change that
+        # silently lengthens the reconciliation window is exactly the drift
+        # this guard exists to surface.
+        assert sleeps == [300, 300, 300]
+        assert pool_mod._POOL_REFRESH_INTERVAL_SECONDS == 300
+
+    async def test_refresh_service_survives_a_failing_reconciliation(self):
+        """One bad rebuild must not silently end the loop.
+
+        A service that dies on the first transient DB error reintroduces the
+        wedge on a longer fuse -- the counter resumes ratcheting and nothing
+        reports it.
+        """
+
+        import app.max_plan_pool as pool_mod
+
+        loads = 0
+
+        async def _fake_load():
+            nonlocal loads
+            loads += 1
+            if loads == 1:
+                raise RuntimeError("transient database failure")
+            if loads >= 3:
+                raise asyncio.CancelledError
+
+        async def _fake_sleep(_seconds):
+            return None
+
+        with patch.object(pool_mod, "load_max_plan_pool", _fake_load), patch.object(
+            pool_mod.asyncio, "sleep", _fake_sleep
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await pool_mod.max_plan_pool_refresh_service()
+
+        assert loads == 3, "loop must keep reconciling after a failed rebuild"
+
+    def test_non_leader_startup_starts_and_supervises_the_refresh(self):
+        """The service is useless unless the non-leader path actually starts it.
+
+        Asserted against the source of the non-leader branch specifically --
+        starting it only on the leader is precisely the bug, so a check that
+        merely finds the name somewhere in the module would still pass.
+        """
+
+        import inspect
+
+        import app.lifecycle as lifecycle_mod
+
+        source = inspect.getsource(lifecycle_mod)
+        marker = "# Per-instance services still run on non-leader instances."
+        assert marker in source, (
+            "non-leader startup block not found in lifecycle.py; update this "
+            "guard rather than deleting it"
+        )
+        non_leader_block = source.split(marker, 1)[1]
+
+        # Split again at the watchdog. The restart clause names the same
+        # service, the same background_tasks key and the same log line, so a
+        # guard that only searched the whole block stayed green when the
+        # startup create_task was deleted -- the exact regression it exists
+        # to catch. Startup and supervision are asserted separately.
+        monitor_marker = "async def _monitor_non_leader():"
+        assert monitor_marker in non_leader_block, (
+            "non-leader watchdog not found; update this guard rather than "
+            "deleting it"
+        )
+        startup, watchdog = non_leader_block.split(monitor_marker, 1)
+
+        assert (
+            "pool_refresh_task_nl = asyncio.create_task("
+            "max_plan_pool_refresh_service())" in startup
+        ), (
+            "non-leader instances must start the periodic pool reconciliation "
+            "at startup, not only from the watchdog; without it their "
+            "active_tasks counter only ratchets upward and every runner pull "
+            "eventually returns no_eligible_account"
+        )
+        assert (
+            '_bg_tasks_nl["max_plan_pool_refresh"] = pool_refresh_task_nl'
+            in startup
+        ), (
+            "the refresh task must be registered in background_tasks so the "
+            "non-leader watchdog can restart it"
+        )
+        assert "max_plan_pool_refresh DIED on non-leader" in watchdog, (
+            "the non-leader watchdog must supervise the refresh task; an "
+            "unsupervised loop that dies restores the original wedge"
+        )
+        assert "max_plan_pool_refresh_service()" in watchdog, (
+            "the watchdog must actually restart the refresh service, not "
+            "merely log that it died"
+        )

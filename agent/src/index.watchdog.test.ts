@@ -2690,7 +2690,10 @@ describe('heartbeat auth-shaped 4xx (401/403) credential-refresh retry cascade',
     expect(body.failure_category).toBe('reassigned');
     // Surfaced-reasons requirement: never a bare "heartbeat 4xx" — must name
     // the actual HTTP status, the endpoint, and the retry-attempt count.
-    const logs = String(body.logs ?? '');
+    // `body.logs` is `unknown` off a Record<string, unknown>; narrow rather than
+    // String()-ing it, which stringifies a non-string to '[object Object]' and
+    // would let the assertions below pass against a shape they never checked.
+    const logs = typeof body.logs === 'string' ? body.logs : '';
     expect(logs).toMatch(/heartbeat/i);
     expect(logs).toMatch(/POST \/api\/agent\/heartbeat/);
     expect(logs).toMatch(/403/);
@@ -2730,8 +2733,9 @@ describe('heartbeat auth-shaped 4xx (401/403) credential-refresh retry cascade',
     const args = curlCall?.[1] as string[];
     const bodyIdx = args.indexOf('-d');
     const body = JSON.parse(args[bodyIdx + 1]) as Record<string, unknown>;
-    expect(String(body.logs ?? '')).toMatch(/404/);
-    expect(String(body.logs ?? '')).toMatch(/non-retryable/);
+    const logs = typeof body.logs === 'string' ? body.logs : '';
+    expect(logs).toMatch(/404/);
+    expect(logs).toMatch(/non-retryable/);
     // Only the initial heartbeat + the one periodic attempt — no 20s-spaced
     // retry attempts fired for a non-auth-shaped 4xx.
     expect(heartbeatCalls).toBe(2);

@@ -18,8 +18,17 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
+try:
+    from guard_suppression_receipt import record_classification  # noqa: E402
+except ImportError:  # pragma: no cover - emitting is fail-open by contract
+    # A tree without the emitter (an older base checkout, a synthetic harness
+    # fixture) must still run this lane unchanged: recording suppressions can
+    # never be the reason a verdict, exit code or blocking decision moves.
+    def record_classification(*_args: object, **_kwargs: object) -> None:
+        return None
 from testing.fixgate_attribution import (  # noqa: E402
     JUnitReport,
     classify_verification,
@@ -153,6 +162,11 @@ def main(argv: list[str] | None = None) -> int:
             outcome["current_failures"] = current_failures
             outcome["baseline_selectors"] = base_selectors
             outcome["current_exit_code"] = args.current_exit_code
+            # The backend lane's attribution already reaches the PR body via
+            # the verification receipt; recording it here puts it in the same
+            # cross-lane aggregate as the other four lanes. Fail-open, and the
+            # stdout JSON contract below is unchanged.
+            record_classification("backend", outcome)
             print(json.dumps(outcome, sort_keys=True))
             return 0
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:

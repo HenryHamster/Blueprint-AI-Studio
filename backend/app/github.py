@@ -1399,6 +1399,104 @@ async def commit_file_changes(
     return new_commit_sha
 
 
+class DanglingCommitUnchangedError(RuntimeError):
+    """Raised when the requested tree is identical to ``base_ref``'s tree.
+
+    A commit whose tree equals its parent's tree ships nothing.  For the hotfix
+    lane that is a fail-closed condition (there is no repair to deploy), so this
+    is an explicit error rather than a silently-returned no-op SHA.
+    """
+
+
+async def create_dangling_commit_from_blob_refs(
+    token: str,
+    owner: str,
+    repo: str,
+    *,
+    base_ref: str,
+    tree_entries: list[dict],
+    message: str,
+    project_id: str | None = None,
+) -> str:
+    """Create a commit on top of ``base_ref`` from EXISTING blob SHAs, moving no ref.
+
+    Sibling of :func:`commit_file_changes` for the case where every blob already
+    exists in the repository (it was written by some other commit) and the caller
+    wants a NARROW commit carrying only those paths on top of an arbitrary base:
+
+      * ``tree_entries`` are passed to the tree API verbatim — each is
+        ``{"path", "mode", "type", "sha"}`` with ``sha`` a real blob SHA (reuse,
+        byte-exact, no re-upload) or ``None`` to DELETE the path.  Unlike
+        ``commit_file_changes``' ``upserts: dict[path, text]`` this never decodes
+        or re-encodes content, so binary and non-UTF-8 files survive intact.
+      * NO ref is created or moved.  The returned commit is a real, addressable
+        object the caller can immediately point a branch at (or simply abandon);
+        there is no scratch branch to name, reuse, or clean up.
+
+    RAISES :class:`DanglingCommitUnchangedError` when the resulting tree equals
+    ``base_ref``'s tree (the commit would ship nothing), and ``RuntimeError`` on
+    any unexpected GitHub status.
+    """
+    if not tree_entries:
+        raise DanglingCommitUnchangedError(
+            f"no tree entries supplied for {owner}/{repo}@{base_ref} — nothing to commit"
+        )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+
+    def _json(resp: httpx.Response, expected: int, what: str) -> dict:
+        if resp.status_code != expected:
+            raise RuntimeError(
+                f"GitHub Git Data API {what} on {owner}/{repo}@{base_ref} "
+                f"returned HTTP {resp.status_code} (expected {expected})"
+            )
+        return resp.json()
+
+    commit_resp = await _github_request(
+        "GET",
+        f"{base}/git/commits/{quote(base_ref, safe='')}",
+        headers,
+        project_id=project_id,
+    )
+    base_tree_sha = _json(commit_resp, 200, "get-commit")["tree"]["sha"]
+
+    tree_resp = await _github_request(
+        "POST",
+        f"{base}/git/trees",
+        headers,
+        json={"base_tree": base_tree_sha, "tree": tree_entries},
+        project_id=project_id,
+    )
+    new_tree_sha = _json(tree_resp, 201, "create-tree")["sha"]
+    if new_tree_sha == base_tree_sha:
+        raise DanglingCommitUnchangedError(
+            f"narrow commit on {owner}/{repo}@{base_ref[:12]} would be empty: "
+            "the requested tree is already the base tree"
+        )
+
+    commit_create_resp = await _github_request(
+        "POST",
+        f"{base}/git/commits",
+        headers,
+        json={"message": message, "tree": new_tree_sha, "parents": [base_ref]},
+        project_id=project_id,
+    )
+    new_commit_sha = _json(commit_create_resp, 201, "create-commit")["sha"]
+    logger.info(
+        "[GITHUB] created dangling commit %s on %s/%s@%s (%d tree entries, no ref moved)",
+        new_commit_sha[:12],
+        owner,
+        repo,
+        base_ref[:12],
+        len(tree_entries),
+    )
+    return new_commit_sha
+
+
 # ---------------------------------------------------------------------------
 # Public-interface façade
 #

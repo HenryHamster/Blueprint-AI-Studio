@@ -1,5 +1,5 @@
 import { useState, type JSX } from 'react';
-import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry, EvidencePreviewEntry, QualificationCategoryVerdict } from '../api';
+import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry, EvidencePreviewEntry, QualificationCategoryVerdict, OperatorAuthorshipEvidenceContract } from '../api';
 import { isSafeUrl } from './TaskCard';
 import { EvidenceTierBadge } from './EvidenceTierBadge';
 
@@ -197,7 +197,60 @@ function EvidenceRow({ entry, idx, criterionKey }: { entry: EvidencePreviewEntry
   );
 }
 
-function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirection }: { coverage: VersionCriterionCoverage; onReinstate?: (criterionKey: string) => Promise<void>; onAttest?: (criterionKey: string) => void; onLinkDirection?: (criterionKey: string) => void }): JSX.Element {
+function OperatorAuthorshipBudget({
+  criterionKey,
+  contract,
+  onUpdate,
+}: {
+  criterionKey: string;
+  contract: OperatorAuthorshipEvidenceContract;
+  onUpdate?: (criterionKey: string, maxCount: number) => Promise<void>;
+}): JSX.Element {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(String(contract.predicate.max_count));
+  const [saving, setSaving] = useState(false);
+  if (onUpdate == null) {
+    return <span className="shrink-0 text-ui-sm text-violet-300" data-testid={`authorship-budget-${criterionKey}`}>budget ≤ {contract.predicate.max_count}</span>;
+  }
+  if (!editing) {
+    return (
+      <button
+        className="shrink-0 text-ui-sm text-violet-300 hover:text-violet-100 ml-1"
+        data-testid={`edit-authorship-budget-${criterionKey}`}
+        onClick={() => { setValue(String(contract.predicate.max_count)); setEditing(true); }}
+      >
+        budget ≤ {contract.predicate.max_count} · edit
+      </button>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 shrink-0" data-testid={`authorship-budget-editor-${criterionKey}`}>
+      <label className="sr-only" htmlFor={`authorship-budget-${criterionKey}`}>Maximum operator-authored commits</label>
+      <input
+        id={`authorship-budget-${criterionKey}`}
+        type="number"
+        min={0}
+        step={1}
+        value={value}
+        onChange={(event) => setValue(event.target.value)}
+        className="w-14 rounded border border-slate-600 bg-slate-800 px-1 text-ui-sm text-slate-200"
+      />
+      <button
+        className="text-ui-sm text-emerald-300 disabled:opacity-50"
+        disabled={saving || !/^\d+$/.test(value)}
+        onClick={async () => {
+          setSaving(true);
+          try { await onUpdate(criterionKey, Number(value)); setEditing(false); } finally { setSaving(false); }
+        }}
+      >
+        {saving ? '…' : 'save'}
+      </button>
+      <button className="text-ui-sm text-slate-500" onClick={() => setEditing(false)}>cancel</button>
+    </span>
+  );
+}
+
+function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirection, onUpdateEvidenceContract }: { coverage: VersionCriterionCoverage; onReinstate?: (criterionKey: string) => Promise<void>; onAttest?: (criterionKey: string) => void; onLinkDirection?: (criterionKey: string) => void; onUpdateEvidenceContract?: (criterionKey: string, maxCount: number) => Promise<void> }): JSX.Element {
   const phantom = coverage.phantom_bookkeeping ?? null;
   const hasDrift = phantom !== null && phantom.has_drift;
   const phantomKeys = phantom?.phantom_keys ?? [];
@@ -329,6 +382,13 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
                   </span>
                 )}
                 <span className="text-xs text-slate-300 break-words min-w-0">{c.text}</span>
+                {c.evidence_contract?.type === 'operator_authored_commits' && (
+                  <OperatorAuthorshipBudget
+                    criterionKey={c.criterion_key}
+                    contract={c.evidence_contract}
+                    onUpdate={onUpdateEvidenceContract}
+                  />
+                )}
                 {stuckLabel != null && (
                   <span className="shrink-0 text-ui-sm text-red-400 ml-1" data-testid={`stuck-reason-${c.criterion_key}`} title={`Stuck: ${c.stuck_reason}`}>
                     {stuckLabel}
@@ -479,6 +539,7 @@ export function VersionSummaryPanel({
   onReinstate,
   onAttest,
   onLinkDirection,
+  onUpdateEvidenceContract,
 }: {
   tasksMerged: ChangelogEntry[] | undefined;
   heading?: string;
@@ -489,6 +550,7 @@ export function VersionSummaryPanel({
   onReinstate?: (criterionKey: string) => Promise<void>;
   onAttest?: (criterionKey: string) => void;
   onLinkDirection?: (criterionKey: string) => void;
+  onUpdateEvidenceContract?: (criterionKey: string, maxCount: number) => Promise<void>;
 }): JSX.Element | null {
   const [copied, setCopied] = useState(false);
   const [filter, setFilter] = useState('');
@@ -501,7 +563,7 @@ export function VersionSummaryPanel({
         data-testid="version-summary-panel-empty"
         className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
       >
-        {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} />}
+        {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} onUpdateEvidenceContract={onUpdateEvidenceContract} />}
         <QualificationCategoryVerdictsBlock verdicts={categoryVerdicts} residualGap={residualUncapturedGap} />
         <div className="text-ui-md text-slate-500 italic">No tasks merged into this version yet.</div>
       </div>
@@ -548,7 +610,7 @@ export function VersionSummaryPanel({
           {copied ? 'Copied!' : 'Copy markdown'}
         </button>
       </div>
-      {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} />}
+      {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} onUpdateEvidenceContract={onUpdateEvidenceContract} />}
       <QualificationCategoryVerdictsBlock verdicts={categoryVerdicts} residualGap={residualUncapturedGap} />
       {acceptanceAggregate && <AcceptanceBucketBreakdown aggregate={acceptanceAggregate} />}
       {/* Per-type count summary — lets operator grasp shape of release at a glance */}
@@ -563,7 +625,7 @@ export function VersionSummaryPanel({
         placeholder="Filter by title or PR…"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
-        className="w-full mb-2 rounded bg-slate-700/50 border border-slate-600/50 px-2 py-1 text-ui-md text-slate-300 placeholder-slate-500 outline-none focus:border-slate-500"
+        className="w-full mb-2 rounded bg-slate-700/50 border border-slate-600/50 px-2 py-1 text-ui-md text-slate-300 placeholder-slate-500 outline-none workbench-focus"
         aria-label="Filter changelog entries"
       />
       <div className="max-h-64 overflow-y-auto pr-1">

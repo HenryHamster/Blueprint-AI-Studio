@@ -1391,7 +1391,9 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   for pure-docs tasks. For \`admin-ui/\` changes this includes both
   the happy-dom unit suite via \`npx vitest run\` (equivalently
   \`npm run test:run\`) on every invocation AND the browser-mode
-  \`npm run test:viewport\` gate (scoped to changed components).
+  viewport gate (scoped to changed components). Both run through
+  \`scripts/vitest_verification_guard.py\`, which warn-passes only the
+  named failure identities that also fail on the base branch.
 - \`./check test\` — same plus a **lightweight standalone backend test
   pass** (~10 invariant/contract files, ~30s). This VM is 8 GB; the FULL Docker
   + Postgres pytest suite OOMs (exit 137) here. CI runs the full suite

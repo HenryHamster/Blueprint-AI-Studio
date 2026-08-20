@@ -3058,13 +3058,25 @@ async def test_suppress_warm_handoff_merge_blocked_rebase(db_session, mocker):
         task, "fake-token", "owner", "repo", db_session, source="webhook"
     )
 
-    # The rebase-fix path passes neither fix_reason nor a custom kwarg beyond
-    # suppress_warm_handoff=True; the call signature is identifiable by the
-    # absence of update_branch_failed/merge_conflict.
+    # 2026-08-20: this spawn now DOES set fix_reason. The previous assertion
+    # pinned its ABSENCE purely as a call-signature fingerprint (see the old
+    # comment: "identifiable by the absence of update_branch_failed/
+    # merge_conflict") — the subject of this test is suppress_warm_handoff, not
+    # the label. The fingerprint moves to the prompt, which is unique to this
+    # site. Flagging the self-certifying shape explicitly: this diff changes
+    # both the emitted value and the assertion on it, so the independent
+    # evidence lives elsewhere — the provenance guards in test_pipeline.py and
+    # the agent-side tests in agent/src/handlers/review-fix.test.ts that make
+    # the obsolete-exit conditional on the label.
     spawn_mock.assert_called_once()
     kw = spawn_mock.call_args.kwargs
-    assert kw.get("fix_reason", "") == "", (
-        f"merge-blocked rebase spawn must NOT set fix_reason, got {kw.get('fix_reason')!r}"
+    assert "GitHub rejected the merge" in kw.get("fix_prompt", ""), (
+        "wrong spawn site fired — this test targets the merge-blocked rebase path"
+    )
+    assert kw.get("fix_reason") == "merge_conflict", (
+        "the merge-blocked rebase spawn is conflict-only work; it must be "
+        "labelled so the agent's obsolete-exit may fire when a sibling merge "
+        "already cleared the block"
     )
     assert kw.get("suppress_warm_handoff") is True, (
         "merge-blocked rebase spawn (ci_completion.py:568) must pass "
@@ -8365,3 +8377,429 @@ async def test_merge_success_changed_files_stamp_is_fail_silent(db_session, mock
     assert ctx.get("_pr_changed_files_github_verified") is not True, (
         "a failed changed-files fetch must not leave a github_verified stamp"
     )
+
+
+# ---------------------------------------------------------------------------
+# Rollup deliverable guard — ghost-success detection (PR #17480 class)
+# ---------------------------------------------------------------------------
+
+
+def _deliverable_guard_common_mocks(mocker):
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "abc123rollupmerge"},
+    )
+    mocker.patch(
+        "app.rollup_pr_verification.verify_rollup_merge_landed",
+        new=AsyncMock(return_value="indeterminate"),
+    )
+
+
+async def _make_rollup_with_child(
+    db_session,
+    project,
+    *,
+    orig_files: list[str],
+    child_files: list[str],
+    child_pr_number: int = 555,
+):
+    """Rollup parent (EVALUATING, verified changed-file stamp) + merged child."""
+    orig_task = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        payloads=[
+            {"type": "create", "prompt": "rollup", "base_branch": "main"}
+        ],
+        context={
+            "_pr_changed_files": orig_files,
+            "_pr_changed_files_github_verified": True,
+        },
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=orig_task.id,
+        title="Child deliverable task",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "child work",
+                "pr_number": child_pr_number,
+            }
+        ],
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": child_files,
+            "_pr_changed_files_github_verified": True,
+        },
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=f"agent-vm-child-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+    return orig_task, child
+
+
+@pytest.mark.asyncio
+async def test_rollup_completes_when_child_deliverables_intact(
+    db_session, mocker
+):
+    """A rollup whose merged diff still carries every child's files completes.
+
+    Regression guard for the guard itself: overlap between a child's verified
+    changed files and the rollup PR's verified diff must NOT trip the dropped
+    or warned paths — the parent lands as plain COMPLETED "Rollup PR merged".
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _deliverable_guard_common_mocks(mocker)
+
+    project = Project(name="Deliverable intact rollup", user_id="test-user-dg1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task, _child = await _make_rollup_with_child(
+        db_session,
+        project,
+        orig_files=["backend/app/feature_a.py", "backend/app/feature_b.py"],
+        child_files=["backend/app/feature_a.py"],
+    )
+
+    ci_task = _make_task(
+        db_session,
+        project,
+        pr_number=901,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+            "base_branch": "main",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        ci_task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    assert result is True
+
+    await db_session.refresh(orig_task)
+    assert orig_task.status == TaskStatus.COMPLETED
+    assert orig_task.latest_status_message == "Rollup PR merged"
+    ctx = orig_task.context or {}
+    assert "rollup_dropped_deliverables" not in ctx
+    assert "rollup_deliverable_warning" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_rollup_dropped_child_deliverable_blocks_ghost_success(
+    db_session, mocker
+):
+    """Incident signature (PR #17480): conflict-fix + vanished child files.
+
+    A conflict-fix intervened on the rollup PR and NONE of the child's
+    GitHub-verified changed files survived into the merged rollup diff. The
+    parent must NOT ghost-complete with "Rollup PR merged": it fails with a
+    reason naming exactly WHICH child PR was dropped, stamps the durable
+    receipt, and records the failure category.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _deliverable_guard_common_mocks(mocker)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert",
+        new=AsyncMock(return_value=None),
+    )
+
+    project = Project(name="Deliverable dropped rollup", user_id="test-user-dg2")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task, child = await _make_rollup_with_child(
+        db_session,
+        project,
+        # Merged rollup diff no longer contains ANY of the child's files —
+        # wholesale conflict resolution toward base erased the deliverable.
+        orig_files=["backend/app/other_feature.py"],
+        child_files=[
+            "backend/app/dropped_feature.py",
+            "backend/testing/test_dropped.py",
+        ],
+        child_pr_number=555,
+    )
+
+    ci_task = _make_task(
+        db_session,
+        project,
+        pr_number=902,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+            "base_branch": "main",
+            # The incident signature: a conflict-fix ran against this PR.
+            "conflict_fix_spawned": str(uuid.uuid4()),
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        ci_task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    assert result is True, "the merge itself succeeded on GitHub"
+
+    await db_session.refresh(orig_task)
+    assert orig_task.status == TaskStatus.FAILED, (
+        "rollup parent must not ghost-complete when a child deliverable "
+        "was dropped during conflict resolution"
+    )
+    assert orig_task.latest_status_message != "Rollup PR merged"
+    # The WHY must name the dropped child PR.
+    assert "PR #555" in (orig_task.latest_status_message or "")
+    ctx = orig_task.context or {}
+    dropped = ctx.get("rollup_dropped_deliverables")
+    assert isinstance(dropped, list) and len(dropped) == 1
+    assert dropped[0]["task_id"] == str(child.id)
+    assert dropped[0]["pr_number"] == 555
+    assert "backend/app/dropped_feature.py" in dropped[0]["missing_files"]
+    assert "PR #555" in ctx.get("rollup_dropped_deliverables_reason", "")
+    assert ctx.get("failure_category") == "CODE_ERROR"
+    alert_mock.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rollup_dropped_without_conflict_evidence_warns_not_blocks(
+    db_session, mocker
+):
+    """Zero overlap WITHOUT a conflict-fix on record is ambiguous → warn only.
+
+    The base branch may have legitimately absorbed identical content, hiding
+    the child's files from the PR diff while the deliverable IS in the merged
+    result. False-blocking healthy rollups is also a platform defect, so the
+    guard stamps a loud warning receipt and completion proceeds.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    _deliverable_guard_common_mocks(mocker)
+
+    project = Project(name="Deliverable warn rollup", user_id="test-user-dg3")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task, _child = await _make_rollup_with_child(
+        db_session,
+        project,
+        orig_files=["backend/app/other_feature.py"],
+        child_files=["backend/app/superseded_feature.py"],
+        child_pr_number=556,
+    )
+
+    ci_task = _make_task(
+        db_session,
+        project,
+        pr_number=903,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+            "base_branch": "main",
+            # NO conflict_fix_spawned — no incident signature.
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        ci_task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    assert result is True
+
+    await db_session.refresh(orig_task)
+    assert orig_task.status == TaskStatus.COMPLETED, (
+        "ambiguous absence (no conflict-fix evidence) must not block completion"
+    )
+    assert orig_task.latest_status_message == "Rollup PR merged"
+    ctx = orig_task.context or {}
+    assert "rollup_dropped_deliverables" not in ctx
+    warning = ctx.get("rollup_deliverable_warning")
+    assert isinstance(warning, str) and "PR #556" in warning
+
+
+@pytest.mark.asyncio
+async def test_deliverable_guard_truncated_stamp_uses_live_pr_files(
+    db_session, mocker
+):
+    """A truncated rollup stamp is unsound for absence testing → live fetch.
+
+    When the parent's stamped list carries ``_pr_changed_files_truncated``,
+    the guard must resolve the authoritative diff with ONE ``get_pr_files``
+    call instead of trusting the 50-file sample, and still detect the drop.
+    """
+    from app.rollup_deliverable_guard import verify_rollup_child_deliverables
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert",
+        new=AsyncMock(return_value=None),
+    )
+    pr_files_mock = mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(return_value=[{"filename": "backend/app/other.py"}]),
+    )
+
+    project = Project(
+        name="Deliverable guard truncated", user_id="test-user-dg4"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task, child = await _make_rollup_with_child(
+        db_session,
+        project,
+        orig_files=["backend/app/stale_sample.py"],
+        child_files=["backend/app/dropped_feature.py"],
+        child_pr_number=557,
+    )
+    orig_task.context = {
+        **(orig_task.context or {}),
+        "_pr_changed_files_truncated": True,
+    }
+    db_session.add(orig_task)
+    await db_session.commit()
+
+    verdict = await verify_rollup_child_deliverables(
+        orig_task,
+        project,
+        db_session,
+        pr_number=904,
+        github_credentials=("fake-token", "owner", "repo"),
+        ci_loop={"conflict_fix_spawned": str(uuid.uuid4())},
+        merge_task=None,
+        source="test.direct",
+    )
+
+    assert verdict == "dropped"
+    pr_files_mock.assert_awaited_once()
+    ctx = orig_task.context or {}
+    assert ctx["rollup_dropped_deliverables"][0]["task_id"] == str(child.id)
+    assert "PR #557" in ctx["rollup_dropped_deliverables_reason"]
+    alert_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_deliverable_guard_unverifiable_children_never_block(
+    db_session, mocker
+):
+    """Children without a usable verified stamp are skipped, not failed.
+
+    No GitHub-verified own-PR file list (parent-derived provenance only) and
+    no credentials to gap-fill → the child is unverifiable; the guard must
+    return "intact" rather than fabricate a drop verdict.
+    """
+    from app.rollup_deliverable_guard import verify_rollup_child_deliverables
+
+    project = Project(name="Deliverable guard skip", user_id="test-user-dg5")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task, child = await _make_rollup_with_child(
+        db_session,
+        project,
+        orig_files=["backend/app/other.py"],
+        child_files=["backend/app/unrelated.py"],
+    )
+    # Parent-derived provenance is circular for this guard → unusable.
+    child.context = {
+        **(child.context or {}),
+        "_pr_changed_files_from_rollup_parent": True,
+    }
+    db_session.add(child)
+    await db_session.commit()
+
+    verdict = await verify_rollup_child_deliverables(
+        orig_task,
+        project,
+        db_session,
+        pr_number=905,
+        github_credentials=None,
+        ci_loop={"conflict_fix_spawned": str(uuid.uuid4())},
+        merge_task=None,
+        source="test.direct",
+    )
+
+    assert verdict == "intact"
+    ctx = orig_task.context or {}
+    assert "rollup_dropped_deliverables" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_pat_credential_refusal_never_writes_to_github_and_terminalizes(
+    db_session, mocker
+):
+    """A local PAT refusal must not drive the GitHub-side escalation machinery.
+
+    ``merge_pull_request`` refuses before any PUT when the only resolvable
+    credential is the operator's own PAT, returning the same
+    ``{"merged": False, "conflict": False}`` shape as a pending-checks 405.
+    Treated as that, the post-merge recheck runs and the ``behind`` branch
+    issues ``update_branch`` with the SAME operator PAT — an automated GitHub
+    write that mints exactly the operator-attributed commit the refusal exists
+    to prevent — before escalating a merge failure that is not the PR's fault.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    get_pr_mock = mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "behind"},
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={
+            "merged": False,
+            "conflict": False,
+            "pat_fallback_blocked": True,
+            "message": "refusing to merge with an operator PAT credential",
+        },
+    )
+    update_mock = mocker.patch("app.github.update_branch", return_value={})
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(type("FT", (), {"id": uuid.uuid4()})(), True),
+    )
+
+    project = Project(name="PAT refusal terminal", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, ci_loop_extra={"ci_passed": True})
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    assert merge_mock.call_count == 1, "a permanent local refusal must not retry"
+    update_mock.assert_not_called()
+    get_pr_mock.assert_not_called()
+    spawn_mock.assert_not_called()
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures", 0) == 0
+    assert "personal access token" in (task.latest_status_message or "")
+    assert "GitHub App" in (task.latest_status_message or "")

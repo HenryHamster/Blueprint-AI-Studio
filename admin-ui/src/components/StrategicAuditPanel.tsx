@@ -22,7 +22,7 @@ function calibrationBadgeStyle(
   if (score == null) {
     return {
       label: 'n/a',
-      className: 'bg-neutral-800/60 text-neutral-500 border-neutral-700/50',
+      className: 'bg-workbench-panel/60 text-neutral-500 border-neutral-700/50',
     };
   }
   const pct = Math.round(score * 100);
@@ -49,7 +49,7 @@ function calibrationBadgeStyle(
 }
 
 function cycleSquareClass(score: number | null, floor: number): string {
-  if (score == null) return 'bg-neutral-800/60 border-neutral-700/50';
+  if (score == null) return 'bg-workbench-panel/60 border-neutral-700/50';
   if (score >= floor) return 'bg-emerald-500/40 border-emerald-500/40';
   if (score >= 0) return 'bg-amber-500/40 border-amber-500/40';
   return 'bg-red-500/40 border-red-500/40';
@@ -126,7 +126,7 @@ function CycleHistorySparkline({
         return (
           <span
             key={`${entry.cycle_id}-${i}`}
-            className={`w-3 h-3 rounded-sm border ${cycleSquareClass(score, floor)}`}
+            className={`w-3 h-3 rounded border ${cycleSquareClass(score, floor)}`}
             title={`${date}: ${label}`}
           />
         );
@@ -202,8 +202,8 @@ export function StrategicAuditPanel({ projectId, calibrationFloor = 0.05 }: Stra
   if (loading) {
     return (
       <div className="mt-4 space-y-2">
-        <div className="h-5 w-48 animate-pulse rounded bg-neutral-900/50" />
-        <div className="h-24 w-full animate-pulse rounded bg-neutral-900/50" />
+        <div className="h-5 w-48 animate-pulse rounded bg-workbench-base/50" />
+        <div className="h-24 w-full animate-pulse rounded bg-workbench-base/50" />
       </div>
     );
   }
@@ -245,7 +245,7 @@ export function StrategicAuditPanel({ projectId, calibrationFloor = 0.05 }: Stra
             {history.length > 0 && (
               <CycleHistorySparkline history={history} floor={calibrationFloor} />
             )}
-            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 mt-2">
+            <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 mt-2">
               {grades.map(g => (
                 <GradeDistributionRow
                   key={g}

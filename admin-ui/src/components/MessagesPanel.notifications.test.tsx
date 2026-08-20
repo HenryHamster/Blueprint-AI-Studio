@@ -1038,7 +1038,7 @@ describe('MessagesPanel event type volume in prefs popover', () => {
     expect(settingsBtn).toBeTruthy();
     await act(async () => { (settingsBtn as HTMLButtonElement).click(); });
 
-    const popover = el.querySelector('[class*="bg-neutral-900"][class*="border-neutral-700"][class*="rounded-xl"]');
+    const popover = el.querySelector('[class*="bg-workbench-base"][class*="border-neutral-700"][class*="rounded-lg"]');
     expect(popover).toBeTruthy();
     const popoverText = popover?.textContent ?? '';
     // Popover should list event types with spaces (pr merged, auto fix spawned)
@@ -1058,7 +1058,7 @@ describe('MessagesPanel event type volume in prefs popover', () => {
     await act(async () => { (settingsBtn as HTMLButtonElement).click(); });
 
     // pr merged (5 events) should appear before auto fix spawned (2 events) when sorted by count
-    const popover = el.querySelector('[class*="bg-neutral-900"][class*="border-neutral-700"][class*="rounded-xl"]');
+    const popover = el.querySelector('[class*="bg-workbench-base"][class*="border-neutral-700"][class*="rounded-lg"]');
     const popoverText = popover?.textContent ?? '';
     const prMergedIdx = popoverText.indexOf('pr merged');
     const autoFixIdx = popoverText.indexOf('auto fix spawned');
@@ -1077,7 +1077,7 @@ describe('MessagesPanel event type volume in prefs popover', () => {
     await act(async () => { (settingsBtn as HTMLButtonElement).click(); });
 
     // Find the count badge - it's the span within the popover row that shows "12"
-    const popover = el.querySelector('[class*="bg-neutral-900"][class*="border-neutral-700"][class*="rounded-xl"]');
+    const popover = el.querySelector('[class*="bg-workbench-base"][class*="border-neutral-700"][class*="rounded-lg"]');
     const countBadges = popover?.querySelectorAll('span');
     const countBadge = countBadges && [...countBadges].find(s => s.textContent?.trim() === '12');
     expect(countBadge).toBeTruthy();
@@ -1098,7 +1098,7 @@ describe('MessagesPanel event type volume in prefs popover', () => {
     const settingsBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Event type visibility'));
     await act(async () => { (settingsBtn as HTMLButtonElement).click(); });
 
-    const popover = el.querySelector('[class*="bg-neutral-900"][class*="border-neutral-700"][class*="rounded-xl"]');
+    const popover = el.querySelector('[class*="bg-workbench-base"][class*="border-neutral-700"][class*="rounded-lg"]');
     // Should only count the recent one (1), not both (2)
     // Check that the popover contains the count 1 for pr merged
     const countBadges = popover?.querySelectorAll('span');

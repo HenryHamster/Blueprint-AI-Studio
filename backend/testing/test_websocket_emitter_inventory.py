@@ -21,6 +21,7 @@ from websocket_event_inventory import (
     inventory_signature,
     read_app_sources,
 )
+from testing.fixgate_attribution import format_offender_marker
 
 # These are source-inventory tests that AST-scan the entire backend/app tree
 # (twice over, in the regen round-trip) — legitimately slow and prone to tripping
@@ -83,6 +84,11 @@ def test_websocket_emitter_inventory_snapshot_matches_source():
         "websocket_event_inventory_v1.json.\n\n"
         f"Missing from source: {json.dumps(missing[:8], indent=2, sort_keys=True)}\n\n"
         f"Added in source: {json.dumps(added[:8], indent=2, sort_keys=True)}"
+        + "\n"
+        + format_offender_marker(
+            [*(f"missing:{item}" for item in missing),
+             *(f"added:{item}" for item in added)]
+        )
     )
 
 
@@ -110,7 +116,7 @@ def test_websocket_emitter_inventory_entries_are_classified():
     classifications = {entry.get("classification") for entry in emitters}
     for entry in emitters:
         missing = required - set(entry)
-        assert not missing, f"Emitter entry is missing fields {missing}: {entry}"
+        assert not missing, f"Emitter entry is missing fields {missing}: {entry}" + "\n" + format_offender_marker(str(offender) for offender in missing)
         assert entry["classification"] in VALID_CLASSIFICATIONS, (
             f"Invalid websocket emitter classification: {entry}"
         )

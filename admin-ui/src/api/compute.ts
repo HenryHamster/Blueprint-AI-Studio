@@ -531,6 +531,13 @@ export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
   last_snapshot_at: string | null;
+  // Provenance for the latest aggregate cohort. A capped cohort is a recent
+  // sample, not a complete requested window.
+  cohort_task_count?: number | null;
+  cohort_capped?: boolean | null;
+  cohort_requested_window_days?: number | null;
+  cohort_effective_window_start?: string | null;
+  cohort_effective_window_end?: string | null;
   // Idle-inclusive cost-per-merged-PR as a companion trended axis (current +
   // history + a baseline sourced from the immutable pre-pool cost axis), so the
   // warm-reuse-vs-cost trend can chart true cost regression beside the headline

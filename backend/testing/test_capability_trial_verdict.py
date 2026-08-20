@@ -1369,6 +1369,20 @@ class TestGetEffectiveHoldbackFraction:
         assert result == 1.0
 
 
+class TestIsHoldbackFractionVerdictPinned:
+    def test_pinned_for_adopt_reject_no_effect_kill(self):
+        from app.capability_trial_verdict import is_holdback_fraction_verdict_pinned
+
+        for verdict in ("adopt", "ADOPT", "reject", "no_effect", "KILL"):
+            assert is_holdback_fraction_verdict_pinned(verdict) is True, verdict
+
+    def test_not_pinned_for_continue_trial_or_missing(self):
+        from app.capability_trial_verdict import is_holdback_fraction_verdict_pinned
+
+        for verdict in ("continue-trial", None, "", "some_other_state"):
+            assert is_holdback_fraction_verdict_pinned(verdict) is False, verdict
+
+
 # ── get_trial_definitions ─────────────────────────────────────────────────────
 
 
@@ -4207,6 +4221,46 @@ class TestPersistStalledTrialNotices:
         assert ctx["with_7d"] == 10
         assert ctx["without_7d"] == 0
         assert ctx["holdback_fraction"] == 0.05
+
+    @pytest.mark.asyncio
+    async def test_unpinned_notice_names_config_knob(self):
+        """A non-pinned (continue-trial) stalled entry keeps naming holdback_fraction/window."""
+        import uuid
+
+        from app.capability_trial_verdict import raise_stalled_trial_notice
+
+        project_id = uuid.uuid4()
+        mock_session, _ = self._build_mock_db(open_messages=[])
+
+        await raise_stalled_trial_notice(
+            mock_session, project_id, "repo_map", self._stalled_entry()
+        )
+
+        added_msg = mock_session.add.call_args[0][0]
+        assert "raise holdback_fraction or extend trial window" in added_msg.content
+        assert "declare-capability-verdict" not in added_msg.content
+
+    @pytest.mark.asyncio
+    async def test_pinned_notice_names_verdict_redeclaration(self):
+        """A verdict-pinned stalled entry names the declare-capability-verdict endpoint,
+        not the (inoperative) holdback_fraction knob."""
+        import uuid
+
+        from app.capability_trial_verdict import raise_stalled_trial_notice
+
+        project_id = uuid.uuid4()
+        mock_session, _ = self._build_mock_db(open_messages=[])
+
+        entry = self._stalled_entry()
+        entry["verdict"] = "no_effect"
+
+        await raise_stalled_trial_notice(
+            mock_session, project_id, "repo_map", entry
+        )
+
+        added_msg = mock_session.add.call_args[0][0]
+        assert "declare-capability-verdict" in added_msg.content
+        assert "raise holdback_fraction or extend trial window" not in added_msg.content
 
     @pytest.mark.asyncio
     async def test_decided_verdicts_do_not_raise_stall_notice(self):

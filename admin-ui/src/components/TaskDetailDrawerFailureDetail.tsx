@@ -121,14 +121,14 @@ export function TeardownForensicsPanel({ task }: { task: Task }) {
   if (!forensics?.serial_tail) return null;
 
   return (
-    <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 p-3 mb-2">
+    <div className="bg-workbench-base/50 rounded-lg border border-neutral-800 p-3 mb-2">
       <div className="flex items-center gap-2 mb-2">
         <span className="inline-block text-ui-sm px-1.5 py-0.5 rounded font-semibold bg-orange-900/60 text-orange-300 border border-orange-800">
           VM Teardown
         </span>
         <span className="text-xs text-neutral-400 truncate" title={forensics.reason}>{forensics.reason}</span>
       </div>
-      <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-950 rounded p-2 max-h-64 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono">
+      <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-workbench-shell rounded p-2 max-h-64 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono">
         {forensics.serial_tail}
       </pre>
     </div>
@@ -141,7 +141,7 @@ export function FailureDetailPanel({ task }: { task: Task }) {
   }
 
   return (
-    <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 p-3 mb-2">
+    <div className="bg-workbench-base/50 rounded-lg border border-neutral-800 p-3 mb-2">
       <div className="flex items-center gap-2 mb-1">
         <span className={`inline-block text-ui-sm px-1.5 py-0.5 rounded font-semibold ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}>
           {FAILURE_CLASS_CONFIG[task.failure_class].label}

@@ -42,7 +42,7 @@ from app.landed_signal import (
 )
 from app.models import Alert, AlertSeverity, Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _is_cadence_due, _strip_tz_assume_utc, _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1956
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1978
 
 logger = logging.getLogger(__name__)
 

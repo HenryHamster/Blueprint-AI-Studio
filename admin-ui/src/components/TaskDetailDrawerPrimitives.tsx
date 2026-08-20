@@ -55,7 +55,7 @@ export function DirectionsSection({ directions }: { directions: { text: string; 
         <ul className="space-y-1.5 pl-1">
           {directions.map((d, i) => (
             <li key={i} className="flex items-start gap-2 text-sm text-neutral-200">
-              <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0" />
+              <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-workbench-control shrink-0" />
               <span className="break-words min-w-0">{d.text}</span>
             </li>
           ))}

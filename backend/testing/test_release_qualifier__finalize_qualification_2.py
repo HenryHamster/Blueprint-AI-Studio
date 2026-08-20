@@ -649,7 +649,7 @@ class TestFinalizeInfraFailure:
         )
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": "cafe" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -697,7 +697,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": "cafe" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -825,7 +825,7 @@ class TestFinalizeInfraFailure:
         )
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -942,7 +942,7 @@ class TestFinalizeInfraFailure:
         original_challenge_id = str(challenge_task.id)
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -1061,7 +1061,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -1198,7 +1198,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": 0,
             "candidate_sha": candidate,
@@ -1292,7 +1292,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": "cafe5678" * 5,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -1358,7 +1358,7 @@ class TestFinalizeInfraFailure:
         original_audit_id = str(audit_task.id)
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -1431,7 +1431,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -1492,7 +1492,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": "dead1234" * 5,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -1554,7 +1554,7 @@ class TestFinalizeInfraFailure:
         persist_failure_category(first_audit, PROVISION_FAILURE)
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": first_candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -1898,7 +1898,7 @@ class TestFinalizeInfraFailure:
         }
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": "dead" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -2387,7 +2387,7 @@ class TestFinalizeInfraFailure:
         original_audit_id = str(audit_task.id)
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": 0,
             "candidate_sha": candidate,
@@ -2474,7 +2474,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -2771,7 +2771,7 @@ class TestFinalizeInfraFailure:
         original_mg_id = str(merge_grade_task.id)
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -2845,7 +2845,7 @@ class TestFinalizeInfraFailure:
         original_mg_id = str(merge_grade_task.id)
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -2917,7 +2917,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -2987,7 +2987,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -3045,7 +3045,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -3140,7 +3140,7 @@ class TestReaperInducedAuditHeartbeatTimeout:
 
         version.last_qualification = {
             "status": "pending",
-            **_EMPTY_RUBRIC_PROJECTION,
+            **(await _live_rubric_projection(db_session, version)),
             "candidate_sha": "dead" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -6000,7 +6000,11 @@ async def test_redrive_failed_audit_with_passed_challenge_is_reused(
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     sha = "d00dfeed" * 5
     version.goal = "Confirmed-deduction audit reuse stays cheap"
-    rubric_fingerprint = rq._rubric_fingerprint([])
+    # open_version seeds a default operator-authorship criterion, so the live
+    # rubric is never empty — the contract fingerprint the reuse gate compares
+    # against must be computed from the version's CURRENT rubric.
+    _live_rubric, _ = await rq._snapshot_qualification_rubric(db_session, version)
+    rubric_fingerprint = rq._rubric_fingerprint(_live_rubric)
     promotion_policy = rq._load_policy(project)
     contract_fingerprint = rq._qualification_contract_fingerprint(
         version.goal,
@@ -6672,6 +6676,25 @@ async def test_sweep_leaves_resolved_blocker_stale_verdict_for_strategic(
     mocker.patch(
         "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
     )
+    # Pre-age the head-stability marker past the candidate_advanced quiet
+    # window so this test's actual subject — the stale not_promoted verdict
+    # must not suppress requalification — still decides the outcome.
+    from datetime import timedelta
+
+    from app.project_telemetry import upsert_telemetry
+    from app.release_qualifier_debounce import _AUTOMAIN_HEAD_FIRST_SEEN_KEY
+    from app.time_utils import _utcnow
+
+    await upsert_telemetry(
+        db_session,
+        project.id,
+        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+        {
+            "head_sha": new_sha,
+            "first_seen_at": (_utcnow() - timedelta(seconds=31 * 60)).isoformat(),
+        },
+    )
+    await db_session.commit()
 
     count = await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)

@@ -72,7 +72,9 @@ from app.release_scoring import (
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
 logger = logging.getLogger("backend.app.release_qualifier")
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2339
+# Governing cap: keep a small explicit margin over the actual size (2340 as
+# of rollup #17573, which grew the module past the old 2339 cap by one line).
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2360
 
 # Minimum consecutive qualifier infrastructure errors (FAILED/CANCELLED
 # required child tasks) before raising a dedicated infra-failure alert.
@@ -636,6 +638,8 @@ async def _spawn_release_audit_task(
     version_goal: str | None = None,
     categories: list[dict[str, Any]] | None = None,
     rubric_fingerprint: str | None = None,
+    candidate_authorship_receipt: dict[str, Any] | None = None,
+    candidate_authorship_measured_range: tuple[str | None, str | None] | None = None,
 ) -> Task:
     """Create the qualifier's single holistic final-review task."""
     await _require_qualifier_task_admission(session, project_id)
@@ -667,12 +671,21 @@ async def _spawn_release_audit_task(
     # The audit context is scoped to the candidate's complete range.  It must
     # not carry a previously promoted serving receipt into a new candidate's
     # grade; the qualifier measures the candidate range before final scoring.
-    candidate_version = await session.get(ReleaseVersion, version_id)
-    candidate_base_sha, candidate_head_sha = candidate_authorship_range(
-        candidate_version
-    )
+    # A caller that already measured the candidate's authorship range (to
+    # build ``candidate_authorship_receipt``) MUST pass the exact same range
+    # here — the receipt's own ``range`` field was stamped against it, and
+    # ``validate_authorship_receipt`` fails closed on any mismatch, including
+    # one caused by two independent re-derivations of an unset base_sha
+    # landing on different values.
+    if candidate_authorship_measured_range is not None:
+        candidate_base_sha, candidate_head_sha = candidate_authorship_measured_range
+    else:
+        candidate_version = await session.get(ReleaseVersion, version_id)
+        candidate_base_sha, candidate_head_sha = candidate_authorship_range(
+            candidate_version
+        )
     payload["release_evidence"] = normalized_authorship_prompt_evidence(
-        None,
+        candidate_authorship_receipt,
         candidate_base_sha,
         candidate_head_sha or candidate_sha,
         list(categories or []),

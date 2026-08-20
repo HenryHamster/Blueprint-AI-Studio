@@ -65,6 +65,7 @@ from app.branch_literal_compliance import (
     strip_typescript_with_linenos,
 )
 from app.json_extract import async_json_loads
+from app.size_limit_policy import SECTION_EXCLUDED, SECTION_EXTENSIONS, SECTION_PATH_PREFIXES
 from app.time_utils import _coerce_naive_utc, _is_cadence_due, _utcnow
 
 if TYPE_CHECKING:
@@ -80,16 +81,14 @@ logger = logging.getLogger(__name__)
 _MODULE_SIZE_LIMITS_PATH = "backend/testing/module_size_limits.json"
 
 # Maps a module_size_limits.json section to the repo-relative path prefix its
-# ``rel`` keys are rooted at. Mirrors hotfix_backmerge._FILE_PREFIX_MAP (inverted
-# direction) and check_size_limits.resolve_section_root's section roots. The
-# ``testing`` section is enforced by CI's TestTestFileSizeGuardrails /
-# test_testing_no_uncapped_large_file and must be scanned exactly like CI does.
-_SECTION_PREFIXES: dict[str, str] = {
-    "backend": "backend/app/",
-    "agent": "agent/src/",
-    "frontend": "admin-ui/src/",
-    "testing": "backend/testing/",
-}
+# ``rel`` keys are rooted at. Single-sourced from ``size_limit_policy`` (mirrors
+# hotfix_backmerge._FILE_PREFIX_MAP, derived from the same table, and
+# check_size_limits.resolve_section_root's section roots) so every consumer
+# covers exactly the five governed sections, including ``scripts``. The
+# ``testing`` and ``scripts`` sections are enforced by CI's
+# TestTestFileSizeGuardrails / test_scripts_no_uncapped_large_file and must be
+# scanned exactly like CI does.
+_SECTION_PREFIXES: dict[str, str] = SECTION_PATH_PREFIXES
 
 # Bound the per-SHA history so the JSONB column cannot grow without limit across
 # thousands of merges. Most-recently-recorded SHAs are retained (dict insertion
@@ -150,33 +149,13 @@ _semaphore = asyncio.Semaphore(_DEFAULT_CONCURRENCY)
 # Mirrors check_size_limits._COVERAGE_THRESHOLD and test_invariants._COVERAGE_THRESHOLD.
 _UNCAPPED_THRESHOLD = 1500
 
-# Per-section source file extensions for the uncapped-coverage guardrail.
-# Mirrors check_size_limits._SECTION_SCAN (backend/app .py, agent .ts,
-# frontend .ts/.tsx, testing .py).
-_SECTION_EXTENSIONS: dict[str, tuple[str, ...]] = {
-    "backend": (".py",),
-    "agent": (".ts",),
-    "frontend": (".ts", ".tsx"),
-    "testing": (".py",),
-}
-
-# Files excluded from the uncapped-coverage guardrail per section.
-# Mirrors check_size_limits._is_frontend_excluded / _is_agent_excluded /
-# _no_exclusion (testing scans every .py like the backend section).
-def _is_frontend_excluded(rel: str) -> bool:
-    return rel.endswith((".test.ts", ".test.tsx", ".d.ts")) or rel.startswith("test/")
-
-
-def _is_agent_excluded(rel: str) -> bool:
-    return rel.endswith((".test.ts", ".d.ts"))
-
-
-_SECTION_EXCLUDED: dict[str, Any] = {
-    "backend": lambda rel: False,
-    "agent": _is_agent_excluded,
-    "frontend": _is_frontend_excluded,
-    "testing": lambda rel: False,
-}
+# Per-section source file extensions and exclusion predicates for the
+# uncapped-coverage guardrail. Single-sourced from ``size_limit_policy``
+# (mirrors check_size_limits._SECTION_SCAN) so ``scripts`` is covered exactly
+# like CI's test_scripts_no_uncapped_large_file scans it, instead of being
+# invisible to this evaluator.
+_SECTION_EXTENSIONS: dict[str, tuple[str, ...]] = SECTION_EXTENSIONS
+_SECTION_EXCLUDED: dict[str, Any] = SECTION_EXCLUDED
 
 # Supplemental agent patterns: extend canonical AGENT_PATTERNS with loose
 # equality (==|!=, not ===|!==) for main/automain and all equality ops for
@@ -336,6 +315,7 @@ async def _scan_capped_files(
     ``{section, rel, count, cap}`` dicts and checked is the number of files
     actually read at the ref.
     """
+    from app.size_limit_policy import governance_caps_from_source_text
     from testing.check_size_limits import classify_size_record
 
     # Collect all (section, rel, cap, path) entries to fetch in parallel.
@@ -379,7 +359,20 @@ async def _scan_capped_files(
             continue
         checked += 1
         count = len(text.splitlines())
-        rec = classify_size_record(rel, count, cap, section, with_verdict=False)
+        # ``text`` is this module's own source AT THE CANDIDATE REF (the same
+        # fetch used to count lines), so any *_SIZE_GOVERNANCE_CAP it declares
+        # is parsed from that ref directly — never from the serving image's
+        # local tree, which would apply the WRONG (deployed-code) governance
+        # cap to a candidate that legitimately raised its own cap.
+        governance_caps = governance_caps_from_source_text(text)
+        rec = classify_size_record(
+            rel,
+            count,
+            cap,
+            section,
+            with_verdict=False,
+            governance_caps=governance_caps,
+        )
         if rec["breach"]:
             violations.append(
                 {"section": section, "rel": rel, "count": count, "cap": cap}

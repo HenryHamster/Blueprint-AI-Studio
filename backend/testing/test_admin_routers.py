@@ -7503,6 +7503,7 @@ class TestHotfixScopePreview:
             db_session,
             project.id,
             candidate_sha=None,
+            repair_commit_shas=[],
         )
 
     @pytest.mark.asyncio
@@ -7580,6 +7581,7 @@ class TestHotfixScopePreview:
             db_session,
             project.id,
             candidate_sha=explicit_sha,
+            repair_commit_shas=[],
         )
 
     @pytest.mark.asyncio
@@ -7631,6 +7633,110 @@ class TestHotfixScopePreview:
             )
         # _get_user_project_with_role raises 404 for users without the required role.
         assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_threads_repair_commit_shas(
+        self, db_session, mocker
+    ):
+        """The narrow lane's commit list reaches the preview helper verbatim."""
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+        repair_sha = "ab" * 20
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "eligible",
+                    "eligible": True,
+                    "changed_files": ["backend/app/release_stall_alerts.py"],
+                    "offending_files": [],
+                    "reason": "all changed files are allowlisted release machinery",
+                    "candidate_sha": "c" * 40,
+                    "prior_deployed_sha": "d" * 40,
+                    "repair_commit_shas": [repair_sha],
+                }
+            ),
+        )
+
+        result = await get_hotfix_scope_preview(
+            project.id,
+            candidate_sha=None,
+            repair_commit_shas=[repair_sha],
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result["repair_commit_shas"] == [repair_sha]
+        preview_mock.assert_awaited_once_with(
+            db_session,
+            project.id,
+            candidate_sha=None,
+            repair_commit_shas=[repair_sha],
+        )
+
+    @pytest.mark.asyncio
+    async def test_hotfix_promote_threads_repair_commit_shas_and_maps_failures(
+        self, db_session, mocker
+    ):
+        """The POST lane forwards ``repair_commit_shas`` and maps its new statuses.
+
+        A materialization failure is an upstream/GitHub problem (502), NOT a 400
+        scope rejection — the operator must be able to tell "your repair is not
+        machinery-only" from "we could not build the narrow candidate"."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import trigger_hotfix_promote
+        from app.routers.admin_hotfix_promote import _HotfixPromoteRequest
+
+        project = await _make_project(db_session)
+        repair_sha = "ab" * 20
+        promote_mock = mocker.patch(
+            "app.release_qualifier.hotfix_promote_current_version",
+            new=AsyncMock(return_value={"status": "promoted"}),
+        )
+        body = _HotfixPromoteRequest(
+            reason="latched gate repair",
+            scope_modules=["backend/app/release_stall_alerts.py"],
+            repair_commit_shas=[repair_sha],
+            ack_inert_until_deploy=True,
+        )
+
+        result = await trigger_hotfix_promote(
+            project.id,
+            body,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result["status"] == "promoted"
+        assert promote_mock.await_args.kwargs["repair_commit_shas"] == [repair_sha]
+
+        promote_mock.return_value = {
+            "status": "content_unavailable",
+            "reason": "could not resolve the repair's file content at abcdef12",
+        }
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_hotfix_promote(
+                project.id,
+                body,
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+        assert exc_info.value.status_code == 502
+        assert "content_unavailable" in exc_info.value.detail
+
+        promote_mock.return_value = {
+            "status": "no_effective_change",
+            "reason": "the named repair commits change nothing",
+        }
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_hotfix_promote(
+                project.id,
+                body,
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+        assert exc_info.value.status_code == 400
 
 
 class TestTriggerRollup:

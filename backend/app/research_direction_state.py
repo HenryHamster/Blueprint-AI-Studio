@@ -407,6 +407,7 @@ async def apply_post_spawn_state(
     low_actionability_deferred: List[Dict[str, Any]] | None = None,
     degradation_gate_deferred: List[Dict[str, Any]] | None = None,
     batch_cap_deferred: List[Dict[str, Any]] | None = None,
+    duplicate_sibling_skips: int = 0,
 ) -> None:
     """Apply all direction-state updates after research child tasks have been spawned.
 
@@ -1486,6 +1487,14 @@ async def apply_post_spawn_state(
     _degraded_reason = (task.context or {}).get("degraded_by_capacity_reason")
     if _degraded_reason:
         status_msg += f" (degraded: {_degraded_reason} — results may be incomplete)"
+    # Duplicate finding children dropped at the spawn boundary/convergence must
+    # stay visible on the FINAL message — a silent drop is as bad as a duplicate
+    # (receipts live in task.context['research_duplicate_finding_skips']).
+    if duplicate_sibling_skips:
+        status_msg += (
+            f" Skipped {duplicate_sibling_skips} duplicate finding child(ren) "
+            "already delivered by an existing task."
+        )
 
     # Snapshot plain values for the final log/broadcast below: the
     # duplicate-spawn catch around the terminal transition rolls the session
@@ -1516,6 +1525,7 @@ async def apply_post_spawn_state(
             type_filtered_count=type_filtered_count,
             empty_prompt_count=empty_prompt_count,
             filtered_findings=filtered_findings,
+            duplicate_sibling_skips=duplicate_sibling_skips,
         )
     except IntegrityError as _dup_exc:
         if "ux_task_active_idempotency_key" not in str(_dup_exc):
@@ -1583,6 +1593,7 @@ async def _apply_terminal_transition(
     type_filtered_count: int,
     empty_prompt_count: int,
     filtered_findings: List[Dict[str, Any]] | None = None,
+    duplicate_sibling_skips: int = 0,
 ) -> None:
     """Flip the research task to its post-spawn status and commit.
 
@@ -1732,6 +1743,11 @@ async def _apply_terminal_transition(
                 f"Research re-derived already-spawned findings ({skipped_duplicates} "
                 "deduped against existing children) — awaiting rollup of existing children"
             )
+            if duplicate_sibling_skips:
+                task.latest_status_message += (
+                    f" Skipped {duplicate_sibling_skips} duplicate finding "
+                    "child(ren) already delivered by an existing task."
+                )
         else:
             task.latest_status_message = status_msg
         task.context = {

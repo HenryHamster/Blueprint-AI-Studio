@@ -138,7 +138,7 @@ describe('EffortEfficiencyPanel', () => {
         })}
       />,
     );
-    expect(screen.getByText(/Pricing coverage/)).toBeInTheDocument();
+    expect(screen.getByText(/Spend-weighted pricing coverage/)).toBeInTheDocument();
     expect(screen.getByText(/75%/)).toBeInTheDocument();
     expect(screen.getByText(/openai:gpt-9/)).toBeInTheDocument();
   });
@@ -433,7 +433,6 @@ describe('EffortEfficiencyPanel', () => {
       cache_hit_rate_delta: 0,
       cache_hit_rate_within_tolerance: true,
       task_count: 15,
-      per_task: [],
       ...overrides,
     };
   }

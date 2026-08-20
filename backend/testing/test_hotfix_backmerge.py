@@ -3483,6 +3483,58 @@ def _make_file_content(n_lines: int) -> str:
     return "\n".join(f"line {i}" for i in range(n_lines))
 
 
+async def test_map_pr_file_to_section_covers_testing_and_scripts():
+    """``_FILE_PREFIX_MAP`` must cover all 5 governed sections, not just 3.
+
+    Regression: before ``_FILE_PREFIX_MAP`` was derived from
+    ``size_limit_policy.SECTION_PREFIX_ORDER`` it hand-listed only
+    backend/agent/frontend, so ``backend/testing/*.py`` and ``scripts/*.py``
+    mapped to ``None`` — invisible to ``_check_module_size_violations`` on a
+    hotfix back-merge even though CI enforces both sections.
+    """
+    assert hb._map_pr_file_to_section("backend/testing/test_invariants.py") == (
+        "testing",
+        "test_invariants.py",
+    )
+    assert hb._map_pr_file_to_section("scripts/local_runner.py") == (
+        "scripts",
+        "local_runner.py",
+    )
+    assert hb._map_pr_file_to_section("backend/app/orchestrator.py") == (
+        "backend",
+        "orchestrator.py",
+    )
+    assert hb._map_pr_file_to_section("README.md") is None
+
+
+async def test_check_module_size_violations_covers_scripts_section(mocker):
+    """A scripts/*.py cap breach must be detected by the hotfix size check.
+
+    Regression: with the pre-fix 3/5 ``_FILE_PREFIX_MAP``, a scripts breach on
+    a hotfix back-merge PR was silently skipped (mapped to ``None``) instead of
+    being reported here.
+    """
+    mocker.patch.object(
+        hb, "_load_size_limits", return_value={"scripts": {"local_runner.py": 100}}
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_make_pr_file("scripts/local_runner.py")]),
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(150)),
+    )
+
+    violations = await hb._check_module_size_violations(
+        "token", "owner", "repo", 123, "sha", uuid.uuid4()
+    )
+
+    assert violations == [
+        {"section": "scripts", "rel": "local_runner.py", "count": 150, "cap": 100}
+    ]
+
+
 async def test_module_size_violation_is_suppressed_from_operator_alerts(
     db_session, mocker
 ):

@@ -1,10 +1,12 @@
 """Tests for constants and helper methods defined in app.models."""
 
+import itertools
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.max_plan_pool import _cooldown_seconds_for_info as _pool_cooldown_seconds_for_info
 from app.models import (
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
@@ -252,6 +254,56 @@ def test_is_in_rate_limit_cooldown_quota_exhausted_uses_24h():
         acct.is_in_rate_limit_cooldown(at_time=disabled_at + timedelta(hours=25))
         is False
     )
+
+
+@pytest.mark.parametrize(
+    "kind,hits,hint_seconds",
+    list(
+        itertools.product(
+            ("rate_limit", "quarantine", "quota_exhausted", "regression"),
+            (1, 2, 3, 4, 5),
+            (None, 60, 4 * 3600),
+        )
+    ),
+)
+def test_is_in_rate_limit_cooldown_matches_pool_math(kind, hits, hint_seconds):
+    """Parity check: the model-level mirror must agree with the pool-level
+    canonical function (app.max_plan_pool._cooldown_seconds_for_info, which
+    now delegates to app.rate_limit_cooldown.cooldown_seconds_for_info) for
+    every kind, hit count, and server-hint combination.
+
+    Before the single-source extraction, MaxPlanAccount.is_in_rate_limit_cooldown
+    inlined a stale copy of this math and disagreed with the pool by up to 16x
+    on kind="quarantine" — this test fails on that stale inline copy.
+    """
+    info = {"hits": hits}
+    # `kind` is only ever persisted for non-rate_limit kinds — see
+    # _serialize_disabled_model_info in max_plan_pool.py.
+    if kind != "rate_limit":
+        info["kind"] = kind
+    if hint_seconds is not None:
+        info["retry_after_seconds"] = hint_seconds
+
+    expected = _pool_cooldown_seconds_for_info(info)
+
+    disabled_at = datetime(2026, 1, 1, 12, 0, 0)
+    at_str = disabled_at.isoformat()
+    acct = _make_account(
+        rate_limit_state={"disabled_models": {"claude-opus-4-7": {**info, "at": at_str}}}
+    )
+
+    assert (
+        acct.is_in_rate_limit_cooldown(
+            at_time=disabled_at + timedelta(seconds=expected - 1)
+        )
+        is True
+    ), f"expected still-in-cooldown 1s before {expected}s boundary for {info}"
+    assert (
+        acct.is_in_rate_limit_cooldown(
+            at_time=disabled_at + timedelta(seconds=expected + 1)
+        )
+        is False
+    ), f"expected cooldown expired 1s after {expected}s boundary for {info}"
 
 
 # task_branch_prefix (project-level branch namespace)

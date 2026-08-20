@@ -482,6 +482,64 @@ def test_changes_requested_override_is_limited_to_explicit_operator_lanes():
         ("admin_approval_followup_handlers.py", "_submit_human_critical_merge"),
     }
 
+
+def test_operator_pat_override_is_limited_to_explicit_operator_lanes():
+    """fix(release): only an explicit human/operator-triggered merge lane may
+    submit a merge authenticated with the operator's own PAT — every other
+    ``merge_pull_request`` caller must stay fail-closed against it (see
+    ``is_operator_pat_token`` / the resolver's PAT-fallback chain)."""
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    overrides = set()
+
+    def _calls_owned_by(function):
+        pending = list(function.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(node, ast.Call):
+                yield node
+            pending.extend(ast.iter_child_nodes(node))
+
+    for source_path in app_dir.rglob("*.py"):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        for function in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            for call in _calls_owned_by(function):
+                called = (
+                    call.func.id
+                    if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute)
+                    else ""
+                )
+                if called != "merge_pull_request":
+                    continue
+                override = next(
+                    (
+                        keyword.value
+                        for keyword in call.keywords
+                        if keyword.arg == "allow_operator_pat"
+                    ),
+                    None,
+                )
+                if override is None:
+                    continue
+                assert isinstance(override, ast.Constant) and override.value is True
+                overrides.add(
+                    (source_path.relative_to(app_dir).as_posix(), function.name)
+                )
+
+    assert overrides == {
+        ("admin_approval_followup_handlers.py", "_submit_human_rollup_merge"),
+        ("admin_approval_followup_handlers.py", "_submit_human_critical_merge"),
+        ("routers/admin_operator_triggers.py", "_submit_operator_rollup_merge"),
+    }
+
+
 @pytest.mark.asyncio
 async def test_merge_pr_default_vetoes_changes_requested_before_put(mocker):
     from app import github_pulls

@@ -1453,6 +1453,59 @@ def test_cycle_refused():
     assert resolve_blocked_need(blocked, need, [foundation]) is None
 
 
+def test_pipeline_lineage_cycle_refused_fix_to_own_original():
+    """A pipeline fix task must never depend on its own EVALUATING original.
+
+    Incident 2026-08-19 (fix dd0e8588 / original c45d9719): the unblock sweep
+    matched the fix task's own original as a capability provider and wired the
+    edge. The original can't complete until its PR pipeline (this very fix
+    task) finishes — a deadlock invisible to depends_on-only cycle traversal.
+    """
+    original = _task(status=TaskStatus.EVALUATING, title="decompose dispatch")
+    fix = _task(
+        status=TaskStatus.BLOCKED,
+        title="Fix PR #17471",
+        payloads=[{
+            "type": "fix",
+            "pr_number": 17471,
+            "original_task_id": str(original.id),
+        }],
+    )
+    need = {"kind": "task", "ref": str(original.id)}
+    assert resolve_blocked_need(fix, need, [original]) is None
+
+
+def test_pipeline_lineage_cycle_refused_transitively():
+    """fix -> X -> original is refused when X depends_on the original."""
+    original = _task(status=TaskStatus.EVALUATING)
+    middle = _task(depends_on=[str(original.id)])
+    fix = _task(
+        status=TaskStatus.BLOCKED,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 1,
+            "original_task_id": str(original.id),
+        }],
+    )
+    need = {"kind": "task", "ref": str(middle.id)}
+    assert resolve_blocked_need(fix, need, [middle, original]) is None
+
+
+def test_pipeline_lineage_guard_leaves_unrelated_original_matchable():
+    """A fix task may still depend on an UNRELATED task's original."""
+    other_original = _task(status=TaskStatus.EVALUATING)
+    fix = _task(
+        status=TaskStatus.BLOCKED,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 2,
+            "original_task_id": str(uuid.uuid4()),
+        }],
+    )
+    need = {"kind": "task", "ref": str(other_original.id)}
+    assert resolve_blocked_need(fix, need, [other_original]) is other_original
+
+
 def test_malformed_need_returns_none():
     blocked = _task(status=TaskStatus.BLOCKED)
     assert resolve_blocked_need(blocked, {}, [_task()]) is None

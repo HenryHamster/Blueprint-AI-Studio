@@ -12,7 +12,12 @@ from sqlalchemy.orm.attributes import flag_modified
 from testing.conftest import USE_POSTGRES
 
 from app.auth import create_agent_token
-from app.models import Project, ReleaseVersion, Task
+from app.models import (
+    Project,
+    ReleaseAuthorshipReconciliationState,
+    ReleaseVersion,
+    Task,
+)
 from app.release_commit_authorship import (
     AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
     AUTHORSHIP_RECEIPT_SOURCE,
@@ -23,9 +28,13 @@ from app.release_commit_authorship import (
     normalized_authorship_prompt_evidence,
     persist_serving_authorship_evidence,
     reconcile_serving_authorship_evidence,
+    resolve_candidate_base_sha,
     validate_authorship_receipt,
 )
-from app.release_scoring import evaluate_merge_grade
+from app.release_scoring import (
+    evaluate_candidate_operator_authorship_gate,
+    evaluate_merge_grade,
+)
 
 
 class _GitHubResponse:
@@ -363,11 +372,12 @@ async def test_compare_rejects_base_in_commit_set(monkeypatch):
     [
         _github_commit("b" * 40, "blueprintagentorchestrator[bot]", verified=True),
         _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="other[bot]", identity_type="Bot", verified=True),
-        _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="blueprintagentorchestrator[bot]", identity_type="User", verified=True),
         _github_commit("b" * 40, "blueprintagentorchestrator[bot]", login="blueprintagentorchestrator[bot]", identity_type="Bot", verified=False),
     ],
 )
 async def test_bot_shaped_commit_requires_full_verified_github_identity(monkeypatch, commit):
+    """Commits with no genuine GitHub PR-merge committer proof, and a broken
+    direct-bot author identity, stay counted as offenders."""
     from app import github
 
     base, head = "a" * 40, "b" * 40
@@ -380,6 +390,136 @@ async def test_bot_shaped_commit_requires_full_verified_github_identity(monkeypa
     assert report["state"] == "resolved"
     assert report["count"] == 1
     assert report["offenders"] == [{"sha": head[:12], "author": "blueprintagentorchestrator[bot]"}]
+
+
+@pytest.mark.asyncio
+async def test_github_merge_committer_trusts_a_non_bot_authored_commit(monkeypatch):
+    """A GitHub PR-merge commit (committer=web-flow, verified) is trusted
+    regardless of the author identity — this is the fix under test: the
+    merge-committer branch must not be gated behind a bot-shaped author."""
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    commit = _github_commit(
+        head,
+        "blueprintagentorchestrator[bot]",
+        login="blueprintagentorchestrator[bot]",
+        identity_type="User",
+        verified=True,
+    )
+    project = Project(id="release-authorship-merge-non-bot-author", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [commit]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 0
+    assert report["offenders"] == []
+
+
+@pytest.mark.asyncio
+async def test_human_authored_pr_merge_is_trusted_and_a_raw_push_still_counts(monkeypatch):
+    """Regression pin for the measured defect: a human-authored commit merged
+    through GitHub (committer=web-flow, verified) is trusted, while a raw
+    push by the same human (no PR-merge committer proof) still counts."""
+    from app import github
+
+    base, head_merged, head_raw = "a" * 40, "b" * 40, "c" * 40
+    human_merged = {
+        "sha": head_merged,
+        "author": {"login": "henryhamster", "type": "User", "id": 1},
+        "committer": {"login": "web-flow", "id": 19864447, "type": "User"},
+        "commit": {
+            "author": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "committer": {"name": "GitHub", "email": "noreply@github.com"},
+            "verification": {"verified": True, "reason": "valid"},
+        },
+    }
+    human_raw = {
+        "sha": head_raw,
+        "author": {"login": "henryhamster", "type": "User", "id": 1},
+        "committer": {"login": "henryhamster", "id": 1, "type": "User"},
+        "commit": {
+            "author": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "committer": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "verification": {"verified": True, "reason": "valid"},
+        },
+    }
+    project = Project(id="release-authorship-human-pr-vs-raw-push", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(
+        github,
+        "_github_request",
+        AsyncMock(return_value=_GitHubResponse(200, _compare(base, head_raw, [human_merged, human_raw]))),
+    )
+
+    report = await count_non_bot_authored_commits(base, head_raw, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
+    assert report["offenders"] == [{"sha": head_raw[:12], "author": "Henry Hamster"}]
+
+
+@pytest.mark.asyncio
+async def test_github_merge_committer_without_valid_verification_still_counts(monkeypatch):
+    """Fail-closed: a web-flow-shaped committer with missing/invalid
+    verification does not grant trust."""
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    commit = {
+        "sha": head,
+        "author": {"login": "henryhamster", "type": "User", "id": 1},
+        "committer": {"login": "web-flow", "id": 19864447, "type": "User"},
+        "commit": {
+            "author": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "committer": {"name": "GitHub", "email": "noreply@github.com"},
+            "verification": {"verified": False, "reason": "unsigned"},
+        },
+    }
+    project = Project(id="release-authorship-merge-unverified", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [commit]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_spoofed_display_author_with_unchanged_committer_still_counts(monkeypatch):
+    """A commit that spoofs only the display author/login while leaving the
+    committer fields as a raw (non-web-flow) push must still count."""
+    from app import github
+
+    base, head = "a" * 40, "b" * 40
+    spoofed = {
+        "sha": head,
+        "author": {
+            "login": "blueprintagentorchestrator[bot]",
+            "type": "Bot",
+            "id": 272093198,
+        },
+        "committer": {"login": "henryhamster", "id": 1, "type": "User"},
+        "commit": {
+            "author": {
+                "name": "blueprintagentorchestrator[bot]",
+                "email": "272093198+blueprintagentorchestrator[bot]@users.noreply.github.com",
+            },
+            "committer": {"name": "Henry Hamster", "email": "henry@example.com"},
+            "verification": {"verified": True, "reason": "valid"},
+        },
+    }
+    project = Project(id="release-authorship-spoofed-display-author", github_owner="owner", github_repo="repo")
+    monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
+    monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [spoofed]))))
+
+    report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
+
+    assert report["state"] == "resolved"
+    assert report["count"] == 1
 
 
 @pytest.mark.asyncio
@@ -675,9 +815,57 @@ def test_candidate_authorship_range_covers_base_to_candidate_head():
     assert candidate_authorship_range(
         {"base_sha": base, "candidate_sha": candidate}
     ) == (base, candidate)
+
+
+def test_candidate_authorship_range_ignores_last_qualification_fallback():
+    """The immutable candidate_sha column is authoritative — a mutable
+    last_qualification["candidate_sha"] write must never substitute for it.
+    """
+    base = "a" * 40
+    candidate = "b" * 40
+    other = "c" * 40
+
     assert candidate_authorship_range(
         {"base_sha": base, "last_qualification": {"candidate_sha": candidate}}
+    ) == (base, None)
+    assert candidate_authorship_range(
+        {
+            "base_sha": base,
+            "candidate_sha": candidate,
+            "last_qualification": {"candidate_sha": other},
+        }
     ) == (base, candidate)
+
+
+def test_identical_compare_range_does_not_resolve_authorship_gate():
+    """An identical base/candidate SHA must never vacuously pass a declared
+    authorship contract, even though the resulting GitHub compare is
+    ``total_commits == 0`` and produces a validly-shaped "resolved" receipt.
+    """
+    same_sha = "a" * 40
+    measurement = {
+        "state": "resolved",
+        "count": 0,
+        "offenders": [],
+        "range": {"base_sha": same_sha, "head_sha": same_sha},
+    }
+    candidate_record = {"base_sha": same_sha, "candidate_sha": same_sha}
+    category = {
+        "category_key": "candidate-authorship",
+        "evidence_contract": {
+            "type": "operator_authored_commits",
+            "predicate": {"max_count": 0},
+        },
+    }
+
+    gate = evaluate_candidate_operator_authorship_gate(
+        candidate_record, measurement, [category]
+    )
+
+    assert gate["status"] == "blocked"
+    assert gate["passed"] is False
+    assert gate["blocker"] == "candidate_authorship_range_identical"
+    assert gate["range"] == {"base_sha": same_sha, "head_sha": same_sha}
 
 
 def test_candidate_authorship_range_drives_declining_graded_criterion():
@@ -1826,14 +2014,32 @@ async def test_reconciliation_deadline_cancels_slow_external_measurement(db_sess
         last_qualification={},
     )
     db_session.add_all([project, row])
+    # Seed the scan cursor straight into the served_at partition. Without it
+    # the sweep first walks the empty ``served_at IS NULL`` partition and
+    # commits the partition flip before it can even see ``row`` -- two full
+    # session/select/commit round-trips charged to the deadline below before
+    # any external I/O happens. That is not what this test asserts, and on a
+    # loaded shard those round-trips alone spent the budget, so the sweep
+    # selected nothing and this failed on ``attempted == 1``.
+    #
+    # merge(), not add(): id=1 is seeded by migration 0756, so it is already
+    # present unless an earlier test's table-wipe removed it. A bare insert
+    # raises UniqueViolation in the first case and this test must work in both.
+    await db_session.merge(
+        ReleaseAuthorshipReconciliationState(id=1, cursor_partition=1)
+    )
     await db_session.commit()
     from app.database import AsyncSessionLocal
 
+    # Deadline and external sleep scale together: the property under test is
+    # that a measurement far slower than the budget gets cancelled by it. A
+    # sleep 6x over budget proves that with room for a slow runner, where the
+    # original 0.2s/0.05s pair left none.
     async def slow_measure(*_args, **_kwargs):
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(3.0)
 
     mocker.patch(
-        "app.release_commit_authorship._RECONCILIATION_MAX_SECONDS", 0.05
+        "app.release_commit_authorship._RECONCILIATION_MAX_SECONDS", 0.5
     )
     mocker.patch(
         "app.release_commit_authorship.measure_serving_authorship_evidence",
@@ -1844,7 +2050,7 @@ async def test_reconciliation_deadline_cancels_slow_external_measurement(db_sess
     elapsed = asyncio.get_running_loop().time() - started
 
     assert attempted == 1
-    assert elapsed < 0.15
+    assert elapsed < 1.5
 
 
 @pytest.mark.asyncio
@@ -1893,3 +2099,308 @@ async def test_promotion_defers_authorship_until_serving_confirmation(db_session
     assert result["status"] == "promoted"
     assert "operator_authored_commits" not in (version.last_qualification or {})
     measurement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_base_sha_derives_the_merge_base(monkeypatch):
+    """A version with no stored base_sha derives one from the promotion target."""
+    from app import github
+
+    candidate_sha = "c" * 40
+    derived_base = "d" * 40
+    project = Project(
+        id="derive-base-success",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+
+    async def _request(method, url, headers, **kwargs):
+        assert url == f"https://api.github.com/repos/owner/repo/compare/main...{candidate_sha}"
+        return _GitHubResponse(
+            200,
+            {
+                "status": "ahead",
+                "ahead_by": 3,
+                "total_commits": 3,
+                "merge_base_commit": {"sha": derived_base},
+                "base_commit": {"sha": derived_base},
+                "commits": [],
+            },
+        )
+
+    monkeypatch.setattr(github, "_github_request", _request)
+
+    base_sha, reason = await resolve_candidate_base_sha(
+        candidate_sha, session=None, project=project
+    )
+
+    assert base_sha == derived_base
+    assert reason == "derived"
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_base_sha_fails_closed_on_non_ancestor(monkeypatch):
+    from app import github
+
+    candidate_sha = "c" * 40
+    project = Project(
+        id="derive-base-diverged",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    monkeypatch.setattr(
+        github,
+        "_github_request",
+        AsyncMock(
+            return_value=_GitHubResponse(
+                200,
+                {
+                    "status": "diverged",
+                    "ahead_by": 1,
+                    "total_commits": 1,
+                    "merge_base_commit": {"sha": "e" * 40},
+                    "base_commit": {"sha": "e" * 40},
+                    "commits": [],
+                },
+            )
+        ),
+    )
+
+    base_sha, reason = await resolve_candidate_base_sha(
+        candidate_sha, session=None, project=project
+    )
+
+    assert base_sha is None
+    assert reason == "range_not_ancestor"
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_base_sha_fails_closed_without_credentials(monkeypatch):
+    project = Project(
+        id="derive-base-no-creds",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=None),
+    )
+
+    base_sha, reason = await resolve_candidate_base_sha(
+        "c" * 40, session=None, project=project
+    )
+
+    assert base_sha is None
+    assert reason == "github_credentials_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_candidate_authorship_measurement_derives_base_when_version_has_none(
+    db_session, monkeypatch
+):
+    """A version opened with no base_sha (write-once, best-effort at open time)
+    must not permanently latch the authorship gate. The qualifier derives the
+    same range the release actually diffs against and measures it.
+    """
+    from app import github, release_qualifier as rq
+
+    candidate_sha = "c" * 40
+    derived_base = "d" * 40
+    project = Project(
+        name="Derive base measurement",
+        user_id="derive-base-measurement",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=7,
+        status="qualifying",
+        base_sha=None,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        # The candidate comes from the dedicated column: the authorship
+        # range no longer falls back to the mutable last_qualification JSONB.
+        candidate_sha=candidate_sha,
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "owner", "repo")),
+    )
+
+    async def _request(method, url, headers, **kwargs):
+        if url == f"https://api.github.com/repos/owner/repo/compare/main...{candidate_sha}":
+            return _GitHubResponse(
+                200,
+                {
+                    "status": "ahead",
+                    "ahead_by": 3,
+                    "total_commits": 3,
+                    "merge_base_commit": {"sha": derived_base},
+                    "base_commit": {"sha": derived_base},
+                    "commits": [],
+                },
+            )
+        if url == (
+            f"https://api.github.com/repos/owner/repo/compare/{derived_base}...{candidate_sha}"
+        ):
+            return _GitHubResponse(
+                200,
+                _compare(
+                    derived_base,
+                    candidate_sha,
+                    [_github_commit(candidate_sha, "Henry Example")],
+                ),
+            )
+        raise AssertionError(f"unexpected compare url: {url}")
+
+    monkeypatch.setattr(github, "_github_request", _request)
+
+    measurement = await rq._measure_candidate_operator_authorship(db_session, version)
+
+    assert measurement["state"] == "resolved"
+    assert measurement["count"] == 1
+    assert measurement["range"] == {"base_sha": derived_base, "head_sha": candidate_sha}
+
+    from app.release_scoring import evaluate_candidate_operator_authorship_gate
+
+    gate = evaluate_candidate_operator_authorship_gate(
+        version,
+        measurement,
+        [
+            {
+                "category_key": "candidate-authorship",
+                "evidence_contract": {
+                    "type": "operator_authored_commits",
+                    "predicate": {"max_count": 0},
+                },
+            }
+        ],
+        resolved_range=(measurement["range"]["base_sha"], measurement["range"]["head_sha"]),
+    )
+
+    assert gate["status"] == "blocked"
+    assert gate["base_sha_provenance"] == "derived"
+    assert gate["range"] == {"base_sha": derived_base, "head_sha": candidate_sha}
+
+
+@pytest.mark.asyncio
+async def test_candidate_authorship_measurement_names_version_when_derivation_fails(
+    db_session, monkeypatch
+):
+    """Derivation failure must block with a distinct, version-scoped reason --
+    never the generic 'evidence missing' blocker the write-once null base
+    could never clear."""
+    from app import release_qualifier as rq
+
+    candidate_sha = "c" * 40
+    project = Project(
+        name="Derive base failure",
+        user_id="derive-base-failure",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=9,
+        status="qualifying",
+        base_sha=None,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        # The candidate comes from the dedicated column: the authorship
+        # range no longer falls back to the mutable last_qualification JSONB.
+        candidate_sha=candidate_sha,
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=None),
+    )
+
+    measurement = await rq._measure_candidate_operator_authorship(db_session, version)
+
+    assert measurement["state"] == "unresolved"
+    assert measurement["reason"] == "base_sha_unset_v9_github_credentials_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_null_candidate_sha_column_blocks_with_evidence_missing(db_session):
+    """A pre-migration-0761 row (candidate_sha NULL) must fail CLOSED.
+
+    ``candidate_authorship_range`` reads the dedicated column only, so a row
+    written before the column existed yields ``(base, None)``.  That must reach
+    the hard ``candidate_operator_authorship_evidence_missing`` blocker — an
+    unmeasurable range is not a passing one — and a stale
+    ``last_qualification["candidate_sha"]`` must not rescue it, since that
+    mutable-JSONB fallback is exactly what was removed.  The block is
+    self-clearing: run_qualification refills the column on the next attempt
+    (see test_release_qualifier_candidate_sha_stamp.py).
+    """
+    from app.release_commit_authorship import count_non_bot_authored_commits
+    from app.release_scoring import evaluate_candidate_operator_authorship_gate
+
+    base_sha = "b" * 40
+    project = Project(
+        name="Null candidate sha",
+        user_id="null-candidate-sha",
+        github_owner="owner",
+        github_repo="repo",
+        promotion_target="main",
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=11,
+        status="qualifying",
+        base_sha=base_sha,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        # Stale mutable candidate: the removed fallback would have used this.
+        last_qualification={"candidate_sha": "c" * 40},
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.candidate_sha is None
+    assert candidate_authorship_range(version) == (base_sha, None)
+
+    measurement = await count_non_bot_authored_commits(
+        base_sha, None, session=db_session, project=project
+    )
+    assert measurement["state"] == "unresolved"
+    assert measurement["reason"] == "missing_or_malformed_sha"
+
+    gate = evaluate_candidate_operator_authorship_gate(
+        version,
+        measurement,
+        [
+            {
+                "category_key": "candidate-authorship",
+                "evidence_contract": {
+                    "type": "operator_authored_commits",
+                    "predicate": {"max_count": 0},
+                },
+            }
+        ],
+    )
+
+    assert gate["passed"] is False
+    assert gate["blocker"] == "candidate_operator_authorship_evidence_missing"
+    assert gate["range"] == {"base_sha": base_sha, "head_sha": None}

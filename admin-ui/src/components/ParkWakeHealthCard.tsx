@@ -9,7 +9,7 @@ function ageLabel(seconds: number | null): string {
 export function ParkWakeHealthCard({ data, stale }: { data?: ParkWakeHealth | null; stale?: boolean }) {
   if (!data && stale) {
     return (
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 opacity-50">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 opacity-50">
         <div className="flex items-center gap-2 mb-2">
           <CircleParking className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
           <h3 className="text-ui-md font-bold text-neutral-500 uppercase tracking-widest">Park/Wake Health</h3>
@@ -26,7 +26,7 @@ export function ParkWakeHealthCard({ data, stale }: { data?: ParkWakeHealth | nu
     : 'Wake delivery flowing';
 
   return (
-    <div className={`bg-neutral-900/50 border rounded-lg p-3 ${stalled ? 'border-red-500/30' : 'border-neutral-800/50'}`}>
+    <div className={`bg-workbench-base/50 border rounded-lg p-3 ${stalled ? 'border-red-500/30' : 'border-neutral-800/50'}`}>
       <div className="flex items-center gap-2 mb-2">
         {stalled ? (
           <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
@@ -44,11 +44,11 @@ export function ParkWakeHealthCard({ data, stale }: { data?: ParkWakeHealth | nu
       </div>
 
       <div className="mt-2 grid grid-cols-2 gap-2 text-ui-sm">
-        <div className="rounded border border-neutral-800/60 bg-neutral-950/40 px-2 py-1.5">
+        <div className="rounded border border-neutral-800/60 bg-workbench-shell/40 px-2 py-1.5">
           <div className="text-neutral-500">Oldest parked</div>
           <div className="font-mono text-neutral-200">{ageLabel(data.oldest_parked_age_seconds)}</div>
         </div>
-        <div className="rounded border border-neutral-800/60 bg-neutral-950/40 px-2 py-1.5">
+        <div className="rounded border border-neutral-800/60 bg-workbench-shell/40 px-2 py-1.5">
           <div className="text-neutral-500">Oldest fired</div>
           <div className="font-mono text-neutral-200">{ageLabel(data.oldest_fired_age_seconds)}</div>
         </div>

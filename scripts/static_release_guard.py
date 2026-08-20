@@ -12,27 +12,75 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+try:
+    from guard_suppression_receipt import record_classification  # noqa: E402
+except ImportError:  # pragma: no cover - emitting is fail-open by contract
+    # A tree without the emitter (an older base checkout, a synthetic harness
+    # fixture) must still run this lane unchanged: recording suppressions can
+    # never be the reason a verdict, exit code or blocking decision moves.
+    def record_classification(*_args: object, **_kwargs: object) -> None:
+        return None
 from testing.fixgate_attribution import (  # noqa: E402
     JUnitReport,
-    attribute_reports,
+    classify_verification,
     extract_base,
     is_attributable_pytest_result,
     parse_junit_report,
 )
+from verification_receipt import (  # noqa: E402
+    LANE_STATIC_CORPUS,
+    record_lane as record_verification_lane,
+)
+from testing.impacted_tests import load_surface_manifest
+
+MANIFEST_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "backend"
+    / "testing"
+    / "conversational_workday_manifest.json"
+)
+
+
+def _manifest_protected_prefixes(manifest_path: Path = MANIFEST_PATH) -> tuple[str, ...]:
+    """Derive extra static-guard prefixes from the Workday protection manifest.
+
+    36 of the manifest's 55 protected paths live outside backend/ (admin-ui/,
+    agent/, scripts/) -- keying guard scope only on the guard's own historical
+    footprint leaves those changes unscoped. Falls back to no extra prefixes
+    (the static floor below still applies) if the manifest is missing or
+    malformed, so a broken manifest cannot crash guard selection.
+    """
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ()
+    prefixes = set()
+    for entry in manifest.get("protect", []):
+        path = entry.get("path", "")
+        if "/" in path:
+            prefixes.add(f"{path.split('/', 1)[0]}/")
+    return tuple(sorted(prefixes))
+
 
 STATIC_PATH_PREFIXES = (
     "backend/",
     "check",
     "scripts/test-backend.sh",
     "scripts/static_release_guard.py",
-)
+) + _manifest_protected_prefixes()
+
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -62,13 +110,29 @@ def _changed_files(repo: Path, base: str) -> list[str]:
     return sorted({path for path in (*committed, *uncommitted, *untracked) if path})
 
 
-def _is_static_scope(path: str) -> bool:
+def _is_static_scope(path: str, repo_root: str = _REPO_ROOT) -> bool:
+    """Whether ``path`` falls in scope for the static release guard corpus.
+
+    In scope either by legacy prefix match, or by matching a surface glob
+    registered in the drift-sentinel manifest (``drift_sentinel_surfaces.json``)
+    — the same manifest that drives the merge-time impacted-test selector, so
+    the two selection layers agree on which non-backend surfaces (e.g.
+    admin-ui/, agent/) have guards with inputs the static corpus must also run
+    for, rather than maintaining a second, independently drifting path list.
+    """
     normalized = path.replace("\\", "/").strip("/")
-    return any(
+    if _STANDALONE_SCRIPT_TEST_RE.fullmatch(normalized):
+        return True
+    if any(
         normalized == prefix.rstrip("/")
         or normalized.startswith(f"{prefix.rstrip('/')}/")
         for prefix in STATIC_PATH_PREFIXES
-    )
+    ):
+        return True
+    for regex, _sentinels in load_surface_manifest(repo_root):
+        if regex.match(normalized):
+            return True
+    return False
 
 
 _extract_base = extract_base
@@ -120,6 +184,46 @@ def _static_roster_changed(base_harness: Path, current_harness: Path) -> bool:
     return fingerprints[0] != fingerprints[1]
 
 
+def _standalone_corpus_inventory(repo: Path) -> set[str]:
+    """Return the harness-owned, checkout-relative standalone corpus identity."""
+
+    result = _run(
+        [
+            "bash",
+            "scripts/test-backend.sh",
+            "--standalone",
+            "--standalone-inventory",
+            "--no-postgres",
+        ],
+        cwd=repo,
+        env={
+            **os.environ,
+            "BLUEPRINT_STANDALONE_INVENTORY": "1",
+            "TESTMON_NO_FETCH": "1",
+        },
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "standalone corpus inventory failed "
+            f"(exit {result.returncode}): {result.stderr.strip()}"
+        )
+    lines = result.stdout.splitlines()
+    try:
+        start = lines.index("BLUEPRINT_STANDALONE_CORPUS_V1")
+        end = lines.index("BLUEPRINT_STANDALONE_CORPUS_END", start + 1)
+    except ValueError as exc:
+        raise RuntimeError("standalone corpus inventory markers are missing") from exc
+    entries = []
+    prefix = "BLUEPRINT_STANDALONE_CORPUS_ENTRY="
+    for line in lines[start + 1 : end]:
+        if not line.startswith(prefix) or not line.removeprefix(prefix):
+            raise RuntimeError("standalone corpus inventory contains an invalid entry")
+        entries.append(line.removeprefix(prefix))
+    if len(entries) != len(set(entries)):
+        raise RuntimeError("standalone corpus inventory contains duplicate entries")
+    return set(entries)
+
+
 def _run_static_corpus(
     repo: Path, junit: Path, *, selectors: list[str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -154,6 +258,9 @@ def _run_size_guard(repo: Path, base_root: Path) -> subprocess.CompletedProcess[
 def _task_id() -> str:
     """Return the runner-provided task identity used for guard attribution."""
     return os.environ.get("TASK_ID", "").strip()
+
+
+_STANDALONE_SCRIPT_TEST_RE = re.compile(r"^scripts/test_[^/]+\.py$")
 
 
 def _base_file_selectors(selectors: dict[str, str], *, base_root: Path) -> list[str]:
@@ -211,6 +318,15 @@ def _attributed_findings(
         {"task_id": task_id, "test": key, "detail": detail}
         for key, detail in sorted(findings.items())
     ]
+
+
+LANE = "static"
+
+
+def _record_suppressions(outcome: dict[str, object]) -> None:
+    """Record this lane's suppressions in the cross-lane aggregate (fail-open)."""
+
+    record_classification(LANE, outcome)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -312,6 +428,23 @@ def main(argv: list[str] | None = None) -> int:
             shutil.copy2(current_route, base_route)
             base_route.chmod(base_route.stat().st_mode | 0o111)
 
+        try:
+            base_inventory = _standalone_corpus_inventory(base_root)
+            current_inventory = _standalone_corpus_inventory(repo)
+        except RuntimeError as exc:
+            print(f"[static guard] ERROR: cannot inspect standalone corpus: {exc}", file=sys.stderr)
+            failures.append("standalone corpus inventory")
+            base_inventory = set()
+            current_inventory = set()
+        corpus_membership_changed = base_inventory != current_inventory
+        # File inventory alone cannot see a deleted, renamed, or skipped test
+        # node inside a still-selected corpus member.  In that case a scoped
+        # baseline of only surviving current failures would omit the baseline
+        # node entirely.  Run the complete base corpus whenever either tree's
+        # selected source was changed; structured JUnit attribution below then
+        # compares the actual failure identities.
+        corpus_source_changed = bool(set(changed) & (base_inventory | current_inventory))
+
         base_junit = Path(temp_dir) / "base.xml"
         current_junit = Path(temp_dir) / "current.xml"
         base_result: subprocess.CompletedProcess[str] | None = None
@@ -338,7 +471,16 @@ def main(argv: list[str] | None = None) -> int:
             elif not current_failures:
                 # A changed harness is checked against the base corpus, but a
                 # normal clean candidate does not need differential subtraction.
-                if harness_changed:
+                # A changed corpus inventory or a skipped current route is also
+                # evidence that a clean report may have erased a baseline
+                # failure, so those paths require the full base corpus.
+                corpus_execution_changed = (
+                    harness_changed
+                    or corpus_membership_changed
+                    or corpus_source_changed
+                    or bool(current_report.skipped_routes)
+                )
+                if corpus_execution_changed:
                     # The partial roster fingerprint only sharpens the finding's
                     # diagnostic. It can never authorize a clean current report
                     # when the unchanged base harness still exposes failures.
@@ -364,17 +506,52 @@ def main(argv: list[str] | None = None) -> int:
                         ):
                             failures.append("standalone static corpus baseline_unavailable")
                             corpus_authoritative = False
-                        elif baseline_report.failures:
-                            if roster_changed:
-                                reason = "changed static test roster"
-                            else:
-                                reason = "changed static test harness"
-                            new_failures["<harness>"] = (
-                                f"{reason} made base corpus failure(s) disappear"
+                        else:
+                            verification = classify_verification(
+                                runtime_available=True,
+                                current_exit_code=current_result.returncode,
+                                current_failures=current_report.failures,
+                                baseline_report=baseline_report,
+                                current_report=current_report,
                             )
+                            disappeared = verification["disappeared_failures"]
+                            skipped = verification["skipped_failures"]
+                            if harness_changed:
+                                reason = (
+                                    "changed static test roster"
+                                    if roster_changed
+                                    else "changed static test harness"
+                                )
+                                if disappeared or skipped or baseline_report.failures:
+                                    suffix = "become skipped" if skipped and not disappeared else "disappear"
+                                    new_failures["<harness>"] = (
+                                        f"{reason} made base corpus failure(s) {suffix}"
+                                    )
+                            else:
+                                for key, failure in {
+                                    **disappeared,
+                                    **skipped,
+                                }.items():
+                                    new_failures[key] = failure["detail"]
+                                if disappeared:
+                                    print(
+                                        "[static guard] baseline failures disappeared: "
+                                        f"{json.dumps(disappeared, sort_keys=True)}"
+                                    )
+                                if skipped:
+                                    print(
+                                        "[static guard] baseline failures became skipped: "
+                                        f"{json.dumps(skipped, sort_keys=True)}"
+                                    )
             else:
                 selectors, unresolved = _failed_selectors(current_junit, tree_root=repo)
-                if harness_changed:
+                corpus_execution_changed = (
+                    harness_changed
+                    or corpus_membership_changed
+                    or corpus_source_changed
+                    or bool(current_report.skipped_routes)
+                )
+                if corpus_execution_changed:
                     # A changed harness can hide a baseline failure outside the
                     # files that still fail in the current tree.  A baseline
                     # scoped to those surviving failures cannot distinguish
@@ -452,35 +629,64 @@ def main(argv: list[str] | None = None) -> int:
                             failures.append("standalone static corpus baseline_unavailable")
                             corpus_authoritative = False
                         else:
-                            attributed = attribute_reports(current_report, baseline_report)
-                            new_failures = attributed.new_failures
+                            outcome = classify_verification(
+                                runtime_available=True,
+                                current_exit_code=current_result.returncode,
+                                current_failures=current_report.failures,
+                                current_report=current_report,
+                                baseline_report=baseline_report,
+                            )
+                            new_failures = dict(outcome["new_failures"])
+                            disappeared = outcome.get("disappeared_failures") or {}
+                            skipped = outcome.get("skipped_failures") or {}
                             hidden_by_harness: list[str] = []
-                            if harness_changed and attributed.disappeared_failures:
+                            if disappeared:
                                 hidden_by_harness.append("disappear")
-                            if harness_changed and attributed.skipped_failures:
+                            if skipped:
                                 hidden_by_harness.append("become skipped")
-                            if hidden_by_harness:
+                            if hidden_by_harness and not new_failures:
+                                if harness_changed:
+                                    subject = (
+                                        "changed static test roster"
+                                        if roster_changed
+                                        else "changed static test harness"
+                                    )
+                                else:
+                                    subject = "this diff"
                                 new_failures["<harness>"] = (
-                                    "changed static test harness made base corpus "
+                                    f"{subject} made base corpus "
                                     f"failure(s) {' or '.join(hidden_by_harness)}"
                                 )
-                            elif harness_changed and roster_changed and baseline_report.failures:
-                                new_failures["<harness>"] = (
-                                    "changed static test roster made base corpus "
-                                    "failure(s) disappear"
-                                )
-                            if attributed.suppressed_failures:
-                                suppressed = {
-                                    key: {
-                                        "detail": detail,
-                                        "reason": "same route/test/failure kind failed on baseline",
-                                    }
-                                    for key, detail in attributed.suppressed_failures.items()
-                                }
+                            suppressed_failures = outcome.get("suppressed_failures") or {}
+                            if new_failures:
+                                corpus_state = "test_failure"
+                            elif suppressed_failures:
+                                corpus_state = "preexisting_test_failure"
+                            else:
+                                corpus_state = "passed"
+                            # Advisory: the receipt records what this lane
+                            # relied on; it never decides the lane's verdict.
+                            # `new_failures` is used rather than the raw
+                            # outcome bucket because the synthetic "<harness>"
+                            # finding above is what actually blocks here.
+                            record_verification_lane(
+                                LANE_STATIC_CORPUS,
+                                state=corpus_state,
+                                blocking=bool(new_failures),
+                                new_failures=new_failures,
+                                suppressed_failures=suppressed_failures,
+                                disappeared_failures=disappeared,
+                                skipped_failures=skipped,
+                            )
+                            if suppressed_failures:
                                 print(
                                     "[static guard] suppressed baseline failures: "
-                                    f"{json.dumps(suppressed, sort_keys=True)}"
+                                    f"{json.dumps(suppressed_failures, sort_keys=True)}"
                                 )
+                            # Additive and fail-open: the stdout line above is
+                            # unchanged, and the receipt never touches the
+                            # verdict computed from `outcome`.
+                            _record_suppressions(outcome)
 
             if corpus_authoritative and new_failures:
                 try:

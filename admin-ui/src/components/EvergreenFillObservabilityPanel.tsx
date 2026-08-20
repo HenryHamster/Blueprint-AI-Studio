@@ -49,7 +49,7 @@ export function EvergreenFillObservabilityPanel() {
   return (
     <div className="border border-neutral-800 rounded-lg overflow-hidden" data-testid="evergreen-fill-observability-panel">
       <button
-        className="w-full flex items-center justify-between px-4 py-3 bg-neutral-900 hover:bg-neutral-800/60 transition-colors"
+        className="w-full flex items-center justify-between px-4 py-3 bg-workbench-base hover:bg-workbench-hover/60 transition-colors"
         onClick={() => setCollapsed(v => !v)}
       >
         <div className="flex items-center gap-2">
@@ -66,7 +66,7 @@ export function EvergreenFillObservabilityPanel() {
       {!collapsed && (
         <div className="px-4 py-3 space-y-4">
           {verdictData != null && (
-            <div className="bg-neutral-900 rounded-lg px-3 py-3 border border-neutral-800">
+            <div className="bg-workbench-base rounded-lg px-3 py-3 border border-neutral-800">
               <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-3">Observe Mode Verdict</p>
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
@@ -76,7 +76,7 @@ export function EvergreenFillObservabilityPanel() {
                         ? 'bg-green-900/40 text-green-300'
                         : verdictData.verdict === 'no_go'
                           ? 'bg-red-900/40 text-red-300'
-                          : 'bg-neutral-700/40 text-neutral-300'
+                          : 'bg-workbench-layer/40 text-neutral-300'
                     }`}
                   >
                     {verdictData.verdict === 'go' ? '✓ GO' : verdictData.verdict === 'no_go' ? '✗ NO-GO' : '◯ INSUFFICIENT DATA'}
@@ -112,15 +112,15 @@ export function EvergreenFillObservabilityPanel() {
           {data != null && (
             <>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Items Created</p>
                   <p className="text-lg font-mono text-neutral-100">{data.created_count}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Reason Types</p>
                   <p className="text-lg font-mono text-neutral-100">{reasonEntries.length}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Trigger Types</p>
                   <p className="text-lg font-mono text-neutral-100">{triggerEntries.length}</p>
                 </div>

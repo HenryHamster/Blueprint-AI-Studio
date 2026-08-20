@@ -1,6 +1,8 @@
 import { AlertTriangle, Infinity as InfinityIcon, LoaderCircle, MessageSquare, Play, Server, Square } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { StrategicResidentRunnerOption } from '../strategicStateApi';
+import { WORKDAY_STATE_PRESENTATION, type ConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
+import type { StrategicChatLiveState } from '../utils/strategicSessionLive';
 
 export type StrategicInteractionMode = 'chat' | 'continuous';
 
@@ -9,9 +11,21 @@ export interface StrategicSessionControlProps {
   mode?: StrategicInteractionMode | null;
   saving?: boolean;
   sessionActive?: boolean;
-  sessionStatus?: string | null;
   sessionState?: string | null;
-  sessionReason?: string | null;
+  // The single reconciled status readout — the same ConversationWorkdayStatus
+  // the utility bar renders. This is the only source for the visible status
+  // label/detail; sessionState/sessionActive above are Start/Stop button
+  // affordance inputs only, not a second display vocabulary.
+  workdayStatus?: ConversationWorkdayStatus | null;
+  /**
+   * The in-flight Chat-turn affordance, derived by MessagesPanel from the same
+   * live transcript the conversation thread renders. This is deliberately NOT a
+   * ConversationWorkdayStatus: Workday's status vocabulary describes Continuous
+   * Resident autonomy (which is `off` in Chat mode and says nothing about a chat
+   * turn being in flight). Null when nothing is in flight, in which case Chat
+   * mode renders only the mode toggle, exactly as before.
+   */
+  chatLiveState?: StrategicChatLiveState | null;
   sessionBusy?: boolean;
   sessionRunners?: StrategicResidentRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
@@ -28,19 +42,8 @@ const MODES: Array<{ value: StrategicInteractionMode; label: string; Icon: Lucid
   { value: 'continuous', label: 'Workday', Icon: InfinityIcon },
 ];
 
-function statusView(state: string | null | undefined, active: boolean, reason: string | null | undefined) {
-  const normalized = state?.trim().toLowerCase() || (active ? 'active' : 'ready');
-  const detail = reason?.trim()
-    ? reason === 'capability_mismatch'
-      ? 'Selected runner cannot host Workday'
-      : reason.replace(/^start_failed\s*:?\s*/i, '').replace(/_/g, ' ')
-    : null;
-  if (normalized === 'active') return { label: 'Active', detail, tone: 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10' };
-  if (normalized === 'starting' || normalized === 'stopping') return { label: normalized === 'starting' ? 'Starting' : 'Stopping', detail, tone: 'text-cyan-300 border-cyan-500/30 bg-cyan-500/10' };
-  if (normalized === 'waiting') return { label: 'Waiting', detail, tone: 'text-cyan-300 border-cyan-500/30 bg-cyan-500/10' };
-  if (normalized === 'blocked' || normalized === 'error') return { label: normalized === 'blocked' ? 'Blocked' : 'Error', detail, tone: 'text-amber-300 border-amber-500/30 bg-amber-500/10' };
-  return { label: 'Ready', detail, tone: 'text-neutral-300 border-neutral-700 bg-neutral-950/80' };
-}
+const FALLBACK_PRESENTATION = WORKDAY_STATE_PRESENTATION.ready;
+const STUCK_STATES = new Set(['unavailable', 'needs_restart']);
 
 function runnerLabel(runner: StrategicResidentRunnerOption): string {
   const name = runner.name || runner.hostname || runner.id.slice(0, 8);
@@ -55,9 +58,9 @@ export function StrategicSessionControl({
   mode,
   saving = false,
   sessionActive = false,
-  sessionStatus,
   sessionState,
-  sessionReason,
+  workdayStatus,
+  chatLiveState,
   sessionBusy = false,
   sessionRunners,
   sessionSelectedRunnerId,
@@ -71,21 +74,26 @@ export function StrategicSessionControl({
   const selectedMode = currentMode ?? mode ?? 'chat';
   const compact = density === 'compact';
   const normalizedSessionState = sessionState?.trim().toLowerCase() || null;
-  const normalizedSessionStatus = sessionStatus?.trim().toLowerCase() || null;
   // The lifecycle state is authoritative whenever the newer API supplies it.
-  // Fall back to the legacy active/status snapshot only for older responses
-  // where the state field is absent.
+  // Fall back to the legacy active snapshot only for older responses where
+  // the state field is absent.
   const active = normalizedSessionState
     ? normalizedSessionState === 'active'
-    : sessionActive || normalizedSessionStatus === 'active';
+    : sessionActive;
+  const wedged = normalizedSessionState === 'blocked' || normalizedSessionState === 'error';
   // Keep a live blob stoppable even when its lifecycle label is not Active.
-  const canStop = active || sessionActive || normalizedSessionStatus === 'starting' || normalizedSessionStatus === 'stopping';
-  const view = statusView(sessionState, active, sessionReason);
+  const canStop = active || sessionActive || normalizedSessionState === 'starting' || normalizedSessionState === 'stopping' || wedged;
+  const presentation = workdayStatus ? WORKDAY_STATE_PRESENTATION[workdayStatus.state] : FALLBACK_PRESENTATION;
+  const statusLabel = workdayStatus?.label ?? 'Ready';
+  const statusDetail = workdayStatus?.detail ?? null;
+  const statusTitle = workdayStatus?.title ?? statusLabel;
+  const spinning = sessionBusy || saving || (workdayStatus ? ['starting', 'stopping', 'waiting', 'retrying'].includes(workdayStatus.state) : false);
+  const stuck = STUCK_STATES.has(workdayStatus?.state ?? '') || wedged;
   const runners = sessionRunners ?? [];
 
   return (
     <div className={`flex min-w-0 items-center justify-end gap-1 ${className}`} data-testid="strategic-session-control">
-      <div className="flex rounded border border-neutral-800 bg-neutral-950/80 p-0.5" role="group" aria-label="Strategic interaction mode">
+      <div className="flex rounded border border-neutral-800 bg-workbench-shell/80 p-0.5" role="group" aria-label="Strategic interaction mode">
         {MODES.map(({ value, label, Icon }) => {
           const selected = selectedMode === value;
           return (
@@ -97,7 +105,7 @@ export function StrategicSessionControl({
               aria-label={`Switch Strategic mode to ${label}`}
               title={`Strategic mode: ${label}`}
               onClick={() => { if (!selected) onModeChange?.(value); }}
-              className={`${compact ? 'h-11 w-11 sm:h-7 sm:w-7' : 'min-h-9 px-2'} inline-flex items-center justify-center gap-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50 ${selected ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'}`}
+              className={`${compact ? 'h-11 w-11 sm:h-7 sm:w-7' : 'min-h-9 px-2'} inline-flex items-center justify-center gap-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50 ${selected ? 'bg-workbench-panel text-neutral-100' : 'text-neutral-400 hover:bg-workbench-hover hover:text-neutral-100'}`}
             >
               <Icon className="h-3.5 w-3.5" aria-hidden="true" />
               <span className={compact ? 'sr-only' : undefined}>{label}</span>
@@ -106,15 +114,40 @@ export function StrategicSessionControl({
         })}
       </div>
 
+      {selectedMode === 'chat' && chatLiveState && (
+        // Reuse the shared Workday PRESENTATION tokens (not its state
+        // vocabulary) so the two live affordances look like one system.
+        <span
+          className={`hidden min-h-7 min-w-0 max-w-64 items-center gap-1.5 rounded border px-2 text-xs sm:inline-flex ${WORKDAY_STATE_PRESENTATION.working.tone}`}
+          role="status"
+          aria-live="polite"
+          aria-label="Strategic reply status"
+          title={chatLiveState.detail ? `${chatLiveState.label} · ${chatLiveState.detail}` : chatLiveState.label}
+          data-testid="strategic-chat-live-status"
+          data-chat-live-phase={chatLiveState.phase}
+        >
+          <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          <span className="truncate">
+            {chatLiveState.detail ? `${chatLiveState.label} · ${chatLiveState.detail}` : chatLiveState.label}
+          </span>
+        </span>
+      )}
+
       {selectedMode === 'continuous' && (
         <>
-          <span className={`hidden min-h-7 min-w-0 items-center gap-1.5 rounded border px-2 text-xs sm:inline-flex ${view.tone}`} role="status" title={view.detail ?? view.label}>
-            {(sessionBusy || saving || normalizedSessionState === 'waiting') ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : normalizedSessionState === 'blocked' || normalizedSessionState === 'error' ? <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> : <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />}
-            <span className="truncate">{view.label}</span>
+          <span
+            className={`hidden min-h-7 min-w-0 max-w-64 items-center gap-1.5 rounded border px-2 text-xs sm:inline-flex ${presentation.tone}`}
+            role="status"
+            aria-label="Workday status"
+            title={statusTitle}
+            data-workday-state={workdayStatus?.state ?? 'ready'}
+          >
+            {spinning ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : stuck ? <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> : <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />}
+            <span className="truncate">{statusDetail ? `${statusLabel} · ${statusDetail}` : statusLabel}</span>
           </span>
 
           {runners.length > 0 && onSelectRunner && (
-            <label className="hidden min-h-7 items-center gap-1 rounded border border-neutral-800 bg-neutral-950/80 px-1.5 sm:inline-flex" title="Workday device">
+            <label className="hidden min-h-7 items-center gap-1 rounded border border-neutral-800 bg-workbench-shell/80 px-1.5 sm:inline-flex" title="Workday device">
               <Server className="h-3.5 w-3.5 text-neutral-500" aria-hidden="true" />
               <span className="sr-only">Workday device</span>
               <select
@@ -130,7 +163,7 @@ export function StrategicSessionControl({
           )}
 
           {canStop ? (
-            <button type="button" onClick={onStopSession} disabled={sessionBusy || !onStopSession} className="inline-flex h-7 min-h-[44px] min-w-[44px] items-center gap-1 rounded border border-red-500/30 bg-red-500/10 px-2 text-xs font-semibold text-red-300 disabled:opacity-50" title={normalizedSessionState === 'blocked' || normalizedSessionState === 'error' ? 'Stop Workday session before restarting' : 'Stop Workday session'}>
+            <button type="button" onClick={onStopSession} disabled={sessionBusy || !onStopSession} className="inline-flex h-7 min-h-[44px] min-w-[44px] items-center gap-1 rounded border border-red-500/30 bg-red-500/10 px-2 text-xs font-semibold text-red-300 disabled:opacity-50" title={wedged ? 'Stop Workday session before restarting' : 'Stop Workday session'}>
               {sessionBusy ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Square className="h-3.5 w-3.5" aria-hidden="true" />}
               <span className="hidden sm:inline">Stop</span>
             </button>

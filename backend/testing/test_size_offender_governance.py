@@ -294,7 +294,7 @@ def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
     )
 
     # A generic 15% bump for the current file would exceed 12,000 lines. The
-    # production fixer must discover and clamp to the module's measured 10649
+    # production fixer must discover and clamp to the module's measured 10900
     # line governance constant.
     mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
     assert (
@@ -315,7 +315,7 @@ def test_self_heal_clamps_governed_release_qualifier_cap(tmp_path, mocker):
     limits = json.loads(limits_path.read_text())
     cap = limits["backend"]["release_qualifier.py"]
     count = len(qualifier_path.read_text(encoding="utf-8").splitlines())
-    assert cap == 10649
+    assert cap == 10900
     assert cap == rq._MODULE_SIZE_GOVERNANCE_CAP
     assert count <= cap
     assert cap - count < cap * 0.10

@@ -54,6 +54,8 @@ from pathlib import Path
 
 import pytest
 
+from testing.fixgate_attribution import format_offender_marker
+
 # Canonical registry for the MissingGreenlet fidelity growth ratchet lives in
 # production (backend/app/greenlet_fidelity.py) so the debt is greppable from
 # application code and the ceiling burn-down is a visible production diff. The
@@ -275,6 +277,8 @@ class TestAuthorizedDivergencesSync:
             "AUTHORIZED_DIVERGENCES entries reference migration files that do not "
             "exist on disk. The deploy-time reconciliation is incoherent without them:\n"
             + "\n".join(f"  - {p}" for p in missing)
+            + "\n"
+            + format_offender_marker(missing)
             + "\n\nEither add the missing migration file or remove the stale entry."
         )
 
@@ -299,6 +303,8 @@ class TestAuthorizedDivergencesSync:
             "AUTHORIZED_DIVERGENCES entries reference renumbered deployed-identity "
             "migration files that do not exist on disk:\n"
             + "\n".join(f"  - {p}" for p in missing)
+            + "\n"
+            + format_offender_marker(missing)
             + "\n\nEither add the missing migration file or remove the stale entry."
         )
 
@@ -444,7 +450,7 @@ class TestDroppedColumnResidualAbsent:
             "The qualificationverdict column was dropped in migration 0351 and must "
             "not be reintroduced.\n"
             "Files containing the dropped column name:\n"
-            + "\n".join(f"  - {h}" for h in sorted(hits))
+            + "\n".join(f"  - {h}" for h in sorted(hits)) + "\n" + format_offender_marker(str(offender) for offender in hits)
         )
 
 
@@ -541,7 +547,7 @@ class TestTestDurationsCommittedAndFresh:
         ]
         assert not bad_values, (
             f"backend/.test_durations has entries with non-positive or non-numeric durations: "
-            f"{bad_values[:5]}. All values must be positive floats."
+            f"{bad_values[:5]}. All values must be positive floats." + "\n" + format_offender_marker(str(offender) for offender in bad_values)
         )
 
         # (d) Non-emptiness / coverage floor
@@ -576,6 +582,8 @@ class TestTestDurationsCommittedAndFresh:
             f"Missing (up to 10): {missing_files[:10]}\n"
             "Regenerate with: bash scripts/store-backend-durations.sh && "
             "git add backend/.test_durations && git commit"
+            + "\n"
+            + format_offender_marker(missing_files)
         )
 
 
@@ -661,6 +669,8 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
             "Documentation contains references to removed code paths or components. "
             "Remove or update these references:\n"
             + "\n".join(f"  - {v}" for v in sorted(violations))
+            + "\n"
+            + format_offender_marker(violations)
             + "\n\nSee backend/app/removed_code_references.py for the registry "
             "of removed items."
         )
@@ -1001,7 +1011,7 @@ class TestMissingGreenletTestsFaithful:
             "test Postgres-only with @pytest.mark.skipif(not USE_POSTGRES, ...):\n"
             + "\n".join(f"  - {v}" for v in sorted(violations))
             + "\n\nTo acknowledge existing debt, add to _KNOWN_UNFAITHFUL_ALLOWLIST "
-            "with a comment explaining why the test cannot be made faithful."
+            "with a comment explaining why the test cannot be made faithful." + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
     def test_unfaithful_allowlist_cannot_grow_beyond_ceiling(self):
@@ -1454,7 +1464,7 @@ class TestRollbackSafetyRegressionCheck:
             "To acknowledge cases the static scanner cannot verify, add an "
             "entry to ROLLBACK_FLOW_ALLOWLIST in backend/app/greenlet_fidelity.py "
             "with a comment explaining why the function is safe:\n"
-            + "\n".join(f"  - {v}" for v in sorted(violations))
+            + "\n".join(f"  - {v}" for v in sorted(violations)) + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
     def test_rollback_flow_allowlist_cannot_grow_beyond_ceiling(self):
@@ -1811,7 +1821,7 @@ class TestCommitFlowSafetyRegressionCheck:
             "be acknowledged by adding an entry to COMMIT_FLOW_ALLOWLIST in "
             "backend/app/greenlet_fidelity.py (and bumping the ceiling) with a "
             "comment explaining why the function is safe or is pending burn-down:"
-            "\n" + "\n".join(f"  - {v}" for v in sorted(violations))
+            "\n" + "\n".join(f"  - {v}" for v in sorted(violations)) + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
 
     def test_commit_flow_allowlist_cannot_grow_beyond_ceiling(self):
@@ -1852,7 +1862,7 @@ class TestCommitFlowSafetyRegressionCheck:
             "These functions were burned down out of COMMIT_FLOW_ALLOWLIST but "
             "have reappeared: " + ", ".join(sorted(_regressed)) + ". A burn-down "
             "is a monotonic-downward step: re-acknowledging a remediated function "
-            "requires re-raising COMMIT_FLOW_ALLOWLIST_CEILING deliberately."
+            "requires re-raising COMMIT_FLOW_ALLOWLIST_CEILING deliberately." + "\n" + format_offender_marker(str(offender) for offender in _regressed)
         )
         assert _COMMIT_FLOW_ALLOWLIST_CEILING <= 2, (
             "COMMIT_FLOW_ALLOWLIST_CEILING regressed above the post-burn-down "
@@ -1955,7 +1965,5 @@ class TestApprovalHoldProvenance:
             "review-wait timer or operator claim. Route each through "
             "establish_independent_approval_hold; only the exact review-wait "
             "owner marker and canonical operator authority may write TRUE "
-            "directly:\n" + "\n".join(f"  - {item}" for item in violations)
+            "directly:\n" + "\n".join(f"  - {item}" for item in violations) + "\n" + format_offender_marker(str(offender) for offender in violations)
         )
-
-

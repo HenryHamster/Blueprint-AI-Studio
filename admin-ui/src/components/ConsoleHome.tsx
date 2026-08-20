@@ -90,7 +90,7 @@ function NeedsAttentionSection({
     return (
       <section>
         {header}
-        <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg text-ui-sm text-neutral-500">
+        <div className="flex items-center gap-2 px-3 py-2 bg-workbench-base/50 border border-neutral-800/50 rounded-lg text-ui-sm text-neutral-500">
           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400/80 shrink-0" />
           Nothing needs your attention — no failed tasks or pending approvals.
         </div>
@@ -109,7 +109,7 @@ function NeedsAttentionSection({
             <button
               key={item.task_id}
               onClick={() => onViewTask(item.task_id)}
-              className="w-full text-left flex items-start gap-2 px-3 py-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg hover:bg-neutral-800/50 transition-colors"
+              className="w-full text-left flex items-start gap-2 px-3 py-2 bg-workbench-base/50 border border-neutral-800/50 rounded-lg hover:bg-workbench-hover/50 transition-colors"
             >
               <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${meta.dotClass}`} aria-hidden="true" />
               <div className="flex-1 min-w-0">
@@ -117,7 +117,7 @@ function NeedsAttentionSection({
                 <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
                   <span className={`text-ui-sm ${meta.reasonClass}`}>{meta.label}</span>
                   {failClass && (
-                    <span className={`text-ui-xs px-1.5 py-0.5 rounded font-medium ${FAILURE_CLASS_COLORS[failClass] ?? 'bg-neutral-500/20 text-neutral-400'}`}>
+                    <span className={`text-ui-xs px-1.5 py-0.5 rounded font-medium ${FAILURE_CLASS_COLORS[failClass] ?? 'bg-workbench-control/20 text-neutral-400'}`}>
                       {failClass.toLowerCase()}
                     </span>
                   )}
@@ -184,7 +184,7 @@ function RecentlyShippedSection({
           <button
             key={item.task_id}
             onClick={() => onViewTask(item.task_id)}
-            className="w-full text-left flex items-start gap-2 px-3 py-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg hover:bg-neutral-800/50 transition-colors"
+            className="w-full text-left flex items-start gap-2 px-3 py-2 bg-workbench-base/50 border border-neutral-800/50 rounded-lg hover:bg-workbench-hover/50 transition-colors"
           >
             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400/80 shrink-0 mt-0.5" aria-hidden="true" />
             <div className="flex-1 min-w-0">
@@ -340,7 +340,7 @@ export function ConsoleHome({
       {!loading && activeCount === 0 && queuedCount === 0 && onCreateTask && (
         <button
           onClick={onCreateTask}
-          className="w-full flex items-center gap-3 px-4 py-4 bg-neutral-900/50 border border-dashed border-neutral-700 rounded-xl hover:border-neutral-500 hover:bg-neutral-800/50 transition-colors text-left"
+          className="w-full flex items-center gap-3 px-4 py-4 bg-workbench-base/50 border border-dashed border-neutral-700 rounded-lg hover:border-neutral-500 hover:bg-workbench-hover/50 transition-colors text-left"
         >
           <PlusCircle className="w-5 h-5 text-neutral-500 shrink-0" />
           <div>
@@ -372,7 +372,7 @@ export function ConsoleHome({
           // eslint-disable-next-line viewport/min-touch-target
           <button
             onClick={onOpenFleet}
-            className="absolute top-2 right-2 flex items-center gap-1 text-ui-sm text-neutral-500 hover:text-neutral-300 transition-colors px-2 py-1 rounded bg-neutral-900/80 border border-neutral-800/60 opacity-0 group-hover:opacity-100"
+            className="absolute top-2 right-2 flex items-center gap-1 text-ui-sm text-neutral-500 hover:text-neutral-300 transition-colors px-2 py-1 rounded bg-workbench-base/80 border border-neutral-800/60 opacity-0 group-hover:opacity-100"
             title="View full fleet details"
           >
             <Layers className="w-3 h-3" />
@@ -386,7 +386,7 @@ export function ConsoleHome({
         <button
           onClick={handleRunSelfAudit}
           disabled={auditLoading}
-          className="w-full flex items-center gap-2 min-h-11 px-3 py-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg hover:bg-neutral-800/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-left"
+          className="w-full flex items-center gap-2 min-h-11 px-3 py-2 bg-workbench-base/50 border border-neutral-800/50 rounded-lg hover:bg-workbench-hover/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-left"
         >
           <Zap className="w-4 h-4 text-neutral-400 shrink-0" />
           <span className="text-xs font-medium text-neutral-300">

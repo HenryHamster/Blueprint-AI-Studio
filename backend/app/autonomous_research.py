@@ -892,6 +892,28 @@ async def _publish_anomaly_action(
         )
 
 
+def _strategic_backstop_due(
+    last_strategic_at: datetime | None,
+    now: datetime,
+    *,
+    max_interval_minutes: int | float,
+) -> bool:
+    """Return whether the wall-clock strategic backstop has elapsed.
+
+    This safety net is independent of the strategic failure breaker. The
+    breaker suppresses routine retries after repeated failures; it must not
+    suppress the liveness mechanism whose job is to force another opportunity
+    for the strategic loop to run.
+    """
+    if max_interval_minutes <= 0 or last_strategic_at is None:
+        return False
+    if last_strategic_at.tzinfo is not None:
+        last_strategic_at = last_strategic_at.replace(tzinfo=None)
+    if now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
+    return (now - last_strategic_at).total_seconds() / 60.0 >= max_interval_minutes
+
+
 async def _spawn_research_task_inner(
     project: Project,
     session: AsyncSession,
@@ -909,12 +931,6 @@ async def _spawn_research_task_inner(
     of 0 admits nothing at all — including the undirected ``[None]`` fallback —
     so a mid-sweep budget exhaustion cannot slip an extra task past the floor.
     """
-    if headroom_budget is not None and headroom_budget <= 0:
-        logger.info(
-            f"[AUTONOMOUS] Fleet headroom budget exhausted ({headroom_budget}) — "
-            f"no research admission for project {project.id}"
-        )
-        return 0
     try:
         legacy_generation = (
             await lock_and_validate_legacy_authority(
@@ -959,6 +975,13 @@ async def _spawn_research_task_inner(
                 )
         except (ValueError, TypeError, OverflowError):
             pass  # malformed or missing timestamp, keep current value
+
+    if headroom_budget is not None and headroom_budget <= 0:
+        logger.info(
+            f"[AUTONOMOUS] Fleet headroom budget exhausted ({headroom_budget}) — "
+            f"no research admission for project {project.id}"
+        )
+        return 0
 
     from app.research_completion import (
         _compute_momentum_factor,
@@ -1398,11 +1421,7 @@ async def _spawn_research_task_inner(
     # — never reaching the strategic spawn block, no matter how long since the
     # last cycle. Hit on 2026-05-26 (deploy 00195): backstop never fired despite
     # last strategic being 2h+ old, because both directions were busy.
-    if (
-        automatic_strategic_cycles_allowed
-        and not force_strategic
-        and strategic_failures < 3
-    ):
+    if not force_strategic:
         strategic_max_interval = _runtime_config.get(
             "strategic_max_interval_minutes", 1_440
         )
@@ -1419,19 +1438,27 @@ async def _spawn_research_task_inner(
                     )
                 )
             ).scalar()
-            if last_strategic_at is not None:
-                # _utcnow() returns naive UTC (project convention).
-                if last_strategic_at.tzinfo is not None:
-                    last_strategic_at = last_strategic_at.replace(tzinfo=None)
-                age_minutes = (_utcnow() - last_strategic_at).total_seconds() / 60.0
-                if age_minutes >= strategic_max_interval:
-                    logger.info(
-                        f"[STRATEGIC] Wall-clock backstop firing for project {project.id}: "
-                        f"last strategic task created {age_minutes:.1f}min ago "
-                        f"(threshold {strategic_max_interval}min, "
-                        f"active_directions={len(active_directions)}, busy={len(busy_direction_ids)})"
+            backstop_now = _utcnow()
+            if _strategic_backstop_due(
+                last_strategic_at,
+                backstop_now,
+                max_interval_minutes=strategic_max_interval,
+            ):
+                normalized_last_strategic_at = last_strategic_at
+                if normalized_last_strategic_at.tzinfo is not None:
+                    normalized_last_strategic_at = normalized_last_strategic_at.replace(
+                        tzinfo=None
                     )
-                    force_strategic = True
+                age_minutes = (
+                    backstop_now - normalized_last_strategic_at
+                ).total_seconds() / 60.0
+                logger.info(
+                    f"[STRATEGIC] Wall-clock backstop firing for project {project.id}: "
+                    f"last strategic task created {age_minutes:.1f}min ago "
+                    f"(threshold {strategic_max_interval}min, "
+                    f"active_directions={len(active_directions)}, busy={len(busy_direction_ids)})"
+                )
+                force_strategic = True
     if not active_directions and not force_strategic:
         # When every active direction is held in refractory (none eligible this
         # cycle), request a coalesced strategic coverage refresh so the

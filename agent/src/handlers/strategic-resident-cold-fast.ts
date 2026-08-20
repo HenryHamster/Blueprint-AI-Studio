@@ -5,6 +5,7 @@ import {
 } from '../index.js';
 import { HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT } from '../constants.js';
 import { typedFastRuntimeConfig } from '../providers/foreground-resident.js';
+import type { ResidentSessionEvent } from '../providers/resident-session.js';
 import {
   advanceCursorFromMessages,
   admitMessageBatchPage,
@@ -19,6 +20,7 @@ import {
   OPERATOR_MESSAGE_BATCH_CAP,
   residentConfig,
   type MessagesPollResponse,
+  type StreamFrameKind,
   type ResidentInboundMessage,
   type SessionHeartbeatResponse,
 } from './strategic-resident-lib.js';
@@ -38,6 +40,7 @@ import {
   typedFastFailureBackoffMs,
 } from './typed-fast-resident.js';
 import { monitorClaimBoundWork } from './strategic-resident-claim-monitor.js';
+import { SessionStreamer } from './session-streamer.js';
 
 const COORDINATOR_API_ATTEMPTS = 1;
 const COORDINATOR_API_TIMEOUT_MS = 5_000;
@@ -316,6 +319,42 @@ export async function runCheckoutIndependentFastStartup(
   const isHandoffSafe = (): boolean => handoffSafe;
   const isCallActive = (): boolean => callLeaseIsPubliclyActive(callLease);
 
+  // The operator's chat surface has no incremental feedback between send and the
+  // durable reply commit. Drive the SAME rate-limited emitter the warm Resident
+  // lane uses so a cold-start Fast turn streams too. Observational ONLY: nothing
+  // here may change what is claimed, persisted, retried, or abandoned.
+  const streamer = new SessionStreamer(ws, sessionId, taskId);
+  let streamTurnOpen = false;
+  const openStreamTurn = (): void => {
+    if (streamTurnOpen) return;
+    streamTurnOpen = true;
+    streamer.responding();
+  };
+  /** Terminate an in-flight turn on EVERY exit path (success, provider failure,
+   *  interrupt, claim loss, stop request) so no consumer is left with a stuck
+   *  in-flight turn. Idempotent: a second call after `done` emits nothing. */
+  const closeStreamTurn = (): void => {
+    if (!streamTurnOpen) return;
+    streamTurnOpen = false;
+    streamer.flush();
+    streamer.done();
+  };
+  const streamSessionEvent = (ev: ResidentSessionEvent): void => {
+    if (ev.kind === 'text' && ev.text) {
+      // Live transcript only — the durable reply is still authored exclusively
+      // through the staged receipt-bound completion.
+      streamer.delta(ev.text);
+    } else if (ev.kind === 'tool' || ev.kind === 'activity') {
+      if (ev.activity) {
+        streamer.activity(ev.activity.kind as StreamFrameKind, ev.activity.text);
+      } else if (ev.kind === 'tool') {
+        streamer.tool(ev.toolName, ev.text);
+      }
+    } else if (ev.kind === 'error' && ev.text) {
+      streamer.status(`error: ${ev.text}`);
+    }
+  };
+
   const restoreStatus = (): void => {
     if (previousStatus !== null && statusRef.value === RESPONDING_STATUS) {
       statusRef.value = previousStatus;
@@ -590,6 +629,9 @@ export async function runCheckoutIndependentFastStartup(
           model: config.model,
           effort: config.effort,
         });
+        // Registered before the first session exists; the controller re-attaches
+        // it to every session it starts, including a mid-turn crash replacement.
+        controller.onEvent(streamSessionEvent);
         await controller.ensureReady();
         if (workspaceFencesProvisioning() || isStopRequested()) return;
         ready = controller.isAlive();
@@ -682,6 +724,16 @@ export async function runCheckoutIndependentFastStartup(
   };
 
   const dispatchClaim = async (
+    messages: ResidentInboundMessage[],
+  ): Promise<'completed' | 'released' | 'deferred' | 'workspace'> => {
+    try {
+      return await dispatchClaimTurn(messages);
+    } finally {
+      closeStreamTurn();
+    }
+  };
+
+  const dispatchClaimTurn = async (
     messages: ResidentInboundMessage[],
   ): Promise<'completed' | 'released' | 'deferred' | 'workspace'> => {
     const selectedMessages = selectTypedFastClaimMessages(messages, pendingClaim);
@@ -791,6 +843,7 @@ export async function runCheckoutIndependentFastStartup(
       if (previousStatus === null) previousStatus = statusRef.value;
       // Pending poll/readiness/claim is not yet a response in progress.
       statusRef.value = RESPONDING_STATUS;
+      openStreamTurn();
       const dispatchOnce = () => exactController.dispatch(receipt, prompt).then(
         value => ({ status: 'fulfilled' as const, value }),
         (reason: unknown) => ({ status: 'rejected' as const, reason }),

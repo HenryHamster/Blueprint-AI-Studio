@@ -169,7 +169,7 @@ function PipelineStatusPill({
   className?: string;
 }) {
   const toneClass = {
-    neutral: 'border-neutral-800/80 bg-neutral-950/35 text-neutral-400',
+    neutral: 'border-neutral-800/80 bg-workbench-shell/35 text-neutral-400',
     good: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300',
     warn: 'border-amber-500/20 bg-amber-500/10 text-amber-300',
     bad: 'border-red-500/25 bg-red-500/10 text-red-300',
@@ -245,7 +245,7 @@ function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
           aria-expanded={detailsOpen}
           aria-controls="pipeline-status-details"
           onClick={() => setDetailsOpen(open => !open)}
-          className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded border border-neutral-800 bg-neutral-950/45 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200 sm:min-h-7 sm:min-w-7"
+          className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded border border-neutral-800 bg-workbench-shell/45 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200 sm:min-h-7 sm:min-w-7"
           title={detailsOpen ? 'Hide data details' : 'Show data details'}
         >
           {detailsOpen ? <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />}
@@ -288,7 +288,7 @@ function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
         <dl
           id="pipeline-status-details"
           data-testid="pipeline-status-details"
-          className="grid min-w-0 grid-cols-2 gap-px border-t border-neutral-800/80 bg-neutral-900/70 sm:grid-cols-3 lg:grid-cols-6"
+          className="grid min-w-0 grid-cols-2 gap-px border-t border-neutral-800/80 bg-workbench-base/70 sm:grid-cols-3 lg:grid-cols-6"
         >
           <PipelineStatusDetail
             label="Scope"
@@ -340,7 +340,7 @@ function PipelineHealthRow({
   tone?: 'neutral' | 'good' | 'warn' | 'bad' | 'info';
 }) {
   const toneClass = {
-    neutral: { dot: 'bg-neutral-500', value: 'text-neutral-200' },
+    neutral: { dot: 'bg-workbench-control', value: 'text-neutral-200' },
     good: { dot: 'bg-emerald-400', value: 'text-emerald-200' },
     warn: { dot: 'bg-amber-400', value: 'text-amber-200' },
     bad: { dot: 'bg-red-400', value: 'text-red-200' },
@@ -362,7 +362,7 @@ function pipelineNowToneClass(tone: PipelineNowTone): string {
   return {
     active: 'border-emerald-500/20 bg-emerald-500/5 text-emerald-200',
     attention: 'border-red-500/25 bg-red-500/5 text-red-200',
-    queued: 'border-neutral-800 bg-neutral-950/35 text-neutral-300',
+    queued: 'border-neutral-800 bg-workbench-shell/35 text-neutral-300',
     selected: 'border-cyan-500/20 bg-cyan-500/5 text-cyan-200',
     waiting: 'border-violet-500/25 bg-violet-500/5 text-violet-200',
   }[tone];
@@ -468,7 +468,7 @@ function PipelineNowRow({
           <button
             type="button"
             onClick={() => onTrackTask(item.task)}
-            className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-neutral-800 bg-neutral-950/55 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-neutral-800 bg-workbench-shell/55 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200"
             title={`Track ${item.task.title || item.task.id}`}
             aria-label={`Track ${item.task.title || item.task.id}`}
           >
@@ -553,13 +553,13 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
             <div className="flex min-w-0 items-center gap-1.5">
               <h2 className="truncate text-sm font-semibold text-neutral-100">Task health</h2>
               {flow.hasActiveFilters && (
-                <span className="shrink-0 rounded border border-neutral-700/80 bg-neutral-950/50 px-1.5 py-0.5 font-mono text-ui-sm uppercase tracking-normal text-neutral-500">
+                <span className="shrink-0 rounded border border-neutral-700/80 bg-workbench-shell/50 px-1.5 py-0.5 font-mono text-ui-sm uppercase tracking-normal text-neutral-500">
                   filtered
                 </span>
               )}
             </div>
           </div>
-          <span className={`shrink-0 rounded border px-2 py-0.5 font-mono text-ui-sm ${attentionCount > 0 ? 'border-amber-500/20 bg-amber-500/10 text-amber-300' : 'border-neutral-800 bg-neutral-950/40 text-neutral-500'}`}>
+          <span className={`shrink-0 rounded border px-2 py-0.5 font-mono text-ui-sm ${attentionCount > 0 ? 'border-amber-500/20 bg-amber-500/10 text-amber-300' : 'border-neutral-800 bg-workbench-shell/40 text-neutral-500'}`}>
             {attentionLabel}
           </span>
         </div>

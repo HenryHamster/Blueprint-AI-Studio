@@ -92,7 +92,7 @@ function IterDistBar({ dist }: { dist: Record<string, number> }) {
           <div
             key={k}
             title={`${k} iter: ${count} (${Math.round(pct)}%)`}
-            className={`${colors[i]} rounded-sm shrink-0`}
+            className={`${colors[i]} rounded shrink-0`}
             style={{ width: `${Math.max(pct, 2)}%`, height: `${Math.max(pct / 100 * 16, 2)}px` }}
           />
         );
@@ -104,7 +104,7 @@ function IterDistBar({ dist }: { dist: Record<string, number> }) {
 function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggregate; onChipClick: (loop: string, reason: string) => void }) {
   if (data.task_count === 0) {
     return (
-      <div className="bg-neutral-900/60 rounded-lg p-3 border border-neutral-800 flex flex-col gap-1 min-w-0">
+      <div className="bg-workbench-base/60 rounded-lg p-3 border border-neutral-800 flex flex-col gap-1 min-w-0">
         <span className={`text-xs font-semibold uppercase tracking-wide ${LOOP_COLORS[name]}`}>{LOOP_LABELS[name]}</span>
         <span className="text-xs text-neutral-600">no data</span>
       </div>
@@ -118,7 +118,7 @@ function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggrega
     .slice(0, 4);
 
   return (
-    <div className="bg-neutral-900/60 rounded-lg p-3 border border-neutral-800 flex flex-col gap-2 min-w-0">
+    <div className="bg-workbench-base/60 rounded-lg p-3 border border-neutral-800 flex flex-col gap-2 min-w-0">
       <div className="flex items-center justify-between gap-2">
         <span className={`text-xs font-semibold uppercase tracking-wide ${LOOP_COLORS[name]}`}>{LOOP_LABELS[name]}</span>
         <span className="text-xs text-neutral-500">{data.task_count} task{data.task_count !== 1 ? 's' : ''}</span>
@@ -143,7 +143,7 @@ function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggrega
 
       <div className="flex flex-wrap gap-1">
         {topReasons.map(([reason, count]) => {
-          const cls = EXIT_REASON_COLORS[reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+          const cls = EXIT_REASON_COLORS[reason] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
           return (
             <button
               data-viewport-allow-small-target
@@ -229,10 +229,10 @@ function DrillDownPanel({
     return () => { panelMountedRef.current = false; };
   }, [fetchDiverged]);
 
-  const reasonCls = EXIT_REASON_COLORS[effectiveReason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  const reasonCls = EXIT_REASON_COLORS[effectiveReason] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
 
   return (
-    <div className="mt-2 bg-neutral-900/80 rounded-lg border border-neutral-700 p-3">
+    <div className="mt-2 bg-workbench-base/80 rounded-lg border border-neutral-700 p-3">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex items-center gap-2 flex-wrap">
           <span className={`text-ui-sm font-semibold uppercase tracking-wide ${LOOP_COLORS[filter.loop]}`}>{LOOP_LABELS[filter.loop]}</span>
@@ -248,7 +248,7 @@ function DrillDownPanel({
           {DIVERGENCE_PATTERNS.map(p => {
             const count = patternCounts[p] ?? 0;
             if (count === 0) return null;
-            const cls = EXIT_REASON_COLORS[p] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+            const cls = EXIT_REASON_COLORS[p] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
             const isActive = activePattern === p;
             return (
               <button
@@ -279,7 +279,7 @@ function DrillDownPanel({
       {!loading && !error && tasks.length > 0 && (
         <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto pr-1">
           {tasks.map(t => (
-            <div key={t.task_id} className="bg-neutral-800/60 rounded p-2 flex flex-col gap-0.5 min-w-0">
+            <div key={t.task_id} className="bg-workbench-panel/60 rounded p-2 flex flex-col gap-0.5 min-w-0">
               <div className="flex items-start justify-between gap-2">
                 <span className="text-ui-md text-neutral-200 font-medium leading-tight truncate flex-1" title={t.title}>{t.title}</span>
                 {onViewTask && (
@@ -296,7 +296,7 @@ function DrillDownPanel({
                 <span className="text-ui-sm text-neutral-500">{t.task_type}</span>
                 {t.scope && <span className="text-ui-sm text-neutral-600">{t.scope}</span>}
                 <span className="text-ui-sm text-neutral-600">{t.iteration_count} iter</span>
-                <span className={`text-ui-sm px-1 py-0.5 rounded border ${EXIT_REASON_COLORS[t.exit_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}>
+                <span className={`text-ui-sm px-1 py-0.5 rounded border ${EXIT_REASON_COLORS[t.exit_reason] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30'}`}>
                   {t.exit_reason.replace(/_/g, ' ')}
                 </span>
               </div>

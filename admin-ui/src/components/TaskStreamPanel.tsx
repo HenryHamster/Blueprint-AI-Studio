@@ -30,11 +30,11 @@ function statusDotColor(status?: string): string {
     case 'PROVISIONING': return 'bg-amber-500';
     case 'COMPLETED': return 'bg-emerald-500';
     case 'FAILED': return 'bg-red-500';
-    case 'CANCELLED': return 'bg-neutral-500';
-    case 'QUEUED': return 'bg-neutral-400';
+    case 'CANCELLED': return 'bg-workbench-control';
+    case 'QUEUED': return 'bg-workbench-control';
     case 'BLOCKED': return 'bg-amber-500';
     case 'PARKED': return 'bg-purple-500';
-    default: return 'bg-neutral-600';
+    default: return 'bg-workbench-card';
   }
 }
 
@@ -96,11 +96,11 @@ export default function TaskStreamPanel({
 
   const activeTask = tasks.find(t => t.id === activeTab);
   const panelClassName = embedded
-    ? 'flex h-[360px] max-h-[52vh] min-h-[260px] min-w-0 flex-col overflow-hidden rounded-md border border-neutral-800 bg-[#10151c]'
-    : `fixed bottom-0 z-40 flex flex-col bg-neutral-950 border-l border-t border-neutral-800 shadow-2xl transition-all ${hideOnDesktop ? 'lg:hidden' : ''} ${isCollapsed ? 'h-10' : 'h-[420px]'}`;
+    ? 'flex h-[360px] max-h-[52vh] min-h-[260px] min-w-0 flex-col overflow-hidden rounded-md border border-neutral-800 bg-workbench-layer'
+    : `fixed bottom-0 z-40 flex flex-col bg-workbench-shell border-l border-t border-neutral-800 shadow-2xl transition-all ${hideOnDesktop ? 'lg:hidden' : ''} ${isCollapsed ? 'h-10' : 'h-[420px]'}`;
   const headerClassName = embedded
     ? 'flex shrink-0 items-center justify-between gap-2 border-b border-neutral-800 bg-[#0b1118] px-3 py-2.5'
-    : 'flex items-center justify-between px-3 py-2 border-b border-neutral-800 shrink-0 bg-neutral-900/80';
+    : 'flex items-center justify-between px-3 py-2 border-b border-neutral-800 shrink-0 bg-workbench-base/80';
   const tabStripClassName = embedded
     ? 'flex shrink-0 items-center gap-1 overflow-x-auto border-b border-neutral-800 bg-[#0b1118]/60 px-2 py-1.5 custom-scrollbar'
     : 'flex items-center gap-1 px-2 py-1.5 border-b border-neutral-800 overflow-x-auto shrink-0 custom-scrollbar';
@@ -129,7 +129,7 @@ export default function TaskStreamPanel({
           {embedded && <span className="shrink-0 font-mono text-ui-sm text-neutral-500">{ids.length} tracked</span>}
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <button type="button" onClick={() => onUntrackAll()} className={`${embedded ? 'rounded border border-neutral-800 bg-neutral-950/50 p-1' : 'p-0.5'} text-neutral-500 transition-colors hover:text-red-400`} title="Untrack all">
+          <button type="button" onClick={() => onUntrackAll()} className={`${embedded ? 'rounded border border-neutral-800 bg-workbench-shell/50 p-1' : 'p-0.5'} text-neutral-500 transition-colors hover:text-red-400`} title="Untrack all">
             <Trash2 className="h-3.5 w-3.5" />
           </button>
           {!embedded && (
@@ -152,7 +152,7 @@ export default function TaskStreamPanel({
                 const isActive = id === activeTab;
                 return (
                   <div key={id}
-                    className={`flex shrink-0 items-center rounded text-ui-sm whitespace-nowrap transition-colors ${isActive ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300'}`}>
+                    className={`flex shrink-0 items-center rounded text-ui-sm whitespace-nowrap transition-colors ${isActive ? 'bg-workbench-panel text-neutral-100' : 'text-neutral-500 hover:bg-workbench-hover hover:text-neutral-300'}`}>
                     {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                     <button type="button" onClick={() => { setSelectedTab(id); setAutoScroll(true); }}
                       className="flex min-w-0 items-center gap-1.5 px-2 py-1 text-left">

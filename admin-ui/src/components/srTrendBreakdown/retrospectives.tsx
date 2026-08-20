@@ -77,7 +77,7 @@ export function SrMissedRetrospective({
           <select
             value={categoryFilter}
             onChange={event => setCategoryFilter(event.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
+            className="bg-workbench-base border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
           >
             <option value="">All categories</option>
             {allCategories.map(category => <option key={category} value={category}>{category}</option>)}
@@ -87,7 +87,7 @@ export function SrMissedRetrospective({
           <select
             value={typeFilter}
             onChange={event => setTypeFilter(event.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
+            className="bg-workbench-base border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
           >
             <option value="">All types</option>
             {allTypes.map(type => <option key={type} value={type}>{type}</option>)}
@@ -103,7 +103,7 @@ export function SrMissedRetrospective({
             // eslint-disable-next-line viewport/min-touch-target -- task rows are intentionally compact and match the pre-refactor panel behavior
             <div
               key={task.task_id}
-              className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
+              className={`bg-workbench-base/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
               onClick={() => onTaskClick?.(task.task_id)}
             >
               <div className="flex items-center gap-1.5 mb-0.5">
@@ -142,9 +142,9 @@ export function SrMissedRetrospective({
                   {task.missed_categories.map(category => {
                     const sr = task.sr_check_results?.[category];
                     return (
-                      <div key={category} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
+                      <div key={category} className="rounded border border-neutral-800/60 bg-workbench-shell/50 p-1.5">
                         <div className="mb-1 text-neutral-400">{category}</div>
-                        <div className="rounded border border-neutral-800/50 bg-neutral-900/60 p-1.5">
+                        <div className="rounded border border-neutral-800/50 bg-workbench-base/60 p-1.5">
                           <div className="mb-0.5 text-ui-xs uppercase tracking-wide text-neutral-500">Self-review evidence</div>
                           {sr ? (
                             <>
@@ -220,7 +220,7 @@ export function SrUnhandledEdgesRetrospective({
           <select
             value={typeFilter}
             onChange={event => setTypeFilter(event.target.value)}
-            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
+            className="bg-workbench-base border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
           >
             <option value="">All types</option>
             {allTypes.map(type => <option key={type} value={type}>{type}</option>)}
@@ -236,7 +236,7 @@ export function SrUnhandledEdgesRetrospective({
             // eslint-disable-next-line viewport/min-touch-target -- task rows are intentionally compact and match the pre-refactor panel behavior
             <div
               key={task.task_id}
-              className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
+              className={`bg-workbench-base/50 border border-neutral-800/50 rounded px-2 py-1.5 text-ui-sm ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
               onClick={() => onTaskClick?.(task.task_id)}
             >
               <div className="flex items-center gap-1.5 mb-0.5">
@@ -269,7 +269,7 @@ export function SrUnhandledEdgesRetrospective({
               {openTaskIds.has(task.task_id) && (
                 <div className="mt-1.5 flex flex-col gap-1">
                   {task.unhandled_edges.map((edge, index) => (
-                    <div key={index} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
+                    <div key={index} className="rounded border border-neutral-800/60 bg-workbench-shell/50 p-1.5">
                       <div className="mb-1 text-neutral-400 font-medium text-ui-sm">{edge.case}</div>
                       {edge.blind_spot && <div className="text-neutral-500 text-ui-xs">{edge.blind_spot}</div>}
                       {edge.origin && <div className="text-neutral-600 text-ui-xs">source: {edge.origin}</div>}

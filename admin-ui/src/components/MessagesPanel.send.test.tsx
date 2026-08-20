@@ -5,7 +5,7 @@ import { fireEvent, waitFor } from '@testing-library/react';
 import { MessagesPanel as MessagesPanelComponent, type MessagesPanelProps } from './MessagesPanel';
 
 import type { ProjectMessage } from './MessageBubble';
-import { armingToastCopy, armingHintCopy, type ArmingOutcome } from './messageArming';
+import { armingToastCopy, armingHintCopy } from './messageArming';
 import { auth } from '../firebase';
 import { loadComposerDraft } from '../utils/conversationDraftState';
 import type { StrategicStateResponse } from '../strategicStateApi';
@@ -359,12 +359,11 @@ describe('MessagesPanel send arming receipt', () => {
     return host as HTMLDivElement;
   }
 
-  // The composer hint <p> always renders one of the send-result ArmingOutcome hint
-  // strings; locate it by matching its text against that closed set.
-  const ALL_HINTS = (['steering', 'passive_note', 'routine_event', 'not_armed', 'duplicate'] as ArmingOutcome[])
-    .map(armingHintCopy);
+  // The composer only ever renders an inline hint <p> for the not_armed outcome
+  // (a genuine delivery failure); every other outcome is toast-only.
+  const NOT_ARMED_HINT = armingHintCopy('not_armed');
   function hintText(el: HTMLElement): string | null {
-    const p = [...el.querySelectorAll('p')].find(p => ALL_HINTS.includes(p.textContent ?? ''));
+    const p = [...el.querySelectorAll('p')].find(p => p.textContent === NOT_ARMED_HINT);
     return p?.textContent ?? null;
   }
 
@@ -399,7 +398,8 @@ describe('MessagesPanel send arming receipt', () => {
     expect(text).toBe(armingToastCopy('steering'));
     expect(text).toContain('steering the strategist');
     expect(severity).toBe('success');
-    expect(hintText(el)).toBe(armingHintCopy('steering'));
+    // steering is steady-state narration: no inline composer hint for it.
+    expect(hintText(el)).toBeNull();
   });
 
   test('steering send refreshes Strategic state and shows pending badge immediately', async () => {
@@ -595,7 +595,8 @@ describe('MessagesPanel send arming receipt', () => {
     expect(text).toBe(armingToastCopy('passive_note'));
     expect(text).toContain('won’t wake the strategist');
     expect(severity).toBe('success');
-    expect(hintText(el)).toBe(armingHintCopy('passive_note'));
+    // passive_note is steady-state narration: no inline composer hint for it.
+    expect(hintText(el)).toBeNull();
   });
 
   test('successful send records the Strategic interaction', async () => {
@@ -621,7 +622,8 @@ describe('MessagesPanel send arming receipt', () => {
     expect(text).toBe(armingToastCopy('routine_event'));
     expect(text).toContain('routine event');
     expect(severity).toBe('success');
-    expect(hintText(el)).toBe(armingHintCopy('routine_event'));
+    // routine_event is steady-state narration: no inline composer hint for it.
+    expect(hintText(el)).toBeNull();
   });
 
   test('not_armed send shows a non-success "wasn’t woken" receipt — NOT a false steering promise', async () => {
@@ -641,38 +643,39 @@ describe('MessagesPanel send arming receipt', () => {
     expect(text).not.toContain('steering the strategist');
     expect(severity).toBe('info');
     expect(severity).not.toBe('success');
-    expect(hintText(el)).toBe(armingHintCopy('not_armed'));
+    const hintEl = [...el.querySelectorAll('p')].find(p => p.textContent === armingHintCopy('not_armed'));
+    expect(hintEl).toBeTruthy();
+    expect(hintEl?.getAttribute('role')).toBe('alert');
+    expect(hintEl?.className).toContain('text-amber-400');
   });
 
-  test('composer hint reflects the server\'s real outcome, not the type-only guess', async () => {
-    // Default type is FEEDBACK, which predicts `steering`. The server instead
-    // reports `routine_event`, so the post-send hint must show the real outcome
-    // — proving the hint is grounded in the response, not the type prediction.
+  test('no other outcome leaves an inline composer hint behind, before or after send', async () => {
+    // Default type is FEEDBACK. No predictive pre-send hint is shown, and the
+    // server-reported routine_event outcome (steady-state narration) is
+    // toast-only — the composer stays free of it.
     _setupSendMock({ arming: 'routine_event' });
     const addToast = vi.fn();
     const el = await renderPanel(addToast);
-    // Before any send the hint is the type-based prediction (steering).
-    expect(hintText(el)).toBe(armingHintCopy('steering'));
+    expect(hintText(el)).toBeNull();
 
     await typeAndSend(el, 'message that the server treats as routine');
     await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
 
-    expect(hintText(el)).toBe(armingHintCopy('routine_event'));
-    expect(hintText(el)).not.toBe(armingHintCopy('steering'));
+    expect(hintText(el)).toBeNull();
   });
 
-  test('changing message type resets the hint to the type-based prediction', async () => {
+  test('changing message type clears a stale not_armed warning', async () => {
     _setupSendMock({ arming: 'not_armed' });
     const addToast = vi.fn();
     const el = await renderPanel(addToast);
     await typeAndSend(el, 'urgent steering attempt');
     await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
-    // After the send the hint reflects the real (not_armed) outcome.
+    // After the send the not_armed warning is visible.
     expect(hintText(el)).toBe(armingHintCopy('not_armed'));
 
     // Switch the message type to Note via the composer dropdown. Selecting a new
-    // type clears the last-arming memory, so the hint falls back to the
-    // type-based prediction (NOTE → passive_note).
+    // type clears the last-arming memory, so the stale warning disappears —
+    // there is no predictive replacement hint to fall back to.
     const typeBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Feedback');
     expect(typeBtn).toBeTruthy();
     await act(async () => { (typeBtn as HTMLButtonElement).click(); });
@@ -680,28 +683,7 @@ describe('MessagesPanel send arming receipt', () => {
     expect(noteOpt).toBeTruthy();
     await act(async () => { (noteOpt as HTMLButtonElement).click(); });
 
-    expect(hintText(el)).toBe(armingHintCopy('passive_note'));
-    expect(hintText(el)).not.toBe(armingHintCopy('not_armed'));
-  });
-
-  test('live strategist-busy state queues the pre-send steering hint and shows the working affordance', async () => {
-    _setupSendMock({ arming: 'steering' });
-    const addToast = vi.fn();
-    // Strategist mid-cycle: default FEEDBACK type predicts steering, but the
-    // live busy signal must flip the pre-send hint to the queued copy and show
-    // the at-a-glance "Strategist working…" affordance.
-    const el = await renderPanel(addToast, true);
-
-    // The four-outcome hintText() helper deliberately won't match the queued
-    // copy — assert on the composer paragraph text directly.
-    expect(el.textContent).toContain('queues for the next cycle');
-    expect(el.textContent).not.toContain('reaches the strategist soon');
-    expect(el.textContent).toContain('Strategist working');
-
-    // Post-send the server's real outcome still wins, overriding the busy hint.
-    await typeAndSend(el, 'please reprioritize while a cycle is running');
-    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
-    expect(hintText(el)).toBe(armingHintCopy('steering'));
+    expect(hintText(el)).toBeNull();
   });
 
   test('response missing the arming field falls back to the generic confirmation without error', async () => {
@@ -717,8 +699,8 @@ describe('MessagesPanel send arming receipt', () => {
     // No arming → generic success, and never a failure toast.
     expect(severity).toBe('success');
     expect(text).not.toBe('Failed to send message');
-    // Hint falls back to the type-based prediction (FEEDBACK → steering).
-    expect(hintText(el)).toBe(armingHintCopy('steering'));
+    // No arming is not a not_armed failure — no inline warning shown.
+    expect(hintText(el)).toBeNull();
   });
 
   test('a failed send and its retry reuse one idempotency key, so a double-submit is one logical message', async () => {
@@ -1055,7 +1037,8 @@ describe('MessagesPanel send arming receipt', () => {
     await typeAndSend(el, 'steer: focus on the migration work');
     await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
     expect(addToast).toHaveBeenCalledWith(armingToastCopy('duplicate'), 'success');
-    expect(hintText(el)).toBe(armingHintCopy('duplicate'));
+    // duplicate is steady-state narration: no inline composer hint for it.
+    expect(hintText(el)).toBeNull();
     expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
   });
 });
@@ -1867,5 +1850,59 @@ describe('MessagesPanel attachment integration', () => {
         value: originalCreateObjectURL,
       });
     }
+  });
+
+  test('an unconfirmed send recovers automatically with the same idempotency key and never duplicates', async () => {
+    const postKeys: string[] = [];
+    let postCount = 0;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        // The canonical store never sees the first attempt land — this is what
+        // makes the automatic retry safe to re-run unattended.
+        return new Response(JSON.stringify({ conversation: { limit: 100, has_more: false, items: [] } }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        const body = JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>;
+        postKeys.push(String(body.idempotency_key));
+        postCount += 1;
+        if (postCount === 1) return new Response(JSON.stringify({ detail: 'boom' }), { status: 500 });
+        return new Response(JSON.stringify({
+          message: makeMsg({
+            id: 'recovered-send', project_id: 'proj-1', from_type: 'user',
+            content: String(body.content), surface: 'conversation', handling_state: 'pending',
+            idempotency_key: String(body.idempotency_key),
+          }),
+          wakeup_state: 'queued',
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast, { filterChrome: 'minimal', canOperateProject: true });
+
+    fireEvent.change(el.querySelector('textarea')!, { target: { value: 'please pick this up without me clicking retry' } });
+    const send = el.querySelector('button[aria-label="Send message"]') as HTMLButtonElement;
+    await act(async () => { send.click(); });
+
+    // The dropped send parks in needs_retry and — with no further clicks —
+    // the panel re-posts under the SAME idempotency key on its own.
+    await waitFor(() => expect(postCount).toBe(2));
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    expect(postKeys.length).toBe(2);
+    expect(postKeys[0]).toBeTruthy();
+    expect(postKeys[0]).toBe(postKeys[1]);
+
+    // The recovery settles the send — no lingering needs_retry / Retry affordance.
+    await waitFor(() => expect(el.querySelector('button[aria-label="Retry message"]')).toBeNull());
+
+    // Give any runaway auto-retry loop a chance to misfire, then confirm it didn't.
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 20)); });
+    expect(postCount).toBe(2);
   });
 });

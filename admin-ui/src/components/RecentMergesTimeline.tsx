@@ -27,20 +27,20 @@ export function RecentMergesTimeline({
       {loading ? (
         <div className="space-y-3"><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /></div>
       ) : mergeEvents.length === 0 ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No recent merges</div>
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No recent merges</div>
       ) : (
         <div className="relative pl-4 space-y-0">
           {/* vertical line */}
-          <div className="absolute left-1.5 top-1 bottom-1 w-px bg-neutral-800" />
+          <div className="absolute left-1.5 top-1 bottom-1 w-px bg-workbench-panel" />
           {mergeEvents.map(ev => {
             const dotColor = (ev.task_type === 'fix' || ev.task_type === 'review') ? 'bg-amber-500' : 'bg-emerald-500';
-            const typeCls = TASK_TYPE_COLORS[ev.task_type ?? ''] ?? 'bg-neutral-500/20 text-neutral-400';
+            const typeCls = TASK_TYPE_COLORS[ev.task_type ?? ''] ?? 'bg-workbench-control/20 text-neutral-400';
             const dirLabel = ev.direction_text ? ev.direction_text.slice(0, 30) + (ev.direction_text.length > 30 ? '…' : '') : null;
             const unverifiedReason = ev.unverified_merge_reason ? ev.unverified_merge_reason.trim() : '';
             return (
               <div key={ev.task_id} className="relative pb-3">
                 <div className={`absolute -left-2.5 top-1.5 w-2 h-2 rounded-full ${dotColor} ring-2 ring-neutral-950`} />
-                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
+                <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-2.5">
                   <div className="flex items-start gap-2">
                     <GitMerge className="w-3.5 h-3.5 text-neutral-500 mt-0.5 shrink-0" />
                     <div className="flex-1 min-w-0">

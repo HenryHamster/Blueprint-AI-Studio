@@ -374,15 +374,30 @@ describe('WorkbenchComposition viewport regression', () => {
               title="Strategic"
               showTitle={false}
               actions={(
-                <StrategicSessionControl
-                  currentMode="chat"
-                  sessionActive={false}
-                  sessionState="ready"
-                  onStartSession={vi.fn()}
-                  onStopSession={vi.fn()}
-                  onModeChange={vi.fn()}
-                  density="compact"
-                />
+                <>
+                  <StrategicSessionControl
+                    currentMode="chat"
+                    sessionActive={false}
+                    sessionState="ready"
+                    onStartSession={vi.fn()}
+                    onStopSession={vi.fn()}
+                    onModeChange={vi.fn()}
+                    density="compact"
+                  />
+                  {/* Mirror of the App.tsx workbench-header mobile context
+                      launcher (lg:hidden). #17499 removed the composer-adjacent
+                      descriptor launcher, so this header button is the real
+                      app's only mobile path to Strategic context. */}
+                  <button
+                    type="button"
+                    onClick={options.onOpenContext ?? (() => {})}
+                    className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 px-2.5 text-xs font-semibold text-neutral-300 sm:min-h-9 lg:hidden"
+                    title="Open Strategic context"
+                    aria-label="Open Strategic context"
+                  >
+                    Context
+                  </button>
+                </>
               )}
               flush
             >
@@ -515,7 +530,11 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(pipelineButton).toBeTruthy();
     expect(rail).toBeTruthy();
     expect(getComputedStyle(rail!.closest('aside')!).display).not.toBe('none');
-    expect(host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]')).toBeNull();
+    // The header context launcher exists (mirroring App.tsx) but is lg:hidden —
+    // at desktop widths the rail itself is the context surface.
+    const desktopContextLauncher = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
+    expect(desktopContextLauncher).toBeTruthy();
+    expect(getComputedStyle(desktopContextLauncher!).display).toBe('none');
     expect(headerCommandSearch).toBeTruthy();
     expect(commandButtons).toContain(headerCommandSearch);
     expect(composerCommandButtons).toHaveLength(0);
@@ -560,7 +579,10 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(getComputedStyle(railAside!).display).toBe('none');
     expect(contextButtons).toHaveLength(1);
     expect(contextButtons[0].closest('[data-testid="strategic-composer-box"]')).toBeNull();
-    expect(contextButtons[0].dataset.testid).toBe('strategic-context-descriptor');
+    // #17499 removed the composer descriptor launcher; the surviving mobile
+    // launcher is the workbench-header Context button (App.tsx, lg:hidden).
+    expect(contextButtons[0].getAttribute('aria-label')).toBe('Open Strategic context');
+    expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')).toBeNull();
     expect(mobileNav).toBeTruthy();
     expect(getComputedStyle(mobileNav!).display).toBe('grid');
     expect(composer!.getBoundingClientRect().bottom).toBeLessThanOrEqual(mobileNav!.getBoundingClientRect().top);

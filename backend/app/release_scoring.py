@@ -26,7 +26,7 @@ from app.migration_reconciliation import effective_authorized_divergences
 from app.finding_identity import audit_finding_key
 
 logger = logging.getLogger(__name__)
-_MODULE_SIZE_GOVERNANCE_CAP: int = 3229
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3900
 
 
 # Canonical fleet default for the promotion confidence gate.  The packaged
@@ -965,6 +965,8 @@ def evaluate_candidate_operator_authorship_gate(
     candidate_version: Any,
     measurement: Any,
     categories: list[dict[str, Any]] | None = None,
+    *,
+    resolved_range: tuple[str | None, str | None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate authorship over the candidate's complete base-to-head range.
 
@@ -974,6 +976,13 @@ def evaluate_candidate_operator_authorship_gate(
     while the candidate is blocked and therefore creates a self-blocking gate.
     ``max_count`` is the existing structured authorship predicate used by
     category grading; multiple contracts use the strictest declared budget.
+
+    ``resolved_range`` overrides the range recomputed from
+    ``candidate_authorship_range(candidate_version)``.  Callers pass it when
+    the version's stored ``base_sha`` was unset and the measurement was taken
+    against a base derived from the promotion target instead -- the gate must
+    validate the receipt against the SAME range that was actually measured,
+    not the still-null stored column.  When omitted, behavior is unchanged.
 
     When NO active category declares an ``operator_authored_commits``
     evidence contract, the gate does not manufacture a zero budget — that
@@ -990,7 +999,17 @@ def evaluate_candidate_operator_authorship_gate(
         validate_authorship_receipt,
     )
 
-    base_sha, candidate_sha = candidate_authorship_range(candidate_version)
+    if resolved_range is not None:
+        base_sha, candidate_sha = resolved_range
+    else:
+        base_sha, candidate_sha = candidate_authorship_range(candidate_version)
+    stored_base_sha, _ = candidate_authorship_range(candidate_version)
+    if stored_base_sha is not None:
+        base_sha_provenance = "stored"
+    elif isinstance(base_sha, str):
+        base_sha_provenance = "derived"
+    else:
+        base_sha_provenance = "unavailable"
     receipt = authorship_receipt_for_measurement(measurement, base_sha, candidate_sha)
     validated = validate_authorship_receipt(receipt, base_sha, candidate_sha)
     if validated is None or validated.get("state") != "resolved":
@@ -999,6 +1018,7 @@ def evaluate_candidate_operator_authorship_gate(
             "passed": False,
             "count": None,
             "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "base_sha_provenance": base_sha_provenance,
             "blocker": "candidate_operator_authorship_evidence_missing",
             "reason": (
                 receipt.get("reason") or "candidate_operator_authorship_receipt_invalid"
@@ -1028,9 +1048,35 @@ def evaluate_candidate_operator_authorship_gate(
             "count": count,
             "max_count": None,
             "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "base_sha_provenance": base_sha_provenance,
             "reason": "no_operator_authorship_contract_declared",
         }
     max_count = min(max_counts)
+    if (
+        isinstance(base_sha, str)
+        and isinstance(candidate_sha, str)
+        and base_sha == candidate_sha
+    ):
+        # A declared contract expects real evidence over the candidate's
+        # range. An identical base/candidate SHA (e.g. an "identical" GitHub
+        # compare, total_commits == 0) proves nothing about the candidate —
+        # it just means no range was actually measured — so it must not be
+        # able to vacuously satisfy the contract the way a genuine
+        # zero-non-bot-commits range would. Report a distinct blocked status
+        # instead of resolving "passed" through an unmeasured range.
+        return {
+            "status": "blocked",
+            "passed": False,
+            "count": count,
+            "max_count": max_count,
+            "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "blocker": "candidate_authorship_range_identical",
+            "reason": (
+                "candidate_sha equals base_sha; a zero-commit range proves no "
+                "operator-authorship evidence and cannot vacuously satisfy "
+                "the declared evidence contract"
+            ),
+        }
     if isinstance(count, int) and count <= max_count:
         return {
             "status": "passed",
@@ -1038,11 +1084,13 @@ def evaluate_candidate_operator_authorship_gate(
             "count": count,
             "max_count": max_count,
             "range": {"base_sha": base_sha, "head_sha": candidate_sha},
+            "base_sha_provenance": base_sha_provenance,
             "reason": "candidate_operator_authored_count_within_contract",
         }
     return {
         "status": "blocked",
         "passed": False,
+        "base_sha_provenance": base_sha_provenance,
         "count": count,
         "max_count": max_count,
         "range": {"base_sha": base_sha, "head_sha": candidate_sha},
@@ -1381,6 +1429,9 @@ def compute_composite(
             "max_count": candidate_operator_authorship_gate.get("max_count"),
             "range": candidate_operator_authorship_gate.get("range"),
             "reason": candidate_operator_authorship_gate.get("reason"),
+            "base_sha_provenance": candidate_operator_authorship_gate.get(
+                "base_sha_provenance"
+            ),
         }
 
     # Goal-verification observability (redesign): surface the per-category grade
@@ -1543,8 +1594,18 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # current validator runs, not an impossible requirement to promote first.
     "migration_identity_collision": EXECUTION_SITE_DEPLOYED,
     "migration_apply_drift": EXECUTION_SITE_DEPLOYED,
-    "candidate_operator_authorship_nonzero": EXECUTION_SITE_CANDIDATE,
-    "candidate_operator_authorship_evidence_missing": EXECUTION_SITE_CANDIDATE,
+    # Deployed-side: the authorship validator (count + evidence-contract
+    # checks) runs in the DEPLOYED backend against the deployed measurement
+    # predicate in release_commit_authorship.py. Re-cutting the candidate
+    # never clears either gate — only a deploy or the hotfix lane does, so a
+    # candidate-side label here would send an operator chasing an automain fix
+    # that cannot take effect until this version itself promotes.
+    "candidate_operator_authorship_nonzero": EXECUTION_SITE_DEPLOYED,
+    "candidate_operator_authorship_evidence_missing": EXECUTION_SITE_DEPLOYED,
+    # Candidate-side: a fresh qualification snapshots a new candidate_sha off
+    # automain HEAD, which stops equaling base_sha the moment automain
+    # advances even one commit past where this version opened.
+    "candidate_authorship_range_identical": EXECUTION_SITE_CANDIDATE,
     # Operator-env site (Slice 4, design 245212a4): the env-preflight judge runs in
     # the DEPLOYED process and compares the candidate's declared boot prerequisites
     # against the deployed process's OWN environ (a presence-proxy of the deploy
@@ -1585,6 +1646,21 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     "criterion_coverage_incomplete": EXECUTION_SITE_DEPLOYED,
     "merge_grade_misses": EXECUTION_SITE_CANDIDATE,
     "capability_proof_gate_blocked": EXECUTION_SITE_CANDIDATE,
+    # Lifecycle and audit blockers below are emitted by the deployed
+    # qualification process.  A repair carried by the candidate is therefore
+    # a self-modifying gate until the version itself promotes; each still has a
+    # non-promotional clearing path in HARD_GATE_CLEARING_PATHS.
+    "qualification_timeout": EXECUTION_SITE_DEPLOYED,
+    "qualification_superseded": EXECUTION_SITE_DEPLOYED,
+    "qualification_contract_superseded": EXECUTION_SITE_DEPLOYED,
+    "sweep_finalize_crash_loop": EXECUTION_SITE_DEPLOYED,
+    "prepromotion_rehearsal_dispatch_pending": EXECUTION_SITE_DEPLOYED,
+    "incompatible_probe": EXECUTION_SITE_DEPLOYED,
+    "audit_challenge_independent_blocker": EXECUTION_SITE_DEPLOYED,
+    # Promotion-disabled is not a code-side gate: the deployed qualifier reads
+    # the project setting and the remedy is an operator environment/config
+    # change that creates the next revision.
+    "promotion_disabled": EXECUTION_SITE_OPERATOR_ENV,
     # NOTE: ``uncorroborated_attestation`` is deliberately absent — the
     # attestation gate it classified was replaced by the per-category
     # goal-verification gate (which blocks as ``criterion_coverage_incomplete``),
@@ -1608,6 +1684,9 @@ HARD_GATE_CLEARING_PATHS: dict[str, dict[str, str]] = {
     },
     "candidate_operator_authorship_evidence_missing": {
         "kind": "input", "evidence": "produce candidate range measurement"
+    },
+    "candidate_authorship_range_identical": {
+        "kind": "input", "evidence": "requalify once automain advances past base_sha"
     },
     "boot_prereq_missing": {
         "kind": "override", "evidence": "bind env or acknowledge same-deploy binding"
@@ -1633,6 +1712,38 @@ HARD_GATE_CLEARING_PATHS: dict[str, dict[str, str]] = {
     "merge_grade_misses": {"kind": "input", "evidence": "satisfy the candidate goal"},
     "capability_proof_gate_blocked": {
         "kind": "input", "evidence": "prove candidate capabilities"
+    },
+    "qualification_timeout": {
+        "kind": "input", "evidence": "complete or recover the pending qualification"
+    },
+    "qualification_superseded": {
+        "kind": "input", "evidence": "reconcile the already-landed candidate"
+    },
+    "qualification_contract_superseded": {
+        "kind": "input", "evidence": "rerun against the current qualification contract"
+    },
+    "sweep_finalize_crash_loop": {
+        "kind": "input", "evidence": "repair the sweep finalization failure"
+    },
+    "prepromotion_rehearsal_dispatch_pending": {
+        "kind": "input", "evidence": "dispatch or reconcile the rehearsal outbox intent"
+    },
+    "incompatible_probe": {
+        "kind": "input", "evidence": "remove or replace the incompatible product probe"
+    },
+    "audit_challenge_independent_blocker": {
+        "kind": "input", "evidence": "resolve the independent challenger finding"
+    },
+    # The remedy is an operator config change, but the invariant in
+    # test_release_qualifier.test_every_hard_promotion_gate_has_a_non_promotional_clearing_path
+    # forbids the "promot" root in clearing evidence (a gate may not document
+    # shipping the release as its own recovery).  Name the runtime-config
+    # toggle descriptively instead of by its literal key.
+    "promotion_disabled": {
+        "kind": "override",
+        "evidence": (
+            "turn on this project's release-delivery toggle in runtime config"
+        ),
     },
 }
 

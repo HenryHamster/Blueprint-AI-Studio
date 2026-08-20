@@ -17,6 +17,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -67,9 +68,36 @@ def _relative_source(source: Path, tree_root: Path) -> str:
 def _normalize_failure_detail(detail: str, *, tree_root: Path | None) -> str:
     """Remove checkout- and runtime-specific noise from failure diagnostics."""
 
+    # pytest-asyncio names its internal Tasks 'Task-<n>' with a process-wide,
+    # monotonically increasing counter. The same test can surface a different
+    # counter value on every run (baseline vs current, or even rerun vs rerun)
+    # purely because of how many async Tasks happened to be created earlier in
+    # the session — never because the test's own behavior changed. Left
+    # unnormalized, this alone makes an identical pre-existing failure
+    # unmatchable across a baseline/current comparison.
+    normalized = re.sub(r"Task-\d+", "Task-<n>", detail)
+    # A coroutine/Task repr truncates its embedded source path with a leading
+    # '...' once the qualname exceeds Python's internal repr budget, so the
+    # checkout-root replace below (which only matches the FULL, untruncated
+    # path) never fires on it. The checkout directory name differs between
+    # the current tree and a freshly `git archive`-extracted baseline temp
+    # dir, so this truncated prefix is exactly the same kind of checkout
+    # noise the full-path replace targets — just past the ellipsis instead of
+    # at the start of the string.
+    normalized = re.sub(r"\.\.\.[^\s>]*?/backend/", ".../<repo-root>/backend/", normalized)
+    # A canonical UUID (e.g. a task id embedded in a diagnostic message by
+    # f"... for task {task_id_str}: {chain_exc}") is generated fresh on every
+    # run. It is run-unique by construction, never diff-sensitive, so an
+    # identical pre-existing failure must not be defeated by it — normalize it
+    # the same way as the other run-unique tokens above.
+    normalized = re.sub(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        "<uuid>",
+        normalized,
+    )
     if tree_root is None:
-        return detail
-    normalized = detail.replace(str(tree_root), "<tree-root>")
+        return normalized
+    normalized = normalized.replace(str(tree_root), "<tree-root>")
     normalized = re.sub(
         r"/tmp/pytest-of-[^/]+/pytest-\d+",
         "<pytest-temp>",
@@ -81,6 +109,24 @@ def _normalize_failure_detail(detail: str, *, tree_root: Path | None) -> str:
 _OFFENDER_SET_RE = re.compile(
     r"(?m)^[ \t]*BLUEPRINT_OFFENDERS:[ \t]*(\[[^\r\n]*\])[ \t]*$"
 )
+
+
+def format_offender_marker(offenders: Iterable[str]) -> str:
+    """Render a deterministic, machine-readable identity set for a guard.
+
+    Guard diagnostics remain written for humans, but their rendered prose often
+    includes counts, ordering, and other context that can legitimately change
+    while the underlying failure is inherited.  Appending this marker gives the
+    differential gate a stable identity without weakening its route, testcase,
+    or failure-kind checks.
+    """
+
+    values = list(offenders)
+    if not all(isinstance(value, str) and value and "\n" not in value for value in values):
+        raise ValueError("offender identities must be non-empty single-line strings")
+    return "BLUEPRINT_OFFENDERS: " + json.dumps(
+        sorted(set(values)), separators=(",", ":")
+    )
 
 
 def _extract_offender_set(detail: str) -> frozenset[str] | None:
@@ -404,6 +450,7 @@ __all__ = [
     "attribute_reports",
     "classify_verification",
     "extract_base",
+    "format_offender_marker",
     "is_attributable_pytest_result",
     "parse_junit_failures",
     "parse_junit_report",

@@ -1536,6 +1536,295 @@ async def sweep_decay_stale_unlinked_blocker_messages(
     return resolved
 
 
+# ── Step 25: age-based failure sweep for stranded PENDING conversation sends ─
+#
+# An operator chat message is accepted and persisted (surface='conversation',
+# handling_state='pending') before any runner claim is established. If the
+# selected runner is dead, no claim ever lands: the message sits at
+# handling_state='pending' forever with no automated mechanism to notice.
+# From the operator's perspective this is indistinguishable from a reply
+# still in flight — there is no failed state and no sweep that reclaims it.
+#
+# This sweep closes that gap: an unclaimed PENDING **operator-authored**
+# conversation message (from_type='user', conversation_claim_id IS NULL) that
+# has been sitting in its current unclaimed state past the bounded window is
+# transitioned to handling_state='failed' / status='resolved', a terminal,
+# operator-visible outcome distinct from both 'pending' (in flight) and a
+# genuine 'responded' resolution. A message that IS claimed is owned by
+# conversation_coordinator's lease-expiry/reclaim path, not this sweep — a
+# live or expired-but-claimed lease can still be recovered by a replacement
+# generation.
+#
+# Three shapes look identical to a naive predicate but have a designed answer
+# path that runs LATER, so they are deliberately outside this sweep:
+#
+#   1. System-authored Workday consultation packets and consultation result
+#      rows (conversation_coordinator.build/record paths) are also
+#      surface=CONVERSATION / PENDING / status='open' with
+#      conversation_claim_id permanently NULL — their claim lives in
+#      context['_workday_consultation_claim_id']. Failing one makes it
+#      unclaimable (the claim gates require status=='open') and zeroes the
+#      operator-visible consultation phase. Excluded by from_type=='user'
+#      plus an explicit consultation-marker guard.
+#   2. Rows deferred by the non-continuous (Chat-mode) path. No runner is
+#      spawned on send; the cadence strategist answers them up to
+#      ``strategic_max_interval_minutes`` (default 1440) later, and the row is
+#      stamped wakeup_state 'paused' / 'waiting_for_capacity' to model exactly
+#      that. Rows released by session handoff (context carries
+#      ``_resident_handoff_at``) are likewise waiting for a *next* session to
+#      rebind them. Both get the much longer deferred window below rather than
+#      the armed-runner window.
+#   3. The synthetic resident-activation prompt row, which
+#      ``_retire_unclaimed_resident_activation`` can only retire while it is
+#      still open+PENDING+unclaimed.
+#
+# The age is measured from when the row entered its CURRENT unclaimed state —
+# max(created_at, updated_at, handoff timestamp) — not from created_at, because
+# session handoff deliberately re-creates this exact row shape from
+# arbitrarily old operator messages so the next resident can claim them.
+
+# Default window before an unclaimed PENDING conversation message whose runner
+# was actually armed (wakeup_state 'queued'/'coalesced') is considered
+# stranded and swept to 'failed'.
+STRANDED_CONVERSATION_MESSAGE_AFTER_MINUTES = 15
+
+# Default window for rows whose designed answer path is deliberately deferred:
+# Chat-mode ('paused'/'waiting_for_capacity') sends answered by the cadence
+# strategist, and session-handoff-released rows awaiting the next resident.
+# Must exceed the cadence backstop ``strategic_max_interval_minutes`` (default
+# 1440) — the effective value below takes the max of the two plus a grace hour.
+STRANDED_DEFERRED_CONVERSATION_MESSAGE_AFTER_MINUTES = 1_500
+
+# Context markers that take a row out of this sweep (or into the deferred
+# window). Resolved from the canonical definitions so a rename upstream breaks
+# loudly here instead of silently re-widening the predicate.
+_STRANDED_SWEEP_CONSULTATION_CLAIM_KEY = "_workday_consultation_claim_id"
+
+# wakeup_state values that mean "a runner really was armed for this send".
+# Anything else (including an unstamped legacy row) is treated as deferred.
+_STRANDED_SWEEP_ARMED_WAKEUP_STATES = frozenset({"queued", "coalesced"})
+
+
+def _stranded_sweep_activation_prompt_key() -> str:
+    from app.strategic_resident_session import (
+        RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY,
+    )
+
+    return RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY
+
+
+def _stranded_sweep_handoff_at_key() -> str:
+    from app.session_message_handoff import RESIDENT_HANDOFF_AT_CONTEXT_KEY
+
+    return RESIDENT_HANDOFF_AT_CONTEXT_KEY
+
+
+def _stranded_sweep_wakeup_state_key() -> str:
+    from app.project_message_projection import WAKEUP_STATE_CONTEXT_KEY
+
+    return WAKEUP_STATE_CONTEXT_KEY
+
+
+def _stranded_sweep_is_excluded(context: dict) -> bool:
+    """True when a row's designed answer path forbids terminal failure here.
+
+    Workday consultation packets/results carry their claim in context rather
+    than ``conversation_claim_id`` (so 'unclaimed' is a lie for them), and the
+    synthetic activation prompt must stay open+PENDING for
+    ``_retire_unclaimed_resident_activation`` to consume it.
+    """
+    if context.get(_STRANDED_SWEEP_CONSULTATION_CLAIM_KEY):
+        return True
+    role = context.get("message_role")
+    if isinstance(role, str) and role.startswith("workday_consultation"):
+        return True
+    return context.get(_stranded_sweep_activation_prompt_key()) is True
+
+
+def _stranded_sweep_unclaimed_since(msg, context: dict) -> datetime:
+    """When the row entered its CURRENT unclaimed state.
+
+    Session handoff re-releases arbitrarily old operator messages back to
+    PENDING with the claim cleared; ageing on ``created_at`` alone would fail
+    them before the next session can rebind them. Take the latest of
+    created_at, updated_at, and the recorded handoff timestamp.
+    """
+    candidates = [msg.created_at]
+    updated_at = getattr(msg, "updated_at", None)
+    if updated_at is not None:
+        candidates.append(updated_at)
+    handoff_at = _parse_iso_naive_utc(
+        context.get(_stranded_sweep_handoff_at_key())
+    )
+    if handoff_at is not None:
+        candidates.append(handoff_at)
+    return max(_stranded_naive_utc(value) for value in candidates)
+
+
+def _parse_iso_naive_utc(value) -> datetime | None:
+    """Parse a stored ISO-8601 context timestamp; None when unusable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _stranded_naive_utc(parsed)
+
+
+def _stranded_naive_utc(value: datetime) -> datetime:
+    from app.time_utils import _coerce_naive_utc as _coerce
+
+    return _coerce(value)
+
+
+async def sweep_fail_stranded_pending_conversation_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 25: fail stranded operator conversation sends past a bounded age.
+
+    Selects up to ``batch_size`` conversation-surface messages with
+    ``from_type == 'user'``, ``handling_state == PENDING``, ``status == 'open'``
+    and ``conversation_claim_id IS NULL`` that have been unclaimed longer than
+    the applicable window, and transitions each to ``handling_state=FAILED`` /
+    ``status='resolved'`` with resolution
+    ``'stranded (no runner claim within the window)'``.
+
+    Two windows apply, because two different answer paths exist:
+
+    * armed runner (wakeup_state 'queued'/'coalesced'):
+      ``stranded_conversation_message_after_minutes`` (default 15);
+    * deferred — Chat-mode 'paused'/'waiting_for_capacity' rows answered by the
+      cadence strategist, and session-handoff-released rows awaiting the next
+      resident: ``stranded_deferred_conversation_message_after_minutes``
+      (default 1500), floored at ``strategic_max_interval_minutes`` + 60 so the
+      sweep can never pre-empt the cadence backstop.
+
+    Age is measured from when the row entered its current unclaimed state
+    (max of created_at / updated_at / ``_resident_handoff_at``), not creation,
+    so a handoff-released message is not destroyed before rebinding.
+
+    System-authored rows (Workday consultation packets and results, whose claim
+    lives in context) and the synthetic resident-activation prompt are excluded
+    outright. Disjoint from conversation_coordinator's claim-lease-expiry path:
+    any message that has been claimed (even with an expired lease) is left
+    alone so a replacement generation can still reclaim it. Fail-safe per
+    message, idempotent (the transition moves handling_state off PENDING), and
+    broadcasts a ``message_updated`` envelope per swept row.
+
+    Returns the number of messages swept to 'failed'.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import MessageHandlingState, MessageSurface, ProjectMessage
+    from app.project_message_projection import message_updated_event_payload
+    from app.shared_state import runtime_config
+
+    stranded_after_minutes = int(
+        runtime_config.get(
+            "stranded_conversation_message_after_minutes",
+            STRANDED_CONVERSATION_MESSAGE_AFTER_MINUTES,
+        )
+    )
+    cadence_backstop_minutes = int(
+        runtime_config.get("strategic_max_interval_minutes", 1_440)
+    )
+    deferred_after_minutes = max(
+        int(
+            runtime_config.get(
+                "stranded_deferred_conversation_message_after_minutes",
+                STRANDED_DEFERRED_CONVERSATION_MESSAGE_AFTER_MINUTES,
+            )
+        ),
+        cadence_backstop_minutes + 60,
+        stranded_after_minutes,
+    )
+    cutoff = now - timedelta(minutes=stranded_after_minutes)
+    deferred_cutoff = now - timedelta(minutes=deferred_after_minutes)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.status == "open",
+                    ProjectMessage.handling_state == MessageHandlingState.PENDING,
+                    ProjectMessage.conversation_claim_id.is_(None),
+                    # Cheap superset of the per-row window test below: the
+                    # effective "unclaimed since" is >= both of these.
+                    ProjectMessage.created_at <= cutoff,
+                    ProjectMessage.updated_at <= cutoff,
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] stranded-conversation-message fail sweep hit cap=%d "
+            "pending unclaimed messages — result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    failed = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        ctx = dict(msg.context or {})
+        if _stranded_sweep_is_excluded(ctx):
+            continue
+        wakeup_state = ctx.get(_stranded_sweep_wakeup_state_key())
+        deferred = wakeup_state not in _STRANDED_SWEEP_ARMED_WAKEUP_STATES or bool(
+            ctx.get(_stranded_sweep_handoff_at_key())
+        )
+        applicable_cutoff = deferred_cutoff if deferred else cutoff
+        if _stranded_sweep_unclaimed_since(msg, ctx) > applicable_cutoff:
+            continue
+        msg.handling_state = MessageHandlingState.FAILED
+        msg.status = "resolved"
+        msg.resolution = "stranded (no runner claim within the window)"
+        msg.resolved_at = now
+        ctx["_stranded_failed_at"] = now.isoformat()
+        msg.context = ctx
+        session.add(msg)
+        failed += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] Step 25: failed stranded conversation message %s "
+            "(unclaimed for >=%dm, deferred=%s)",
+            msg.id,
+            deferred_after_minutes if deferred else stranded_after_minutes,
+            deferred,
+        )
+
+    if failed:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 25: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 25: failed %d stranded pending conversation message(s)",
+            failed,
+        )
+    return failed
+
+
 async def sweep_wake_delivery_stall_alerts(
     session,
     *,

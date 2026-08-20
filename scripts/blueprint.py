@@ -3344,6 +3344,66 @@ def _cut_confirmation_prompt(pid: str) -> str:
     return "\n".join(lines)
 
 
+def _force_promote_confirmation_prompt(pid: str, candidate_sha) -> str:
+    """Build the force-promote confirmation prompt from lifecycle state.
+
+    This is the most privileged lever in the CLI, so the prompt names the
+    version, the exact commit that will be promoted, and the blocker being
+    overridden. A failed lifecycle read degrades to an explicit "cannot show
+    what will be promoted" line rather than a bare y/N — the operator must
+    never be asked to confirm a force-promote with no disclosure at all.
+    """
+    lines = ["About to FORCE-PROMOTE this project's open version, SKIPPING the audit gate."]
+
+    lifecycle, err = _safe_read(f"/api/admin/projects/{pid}/version-lifecycle")
+    cv = {} if err else ((lifecycle or {}).get("current_version") or {})
+    if err:
+        lines.append(f"- Lifecycle read FAILED ({err}) - cannot show what will be promoted.")
+    elif not cv:
+        lines.append("- No open version reported; the backend will reject this with 404.")
+    else:
+        lines[0] = (
+            f"About to FORCE-PROMOTE v{cv.get('version_number')}, SKIPPING the audit gate."
+        )
+        active_sha = cv.get("active_candidate_sha")
+        if candidate_sha:
+            lines.append(f"- Promoting the PINNED commit {candidate_sha}.")
+            if active_sha and not (
+                str(active_sha).startswith(str(candidate_sha))
+                or str(candidate_sha).startswith(str(active_sha))
+            ):
+                lines.append(
+                    f"  WARNING: that is NOT the candidate under evaluation ({active_sha})."
+                )
+        else:
+            lines.append(
+                "- Promoting the CURRENT integration-branch HEAD (no --candidate-sha pinned); "
+                f"the candidate last evaluated was {active_sha or 'unknown'}."
+            )
+        lq = cv.get("last_qualification") or {}
+        blocker = lq.get("blocker")
+        if blocker:
+            lines.append(
+                f"- Overriding qualification blocker '{blocker}' "
+                f"(status={lq.get('status')}, confidence={lq.get('confidence')}, "
+                f"threshold={lq.get('threshold')})."
+            )
+        in_flight = cv.get("in_flight_task_count")
+        if in_flight:
+            lines.append(
+                f"- {in_flight} in-flight task{'s' if in_flight != 1 else ''} will NOT be "
+                "stopped and will NOT be part of this release."
+            )
+
+    lines.append(
+        "- CI is NOT skipped: the promotion PR is still gated on the promotion target's "
+        "required checks, and a RED run DELETES that PR and its release branch. Verify CI "
+        "is green on the candidate BEFORE confirming."
+    )
+    lines.append("Proceed?")
+    return "\n".join(lines)
+
+
 # action -> (HTTP method, path-template, summary, body-builder)
 # path-template is formatted with {pid}. body-builder takes args -> dict|None.
 _PROMOTE_RECOVER_ACTIONS = {
@@ -3377,6 +3437,16 @@ _PROMOTE_RECOVER_ACTIONS = {
     "resume": ("POST", "/api/admin/deploy-state/resume",
                "resume the pipeline",
                lambda a: {}),
+    # OWNER-only. Skips the AUDIT gate, NOT CI: it still cuts release-vN, opens
+    # the PR to the promotion target, and waits for that branch's required
+    # checks. Exposed here because the alternative when a version latches is a
+    # hand-assembled raw call against the admin API -- unconfirmed, unaudited and
+    # easy to point at the wrong project. The backend rechecks OWNER role, so a
+    # scoped `project-operator` credential gets 403 rather than this lever.
+    "force-promote": ("POST", "/api/admin/projects/{pid}/promote/force",
+                      "FORCE-PROMOTE the open version, SKIPPING the audit gate",
+                      lambda a: {"candidate_sha": getattr(a, "candidate_sha", None),
+                                 "reason": getattr(a, "reason", None)}),
 }
 
 
@@ -3400,7 +3470,12 @@ def cmd_promote_recover(args: argparse.Namespace) -> None:
     path = path_tmpl.format(pid=pid)
     body = build_body(args)
 
-    prompt = _cut_confirmation_prompt(pid) if action == "cut" else f"About to {summary}. Proceed?"
+    if action == "cut":
+        prompt = _cut_confirmation_prompt(pid)
+    elif action == "force-promote":
+        prompt = _force_promote_confirmation_prompt(pid, getattr(args, "candidate_sha", None))
+    else:
+        prompt = f"About to {summary}. Proceed?"
     if not _confirm(prompt, getattr(args, "yes", False)):
         print("Aborted.")
         return
@@ -6652,9 +6727,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr.add_argument("--yes", action="store_true",
                       help="Skip the confirmation prompt (for scripting).")
     p_pr.add_argument("--reason", default=None,
-                      help="Reason recorded for cut / clear-deploy-failed.")
+                      help="Reason recorded for cut / clear-deploy-failed / force-promote.")
     p_pr.add_argument("--force", action="store_true",
                       help="Force clear-deploy-failed when serving SHA is unobservable.")
+    p_pr.add_argument("--candidate-sha", default=None,
+                      help="force-promote only: pin the commit to promote "
+                           "(default: current integration-branch HEAD).")
 
     # messages
     p_msgs = sub.add_parser(

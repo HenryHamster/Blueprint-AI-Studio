@@ -36,6 +36,7 @@ const {
 const typedFastMocks = vi.hoisted(() => ({
   construct: vi.fn(),
   ensureReady: vi.fn<() => Promise<void>>(),
+  onEvent: vi.fn(),
   dispatch: vi.fn(),
   interrupt: vi.fn(),
   replaceAfterCrash: vi.fn(),
@@ -171,6 +172,7 @@ vi.mock('./typed-fast-resident.js', () => ({
   ForegroundTypedController: class {
     constructor(options: unknown) { typedFastMocks.construct(options); }
     ensureReady(): Promise<void> { return typedFastMocks.ensureReady(); }
+    onEvent(cb: (ev: unknown) => void): void { typedFastMocks.onEvent(cb); }
     dispatch(...args: unknown[]): unknown { return typedFastMocks.dispatch(...args); }
     interrupt(): void { typedFastMocks.interrupt(); }
     replaceAfterCrash(): void { typedFastMocks.replaceAfterCrash(); }
@@ -1014,6 +1016,89 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         filter: 'blob:none',
       }),
     );
+  });
+
+  it('streams warm typed-Fast turn deltas to the operator', async () => {
+    mockSendWsFrame.mockReset();
+    mockSendWsFrame.mockReturnValue(true); // simulate a live viewer socket
+    const operatorMessage = {
+      id: 'warm-typed-fast-stream', content: 'Stream me something.',
+      created_at: new Date().toISOString(), from_type: 'user', context: {},
+    };
+    let completed = false;
+    // The resident's checkout-independent (cold-start) Fast lane gets exactly
+    // one bounded poll for a waiting message before the main loop starts, and
+    // it already streams correctly (it is not the seam under test). Hide the
+    // message from that first poll — same idiom as the claim-conflict test
+    // above — so ONLY the warm foreground lane (ensureTypedFastReady /
+    // tryHandleTypedFastTurn, driven by foregroundTyped) can claim it; a false
+    // pass from the already-working cold lane would defeat this test.
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?') || completed) return Promise.resolve({ messages: [] });
+      messagePolls += 1;
+      return Promise.resolve(messagePolls === 1
+        ? { messages: [], fast_message_ids: [] }
+        : { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        return Promise.resolve({ authority_held: true });
+      }
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({
+          acquired: true, lease: { lease_id: 'warm-stream-lease', generation: 1 },
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        return Promise.resolve({
+          claim_id: 'warm-stream-claim', owner: 'fast',
+          message_ids: [operatorMessage.id],
+          envelope: typedEnvelope(operatorMessage.content, 401),
+        });
+      }
+      if (url.endsWith('/conversation/turns/complete')) {
+        completed = true;
+        return Promise.resolve({ status: 'completed' });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) {
+        return Promise.resolve({ released: true });
+      }
+      return Promise.resolve({});
+    });
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => {
+      // Simulate the warm child streaming an assistant delta mid-turn, before
+      // its durable completion — this is what the warm controller's onEvent
+      // subscription must forward live to the operator.
+      const emit = typedFastMocks.onEvent.mock.calls.at(-1)?.[0] as
+        ((ev: ResidentSessionEvent) => void) | undefined;
+      emit?.({ kind: 'text', text: 'streamed chunk' });
+      return Promise.resolve({
+        receipt,
+        result: turnResult({ resultText: 'Final typed reply.' }),
+        completion: { receipt, content: 'Final typed reply.' },
+        workdayRequests: [],
+      });
+    });
+    const workday = makeSession(() => turnResult(), () => !completed);
+    mockStartSession.mockReturnValue(workday);
+
+    await run('warm-typed-fast-stream', {
+      ...qualifiedPayload(),
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
+    // The warm controller must have been subscribed before the turn that
+    // streamed — not left unbound like the pre-fix warm lane.
+    expect(typedFastMocks.onEvent.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(typeof typedFastMocks.onEvent.mock.calls[0]?.[0]).toBe('function');
+    await vi.waitFor(() => {
+      expect(mockSendWsFrame.mock.calls.some((c) => (
+        (c[1] as SessionFrame).payload.text === 'streamed chunk'
+      ))).toBe(true);
+    });
   });
 
   it('finishes a claimed cold Fast response when clone becomes ready during slow prompt materialization', async () => {

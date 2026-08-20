@@ -2537,6 +2537,144 @@ class TestVersionLifecycleInfraFailureFields:
         assert lq["audit_missing_reason"] is None
 
 
+class TestVersionLifecycleGateLatch:
+    """GET /api/admin/projects/{id}/version-lifecycle exposes gate_latch.
+
+    is_permanent_gate_incapacity only fires on a same-signature INFRA-error
+    streak, so a cleanly-run qualification blocked by a scoring gate that the
+    candidate itself repairs (in the deployed module) never sets it. gate_latch
+    is a separate, additive signal sourced from the persisted deployed-gate-latch
+    Alert the reaper sweep writes, so the hotfix lane is discoverable in that
+    case too.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gate_latch_exposed_for_clean_scoring_blocker(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=3,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "not_promoted",
+                "blocker": "candidate_operator_authorship_nonzero",
+                "candidate_sha": "abc1234567890",
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        dedupe_key = (
+            f"release-gate-latch:{version.id}:"
+            "candidate_operator_authorship_nonzero:deadbeef...abc1234567890"
+        )
+        alert_message = (
+            "v3 is blocked by gate candidate_operator_authorship_nonzero, but "
+            "the candidate modifies its deployed implementation: "
+            "backend/app/release_commit_authorship.py. Compare range "
+            "deadbeef...abc1234567890. This repair cannot clear the gate from "
+            "inside the qualifier; use the approved release-machinery hotfix lane."
+        )
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                event_type="release_blocked",
+                domain="release_lifecycle",
+                source="release_stall_alerts",
+                dedupe_key=dedupe_key,
+                title="Release v3 gate latched: candidate_operator_authorship_nonzero",
+                message=alert_message,
+            )
+        )
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        cv = resp.json()["current_version"]
+        assert cv["last_qualification"]["is_permanent_gate_incapacity"] is None
+        assert cv["gate_latch"] is not None
+        assert cv["gate_latch"]["gate"] == "candidate_operator_authorship_nonzero"
+        assert cv["gate_latch"]["compare_range"] == "deadbeef...abc1234567890"
+        assert cv["gate_latch"]["message"] == alert_message
+
+    @pytest.mark.asyncio
+    async def test_gate_latch_null_when_no_active_alert(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=4,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "dry_run",
+                "confidence": 0.95,
+                "threshold": 0.90,
+                "sub_scores": {"audit": 1.0, "test_erosion": 0.9, "smoketest": 0.95},
+                "blocker": None,
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": True, "reason": "ok"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["current_version"]["gate_latch"] is None
+
+
 class TestVersionLifecyclePolicyProvenance:
     """GET /version-lifecycle exposes promotion policy source and fallback detail."""
 

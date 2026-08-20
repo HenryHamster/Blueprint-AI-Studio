@@ -47,6 +47,7 @@ from app.capability_trial_verdict import (
     LANE_PILOT_CAP_NAME,
     evaluate_lane_pilot_verdict,
     evaluate_trial_verdict,
+    get_effective_holdback_fraction,
     get_trial_definitions,
     is_ambiguous_lift_escalation_needed,
     is_trial_stalled,
@@ -186,6 +187,20 @@ from app.pipeline_health import (  # noqa: E402
     compute_pipeline_health_summary,  # noqa: F401
     read_project_sr_analytics,
 )
+
+
+def _without_per_task(reconciliation: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """Drop the zero-reader per_task rows from a served reconciliation dict.
+
+    per_task has no readers anywhere in the codebase (backend or admin-ui) but
+    dominates the digest response's byte size, since the same dict is
+    serialized four times (nested under effort_model_efficiency twice, and
+    top-level twice). Strip it at the response boundary only — the in-process
+    ReconciliationResult.asdict() output used elsewhere keeps per_task intact.
+    """
+    if reconciliation is None:
+        return None
+    return {k: v for k, v in reconciliation.items() if k != "per_task"}
 
 
 @router.get("/digest")
@@ -1357,7 +1372,7 @@ async def _compute_digest(
     # is trustworthy within declared tolerance. Injected into the efficiency dict
     # and surfaced as a top-level key for the EffortEfficiencyPanel trust indicator.
     _reconciliation_window = completed_tasks + failed_tasks + cancelled_tasks
-    effort_model_efficiency["cost_telemetry_reconciliation"] = (
+    effort_model_efficiency["cost_telemetry_reconciliation"] = _without_per_task(
         reconcile_llm_cost(_reconciliation_window).asdict()
         if _reconciliation_window
         else None
@@ -1387,7 +1402,9 @@ async def _compute_digest(
                 _provider_recon.total_task_count,
             )
     effort_model_efficiency["cost_telemetry_reconciliation_provider_reported"] = (
-        _provider_recon.asdict() if _provider_recon is not None else None
+        _without_per_task(_provider_recon.asdict())
+        if _provider_recon is not None
+        else None
     )
 
     # --- Scope mismatch diagnostics ---
@@ -1959,8 +1976,11 @@ async def _compute_digest(
                 assignment_key=_assignment_key,
                 window_days=_accrual_window_days,
             )
-            _holdback_fraction = float(
+            _default_holdback_fraction = float(
                 _runtime_config.get(f"{_cap}_holdback_fraction", 0.0)
+            )
+            _holdback_fraction = get_effective_holdback_fraction(
+                _stored_verdicts, _cap, _default_holdback_fraction
             )
             _with_daily = _accrual["with_7d"] / _accrual_window_days
             _without_daily = _accrual["without_7d"] / _accrual_window_days

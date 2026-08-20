@@ -70,7 +70,7 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
         className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
           !allSelected
             ? 'bg-white/5 border-neutral-600 text-neutral-100'
-            : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+            : 'bg-workbench-base/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
         }`}
       >
         <span>{buttonLabel}</span>
@@ -78,10 +78,10 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
       </button>
 
       {open && (
-        <div className="absolute top-full mt-1 left-0 z-50 min-w-[140px] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
+        <div className="absolute top-full mt-1 left-0 z-50 min-w-[140px] bg-workbench-base border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
           <button
             onClick={() => { onChange(options.map(o => o.value)); setOpen(false); }}
-            className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-neutral-800 transition-colors ${
+            className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-workbench-hover transition-colors ${
               allSelected ? 'text-neutral-100' : 'text-neutral-400'
             }`}
           >
@@ -95,7 +95,7 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
               <button
                 key={opt.value}
                 onClick={() => toggle(opt.value)}
-                className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-neutral-800 transition-colors ${
+                className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-workbench-hover transition-colors ${
                   isSelected ? 'text-neutral-100' : 'text-neutral-400'
                 }`}
               >
@@ -143,7 +143,7 @@ export function SingleSelectDropdown({ options, value, onChange, isActive }: Sin
         className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
           active
             ? 'bg-white/5 border-neutral-600 text-neutral-100'
-            : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+            : 'bg-workbench-base/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
         }`}
       >
         <span>{currentLabel}</span>
@@ -151,12 +151,12 @@ export function SingleSelectDropdown({ options, value, onChange, isActive }: Sin
       </button>
 
       {open && (
-        <div className="absolute top-full mt-1 left-0 z-50 min-w-[140px] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
+        <div className="absolute top-full mt-1 left-0 z-50 min-w-[140px] bg-workbench-base border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
           {options.map(opt => (
             <button
               key={opt.value}
               onClick={() => { onChange(opt.value); setOpen(false); }}
-              className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-neutral-800 transition-colors ${
+              className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-workbench-hover transition-colors ${
                 opt.value === value ? 'text-neutral-100' : 'text-neutral-400'
               }`}
             >
@@ -227,7 +227,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           value={inputValue}
           onChange={e => setInputValue(e.target.value)}
           placeholder="Search by title, ID, or status..."
-          className="w-full rounded-md border border-neutral-800/70 bg-neutral-950 pl-9 pr-3 py-2 text-base text-neutral-100 placeholder-neutral-600 outline-none focus:ring-1 focus:ring-neutral-700 md:w-64 md:py-1.5 md:text-sm"
+          className="w-full rounded-md border border-neutral-800/70 bg-workbench-shell pl-9 pr-3 py-2 text-base text-neutral-100 placeholder-neutral-600 outline-none md:w-64 md:py-1.5 md:text-sm workbench-focus"
         />
       </div>
 
@@ -259,7 +259,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
           blockedFilter
             ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
-            : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+            : 'bg-workbench-base/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
         }`}
       >
         <GitFork className="w-3 h-3" />
@@ -272,7 +272,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
             stuckFilter
               ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-              : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+              : 'bg-workbench-base/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
           }`}
         >
           <Timer className="w-3 h-3" />

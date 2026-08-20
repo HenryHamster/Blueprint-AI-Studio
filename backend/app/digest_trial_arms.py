@@ -87,22 +87,10 @@ async def compute_trial_arm_accumulation(
         _assign_flag_expr = (
             case((_primary_expr.is_not(None), 1), else_=0) if _has_assignment else None
         )
-        # Delivered = assignment key set AND receipt key also set (treatment ran).
+        # Delivered = assignment key set AND receipt key is truthy (treatment actually
+        # ran) — a present-but-false receipt (e.g. a kill-switch-off task) must not
+        # count as delivered, or the futility engagement guard cannot see non-delivery.
         _receipt_expr_for_delivery = func.json_extract(Task.context, f"$.{context_key}")
-        _delivered_flag_expr = (
-            case(
-                (
-                    and_(
-                        _primary_expr.is_not(None),
-                        _receipt_expr_for_delivery.is_not(None),
-                    ),
-                    1,
-                ),
-                else_=0,
-            )
-            if _has_assignment
-            else None
-        )
         # Receipt truthy: receipt key is explicitly true (SQLite json_extract returns 1 for JSON true).
         _receipt_truthy_flag_expr = (
             case((_receipt_expr_for_delivery == 1, 1), else_=0)
@@ -121,22 +109,10 @@ async def compute_trial_arm_accumulation(
         _assign_flag_expr = (
             case((_primary_expr.is_not(None), 1), else_=0) if _has_assignment else None
         )
-        # Delivered = assignment key set AND receipt key also set (treatment ran).
+        # Delivered = assignment key set AND receipt key is truthy (treatment actually
+        # ran) — a present-but-false receipt (e.g. a kill-switch-off task) must not
+        # count as delivered, or the futility engagement guard cannot see non-delivery.
         _receipt_expr_for_delivery = Task.context[context_key].astext
-        _delivered_flag_expr = (
-            case(
-                (
-                    and_(
-                        _primary_expr.is_not(None),
-                        _receipt_expr_for_delivery.is_not(None),
-                    ),
-                    1,
-                ),
-                else_=0,
-            )
-            if _has_assignment
-            else None
-        )
         # Receipt truthy: receipt key is explicitly "true" (PG astext returns string).
         _receipt_truthy_flag_expr = (
             case((_receipt_expr_for_delivery == "true", 1), else_=0)
@@ -159,7 +135,6 @@ async def compute_trial_arm_accumulation(
                 arm_expr,
                 succ_expr,
                 _assign_flag_expr,
-                _delivered_flag_expr,
                 _receipt_truthy_flag_expr,
                 func.count(),
             )
@@ -168,7 +143,6 @@ async def compute_trial_arm_accumulation(
                 arm_expr,
                 succ_expr,
                 _assign_flag_expr,
-                _delivered_flag_expr,
                 _receipt_truthy_flag_expr,
             )
         )
@@ -179,7 +153,6 @@ async def compute_trial_arm_accumulation(
             arm_val,
             succ_val,
             is_assigned_val,
-            is_delivered_val,
             receipt_truthy_val,
             cnt,
         ) in rows:
@@ -191,7 +164,11 @@ async def compute_trial_arm_accumulation(
                     with_succ += cnt
                 if is_assigned:
                     with_assigned += cnt
-                    if bool(is_delivered_val):
+                    # Delivery is receipt TRUTHINESS, not mere presence: a kill-switch-off
+                    # task writes a present-but-false receipt (had_diagnostics_after_edit=false),
+                    # which must not count as delivered or the futility engagement guard
+                    # (futility_min_delivery_rate) can never see non-delivery.
+                    if bool(receipt_truthy_val):
                         with_assigned_delivered += cnt
                 else:
                     with_receipt += cnt
@@ -223,11 +200,17 @@ async def compute_trial_arm_accumulation(
                 if _json_truthy(succ_val):
                     without_succ += cnt
 
-    with_rate = round(with_succ / with_n, 2) if with_n else None
-    without_rate = round(without_succ / without_n, 2) if without_n else None
+    # Lift is computed from the UNROUNDED arm rates so a verdict decision never
+    # depends on quantization error (rounding each rate to 2dp before subtracting
+    # can shift the difference by up to 0.01 either way). Rounding is applied only
+    # to the persisted/display with_rate and without_rate fields below.
+    _with_rate_raw = with_succ / with_n if with_n else None
+    _without_rate_raw = without_succ / without_n if without_n else None
+    with_rate = round(_with_rate_raw, 2) if _with_rate_raw is not None else None
+    without_rate = round(_without_rate_raw, 2) if _without_rate_raw is not None else None
     lift = (
-        round(with_rate - without_rate, 2)
-        if with_rate is not None and without_rate is not None
+        _with_rate_raw - _without_rate_raw
+        if _with_rate_raw is not None and _without_rate_raw is not None
         else None
     )
     result: Dict[str, Any] = {

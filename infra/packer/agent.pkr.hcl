@@ -241,7 +241,10 @@ build {
       "# process entirely inside the sandbox.",
       "sudo python3 -m venv /opt/blueprint-backend-venv",
       "sudo /opt/blueprint-backend-venv/bin/pip install --no-cache-dir -r /tmp/backend-deps-ctx/requirements.txt",
-      "sudo /opt/blueprint-backend-venv/bin/python -c 'import fastapi, asyncpg, pytest; print(\"PACKER_BACKEND_SANDBOX_VENV_OK\")'",
+      # The fastapi/asyncpg/sqlmodel import check that used to run inline here is
+      # now performed (more strictly, including sqlmodel) by
+      # provision-verification-toolchain.sh against this SAME venv two shell
+      # blocks below — a redundant probe here would just duplicate that gate.
       "sudo rm -rf /tmp/backend-deps-ctx"
     ]
   }

@@ -41,7 +41,7 @@ const CATCH_RATE_HEALTH_STATUS_STYLE: Record<SrCatchRateHealthResponse['status']
     titlePrefix: 'Frozen snapshot',
   },
   low_data: {
-    badge: 'bg-neutral-800/70 text-neutral-300 border-neutral-700/70',
+    badge: 'bg-workbench-panel/70 text-neutral-300 border-neutral-700/70',
     label: 'low data',
     titlePrefix: 'Low data',
   },

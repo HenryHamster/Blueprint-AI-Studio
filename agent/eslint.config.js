@@ -29,6 +29,6 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ['node_modules/', 'dist/', 'eslint.config.js', 'sr-pr-section.js', 'screenshots-pr-section.js'],
+    ignores: ['node_modules/', 'dist/', 'eslint.config.js', 'sr-pr-section.js', 'screenshots-pr-section.js', 'guard-suppressions-pr-section.js'],
   }
 )

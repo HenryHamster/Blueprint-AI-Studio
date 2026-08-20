@@ -30,7 +30,7 @@ export function FailureStageWidget({ distribution }: Props) {
           const count = distribution.stages[stage];
           if (!count) return null;
           const isDominant = distribution.dominant_stage === stage;
-          const base = STAGE_COLORS[stage] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+          const base = STAGE_COLORS[stage] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
           const cls = isDominant ? `${base} ring-1 ring-current` : base;
           return (
             <span

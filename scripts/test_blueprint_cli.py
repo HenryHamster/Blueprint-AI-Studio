@@ -23,6 +23,49 @@ import blueprint_api
 import local_app_release as local_release
 import pytest
 
+# scripts/*.py tests run with --noconftest, so the shared offender-identity
+# producer is reached by the same explicit path insertion the other scripts
+# guards use rather than by a conftest-installed sys.path entry.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+
+from testing.fixgate_attribution import format_offender_marker  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_blueprint_config(monkeypatch, tmp_path):
+    """Guarantee blueprint_api.load_config() resolves without touching the host.
+
+    Most tests here mock blueprint_api.api directly, but several blueprint.py
+    helpers call the *real* load_config() unconditionally on the way to that
+    mocked api() (e.g. _using_scoped_service_credential(), which many CLI
+    flows consult before ever making a request). On a dev host that has an
+    ambient ~/.blueprint-config.json or repo-root .blueprint-config.json,
+    that real call silently succeeds — but the CI lane runs this file with
+    --noconftest in a container with no config anywhere in the search order
+    (see blueprint_api._config_search_paths), so the same call raises
+    APIError there. Point BLUEPRINT_CONFIG at a throwaway file with the
+    minimal shape load_config()/api() actually read (api_url, api_key) so
+    every test gets the same deterministic, host-independent resolution
+    regardless of what config files exist on the machine running pytest.
+    BLUEPRINT_CONFIG is checked first in load_config(), ahead of the
+    BLUEPRINT_API_URL/KEY pair, the repo-root/home search paths, and the
+    gcloud/agent-token fallbacks, so this fully short-circuits config
+    discovery. Also reset the process-global _config_cache so no test can
+    leak a resolved config into the next one.
+
+    Tests that exercise load_config()'s own search/precedence/error behavior
+    (test_load_config_*) or that replace load_config() outright override this
+    fixture via their own monkeypatch calls, which run after this fixture's
+    setup and are undone independently at teardown.
+    """
+    dummy_config = tmp_path / "hermetic-blueprint-config.json"
+    dummy_config.write_text(
+        json.dumps({"api_url": "https://blueprint-cli-test.invalid", "api_key": "test-key"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINT_CONFIG", str(dummy_config))
+    monkeypatch.setattr(blueprint_api, "_config_cache", None)
+
 
 @pytest.fixture(autouse=True)
 def _hermetic_blueprint_config(monkeypatch, tmp_path):
@@ -637,6 +680,8 @@ def test_no_duplicate_top_level_defs():
                     seen[name] = node.lineno
         assert not dups, (
             f"{module_name} has duplicate top-level definitions: {', '.join(dups)}"
+            + "\n"
+            + format_offender_marker(str(duplicate) for duplicate in dups)
         )
 
 
@@ -2010,6 +2055,142 @@ def test_promote_recover_cut_falls_back_when_lifecycle_read_fails(monkeypatch):
     assert prompts, "expected a confirmation prompt"
     assert prompts[0] == "About to abandon the open version and open the next. Proceed? [y/N] "
     assert not any(method == "POST" and "version-cut" in path for method, path, _ in calls)
+
+def _force_promote_harness(monkeypatch, lifecycle, answer="n"):
+    """Wire promote-recover force-promote against a canned lifecycle read.
+
+    Returns ``(calls, prompts)``; ``lifecycle`` may be an Exception to simulate
+    a failed read.
+    """
+    calls = []
+    prompts = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and "version-lifecycle" in path:
+            if isinstance(lifecycle, Exception):
+                raise lifecycle
+            return lifecycle
+        if method == "POST" and "promote/force" in path:
+            return {"status": "promoted", "pr_number": 999}
+        raise AssertionError(f"unexpected API call: {method} {path}")
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or answer)
+    return calls, prompts
+
+
+_FORCE_PROMOTE_LIFECYCLE = {
+    "current_version": {
+        "version_number": 34,
+        "phase": "stabilize",
+        "in_flight_task_count": 2,
+        "active_candidate_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "last_qualification": {
+            "status": "blocked",
+            "blocker": "candidate_operator_authorship_nonzero",
+            "confidence": 0.0,
+            "threshold": 0.75,
+        },
+    }
+}
+
+
+def test_promote_recover_force_promote_discloses_what_it_overrides(monkeypatch):
+    """The most privileged lever must name the version, candidate and blocker.
+
+    A bare "About to FORCE-PROMOTE. Proceed?" is not an informed confirmation:
+    the operator cannot tell which commit ships or which gate is being skipped.
+    """
+    calls, prompts = _force_promote_harness(monkeypatch, _FORCE_PROMOTE_LIFECYCLE)
+
+    rc = blueprint.main(["promote-recover", "force-promote"])
+    assert rc == 0
+    assert prompts, "expected a confirmation prompt"
+    prompt = prompts[0]
+    assert "FORCE-PROMOTE v34" in prompt
+    assert "SKIPPING the audit gate" in prompt
+    assert "candidate_operator_authorship_nonzero" in prompt
+    assert "aaaaaaaaaaaa" in prompt
+    assert "2 in-flight tasks will NOT be" in prompt
+    # CI is NOT waived by force-promote, and a red run destroys the promotion
+    # PR + branch (see the force-promote endpoint docstring). Declining to say
+    # so would invite an operator to fire this at a red candidate.
+    assert "CI is NOT skipped" in prompt
+    assert "DELETES" in prompt
+    assert not any("promote/force" in path for _, path, _ in calls), (
+        "declining the prompt must not fire the mutation"
+    )
+
+
+def test_promote_recover_force_promote_warns_when_pinned_sha_is_not_the_candidate(monkeypatch):
+    """A pinned --candidate-sha that is not the evaluated candidate is called out."""
+    _calls, prompts = _force_promote_harness(monkeypatch, _FORCE_PROMOTE_LIFECYCLE)
+
+    rc = blueprint.main([
+        "promote-recover", "force-promote", "--candidate-sha", "bbbbbbbbbbbb",
+    ])
+    assert rc == 0
+    prompt = prompts[0]
+    assert "PINNED commit bbbbbbbbbbbb" in prompt
+    assert "NOT the candidate under evaluation" in prompt
+
+
+def test_promote_recover_force_promote_still_warns_when_lifecycle_read_fails(monkeypatch):
+    """A failed lifecycle read must not silently degrade to a bare y/N."""
+    _calls, prompts = _force_promote_harness(monkeypatch, RuntimeError("boom"))
+
+    rc = blueprint.main(["promote-recover", "force-promote"])
+    assert rc == 0
+    prompt = prompts[0]
+    assert "SKIPPING the audit gate" in prompt
+    assert "Lifecycle read FAILED" in prompt
+    assert "CI is NOT skipped" in prompt
+
+
+def test_promote_recover_force_promote_posts_candidate_and_reason(monkeypatch):
+    """With --yes the lever POSTs to promote/force carrying sha + reason."""
+    calls, _prompts = _force_promote_harness(monkeypatch, _FORCE_PROMOTE_LIFECYCLE)
+
+    rc = blueprint.main([
+        "--json", "promote-recover", "force-promote", "--yes",
+        "--candidate-sha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--reason", "authorship gate latched",
+    ])
+    assert rc == 0
+    posts = [
+        (path, body) for method, path, body in calls
+        if method == "POST" and "promote/force" in path
+    ]
+    assert len(posts) == 1, (
+        f"expected exactly one force-promote POST, got {posts}"
+        + "\n"
+        + format_offender_marker(str(post) for post in posts)
+    )
+    path, body = posts[0]
+    assert path == "/api/admin/projects/proj-1/promote/force"
+    assert body["candidate_sha"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert body["reason"] == "authorship gate latched"
+
+
+def test_promote_recover_force_promote_read_only_config_refuses(monkeypatch):
+    """A read-only (agent-JWT) config must not reach the most privileged lever."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+
+    def fake_api(method, path, body=None, timeout=30):
+        raise AssertionError(f"read-only config must not call the API: {method} {path}")
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    with pytest.raises(SystemExit):
+        blueprint.main(["promote-recover", "force-promote", "--yes"])
+
 
 
 def test_ops_requeue_failed_aborts_without_confirmation(mock_api, monkeypatch, capsys):
@@ -5680,7 +5861,11 @@ def test_compute_run_local_single_command_wrapped_in_docker(tmp_path, monkeypatc
 
     # The run command must use docker, not bare bash
     run_cmds = [c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]]
-    assert run_cmds, f"expected a 'docker run' invocation; got commands: {captured_cmds}"
+    assert run_cmds, (
+        f"expected a 'docker run' invocation; got commands: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
     docker_cmd = run_cmds[0]
     assert "myregistry.io/myimage:latest" in docker_cmd
     assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
@@ -5718,7 +5903,11 @@ def test_compute_run_local_single_command_docker_gpus_when_gpu_detected(tmp_path
     blueprint._compute_run_local(args)
 
     run_cmds = [c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]]
-    assert run_cmds, f"expected 'docker run'; got: {captured_cmds}"
+    assert run_cmds, (
+        f"expected 'docker run'; got: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
     docker_cmd = run_cmds[0]
     assert "--gpus" in docker_cmd
     assert "all" in docker_cmd
@@ -5754,12 +5943,20 @@ def test_compute_run_local_no_container_uses_bare_bash(tmp_path, monkeypatch, ca
     assert any(
         isinstance(c, list) and c[:2] == ["bash", "-lc"]
         for c in captured_cmds
-    ), f"expected bare 'bash -lc'; got: {captured_cmds}"
+    ), (
+        f"expected bare 'bash -lc'; got: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
     # No docker invocation
     assert not any(
         isinstance(c, list) and "docker" in c
         for c in captured_cmds
-    ), f"expected no docker call; got: {captured_cmds}"
+    ), (
+        f"expected no docker call; got: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
 
 
 def test_compute_run_local_arms_wrapped_in_docker_per_arm(tmp_path, monkeypatch, capsys):
@@ -5799,7 +5996,11 @@ def test_compute_run_local_arms_wrapped_in_docker_per_arm(tmp_path, monkeypatch,
         c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]
     ]
     # One docker run per arm
-    assert len(docker_run_cmds) == 2, f"expected 2 docker run invocations; got: {captured_cmds}"
+    assert len(docker_run_cmds) == 2, (
+        f"expected 2 docker run invocations; got: {captured_cmds}"
+        + "\n"
+        + format_offender_marker(str(command) for command in captured_cmds)
+    )
     for docker_cmd in docker_run_cmds:
         assert "myregistry.io/myimage:latest" in docker_cmd
         assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
@@ -6363,7 +6564,11 @@ def test_messages_answer_targets_real_endpoint(mock_api, monkeypatch, capsys):
     assert body["resolution"] == "This is my answer"
     # The old /answer POST route must NOT have been called
     old_route_calls = [p for _, p, _ in mock_api if "/answer" in p]
-    assert not old_route_calls, f"Old /answer route was called: {old_route_calls}"
+    assert not old_route_calls, (
+        f"Old /answer route was called: {old_route_calls}"
+        + "\n"
+        + format_offender_marker(str(call) for call in old_route_calls)
+    )
 
 
 def test_messages_confirm_list_json(mock_api, capsys):

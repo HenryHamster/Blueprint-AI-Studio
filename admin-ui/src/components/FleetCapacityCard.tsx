@@ -85,7 +85,7 @@ export function FleetCapacityCard({
           </span>
         )}
         {!loading && data && data.saturation == null && (
-          <span className="text-ui-sm font-semibold px-2 py-0.5 rounded border bg-neutral-800/50 border-neutral-700/50 text-neutral-500">
+          <span className="text-ui-sm font-semibold px-2 py-0.5 rounded border bg-workbench-panel/50 border-neutral-700/50 text-neutral-500">
             Unknown
           </span>
         )}
@@ -101,12 +101,12 @@ export function FleetCapacityCard({
       {loading ? (
         <div className="space-y-2"><Skeleton className="h-10 w-full" /></div>
       ) : !data ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-neutral-400 text-xs">
+        <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-neutral-400 text-xs">
           <AlertTriangle className="w-4 h-4" />
           Fleet capacity data unavailable
         </div>
       ) : (
-        <div className={`bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 ${stale ? STALE_CLASSES : ''}`}>
+        <div className={`bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 ${stale ? STALE_CLASSES : ''}`}>
           <div className="flex flex-wrap gap-2">
             <div className="flex items-center gap-1.5 text-xs">
               <span className="text-neutral-500">Active</span>
@@ -199,7 +199,7 @@ export function FleetCapacityCard({
                 ) : shaBuckets.map(bucket => (
                   <div
                     key={bucket.source_sha ?? 'unknown'}
-                    className="rounded border border-neutral-800/70 bg-neutral-950/30 px-2 py-1.5"
+                    className="rounded border border-neutral-800/70 bg-workbench-shell/30 px-2 py-1.5"
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className={`font-mono text-ui-md ${bucket.source_sha ? 'text-neutral-200' : 'text-amber-400'}`}>

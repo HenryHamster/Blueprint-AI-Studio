@@ -2680,6 +2680,45 @@ async def test_post_version_stabilize_stalled_message_fires_external_webhook(
     assert "summary" in payload and "stabilize" in payload["summary"]
 
 
+@pytest.mark.asyncio
+async def test_post_version_stabilize_stalled_message_names_external_delivery_remedy(
+    db_session,
+):
+    """External-delivery context reaches both message and webhook consumers."""
+    project = Project(name="External Delivery Stall", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch(
+        "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
+    ):
+        msg = await post_version_stabilize_stalled_message(
+            db_session,
+            project.id,
+            version_number=7,
+            version_id="vid-external-delivery",
+            age_days=15,
+            tasks_merged=41,
+            blocker="promotion_disabled",
+            blocker_class="external_delivery",
+            remedy="enable_project_promotion",
+        )
+        await asyncio.sleep(0)
+
+    assert msg.context["blocker"] == "promotion_disabled"
+    assert msg.context["blocker_class"] == "external_delivery"
+    assert msg.context["remedy"] == "enable_project_promotion"
+    assert "Enable project promotion before requesting qualification" in msg.content
+
+    dispatch_mock.assert_called_once()
+    payload = dispatch_mock.call_args.args[2]
+    assert payload["blocker"] == "promotion_disabled"
+    assert payload["blocker_class"] == "external_delivery"
+    assert payload["remedy"] == "enable_project_promotion"
+    assert "Enable project promotion before requesting qualification" in payload["summary"]
+
+
 # ---------------------------------------------------------------------------
 # post_version_ci_unresolved_stall_message
 # ---------------------------------------------------------------------------

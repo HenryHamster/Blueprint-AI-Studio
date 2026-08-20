@@ -547,7 +547,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
                 className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
                   props.showUserManagement
                     ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                    : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+                    : 'bg-workbench-panel hover:bg-workbench-hover text-neutral-300 border-neutral-700'
                 }`}
               >
                 <Users className="w-3.5 h-3.5" />

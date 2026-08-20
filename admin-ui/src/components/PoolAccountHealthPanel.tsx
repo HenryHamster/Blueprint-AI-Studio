@@ -82,7 +82,7 @@ const FAILURE_CLASS_SHORT: Record<string, string> = {
 };
 
 function Skeleton({ className = '' }: { className?: string }) {
-  return <div className={`animate-pulse bg-neutral-800/60 rounded ${className}`} />;
+  return <div className={`animate-pulse bg-workbench-panel/60 rounded ${className}`} />;
 }
 
 // Utilization is "fraction of the window's budget consumed" — higher is worse
@@ -188,7 +188,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
       </div>
       <div
         data-testid="account-health-summary"
-        className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-neutral-950/30 sm:grid-cols-4"
+        className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-shell/30 sm:grid-cols-4"
       >
         <div className="border-r border-b border-neutral-800/60 px-2.5 py-2 sm:border-b-0">
           <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Healthy</div>
@@ -218,7 +218,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
       <div className="space-y-1">
         {accounts.map(acct => {
           const expanded = expandedId === acct.account_id;
-          const stateBadge = ACCOUNT_STATE_BADGES[acct.state] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+          const stateBadge = ACCOUNT_STATE_BADGES[acct.state] ?? 'bg-workbench-control/20 text-neutral-400 border-neutral-500/30';
           const scoreColor = acct.health_score >= 0.7 ? 'text-emerald-400' : acct.health_score >= 0.4 ? 'text-amber-400' : 'text-red-400';
           const counts = Object.entries(acct.failure_class_counts).filter(([, v]) => (v ?? 0) > 0);
           const totalFailures = counts.reduce((s, [, v]) => s + (v ?? 0), 0);
@@ -228,7 +228,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
           const dimmed = acct.state === 'disabled' || acct.state === 'disqualified';
           const action = accountNextAction(acct, totalFailures);
           return (
-            <div key={acct.account_id} className={`bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5${dimmed ? ' opacity-50' : ''}`}>
+            <div key={acct.account_id} className={`bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-2.5${dimmed ? ' opacity-50' : ''}`}>
               <button
                 type="button"
                 className="min-h-11 w-full text-left"
@@ -291,15 +291,15 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                       {acct.failure_class_buckets && (
                         <div className="flex items-center gap-1.5 text-ui-xs">
                           <span className="text-yellow-400/80" title="provider: rate-limit + external API">
-                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-yellow-400/70 align-middle mr-0.5" />
+                            <span className="inline-block w-1.5 h-1.5 rounded bg-yellow-400/70 align-middle mr-0.5" />
                             {acct.failure_class_buckets.provider ?? 0}p
                           </span>
                           <span className="text-red-400/80" title="code: code error + migration">
-                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-red-400/70 align-middle mr-0.5" />
+                            <span className="inline-block w-1.5 h-1.5 rounded bg-red-400/70 align-middle mr-0.5" />
                             {acct.failure_class_buckets.code ?? 0}c
                           </span>
                           <span className="text-orange-400/80" title="infra: provision + timeout + scope">
-                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-orange-400/70 align-middle mr-0.5" />
+                            <span className="inline-block w-1.5 h-1.5 rounded bg-orange-400/70 align-middle mr-0.5" />
                             {acct.failure_class_buckets.infrastructure ?? 0}i
                           </span>
                         </div>
@@ -315,7 +315,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                             <div
                               key={cls}
                               title={`${FAILURE_CLASS_SHORT[cls] ?? cls}: ${count}`}
-                              className={`h-2 rounded-sm ${FAILURE_CLASS_BAR_COLORS[cls] ?? 'bg-neutral-500'}`}
+                              className={`h-2 rounded ${FAILURE_CLASS_BAR_COLORS[cls] ?? 'bg-workbench-control'}`}
                               style={{ width: `${Math.max(4, Math.round(((count ?? 0) / totalFailures) * 32))}px` }}
                             />
                           ))}

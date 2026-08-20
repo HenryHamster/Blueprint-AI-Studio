@@ -192,7 +192,7 @@ export function ProviderSettingsPanel({
           <select
             value={selectedTaskType}
             onChange={e => setSelectedTaskType(e.target.value)}
-            className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 text-xs text-neutral-100"
+            className="flex-1 bg-workbench-base border border-neutral-700 rounded px-2 py-1.5 text-xs text-neutral-100"
           >
             {providerRoutableOptions.map(t => (
               <option key={t.value} value={t.value}>{t.label}</option>
@@ -211,8 +211,8 @@ export function ProviderSettingsPanel({
             onClick={() => setSelectedProvider(name)}
             className={`px-3 py-1.5 rounded text-xs transition-colors ${
               selectedProvider === name
-                ? 'bg-neutral-800 text-neutral-100 border border-neutral-700'
-                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50 border border-transparent'
+                ? 'bg-workbench-panel text-neutral-100 border border-neutral-700'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-workbench-hover/50 border border-transparent'
             }`}
           >
             {name}
@@ -261,7 +261,7 @@ function ScopeTab({ active, onClick, children }: { active: boolean; onClick: () 
       onClick={onClick}
       className={`px-3 py-1.5 rounded text-xs transition-colors ${
         active
-          ? 'bg-neutral-800 text-neutral-100'
+          ? 'bg-workbench-panel text-neutral-100'
           : 'text-neutral-400 hover:text-neutral-200'
       }`}
     >
@@ -449,7 +449,7 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
       <select
         value={(value as string | number) ?? ''}
         onChange={e => onChange(e.target.value)}
-        className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+        className="w-full bg-workbench-base border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
       >
         {schema.enum.map(opt => {
           const reason = disabledEnumValues?.[String(opt)];
@@ -474,7 +474,7 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
       <button
         data-viewport-allow-small-target
         onClick={() => onChange(!value)}
-        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${value ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${value ? 'bg-emerald-600' : 'bg-workbench-layer'}`}
       >
         <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${value ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
       </button>
@@ -493,7 +493,7 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
           const n = schema.type === 'integer' ? parseInt(raw, 10) : parseFloat(raw);
           if (!Number.isNaN(n)) onChange(n);
         }}
-        className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+        className="w-full bg-workbench-base border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
       />
     );
   }
@@ -511,7 +511,7 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
           onChange(parts);
         }}
         placeholder="comma-separated"
-        className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100 font-mono"
+        className="w-full bg-workbench-base border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100 font-mono"
       />
     );
   }
@@ -519,7 +519,7 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
   if (schema.type === 'object' && schema.properties) {
     const asBag = (typeof value === 'object' && value !== null) ? value as ProviderSettingsBag : {};
     return (
-      <div className="border border-neutral-800 rounded p-2 space-y-1.5 bg-neutral-900/30">
+      <div className="border border-neutral-800 rounded p-2 space-y-1.5 bg-workbench-base/30">
         <SchemaForm
           schema={schema}
           value={asBag}
@@ -545,7 +545,7 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
         value={(value as string) ?? ''}
         onChange={e => onChange(e.target.value || undefined)}
         list={listId}
-        className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+        className="w-full bg-workbench-base border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
       />
       {hasExamples && (
         <datalist id={listId}>

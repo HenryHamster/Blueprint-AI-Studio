@@ -37,7 +37,7 @@ export function MetricsIntegrityObservabilityPanel({
   return (
     <div className="border border-neutral-800 rounded-lg overflow-hidden" data-testid="metrics-integrity-observability-panel">
       <button
-        className="w-full flex items-center justify-between px-4 py-3 bg-neutral-900 hover:bg-neutral-800/60 transition-colors"
+        className="w-full flex items-center justify-between px-4 py-3 bg-workbench-base hover:bg-workbench-hover/60 transition-colors"
         onClick={() => setCollapsed(v => !v)}
       >
         <div className="flex items-center gap-2">
@@ -56,14 +56,14 @@ export function MetricsIntegrityObservabilityPanel({
           {sweepMode != null && onSweepModeChange != null && (
             <div>
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Mode</label>
-              <div className="flex gap-1 bg-neutral-950 border border-neutral-700 rounded-lg p-1 w-fit">
+              <div className="flex gap-1 bg-workbench-shell border border-neutral-700 rounded-lg p-1 w-fit">
                 {(['off', 'observe', 'enforce'] as const).map(mode => (
                   <button
                     key={mode}
                     onClick={() => void onSweepModeChange(mode)}
                     className={`px-3 py-1.5 text-xs rounded-md transition-colors capitalize ${
                       sweepMode === mode
-                        ? 'bg-neutral-700 text-neutral-100'
+                        ? 'bg-workbench-layer text-neutral-100'
                         : 'text-neutral-500 hover:text-neutral-300'
                     }`}
                   >
@@ -85,31 +85,31 @@ export function MetricsIntegrityObservabilityPanel({
           {data != null && (
             <>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Ticks</p>
                   <p className="text-lg font-mono text-neutral-100">{data.ticks}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Checks Run</p>
                   <p className="text-lg font-mono text-neutral-100">{data.checks_run}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Flags Total</p>
                   <p className={`text-lg font-mono ${data.flags_total > 0 ? 'text-yellow-400' : 'text-neutral-100'}`}>{data.flags_total}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Errors Total</p>
                   <p className={`text-lg font-mono ${data.errors_total > 0 ? 'text-red-400' : 'text-neutral-100'}`}>{data.errors_total}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Auto-Resolved</p>
                   <p className={`text-lg font-mono ${(data.auto_resolved_total ?? 0) > 0 ? 'text-green-400' : 'text-neutral-100'}`}>{data.auto_resolved_total ?? 0}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Backing Path</p>
                   <p className="text-lg font-mono text-neutral-100">{data.auto_resolved_backing_path_total ?? 0}</p>
                 </div>
-                <div className="bg-neutral-900 rounded-lg px-3 py-2 border border-neutral-800">
+                <div className="bg-workbench-base rounded-lg px-3 py-2 border border-neutral-800">
                   <p className="text-ui-sm text-neutral-500 uppercase tracking-wider mb-1">Named Test</p>
                   <p className="text-lg font-mono text-neutral-100">{data.auto_resolved_named_test_present_total ?? 0}</p>
                 </div>

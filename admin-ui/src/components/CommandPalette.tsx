@@ -234,7 +234,7 @@ export function CommandPalette({
       >
         <header className="flex min-w-0 items-center justify-between gap-2.5 border-b border-workbench-border bg-workbench-shell px-3 py-2">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-neutral-950 text-neutral-300">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-workbench-shell text-neutral-300">
               <Command className="h-4 w-4" aria-hidden="true" />
             </span>
             <div className="min-w-0">
@@ -251,7 +251,7 @@ export function CommandPalette({
             type="button"
             onClick={onClose}
             aria-label="Close command palette"
-            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-neutral-950 text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100 md:min-h-8 md:min-w-8"
+            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-workbench-shell text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100 md:min-h-8 md:min-w-8"
           >
             <X className="h-4 w-4" aria-hidden="true" />
           </button>
@@ -274,7 +274,7 @@ export function CommandPalette({
               type="button"
               onClick={() => updateQuery('')}
               aria-label="Clear command search"
-              className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-neutral-950 text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100 md:min-h-8 md:min-w-8"
+              className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-workbench-shell text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100 md:min-h-8 md:min-w-8"
             >
               <X className="h-4 w-4" aria-hidden="true" />
             </button>
@@ -315,7 +315,7 @@ export function CommandPalette({
                           ? 'cursor-not-allowed border-transparent text-neutral-500 opacity-65'
                           : active
                             ? 'border-cyan-400/40 bg-cyan-400/10 text-neutral-50 shadow-[inset_2px_0_0_rgba(34,211,238,0.75)]'
-                            : 'border-transparent text-neutral-200 hover:bg-neutral-800/70'
+                            : 'border-transparent text-neutral-200 hover:bg-workbench-hover/70'
                       }`}
                     >
                       <span className="min-w-0 flex-1">
@@ -327,7 +327,7 @@ export function CommandPalette({
                         )}
                       </span>
                       {command.shortcut && (
-                        <kbd className="hidden shrink-0 rounded border border-neutral-700 bg-neutral-950/80 px-1.5 py-0.5 font-mono text-ui-md text-neutral-500 sm:inline-block">
+                        <kbd className="hidden shrink-0 rounded border border-neutral-700 bg-workbench-shell/80 px-1.5 py-0.5 font-mono text-ui-md text-neutral-500 sm:inline-block">
                           {command.shortcut}
                         </kbd>
                       )}

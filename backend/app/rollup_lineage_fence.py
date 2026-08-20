@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import logging
 import uuid
 from typing import Any
 
@@ -25,6 +27,8 @@ from app.closed_pr_reconciliation import (
 )
 from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
+
+logger = logging.getLogger(__name__)
 
 _LINEAGE_GENERATION_KEY = "_rollup_lineage_generation"
 _INVALIDATION_KEY = "_rollup_invalidated_by_descendant"
@@ -351,42 +355,165 @@ async def invalidate_ancestor_rollups_for_requeue(
             )
             invalidated.append(str(ancestor.id))
 
-        blocks = dict((ancestor.context or {}).get(_OPERATOR_BLOCKS_KEY) or {})
-        if str(task.id) in blocks:
-            cleaned = dict(ancestor.context or {})
-            block_hold = copy.deepcopy(cleaned.get(_OPERATOR_BLOCK_HOLD_KEY))
-            blocks.pop(str(task.id), None)
-            if blocks:
-                cleaned[_OPERATOR_BLOCKS_KEY] = blocks
-                ancestor.context = cleaned
-                ancestor.latest_status_message = (
-                    f"{len(blocks)} descendant task(s) still need operator "
-                    "intervention"
-                )
-            else:
-                cleaned.pop(_OPERATOR_BLOCKS_KEY, None)
-                cleaned.pop(_PRIOR_APPROVAL_KEY, None)
-                prior_state = copy.deepcopy(
-                    cleaned.pop(_PRIOR_APPROVAL_STATE_KEY, None)
-                )
-                cleaned.pop(_OPERATOR_BLOCK_HOLD_KEY, None)
-                ancestor.context = cleaned
-                prior_state_is_restorable = isinstance(
-                    prior_state, dict
-                ) and isinstance(prior_state.get("context"), dict)
-                if (
-                    prior_state_is_restorable
-                    and _owns_descendant_block_hold(ancestor, block_hold)
-                ):
-                    consumed = consume_approval_hold_metadata(
-                        ancestor,
-                        expected_episode=block_hold.get("approval_state"),
-                    )
-                    if consumed:
-                        _restore_approval_state(ancestor, prior_state)
+        _release_descendant_block_entries(ancestor, [str(task.id)])
 
         session.add(ancestor)
     return invalidated
+
+
+def _release_descendant_block_entries(
+    ancestor: Task, resolved_ids: list[str]
+) -> bool:
+    """Drop ``resolved_ids`` from the ancestor's keyed descendant blocks.
+
+    When the LAST block clears, the fence's approval hold is consumed (with
+    ownership verification) and the prior approval state restored — identical
+    semantics for the requeue path and the resolved-subject release path.
+    Returns ``True`` iff every block is now gone and the hold was released.
+    Callers own ``session.add`` / commit.
+    """
+    blocks = dict((ancestor.context or {}).get(_OPERATOR_BLOCKS_KEY) or {})
+    to_drop = [rid for rid in resolved_ids if rid in blocks]
+    if not to_drop:
+        return False
+    cleaned = dict(ancestor.context or {})
+    block_hold = copy.deepcopy(cleaned.get(_OPERATOR_BLOCK_HOLD_KEY))
+    for rid in to_drop:
+        blocks.pop(rid, None)
+    if blocks:
+        cleaned[_OPERATOR_BLOCKS_KEY] = blocks
+        ancestor.context = cleaned
+        ancestor.latest_status_message = (
+            f"{len(blocks)} descendant task(s) still need operator "
+            "intervention"
+        )
+        return False
+    cleaned.pop(_OPERATOR_BLOCKS_KEY, None)
+    cleaned.pop(_PRIOR_APPROVAL_KEY, None)
+    prior_state = copy.deepcopy(
+        cleaned.pop(_PRIOR_APPROVAL_STATE_KEY, None)
+    )
+    cleaned.pop(_OPERATOR_BLOCK_HOLD_KEY, None)
+    ancestor.context = cleaned
+    prior_state_is_restorable = isinstance(
+        prior_state, dict
+    ) and isinstance(prior_state.get("context"), dict)
+    if (
+        prior_state_is_restorable
+        and _owns_descendant_block_hold(ancestor, block_hold)
+    ):
+        consumed = consume_approval_hold_metadata(
+            ancestor,
+            expected_episode=block_hold.get("approval_state"),
+        )
+        if consumed:
+            _restore_approval_state(ancestor, prior_state)
+    return True
+
+
+async def release_resolved_descendant_operator_blocks(
+    ancestor: Task,
+    session: AsyncSession,
+) -> bool:
+    """Release fence blocks whose subjects have since resolved on their own.
+
+    ``mark_ancestor_rollups_awaiting_operator`` had exactly ONE release path:
+    an operator requeueing the flagged descendant
+    (``invalidate_ancestor_rollups_for_requeue``). When the flagged blocker
+    instead resolved out-of-band — its subject PR merged or closed, or the
+    PR-less descendant completed — the ancestor's approval hold persisted
+    forever and the approval-gate timeout killed the row (incident
+    2026-08-19: PR #17419 merged at 02:15Z, yet ancestor 289809a3 was FAILED
+    by the 2h timeout at 02:18Z, and its requeued clone re-inherited the
+    stale hold).
+
+    A block entry is treated as resolved when its recorded ``pr_number`` is
+    MERGED or CLOSED on GitHub, or — entries without a PR — when the flagged
+    descendant task is COMPLETED. Every lookup failure is conservative: the
+    entry stays and the hold is kept. Returns ``True`` iff every block
+    resolved and the hold was released (prior approval state restored).
+    Mutates + ``session.add``s the ancestor; the caller owns the commit.
+    """
+    blocks = dict((ancestor.context or {}).get(_OPERATOR_BLOCKS_KEY) or {})
+    if not blocks:
+        return False
+
+    from app.github import get_pull_request
+    from app.routers.agent import get_github_token_for_task
+
+    gh_auth = None
+    pr_state_cache: dict[int, dict | None] = {}
+
+    async def _pr_resolved(pr_number: int) -> bool:
+        nonlocal gh_auth
+        if pr_number in pr_state_cache:
+            pr = pr_state_cache[pr_number]
+        else:
+            if gh_auth is None:
+                try:
+                    gh_auth = await get_github_token_for_task(
+                        ancestor.id, session
+                    )
+                except Exception:  # noqa: BLE001 — config failure: keep hold
+                    gh_auth = ()
+            if not gh_auth:
+                pr_state_cache[pr_number] = None
+                return False
+            gh_token, owner, repo = gh_auth
+            try:
+                pr = await asyncio.wait_for(
+                    get_pull_request(
+                        gh_token,
+                        owner,
+                        repo,
+                        pr_number,
+                        project_id=str(ancestor.project_id),
+                    ),
+                    timeout=30,
+                )
+            except Exception:  # noqa: BLE001 — unknown state: keep hold
+                pr = None
+            pr_state_cache[pr_number] = pr
+        if not isinstance(pr, dict):
+            return False
+        return bool(pr.get("merged")) or str(pr.get("state")) == "closed"
+
+    resolved: list[str] = []
+    for block_id, entry in blocks.items():
+        entry = entry if isinstance(entry, dict) else {}
+        pr_number = entry.get("pr_number")
+        if pr_number:
+            try:
+                if await _pr_resolved(int(pr_number)):
+                    resolved.append(block_id)
+            except (TypeError, ValueError):
+                continue
+            continue
+        try:
+            block_uuid = uuid.UUID(str(entry.get("task_id") or block_id))
+        except (TypeError, ValueError):
+            continue
+        descendant = await session.get(Task, block_uuid)
+        if descendant is not None and descendant.status == TaskStatus.COMPLETED:
+            resolved.append(block_id)
+
+    if not resolved:
+        return False
+    released = _release_descendant_block_entries(ancestor, resolved)
+    if released:
+        ancestor.latest_status_message = (
+            "Descendant operator block(s) resolved out-of-band "
+            "(PR merged/closed or descendant completed) — released "
+            "the fence hold and restored prior approval state"
+        )
+        logger.info(
+            "[LINEAGE FENCE] Released %d resolved descendant block(s) on "
+            "ancestor %s — hold cleared without operator requeue",
+            len(resolved),
+            str(ancestor.id)[:8],
+        )
+    session.add(ancestor)
+    return released
 
 
 async def mark_ancestor_rollups_awaiting_operator(

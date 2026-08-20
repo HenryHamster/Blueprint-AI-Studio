@@ -79,7 +79,7 @@ function statusToneClass(status?: string | null): string {
   if (['ready', 'done', 'complete', 'resolved'].some(term => normalized.includes(term))) {
     return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300';
   }
-  return 'border-neutral-700 bg-neutral-900/80 text-neutral-400';
+  return 'border-neutral-700 bg-workbench-base/80 text-neutral-400';
 }
 
 function truncateEdgeLabel(label: string): string {
@@ -233,7 +233,7 @@ function NodeCard({
   const className = [
     'absolute flex h-[88px] w-[clamp(6rem,22vw,11.5rem)] -translate-x-1/2 flex-col overflow-hidden rounded-md border px-2.5 py-2 text-left shadow-lg shadow-black/20 ring-1 ring-white/[0.03]',
     canOpen
-      ? 'border-neutral-700/90 bg-[#0d141d]/95 transition-colors hover:border-cyan-500/50 hover:bg-[#111b25] focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500/60'
+      ? 'border-neutral-700/90 bg-[#0d141d]/95 transition-colors hover:border-cyan-500/50 hover:bg-[#111b25] workbench-focus'
       : 'border-neutral-800 bg-[#0b1118]/95',
   ].join(' ');
   const content = (
@@ -292,7 +292,7 @@ export function StrategicContextMap({ canvas, onOpenTarget }: StrategicContextMa
   if (nodes.length === 0) {
     return (
       <section aria-label="Strategic context map overview" data-testid="strategic-context-map">
-        <div className="rounded-md border border-dashed border-neutral-800 bg-neutral-950/40 px-3 py-4 text-sm text-neutral-500">
+        <div className="rounded-md border border-dashed border-neutral-800 bg-workbench-shell/40 px-3 py-4 text-sm text-neutral-500">
           No map nodes are available yet. Resources and evidence below can still carry the discussion context.
         </div>
       </section>
@@ -302,7 +302,7 @@ export function StrategicContextMap({ canvas, onOpenTarget }: StrategicContextMa
   return (
     <section aria-label="Strategic context map overview" data-testid="strategic-context-map">
       <div
-        className="max-h-[520px] min-w-0 overflow-auto rounded-md border border-neutral-800 bg-[#080d13] custom-scrollbar"
+        className="max-h-[520px] min-w-0 overflow-auto rounded-md border border-neutral-800 bg-workbench-rail custom-scrollbar"
         role="group"
         aria-label={`Strategic context map with ${formatUnitCount(nodes.length, 'node')} and ${formatUnitCount(layout.visibleEdges.length, 'link')}`}
       >
@@ -376,14 +376,14 @@ export function StrategicContextMap({ canvas, onOpenTarget }: StrategicContextMa
       </ul>
 
       <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5 text-ui-sm font-semibold uppercase text-neutral-500">
-        <span className="rounded border border-neutral-800 bg-neutral-950/50 px-1.5 py-0.5">
+        <span className="rounded border border-neutral-800 bg-workbench-shell/50 px-1.5 py-0.5">
           {formatUnitCount(nodes.length, 'node')}
         </span>
-        <span className="rounded border border-neutral-800 bg-neutral-950/50 px-1.5 py-0.5">
+        <span className="rounded border border-neutral-800 bg-workbench-shell/50 px-1.5 py-0.5">
           {formatUnitCount(layout.visibleEdges.length, 'link')}
         </span>
         {hiddenEdgeCount > 0 && (
-          <span className="rounded border border-neutral-800 bg-neutral-950/50 px-1.5 py-0.5 text-neutral-600">
+          <span className="rounded border border-neutral-800 bg-workbench-shell/50 px-1.5 py-0.5 text-neutral-600">
             {formatCompactNumber(hiddenEdgeCount)} unresolved
           </span>
         )}

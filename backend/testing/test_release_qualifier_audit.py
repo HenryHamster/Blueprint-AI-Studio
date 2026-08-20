@@ -420,6 +420,99 @@ async def test_goal_category_grading_uses_full_version_delta_while_audit_stays_i
 
 
 @pytest.mark.asyncio
+async def test_release_audit_payload_carries_candidate_range_authorship_evidence_and_contract(
+    db_session, mocker
+):
+    """The spawned release_audit payload's release_evidence must reflect the
+    candidate's REAL measured base-to-head authorship receipt and the active
+    authorship criterion's evidence_contract — not the hardcoded
+    ``missing_or_invalid``/empty-contracts degrade the spawn call used to emit
+    unconditionally.
+
+    Regression: ``_spawn_release_audit_task`` was called with a literal
+    ``None`` receipt and a ``categories`` projection stripped of
+    ``evidence_contract``, so the audit's ``release_evidence`` always reported
+    state ``missing_or_invalid`` with an empty ``contracts`` list, even though
+    the candidate's authorship budget was measurable and declared. The goal
+    grader can only machine-attest a declared candidate-range authorship
+    budget when the payload actually carries the measured receipt and the
+    contract."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "STABILIZE — declared authorship budget"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    candidate = "cccc3333" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier.resolve_project_promotion_enabled",
+        return_value=True,
+    )
+
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    audit_tasks = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "release_audit"
+    ]
+    assert len(audit_tasks) == 1, (
+        f"expected 1 release_audit task, got {len(audit_tasks)}"
+    )
+    payload = audit_tasks[0].first_payload
+    release_evidence = payload.get("release_evidence") or {}
+    authorship_evidence = release_evidence.get("operator_authored_commits") or {}
+
+    # The autouse _qualifier_ci_resolves_green fixture measures the candidate
+    # range as a clean, resolved receipt (count=0) -- the payload must carry
+    # THAT, not the always-missing degrade branch the bug produced.
+    assert authorship_evidence.get("state") == "resolved"
+    assert authorship_evidence.get("count") == 0
+
+    # The default operator-authorship criterion (opened on every new version
+    # by ensure_operator_authorship_criterion) declares max_count=0 -- its
+    # evidence_contract must survive the categories projection into the
+    # audit payload instead of being stripped to {category_key, text} only.
+    contracts = release_evidence.get("contracts") or []
+    assert {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 0},
+    } in contracts
+
+    categories = payload.get("categories") or []
+    authorship_category = next(
+        (c for c in categories if c.get("category_key") == "c-operator-authorship"),
+        None,
+    )
+    assert authorship_category is not None
+    assert authorship_category.get("evidence_contract") == {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 0},
+    }
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_audit_graded_a_narrowed_goal_category_range(
     db_session,
 ):

@@ -641,6 +641,49 @@ describe('initial window and newest-message pinning', () => {
     expect(messages.map(item => item.sequence)).toEqual([50]);
   });
 
+  test('renders the retained transcript on remount without an unconditional refetch', async () => {
+    // Simulates the caller (MessagesPanel) staying mounted across a tab switch:
+    // the hook instance and its refs survive, so returning to the same scope
+    // must not repeat the unconditional (no-etag) initial fetch, and the
+    // transcript already held by the caller's own state must still be there.
+    let messages: ProjectMessage[] = [];
+    fetchStrategicConversation.mockResolvedValue({
+      etag: 'etag-1',
+      conversation: { has_more: false, next_before_sequence: null, items: [message(50)] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+
+    const { rerender } = renderHook(
+      () => useConversation({
+        enabled: true,
+        fetchInitial: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+    );
+
+    await waitFor(() => expect(fetchStrategicConversation).toHaveBeenCalledTimes(1));
+    // First fetch is unconditional — no prior etag exists yet.
+    expect(fetchStrategicConversation.mock.calls[0][3]).toBeNull();
+    expect(messages.map(item => item.sequence)).toEqual([50]);
+
+    // Re-render with the same scope (project/actor/target unchanged) — this is
+    // what happens when the operator switches away from and back to chat now
+    // that the panel is never unmounted. `initialFetchScopeRef` must recognize
+    // the scope hasn't changed and skip a second unconditional fetch.
+    rerender();
+
+    expect(fetchStrategicConversation).toHaveBeenCalledTimes(1);
+    expect(messages.map(item => item.sequence)).toEqual([50]);
+  });
+
   test('initial fetch uses the bounded conversation window', async () => {
     let messages: ProjectMessage[] = [];
     fetchStrategicConversation.mockResolvedValue({

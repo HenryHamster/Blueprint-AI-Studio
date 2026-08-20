@@ -36,6 +36,7 @@ USE_POSTGRES=1
 USE_TESTMON=1
 REQUIRE_TESTMON=0
 SANDBOX_POSTGRES=0
+INVENTORY_ONLY=0
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
@@ -44,6 +45,7 @@ for arg in "$@"; do
     --no-postgres) USE_POSTGRES=0 ;;
     --no-testmon) USE_TESTMON=0 ;;
     --require-testmon) REQUIRE_TESTMON=1 ;;
+    --standalone-inventory) INVENTORY_ONLY=1 ;;
     *)
       case "$arg" in
         backend/*) ARGS+=("${arg#backend/}") ;;
@@ -163,6 +165,9 @@ elif [ "$USE_POSTGRES" = "1" ] && _AUTO_POSTGRES_FLAG="$(select_backend_test_rou
   echo "=== Using off-image pgserver PostgreSQL sandbox ==="
 elif command -v docker &>/dev/null && docker info >/dev/null 2>&1; then
   USE_DOCKER=1
+elif [ "$INVENTORY_ONLY" = "1" ]; then
+  USE_DOCKER=0
+  echo "=== Standalone corpus inventory (no test runtime) ==="
 else
   USE_DOCKER=0
   if [ "$USE_POSTGRES" = "1" ]; then
@@ -539,6 +544,19 @@ _run() {
 CI_TEST_MODULE_ROOTS=(
   scripts
   backend/testing
+  infra/db_recovery
+  infra/livekit/tests
+)
+
+# infra/db_recovery and infra/livekit/tests hold pure static-assertion tests
+# (path reads + string asserts against checked-in IaC/config text, no Docker/
+# DB/cloud dependency) that ran in no lane at all before this: they are outside
+# CI_TEST_MODULE_ROOTS's old coverage and outside backend/testing/, so nothing
+# executed them and nothing flagged that. Unlike the scripts/ roster they need
+# no capability exemption list -- every discovered file always runs.
+INFRA_TEST_ROOTS=(
+  infra/db_recovery
+  "infra/livekit/tests"
 )
 
 # Discover the scripts test corpus at runtime. This is intentionally a glob,
@@ -561,15 +579,27 @@ CI_SCRIPT_TEST_DISCOVERY_GLOB="test_*.py"
 # calls a real API or Docker daemon. Keep it in the roster; if a specific test
 # genuinely needs a capability this lane lacks, exempt that one test with
 # pytest.mark.skipif, not the whole file.
+#
+# test_local_runner.py is no longer here either. It carried the reason
+# "requires an enrolled local runner and its host services", but its 648 tests
+# import local_runner in-process and mock the host: no test enrolls a runner,
+# and the handful that genuinely touched the host (a real `codex --version`
+# probe, a real HTTP POST to api.example.com, a saved ~/.blueprint token, a
+# clean git checkout) were each scoped or stubbed per-test rather than by
+# exempting the file. The blanket exemption is what let the file drift 20-red
+# and 49s long while reporting nothing; it now runs in 9s.
 CI_SCRIPT_TEST_EXEMPTIONS=(
   "test_blueprint_node.py|requires a root-owned system Python and systemd deployment host"
   "test_local_postgres_cutover_integration.py|requires a Docker daemon and two real PostgreSQL containers"
-  "test_local_runner.py|requires an enrolled local runner and its host services"
 )
 
 STANDALONE_SCRIPT_TEST_ARGS=()
 STANDALONE_RELEASE_TEST_ARGS=()
-if [ "$USE_DOCKER" = "1" ]; then
+if [ "$INVENTORY_ONLY" = "1" ]; then
+  # Inventory mode runs outside the container, so inspect this checkout even
+  # when the eventual test run would use the /repo Docker mount.
+  SCRIPT_TEST_ROOT=../scripts
+elif [ "$USE_DOCKER" = "1" ]; then
   SCRIPT_TEST_ROOT=/repo/scripts
 else
   # Docker-less local runs are rooted at the checkout, not the /repo bind mount.
@@ -601,6 +631,29 @@ elif [ -f "$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py" ]; then
   STANDALONE_RELEASE_TEST_ARGS+=("$SCRIPT_TEST_ROOT/test_bootstrap_local_app_release.py")
 fi
 
+# Discover the infra test corpus the same way: a glob, not a second per-file
+# roster. Every discovered test_*.py under an INFRA_TEST_ROOTS entry always
+# runs -- these files are static-assertion-only, so there is no capability
+# axis to exempt against.
+STANDALONE_INFRA_TEST_ARGS=()
+for infra_root in "${INFRA_TEST_ROOTS[@]}"; do
+  # Inventory mode runs outside the container, so it must inspect this
+  # checkout even when the eventual test run would use the /repo mount --
+  # the same reason SCRIPT_TEST_ROOT special-cases it above. Without this
+  # the glob resolves to a nonexistent /repo path, the infra corpus drops
+  # out of the inventory silently, and the release guard that diffs this
+  # inventory between trees stops seeing infra test deletions.
+  if [ "$USE_DOCKER" = "1" ] && [ "$INVENTORY_ONLY" != "1" ]; then
+    infra_test_root="/repo/$infra_root"
+  else
+    infra_test_root="../$infra_root"
+  fi
+  for infra_test_path in "$infra_test_root"/$CI_SCRIPT_TEST_DISCOVERY_GLOB; do
+    [ -f "$infra_test_path" ] || continue
+    STANDALONE_INFRA_TEST_ARGS+=("$infra_test_path")
+  done
+done
+
 STATIC_GUARD_SELECTORS_ARGS=()
 if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ]; then
   while IFS= read -r selector; do
@@ -620,6 +673,70 @@ if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ]; then
     echo "ERROR: static guard selector list is empty or invalid" >&2
     exit 2
   }
+fi
+
+if [ "${1:-}" = "--standalone" ]; then
+  if [ "${#STATIC_GUARD_SELECTORS_ARGS[@]}" -gt 0 ]; then
+    STANDALONE_ARGS=("${STATIC_GUARD_SELECTORS_ARGS[@]}")
+  else
+    STANDALONE_ARGS=(
+    testing/test_security.py
+    testing/test_pipeline.py
+    testing/test_invariants.py
+    testing/test_impacted_tests.py
+    testing/test_audit_finding_class_guards.py
+    testing/test_admin_auth_invariant.py
+    testing/test_release_promotion_metric_manifest.py
+    testing/test_dependency_deprecations.py
+    testing/test_websocket_emitter_inventory.py
+    testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
+    testing/test_monthly_budget_alerts.py
+    testing/test_migration_chain.py
+    testing/test_message_audience.py
+    testing/test_event_type_invariants.py
+    testing/test_salvage_bundle_standalone.py
+    testing/test_test_durations_freshness.py
+    testing/test_shard_balance.py
+    testing/test_conversational_workday_protection.py
+    testing/test_vitest_durations_freshness.py
+    )
+    # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
+    # The scripts roster is explicitly maintained above and checked by
+    # backend/testing/test_ci_compliance_gate.py. It runs from the /repo mount in
+    # CI and from ../scripts on Docker-less checkouts.
+    STANDALONE_ARGS+=("${STANDALONE_SCRIPT_TEST_ARGS[@]}")
+    # This exit-proof release suite covers durable handoff, serving confirmation,
+    # and receipt retry behavior that pytest backend shards do not collect.
+    STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
+    STANDALONE_ARGS+=("${STANDALONE_INFRA_TEST_ARGS[@]}")
+  fi
+fi
+
+# This is the one machine-readable view of the corpus that this harness will
+# execute. The release guard compares it between trees to detect deleted,
+# renamed, or otherwise omitted corpus members without maintaining a second
+# per-file roster. Normalize mount paths back to checkout-relative identities so
+# Docker and direct execution produce the same inventory.
+if [ "$INVENTORY_ONLY" = "1" ]; then
+  [ "${1:-}" = "--standalone" ] || {
+    echo "ERROR: --standalone-inventory requires --standalone" >&2
+    exit 2
+  }
+  echo "BLUEPRINT_STANDALONE_CORPUS_V1"
+  for corpus_entry in "${STANDALONE_ARGS[@]}"; do
+    case "$corpus_entry" in
+      /repo/*) canonical_entry="${corpus_entry#/repo/}" ;;
+      # Any checkout-relative entry (scripts/, infra/) normalizes to the
+      # same repo-relative identity the /repo mount produces, so the two
+      # execution modes emit one comparable inventory.
+      ../*) canonical_entry="${corpus_entry#../}" ;;
+      testing/*) canonical_entry="backend/$corpus_entry" ;;
+      *) canonical_entry="$corpus_entry" ;;
+    esac
+    printf 'BLUEPRINT_STANDALONE_CORPUS_ENTRY=%s\n' "$canonical_entry"
+  done
+  echo "BLUEPRINT_STANDALONE_CORPUS_END"
+  exit 0
 fi
 
 if [ "$USE_DOCKER" = "1" ]; then
@@ -671,39 +788,6 @@ _run python3 -c "from app.main import app; print(f'OK: {len(app.routes)} routes'
 
 if [ "${1:-}" = "--standalone" ]; then
   echo "=== Standalone tests (no DB) ==="
-  if [ "${#STATIC_GUARD_SELECTORS_ARGS[@]}" -gt 0 ]; then
-    STANDALONE_ARGS=("${STATIC_GUARD_SELECTORS_ARGS[@]}")
-  else
-    STANDALONE_ARGS=(
-    testing/test_security.py
-    testing/test_pipeline.py
-    testing/test_invariants.py
-    testing/test_impacted_tests.py
-    testing/test_audit_finding_class_guards.py
-    testing/test_admin_auth_invariant.py
-    testing/test_release_promotion_metric_manifest.py
-    testing/test_dependency_deprecations.py
-    testing/test_websocket_emitter_inventory.py
-    testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
-    testing/test_monthly_budget_alerts.py
-    testing/test_migration_chain.py
-    testing/test_message_audience.py
-    testing/test_event_type_invariants.py
-    testing/test_salvage_bundle_standalone.py
-    testing/test_test_durations_freshness.py
-    testing/test_shard_balance.py
-    testing/test_conversational_workday_protection.py
-    testing/test_vitest_durations_freshness.py
-    )
-    # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
-    # The scripts roster is explicitly maintained above and checked by
-    # backend/testing/test_ci_compliance_gate.py. It runs from the /repo mount in
-    # CI and from ../scripts on Docker-less checkouts.
-    STANDALONE_ARGS+=("${STANDALONE_SCRIPT_TEST_ARGS[@]}")
-    # This exit-proof release suite covers durable handoff, serving confirmation,
-    # and receipt retry behavior that pytest's backend shards do not collect.
-    STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
-  fi
   STANDALONE_JUNIT_ARGS=()
   if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
     STANDALONE_JUNIT_ARGS+=("--junitxml=${BLUEPRINT_STATIC_GUARD_JUNIT}")

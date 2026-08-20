@@ -16,6 +16,7 @@ import {
   setProjectPromotionEnabled,
   setVersionPhase,
   setVersionGoal,
+  updateAcceptanceCriterionEvidenceContract,
   triggerHotfixPromote,
   triggerQualify,
   type AgentServingShasResponse,
@@ -26,6 +27,7 @@ import {
   type RecentVersion,
   type QualificationState,
   type QualificationTriggerState,
+  type OperatorAuthorshipEvidenceContract,
 } from '../api';
 import { timeAgo } from '../utils/time';
 import {
@@ -580,26 +582,42 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
       }
     : undefined;
 
+  const handleUpdateEvidenceContract = projectId && canManageProject && !readOnly
+    ? async (criterionKey: string, maxCount: number) => {
+        try {
+          const evidenceContract: OperatorAuthorshipEvidenceContract = {
+            type: 'operator_authored_commits',
+            predicate: { max_count: maxCount },
+          };
+          await updateAcceptanceCriterionEvidenceContract(projectId, criterionKey, evidenceContract);
+          setActionMsg('Candidate authorship budget updated');
+          onRefresh();
+        } catch (err) {
+          setActionMsg(err instanceof Error ? err.message : 'Failed to update authorship budget');
+        }
+      }
+    : undefined;
+
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
       {refreshError && (
         <VersionLifecycleRefreshBanner kind="stale" message={refreshError} lastSuccessfulRefreshAt={lastSuccessfulRefreshAt} refreshing={refreshing} canRetry={!!projectId} onRefresh={onRefresh} />
       )}
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-ui-sm">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-ui-sm">
         <div className="flex flex-wrap items-center gap-2">
           {data.promotion_enabled !== undefined && (
             <>
               <div className="flex flex-col gap-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Fleet-wide setting (all projects)">
+                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-workbench-control/10 border-neutral-500/30 text-neutral-400'}`} title="Fleet-wide setting (all projects)">
                     {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
                   </span>
                   {projectId && canManagePlatform && !readOnly && (
                     <button
                       onClick={handleTogglePromotionEnabled}
                       disabled={actionLoading !== null}
-                      className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                      className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                       title="Changes promotion mode for all projects"
                       data-viewport-allow-small-target
                     >
@@ -612,7 +630,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
               {data.promotion_enabled_effective !== undefined && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${data.promotion_enabled_effective ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Effective promotion mode for THIS project">
+                    <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${data.promotion_enabled_effective ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-workbench-control/10 border-neutral-500/30 text-neutral-400'}`} title="Effective promotion mode for THIS project">
                       {data.promotion_enabled_effective ? 'LIVE' : 'DRY-RUN'}
                     </span>
                     {projectId && canManageProject && !readOnly && (
@@ -629,7 +647,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                         <button
                           onClick={() => handleSetProjectPromotion(false)}
                           disabled={actionLoading !== null || (data.promotion_enabled_source === 'project' && data.promotion_enabled_override === false)}
-                          className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                          className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                           title="Hold live promotion for this project only"
                           data-viewport-allow-small-target
                         >
@@ -639,7 +657,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                           <button
                             onClick={() => handleSetProjectPromotion(null)}
                             disabled={actionLoading !== null}
-                            className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                            className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                             title="Clear this project's override and follow the fleet default"
                             data-viewport-allow-small-target
                           >
@@ -730,7 +748,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   placeholder="Enter version goal..."
                   maxLength={500}
                   disabled={actionLoading !== null}
-                  className="text-ui-md bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-1 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed resize-none"
+                  className="text-ui-md bg-workbench-panel border border-neutral-700 text-neutral-300 rounded px-2 py-1 disabled:opacity-50 disabled:cursor-not-allowed resize-none workbench-focus"
                   rows={2}
                 />
                 <div className="flex gap-1">
@@ -748,7 +766,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                       setGoalInput(cv.goal || '');
                     }}
                     disabled={actionLoading !== null}
-                    className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                     data-viewport-allow-small-target
                   >
                     Cancel
@@ -793,7 +811,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   <button
                     onClick={() => setEditingGoal(true)}
                     disabled={actionLoading !== null}
-                    className="text-ui-sm px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-ui-sm px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                     data-viewport-allow-small-target
                   >
                     Edit
@@ -804,7 +822,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
               <button
                 onClick={() => setEditingGoal(true)}
                 disabled={actionLoading !== null}
-                className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                 data-viewport-allow-small-target
               >
                 Set goal
@@ -819,7 +837,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
             {cv.qualification_state && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-neutral-800 text-neutral-400 border-neutral-700'}`}>
+                  <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${QUAL_STATE_STYLE[cv.qualification_state.state] ?? 'bg-workbench-panel text-neutral-400 border-neutral-700'}`}>
                     {cv.qualification_state.state.replace(/_/g, ' ')}
                   </span>
                   <ServingStatusBadge
@@ -936,6 +954,26 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                 {cv.dimension_states && cv.dimension_states.length > 0 && (
                   <DimensionBreakdown dimensions={cv.dimension_states} />
                 )}
+                {cv.last_qualification.sub_scores?.candidate_operator_authorship && (
+                  <div
+                    className="flex flex-wrap items-baseline gap-x-2 text-ui-sm text-violet-300"
+                    data-testid="candidate-operator-authorship-gate"
+                  >
+                    <span className="font-medium">Candidate authorship</span>
+                    <span>{cv.last_qualification.sub_scores.candidate_operator_authorship.status}</span>
+                    <span className="font-mono">
+                      {cv.last_qualification.sub_scores.candidate_operator_authorship.count ?? '—'}
+                      {cv.last_qualification.sub_scores.candidate_operator_authorship.max_count != null
+                        ? ` / ${cv.last_qualification.sub_scores.candidate_operator_authorship.max_count}`
+                        : ' commits'}
+                    </span>
+                    {cv.last_qualification.sub_scores.candidate_operator_authorship.reason && (
+                      <span className="text-neutral-500">
+                        {cv.last_qualification.sub_scores.candidate_operator_authorship.reason}
+                      </span>
+                    )}
+                  </div>
+                )}
                 {cv.last_qualification.blocker && (
                   <p className="text-ui-sm text-red-400 truncate">{cv.last_qualification.blocker}</p>
                 )}
@@ -958,11 +996,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                     )}
                   </div>
                 )}
-                {cv.last_qualification.is_permanent_gate_incapacity && projectId && !readOnly && (
+                {(cv.last_qualification.is_permanent_gate_incapacity || cv.gate_latch) && projectId && !readOnly && (
                   <div className="mt-1 pl-2 border-l-2 border-red-500/40 space-y-2" data-testid="hotfix-remediation-panel">
                     <p className="text-ui-sm text-red-400 font-medium">
-                      Permanent gate incapacity — the release is held by a structural gate failure.
-                      The operator hotfix-deploy channel may unblock it.
+                      {cv.gate_latch
+                        ? `Gate latched${cv.gate_latch.gate ? `: ${cv.gate_latch.gate}` : ''} — the candidate carries the repair to the deployed gate, so re-cutting it cannot clear the release. The operator hotfix-deploy channel may unblock it.`
+                        : 'Permanent gate incapacity — the release is held by a structural gate failure. The operator hotfix-deploy channel may unblock it.'}
                     </p>
                     {!hotfixPanelOpen ? (
                       <button
@@ -1024,7 +1063,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                                       value={hotfixReason}
                                       onChange={e => setHotfixReason(e.target.value)}
                                       placeholder="Describe what this hotfix fixes and why it is safe"
-                                      className="w-full bg-neutral-800 border border-neutral-600 rounded px-2 py-1 text-ui-sm text-neutral-200 placeholder:text-neutral-600"
+                                      className="w-full bg-workbench-panel border border-neutral-600 rounded px-2 py-1 text-ui-sm text-neutral-200 placeholder:text-neutral-600"
                                       data-testid="hotfix-reason-input"
                                     />
                                   </div>
@@ -1126,7 +1165,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   </span>
                 </button>
                 {changelogExpanded && (
-                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} categoryVerdicts={cv.last_qualification?.category_verdicts} residualUncapturedGap={cv.last_qualification?.residual_uncaptured_gap} onReinstate={handleReinstate} onAttest={handleAttest} onLinkDirection={handleLinkDirection} />
+                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} categoryVerdicts={cv.last_qualification?.category_verdicts} residualUncapturedGap={cv.last_qualification?.residual_uncaptured_gap} onReinstate={handleReinstate} onAttest={handleAttest} onLinkDirection={handleLinkDirection} onUpdateEvidenceContract={handleUpdateEvidenceContract} />
                 )}
               </div>
             )}
@@ -1183,7 +1222,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                         placeholder="Optional reason for cut..."
                         disabled={actionLoading !== null}
                         maxLength={200}
-                        className="text-ui-sm flex-1 bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="text-ui-sm flex-1 bg-workbench-panel border border-neutral-700 text-neutral-300 rounded px-2 py-0.5 disabled:opacity-50 disabled:cursor-not-allowed workbench-focus"
                       />
                       <button
                         onClick={handleCutVersion}
@@ -1199,7 +1238,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                           setCutReason('');
                         }}
                         disabled={actionLoading !== null}
-                        className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-workbench-hover/10 disabled:opacity-40 disabled:cursor-not-allowed"
                         data-viewport-allow-small-target
                       >
                         Cancel

@@ -253,7 +253,7 @@ export function LogsTab({
   };
 
   const levelButtons: { level: LogLevel; label: string; count?: number; activeClass: string }[] = [
-    { level: 'all', label: 'ALL', activeClass: 'bg-neutral-700 text-neutral-100' },
+    { level: 'all', label: 'ALL', activeClass: 'bg-workbench-layer text-neutral-100' },
     { level: 'error', label: 'ERROR', count: errorCount, activeClass: 'bg-red-500/20 text-red-400 border-red-500/30' },
     { level: 'warn', label: 'WARN', count: warnCount, activeClass: 'bg-amber-500/20 text-amber-400 border-amber-500/30' },
     { level: 'status', label: 'STATUS', count: statusCount, activeClass: 'bg-blue-500/20 text-blue-400 border-blue-500/30' },
@@ -326,7 +326,7 @@ export function LogsTab({
                     {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                     <button
                       type="button"
-                      className="w-full bg-neutral-900/80 border border-neutral-700/50 rounded px-2 py-1 text-ui-md text-neutral-400 flex items-center gap-2 cursor-pointer sticky top-0 z-10 hover:bg-neutral-800/80 transition-colors"
+                      className="w-full bg-workbench-base/80 border border-neutral-700/50 rounded px-2 py-1 text-ui-md text-neutral-400 flex items-center gap-2 cursor-pointer sticky top-0 z-10 hover:bg-workbench-hover/80 transition-colors"
                       onClick={() => toggleSection(sIdx)}
                     >
                       <ChevronRight

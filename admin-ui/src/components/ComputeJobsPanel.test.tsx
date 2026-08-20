@@ -2709,10 +2709,10 @@ describe('ComputeJobsPanel render + kill', () => {
       expect(fetchComputeJobs).toHaveBeenCalledWith('proj-1', expect.anything(), { allTerminal: true, offset: 0 }),
     );
     // The All button should now be active (highlighted)
-    expect(allBtn.className).toContain('bg-neutral-700');
+    expect(allBtn.className).toContain('bg-workbench-layer');
     // The 6h button should not be active
     const btn6h = await findByTestId('compute-window-6h');
-    expect(btn6h.className).not.toContain('bg-neutral-700');
+    expect(btn6h.className).not.toContain('bg-workbench-layer');
   });
 
   test('Load more button appears when hasMore is true and clicking appends jobs', async () => {

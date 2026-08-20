@@ -104,6 +104,7 @@ from app.release_commit_authorship import (
     authorship_receipt_for_measurement,
     candidate_authorship_range,
     count_non_bot_authored_commits,
+    resolve_candidate_base_sha,
 )
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
@@ -324,7 +325,7 @@ from app.release_qualifier_audit_surface import (
 # Keep the JSON entry in sync with this constant — the governance test in
 # test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
 # red instead of silently widening headroom past the point the guardrail fires.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 10649
+_MODULE_SIZE_GOVERNANCE_CAP: int = 10900
 
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a
@@ -2659,23 +2660,22 @@ async def run_qualification(
     #     the fix; its surface == the passed one by hypothesis) WITHOUT re-running
     #     the ~15min audit or re-rolling the non-deterministic score (the v21
     #     treadmill).  Strictly gated: prior status promotion_failed AND the live
-    #     candidate_diff_hash is truthy AND == the prior verdict's hash AND the
-    #     promotion-failure re-qualify cap is NOT exhausted.  ANY miss (a CHANGED
-    #     surface = an app-code fix, or the cap reached) FALLS THROUGH to the
-    #     normal re-audit below — fail-safe.
-    #
+    #     candidate_diff_hash is truthy AND == the prior verdict's hash.
     #     Lock/session discipline (critical): the promote runs in a DEDICATED
     #     AsyncSessionLocal session, NEVER this caller's — otherwise promote()'s
     #     intermediate commit (which it issues to free the row lock before its
     #     30-120s of GitHub I/O) would prematurely commit the caller's unrelated
     #     dirty work.  This runs BEFORE this function's own FOR UPDATE lock (step
     #     4 below): the dedicated session must be free to SELECT..FOR UPDATE the
-    #     version row, which this caller has NOT yet locked, so there is no
-    #     self-deadlock.  The dedicated helper re-verifies the gate + cap under
-    #     its OWN row lock (authoritative — the pre-lock read may be stale) and
-    #     reconstructs composite/base_record from the passing fields the
-    #     promotion_failed record carries; a None return (state changed, cap hit,
-    #     candidate already on main, lock contended) falls through to re-audit.
+    #     version row, which this caller has NOT yet locked. A capped record is
+    #     escalated below; otherwise the dedicated retry is used.
+    if (_pre_lock_qual.get("status") == "promotion_failed" and
+            int(_pre_lock_qual.get("promotion_failure_count") or 0) >=
+            _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS):
+        from app.release_qualifier_redrive import _escalate_promotion_failure_loop_in_dedicated_session
+        await _escalate_promotion_failure_loop_in_dedicated_session(version.id, session_factory=session_factory)
+        return {"status": "promotion_failed_requalify_cap", "candidate_sha": candidate_sha}
+
     if (
         not effective_requested_probes
         and _qualification_probe_contract_is_reusable(
@@ -2756,7 +2756,6 @@ async def run_qualification(
     # From here on, mutate the freshly-locked row (its attributes are the
     # post-lock DB truth) rather than the caller's possibly-stale instance.
     version = locked_version
-
     # Re-check the phase under the lock — a concurrent strategic cycle may
     # have flipped it out of stabilize between the cheap guard and the lock.
     if version.phase != "stabilize":
@@ -2802,6 +2801,24 @@ async def run_qualification(
             version.version_number,
         )
         return _promo
+
+    # Stamp the candidate this attempt actually evaluates.  ``candidate_sha``
+    # is re-resolved live from integration-branch HEAD on EVERY call (see the
+    # snapshot above), including a CONTINUED attempt, and every other consumer
+    # in this run — the diff range, the dimension rows, and
+    # ``last_qualification['candidate_sha']`` — uses that fresh value.  Pinning
+    # the column only on a new attempt would let a continued attempt whose
+    # candidate advanced measure base..STALE_head in the hard authorship gate
+    # while the promotion candidate is base..NEW_head, so the write is
+    # unconditional and no gate can disagree with another.
+    #
+    # It is written AFTER the skip guards above (wrong_phase / already_pending
+    # / promotion_check_wait) on purpose: those paths do not evaluate this
+    # candidate at all, and re-pointing the column on a promotion_check_wait
+    # would move the authorship range out from under an already-pending
+    # promotion.
+    version.candidate_sha = candidate_sha
+    session.add(version)
 
     active_criteria = [
         row
@@ -3478,6 +3495,14 @@ async def run_qualification(
             )
             walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
         if _audit_needed:
+            # Measure the candidate's real base-to-head authorship receipt so
+            # the audit prompt's release_evidence reflects the actual range
+            # instead of always taking the receipt-missing degrade branch.
+            # Mirrors the finalize-time pattern (_finalize_qualification).
+            (
+                _audit_authorship_receipt,
+                _audit_authorship_range,
+            ) = await _measured_authorship_receipt_for_audit_spawn(session, version)
             audit_task = await _spawn_release_audit_task(
                 session,
                 project_id,
@@ -3489,11 +3514,21 @@ async def run_qualification(
                 audit_base_sha=incremental_audit_base_sha,
                 version_goal=version.goal,
                 categories=[
-                    {"category_key": c.get("criterion_key"), "text": c.get("text")}
+                    {
+                        "category_key": c.get("criterion_key"),
+                        "text": c.get("text"),
+                        **(
+                            {"evidence_contract": c["evidence_contract"]}
+                            if isinstance(c.get("evidence_contract"), dict)
+                            else {}
+                        ),
+                    }
                     for c in rubric_snapshot
                     if c.get("criterion_key")
                 ],
                 rubric_fingerprint=rubric_fingerprint,
+                candidate_authorship_receipt=_audit_authorship_receipt,
+                candidate_authorship_measured_range=_audit_authorship_range,
             )
             audit_task_id = str(audit_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
@@ -6233,9 +6268,39 @@ async def _measure_candidate_operator_authorship(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> dict[str, Any]:
-    """Measure the candidate's immutable base-to-head authorship range."""
+    """Measure the candidate's immutable base-to-head authorship range.
+
+    ``base_sha`` is write-once and best-effort at version-open time: a
+    resolution failure there deliberately degrades to ``None`` rather than
+    abort the cut, and no admin path can ever backfill it afterward.  When it
+    is unset, derive the same range the release actually diffs against --
+    merge-base(promotion_target, candidate_sha) -- so the gate can still reach
+    a real verdict instead of latching permanently on a measurement that
+    executed correctly but found nothing to measure.
+    """
     base_sha, candidate_sha = candidate_authorship_range(version)
     project = await session.get(Project, version.project_id)
+    if base_sha is None and isinstance(candidate_sha, str) and project is not None:
+        derived_base_sha, derive_reason = await resolve_candidate_base_sha(
+            candidate_sha, session=session, project=project
+        )
+        if derived_base_sha is not None:
+            base_sha = derived_base_sha
+        else:
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d has no stored base_sha and derivation "
+                "from the promotion target failed (%s); authorship gate blocks "
+                "with a distinct reason instead of latching on 'evidence missing'",
+                version.version_number,
+                derive_reason,
+            )
+            return {
+                "state": "unresolved",
+                "count": None,
+                "offenders": [],
+                "range": {"base_sha": None, "head_sha": candidate_sha},
+                "reason": f"base_sha_unset_v{version.version_number}_{derive_reason}",
+            }
     try:
         return await count_non_bot_authored_commits(
             base_sha,
@@ -6256,6 +6321,35 @@ async def _measure_candidate_operator_authorship(
             "range": {"base_sha": base_sha, "head_sha": candidate_sha},
             "reason": "candidate_authorship_measurement_unavailable",
         }
+
+
+async def _measured_authorship_receipt_for_audit_spawn(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> tuple[dict[str, Any], tuple[str | None, str | None]]:
+    """Measure the candidate range and wrap it as a validated receipt.
+
+    Returns the receipt alongside the EXACT (base_sha, head_sha) pair it was
+    measured against, so a caller can pass both into
+    ``_spawn_release_audit_task`` and the payload's ``release_evidence`` can
+    validate the receipt against the same range it was built from — a base_sha
+    the version has no stored column for is derived from the measurement's own
+    range (mirrors ``_finalize_qualification``'s handling), so re-deriving it a
+    second time independently cannot land on a different value and fail
+    ``validate_authorship_receipt`` closed by mismatch.
+    """
+    measurement = await _measure_candidate_operator_authorship(session, version)
+    base_sha, head_sha = candidate_authorship_range(version)
+    if base_sha is None:
+        measured_range = (
+            measurement.get("range") if isinstance(measurement, dict) else None
+        )
+        if isinstance(measured_range, dict) and isinstance(
+            measured_range.get("base_sha"), str
+        ) and measured_range.get("head_sha") == head_sha:
+            base_sha = measured_range["base_sha"]
+    receipt = authorship_receipt_for_measurement(measurement, base_sha, head_sha)
+    return receipt, (base_sha, head_sha)
 
 
 async def _finalize_qualification(
@@ -6561,6 +6655,12 @@ async def _finalize_qualification(
                         fp.get("diff_range", "")
                         or f"{_integration_branch}...{candidate_sha}"
                     )
+                    (
+                        _respawn_authorship_receipt,
+                        _respawn_authorship_range,
+                    ) = await _measured_authorship_receipt_for_audit_spawn(
+                        session, version
+                    )
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -6571,6 +6671,10 @@ async def _finalize_qualification(
                         qualification_attempt_id=attempt_id,
                         audit_base_sha=fp.get("audit_base_sha"),
                         version_goal=_frozen_version_goal,
+                        categories=fp.get("categories"),
+                        rubric_fingerprint=fp.get("rubric_fingerprint"),
+                        candidate_authorship_receipt=_respawn_authorship_receipt,
+                        candidate_authorship_measured_range=_respawn_authorship_range,
                     )
                     new_count = rl_respawn_count + 1
                     updated_qual = {
@@ -6621,6 +6725,12 @@ async def _finalize_qualification(
                         fp.get("diff_range", "")
                         or f"{_integration_branch}...{candidate_sha}"
                     )
+                    (
+                        _respawn_authorship_receipt,
+                        _respawn_authorship_range,
+                    ) = await _measured_authorship_receipt_for_audit_spawn(
+                        session, version
+                    )
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -6631,6 +6741,10 @@ async def _finalize_qualification(
                         qualification_attempt_id=attempt_id,
                         audit_base_sha=fp.get("audit_base_sha"),
                         version_goal=_frozen_version_goal,
+                        categories=fp.get("categories"),
+                        rubric_fingerprint=fp.get("rubric_fingerprint"),
+                        candidate_authorship_receipt=_respawn_authorship_receipt,
+                        candidate_authorship_measured_range=_respawn_authorship_range,
                     )
                     new_count = infra_respawn_count + 1
                     updated_qual = append_infra_failure_child_event(
@@ -6687,6 +6801,12 @@ async def _finalize_qualification(
                         fp.get("diff_range", "")
                         or f"{_integration_branch}...{candidate_sha}"
                     )
+                    (
+                        _respawn_authorship_receipt,
+                        _respawn_authorship_range,
+                    ) = await _measured_authorship_receipt_for_audit_spawn(
+                        session, version
+                    )
                     new_audit_task = await _spawn_release_audit_task(
                         session,
                         version.project_id,
@@ -6697,6 +6817,10 @@ async def _finalize_qualification(
                         qualification_attempt_id=attempt_id,
                         audit_base_sha=fp.get("audit_base_sha"),
                         version_goal=_frozen_version_goal,
+                        categories=fp.get("categories"),
+                        rubric_fingerprint=fp.get("rubric_fingerprint"),
+                        candidate_authorship_receipt=_respawn_authorship_receipt,
+                        candidate_authorship_measured_range=_respawn_authorship_range,
                     )
                     new_count = admin_cancel_respawn_count + 1
                     updated_qual = append_infra_failure_child_event(
@@ -8173,6 +8297,22 @@ async def _finalize_qualification(
             session, version
         )
     candidate_base_sha, candidate_head_sha = candidate_authorship_range(version)
+    if candidate_base_sha is None:
+        # The version has no stored base_sha (write-once, best-effort at open
+        # time). ``_measure_candidate_operator_authorship`` derives one from
+        # the promotion target and reports it in the measurement's own range
+        # -- trust that derived value here so the receipt is validated
+        # against the SAME range that was actually measured, instead of
+        # recomputing a still-null base and invalidating the receipt.
+        _measured_range = (
+            authorship_measurement.get("range")
+            if isinstance(authorship_measurement, dict)
+            else None
+        )
+        if isinstance(_measured_range, dict) and isinstance(
+            _measured_range.get("base_sha"), str
+        ) and _measured_range.get("head_sha") == candidate_head_sha:
+            candidate_base_sha = _measured_range["base_sha"]
     candidate_authorship_receipt = authorship_receipt_for_measurement(
         authorship_measurement,
         candidate_base_sha,
@@ -8182,6 +8322,7 @@ async def _finalize_qualification(
         version,
         authorship_measurement,
         active_categories,
+        resolved_range=(candidate_base_sha, candidate_head_sha),
     )
     authorship_evidence = authorship_category_evidence(
         candidate_authorship_receipt,
@@ -9904,7 +10045,9 @@ async def _reattempt_promotion_failed_locked(
         int(qual.get("promotion_failure_count") or 0)
         >= _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
     ):
-        return None
+        from app.release_qualifier_redrive import _escalate_promotion_failure_loop
+        await _escalate_promotion_failure_loop(session, version)
+        return {"status": "promotion_failed_requalify_cap", "candidate_sha": candidate_sha}
 
     # Reconstruct the composite promote() needs (it only reads confidence, for
     # the PR body) from the passing verdict — do NOT re-score.

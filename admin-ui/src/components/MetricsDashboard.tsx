@@ -400,20 +400,20 @@ function DigestLatencyWidget() {
   return (
     <div className="space-y-2 text-xs">
       <div className="grid grid-cols-3 gap-2">
-        <div className="rounded bg-neutral-800/50 px-3 py-2">
+        <div className="rounded bg-workbench-panel/50 px-3 py-2">
           <div className="text-ui-sm uppercase tracking-wide text-neutral-500">p50</div>
           <div className="font-mono text-neutral-100">{formatSeconds(data.latency_percentiles.p50_seconds)}</div>
         </div>
-        <div className="rounded bg-neutral-800/50 px-3 py-2">
+        <div className="rounded bg-workbench-panel/50 px-3 py-2">
           <div className="text-ui-sm uppercase tracking-wide text-neutral-500">p95</div>
           <div className="font-mono text-neutral-100">{formatSeconds(data.latency_percentiles.p95_seconds)}</div>
         </div>
-        <div className="rounded bg-neutral-800/50 px-3 py-2">
+        <div className="rounded bg-workbench-panel/50 px-3 py-2">
           <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Samples</div>
           <div className="font-mono text-neutral-100">{data.latency_percentiles.sample_n}</div>
         </div>
       </div>
-      <div className="rounded bg-neutral-800/50 px-3 py-2">
+      <div className="rounded bg-workbench-panel/50 px-3 py-2">
         <div className="mb-1 text-ui-sm uppercase tracking-wide text-neutral-500">Serve mix</div>
         <div className="space-y-1">
           {tiers.map((tier) => (
@@ -568,6 +568,17 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
 
   return (
     <div className="space-y-2">
+      {data.cohort_task_count != null && (
+        <div
+          data-testid="efficiency-cohort-provenance"
+          className={`px-3 py-1.5 rounded text-ui-sm ${data.cohort_capped ? 'bg-amber-500/10 text-amber-300 border border-amber-500/30' : 'bg-workbench-panel/50 text-neutral-500'}`}
+        >
+          Cost cohort: {data.cohort_task_count} rows ·{' '}
+          {data.cohort_capped
+            ? `truncated to ${data.cohort_effective_window_start && data.cohort_effective_window_end ? 'effective window' : 'row cap'}`
+            : `${data.cohort_requested_window_days ?? 'requested'}d window`}
+        </div>
+      )}
       {EFFICIENCY_AXES.map((axisDef) => {
         const axisData = data.axes[axisDef.key];
         if (!axisData) return null;
@@ -578,7 +589,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           ? baseline_seeded_at
           : null;
         return (
-          <div key={axisDef.key} className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div key={axisDef.key} className="py-1.5 px-3 rounded bg-workbench-panel/50 text-xs">
             <div className="flex justify-between items-center">
               <span className="text-neutral-400">{axisDef.label}</span>
               <div className="flex gap-4 items-center text-neutral-300 font-mono">
@@ -613,7 +624,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
         );
       })}
       {data.vm_cost_attribution && data.vm_cost_attribution.by_task_type.length > 0 && (
-        <div data-testid="vm-cost-attribution-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+        <div data-testid="vm-cost-attribution-block" className="py-1.5 px-3 rounded bg-workbench-panel/50 text-xs">
           <div className="flex justify-between items-center gap-4 mb-2">
             <span className="text-neutral-400">VM cost by task type</span>
             <span className="text-neutral-500 font-mono">${data.vm_cost_attribution.total_vm_usd.toFixed(2)} total</span>
@@ -654,7 +665,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
         </div>
       )}
       {data.llm_cost_attribution && data.llm_cost_attribution.by_failure_class.length > 0 && (
-        <div data-testid="llm-cost-by-outcome-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+        <div data-testid="llm-cost-by-outcome-block" className="py-1.5 px-3 rounded bg-workbench-panel/50 text-xs">
           <div className="flex justify-between items-center gap-4 mb-2">
             <span className="text-neutral-400">LLM cost by terminal outcome</span>
             <span className="text-neutral-500 font-mono">${data.llm_cost_attribution.total_llm_usd.toFixed(2)} total</span>
@@ -712,7 +723,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           ? `recent ${meta.recent_n} vs prior ${meta.prior_count}`
           : 'recent vs prior';
         return (
-          <div data-testid="llm-cost-window-delta-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+          <div data-testid="llm-cost-window-delta-block" className="py-1.5 px-3 rounded bg-workbench-panel/50 text-xs">
             <div className="flex justify-between items-center gap-4 mb-1.5">
               <span className="text-neutral-400">LLM cost-mix shift <span className="text-neutral-600">({windowLabel} snapshots)</span></span>
               {totalDelta?.abs_delta != null && (
@@ -739,7 +750,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
         );
       })()}
       {data.format_compliance && (
-        <div data-testid="format-compliance-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+        <div data-testid="format-compliance-block" className="py-1.5 px-3 rounded bg-workbench-panel/50 text-xs">
           <div className="flex justify-between items-center gap-4">
             <span className="text-neutral-400">Format compliance</span>
             <div className="space-y-1 min-w-0">
@@ -809,7 +820,7 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
         </div>
       )}
       {data.agent_timeout_rate && (
-        <div data-testid="agent-timeout-rate-block" className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+        <div data-testid="agent-timeout-rate-block" className="py-1.5 px-3 rounded bg-workbench-panel/50 text-xs">
           <div className="flex justify-between items-center gap-4">
             <span className="text-neutral-400">Agent timeout rate</span>
             <div className="space-y-1 min-w-0">
@@ -932,7 +943,7 @@ function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; win
     return <div className="flex items-center justify-center h-24 text-neutral-500 text-xs">No completed cost data in this window</div>;
   }
 
-  const sectionCard = 'rounded-lg bg-neutral-800/50 border border-neutral-700/50 p-3';
+  const sectionCard = 'rounded-lg bg-workbench-panel/50 border border-neutral-700/50 p-3';
 
   return (
     <div className="space-y-3">
@@ -1053,7 +1064,7 @@ export default function MetricsDashboard({
     return 'text-red-400';
   }
 
-  const cardClass = 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4';
+  const cardClass = 'bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-4';
   const filteredMetrics = useMemo(() => metricsHistory.filter((p) => p.timestamp >= now - windowMs), [metricsHistory, now, windowMs]);
   const exportMetrics = (format: 'csv' | 'json') => {
     const rows = filteredMetrics.map((p) => ({
@@ -1085,8 +1096,8 @@ export default function MetricsDashboard({
             onClick={() => onWindowChange(w)}
             className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
               metricsWindow === w
-                ? 'bg-neutral-700 border-neutral-600 text-neutral-100'
-                : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+                ? 'bg-workbench-layer border-neutral-600 text-neutral-100'
+                : 'bg-workbench-base/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
             }`}
           >
             {w}
@@ -1094,8 +1105,8 @@ export default function MetricsDashboard({
         ))}
         </div>
         <div className="flex items-center gap-1">
-          <button data-viewport-allow-small-target onClick={() => exportMetrics('csv')} className="px-3 py-1 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300">CSV</button>
-          <button data-viewport-allow-small-target onClick={() => exportMetrics('json')} className="px-3 py-1 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300">JSON</button>
+          <button data-viewport-allow-small-target onClick={() => exportMetrics('csv')} className="px-3 py-1 rounded-full text-xs font-medium border bg-workbench-base/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300">CSV</button>
+          <button data-viewport-allow-small-target onClick={() => exportMetrics('json')} className="px-3 py-1 rounded-full text-xs font-medium border bg-workbench-base/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300">JSON</button>
         </div>
       </div>
 

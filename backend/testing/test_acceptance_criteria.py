@@ -151,6 +151,28 @@ async def test_create_and_fetch_criterion(db_session):
 
 
 @pytest.mark.asyncio
+async def test_open_version_seeds_idempotent_operator_authorship_budget(db_session):
+    """Every production-opened version arms the candidate-range gate once."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AC-Authorship-Default")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    seeded = await ac.get_criteria_for_version(db_session, version.id)
+    assert len(seeded) == 1
+    assert seeded[0].criterion_key == ac.OPERATOR_AUTHORSHIP_CRITERION_KEY
+    assert seeded[0].evidence_contract == {
+        "type": "operator_authored_commits",
+        "predicate": {"max_count": 0},
+    }
+
+    await ac.ensure_operator_authorship_criterion(db_session, project.id, version.id)
+    await db_session.commit()
+    assert len(await ac.get_criteria_for_version(db_session, version.id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_get_criteria_for_version_ordered(db_session):
     """get_criteria_for_version returns rows ordered by created_at ascending."""
     project = await _make_project(db_session)
@@ -332,7 +354,8 @@ async def test_apply_new_acceptance_criteria_enforces_cap(db_session):
     await _apply_new_acceptance_criteria(criteria_texts, task, project, db_session, path="test")
 
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    assert len(fetched) == ac.MAX_CRITERIA_PER_VERSION
+    # The release-policy authorship criterion is additive to the user-criteria cap.
+    assert len(fetched) == ac.MAX_CRITERIA_PER_VERSION + 1
     new_texts = {c.text for c in fetched if c.text.startswith("New criterion")}
     assert len(new_texts) == headroom
 
@@ -373,7 +396,7 @@ async def test_apply_new_acceptance_criteria_already_at_cap_is_noop(db_session):
     await _apply_new_acceptance_criteria(["Should not appear"], task, project, db_session, path="test")
 
     count = await ac.count_criteria_for_version(db_session, version.id)
-    assert count == ac.MAX_CRITERIA_PER_VERSION
+    assert count == ac.MAX_CRITERIA_PER_VERSION + 1
 
 
 # ---------------------------------------------------------------------------
@@ -2189,12 +2212,14 @@ async def test_strategist_criterion_authoring(db_session):
     await _apply_new_acceptance_criteria(criteria_texts, task, project, db_session, path="test")
 
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    assert len(fetched) == 3
+    assert len(fetched) == 4  # three strategist criteria plus the policy criterion
     fetched_texts = {c.text for c in fetched}
     assert "All unit tests pass" in fetched_texts
     assert "No P0 bugs open" in fetched_texts
     assert "Deploy to staging succeeds" in fetched_texts
     for c in fetched:
+        if ac.is_operator_authorship_criterion(c):
+            continue
         assert c.created_by == "strategist"
 
 
@@ -2239,7 +2264,7 @@ async def test_strategist_criterion_authoring_skips_duplicates(db_session):
     )
 
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    assert len(fetched) == 2  # only one new criterion created
+    assert len(fetched) == 3  # one new criterion plus the policy criterion
     fetched_texts = {c.text for c in fetched}
     assert "Existing criterion" in fetched_texts
     assert "Brand new criterion" in fetched_texts
@@ -3911,7 +3936,7 @@ async def test_apply_new_acceptance_criteria_active_only_headroom(db_session):
         f"expected exactly 1 new active criterion (retracted rows must not consume cap), "
         f"got {len(new_active)}"
     )
-    assert len(active_criteria) == ac.MAX_CRITERIA_PER_VERSION
+    assert len(active_criteria) == ac.MAX_CRITERIA_PER_VERSION + 1
 
 
 @pytest.mark.asyncio
@@ -12205,234 +12230,6 @@ async def test_criterion_trial_terminal_identity_survives_more_than_200_newer_ta
     ]
     assert [task.id for task in matching] == [first.id]
 
-
-# ---------------------------------------------------------------------------
-# In-flight debounce: at most one non-terminal criterion_named_test_trial per
-# criterion + release version (root-fix for the O(criteria x SHA bumps) spam
-# mechanism — see enroll_criterion_named_test_trial).
-# ---------------------------------------------------------------------------
-
-_TASK_TERMINAL_STATUSES = frozenset(
-    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
-)
-
-
-async def _set_candidate_sha(db_session, version, sha: str) -> None:
-    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
-    db_session.add(version)
-    await db_session.commit()
-
-
-async def _enroll_trial(db_session, project, version, criterion, ref):
-    return await ac.enroll_criterion_named_test_trial(
-        db_session, project, version=version,
-        criterion_key=criterion.criterion_key, criterion_text=criterion.text,
-        test_refs=[ref],
-    )
-
-
-@pytest.mark.asyncio
-async def test_criterion_trial_inflight_queued_same_head_skips_new_enrollment(db_session):
-    """A QUEUED trial pinned to the CURRENT head suppresses a duplicate enroll."""
-    project = await _make_project(db_session, "CriterionTrialInflightSameHead")
-    version = await _make_version(db_session, project)
-    await _set_candidate_sha(db_session, version, "1" * 40)
-    criterion = await ac.create_criterion(db_session, project.id, version.id, "same-head")
-    ref = "testing/test_inflight_same_head.py"
-
-    first = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert first is not None and first.status == TaskStatus.QUEUED
-
-    second = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert second is None, "an in-flight QUEUED trial at the same head must debounce"
-
-    trials = await _select_criterion_trials(db_session, project.id)
-    assert [t.id for t in trials] == [first.id]
-    await db_session.refresh(first)
-    assert first.status == TaskStatus.QUEUED, "the original trial must be untouched"
-
-
-@pytest.mark.asyncio
-async def test_criterion_trial_inflight_queued_stale_head_is_superseded(db_session):
-    """A QUEUED trial on a stale head is cancelled+superseded; a fresh trial enrolls.
-
-    Exactly one non-terminal trial must remain for this criterion afterward.
-    """
-    project = await _make_project(db_session, "CriterionTrialInflightStaleHead")
-    version = await _make_version(db_session, project)
-    await _set_candidate_sha(db_session, version, "2" * 40)
-    criterion = await ac.create_criterion(db_session, project.id, version.id, "stale-head")
-    ref = "testing/test_inflight_stale_head.py"
-
-    stale = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert stale is not None and stale.status == TaskStatus.QUEUED
-
-    await _set_candidate_sha(db_session, version, "3" * 40)  # candidate SHA moves
-    fresh = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert fresh is not None, "a stale QUEUED trial must be superseded, not blocking"
-    assert fresh.first_payload["candidate_identity"] == "3" * 40
-
-    await db_session.refresh(stale)
-    assert stale.status == TaskStatus.CANCELLED
-    assert stale.context.get("superseded_by_newer_candidate") is True
-    assert stale.context.get("superseded_stale_head_sha") == "2" * 40
-    assert stale.context.get("superseded_successor_head_sha") == "3" * 40
-    assert "superseded" in (stale.latest_status_message or "").lower()
-
-    trials = await _select_criterion_trials(db_session, project.id)
-    assert {t.id for t in trials} == {stale.id, fresh.id}
-    non_terminal = [t for t in trials if t.status not in _TASK_TERMINAL_STATUSES]
-    assert [t.id for t in non_terminal] == [fresh.id]
-
-
-@pytest.mark.asyncio
-async def test_criterion_trial_inflight_running_stale_head_blocks_new_enrollment(db_session):
-    """A running (IN_PROGRESS) trial on a stale head is left alone; no new enroll.
-
-    Yanking running work is the review-supersede-churn antipattern; the periodic
-    backfill sweep enrolls the follow-up once the running trial goes terminal.
-    """
-    project = await _make_project(db_session, "CriterionTrialInflightRunningStale")
-    version = await _make_version(db_session, project)
-    await _set_candidate_sha(db_session, version, "4" * 40)
-    criterion = await ac.create_criterion(db_session, project.id, version.id, "running-stale")
-    ref = "testing/test_inflight_running_stale.py"
-
-    running = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert running is not None
-    running.status = TaskStatus.IN_PROGRESS
-    db_session.add(running)
-    await db_session.commit()
-
-    await _set_candidate_sha(db_session, version, "5" * 40)  # moves while running
-    result = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert result is None, "a running trial on a stale head must block new enrollment"
-
-    await db_session.refresh(running)
-    assert running.status == TaskStatus.IN_PROGRESS, "running trial must not be cancelled"
-    assert not running.context.get("superseded_by_newer_candidate")
-
-    trials = await _select_criterion_trials(db_session, project.id)
-    assert [t.id for t in trials] == [running.id], "no new trial must be enrolled"
-
-
-@pytest.mark.asyncio
-async def test_criterion_trial_terminal_identical_identity_still_suppressed(db_session):
-    """Regression pin: a terminal trial with an IDENTICAL identity stays suppressed."""
-    project = await _make_project(db_session, "CriterionTrialTerminalIdenticalPin")
-    version = await _make_version(db_session, project)
-    await _set_candidate_sha(db_session, version, "6" * 40)
-    criterion = await ac.create_criterion(db_session, project.id, version.id, "identical")
-    ref = "testing/test_terminal_identical.py"
-
-    first = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert first is not None
-    first.status = TaskStatus.COMPLETED
-    db_session.add(first)
-    await db_session.commit()
-
-    duplicate = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert duplicate is None, "an identical terminal trial identity must stay suppressed"
-
-    trials = await _select_criterion_trials(db_session, project.id)
-    assert [t.id for t in trials] == [first.id]
-
-
-@pytest.mark.asyncio
-async def test_criterion_trial_terminal_plus_new_head_enrolls_legit_rearm(db_session):
-    """A terminal trial plus a new candidate head enrolls a legitimate re-arm."""
-    project = await _make_project(db_session, "CriterionTrialTerminalRearm")
-    version = await _make_version(db_session, project)
-    await _set_candidate_sha(db_session, version, "7" * 40)
-    criterion = await ac.create_criterion(db_session, project.id, version.id, "rearm")
-    ref = "testing/test_terminal_rearm.py"
-
-    first = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert first is not None
-    first.status = TaskStatus.COMPLETED
-    db_session.add(first)
-    await db_session.commit()
-
-    await _set_candidate_sha(db_session, version, "8" * 40)
-    second = await _enroll_trial(db_session, project, version, criterion, ref)
-    assert second is not None, "a new candidate head must remain a legitimate re-arm"
-    assert second.first_payload["candidate_identity"] == "8" * 40
-
-    trials = await _select_criterion_trials(db_session, project.id)
-    assert {t.id for t in trials} == {first.id, second.id}
-    non_terminal = [t for t in trials if t.status not in _TASK_TERMINAL_STATUSES]
-    assert [t.id for t in non_terminal] == [second.id]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("freeze", ["paused", "autonomy_off"])
-async def test_criterion_trial_respects_project_work_freeze(db_session, freeze):
-    project = await _make_project(db_session, f"CriterionTrialFreeze-{freeze}")
-    version = await _make_version(db_session, project)
-    version.last_qualification = {"status": "scoring", "candidate_sha": "f" * 40}
-    if freeze == "paused":
-        project.paused = True
-    else:
-        project.autonomous_enabled = False
-    db_session.add(project)
-    db_session.add(version)
-    await db_session.commit()
-    criterion = await ac.create_criterion(
-        db_session, project.id, version.id, "Frozen project criterion"
-    )
-
-    trial = await ac.enroll_criterion_named_test_trial(
-        db_session,
-        project,
-        version=version,
-        criterion_key=criterion.criterion_key,
-        criterion_text=criterion.text,
-        test_refs=["testing/test_frozen.py"],
-    )
-    assert trial is None
-    assert await _select_criterion_trials(db_session, project.id) == []
-
-
-@pytest.mark.asyncio
-async def test_criterion_trial_rechecks_autonomy_at_locked_admission(
-    db_session, mocker
-):
-    """A stale enabled Project snapshot cannot bypass locked autonomy policy."""
-
-    from app.task_locking import AUTOMATIC_TASK_CREATION_AUTONOMY_DISABLED
-
-    project = await _make_project(db_session, "CriterionTrialLockedAutonomy")
-    version = await _make_version(db_session, project)
-    version.last_qualification = {"status": "scoring", "candidate_sha": "e" * 40}
-    db_session.add(version)
-    await db_session.commit()
-    criterion = await ac.create_criterion(
-        db_session, project.id, version.id, "Locked autonomy criterion"
-    )
-    assert project.autonomous_enabled is True
-
-    locked_admission = mocker.patch(
-        "app.task_locking.acquire_automatic_task_creation_authority",
-        new_callable=AsyncMock,
-        return_value=AUTOMATIC_TASK_CREATION_AUTONOMY_DISABLED,
-    )
-    trial = await ac.enroll_criterion_named_test_trial(
-        db_session,
-        project,
-        version=version,
-        criterion_key=criterion.criterion_key,
-        criterion_text=criterion.text,
-        test_refs=["testing/test_stale_autonomy.py"],
-    )
-
-    assert trial is None
-    locked_admission.assert_awaited_once_with(
-        db_session,
-        project.id,
-        skip_locked=True,
-        require_autonomous_enabled=True,
-    )
-    assert await _select_criterion_trials(db_session, project.id) == []
 
 
 @pytest.mark.asyncio

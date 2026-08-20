@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
-from typing import TypedDict
+from typing import Callable, TypedDict
 
 
 class GovernanceCapExceededError(ValueError):
@@ -36,38 +36,91 @@ _SECTION_SOURCE_DIRS = {
     "agent": ("agent", "src"),
     "frontend": ("admin-ui", "src"),
     "testing": ("backend", "testing"),
+    "scripts": ("scripts",),
+}
+
+# The authoritative section-key set: the top-level keys of
+# ``module_size_limits.json``. Every consumer that scans, maps, or gates on a
+# section (``ci_compliance``, ``rollup_size_preflight``, ``hotfix_backmerge``,
+# ``check_size_limits``) must cover exactly this set — a consumer with a
+# hand-copied subset silently under-reports the missing sections. Kept as a
+# literal (not merely ``frozenset(_SECTION_SOURCE_DIRS)``) so a future 6th
+# section added to one but not the other fails a parity assertion loudly
+# instead of both sides silently agreeing on the smaller set.
+SECTION_KEYS: frozenset[str] = frozenset(
+    {"backend", "agent", "frontend", "testing", "scripts"}
+)
+assert frozenset(_SECTION_SOURCE_DIRS) == SECTION_KEYS, (
+    "_SECTION_SOURCE_DIRS must declare exactly SECTION_KEYS"
+)
+
+
+def _no_section_exclusion(_rel_path: str) -> bool:
+    return False
+
+
+def _is_frontend_section_excluded(rel_path: str) -> bool:
+    """Mirror check_size_limits._is_frontend_excluded: skip test/type files."""
+    return rel_path.endswith((".test.ts", ".test.tsx", ".d.ts")) or rel_path.startswith(
+        "test/"
+    )
+
+
+def _is_agent_section_excluded(rel_path: str) -> bool:
+    """Mirror check_size_limits._is_agent_excluded: skip test/type files."""
+    return rel_path.endswith((".test.ts", ".d.ts"))
+
+
+# Repo-relative path prefix each section's ``rel`` keys are rooted at, derived
+# from ``_SECTION_SOURCE_DIRS`` so the two can never drift apart. Consumers
+# that need a trailing-slash string prefix (``ci_compliance``,
+# ``rollup_size_preflight``) use this directly instead of hand-copying a
+# second literal table.
+SECTION_PATH_PREFIXES: dict[str, str] = {
+    section: "/".join(parts) + "/" for section, parts in _SECTION_SOURCE_DIRS.items()
+}
+
+# Ordered longest-prefix-first for consumers (``hotfix_backmerge``) that match
+# a changed file's path against each section prefix with ``startswith`` — a
+# more-specific prefix must always be tried before a shorter one that could
+# otherwise shadow it. No two section prefixes here are actually in a
+# prefix relationship (verified by a guard test), but the ordering keeps that
+# true by construction rather than by accident of dict insertion order.
+SECTION_PREFIX_ORDER: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        ((prefix, section) for section, prefix in SECTION_PATH_PREFIXES.items()),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
+# Per-section source file extensions scanned for the uncapped-coverage
+# guardrail. Mirrors check_size_limits._SECTION_SCAN.
+SECTION_EXTENSIONS: dict[str, tuple[str, ...]] = {
+    "backend": (".py",),
+    "agent": (".ts",),
+    "frontend": (".ts", ".tsx"),
+    "testing": (".py",),
+    "scripts": (".py",),
+}
+
+# Per-section exclusion predicate for the uncapped-coverage guardrail. Mirrors
+# check_size_limits._SECTION_SCAN (backend/testing/scripts scan every file of
+# their extension; agent/frontend skip their own test/type files).
+SECTION_EXCLUDED: dict[str, Callable[[str], bool]] = {
+    "backend": _no_section_exclusion,
+    "agent": _is_agent_section_excluded,
+    "frontend": _is_frontend_section_excluded,
+    "testing": _no_section_exclusion,
+    "scripts": _no_section_exclusion,
 }
 
 
-def _governing_caps_for_module(
-    module_key: str, section: str, repo_root: str | None = None
-) -> list[int]:
-    """Discover integer ``*_SIZE_GOVERNANCE_CAP`` declarations for a module.
-
-    Governance belongs next to the source it protects. Reading the declaration
-    from the module's AST keeps this policy generic: a future module can opt in
-    by declaring its own governing constant without adding a filename-specific
-    branch here. Invalid or unavailable source is treated as having no
-    discovered relationship; the ordinary cap policy remains available.
-    """
-    root = repo_root or _REPO_ROOT
-    source_root_parts = _SECTION_SOURCE_DIRS.get(section)
-    if source_root_parts is None:
-        return []
-    source_root = os.path.abspath(os.path.join(root, *source_root_parts))
-    if section == "backend" and not os.path.isdir(source_root):
-        # The production backend image installs the package at /app/app rather
-        # than carrying a full repository checkout. Keep source-adjacent
-        # governance effective there instead of silently applying generic
-        # headroom.
-        source_root = os.path.abspath(os.path.dirname(__file__))
-    source_path = os.path.abspath(os.path.join(source_root, module_key))
+def governance_caps_from_source_text(source_text: str) -> list[int]:
+    """``*_SIZE_GOVERNANCE_CAP`` int declarations in source text (no disk I/O)."""
     try:
-        if os.path.commonpath((source_root, source_path)) != source_root:
-            return []
-        with open(source_path, encoding="utf-8") as source_file:
-            tree = ast.parse(source_file.read(), filename=source_path)
-    except (OSError, SyntaxError, UnicodeError, ValueError):
+        tree = ast.parse(source_text)
+    except (SyntaxError, ValueError):
         return []
 
     caps: list[int] = []
@@ -91,6 +144,41 @@ def _governing_caps_for_module(
             ):
                 caps.append(value.value)
     return caps
+
+
+def _governing_caps_for_module(
+    module_key: str, section: str, repo_root: str | None = None
+) -> list[int]:
+    """Discover integer ``*_SIZE_GOVERNANCE_CAP`` declarations for a module.
+
+    Governance belongs next to the source it protects. Reading the declaration
+    from the module's AST keeps this policy generic: a future module can opt in
+    by declaring its own governing constant without adding a filename-specific
+    branch here. Invalid or unavailable source is treated as having no
+    discovered relationship; the ordinary cap policy remains available.
+    Reads the LOCAL tree; a caller holding ref-fetched text should call
+    :func:`governance_caps_from_source_text` directly instead.
+    """
+    root = repo_root or _REPO_ROOT
+    source_root_parts = _SECTION_SOURCE_DIRS.get(section)
+    if source_root_parts is None:
+        return []
+    source_root = os.path.abspath(os.path.join(root, *source_root_parts))
+    if section == "backend" and not os.path.isdir(source_root):
+        # The production backend image installs the package at /app/app rather
+        # than carrying a full repository checkout. Keep source-adjacent
+        # governance effective there instead of silently applying generic
+        # headroom.
+        source_root = os.path.abspath(os.path.dirname(__file__))
+    source_path = os.path.abspath(os.path.join(source_root, module_key))
+    try:
+        if os.path.commonpath((source_root, source_path)) != source_root:
+            return []
+        with open(source_path, encoding="utf-8") as source_file:
+            source_text = source_file.read()
+    except (OSError, UnicodeError, ValueError):
+        return []
+    return governance_caps_from_source_text(source_text)
 
 
 def bump_size_limit(
@@ -203,6 +291,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_promotion_pending.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_qualification_deferral.py"): GoverningCap(
+        source_path="backend/app/release_qualification_deferral.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_qualifier.py"): GoverningCap(
         source_path="backend/app/release_qualifier.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -247,6 +339,10 @@ _GOVERNING_CAPS: dict[tuple[str, str], GoverningCap] = {
         source_path="backend/app/release_stall_alerts.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
     ),
+    ("backend", "release_task_admission.py"): GoverningCap(
+        source_path="backend/app/release_task_admission.py",
+        constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
+    ),
     ("backend", "release_version.py"): GoverningCap(
         source_path="backend/app/release_version.py",
         constant_name="_MODULE_SIZE_GOVERNANCE_CAP",
@@ -258,6 +354,18 @@ def governing_cap_source_path(section: str, module_key: str) -> str | None:
     """Return the source path whose cap constant must move, if any."""
     governing = _GOVERNING_CAPS.get((section, module_key))
     return governing["source_path"] if governing else None
+
+
+def governance_source_relpath(section: str, module_key: str) -> str | None:
+    """Repo-relative path where ``module_key``'s own governance cap lives.
+
+    Pure path construction; covers any governed module, unlike
+    :func:`governing_cap_source_path` (curated ``_GOVERNING_CAPS`` only).
+    """
+    source_root_parts = _SECTION_SOURCE_DIRS.get(section)
+    if source_root_parts is None:
+        return None
+    return "/".join((*source_root_parts, module_key))
 
 
 def governing_cap_repair(
@@ -343,6 +451,41 @@ def is_breach(count: int | None, cap: int | None) -> bool:
     re-deriving it inline.
     """
     return count is not None and cap is not None and count > cap
+
+
+def resolve_effective_cap(
+    module_key: str,
+    section: str,
+    json_cap: int | None,
+    repo_root: str | None = None,
+    *,
+    governance_caps: list[int] | None = None,
+) -> int | None:
+    """Fold a source-declared governance cap into the cap the breach test uses.
+
+    Previously the ``*_SIZE_GOVERNANCE_CAP`` a module declares was read only
+    inside :func:`bump_size_limit` (the ``--fix`` auto-bump path) and never
+    consulted by the breach comparison itself — a module sitting between its
+    governance cap and a looser JSON cap, or with a governance cap and no
+    JSON entry at all, raised nothing. This is the single point where "which
+    number actually gates a breach" is decided: the tighter of the two when
+    both exist, the governance cap alone when there is no JSON entry, and the
+    JSON cap unchanged when the module declares no governance cap.
+    ``governance_caps``, when passed (even ``[]``), is used AS-IS instead of
+    reading the local tree — pass ``governance_caps_from_source_text(ref_text)``
+    to gate against a specific ref instead of the local tree.
+    """
+    governing_caps = (
+        governance_caps
+        if governance_caps is not None
+        else _governing_caps_for_module(module_key, section, repo_root)
+    )
+    if not governing_caps:
+        return json_cap
+    governance_cap = min(governing_caps)
+    if json_cap is None:
+        return governance_cap
+    return min(json_cap, governance_cap)
 
 
 # ---------------------------------------------------------------------------

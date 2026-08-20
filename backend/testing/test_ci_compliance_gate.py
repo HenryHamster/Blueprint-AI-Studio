@@ -2806,3 +2806,168 @@ def test_git_refs_has_no_ci_compliance_branch_literal_fallback():
         + "\n".join(violations)
         + "\nResolve the branch through a named constant or per-project config."
     )
+
+
+@pytest.mark.asyncio
+async def test_scan_capped_files_uses_ref_declared_governance_cap_not_local_tree(
+    mocker,
+):
+    """Leg 2 regression: the at-SHA evaluator must classify a module against
+    the ``*_SIZE_GOVERNANCE_CAP`` declared IN THE FETCHED REF TEXT, not
+    whatever the local/installed tree resolves for that ``module_key``.
+
+    ``ref_only_governed.py`` has no counterpart on the local disk tree that
+    ``ci_compliance._scan_capped_files`` runs on, so resolving governance from
+    the local tree (the pre-fix behavior) finds NO governance cap at all and
+    misses this breach — the module reads as compliant at 150/200 lines
+    against the looser JSON cap alone. Resolving from the ref's own fetched
+    text (the fix) finds the tighter governance cap of 100 declared at that
+    ref and correctly flags the breach. Same fetched text, opposite verdict
+    depending on which tree the governance cap is read from.
+    """
+    ref_module_text = "\n".join(
+        ["_MODULE_SIZE_GOVERNANCE_CAP: int = 100"] + ["# pad"] * 149
+    )
+    assert len(ref_module_text.splitlines()) == 150
+
+    async def _reader(path, *, token, owner, repo, ref, project_id=None):
+        if path == "backend/app/ref_only_governed.py":
+            return ref_module_text
+        return None
+
+    mocker.patch.object(ci_compliance.github, "get_file_text_at_ref", new=_reader)
+
+    limits = {"backend": {"ref_only_governed.py": 200}}  # looser JSON cap
+    violations, checked = await ci_compliance._scan_capped_files(
+        limits=limits,
+        token="token",
+        owner="owner",
+        repo="repo",
+        ref=_HEAD_SHA,
+        project_id=None,
+    )
+
+    assert checked == 1
+    assert violations == [
+        {
+            "section": "backend",
+            "rel": "ref_only_governed.py",
+            "count": 150,
+            "cap": 200,
+        }
+    ], (
+        "must flag the breach against the ref-declared governance cap (100), "
+        f"not silently pass on the looser JSON cap (200); got {violations}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scan_capped_files_flags_scripts_section_breach(mocker):
+    """The at-SHA evaluator must cover the ``scripts`` governed section.
+
+    Regression: ``_SECTION_PREFIXES`` previously hand-listed only
+    backend/agent/frontend/testing (4 of 5 governed sections), so a
+    scripts/*.py cap breach at the candidate ref was invisible to
+    ``_scan_capped_files`` even though CI's ``test_scripts_file_within_limit``
+    enforces it.
+    """
+    over_text = "\n".join(f"line {i}" for i in range(150))
+
+    async def _reader(path, *, token, owner, repo, ref, project_id=None):
+        if path == "scripts/some_script.py":
+            return over_text
+        return None
+
+    mocker.patch.object(ci_compliance.github, "get_file_text_at_ref", new=_reader)
+
+    limits = {"scripts": {"some_script.py": 100}}
+    violations, checked = await ci_compliance._scan_capped_files(
+        limits=limits,
+        token="token",
+        owner="owner",
+        repo="repo",
+        ref=_HEAD_SHA,
+        project_id=None,
+    )
+
+    assert checked == 1
+    assert violations == [
+        {"section": "scripts", "rel": "some_script.py", "count": 150, "cap": 100}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scan_uncapped_files_flags_scripts_over_threshold(mocker):
+    """An over-threshold scripts/*.py with no cap entry must be flagged.
+
+    Regression: with the pre-fix 4/5 ``_SECTION_PREFIXES`` / ``_SECTION_EXTENSIONS``,
+    this file was never even a scan candidate — invisible to the
+    uncapped-coverage guardrail this function implements.
+    """
+    over_line_count = ci_compliance._UNCAPPED_THRESHOLD + 10
+    over_text = "\n".join(f"line {i}" for i in range(over_line_count))
+
+    async def _reader(path, *, token, owner, repo, ref, project_id=None):
+        if path == "scripts/brand_new_uncapped.py":
+            return over_text
+        return None
+
+    mocker.patch.object(ci_compliance.github, "get_file_text_at_ref", new=_reader)
+
+    tree_paths = [
+        {
+            "path": "scripts/brand_new_uncapped.py",
+            "size": ci_compliance._UNCAPPED_THRESHOLD + 100,
+        },
+    ]
+    violations = await ci_compliance._scan_uncapped_files(
+        limits={},
+        tree_paths=tree_paths,
+        token="token",
+        owner="owner",
+        repo="repo",
+        ref=_HEAD_SHA,
+        project_id=None,
+    )
+
+    assert violations == [
+        {
+            "section": "scripts",
+            "rel": "brand_new_uncapped.py",
+            "count": over_line_count,
+            "cap": None,
+        }
+    ]
+
+
+def test_section_registries_agree_across_all_consumers():
+    """Parity guard: every section-scanning consumer must cover the exact same
+    5-key section set as ``module_size_limits.json``'s own top-level sections.
+
+    A LITERAL pin on both sides (not merely re-deriving one side from the
+    other) so that adding a 6th section to the JSON without updating a
+    consumer's registry — or vice versa — fails loudly instead of both sides
+    silently agreeing on a stale subset.
+    """
+    from app import hotfix_backmerge, rollup_size_preflight
+    from app.size_limit_policy import SECTION_KEYS
+
+    literal_keys = frozenset({"backend", "agent", "frontend", "testing", "scripts"})
+    assert literal_keys == SECTION_KEYS
+
+    caps_path = Path(__file__).with_name("module_size_limits.json")
+    caps_data = json.loads(caps_path.read_text())
+    json_section_keys = frozenset(k for k in caps_data if not k.startswith("_"))
+    assert json_section_keys == literal_keys, (
+        f"module_size_limits.json top-level sections {json_section_keys} must "
+        f"equal the authoritative section set {literal_keys}"
+    )
+
+    assert frozenset(ci_compliance._SECTION_PREFIXES) == literal_keys
+    assert frozenset(ci_compliance._SECTION_EXTENSIONS) == literal_keys
+    assert frozenset(ci_compliance._SECTION_EXCLUDED) == literal_keys
+    assert frozenset(rollup_size_preflight._SECTION_PREFIXES) == literal_keys
+    assert (
+        frozenset(section for _prefix, section in hotfix_backmerge._FILE_PREFIX_MAP)
+        == literal_keys
+    )

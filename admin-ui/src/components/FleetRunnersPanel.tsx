@@ -210,7 +210,7 @@ type ConfigStatusTone = 'good' | 'warn' | 'idle' | 'bad';
 const CONFIG_STATUS_CLS: Record<ConfigStatusTone, string> = {
   good: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
   warn: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
-  idle: 'border-neutral-700 bg-neutral-800/40 text-neutral-300',
+  idle: 'border-neutral-700 bg-workbench-panel/40 text-neutral-300',
   bad: 'border-red-500/40 bg-red-500/10 text-red-300',
 };
 
@@ -450,7 +450,7 @@ function readinessClasses(tone: ReadinessTone): string {
   if (tone === 'good') return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300';
   if (tone === 'warn') return 'border-amber-500/30 bg-amber-500/10 text-amber-300';
   if (tone === 'bad') return 'border-red-500/30 bg-red-500/10 text-red-300';
-  return 'border-neutral-700 bg-neutral-950/40 text-neutral-400';
+  return 'border-neutral-700 bg-workbench-shell/40 text-neutral-400';
 }
 
 /** Compact "ready for Workday / not ready (reason)" statement for a runner row.
@@ -539,7 +539,7 @@ function TokenDialog({
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60" />
-      <div className="relative z-10 w-full max-w-2xl bg-neutral-900 border border-neutral-700 rounded-lg p-5 shadow-2xl mx-4">
+      <div className="relative z-10 w-full max-w-2xl bg-workbench-base border border-neutral-700 rounded-lg p-5 shadow-2xl mx-4">
         <h3 className="text-sm font-semibold text-neutral-200 mb-1">
           {mode === 'rotate'
             ? 'Runner token rotated'
@@ -555,7 +555,7 @@ function TokenDialog({
 
         <div className="mb-3">
           <div className="text-xs text-neutral-400 mb-1">Token</div>
-          <div className="flex items-center gap-2 bg-neutral-950 border border-neutral-700 rounded px-3 py-2">
+          <div className="flex items-center gap-2 bg-workbench-shell border border-neutral-700 rounded px-3 py-2">
             <code className="flex-1 text-xs text-emerald-300 break-all font-mono">{token}</code>
             <button
               onClick={() => copy('token', token)}
@@ -569,7 +569,7 @@ function TokenDialog({
         </div>
 
         {mode === 'enroll' && (
-          <div className="mb-4 rounded border border-neutral-700 bg-neutral-950/60 px-3 py-2.5" data-testid="runner-prerequisites">
+          <div className="mb-4 rounded border border-neutral-700 bg-workbench-shell/60 px-3 py-2.5" data-testid="runner-prerequisites">
             <div className="text-xs font-semibold text-neutral-300 mb-1.5">Before you start — prerequisites</div>
             <ul className="space-y-1.5 text-ui-md text-neutral-400 list-disc pl-4">
               {RUNNER_PREREQUISITES.map((req, i) => (
@@ -587,7 +587,7 @@ function TokenDialog({
             </div>
             <div className="grid gap-2 md:grid-cols-2">
               {installSnippetItems.map(item => (
-                <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-neutral-950">
+                <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-workbench-shell">
                   <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-1.5">
                     <div className="text-ui-md font-semibold uppercase tracking-wide text-neutral-500">{item.label}</div>
                     <button
@@ -614,7 +614,7 @@ function TokenDialog({
           </div>
           <div className="grid gap-2 md:grid-cols-2">
             {setupSnippetItems.map(item => (
-              <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-neutral-950">
+              <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-workbench-shell">
                 <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-1.5">
                   <div className="text-ui-md font-semibold uppercase tracking-wide text-neutral-500">{item.label}</div>
                   <button
@@ -741,7 +741,7 @@ function TokenDialog({
 
         <button
           onClick={onDismiss}
-          className="w-full py-2 text-sm font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded transition-colors min-h-[44px]"
+          className="w-full py-2 text-sm font-medium bg-workbench-panel hover:bg-workbench-hover text-neutral-200 rounded transition-colors min-h-[44px]"
         >
           I've copied the token — close
         </button>
@@ -1154,7 +1154,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         <div className="flex flex-wrap items-center justify-end gap-2">
           <button
             onClick={() => void load()}
-            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md border border-neutral-800 text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-[#151c25] hover:text-neutral-200 md:min-h-9 md:min-w-9"
+            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md border border-neutral-800 text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-workbench-hover hover:text-neutral-200 md:min-h-9 md:min-w-9"
             aria-label="Refresh runners"
             title="Refresh"
           >
@@ -1173,7 +1173,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
               <button
                 onClick={() => handleEnroll('default')}
                 disabled={enrollingPreset !== null}
-                className="min-h-[44px] rounded-md border border-neutral-700 bg-[#151c25] px-3 text-xs font-semibold text-neutral-100 transition-colors hover:border-neutral-600 hover:bg-neutral-800 disabled:opacity-50 md:min-h-9"
+                className="min-h-[44px] rounded-md border border-neutral-700 bg-workbench-hover px-3 text-xs font-semibold text-neutral-100 transition-colors hover:border-neutral-600 hover:bg-workbench-hover disabled:opacity-50 md:min-h-9"
               >
                 {enrollingPreset === 'default' ? 'Enrolling...' : 'Enroll runner'}
               </button>
@@ -1190,7 +1190,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
 
       {!loading && runners.length > 0 && (
         <div className="grid grid-cols-2 gap-2 text-xs lg:grid-cols-4">
-          <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
+          <div className="rounded-md border border-neutral-800 bg-workbench-card px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">readiness</div>
             <div className={`mt-0.5 font-mono ${readyAgentRunners + readyComputeRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
               <span data-testid="fleet-runner-agent-readiness">{readyAgentRunners} agent</span>{' · '}
@@ -1202,7 +1202,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 : `${liveRunners.length} connected`}
             </div>
           </div>
-          <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
+          <div className="rounded-md border border-neutral-800 bg-workbench-card px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">capacity</div>
             <div className="mt-0.5 truncate text-ui-sm text-neutral-500">
               agents <span className="font-mono text-neutral-100" data-testid="fleet-runner-work-capacity">{agentCapacity.busy}/{agentCapacity.max || '-'}</span>
@@ -1214,14 +1214,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 ? `${computeCapacity.free}+ known free` : `${computeCapacity.free} free`}
             </div>
           </div>
-          <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
+          <div className="rounded-md border border-neutral-800 bg-workbench-card px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">gpu</div>
             <div className={`mt-0.5 font-mono ${liveGpuRunners.length > 0 ? 'text-purple-300' : 'text-neutral-500'}`}>
               {gpuCapacityLabel}
             </div>
             <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{liveGpuRunners.length} connected</div>
           </div>
-          <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
+          <div className="rounded-md border border-neutral-800 bg-workbench-card px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">strategic</div>
             <div className={`mt-0.5 font-mono ${eligibleStrategicRunners > 0 ? 'text-emerald-300' : 'text-neutral-500'}`} data-testid="fleet-runner-strategic-readiness">
               {eligibleStrategicRunners > 0 ? `${eligibleStrategicRunners} eligible live` : 'none eligible'}
@@ -1299,14 +1299,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             return (
               <div
                 key={runner.id}
-                className="rounded-md border border-neutral-800 bg-[#0d1218]"
+                className="rounded-md border border-neutral-800 bg-workbench-card"
               >
               <div
                 className="flex flex-wrap items-start gap-2.5 p-2.5"
                 data-testid="fleet-runner-row"
               >
                 <div className="mt-0.5 shrink-0">
-                  <div className="flex h-7 w-7 items-center justify-center rounded-md border border-neutral-800 bg-[#151c25]">
+                  <div className="flex h-7 w-7 items-center justify-center rounded-md border border-neutral-800 bg-workbench-hover">
                     <Cpu className="h-3.5 w-3.5 text-neutral-400" />
                   </div>
                 </div>
@@ -1328,7 +1328,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     {runner.version && (
                       <span className="text-xs text-neutral-500">{runner.version}</span>
                     )}
-                    <span className={`rounded border border-neutral-700 bg-neutral-950/40 px-1.5 py-0.5 text-xs font-medium ${livCls}`}>{livLabel}</span>
+                    <span className={`rounded border border-neutral-700 bg-workbench-shell/40 px-1.5 py-0.5 text-xs font-medium ${livCls}`}>{livLabel}</span>
                     {strategicRunner && (
                       <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-xs text-emerald-300">
                         <Compass className="w-3 h-3" />
@@ -1346,7 +1346,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                       </span>
                     )}
                     {!isActive && !isPaused && !isDraining && (
-                      <span className="rounded border border-neutral-600/50 bg-neutral-700/40 px-1.5 py-0.5 text-xs text-neutral-300">
+                      <span className="rounded border border-neutral-600/50 bg-workbench-layer/40 px-1.5 py-0.5 text-xs text-neutral-300">
                         {runner.status === 'inactive' ? 'offline (deactivated)' : runner.status}
                       </span>
                     )}
@@ -1359,7 +1359,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                         status; all editing lives in the Configure panel (gear
                         toggle in the action strip), reached below. */}
                     {slots !== null && (
-                      <span className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300">
+                      <span className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-workbench-hover px-1.5 py-0.5 text-xs text-neutral-300">
                         {hasPerClassCapacity ? `${slots} agent slots free` : `${slots} slots free`}
                       </span>
                     )}
@@ -1478,7 +1478,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                             className={`rounded border px-1.5 py-0.5 text-xs ${
                               selected
                                 ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-                                : 'border-neutral-700 bg-[#151c25] text-neutral-300'
+                                : 'border-neutral-700 bg-workbench-hover text-neutral-300'
                             }`}
                           >
                             {name}
@@ -1598,7 +1598,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                       return (
                         <span
                           key={p.project_id}
-                          className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300"
+                          className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-workbench-hover px-1.5 py-0.5 text-xs text-neutral-300"
                           data-testid="fleet-runner-project"
                         >
                           {name}
@@ -1620,7 +1620,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     })}
                     {!readOnly && (addingProjectFor === runner.id ? (
                       <span
-                        className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300"
+                        className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-workbench-hover px-1.5 py-0.5 text-xs text-neutral-300"
                         data-testid="fleet-runner-add-project-editor"
                       >
                         <select
@@ -1947,7 +1947,7 @@ function RunnerTelemetryDetail({
                   ))}
               </div>
               {(o.status === 'FAILED' || o.status === 'TIMED_OUT') && o.command_log_tail && (
-                <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-900/60 px-2 py-1 font-mono text-ui-sm text-neutral-400">
+                <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-workbench-base/60 px-2 py-1 font-mono text-ui-sm text-neutral-400">
                   {o.command_log_tail}
                 </pre>
               )}

@@ -5,7 +5,13 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.failure_classification import _CRED_FIELD_RE, _CRED_REDACT_SUBS
 from app.execution_capability_requirements import (
@@ -205,6 +211,18 @@ class PublicationGateReceipt(BaseModel):
     exit_code: int = Field(..., ge=0, le=255)
     authoritative_ci_required: bool
     recorded_at: str = Field(..., min_length=1, max_length=64)
+    attribution_state: str | None = Field(None, max_length=4000)
+    new_failures: Dict[str, str | Dict[str, str]] | None = None
+    suppressed_failures: Dict[str, str | Dict[str, str]] | None = None
+    disappeared_failures: Dict[str, str | Dict[str, str]] | None = None
+    skipped_failures: Dict[str, str | Dict[str, str]] | None = None
+    attribution_counts: Dict[str, Dict[str, int]] | None = None
+    # Cross-lane guard-suppression projection: {lane: {state, suppressed,
+    # suppressed_observed_count}}, merged from every guard lane's receipt (see
+    # scripts/guard_suppression_receipt.py). Backend-pytest-only until now;
+    # this widens the same receipt to cover static/vitest/typecheck/viewport too.
+    guard_suppressions: Dict[str, Dict[str, object]] | None = None
+    guard_suppressions_counts: Dict[str, int] | None = None
 
 
 class AgentStatusPayload(BaseModel):

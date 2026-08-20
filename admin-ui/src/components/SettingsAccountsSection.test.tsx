@@ -315,6 +315,35 @@ describe('SettingsAccountsSection', () => {
     expect(onRemoveAccount).toHaveBeenNthCalledWith(2, 'acct-1', true);
   });
 
+  it('reads a quota_exhausted cooldown from the server, not a 30m local guess', () => {
+    // Regression guard: the component must not compute cooldown windows
+    // itself. A quota_exhausted hold is a flat 24h billing wall server-side
+    // (see app.rate_limit_cooldown.cooldown_seconds_for_info); disabled 5
+    // minutes ago it must still read as the 24h-quota state, not "recovering"
+    // (which the old `Math.min(30 * 2^(hits-1), 240)` formula would report
+    // once its fake 30m local window elapsed).
+    const disabledAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    render(
+      <Harness
+        maxPlanAccounts={[
+          makeAccount({
+            disabled_models: {
+              'claude-sonnet-4-6': {
+                hits: 1,
+                at: disabledAt,
+                kind: 'quota_exhausted',
+                cooldown_seconds: 86400,
+              },
+            },
+          }),
+        ]}
+      />
+    );
+
+    expect(screen.getByText('24h quota')).toBeInTheDocument();
+    expect(screen.queryByText('recovering')).not.toBeInTheDocument();
+  });
+
   it('disables row actions while an edit save is pending', async () => {
     let resolveSave: (v: AccountMutationResult) => void = () => {};
     const onUpdateAccount = vi.fn(() => new Promise<AccountMutationResult>(res => { resolveSave = res; }));

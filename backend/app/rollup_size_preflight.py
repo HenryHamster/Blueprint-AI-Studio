@@ -37,6 +37,7 @@ from app.github import (
 )
 from app.json_extract import async_json_loads
 from app.size_limit_policy import (
+    SECTION_PATH_PREFIXES,
     classify_breach,
     governing_cap_source_path,
     ledger_with_pending_bumps,
@@ -95,13 +96,11 @@ def _is_transient_commit_error(exc: BaseException) -> bool:
     )
 
 # Maps each JSON section to the repo-relative prefix that anchors its source
-# files, mirroring the resolution in check_size_limits.resolve_section_root.
-_SECTION_PREFIXES: dict[str, str] = {
-    "backend": "backend/app/",
-    "agent": "agent/src/",
-    "frontend": "admin-ui/src/",
-    "testing": "backend/testing/",
-}
+# files. Single-sourced from ``size_limit_policy`` (mirrors the resolution in
+# check_size_limits.resolve_section_root) so a ``scripts`` cap breach on a
+# rollup is auto-bumped the same as any other section instead of being
+# invisible to this preflight.
+_SECTION_PREFIXES: dict[str, str] = SECTION_PATH_PREFIXES
 
 
 async def preflight_rollup_size_caps(

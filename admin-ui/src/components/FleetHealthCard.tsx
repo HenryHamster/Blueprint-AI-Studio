@@ -29,14 +29,14 @@ export function FleetHealthCard({
 
   if (loading) {
     return (
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
         <div className="flex items-center gap-2 mb-2">
           <Activity className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
           <h3 className="text-ui-md font-bold text-neutral-500 uppercase tracking-widest">Fleet Health</h3>
         </div>
         <div className="animate-pulse space-y-2">
-          <div className="h-8 bg-neutral-800/50 rounded w-1/2" />
-          <div className="h-4 bg-neutral-800/50 rounded w-3/4" />
+          <div className="h-8 bg-workbench-panel/50 rounded w-1/2" />
+          <div className="h-4 bg-workbench-panel/50 rounded w-3/4" />
         </div>
       </div>
     );
@@ -44,7 +44,7 @@ export function FleetHealthCard({
 
   if (!data || data.total === 0) {
     return (
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+      <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
         <div className="flex items-center gap-2 mb-2">
           <Activity className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
           <h3 className="text-ui-md font-bold text-neutral-500 uppercase tracking-widest">Fleet Health</h3>
@@ -62,7 +62,7 @@ export function FleetHealthCard({
   const hasCritical = data.offline > 0 || data.low_disk > 0 || lowMemory > 0;
 
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+    <div className="bg-workbench-base/50 border border-neutral-800/50 rounded-lg p-3">
       <div className="flex items-center gap-2 mb-2">
         {hasCritical ? (
           <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
@@ -120,7 +120,7 @@ export function FleetHealthCard({
               <div key={proj.project_id}>
                 <button
                   onClick={() => setExpandedProject(expandedProject === proj.project_id ? null : proj.project_id)}
-                  className="flex items-center gap-1.5 w-full text-left text-ui-sm hover:bg-neutral-800/50 rounded px-1.5 py-0.5 transition-colors min-h-[44px]"
+                  className="flex items-center gap-1.5 w-full text-left text-ui-sm hover:bg-workbench-hover/50 rounded px-1.5 py-0.5 transition-colors min-h-[44px]"
                 >
                   {expandedProject === proj.project_id ? (
                     <ChevronDown className="w-3 h-3 shrink-0 text-neutral-400" />

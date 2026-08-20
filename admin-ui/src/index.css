@@ -31,13 +31,6 @@
   --color-workbench-text-muted: #a3a3a3;
   --color-workbench-text-subtle: #737373;
 
-  --spacing-workbench-1: 2px;
-  --spacing-workbench-2: 4px;
-  --spacing-workbench-3: 6px;
-  --spacing-workbench-4: 8px;
-  --spacing-workbench-5: 12px;
-  --spacing-workbench-6: 16px;
-
   /* Font size tokens for compact UI typography (8-11px range).
      Use text-ui-2xs (8px), text-ui-xs (9px), text-ui-sm (10px), or text-ui-md (11px) for
      dense labels, badges, and secondary meta inside cards. */

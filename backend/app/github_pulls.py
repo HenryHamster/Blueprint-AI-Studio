@@ -929,6 +929,7 @@ async def merge_pull_request(
     project_id: str | None = None,
     *,
     allow_changes_requested: bool = False,
+    allow_operator_pat: bool = False,
     expected_head_sha: str | None = None,
 ) -> dict:
     """Merge a PR and return its authoritative merge commit when supplied.
@@ -954,7 +955,28 @@ async def merge_pull_request(
     and an unavailable decision lookup raises. Only explicit human/operator
     approval lanes may set ``allow_changes_requested=True``; a static invariant
     pins that override allowlist.
+
+    Same fail-closed treatment applies to the credential itself: ``token`` can
+    silently be the operator's own PAT (the resolver's last-resort fallback
+    after App/installation discovery fails), and merging with it mints a
+    commit GitHub attributes to the operator for what is really automated
+    pipeline work. Only an explicit human/operator-triggered merge lane may
+    set ``allow_operator_pat=True``.
     """
+    from app.github_token_resolver import is_operator_pat_token
+
+    if not allow_operator_pat and is_operator_pat_token(token):
+        logger.warning(
+            "[PR] Merge refused for PR #%s — only an operator PAT credential "
+            "is available and this lane does not allow it",
+            pr_number,
+        )
+        return {
+            "merged": False,
+            "conflict": False,
+            "pat_fallback_blocked": True,
+            "message": "refusing to merge with an operator PAT credential",
+        }
     if not allow_changes_requested:
         decision = await get_pull_request_review_decision(
             token, owner, repo, pr_number, project_id=project_id

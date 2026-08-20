@@ -155,7 +155,12 @@ async def test_pending_goal_change_supersedes_attempt_before_promotion(
     shared_state.runtime_config["promotion_enabled"] = True
     _project, version = await _make_project_and_version(db_session, phase="stabilize")
     launched_goal = "Ship the original goal"
-    launched_rubric = []
+    # Only the GOAL may differ from the launch contract here: open_version seeds
+    # a default authorship criterion, so a hardcoded empty launched rubric would
+    # trip the earlier rubric-drift gate and never reach the contract check.
+    launched_rubric, launched_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
     rubric_fingerprint = rq._rubric_fingerprint(launched_rubric)
     policy_snapshot = {"threshold": 0.8, "weights": {}}
     version.goal = "Ship the revised goal"
@@ -166,7 +171,7 @@ async def test_pending_goal_change_supersedes_attempt_before_promotion(
         "version_goal": launched_goal,
         "rubric_snapshot": launched_rubric,
         "rubric_fingerprint": rubric_fingerprint,
-        "rubric_lifecycle_snapshot": [],
+        "rubric_lifecycle_snapshot": launched_lifecycle,
         "rubric_provenance": rq._rubric_provenance(
             launched_rubric,
             source="qualification_launch",
@@ -220,7 +225,7 @@ async def test_same_sha_contract_change_spawns_fresh_holistic_review(
         clear=False,
     )
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    candidate = "newcontract" * 4
+    candidate = ("newcontract" * 4)[:40]
     launched_goal = "Ship the original outcome"
     launched_rubric = []
     launched_rubric_fingerprint = rq._rubric_fingerprint(launched_rubric)

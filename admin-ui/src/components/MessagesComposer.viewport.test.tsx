@@ -2,7 +2,6 @@ import { afterEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
 import { MessagesComposer } from './MessagesComposer';
-import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import type { PendingAttachment } from './MessagesComposer';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 import { MESSAGE_CONTENT_MAX } from '../api';
@@ -11,9 +10,7 @@ async function renderComposer(
   root: Root,
   newType: string,
   lastArming: 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | null = null,
-  strategistBusy = false,
   chrome: 'full' | 'minimal' = 'full',
-  strategicContext: StrategicContextDescriptorModel | null = null,
   onOpenCommandPalette?: () => void,
   newContent = '',
   pendingAttachments: PendingAttachment[] = [],
@@ -30,14 +27,11 @@ async function renderComposer(
         submitting={false}
         replyTo={null}
         lastArming={lastArming}
-        strategistBusy={strategistBusy}
         onChangeType={() => {}}
         onChangeContent={() => {}}
         onCancelReply={() => {}}
         onSubmit={() => {}}
         chrome={chrome}
-        strategicContext={strategicContext}
-        onOpenStrategicContext={() => {}}
         onOpenCommandPalette={onOpenCommandPalette}
         pendingAttachments={pendingAttachments}
         onAddAttachment={onAddAttachment}
@@ -47,7 +41,7 @@ async function renderComposer(
   });
 }
 
-describe('MessagesComposer — steering hint viewport regression', () => {
+describe('MessagesComposer — not_armed warning viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
@@ -63,63 +57,18 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     }
   });
 
-  test('NOTE (passive) hint fits 375px without overflow, truncation, or small targets', async () => {
+  test('no steady narration hint renders for steering, passive, or routine outcomes', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await renderComposer(r, 'NOTE');
-    });
-    expect(host!.textContent).toContain('won’t wake the strategist');
-    await expectNoTextTruncationAt(375, async () => {});
-    await expectMinTouchTargetAt(375, async () => {});
-  });
-
-  test('FEEDBACK (steering) hint fits 375px without overflow, truncation, or small targets', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await renderComposer(r, 'FEEDBACK');
-    });
-    expect(host!.textContent).toContain('reaches the strategist soon');
-    await expectNoTextTruncationAt(375, async () => {});
-    await expectMinTouchTargetAt(375, async () => {});
-  });
-
-  test('busy-strategist steering hint (queued) fits 375px without overflow, truncation, or small targets', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      // FEEDBACK while a cycle is running → pre-send hint says the steer queues.
-      await renderComposer(r, 'FEEDBACK', null, true);
-    });
-    expect(host!.textContent).toContain('queues for the next cycle');
-    expect(host!.textContent).not.toContain('reaches the strategist soon');
-    await expectNoTextTruncationAt(375, async () => {});
-    await expectMinTouchTargetAt(375, async () => {});
-  });
-
-  test('last-send routine_event outcome overrides the type-based prediction', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      // FEEDBACK would predict steering, but the server reported routine_event
-      // for the last send — the real outcome must win.
       await renderComposer(r, 'FEEDBACK', 'routine_event');
     });
-    expect(host!.textContent).toContain('Routine event');
-    expect(host!.textContent).toContain('won’t wake the strategist');
+    expect(host!.textContent).not.toContain('Routine event');
+    expect(host!.textContent).not.toContain('reaches the strategist soon');
+    expect(host!.textContent).not.toContain('won’t wake the strategist');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });
@@ -131,7 +80,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await renderComposer(r, 'FEEDBACK', null, false, 'minimal');
+      await renderComposer(r, 'FEEDBACK', null, 'minimal');
     });
     expect(host!.querySelector('button[aria-label="Send message"]')).not.toBeNull();
     expect(host!.textContent).not.toContain('Strategic');
@@ -149,7 +98,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, onOpenCommandPalette);
+      await renderComposer(r, 'FEEDBACK', null, 'minimal', onOpenCommandPalette);
     });
     if (!host) throw new Error('Expected composer viewport test host to be mounted');
     const commandButton = host.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
@@ -163,64 +112,19 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     await expectMinTouchTargetAt(375, async () => {});
   });
 
-  test('minimal chat composer still shows queued state when the strategist is busy', async () => {
+  test('minimal chat composer keeps not-armed warning visible and styled distinctly', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await renderComposer(r, 'FEEDBACK', null, true, 'minimal');
-    });
-    expect(host!.querySelector('button[aria-label="Send message"]')).not.toBeNull();
-    expect(host!.textContent).toContain('queues for the next cycle');
-    expect(host!.textContent).not.toContain('Strategic');
-    await expectNoTextTruncationAt(375, async () => {});
-    await expectMinTouchTargetAt(375, async () => {});
-  });
-
-  test('minimal chat composer suppresses routine post-send hint chrome', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await renderComposer(r, 'FEEDBACK', 'routine_event', false, 'minimal');
-    });
-    expect(host!.querySelector('button[aria-label="Send message"]')).not.toBeNull();
-    expect(host!.textContent).not.toContain('Routine event');
-    expect(host!.textContent).not.toContain('won’t wake the strategist');
-    await expectNoTextTruncationAt(375, async () => {});
-    await expectMinTouchTargetAt(375, async () => {});
-  });
-
-  test('minimal chat composer prefers busy queued state over routine post-send hint', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await renderComposer(r, 'FEEDBACK', 'routine_event', true, 'minimal');
-    });
-    expect(host!.textContent).toContain('queues for the next cycle');
-    expect(host!.textContent).not.toContain('Routine event');
-    expect(host!.textContent).not.toContain('won’t wake the strategist');
-    await expectNoTextTruncationAt(375, async () => {});
-    await expectMinTouchTargetAt(375, async () => {});
-  });
-
-  test('minimal chat composer keeps not-armed warning visible', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await renderComposer(r, 'FEEDBACK', 'not_armed', false, 'minimal');
+      await renderComposer(r, 'FEEDBACK', 'not_armed', 'minimal');
     });
     expect(host!.textContent).toContain('Couldn’t wake the strategist');
+    const warning = host!.querySelector('[role="alert"]');
+    expect(warning).not.toBeNull();
+    expect(warning?.className).toContain('text-amber-400');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });
@@ -232,7 +136,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'NOTE', null, false, 'full', null, undefined, content);
+    await renderComposer(r, 'NOTE', null, 'full', undefined, content);
     expect(host!.textContent).not.toContain(`/ ${MESSAGE_CONTENT_MAX.toLocaleString()}`);
   });
 
@@ -243,7 +147,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'NOTE', null, false, 'full', null, undefined, content);
+    await renderComposer(r, 'NOTE', null, 'full', undefined, content);
     expect(host!.textContent).toContain(`/ ${MESSAGE_CONTENT_MAX.toLocaleString()}`);
   });
 
@@ -254,7 +158,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'NOTE', null, false, 'full', null, undefined, content);
+    await renderComposer(r, 'NOTE', null, 'full', undefined, content);
     const sendBtn = host!.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
     expect(sendBtn?.disabled).toBe(true);
     const counterEl = Array.from(host!.querySelectorAll('p')).find(p =>
@@ -264,58 +168,6 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     expect(counterEl?.className).toContain('text-red-400');
   });
 
-  test('minimal chat composer context descriptor fits 375px without overflow', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', {
-        modeLabel: 'Workday',
-        surfaceLabel: 'Pipeline',
-        contextLabel: 'Context ready',
-        contextTone: 'ready',
-        refCount: 1,
-        refs: [{
-          id: 'knowledge_document:operator-notes',
-          kind: 'knowledge_document',
-          label: 'Operator notes for the local Strategic workday session',
-          status: 'active',
-        }],
-      });
-    });
-    if (!host) throw new Error('Expected host to be mounted');
-    expect(host.textContent).toContain('Context');
-    expect(host.textContent).toContain('Workday');
-    expect(host.textContent).toContain('Pipeline');
-    expect(host.textContent).toContain('Operator notes');
-    await expectNoTextTruncationAt(375, async () => {});
-    await expectMinTouchTargetAt(375, async () => {});
-  });
-
-  test('minimal chat composer short context descriptor keeps a mobile tap target', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', {
-        modeLabel: 'Chat',
-        surfaceLabel: 'Strategic',
-        contextLabel: 'Context captured',
-        contextTone: 'ready',
-        refCount: 0,
-        refs: [],
-      });
-    });
-    const descriptor = host?.querySelector<HTMLElement>('[data-testid="strategic-context-descriptor"]');
-    expect(descriptor).not.toBeNull();
-    expect(descriptor!.getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
-    await expectMinTouchTargetAt(375, async () => {});
-  });
-
   test('minimal chat composer with pending attachment preview fits 1280px without overflow', async () => {
     await expectNoOverflowAt(1280, async () => {
       host = document.createElement('div');
@@ -323,7 +175,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
+      await renderComposer(r, 'FEEDBACK', null, 'minimal', undefined, '', [
         { id: '1', file: new File([], 'screenshot.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'screenshot.png', size_bytes: 123456 },
         { id: '2', file: new File([], 'report.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 789012 },
       ]);
@@ -338,7 +190,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
+      await renderComposer(r, 'FEEDBACK', null, 'minimal', undefined, '', [
         { id: 'a', file: new File([], 'screenshot.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'screenshot.png', size_bytes: 123456 },
         { id: 'b', file: new File([], 'report.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 789012 },
         { id: 'c', file: new File([], 'notes.txt', { type: 'text/plain' }), previewUrl: null, mime_type: 'text/plain', name: 'notes.txt', size_bytes: 1024 },
@@ -371,7 +223,7 @@ describe('MessagesComposer — attachment interaction', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
+    await renderComposer(r, 'FEEDBACK', null, 'minimal', undefined, '', [
       { id: 'first-id', file: new File([], 'first.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'first.png', size_bytes: 1000 },
       { id: 'second-id', file: new File([], 'second.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'second.pdf', size_bytes: 2000 },
     ], undefined, onRemoveAttachment);
@@ -394,7 +246,7 @@ describe('MessagesComposer — attachment interaction', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
+    await renderComposer(r, 'FEEDBACK', null, 'minimal', undefined, '', [
       { id: '3', file: new File([], 'my-notes.txt', { type: 'text/plain' }), previewUrl: null, mime_type: 'text/plain', name: 'my-notes.txt', size_bytes: 500 },
     ]);
 
@@ -409,7 +261,7 @@ describe('MessagesComposer — attachment interaction', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
+    await renderComposer(r, 'FEEDBACK', null, 'minimal', undefined, '', [], onAddAttachment);
 
     const textarea = host?.querySelector('textarea');
     expect(textarea).toBeTruthy();
@@ -435,7 +287,7 @@ describe('MessagesComposer — attachment interaction', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
+    await renderComposer(r, 'FEEDBACK', null, 'minimal', undefined, '', [], onAddAttachment);
 
     const textarea = host?.querySelector('textarea');
     expect(textarea).toBeTruthy();
@@ -458,7 +310,7 @@ describe('MessagesComposer — attachment interaction', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
+    await renderComposer(r, 'FEEDBACK', null, 'minimal', undefined, '', [], onAddAttachment);
 
     const composerBox = host?.querySelector('[data-testid="strategic-composer-box"]');
     expect(composerBox).toBeTruthy();
@@ -482,7 +334,7 @@ describe('MessagesComposer — attachment interaction', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal');
+    await renderComposer(r, 'FEEDBACK', null, 'minimal');
 
     const composerBox = host!.querySelector('[data-testid="strategic-composer-box"]')!;
     expect(composerBox).toBeTruthy();
@@ -510,7 +362,7 @@ describe('MessagesComposer — attachment interaction', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
+    await renderComposer(r, 'FEEDBACK', null, 'minimal', undefined, '', [], onAddAttachment);
 
     const composerBox = host!.querySelector('[data-testid="strategic-composer-box"]')!;
 

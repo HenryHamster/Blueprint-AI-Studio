@@ -26,6 +26,7 @@ from app.rollup_management import (
     _extract_rollup_migration_sources,
     _validate_rollup_migration_chain,
 )
+from testing.fixgate_attribution import format_offender_marker
 
 
 def _migration_src(revision: str, down_revision: str | None) -> str:
@@ -84,6 +85,8 @@ def test_migration_files_do_not_import_app_modules():
         "executes candidate migrations in the serving process, where app imports "
         "resolve against the serving tree rather than the candidate. "
         f"Offenders: {offenders}"
+        + "\n"
+        + format_offender_marker(offenders)
     )
 
 
@@ -1639,7 +1642,7 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0758", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0758', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0761", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0761', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

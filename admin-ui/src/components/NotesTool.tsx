@@ -335,7 +335,7 @@ function NotesDocument({ projectId, tool, readOnly }: ToolComponentProps) {
             onClick={() => setMode('edit')}
             className={`min-h-[44px] rounded border px-2 py-1 text-xs transition-colors ${
               mode === 'edit'
-                ? 'border-white bg-neutral-700 text-neutral-100'
+                ? 'border-white bg-workbench-layer text-neutral-100'
                 : 'border-neutral-600 text-neutral-400 hover:border-neutral-400'
             }`}
           >
@@ -349,7 +349,7 @@ function NotesDocument({ projectId, tool, readOnly }: ToolComponentProps) {
             onClick={() => setMode('preview')}
             className={`min-h-[44px] rounded border px-2 py-1 text-xs transition-colors ${
               mode === 'preview'
-                ? 'border-white bg-neutral-700 text-neutral-100'
+                ? 'border-white bg-workbench-layer text-neutral-100'
                 : 'border-neutral-600 text-neutral-400 hover:border-neutral-400'
             }`}
           >
@@ -402,7 +402,7 @@ function NotesDocument({ projectId, tool, readOnly }: ToolComponentProps) {
           placeholder="Write Markdown here. LaTeX renders in preview, e.g. $E = mc^2$"
           aria-label="Notes markdown editor"
           spellCheck={false}
-          className="min-h-[16rem] w-full resize-y rounded border border-neutral-700 bg-[#1a1a2e] p-3 font-mono text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-neutral-500 focus:outline-none"
+          className="min-h-[16rem] w-full resize-y rounded border border-neutral-700 bg-[#1a1a2e] p-3 font-mono text-sm text-neutral-200 placeholder:text-neutral-600 workbench-focus"
         />
       ) : (
         <div

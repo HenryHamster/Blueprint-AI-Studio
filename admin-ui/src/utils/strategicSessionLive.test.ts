@@ -6,7 +6,10 @@ import {
   RESIDENT_HEARTBEAT_STALE_MS,
   countStrategicReplies,
   isStrategicReplyDelta,
+  scopeStrategicTranscript,
+  computeStrategicChatLiveState,
 } from './strategicSessionLive';
+import type { StrategicLiveActivity } from './strategicSessionLive';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
 import type { ProjectMessage } from '../types/messages';
 import type { StrategicResidentSessionSnapshot } from '../strategicStateApi';
@@ -428,5 +431,93 @@ describe('computeResidentActivityState', () => {
 describe('countStrategicReplies', () => {
   it('counts strategic/strategist from_type messages', () => {
     expect(countStrategicReplies([strategicMsg('2026-06-01T10:00:00Z'), strategicMsg('2026-06-01T10:01:00Z')])).toBe(2);
+  });
+});
+
+describe('scopeStrategicTranscript', () => {
+  it('keeps only deltas stamped with the selected project', () => {
+    const transcript = [
+      delta({ id: 1, project_id: 'p1', kind: 'message', text: 'mine' }),
+      delta({ id: 2, project_id: 'p2', kind: 'message', text: 'theirs' }),
+    ];
+    expect(scopeStrategicTranscript(transcript, 'p1').map(d => d.text)).toEqual(['mine']);
+    expect(scopeStrategicTranscript(transcript, 'p2').map(d => d.text)).toEqual(['theirs']);
+  });
+
+  it('drops unattributable deltas rather than letting them leak across projects', () => {
+    const transcript = [delta({ id: 1, kind: 'message', text: 'no project' })];
+    expect(scopeStrategicTranscript(transcript, 'p1')).toEqual([]);
+  });
+
+  it('renders nothing when no project is selected, and tolerates an absent buffer', () => {
+    const transcript = [delta({ id: 1, project_id: 'p1', kind: 'message', text: 'mine' })];
+    expect(scopeStrategicTranscript(transcript, null)).toEqual([]);
+    expect(scopeStrategicTranscript(transcript, undefined)).toEqual([]);
+    expect(scopeStrategicTranscript(undefined, 'p1')).toEqual([]);
+  });
+});
+
+describe('computeStrategicChatLiveState', () => {
+  const noActivity: StrategicLiveActivity = { items: [], latestLifecycle: null };
+
+  it('is null when nothing is in flight — a poll-only turn shows no affordance', () => {
+    expect(computeStrategicChatLiveState(null, noActivity)).toBeNull();
+  });
+
+  it('reports the streaming phase with the newest activity one-liner as detail', () => {
+    const turn = computeStrategicStreamingTurn(
+      [delta({ id: 1, seq: 1, kind: 'message', text: 'partial answer' })],
+      [],
+    );
+    const activity = computeStrategicSessionActivity(
+      [
+        delta({ id: 1, seq: 1, status: 'responding' }),
+        delta({ id: 2, seq: 2, kind: 'command', text: 'pytest testing/test_release_scoring.py' }),
+      ],
+      [],
+    );
+    expect(computeStrategicChatLiveState(turn, activity)).toEqual({
+      phase: 'streaming',
+      label: 'Replying',
+      detail: 'pytest testing/test_release_scoring.py',
+    });
+  });
+
+  it('reports the working phase when the turn is open but no reply text has streamed', () => {
+    const activity = computeStrategicSessionActivity(
+      [
+        delta({ id: 1, seq: 1, status: 'working' }),
+        delta({ id: 2, seq: 2, kind: 'read', text: 'read release_scoring.py' }),
+      ],
+      [],
+    );
+    expect(computeStrategicChatLiveState(null, activity)).toEqual({
+      phase: 'working',
+      label: 'Working',
+      detail: 'read release_scoring.py',
+    });
+  });
+
+  it('clears once the turn closes with a done frame', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, status: 'responding' }),
+      delta({ id: 2, seq: 2, kind: 'message', text: 'answer' }),
+      delta({ id: 3, seq: 3, status: 'done' }),
+    ];
+    const turn = computeStrategicStreamingTurn(transcript, []);
+    const activity = computeStrategicSessionActivity(transcript, []);
+    expect(turn).toBeNull();
+    expect(computeStrategicChatLiveState(turn, activity)).toBeNull();
+  });
+
+  it('elides an over-long activity detail instead of blowing out the header', () => {
+    const long = 'x'.repeat(200);
+    const activity = computeStrategicSessionActivity(
+      [delta({ id: 1, seq: 1, status: 'working' }), delta({ id: 2, seq: 2, kind: 'command', text: long })],
+      [],
+    );
+    const state = computeStrategicChatLiveState(null, activity);
+    expect(state?.detail).toHaveLength(60);
+    expect(state?.detail?.endsWith('…')).toBe(true);
   });
 });

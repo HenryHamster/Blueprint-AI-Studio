@@ -3215,11 +3215,14 @@ def test_runner_bridge_last_progress_at_reflects_written_samples():
 async def test_compute_experiment_defaults_container_image_to_project_image(
     db_session, mocker
 ):
-    """When a project's manifest declares compute.image.name and a plan subtask omits
-    container_image, _handle_plan_completion must default the spawned child's
-    container_image to the project's declared image — pinned to the durable
-    ProjectComputeImage build digest (not the mutable tag) when one exists, so
-    two runs of the same experiment are bit-identical over time (design gap G3)."""
+    """When a project's manifest declares compute.image.name and an
+    accelerator-declaring plan subtask omits container_image,
+    _handle_plan_completion must default the spawned child's container_image to
+    the project's declared image — pinned to the durable ProjectComputeImage
+    build digest (not the mutable tag) when one exists, so two runs of the same
+    experiment are bit-identical over time (design gap G3). Bare payloads (no
+    accelerator, no container_image) deliberately get NO image so the GPU/arch
+    pre-flight never arms (#17458)."""
     from sqlmodel import select as _select
     from app.models import ProjectComputeImage
     from app.plan_completion import _handle_plan_completion

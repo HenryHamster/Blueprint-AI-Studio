@@ -92,6 +92,32 @@ qualification and deploy path. Keep the release held when the preview is
 ineligible or unavailable; do not substitute the whole-tree force-promotion
 endpoint for this narrow recovery path.
 
+### When integration has moved on (the usual case)
+
+The preview above compares the promotion target against the whole integration
+branch, so once integration has accumulated unrelated work since the last
+promotion it reports every one of those files as offending — even when the
+repair you want is a two-file machinery fix already sitting in that history.
+Do not hand-cut a branch for this. Name the repair instead:
+
+```bash
+# preview exactly what would ship
+GET  /api/admin/projects/{project_id}/promote/hotfix/preview?repair_commit_shas=<full-40-hex-sha>
+# ship it
+POST /api/admin/projects/{project_id}/promote/hotfix
+     {"reason": "...", "scope_modules": [...], "ack_inert_until_deploy": true,
+      "repair_commit_shas": ["<full-40-hex-sha>", ...]}
+```
+
+Each named commit is diffed against its own first parent, the union of those
+diffs goes through the SAME fail-closed allowlist (a named commit that also
+touches product code, a migration, a workflow, or `EXPECTED_SCHEMA_REVISION` is
+still rejected and nothing is cut), and an eligible repair is materialized as a
+new commit on top of the promotion target carrying only those files. SHAs must
+be full 40-hex and at most ten may be named. CI is resolved against the commit
+the repair was actually built and tested on, and the promotion PR then runs its
+own CI on the narrow branch.
+
 ---
 
 ## GitHub App Setup

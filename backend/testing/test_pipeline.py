@@ -40,6 +40,7 @@ from app.models import (
     TaskStatus,
     DeploymentStatus,
 )
+from testing.fixgate_attribution import format_offender_marker
 
 
 # ── Verdict Parsing ─────────────────────────────────────────────────────────
@@ -3878,6 +3879,8 @@ async def test_rollup_merge_queue_updates_siblings_fifo_by_pr_created_at(
     assert updated_pr_order == [903, 902, 901], (
         f"siblings must be updated FIFO by PR created_at (closed #904 skipped), "
         f"got {updated_pr_order}"
+        + "\n"
+        + format_offender_marker(str(pr) for pr in updated_pr_order)
     )
     # Each updated sibling carries the in-flight marker + a forced PR refetch.
     from app.rollup_state import (
@@ -3953,6 +3956,8 @@ async def test_rollup_merge_queue_skips_not_behind_sibling(rollup_db, mocker):
     updated_pr_order = [c.args[3] for c in mock_update.await_args_list]
     assert updated_pr_order == [902], (
         f"only the genuinely-behind sibling gets update_branch, got {updated_pr_order}"
+        + "\n"
+        + format_offender_marker(str(pr) for pr in updated_pr_order)
     )
 
 
@@ -5921,7 +5926,11 @@ async def test_anomaly_detection_includes_top_patterns(spawn_db, mocker):
     assert len(patterns) >= 1
     # The "process exited" pattern should appear 3 times (same fingerprint)
     counts = sorted([p["count"] for p in patterns], reverse=True)
-    assert counts[0] == 3, f"Expected top pattern count=3, got {counts}"
+    assert counts[0] == 3, (
+        f"Expected top pattern count=3, got {counts}"
+        + "\n"
+        + format_offender_marker(str(count) for count in counts)
+    )
     assert counts[1] == 1
 
 
@@ -6707,3 +6716,118 @@ def text_helper(s):
     from sqlalchemy import text
 
     return text(s)
+
+
+# ── Conflict-only fix provenance ──────────────────────────────────────────────
+#
+# The agent's obsolete-exit (agent/src/handlers/review-fix.ts,
+# CONFLICT_ONLY_FIX_REASONS) COMPLETES a fix task without ever running Claude
+# when the PR turns out to be clean. Voiding a task that carried other work
+# destroys it silently (regression 2026-08-20: operator fix task 10384f8e was
+# scoped to three BP- review findings and finished with all three untouched),
+# so the exit now fires only for spawns the backend explicitly labelled as
+# conflict-only. These guards pin the labels at the spawn sites: drop one and
+# every conflict fix from that site re-runs Claude on an already-clean PR.
+
+
+def _spawn_call_containing(source: str, needle: str, after: str = "") -> str:
+    """Return the balanced ``_spawn_pipeline_task(...)`` argument text whose
+    body contains ``needle``.
+
+    Scoping to the individual call is the point. A whole-module (or
+    whole-function) substring search goes green as soon as ANY spawn in the
+    file stamps ``fix_reason``, which is precisely the vacuous-guard failure
+    mode these assertions exist to avoid.
+    """
+    import re
+
+    pattern = re.escape("_spawn_pipeline_task(")
+    start = source.index(after) if after else 0
+    for m in re.finditer(pattern, source):
+        if m.start() < start:
+            continue
+        idx, depth = m.end(), 1
+        while depth:
+            ch = source[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            idx += 1
+        call = source[m.end() : idx - 1]
+        if needle in call:
+            return call
+    raise AssertionError(
+        f"no _spawn_pipeline_task(...) call contains {needle!r} — the spawn site "
+        "moved or was renamed; re-anchor this guard rather than deleting it"
+    )
+
+
+def _module_source(dotted: str) -> str:
+    import importlib
+    import inspect
+
+    return inspect.getsource(importlib.import_module(dotted))
+
+
+def test_ci_monitor_conflict_spawn_labels_its_fix_reason():
+    """Highest-volume conflict-fix producer: orchestrator_ci_monitor."""
+    call = _spawn_call_containing(
+        _module_source("app.orchestrator_ci_monitor"),
+        "fix_target=_conflict_fix_target",
+    )
+    assert "fix_reason=" in call, (
+        "the CI monitor's conflict/behind fix spawn must label itself "
+        "conflict-only; unlabelled, the agent assumes the task carries real "
+        "work and re-runs Claude on every already-clean PR"
+    )
+    assert '"update_branch_failed"' in call and '"merge_conflict"' in call, (
+        "both arms must be labelled: BEHIND spawns are update_branch_failed, "
+        "DIRTY spawns are merge_conflict"
+    )
+    assert "_behind_fallthrough" in call, (
+        "the label must be selected by the same flag that selects the prompt, "
+        "not hardcoded to one arm"
+    )
+
+
+def test_rollup_conflict_fix_spawns_label_their_fix_reason():
+    """Both rollup conflict spawns: per-child respawn and the rollup PR itself."""
+    source = _module_source("app.rollup_management")
+
+    child_call = _spawn_call_containing(source, 'original_task_id=str(child.id)')
+    assert 'fix_reason=("merge_conflict" if spawn_type == "fix" else "")' in child_call, (
+        "the rollup child respawn is conflict-only ONLY on its fix branch; its "
+        "review branch carries real work and must stay unlabelled"
+    )
+
+    # Anchored on the prompt text, not on the label itself: an anchor that
+    # lives inside the thing being asserted turns a deleted label into a
+    # confusing lookup error instead of a clean assertion failure.
+    rollup_call = _spawn_call_containing(
+        source,
+        "original_task_id=str(parent.id)",
+        after="is behind the target branch and the GitHub update-branch API failed",
+    )
+    assert "fix_reason=" in rollup_call, (
+        "the rollup PR conflict/behind fix spawn must label itself conflict-only"
+    )
+    assert '"update_branch_failed"' in rollup_call and '"merge_conflict"' in rollup_call, (
+        "both arms must be labelled, selected by the same _ms flag that selects "
+        "the prompt"
+    )
+
+
+def test_merge_rejected_rebase_spawn_labels_its_fix_reason():
+    """ci_completion's post-APPROVE rebase after GitHub rejected the merge."""
+    call = _spawn_call_containing(
+        _module_source("app.ci_completion"), "fix_prompt=rebase_prompt"
+    )
+    assert 'fix_reason="merge_conflict"' in call, (
+        "the merge-rejected rebase spawn exists solely to rebase; without the "
+        "label the agent re-runs Claude whenever a sibling merge already "
+        "cleared the block"
+    )
+    assert "suppress_warm_handoff=True" in call, (
+        "Phase 2d post-APPROVE: this fix must cold-provision"
+    )

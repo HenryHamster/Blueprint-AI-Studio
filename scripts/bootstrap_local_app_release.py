@@ -21,6 +21,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+_REVISION_MARKER_NAME = "RELEASE_REVISION"
 _SOURCE_NAMES = (
     "frontend_release_manifest.py",
     "local_app_release.py",
@@ -30,6 +31,7 @@ _SOURCE_NAMES = (
     "blueprint.py",
     "blueprint_api.py",
     "release_activation.py",
+    _REVISION_MARKER_NAME,
 )
 _EDGE_TEMPLATE_NAME = "blueprint-edge-system.service"
 _BUNDLE_ROOT = Path("/usr/local/lib/blueprint-node")
@@ -106,6 +108,28 @@ def _trusted_directory(path: Path) -> None:
         or stat.S_IMODE(info.st_mode) & 0o022
     ):
         raise ValueError(f"unsafe bootstrap source directory: {path}")
+
+
+def _verify_staged_revision(payloads: dict[str, bytes], revision: str) -> None:
+    """Fail closed before any unit is touched if the staged bundle names a
+    different candidate than the one requested on the command line.
+
+    The staged marker is folded into ``payloads`` (and therefore into
+    ``_bundle_digest``), so the installed immutable bundle stays content-bound
+    to the declared revision rather than to whatever happens to be on disk.
+    """
+    staged = payloads.get(_REVISION_MARKER_NAME)
+    if staged is None:
+        raise ValueError(f"staged bootstrap source is missing {_REVISION_MARKER_NAME}")
+    try:
+        staged_revision = staged.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{_REVISION_MARKER_NAME} is not ASCII") from exc
+    if staged_revision != revision:
+        raise ValueError(
+            f"staged {_REVISION_MARKER_NAME} ({staged_revision!r}) does not "
+            f"match --revision ({revision!r})"
+        )
 
 
 def _bundle_digest(payloads: dict[str, bytes]) -> str:
@@ -764,6 +788,7 @@ def bootstrap(revision: str) -> Path:
         name: _trusted_file(_source_path(source, name))
         for name in _SOURCE_NAMES
     }
+    _verify_staged_revision(payloads, revision)
     _provision_github_cli_config(install_user)
     release_shim = _trusted_file(source / "blueprint_release.py")
     edge_template = _trusted_file(source / _EDGE_TEMPLATE_NAME)
@@ -877,7 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rehearse",
         action="store_true",
-        help="check candidate preconditions without changing units or files",
+        help="disabled: refuses candidate execution on the production host",
     )
     return parser
 

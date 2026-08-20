@@ -91,6 +91,33 @@ _github_token_cache_lock = asyncio.Lock()
 _project_mint_locks: Dict[str, asyncio.Lock] = {}
 
 
+# GitHub token prefixes distinguish credential kind by construction (already
+# relied on elsewhere in this codebase, e.g. github.py's install-token/quota
+# routing and the log-scrubbing patterns in broadcast.py):
+#   * App/installation access tokens ALWAYS start with "ghs_" (or the "ghu_"
+#     user-to-server variant).
+#   * A classic operator PAT starts with "ghp_"; a fine-grained PAT starts
+#     with "github_pat_". Only the resolver's LAST fallback (a user's stored
+#     PAT) can ever produce one of these.
+_OPERATOR_PAT_PREFIXES = ("ghp_", "github_pat_")
+
+
+def is_operator_pat_token(token: str | None) -> bool:
+    """True when ``token`` is an operator-owned PAT, not an App/installation token.
+
+    Callers that perform an automated GitHub write attributed to "the
+    pipeline" (most importantly a merge) must check this before acting: a PAT
+    is authenticated as the human operator, so any commit it mints (e.g. a
+    squash-merge commit) is recorded on GitHub as authored BY the operator —
+    even though no operator actually did the work. See
+    ``release_commit_authorship.py``, which counts commits by GitHub author
+    identity and therefore cannot see this without this callers-side check.
+    """
+    if not token:
+        return False
+    return token.startswith(_OPERATOR_PAT_PREFIXES)
+
+
 def _get_project_mint_lock(project_id: str) -> asyncio.Lock:
     """Return (creating on first use) the single-flight mint lock for a project.
 

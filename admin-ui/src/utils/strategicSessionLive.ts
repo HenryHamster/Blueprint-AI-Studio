@@ -461,3 +461,88 @@ export function computeResidentActivityState(
     label: 'Waiting for direction',
   };
 }
+
+/**
+ * Restrict a live transcript buffer to one project.
+ *
+ * The transcript buffer in `useLogViewer` is hook-global and cleared by an
+ * EFFECT on project switch — effects run after render, so for one render pass
+ * the previous project's deltas are still in the buffer while the newly
+ * selected project's durable messages are already rendered. Each delta carries
+ * the project it was received under (`project_id`, stamped at append time), so
+ * scoping here closes that one-render window: a delta can never render under a
+ * project it did not arrive for. Deltas with no recorded project are dropped
+ * once a project is selected — an unattributable delta is exactly the one that
+ * could leak across projects.
+ *
+ * Session scoping is intrinsic to the derivations below: `visibleSessionDeltas`
+ * keeps only the LATEST session's deltas, so a session change drops the prior
+ * session's buffered deltas on the next frame without a separate reset.
+ */
+export function scopeStrategicTranscript(
+  transcript: StrategicSessionDelta[] | undefined,
+  projectId: string | null | undefined,
+): StrategicSessionDelta[] {
+  const deltas = transcript ?? [];
+  if (deltas.length === 0) return [];
+  if (!projectId) return [];
+  return deltas.filter(d => d.project_id === projectId);
+}
+
+/** The in-flight chat-turn affordance: what the strategist is doing RIGHT NOW,
+ *  between the operator's send and the durable reply landing. Deliberately NOT
+ *  a `ConversationWorkdayState` — Workday's vocabulary describes the Continuous
+ *  Resident's autonomy lifecycle, which is `off` in Chat mode and says nothing
+ *  about a chat turn being in flight. */
+export type StrategicChatLivePhase = 'streaming' | 'working';
+
+export interface StrategicChatLiveState {
+  phase: StrategicChatLivePhase;
+  /** Short status label for the header affordance. */
+  label: string;
+  /** The newest activity one-liner (or streamed reply excerpt) — optional. */
+  detail?: string;
+}
+
+const CHAT_LIVE_DETAIL_MAX_CHARS = 60;
+
+function chatLiveDetail(value: string | undefined): string | undefined {
+  const compact = value?.trim().replace(/\s+/g, ' ');
+  if (!compact) return undefined;
+  return compact.length <= CHAT_LIVE_DETAIL_MAX_CHARS
+    ? compact
+    : `${compact.slice(0, CHAT_LIVE_DETAIL_MAX_CHARS - 1)}…`;
+}
+
+/**
+ * Derive the Chat-mode in-flight affordance from the SAME two live derivations
+ * the conversation surface renders, so the header and the thread can never
+ * disagree about whether a turn is in flight.
+ *
+ * `streaming` — reply/reasoning text is actively arriving (the preview bubble is
+ * on screen). `working` — the turn is open (a `responding`/`working` lifecycle
+ * frame with no `done` yet) but no reply text has streamed, so only the activity
+ * strip has anything to show. `null` — nothing is in flight, which is also the
+ * only state a non-streaming (poll-only) turn can ever produce.
+ */
+export function computeStrategicChatLiveState(
+  turn: StrategicStreamingTurn | null,
+  activity: StrategicLiveActivity,
+): StrategicChatLiveState | null {
+  const latestActivityText = activity.items[activity.items.length - 1]?.text;
+  if (turn && turn.segments.length > 0) {
+    return {
+      phase: 'streaming',
+      label: 'Replying',
+      detail: chatLiveDetail(latestActivityText),
+    };
+  }
+  if (activity.latestLifecycle === 'responding' || activity.latestLifecycle === 'working') {
+    return {
+      phase: 'working',
+      label: 'Working',
+      detail: chatLiveDetail(latestActivityText),
+    };
+  }
+  return null;
+}

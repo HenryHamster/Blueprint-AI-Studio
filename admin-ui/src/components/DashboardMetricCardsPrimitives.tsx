@@ -1,5 +1,5 @@
 export function Skeleton({ className = '' }: { className?: string }) {
-  return <div className={`animate-pulse bg-neutral-800/60 rounded ${className}`} />;
+  return <div className={`animate-pulse bg-workbench-panel/60 rounded ${className}`} />;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components

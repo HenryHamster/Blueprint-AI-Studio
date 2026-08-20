@@ -104,8 +104,8 @@ export function DirectionsList(props: DirectionsListProps) {
                   ? cat === 'product' ? 'bg-emerald-950/60 border-emerald-900/50 text-emerald-400'
                     : cat === 'structural' ? 'bg-blue-950/60 border-blue-900/50 text-blue-400'
                     : cat === 'mixed' ? 'bg-purple-950/60 border-purple-900/50 text-purple-400'
-                    : 'bg-neutral-700/60 border-neutral-600/50 text-neutral-300'
-                  : 'bg-neutral-900/40 border-neutral-700/40 text-neutral-500 hover:text-neutral-300'
+                    : 'bg-workbench-layer/60 border-neutral-600/50 text-neutral-300'
+                  : 'bg-workbench-base/40 border-neutral-700/40 text-neutral-500 hover:text-neutral-300'
               }`}
             >
               {cat}

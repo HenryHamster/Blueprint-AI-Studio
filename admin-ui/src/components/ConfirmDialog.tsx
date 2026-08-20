@@ -26,7 +26,7 @@ export function ConfirmDialog({ title, message, confirmLabel = 'Confirm', attest
             value={inputVal}
             onChange={(e) => setInputVal(e.target.value)}
             placeholder={attestationInput.placeholder}
-            className="w-full text-xs bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-1.5 focus:outline-none focus:border-neutral-600"
+            className="w-full text-xs bg-workbench-panel border border-neutral-700 text-neutral-300 rounded px-2 py-1.5 workbench-focus"
             data-testid="confirm-dialog-attestation-input"
           />
         </div>
@@ -35,7 +35,7 @@ export function ConfirmDialog({ title, message, confirmLabel = 'Confirm', attest
         <button
           onClick={onCancel}
           data-testid="confirm-dialog-cancel"
-          className="min-h-11 min-w-11 px-4 py-2 rounded-lg text-xs font-medium bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 transition-colors"
+          className="min-h-11 min-w-11 px-4 py-2 rounded-lg text-xs font-medium bg-workbench-panel hover:bg-workbench-hover text-neutral-300 border border-neutral-700 transition-colors"
         >
           Cancel
         </button>

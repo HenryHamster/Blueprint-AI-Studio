@@ -202,6 +202,7 @@ export interface VersionQualificationSubScores {
   smoketest?: number | null;
   ci_resolution?: CiResolution | null;
   debt_pressure?: number | null;
+  candidate_operator_authorship?: CandidateOperatorAuthorshipGate | null;
 }
 
 export interface CompletionDebtQualItem {
@@ -259,6 +260,19 @@ export interface QualificationCategoryVerdict {
   tier: string | null;       // 'judged' | 'machine' | 'unverified'
   gap?: string | null;
   citations?: unknown[] | null;
+}
+
+export interface OperatorAuthorshipEvidenceContract {
+  type: 'operator_authored_commits';
+  predicate: { max_count: number };
+}
+
+export interface CandidateOperatorAuthorshipGate {
+  status: 'passed' | 'blocked' | 'unresolved' | 'not_applicable' | string;
+  count: number | null;
+  max_count: number | null;
+  range?: { base_sha: string | null; head_sha: string | null } | null;
+  reason?: string | null;
 }
 
 export interface AuditFinding {
@@ -487,6 +501,9 @@ export interface CriterionCoverageEntry {
   coverage: 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered';
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
+  evidence_contract?: OperatorAuthorshipEvidenceContract | null;
+  evidence_contract_updated_at?: string | null;
+  evidence_contract_updated_by?: string | null;
   stuck_reason?: 'no_mapping' | 'direction_retired' | 'direction_inactive' | null;
   /** ISO-8601 UTC timestamp when the operator attestation expires.
    *  Present only when coverage='attested' and the attestation carries a
@@ -678,6 +695,22 @@ export interface CurrentVersion {
    *  resolved|stale|unresolved state) plus the gating counts and reason. */
   requalification_ready?: boolean | null;
   requalification_readiness?: RequalificationReadiness | null;
+  /** Detected deployed-gate latch (additive; nullable). Populated when a
+   *  persisted, undismissed gate-latch Alert exists for this open version —
+   *  i.e. the candidate itself modifies the deployed implementation of the
+   *  blocker gate, so re-cutting the candidate can never clear it and only a
+   *  deploy or the hotfix lane can. Distinct from
+   *  last_qualification.is_permanent_gate_incapacity, which only fires on a
+   *  same-signature INFRA-error streak and never on a clean scoring blocker. */
+  gate_latch?: GateLatchDetection | null;
+}
+
+/** Detected deployed-gate latch (see CurrentVersion.gate_latch). */
+export interface GateLatchDetection {
+  gate: string | null;
+  compare_range: string | null;
+  message: string;
+  detected_at: string | null;
 }
 
 /** Auto-trigger mode for the qualification trigger resolver. */
@@ -1133,6 +1166,23 @@ export async function createAcceptanceCriterion(
   if (!res.ok) {
     const detail = data?.detail || `Failed to create criterion: ${res.status}`;
     throw new Error(detail);
+  }
+  return data;
+}
+
+export async function updateAcceptanceCriterionEvidenceContract(
+  projectId: string,
+  criterionKey: string,
+  evidenceContract: OperatorAuthorshipEvidenceContract | null,
+): Promise<{ criterion_key: string; evidence_contract: OperatorAuthorshipEvidenceContract | null }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/${encodeURIComponent(criterionKey)}/evidence-contract`,
+    { method: 'PATCH', body: JSON.stringify({ evidence_contract: evidenceContract }) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to update criterion contract: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : `Failed to update criterion contract: ${res.status}`);
   }
   return data;
 }

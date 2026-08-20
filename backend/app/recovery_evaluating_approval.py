@@ -349,6 +349,44 @@ async def _handle_approval_gate_timeout(
                 # branch/PR number unrecoverable, ...) — fall through to the
                 # existing preserve/FAILED disposition below unchanged.
 
+        # A rollup_lineage_fence descendant-block hold whose flagged blockers
+        # have ALL resolved out-of-band (subject PR merged/closed, or the
+        # PR-less descendant completed) is RELEASED here instead of killed:
+        # the fence's only other release path is an operator requeue of the
+        # flagged descendant, so a self-resolved blocker left the hold in
+        # place forever. Incident 2026-08-19: PR #17419 merged at 02:15Z, yet
+        # this timeout FAILED ancestor 289809a3 at 02:18Z and the requeued
+        # clone re-inherited the stale hold. Conservative: any unknown PR
+        # state keeps the hold and falls through to preserve/FAILED below.
+        try:
+            from app.rollup_lineage_fence import (
+                release_resolved_descendant_operator_blocks,
+            )
+
+            _fence_released = await release_resolved_descendant_operator_blocks(
+                task, session
+            )
+        except Exception:  # noqa: BLE001 — release is best-effort recovery
+            _fence_released = False
+            logger.debug(
+                f"[EVAL TIMEOUT] Fence-block release check failed for "
+                f"{str(task.id)[:8]}",
+                exc_info=True,
+            )
+        if _fence_released:
+            logger.info(
+                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} approval-gate "
+                f"timeout after {hours}h — descendant operator block(s) "
+                f"resolved out-of-band, hold RELEASED instead of failing"
+            )
+            await session.commit()
+            await services.broadcast_to_project(
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(task.id), "status": task.status},
+            )
+            return True
+
         # If the PR is still clean/mergeable and not yet preserved, leave it
         # open for hand-merge instead of silently abandoning it. Guard with
         # the preserve flag so re-entering sweeps are idempotent (no repeat

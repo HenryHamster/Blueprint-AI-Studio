@@ -10,6 +10,15 @@ import json
 import re
 from pathlib import Path
 
+from testing.fixgate_attribution import format_offender_marker
+
+
+def _snapshot_missing_field_offenders(entry: dict, missing: set[str]) -> list[str]:
+    """Qualify a missing field with the snapshot entry that owns it."""
+
+    name = entry.get("name", "<unnamed>")
+    return [f"{name}:{field}" for field in sorted(missing)]
+
 
 def test_event_type_snapshot_exists():
     """Verify the snapshot file exists."""
@@ -80,7 +89,15 @@ def test_extract_event_types_from_source():
         )
 
     if error_parts:
-        raise AssertionError("\n\n".join(error_parts))
+        offenders = [
+            *(f"missing-from-snapshot:{name}" for name in missing_in_snapshot),
+            *(f"extra-in-snapshot:{name}" for name in extra_in_snapshot),
+        ]
+        raise AssertionError(
+            "\n\n".join(error_parts)
+            + "\n"
+            + format_offender_marker(offenders)
+        )
 
 
 def test_snapshot_has_required_fields():
@@ -97,20 +114,40 @@ def test_snapshot_has_required_fields():
     for entry in snapshot["event_types"]:
         missing = required_fields - set(entry.keys())
         assert not missing, (
-            f"Event type '{entry.get('name')}' missing fields: {missing}"
+            f"Event type '{entry.get('name')}' missing fields: {missing}\n"
+            + format_offender_marker(_snapshot_missing_field_offenders(entry, missing))
         )
 
         classification = entry.get("classification")
         assert classification in valid_classifications, (
             f"Event type '{entry['name']}' has invalid classification '{classification}'. "
             f"Must be one of: {valid_classifications}"
+            + "\n"
+            + format_offender_marker(
+                [f"{entry['name']}:invalid-classification:{classification}"]
+            )
         )
-
         audience = entry.get("audience")
         assert audience in valid_audiences, (
             f"Event type '{entry['name']}' has invalid audience '{audience}'. "
             f"Must be one of: {valid_audiences}"
+            + "\n"
+            + format_offender_marker(
+                [f"{entry['name']}:invalid-audience:{audience}"]
+            )
         )
+
+
+def test_snapshot_missing_field_identity_includes_entry_name():
+    """Two entries missing the same field remain distinct attribution offenders."""
+
+    missing = {"audience"}
+    assert _snapshot_missing_field_offenders({"name": "old_event"}, missing) == [
+        "old_event:audience"
+    ]
+    assert _snapshot_missing_field_offenders({"name": "new_event"}, missing) == [
+        "new_event:audience"
+    ]
 
 
 def test_all_snapshot_entries_have_audience():
@@ -132,6 +169,10 @@ def test_all_snapshot_entries_have_audience():
         assert audience in valid_audiences, (
             f"Event type '{entry['name']}' has missing or invalid audience='{audience}'. "
             f"Every event type must declare an audience in {valid_audiences}."
+            + "\n"
+            + format_offender_marker(
+                [f"{entry['name']}:invalid-audience:{audience}"]
+            )
         )
 
 
@@ -167,6 +208,8 @@ def test_snapshot_audience_matches_runtime_registry():
         + "\n".join(mismatches)
         + "\n\n→ Update either event_type_snapshot.json or message_audience._EVENT_AUDIENCE_REGISTRY"
         " so they agree."
+        + "\n"
+        + format_offender_marker(mismatches)
     )
 
 
@@ -201,6 +244,8 @@ def test_high_signal_note_set_matches_snapshot():
     assert not escalation_notes, (
         f"Escalation event types must emit as BLOCKER, not NOTE: {sorted(escalation_notes)}\n"
         "  → Update snapshot message_type or the source function's message_type argument."
+        + "\n"
+        + format_offender_marker(escalation_notes)
     )
 
     # Import the backend constant from notification_dispatch (canonical source of truth)
@@ -250,4 +295,26 @@ def test_high_signal_note_set_matches_snapshot():
         )
 
     if drift_parts:
-        raise AssertionError("\n\n".join(drift_parts))
+        offenders = [
+            *(
+                f"notification_dispatch:missing:{name}"
+                for name in expected - set(nd_set)
+            ),
+            *(
+                f"notification_dispatch:extra:{name}"
+                for name in set(nd_set) - expected
+            ),
+            *(
+                f"admin_notifications:missing:{name}"
+                for name in expected - set(an_set)
+            ),
+            *(
+                f"admin_notifications:extra:{name}"
+                for name in set(an_set) - expected
+            ),
+        ]
+        raise AssertionError(
+            "\n\n".join(drift_parts)
+            + "\n"
+            + format_offender_marker(offenders)
+        )
