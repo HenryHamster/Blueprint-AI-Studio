@@ -13,7 +13,7 @@
     "orchestrator.py": 5900,
     "orchestrator_ci_monitor.py": 4150,
     "orchestrator_health.py": 1400,
-    "orchestrator_runner_dispatch.py": 4250,
+    "orchestrator_runner_dispatch.py": 3152,
     "orchestrator_runtime_env.py": 400,
     "orchestrator_provision.py": 800,
     "admin.py": 5350,
@@ -425,8 +425,7 @@
     "test_strategic_spawning_capability_verification.py": 3260,
     "test_strategic_spawning_portfolio_messages.py": 3274,
     "test_strategic_spawning_summaries.py": 2966,
-    "check_size_limits.py": 1750,
-    "test_strategic_spawning.py": 22650
+    "check_size_limits.py": 1750
   },
   "scripts": {
     "test_local_runner.py": 14250,
