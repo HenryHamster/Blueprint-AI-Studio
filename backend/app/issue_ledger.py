@@ -22,6 +22,7 @@ from app.issue_ledger_state import (
     _history_entry_key,
     _seed_open_record,
     issue_ledger_complete_for_history,  # noqa: F401 - compatibility re-export
+    issue_ledger_lineage_proof_unsatisfiable,  # noqa: F401 - re-export
     normalize_issue_ledger,
 )
 

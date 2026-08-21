@@ -6,12 +6,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.ci_merge_helpers import _review_not_required
+from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
 from app.issue_ledger import build_issue_ledger
 from app.models import Project, Task, TaskStatus
+from app.review_loop_convergence import REVIEW_LOOP_ABANDON_CANDIDATE_KEY
 from app.review_merge_authority import (
     attempt_merge_with_authority,
     enforce_merge_authority,
 )
+from app.review_merge_gate import _enforce_authoritative_review_merge_gate
 
 
 @pytest.mark.parametrize(
@@ -550,3 +553,157 @@ async def test_pat_credential_refusal_is_terminal_for_the_autonomous_retry_loop(
     assert decision.allowed is True
     assert result == refusal
     merge.assert_awaited_once_with(target["head_sha"])
+
+
+def _clean_approval(project: Project, pr_number: int, iteration: int) -> dict:
+    target = _target(project, pr_number)
+    return {
+        "iteration": iteration,
+        "verdict": "APPROVE",
+        "review_task_id": str(uuid.uuid4()),
+        "target_verified_by_backend": True,
+        "reviewed_base_sha": target["base_sha"],
+        "reviewed_head_sha": target["head_sha"],
+        "issues": [],
+        "resolutions": [],
+    }
+
+
+async def _gate_task(db_session, project: Project, pr_number: int, loop: dict) -> Task:
+    task = Task(
+        project_id=project.id,
+        title="Ledger lineage gate source",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do the thing",
+                "pr_number": pr_number,
+                "branch": f"blueprint/task-{pr_number}",
+                "base_branch": "main",
+            }
+        ],
+        context={"review_loop": loop},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("latched", [True, False])
+async def test_unsatisfiable_ledger_escalates_instead_of_respawning_review(
+    db_session, mocker, latched
+):
+    """A gate no review can satisfy must stop buying reviews.
+
+    Defect this exists for: once the durable ledger latches ``complete=false``
+    with a lineage marker at the history cap, the gate re-raises the synthetic
+    ``BP-ledger-proof-incomplete`` blocker on every pass and spawns another
+    exact-target review to clear it.  The reviewer verifies the same clean
+    delta and returns the same verdict forever.  NeurIPS PR #1769 burned 65
+    byte-identical APPROVE reviews across 78 attempts that way, and the stop
+    was then attributed to the fix agent failing to converge.
+
+    The ``latched=False`` leg is the control: an ordinary open blocker must
+    still spawn its review, so this cannot pass by never spawning at all.
+    """
+    project = Project(name=f"Lineage {latched}", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pr_number = 17801 if latched else 17802
+    target = _target(project, pr_number)
+    history = [
+        _clean_approval(project, pr_number, iteration)
+        for iteration in range(1, 1 + REVIEW_HISTORY_MAX_ENTRIES)
+    ]
+    if latched:
+        # The exact live shape read off task 70c4d06b: a marker, complete=false,
+        # and a full retained window.
+        ledger = {
+            "open": [],
+            "resolved": [],
+            "schema_version": 1,
+            "complete": False,
+            "through_entry_key": "883a8476fd18685e2939b861",
+        }
+    else:
+        # Same history length, but a ledger whose lineage was maintained round
+        # by round the way the review loop does it -- so it is complete, the
+        # proof holds, and only the real finding blocks the merge.
+        ledger = None
+        for index in range(1, len(history) + 1):
+            ledger = build_issue_ledger(
+                history[:index],
+                **({"seed_ledger": ledger} if ledger is not None else {}),
+                stamp_complete=True,
+            )
+        assert ledger["complete"] is True
+        ledger["open"] = [
+            {
+                "issue_id": "BP-real-blocker",
+                "severity": "major",
+                "description": "an actual finding in the diff",
+            }
+        ]
+
+    loop = {
+        "pr_number": pr_number,
+        "branch": f"blueprint/task-{pr_number}",
+        "base_branch": "main",
+        "base_sha": target["base_sha"],
+        "head_sha": target["head_sha"],
+        "review_history": history,
+        "issue_ledger": ledger,
+        "review_target": target,
+    }
+    task = await _gate_task(db_session, project, pr_number, loop)
+
+    spawned: list[str] = []
+
+    async def _spawn(_task, kind, *_args, **_kwargs):
+        spawned.append(kind)
+        return None, False
+
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", side_effect=_spawn)
+
+    allowed = await _enforce_authoritative_review_merge_gate(
+        task,
+        db_session,
+        ci_loop=dict(loop),
+        pr_number=pr_number,
+        branch=f"blueprint/task-{pr_number}",
+        base_branch="main",
+        original_task_id=str(task.id),
+        live_review_target=target,
+    )
+
+    assert allowed is False, "the gate stays fail-closed in both legs"
+
+    context = task.context or {}
+    marker = context.get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+
+    if latched:
+        assert spawned == [], (
+            "a review cannot restore a lost lineage proof, so spawning one is "
+            "pure burn"
+        )
+        assert isinstance(marker, dict)
+        assert marker["reason"] == "ledger_lineage_unsatisfiable"
+        assert marker["pr_number"] == pr_number
+        assert marker["review_history_entries"] == REVIEW_HISTORY_MAX_ENTRIES
+        assert "BP-ledger-proof-incomplete" in marker["open_issue_ids"]
+        assert (
+            context["review_loop"].get("ledger_lineage_unsatisfiable") is True
+        )
+        assert "adjudication" in (task.latest_status_message or "").lower()
+    else:
+        assert spawned == ["review"], (
+            "an ordinary blocker must still get its exact-target review"
+        )
+        assert marker is None, (
+            "a recoverable gate must never be escalated to the operator"
+        )

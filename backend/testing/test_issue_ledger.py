@@ -12,6 +12,7 @@ from app.issue_ledger import (
     build_issue_ledger,
     ensure_issue_ids,
     issue_ledger_complete_for_history,
+    issue_ledger_lineage_proof_unsatisfiable,
 )
 
 
@@ -696,3 +697,151 @@ def test_discontinuous_capped_history_cannot_extend_stale_seed_proof() -> None:
     assert issue_ledger_complete_for_history(
         rebuilt, discontinuous_history
     ) is False
+
+
+def _grow_capped_history(
+    ledger: dict | None,
+    history: list[dict],
+    iteration: int,
+    *,
+    drop_seed: bool = False,
+) -> tuple[dict, list[dict]]:
+    """Append one clean APPROVE round exactly as the review loop does."""
+    history = [
+        *history,
+        _review(iteration, f"head-{iteration}", verdict="APPROVE"),
+    ][-REVIEW_HISTORY_MAX_ENTRIES:]
+    seed = None if drop_seed else ledger
+    return (
+        build_issue_ledger(
+            history,
+            **({"seed_ledger": seed} if seed is not None else {}),
+            stamp_complete=True,
+        ),
+        history,
+    )
+
+
+def test_lineage_proof_lost_at_the_history_cap_never_recovers() -> None:
+    """A single seed loss at the cap latches the ledger unprovable forever.
+
+    This is the shape behind NeurIPS PR #1769: once ``complete=False`` is
+    stamped alongside a lineage marker while the history sits at the cap,
+    neither branch of ``build_issue_ledger``'s lineage test can ever be
+    satisfied again -- the seed cannot become complete, the marker cannot be
+    dropped, and history only grows.  The merge gate then re-raises
+    ``BP-ledger-proof-incomplete`` on every pass, so the PR is unmergeable no
+    matter how many clean reviews follow.
+    """
+    ledger: dict | None = None
+    history: list[dict] = []
+    loss_iteration = REVIEW_HISTORY_MAX_ENTRIES + 2
+
+    for iteration in range(1, loss_iteration):
+        ledger, history = _grow_capped_history(ledger, history, iteration)
+        assert issue_ledger_complete_for_history(ledger, history) is True
+        assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is False
+
+    ledger, history = _grow_capped_history(
+        ledger, history, loss_iteration, drop_seed=True
+    )
+
+    assert issue_ledger_complete_for_history(ledger, history) is False
+    assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is True
+
+    # Ten further perfectly clean rounds, every one seeded from the durable
+    # ledger. None of them can restore the proof.
+    for iteration in range(loss_iteration + 1, loss_iteration + 11):
+        ledger, history = _grow_capped_history(ledger, history, iteration)
+        assert issue_ledger_complete_for_history(ledger, history) is False, (
+            f"iteration {iteration} recovered; the latch is no longer permanent "
+            "and this test's premise needs revisiting"
+        )
+        assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is True
+
+
+def test_lineage_proof_lost_below_the_cap_self_heals_and_is_not_terminal() -> None:
+    """The same seed loss under the cap recovers, so it must not escalate."""
+    ledger: dict | None = None
+    history: list[dict] = []
+    loss_iteration = REVIEW_HISTORY_MAX_ENTRIES // 2
+
+    for iteration in range(1, loss_iteration):
+        ledger, history = _grow_capped_history(ledger, history, iteration)
+
+    ledger, history = _grow_capped_history(
+        ledger, history, loss_iteration, drop_seed=True
+    )
+
+    assert issue_ledger_complete_for_history(ledger, history) is True
+    assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is False
+
+    for iteration in range(loss_iteration + 1, REVIEW_HISTORY_MAX_ENTRIES + 6):
+        ledger, history = _grow_capped_history(ledger, history, iteration)
+        assert issue_ledger_complete_for_history(ledger, history) is True
+        assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is False
+
+
+def test_lineage_unsatisfiable_requires_marker_incompleteness_and_the_cap() -> None:
+    """Each of the three conditions is load-bearing; none alone is terminal."""
+    capped = [
+        _review(iteration, f"head-{iteration}", verdict="APPROVE")
+        for iteration in range(1, 1 + REVIEW_HISTORY_MAX_ENTRIES)
+    ]
+    latched = {
+        "open": [],
+        "resolved": [],
+        "schema_version": 1,
+        "complete": False,
+        "through_entry_key": "abc123",
+    }
+
+    assert issue_ledger_lineage_proof_unsatisfiable(latched, capped) is True
+
+    # Under the cap the next build re-derives the whole retained window.
+    assert (
+        issue_ledger_lineage_proof_unsatisfiable(latched, capped[:-1]) is False
+    )
+    # A markerless seed is rebuilt conservatively instead of latching.
+    assert (
+        issue_ledger_lineage_proof_unsatisfiable(
+            {**latched, "through_entry_key": ""}, capped
+        )
+        is False
+    )
+    # A complete ledger is not a stuck one.
+    assert (
+        issue_ledger_lineage_proof_unsatisfiable(
+            {**latched, "complete": True}, capped
+        )
+        is False
+    )
+    # A malformed ledger is somebody else's fail-closed problem, not a latch.
+    assert issue_ledger_lineage_proof_unsatisfiable("not-a-ledger", capped) is False
+
+
+def test_first_ledger_build_at_the_history_cap_latches_immediately() -> None:
+    """A loop that reaches the cap before it ever stamps a ledger is born stuck.
+
+    This is the cheapest way into the latch and needs no corruption at all: a
+    rollup that inherits a long review history, or any loop whose
+    ``issue_ledger`` key was absent when the history crossed
+    ``REVIEW_HISTORY_MAX_ENTRIES``, gets ``complete=False`` stamped together
+    with a marker on its very first build -- and can never recover.
+    """
+    history = [
+        _review(iteration, f"head-{iteration}", verdict="APPROVE")
+        for iteration in range(1, 1 + REVIEW_HISTORY_MAX_ENTRIES)
+    ]
+
+    first = build_issue_ledger(history, stamp_complete=True)
+
+    assert first["complete"] is False
+    assert first["through_entry_key"]
+    assert issue_ledger_lineage_proof_unsatisfiable(first, history) is True
+
+    # One entry fewer and the same first build is trusted.
+    under_cap = history[:-1]
+    healthy = build_issue_ledger(under_cap, stamp_complete=True)
+    assert healthy["complete"] is True
+    assert issue_ledger_lineage_proof_unsatisfiable(healthy, under_cap) is False
