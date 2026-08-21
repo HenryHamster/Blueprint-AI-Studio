@@ -700,6 +700,9 @@ async def test_update_drain_stuck_raises_one_alert_per_episode(db_session):
     assert len(alerts) == 1
     assert alerts[0].project_id == project.id
     assert alerts[0].source == "runner"
+    # Findability contract: the recovery path locates this exact incident by
+    # its deterministic key. A null dedupe_key made the row unresolvable.
+    assert alerts[0].dedupe_key == f"runner.update_drain_stuck:{runner.id}"
     await db_session.refresh(runner)
     assert runner.capabilities["update_drain_alerted_at"]
 
@@ -721,6 +724,90 @@ async def test_update_drain_stuck_raises_one_alert_per_episode(db_session):
     await db_session.refresh(runner)
     assert "update_draining_since" not in runner.capabilities
     assert "update_drain_alerted_at" not in runner.capabilities
+    # ...and the episode's alert is resolved, not left standing.
+    assert [a.dismissed_at is not None for a in await _stuck_alerts()] == [True]
+
+
+@pytest.mark.asyncio
+async def test_update_drain_recovery_dismisses_the_stuck_alert(db_session):
+    """Leaving the drain resolves the alert; a later episode opens a new one.
+
+    Regression for iconlab, 2026-08-20: the runner self-updated to the hinted
+    SHA and went back to claiming work, but its stuck-drain WARNING stayed
+    open for hours still asserting "the self-update is failing repeatedly".
+    Clearing the episode markers without clearing the alert leaves the
+    operator feed asserting a condition that has already ended, which is a
+    worse failure than duplicate alerts: it cannot be distinguished from a
+    live outage, so it trains the reader to ignore the feed.
+    """
+    _project, runner = await _make_runner(db_session)
+
+    async def _stuck_alerts():
+        result = await db_session.execute(
+            select(Alert)
+            .where(Alert.event_type == "runner.update_drain_stuck")
+            .order_by(Alert.created_at)
+        )
+        return result.scalars().all()
+
+    async def _drain_past_threshold():
+        """Enter the drain and backdate it so the next heartbeat alerts."""
+        await heartbeat(
+            payload=HeartbeatRequest(update_draining=True),
+            runner=runner,
+            session=db_session,
+        )
+        await db_session.refresh(runner)
+        caps = dict(runner.capabilities)
+        caps["update_draining_since"] = (
+            _utcnow()
+            - timedelta(seconds=runner_mod._UPDATE_DRAIN_STUCK_ALERT_SECONDS + 60)
+        ).isoformat()
+        runner.capabilities = caps
+        db_session.add(runner)
+        await db_session.commit()
+        await heartbeat(
+            payload=HeartbeatRequest(update_draining=True),
+            runner=runner,
+            session=db_session,
+        )
+
+    await _drain_past_threshold()
+    opened = await _stuck_alerts()
+    assert len(opened) == 1
+    assert opened[0].dismissed_at is None
+    first_alert_id = opened[0].id
+
+    # The runner finishes its update and reports healthy.
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=False),
+        runner=runner,
+        session=db_session,
+    )
+    resolved = await _stuck_alerts()
+    assert len(resolved) == 1, "recovery must resolve, not delete or duplicate"
+    assert resolved[0].dismissed_at is not None
+
+    # A healthy heartbeat is not a recovery transition: it must not re-run the
+    # resolve, and it must not resurrect or duplicate anything.
+    await heartbeat(
+        payload=HeartbeatRequest(update_draining=False),
+        runner=runner,
+        session=db_session,
+    )
+    assert len(await _stuck_alerts()) == 1
+
+    # A SECOND wedge is a new incident: the resolved row stays resolved and a
+    # fresh open alert is raised, so persistence is still visible per episode.
+    await _drain_past_threshold()
+    both = await _stuck_alerts()
+    assert len(both) == 2
+    by_id = {a.id: a for a in both}
+    assert by_id[first_alert_id].dismissed_at is not None
+    still_open = [a for a in both if a.dismissed_at is None]
+    assert len(still_open) == 1
+    assert still_open[0].id != first_alert_id
+    assert still_open[0].dedupe_key == f"runner.update_drain_stuck:{runner.id}"
 
 
 @pytest.mark.asyncio

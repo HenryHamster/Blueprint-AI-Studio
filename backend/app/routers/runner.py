@@ -1776,6 +1776,9 @@ async def heartbeat(
     if runner.status not in ("paused", "draining"):
         runner.status = "active"
     caps = dict(runner.capabilities or {})
+    # Set when THIS heartbeat ends an auto-update drain episode, so the
+    # episode's stuck-drain alert is resolved once the row is committed.
+    _drain_episode_ended = False
     if payload.update_draining is not None:
         was_update_draining = caps.get("update_draining") is True
         caps["update_draining"] = payload.update_draining
@@ -1839,6 +1842,12 @@ async def heartbeat(
                 caps["update_drain_alerted_at"] = now.isoformat()
                 from app.main import _current_sha
 
+                # Lazy: app.alert_dispatch imports this router's package.
+                from app.alert_dispatch import (
+                    _RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE,
+                    _update_drain_stuck_dedupe_key,
+                )
+
                 _runner_label = runner.hostname or f"runner {str(runner_id)[:8]}"
                 session.add(
                     Alert(
@@ -1858,7 +1867,13 @@ async def heartbeat(
                             "(main), deploy a main-reachable revision."
                         )[:1000],
                         source="runner",
-                        event_type="runner.update_drain_stuck",
+                        event_type=_RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE,
+                        # Deterministic per-runner key so the recovery path can
+                        # find and dismiss this exact incident. Without it the
+                        # row was unfindable and every episode left a permanent
+                        # WARNING behind (iconlab 2026-08-20 read 218 minutes
+                        # stale while the runner was already healthy).
+                        dedupe_key=_update_drain_stuck_dedupe_key(runner_id),
                     )
                 )
                 logger.error(
@@ -1868,6 +1883,12 @@ async def heartbeat(
                     _drain_age_s / 60,
                 )
         else:
+            # The drain ended. Clearing the episode markers lets the NEXT
+            # episode alert from a fresh clock; the episode's own alert is
+            # dismissed after the commit below (see _drain_episode_ended)
+            # so a recovered runner stops carrying a WARNING that claims its
+            # self-update is still failing.
+            _drain_episode_ended = was_update_draining
             caps.pop("update_draining_since", None)
             caps.pop("update_drain_alerted_at", None)
     # Refresh the reported active-work set + its report timestamp ONLY for a
@@ -2214,6 +2235,21 @@ async def heartbeat(
         except Exception:
             logger.exception(
                 "[RUNNERS] Failed to resolve runner-deactivated alert for %s",
+                runner_id,
+            )
+    # Recovery: this heartbeat ended an auto-update drain episode. Gated on the
+    # transition, so a healthy runner's heartbeat never runs the resolve query.
+    # Best-effort — a resolve failure must not fail the heartbeat.
+    if _drain_episode_ended:
+        try:
+            from app.alert_dispatch import _resolve_update_drain_stuck_alert
+
+            await _resolve_update_drain_stuck_alert(
+                session, runner_project_id, runner_id
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve update-drain-stuck alert for %s",
                 runner_id,
             )
     # Lazy import to avoid circular dependency (main.py imports this module).
