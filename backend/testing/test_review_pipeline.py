@@ -14228,14 +14228,40 @@ def test_clear_gate_never_touches_holds_without_a_resolvable_breadcrumb():
     assert capped.requires_approval is True
 
 
-def test_clear_gate_noop_when_gate_not_set():
+def test_clear_gate_releases_the_park_when_no_approval_gate_was_raised():
+    """A gates-off park is still a park, and this is its only release path.
+
+    This previously asserted a flat no-op ("noop when gate not set"). That
+    conflated the two things a stuck/standoff escalation writes: the
+    ``review_loop_terminal_outcome`` breadcrumb (always) and the discretionary
+    ``requires_approval`` flag (only when ``require_approval_gates`` is on).
+    ``review_loop_parked_for_operator`` reads the *breadcrumb*, so a no-op here
+    made every gates-off park permanent -- unreleasable by a later APPROVE, by
+    a merge, or by a fix landing on the branch, because all five call sites go
+    through this one function. Live instance: task 30642725 / PR #17601,
+    2026-08-21, the last unmerged child of an otherwise-complete research
+    parent.
+
+    What the old assertion was actually protecting is pinned below and is now
+    strictly stronger: the release must not raise the flag, and must not
+    consume approval-episode metadata owned by a hold this escalation never
+    established.
+    """
     from app.review_loop_convergence import clear_review_escalation_approval_gate
 
     task = _escalation_gated_task(kind="stuck")
     task.requires_approval = False
-    ctx_before = dict(task.context)
-    assert not clear_review_escalation_approval_gate(task, resolved_by="x")
-    assert task.context == ctx_before
+
+    assert clear_review_escalation_approval_gate(task, resolved_by="x") is True
+
+    outcome = task.context["review_loop_terminal_outcome"]
+    assert outcome["resolved"] is True
+    assert outcome["resolved_by"] == "x"
+    assert outcome["kind"] == "stuck"
+    # No hold existed: none is invented, and none is consumed.
+    assert task.requires_approval is False
+    assert task.context["_approval_set_at"] == "2026-06-09T23:29:15.375394"
+    assert set(task.context) == {"review_loop_terminal_outcome", "_approval_set_at"}
 
 
 # ── review_loop_park_stale_head (stale-park release, Fix #3) ─────────────────

@@ -461,19 +461,69 @@ def clear_review_escalation_approval_gate(orig: Task, *, resolved_by: str) -> bo
     caller owns the row lock and the commit. Only touches holds whose recorded
     terminal-outcome breadcrumb is one of the resolvable escalation kinds —
     spend/budget holds, branch-safety holds, and any hold without a matching
-    breadcrumb are left untouched. Returns ``True`` iff the gate was released.
+    breadcrumb are left untouched. Returns ``True`` iff the park was released.
+
+    Two release shapes, because a stuck/standoff escalation writes two things:
+
+    * the ``review_loop_terminal_outcome`` **breadcrumb**, written
+      unconditionally by :func:`_set_review_loop_terminal_outcome`; and
+    * the discretionary ``requires_approval`` **flag**, raised only when the
+      runtime config's ``require_approval_gates`` is on.
+
+    :func:`review_loop_parked_for_operator` reads the *breadcrumb*, so with
+    gates off the chain is still parked and review/fix respawn is still
+    suppressed while no approval episode exists to consume. This function used
+    to bail on ``not orig.requires_approval`` before ever looking at the
+    breadcrumb, which made that park permanent: it is the single release path
+    behind all five call sites, including the two stale-head sites
+    (``review_pipeline`` / ``review_request_changes``) added precisely so a
+    park could not outlive the commits it never saw, plus the APPROVE
+    (``task_lifecycle``) and merge (``ci_completion``) convergence sites. With
+    gates off, a stuck chain could therefore not be released by a later
+    APPROVE, by a merge, or by a fix landing on the branch -- only by hand.
+
+    Live instance (task 30642725 / PR #17601, 2026-08-21): parked ``stuck`` at
+    head ``f5dad10d`` with ``requires_approval`` False; a fix closing the one
+    demanded finding landed at ``0b6875a4`` fifteen minutes later, and every
+    later spawn attempt discarded into the same park. It was the last unmerged
+    child of research parent ``4a13ea07`` (six of seven siblings already
+    merged), so one unreleasable breadcrumb held the whole parent in
+    EVALUATING.
     """
     from sqlalchemy.orm.attributes import flag_modified
 
-    if not orig.requires_approval:
-        return False
     ctx = dict(orig.context or {})
+    outcome = ctx.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY) or {}
+    if outcome.get("kind") not in _RESOLVABLE_ESCALATION_GATE_KINDS:
+        return False
+    if not orig.requires_approval:
+        # Gates off: nothing raised an approval episode, so there is no hold to
+        # consume and popping the approval metadata below would be claiming
+        # authority over a hold this escalation never established. The park is
+        # the breadcrumb, so releasing the breadcrumb IS the release.
+        if outcome.get("resolved"):
+            # Already released. Re-stamping would move ``resolved_at`` and
+            # re-log on every later convergence pass over the same chain.
+            return False
+        ctx[_REVIEW_LOOP_TERMINAL_OUTCOME_KEY] = {
+            **outcome,
+            "resolved": True,
+            "resolved_by": resolved_by,
+            "resolved_at": _utcnow().isoformat(),
+        }
+        orig.context = ctx
+        flag_modified(orig, "context")
+        logger.info(
+            "[PIPELINE] Released %s park on %s (%s) - breadcrumb only, "
+            "approval gates are off",
+            outcome.get("kind"),
+            str(orig.id)[:8],
+            resolved_by,
+        )
+        return True
     from app.spawn_calibration import SPEND_BUDGET_APPROVAL_HOLD_REASON
 
     if ctx.get("approval_hold_reason") == SPEND_BUDGET_APPROVAL_HOLD_REASON:
-        return False
-    outcome = ctx.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY) or {}
-    if outcome.get("kind") not in _RESOLVABLE_ESCALATION_GATE_KINDS:
         return False
     from app.admin_approval_authority import (
         APPROVAL_HOLD_EPISODE_KEY,

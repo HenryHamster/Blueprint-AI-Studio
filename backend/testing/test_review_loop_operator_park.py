@@ -421,3 +421,143 @@ class TestTruthfulRefusalMessages:
 
         task = make_task(context={})
         assert _pipeline_spawn_refusal_label(task) == "unknown"
+
+
+# ── D. Gates-off parks (breadcrumb without the discretionary flag) ────────────
+#
+# The production stuck/standoff path (review_pipeline.py) writes the breadcrumb
+# UNCONDITIONALLY but raises ``requires_approval`` only when the runtime
+# config's ``require_approval_gates`` is on. ``review_loop_parked_for_operator``
+# reads the breadcrumb, so with gates off the chain is still parked — but
+# ``clear_review_escalation_approval_gate`` used to return early on
+# ``not requires_approval``, and it is the single release path behind all five
+# call sites (the two stale-head sites, the APPROVE site, the merge site, and
+# the churn-halt recovery). A gates-off park was therefore unreleasable by any
+# automated path: not by a later APPROVE, not by a merge, not by a fix landing
+# on the branch.
+#
+# The ``_park`` helper above hardcodes ``requires_approval = True``, which is
+# exactly why the suite never saw this: it bakes in the branch production takes
+# only when gates are on.
+
+
+def _park_gates_off(task, *, kind="stuck", pr_number=17601, iterations=3):
+    """Record the park as production does with ``require_approval_gates`` OFF.
+
+    Mirrors review_pipeline.py's stuck/standoff block: the breadcrumb is
+    written unconditionally; ``establish_independent_approval_hold`` is skipped
+    entirely, so the flag stays False.
+    """
+    assert not task.requires_approval
+    _set_review_loop_terminal_outcome(
+        task,
+        kind=kind,
+        reason=kind,
+        pr_number=pr_number,
+        iterations=iterations,
+        detail="rephrased-issue similarity 80% >= 68% (exact match 1/2)",
+        head_sha="f5dad10dde6a3ee1467edd3ab7470c222b61bf9f",
+    )
+
+
+class TestGatesOffParkRelease:
+    def test_gates_off_park_still_parks(self):
+        """Control: the flag is discretionary, the breadcrumb is the signal."""
+        task = make_task(status=TaskStatus.EVALUATING)
+        _park_gates_off(task)
+        assert task.requires_approval is not True
+        assert review_loop_parked_for_operator(task) == "stuck"
+
+    @pytest.mark.parametrize("kind", ["stuck", "standoff"])
+    def test_gates_off_park_is_released(self, kind):
+        """A gates-off park must be releasable — otherwise it is permanent."""
+        task = make_task(status=TaskStatus.EVALUATING)
+        _park_gates_off(task, kind=kind)
+
+        released = clear_review_escalation_approval_gate(
+            task, resolved_by="head_advanced_past_park"
+        )
+
+        assert released is True, (
+            "with approval gates off nothing else can ever release this park - "
+            "not an APPROVE, not a merge, not a fix landing on the branch"
+        )
+        outcome = task.context["review_loop_terminal_outcome"]
+        assert outcome["resolved"] is True
+        assert outcome["resolved_by"] == "head_advanced_past_park"
+        assert outcome["resolved_at"]
+        assert review_loop_parked_for_operator(task) is None
+
+    def test_gates_off_release_does_not_invent_an_approval_hold(self):
+        """Releasing a breadcrumb must not touch a flag it never raised."""
+        task = make_task(status=TaskStatus.EVALUATING)
+        _park_gates_off(task)
+        clear_review_escalation_approval_gate(task, resolved_by="pr_17601_merged")
+        assert task.requires_approval is not True
+
+    def test_gates_off_release_is_idempotent(self):
+        task = make_task(status=TaskStatus.EVALUATING)
+        _park_gates_off(task)
+        assert clear_review_escalation_approval_gate(task, resolved_by="first") is True
+        first = dict(task.context["review_loop_terminal_outcome"])
+
+        assert (
+            clear_review_escalation_approval_gate(task, resolved_by="second") is False
+        ), "a released park must not re-stamp on every later convergence pass"
+        assert task.context["review_loop_terminal_outcome"] == first
+
+    def test_gates_off_release_preserves_the_rest_of_context(self):
+        task = make_task(status=TaskStatus.EVALUATING)
+        task.context = {
+            **(task.context or {}),
+            "review_loop": {"pr_number": 17601, "iteration": 3},
+            "finding_hash": "keep-me",
+        }
+        _park_gates_off(task)
+
+        assert clear_review_escalation_approval_gate(task, resolved_by="t") is True
+        assert task.context["review_loop"] == {"pr_number": 17601, "iteration": 3}
+        assert task.context["finding_hash"] == "keep-me"
+
+    @pytest.mark.parametrize("kind", ["cap_exhausted", "empty_effective_diff"])
+    def test_gates_off_unresolvable_kind_is_left_alone(self, kind):
+        """Scope pin: only the resolvable escalation kinds are releasable.
+
+        ``cap_exhausted`` closes the PR and terminalizes the chain, so nothing
+        can legitimately converge afterwards — releasing it would be wrong.
+        """
+        task = make_task(status=TaskStatus.EVALUATING)
+        _set_review_loop_terminal_outcome(
+            task, kind=kind, reason=kind, pr_number=17601, iterations=3
+        )
+
+        assert clear_review_escalation_approval_gate(task, resolved_by="t") is False
+        assert "resolved" not in task.context["review_loop_terminal_outcome"]
+
+    def test_no_breadcrumb_is_not_a_release(self):
+        task = make_task(status=TaskStatus.EVALUATING)
+        assert clear_review_escalation_approval_gate(task, resolved_by="t") is False
+
+    def test_gates_off_release_unblocks_the_stale_head_check(self):
+        """The end-to-end shape of the live incident (task 30642725 / PR #17601).
+
+        A fix landed at a head the park never saw. ``review_loop_park_stale_head``
+        says the park is stale; the release site acts on that answer. Before the
+        fix the release returned False and the spawn discarded into the same
+        park forever.
+        """
+        from app.review_loop_convergence import review_loop_park_stale_head
+
+        live_head = "0b6875a47b963469a81577b15f4bf391f6df9bba"
+        task = make_task(status=TaskStatus.EVALUATING)
+        _park_gates_off(task)
+
+        assert review_loop_park_stale_head(task, live_head) is True
+        assert (
+            clear_review_escalation_approval_gate(
+                task, resolved_by="head_advanced_past_park"
+            )
+            is True
+        )
+        assert review_loop_parked_for_operator(task) is None
+        assert review_loop_park_stale_head(task, live_head) is False
