@@ -398,7 +398,7 @@ def test_backend_verification_reports_base_failure_route_missing_from_current_re
     )
 
     assert outcome["state"] == "baseline_failure_disappeared"
-    assert outcome["blocking"] is True
+    assert outcome["blocking"] is False
     assert outcome["disappeared_failures"] == {
         "backend/testing/test_old.py::test_removed::failure": {
             "detail": "old",
@@ -427,7 +427,7 @@ def test_backend_verification_reports_base_failure_route_skipped():
     )
 
     assert outcome["state"] == "baseline_failure_skipped"
-    assert outcome["blocking"] is True
+    assert outcome["blocking"] is False
     assert outcome["skipped_failures"] == {
         "backend/testing/test_old.py::test_removed::failure": {
             "detail": "old",
@@ -991,7 +991,7 @@ def test_resolver_reads_each_app_and_test_source_once(tmp_path, monkeypatch):
             f"from app.{previous} import value\n",
         )
 
-    opened_py: "dict[str, int]" = {}
+    opened_py: dict[str, int] = {}
     real_open = open
 
     def counting_open(path, *args, **kwargs):

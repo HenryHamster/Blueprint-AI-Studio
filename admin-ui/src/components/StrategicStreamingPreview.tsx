@@ -24,12 +24,19 @@ import type {
   StrategicLiveActivity,
   StrategicStreamingTurn,
 } from '../utils/strategicSessionLive';
+import { MarkdownContent } from './MarkdownContent';
 
 export interface StrategicStreamingPreviewProps {
   /** The in-flight streamed reply, or null when nothing is streaming. */
   turn: StrategicStreamingTurn | null;
   /** The in-flight ephemeral activity feed. */
   activity: StrategicLiveActivity;
+  /** Route task citations exactly as durable messages do. */
+  onOpenTask?: (taskId: string) => void;
+  /** Route direction citations exactly as durable messages do. */
+  onOpenDirection?: (directionId: string) => void;
+  /** Resolve pull-request citations against the active repository. */
+  githubRepo?: string | null;
 }
 
 /** Activity kinds render with a short, stable prefix so the strip reads as a
@@ -44,7 +51,7 @@ const ACTIVITY_KIND_LABEL: Record<string, string> = {
   action: 'action',
 };
 
-export function StrategicStreamingPreview({ turn, activity }: StrategicStreamingPreviewProps) {
+export function StrategicStreamingPreview({ turn, activity, onOpenTask, onOpenDirection, githubRepo }: StrategicStreamingPreviewProps) {
   const segments = turn?.segments ?? [];
   const activityItems = activity.items;
   // Nothing in flight → render nothing at all, so the thread is byte-identical
@@ -97,19 +104,32 @@ export function StrategicStreamingPreview({ turn, activity }: StrategicStreaming
               <span>Strategic is replying…</span>
             </div>
             {segments.map((segment, index) => (
-              <p
-                // Segments are positional runs of one continuous stream; index is
-                // their identity and they only ever grow at the tail.
-                key={`${turn?.key ?? 'turn'}:${index}`}
-                data-testid={segment.kind === 'reasoning'
-                  ? 'strategic-streaming-reasoning'
-                  : 'strategic-streaming-reply'}
-                className={segment.kind === 'reasoning'
-                  ? 'mt-1 whitespace-pre-wrap border-l-2 border-neutral-800 pl-2 text-ui-sm italic text-neutral-500'
-                  : 'mt-1 whitespace-pre-wrap text-ui-sm text-neutral-200'}
-              >
-                {segment.text}
-              </p>
+              segment.kind === 'reasoning' ? (
+                <p
+                  // Segments are positional runs of one continuous stream; index is
+                  // their identity and they only ever grow at the tail.
+                  key={`${turn?.key ?? 'turn'}:${index}`}
+                  data-testid="strategic-streaming-reasoning"
+                  className="mt-1 whitespace-pre-wrap border-l-2 border-neutral-800 pl-2 text-ui-sm italic text-neutral-500"
+                >
+                  {segment.text}
+                </p>
+              ) : (
+                <div
+                  // Segments are positional runs of one continuous stream; index is
+                  // their identity and they only ever grow at the tail.
+                  key={`${turn?.key ?? 'turn'}:${index}`}
+                  data-testid="strategic-streaming-reply"
+                  className="mt-1 text-ui-sm text-neutral-200"
+                >
+                  <MarkdownContent
+                    content={segment.text}
+                    onOpenTask={onOpenTask}
+                    onOpenDirection={onOpenDirection}
+                    githubRepo={githubRepo}
+                  />
+                </div>
+              )
             ))}
           </div>
         )}

@@ -163,12 +163,14 @@
         _verification_attribution_file="$_verification_attribution_dir/attribution.json"
         printf '%s' "$_verification_attribution" >"$_verification_attribution_file"
         _verification_state=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","attribution_unavailable"))' 2>/dev/null || printf attribution_unavailable)
+        _verification_blocking=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("blocking", True) else "0")' 2>/dev/null || printf 1)
         _verification_tests=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for _ in ET.parse(sys.argv[1]).getroot().iter("testcase")))' "$_verification_current_junit" 2>/dev/null || printf 0)
         _verification_skipped=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for c in ET.parse(sys.argv[1]).getroot().iter("testcase") if c.find("skipped") is not None))' "$_verification_current_junit" 2>/dev/null || printf 0)
         if [ "$_verification_tests" -gt 0 ] && [ "$_verification_skipped" -eq "$_verification_tests" ]; then
           _verification_state=skipped_test
+          _verification_blocking=1
         fi
-        if [ "$_verification_state" = "passed" ] || [ "$_verification_state" = "preexisting_test_failure" ]; then
+        if [ "$_verification_blocking" = "0" ]; then
           echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK — state=$_verification_state"
           _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
           # Prefer the Blueprint-repo-local writer (it merges this lane into the

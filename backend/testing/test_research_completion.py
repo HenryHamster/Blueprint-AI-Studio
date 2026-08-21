@@ -1843,7 +1843,7 @@ class TestNoOutputDowngrade:
         assert persisted_direction["consecutive_unproductive_cycles"] >= 1
 
     @_pytest.mark.asyncio
-    async def test_claimed_research_rejects_mixed_non_object_batch(
+    async def test_mixed_artifact_routes_valid_findings_and_records_rejections(
         self, db_session, mocker
     ):
         from test_autonomous_research import _make_finding, _patch_research_externals
@@ -1855,7 +1855,9 @@ class TestNoOutputDowngrade:
         task.context = {
             **(task.context or {}),
             RESEARCH_OUTPUT_CONTRACT_VERSION_KEY: RESEARCH_OUTPUT_CONTRACT_VERSION,
-            "research_depth": 3,
+            "research_depth": 0,
+            QUALITY_GRADER_VERDICT_KEY: {"passed": True},
+            ADVERSARIAL_GATE_VERDICT_KEY: {},
         }
         valid = _make_finding(
             "Well-shaped finding cannot hide a malformed peer",
@@ -1870,8 +1872,11 @@ class TestNoOutputDowngrade:
                 "acceptance_evidence": {
                     "kind": "named_test",
                     "test_path": "backend/testing/test_research_completion.py",
-                    "test_id": "test_claimed_research_rejects_mixed_non_object_batch",
+                    "test_id": "test_mixed_artifact_routes_valid_findings_and_records_rejections",
                 },
+                "actionability_grade": "HIGH",
+                "verification_basis": "code_verified",
+                "related_files": ["backend/app/research_completion.py"],
             }
         )
         db_session.add(task)
@@ -1879,11 +1884,22 @@ class TestNoOutputDowngrade:
         _patch_research_externals(mocker)
 
         await _handle_research_completion(
-            task, json.dumps([valid, "not-a-finding"]), db_session
+            task,
+            json.dumps(
+                [
+                    valid,
+                    "not-a-finding",
+                    {
+                        "type": "knowledge",
+                        "title": "Unknown sibling remains quarantined",
+                    },
+                ]
+            ),
+            db_session,
         )
         await db_session.refresh(task)
 
-        assert task.status == TaskStatus.FAILED
+        assert task.status == TaskStatus.EVALUATING
         assert task.context["research_output_contract_rejections"] == [
             {
                 "index": 1,
@@ -1891,20 +1907,26 @@ class TestNoOutputDowngrade:
                 "type": "str",
                 "title": "not-a-finding",
                 "errors": ["finding_must_be_an_object"],
-            }
+            },
+            {
+                "index": 2,
+                "source": "agent_output",
+                "type": "knowledge",
+                "title": "Unknown sibling remains quarantined",
+                "errors": ["unsupported_finding_type"],
+            },
         ]
         children = (
-            (
-                await db_session.execute(
-                    _select(_Task).where(_Task.parent_task_id == task.id)
-                )
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
             )
-            .scalars()
-            .all()
-        )
-        assert children == []
+        ).scalars().all()
+        assert [child.title for child in children] == [
+            "Well-shaped finding cannot hide a malformed peer"
+        ]
+        assert task.context.get("research_output_invalid") is not True
         await db_session.refresh(project)
-        assert str(task.id) not in (project.vision or {}).get(
+        assert str(task.id) in (project.vision or {}).get(
             "_research_spawn_counted_ids", []
         )
 
@@ -14591,7 +14613,7 @@ class TestAcceptanceEvidencePropagation:
             .scalars()
             .all()
         )
-        # The finding lacks named_test evidence on a criterion-carrying direction
+        # The finding lacks acceptance evidence on a criterion-carrying direction
         # → hard rejection: zero implementation child tasks spawned. A memo task
         # records the rejection reason but is not an implementation task.
         impl_children = [
@@ -14600,7 +14622,7 @@ class TestAcceptanceEvidencePropagation:
         ]
         assert len(impl_children) == 0, (
             "expected zero implementation children for criterion-carrying finding "
-            f"without named_test evidence; got {len(impl_children)}"
+            f"without acceptance evidence; got {len(impl_children)}"
         )
         # The rejection count is recorded in the research task context.
         rejected = (task.context or {}).get("research_criterion_evidence_rejected")
@@ -14610,12 +14632,42 @@ class TestAcceptanceEvidencePropagation:
         )
 
     @_pytest.mark.asyncio
-    async def test_criterion_carrying_finding_with_named_test_evidence_spawns(
-        self, db_session, mocker
+    @_pytest.mark.parametrize(
+        "acceptance_evidence",
+        [
+            {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_research_completion.py",
+            },
+            {
+                "kind": "observable_behavior",
+                "description": "the endpoint returns a bounded completion result",
+            },
+            {
+                "kind": "downstream_artifact",
+                "artifact_id": "research-completion-report",
+            },
+            {
+                "kind": "visual",
+                "component": "Research completion panel",
+                "viewport_width": 1280,
+            },
+            {"kind": "coverage_delta", "threshold": 85.0},
+        ],
+        ids=[
+            "named_test",
+            "observable_behavior",
+            "downstream_artifact",
+            "visual",
+            "coverage_delta",
+        ],
+    )
+    async def test_criterion_carrying_finding_with_any_valid_evidence_spawns(
+        self, db_session, mocker, acceptance_evidence
     ):
         """When a direction carries criterion_keys and a finding declares
-        acceptance_evidence:{kind:named_test}, the spawn loop must let the
-        finding through — the named_test declaration is sufficient proof."""
+        any legal acceptance_evidence kind, the spawn loop must let the finding
+        through — the merge-time acceptance gate owns kind-specific verification."""
         from app.models import Direction as _Direction, ReleaseVersion
         from app import acceptance_criteria as _ac
         from test_autonomous_research import (
@@ -14682,13 +14734,10 @@ class TestAcceptanceEvidencePropagation:
         await db_session.refresh(task)
 
         finding = _make_finding(
-            title="Has named_test evidence",
+            title=f"Has {acceptance_evidence['kind']} evidence",
             direction_id=direction_id,
         )
-        finding["acceptance_evidence"] = {
-            "kind": "named_test",
-            "test_path": "backend/testing/test_research_completion.py",
-        }
+        finding["acceptance_evidence"] = acceptance_evidence
 
         _patch_research_externals(mocker)
         mocker.patch(
@@ -14713,15 +14762,13 @@ class TestAcceptanceEvidencePropagation:
         )
         assert len(children) == 1, (
             "expected exactly one spawned child task for finding with "
-            f"named_test evidence; got {len(children)}"
+            f"{acceptance_evidence['kind']} evidence; got {len(children)}"
         )
         # Verify the acceptance evidence was forwarded to the child.
         child = children[0]
-        assert child.first_payload.get("acceptance_evidence") == {
-            "kind": "named_test",
-            "test_path": "backend/testing/test_research_completion.py",
-        }, (
-            "child payload must carry the named_test acceptance_evidence; "
+        assert child.first_payload.get("acceptance_evidence") == acceptance_evidence, (
+            f"child payload must carry the {acceptance_evidence['kind']} "
+            "acceptance_evidence; "
             f"got {child.first_payload.get('acceptance_evidence')!r}"
         )
 
@@ -14731,8 +14778,8 @@ class TestAcceptanceEvidencePropagation:
     ):
         """When a direction carries active criterion_keys and a finding is
         spawned, the child task's prompt_suffix must include a criterion_keys
-        warning so the implementing agent knows to declare named_test
-        acceptance evidence in its output. Without this upfront signal the
+        warning so the implementing agent knows to declare legal acceptance
+        evidence in its output. Without this upfront signal the
         agent wastes a full research cycle before the rejection gate fires."""
         from app.models import Direction as _Direction, ReleaseVersion
         from app import acceptance_criteria as _ac
@@ -14840,8 +14887,15 @@ class TestAcceptanceEvidencePropagation:
             "about acceptance_evidence requirement; "
             f"got {prompt_suffix!r}"
         )
-        assert "named_test" in prompt_suffix, (
-            "child prompt_suffix must mention named_test evidence kind; "
+        assert all(kind in prompt_suffix for kind in (
+            "named_test",
+            "observable_behavior",
+            "downstream_artifact",
+            "visual",
+            "coverage_delta",
+        )), (
+            "child prompt_suffix must mention every legal acceptance evidence "
+            "kind; "
             f"got {prompt_suffix!r}"
         )
 

@@ -236,7 +236,7 @@ def _set_up_clean_changed_test_run(
     suite = guard.SUITES[suite_name]
     calls: list[tuple[Path, list[str] | None]] = []
     current_report = current_report or JUnitReport(
-        test_routes={"src/example.test.ts::passes"}
+        test_routes={"src/example.test.ts::fails"}
     )
 
     def fake_run(
@@ -281,21 +281,21 @@ def _set_up_clean_changed_test_run(
 
 
 @pytest.mark.parametrize("suite", ["agent", "admin-ui"])
-def test_guard_blocks_a_vanished_baseline_failure_when_a_suite_test_file_changed(
+def test_guard_allows_a_vanished_baseline_failure_when_the_test_route_still_runs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     suite: str,
 ) -> None:
-    """A clean current run cannot erase a failing changed base test."""
+    """A repaired test route keeps coverage without charging inherited debt."""
 
     baseline = _named_failure_report("inherited failure")
     calls = _set_up_clean_changed_test_run(monkeypatch, tmp_path, suite, baseline)
 
-    assert guard.main(["--suite", suite, "--repo-root", str(tmp_path)]) == 1
+    assert guard.main(["--suite", suite, "--repo-root", str(tmp_path)]) == 0
     assert calls[0] == (tmp_path, None)
     assert calls[1][1] == ["src/example.test.ts"]
-    assert "FAILED state=baseline_failure_disappeared" in capsys.readouterr().out
+    assert "PASS state=baseline_failure_disappeared" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("suite", ["agent", "admin-ui"])
@@ -315,8 +315,8 @@ def test_guard_blocks_a_skipped_baseline_failure_when_a_suite_test_file_changed(
     )
 
     assert guard.main(["--suite", suite, "--repo-root", str(tmp_path)]) == 1
-    assert calls[1][1] == ["src/example.test.ts"]
-    assert "FAILED state=baseline_failure_skipped" in capsys.readouterr().out
+    assert calls[1][1] is None
+    assert "FAILED state=coverage_regression" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("suite", ["agent", "admin-ui"])
@@ -513,7 +513,7 @@ def test_guard_blocks_a_baseline_failure_removed_by_a_vitest_config_exclude(
     assert guard.main(["--suite", "admin-ui", "--repo-root", str(tmp_path)]) == 1
     output = capsys.readouterr().out
     assert "baseline scoped to the full suite" in output
-    assert "FAILED state=baseline_failure_disappeared" in output
+    assert "FAILED state=coverage_regression" in output
 
 
 def test_runnable_changed_test_files_drops_deleted_and_pre_rename_paths(

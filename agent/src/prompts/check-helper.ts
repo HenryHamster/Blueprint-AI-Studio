@@ -254,8 +254,11 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
 #                   # when a baseline-warned WARN is hiding a real
 #                   # regression you want to confirm. Combine with
 #                   # 'test' (./check full test) to also run tests.
-# Exits 0 on green, non-zero on any failure. Output is the actual error tail
-# so you can act on it. Re-run after edits.
+# Exits 0 on green or on named, structured failures confirmed inherited on the
+# base branch; those publish through ./pr open with their verification receipt.
+# New or unattributed failures, execution/attribution failures, and explicit
+# coverage failures stay non-zero and block ./pr open. Output is the actual
+# error tail so you can act on it. Re-run after edits.
 
 set -uo pipefail
 ${agentTokenFn}

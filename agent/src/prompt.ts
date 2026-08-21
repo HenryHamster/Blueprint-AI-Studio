@@ -1381,8 +1381,8 @@ does NOT auto-commit or auto-push your work. Use these helpers (already in
 the workspace, executable):
 `;
 
-// Blueprint self-repo ./check description — the exact wording shipped today,
-// preserved byte-for-byte (the 8 GB / OOM / scripts/test-backend.sh paragraph).
+// Blueprint self-repo ./check description — keeps the project-specific 8 GB /
+// OOM / scripts/test-backend.sh guidance alongside the generated gate contract.
 const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks your changes touched
   (admin-ui eslint+viewport+build, agent tsc+eslint, backend ruff). Fast. Exits
   non-zero on failure with the actual error tail; fix and re-run until
@@ -1393,7 +1393,9 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   \`npm run test:run\`) on every invocation AND the browser-mode
   viewport gate (scoped to changed components). Both run through
   \`scripts/vitest_verification_guard.py\`, which warn-passes only the
-  named failure identities that also fail on the base branch.
+  named failure identities that also fail on the base branch and publishes
+  those inherited failures in the verification receipt. New, unattributed,
+  execution, attribution, and explicit coverage failures remain blocking.
 - \`./check test\` — same plus a **lightweight standalone backend test
   pass** (~10 invariant/contract files, ~30s). This VM is 8 GB; the FULL Docker
   + Postgres pytest suite OOMs (exit 137) here. CI runs the full suite
@@ -1412,19 +1414,24 @@ export const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --bod
   \`./check test\`. **Exit 4 = conflicts:** rebase on origin/<base>, resolve,
   re-check and reopen; after ~2 failed attempts, \`./blocked\`.
 - \`./done\` — marks COMPLETED with the PR URL. Requires \`./pr open\` first.
+  Named baseline-attributed failures are not a precondition: \`./pr open\`
+  publishes the diff with its receipt. New, unattributed, execution/attribution,
+  or explicit coverage failures remain blocking.
   - \`./done --already-done "<reason>"\` — Deliverable EXISTS on base branch.
     Reason MUST name concrete artifact (≥30 chars), e.g.
     "migration 0133 + EXPECTED_SCHEMA_REVISION on base via sibling PR #6978".
     Does NOT require \`./pr open\`.
-  - \`./done --warn-out-of-scope "<reason>"\` — \`./check\` fails on
-    pre-existing issues in your edited files (not your changes). Reason MUST be
-    specific (≥30 chars): gates, files, why unfixable. Posts FEEDBACK message.
+  - \`./done --warn-out-of-scope "<reason>"\` — after \`./pr open\` passes,
+    report a pre-existing out-of-scope issue in an edited file (≥30 chars). It
+    does not waive new, unattributed, execution/attribution, or explicit
+    coverage failures.
 - \`./fail "<reason>"\` — Task fundamentally can't complete (wrong scope,
   conflicting requirements, unknown approach). NOT for transient lint/test
   failures — iterate with \`./check\`.
 - For \`GATE-ENVIRONMENT\`/local time or tool limits, do NOT call \`./blocked\`:
   run cheapest faithful checks, \`./pr open\`, \`./done\`; CI is authoritative.
-  A real assertion/lint/build/test failure still blocks publication and must be fixed.
+  A new, unattributed, execution/attribution, or explicit coverage failure
+  blocks publication.
 - \`./blocked "<reason>"\` — Only when no code edit can fix it; routes to strategic.
 - \`compute-image status\` — diagnose compute images; \`build\` is Strategic-only.
 

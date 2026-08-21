@@ -2625,6 +2625,78 @@ describe('MessagesPanel live strategist streaming', () => {
     expect(messageListHtml(el)).toBe(pollOnlyHtml);
   });
 
+  test('test_streaming_preview_renders_math_and_citations_like_the_durable_message', async () => {
+    const content = 'The **answer** is \\(x^2\\), and see task c0f26a99 for the grounded work.';
+    const durable = makeMsg({
+      id: 'reply-markdown-1',
+      sequence: 2,
+      from_type: 'strategic',
+      content,
+      surface: 'conversation',
+      created_at: DURABLE_REPLY_AT,
+    });
+    const onOpenTask = vi.fn();
+
+    // The durable row establishes the canonical Markdown, math, and citation
+    // behavior that the ephemeral preview must match.
+    const baselineEl = await render({ onOpenTask }, [operatorTurn(), durable]);
+    await waitFor(() => {
+      expect(baselineEl.querySelector('.katex')).toBeTruthy();
+      expect([...baselineEl.querySelectorAll('[data-testid="message-bubble"] button')]
+        .find(button => button.textContent?.includes('task c0f26a99')))
+        .toBeTruthy();
+    });
+    const durableCitation = [...baselineEl.querySelectorAll('[data-testid="message-bubble"] button')]
+      .find(button => button.textContent?.includes('task c0f26a99')) as HTMLButtonElement | undefined;
+    expect(durableCitation).toBeTruthy();
+    await act(async () => { durableCitation?.click(); });
+    expect(onOpenTask).toHaveBeenCalledWith('c0f26a99');
+    const durableList = baselineEl.querySelector('.overflow-y-auto');
+    expect(durableList).toBeTruthy();
+    const pollOnlyHtml = durableList?.innerHTML;
+
+    act(() => root!.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    onOpenTask.mockClear();
+
+    // The same content arrives in fragments. The preview must run it through
+    // the durable renderer while remaining an ephemeral, action-free row.
+    const transcript: StrategicSessionDelta[] = [
+      delta({ id: 1, seq: 1, status: 'responding', ts: STREAM_AT }),
+      delta({ id: 2, seq: 2, kind: 'message', text: 'The **answer** is \\(x^2\\), and see ', ts: STREAM_AT }),
+      delta({ id: 3, seq: 3, kind: 'message', text: 'task c0f26a99 for the grounded work.', ts: STREAM_AT }),
+    ];
+    const el = await render({ strategicSessionTranscript: transcript, onOpenTask }, [operatorTurn()]);
+    const reply = el.querySelector('[data-testid="strategic-streaming-reply"]');
+    await waitFor(() => {
+      expect(reply?.querySelector('.katex')).toBeTruthy();
+      expect(reply?.querySelector('strong')?.textContent).toBe('answer');
+      expect(reply?.querySelector('button')?.textContent).toContain('task c0f26a99');
+    });
+    const previewCitation = reply?.querySelector('button') as HTMLButtonElement | null;
+    expect(previewCitation).toBeTruthy();
+    await act(async () => { previewCitation?.click(); });
+    expect(onOpenTask).toHaveBeenCalledWith('c0f26a99');
+    expect(el.querySelector('[data-testid="strategic-streaming-bubble"] input[type="checkbox"]')).toBeNull();
+
+    // Once the canonical row arrives, the ephemeral preview retires and the
+    // durable message list is byte-for-byte the poll-only baseline.
+    _mockMessagesFetch([operatorTurn(), durable]);
+    await rerender({
+      strategicSessionTranscript: [
+        ...transcript,
+        delta({ id: 4, seq: 4, status: 'done', ts: DURABLE_REPLY_AT }),
+      ],
+      onOpenTask,
+      realtimeRefreshSignal: 1,
+    });
+    await waitFor(() => expect(el.textContent).toContain('task c0f26a99'));
+    expect(preview(el)).toBeNull();
+    expect(el.querySelector('.overflow-y-auto')?.innerHTML).toBe(pollOnlyHtml);
+  });
+
   test('stream dropped mid-reply: no done frame ever arrives, the poll alone converges the thread', async () => {
     // A truncated stream: reply fragments, no `done`, and the transport dies.
     const transcript: StrategicSessionDelta[] = [

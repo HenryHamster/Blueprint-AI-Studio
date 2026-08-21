@@ -2073,7 +2073,9 @@ async def _spawn_research_task_inner(
             should_skip_strategic_cycle,
         )
 
-        gate_decision = await should_skip_strategic_cycle(session, project)
+        gate_decision = await should_skip_strategic_cycle(
+            session, project, force_strategic=force_strategic
+        )
         if gate_decision.skip:
             logger.info(
                 "[STRATEGIC] no-delta gate: skipping strategic cycle for project %s "

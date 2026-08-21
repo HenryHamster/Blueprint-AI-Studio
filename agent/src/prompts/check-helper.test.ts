@@ -231,6 +231,23 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).not.toContain('( cd agent && [ -d node_modules ] || npm ci )');
   }, 15_000);
 
+  it('generated ./check guidance publishes named inherited failures but blocks un-attributed failures', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-guidance-attribution',
+      workBranch: 'blueprint/check-guidance-attribution',
+      baseBranch: 'main',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    const generated = capturedScripts['/tmp/workspace/.check-task'];
+    expect(generated).toContain('named, structured failures confirmed inherited on the');
+    expect(generated).toContain('publish through ./pr open with their verification receipt');
+    expect(generated).toContain('New or unattributed failures, execution/attribution failures');
+    expect(generated).toContain('explicit\n# coverage failures stay non-zero and block ./pr open');
+  });
+
   it('routes the admin-ui viewport lane through the attributed verification guard', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
@@ -1831,7 +1848,8 @@ esac
 // The required backend verification fragment resolves the impacted selectors
 // and runs them once through the sanctioned Postgres harness plus the shared
 // baseline attributor. This keeps inherited failures publishable while keeping
-// introduced, disappeared, skipped, or unavailable verification states blocking.
+// introduced or unavailable verification states blocking; independent coverage
+// checks reject an all-skipped selected run.
 describe('writeCheckHelper — attributed backend verification', () => {
   let capturedScripts: Record<string, string> = {};
 
@@ -1879,7 +1897,8 @@ describe('writeCheckHelper — attributed backend verification', () => {
     expect(script).not.toContain('IMPACTED_TEST_CAP=8');
     expect(script).not.toContain('FAILED+=("impacted-test gate")');
     expect(script).not.toContain('scripts/test-backend.sh --postgres $_it_run');
-    expect(script).toContain('preexisting_test_failure');
+    expect(script).toContain('get("blocking", True)');
+    expect(script).not.toContain('"preexisting_test_failure" ]; then');
   });
 
   it('the attributed backend verification always fires for the self-repo (no constant-false guard)', async () => {

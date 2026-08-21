@@ -320,17 +320,28 @@ async def compute_cycle_delta_signals(
 
 
 async def should_skip_strategic_cycle(
-    session, project: Project
+    session, project: Project, *, force_strategic: bool = False
 ) -> CycleGateDecision:
     """Decide whether the cadence tick can skip the expensive context assembly.
 
     Conservative ordering: any must-run condition immediately RUNS; only when
     nothing structurally demands a cycle do the delta signals get consulted.
+    An explicit ``force_strategic`` request also runs before delta evaluation;
+    wall-clock policy stays in the caller, while this gate preserves that
+    caller-owned decision instead of turning it into a no-delta skip.
     All comparisons are against timestamps stored in the DB (the watermark and
-    the durable signal rows), so the decision is deterministic under a given
-    database state — no wall-clock is consulted on the decision path.
+    the durable signal rows), so the ordinary decision is deterministic under
+    a given database state — no wall-clock is consulted on the decision path.
     """
     watermark, last_outcome = await latest_cycle_watermark(session, project.id)
+    if force_strategic:
+        return CycleGateDecision(
+            skip=False,
+            watermark=watermark,
+            signals=CycleDeltaSignals(),
+            must_run_reasons=["forced_strategic"],
+            reason="forced_strategic",
+        )
     signals = await compute_cycle_delta_signals(session, project.id, watermark)
     must_run = must_run_reasons(
         project, last_outcome, signals.open_user_messages, project.vision or {}

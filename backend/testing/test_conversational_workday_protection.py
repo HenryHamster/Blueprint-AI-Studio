@@ -15,11 +15,12 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
-from testing.identity_extraction import extract_python_test_ids
+from testing.identity_extraction import count_python_test_ids, extract_python_test_ids
 
 MANIFEST_PATH = Path(__file__).resolve().parent / "conversational_workday_manifest.json"
 
@@ -42,7 +43,7 @@ REPO_ROOT = _resolve_repo_root()
 
 def _load_manifest() -> dict:
     with MANIFEST_PATH.open(encoding="utf-8") as fh:
-        return json.load(fh)
+        return cast(dict, json.load(fh))
 
 
 def _extract_ts_it_labels(source: str) -> set[str]:
@@ -152,6 +153,39 @@ def _find_completeness_violations(manifest: dict, repo_root: Path) -> list[dict]
                 }
             )
     return violations
+
+
+def _protected_test_count(path: str, source: str) -> int | None:
+    """Return the collector-faithful test count for a protected source file."""
+    if path.endswith(".py"):
+        return count_python_test_ids(source)
+    if path.endswith((".ts", ".tsx")):
+        return len(
+            _extract_ts_it_labels(source)
+            | _extract_ts_it_each_labels(source)
+            | _extract_ts_test_labels(source)
+        )
+    return None
+
+
+def _find_test_count_mismatches(manifest: dict, repo_root: Path) -> list[str]:
+    """Return protected entries whose declared count is not an exact snapshot."""
+    mismatches: list[str] = []
+    for entry in manifest["protect"]:
+        path = entry["path"]
+        full_path = repo_root / path
+        if not full_path.exists():
+            continue
+        actual = _protected_test_count(path, full_path.read_text(encoding="utf-8"))
+        if actual is None:
+            mismatches.append(f"{path}: unsupported test file type")
+            continue
+        declared_count = entry["test_count"]
+        if actual != declared_count:
+            mismatches.append(
+                f"{path}: actual={actual}, declared_exact={declared_count}"
+            )
+    return mismatches
 
 
 # ---------------------------------------------------------------------------
@@ -317,41 +351,46 @@ def test_all_protect_test_ids_exist_in_their_files():
 
 
 def test_every_protected_file_meets_declared_test_count():
-    """Every protected file must retain at least its manifest test count.
+    """Every protected file must match its manifest test count exactly.
 
     The manifest's hand-picked ``test_ids`` remain a forward existence contract;
-    this data-driven count floor closes the reverse gap, so deleting an
-    undeclared test from any protected file fails without hardcoding file paths.
+    this data-driven exact snapshot closes both directions of the reverse gap,
+    so adding or deleting an undeclared test fails without hardcoding paths.
     """
     manifest = _load_manifest()
-    mismatches: list[str] = []
-    for entry in manifest["protect"]:
-        path = entry["path"]
-        full_path = REPO_ROOT / path
-        if not full_path.exists():
-            continue
-        source = full_path.read_text(encoding="utf-8")
-        if path.endswith(".py"):
-            actual = extract_python_test_ids(source)
-        elif path.endswith((".ts", ".tsx")):
-            actual = _extract_ts_it_labels(source)
-            actual |= _extract_ts_it_each_labels(source)
-            actual |= _extract_ts_test_labels(source)
-        else:
-            mismatches.append(f"{path}: unsupported test file type")
-            continue
-        declared_count = entry["test_count"]
-        if len(actual) < declared_count:
-            mismatches.append(
-                f"{path}: actual={len(actual)}, declared_floor={declared_count}"
-            )
+    mismatches = _find_test_count_mismatches(manifest, REPO_ROOT)
 
     assert not mismatches, (
-        "Protected test files must retain their declared test-count floor; "
-        "update conversational_workday_manifest.json after an intentional test removal:\n"
+        "Protected test files must match their declared test-count snapshot; "
+        "update conversational_workday_manifest.json after an intentional inventory change:\n"
         + "\n".join(f"  - {item}" for item in mismatches)
         + "\n" + format_offender_marker(str(offender) for offender in mismatches)
     )
+
+
+def test_new_floor_slack_relative_to_integration_branch_fails():
+    """An integration-branch count lag is reported as a protected mismatch."""
+    manifest = _load_manifest()
+    entry = next(
+        item for item in manifest["protect"]
+        if item["path"] == "backend/testing/test_reaper.py"
+    )
+    actual = _protected_test_count(
+        entry["path"],
+        (REPO_ROOT / entry["path"]).read_text(encoding="utf-8"),
+    )
+    assert actual is not None and actual > 1
+
+    integration_branch_manifest = json.loads(json.dumps(manifest))
+    integration_entry = next(
+        item for item in integration_branch_manifest["protect"]
+        if item["path"] == entry["path"]
+    )
+    integration_entry["test_count"] = actual - 1
+
+    assert _find_test_count_mismatches(
+        integration_branch_manifest, REPO_ROOT
+    ) == [f"{entry['path']}: actual={actual}, declared_exact={actual - 1}"]
 
 
 def test_python_identity_extraction_includes_unittest_subclass_methods():
@@ -367,6 +406,7 @@ def test_python_identity_extraction_includes_unittest_subclass_methods():
     )
 
     assert extract_python_test_ids(source) == {"RunnerRegressionTests::test_protected"}
+    assert count_python_test_ids(source) == 1
 
 
 def test_python_identity_extraction_expands_inherited_unittest_methods():

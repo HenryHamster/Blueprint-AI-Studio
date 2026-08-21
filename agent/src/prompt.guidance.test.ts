@@ -1792,8 +1792,15 @@ describe('SHARED_LIFECYCLE_REMAINDER — byte size and category coverage', () =>
     expect(SHARED_LIFECYCLE_REMAINDER).toContain('do NOT call `./blocked`');
     expect(SHARED_LIFECYCLE_REMAINDER).toContain('`./pr open`');
     expect(SHARED_LIFECYCLE_REMAINDER).toContain('`./done`');
-    expect(SHARED_LIFECYCLE_REMAINDER).toContain('A real');
-    expect(SHARED_LIFECYCLE_REMAINDER).toContain('test failure still blocks publication');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('New, unattributed, execution/attribution');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('explicit coverage failures');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('blocks publication');
+  });
+
+  it('does not route named attributed baseline debt to ./blocked', () => {
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('baseline-attributed failures are not a precondition');
+    expect(SHARED_LIFECYCLE_REMAINDER).toContain('publishes the diff with its receipt');
+    expect(SHARED_LIFECYCLE_REMAINDER).not.toContain('repo-wide gate failure on files you did not touch');
   });
 
   it('is under 4500 bytes', () => {

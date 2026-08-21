@@ -301,7 +301,7 @@ def attribute_reports(current: JUnitReport, baseline: JUnitReport) -> Attributio
     disappeared = {
         key: baseline.failures[key]
         for key in sorted(baseline_keys)
-        if _test_key(key) not in current.test_routes
+        if key not in current.failures and _test_key(key) not in current.skipped_routes
     }
     skipped = {
         key: baseline.failures[key]
@@ -342,6 +342,34 @@ def attribute_failure_maps(
         _report_from_failures(current, tree_root=current_root),
         _report_from_failures(baseline, tree_root=baseline_root),
     )
+
+
+def test_route_coverage_gaps(current: JUnitReport, baseline: JUnitReport) -> dict[str, str]:
+    """Return independently observable test-route coverage losses.
+
+    Differential failure attribution intentionally permits a baseline failure
+    to resolve. A lane that changes its executable test scope must therefore
+    separately prove that it still executed each relevant baseline route. A
+    missing route or a route now reported as skipped is a coverage regression,
+    not a reclassification of the inherited failure identity.
+    """
+
+    # Scope the obligation to routes that actually carried a baseline failure.
+    # A lane may freely rename, drop, or reparametrize a route that was green at
+    # base; only an inherited failure identity must still be observably executed,
+    # otherwise every legitimate test rename would publish a coverage_regression.
+    obligated = {_test_key(key) for key in baseline.failures} & baseline.test_routes
+    missing = obligated - current.test_routes
+    skipped = obligated & current.skipped_routes
+    gaps = dict.fromkeys(
+        sorted(missing), "baseline test route is absent from the current report"
+    )
+    gaps.update(
+        dict.fromkeys(
+            sorted(skipped), "baseline test route is skipped in the current report"
+        )
+    )
+    return gaps
 
 
 def is_attributable_pytest_result(exit_code: int, report: JUnitReport) -> bool:
@@ -408,14 +436,24 @@ def classify_verification(
         state = "preexisting_test_failure"
     return {
         "state": state,
-        "blocking": bool(new_failures or disappeared or skipped),
+        # Resolved or skipped inherited identities remain receipt evidence.
+        # Lanes with mutable test scope enforce route coverage separately;
+        # publication attribution itself blocks only introduced identities.
+        "blocking": bool(new_failures),
         "new_failures": new_failures,
         "suppressed_failures": {
             key: {"detail": detail, "reason": "same route/test/failure kind failed on baseline"}
             for key, detail in attributed.suppressed_failures.items()
         },
         "disappeared_failures": {
-            key: {"detail": detail, "reason": "baseline failing route absent from current report"}
+            key: {
+                "detail": detail,
+                "reason": (
+                    "baseline failure no longer reproduces in current report"
+                    if _test_key(key) in current_report.test_routes
+                    else "baseline failing route absent from current report"
+                ),
+            }
             for key, detail in disappeared.items()
         },
         "skipped_failures": {

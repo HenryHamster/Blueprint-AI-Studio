@@ -691,7 +691,7 @@ def research_finding_contract_errors(
 
 
 def research_contract_rejection_receipts(
-    findings: list[Dict[str, Any]],
+    findings: list[Any],
     *,
     source: str,
     limit: int = 20,
@@ -699,26 +699,72 @@ def research_contract_rejection_receipts(
 ) -> list[dict[str, Any]]:
     """Build a bounded, non-prompt audit receipt for invalid findings."""
 
+    _, receipts = partition_research_findings(
+        findings,
+        source=source,
+        limit=limit,
+        valid_direction_ids=valid_direction_ids,
+    )
+    return receipts
+
+
+def partition_research_findings(
+    findings: list[Any],
+    *,
+    source: str,
+    limit: int = 20,
+    valid_direction_ids: set[str] | frozenset[str] | None = None,
+) -> tuple[list[Dict[str, Any]], list[dict[str, Any]]]:
+    """Partition strict output into routable findings and bounded rejections.
+
+    A producer contract applies to each finding independently.  One malformed
+    sibling must not discard well-formed findings that can still be routed, but
+    an array containing no routable findings remains fail-closed at the caller.
+    The helper accepts the raw parsed array so non-object entries receive the
+    same compact audit receipt as object-level contract violations.
+    """
+
+    routable: list[Dict[str, Any]] = []
     receipts: list[dict[str, Any]] = []
-    for index, finding in enumerate(findings):
-        errors = research_finding_contract_errors(
-            finding,
-            valid_direction_ids=valid_direction_ids,
-        )
-        if not errors:
-            continue
+
+    def reject(index: int, finding: Any, errors: list[str]) -> None:
+        if len(receipts) >= limit:
+            return
+        if isinstance(finding, dict):
+            finding_type = str(finding.get("type") or "")[:80]
+            title = str(finding.get("title") or "")[:200]
+        else:
+            finding_type = type(finding).__name__[:80]
+            title = str(finding or "")[:200]
         receipts.append(
             {
                 "index": index,
                 "source": source,
-                "type": str(finding.get("type") or "")[:80],
-                "title": str(finding.get("title") or "")[:200],
+                "type": finding_type,
+                "title": title,
                 "errors": errors,
             }
         )
-        if len(receipts) >= limit:
-            break
-    return receipts
+
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            reject(index, finding, ["finding_must_be_an_object"])
+            continue
+
+        normalized_type = str(finding.get("type") or "").strip().lower()
+        if normalized_type not in RESEARCH_ALLOWED_FINDING_TYPES:
+            reject(index, finding, ["unsupported_finding_type"])
+            continue
+        finding["type"] = normalized_type
+        errors = research_finding_contract_errors(
+            finding,
+            valid_direction_ids=valid_direction_ids,
+        )
+        if errors:
+            reject(index, finding, errors)
+            continue
+        routable.append(finding)
+    return routable, receipts
 
 
 # Established private names remain available to the completion module/tests.
@@ -732,3 +778,4 @@ _prepare_research_metadata_targets = prepare_research_metadata_targets
 _research_output_contract_enabled = research_output_contract_enabled
 _research_finding_contract_errors = research_finding_contract_errors
 _research_contract_rejection_receipts = research_contract_rejection_receipts
+_partition_research_findings = partition_research_findings

@@ -3339,6 +3339,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         <StrategicStreamingPreview
           turn={strategicStreamingTurn}
           activity={strategicLiveActivity}
+          onOpenTask={onOpenTask}
+          onOpenDirection={onOpenDirection}
+          githubRepo={githubRepo}
         />
       )}
 

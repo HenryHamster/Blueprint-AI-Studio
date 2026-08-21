@@ -49,6 +49,16 @@ def extract_python_test_ids(source: str) -> set[str]:
     return test_ids
 
 
+def count_python_test_ids(source: str) -> int:
+    """Return the collector-faithful number of Python test identities.
+
+    Keep count-based guards on the same identity universe as duration and
+    protection consumers instead of allowing each caller to invent a second
+    counting rule.
+    """
+    return len(extract_python_test_ids(source))
+
+
 def _has_pytest_class_name(name: str) -> bool:
     """Match Blueprint's configured pytest ``python_classes`` conventions."""
     return name.startswith("Test") or name.endswith("Test")
