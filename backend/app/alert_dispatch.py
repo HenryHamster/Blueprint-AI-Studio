@@ -20,6 +20,7 @@ import uuid  # used in the "uuid.UUID" string annotations on the alert helpers
 from datetime import datetime  # used in the "datetime" string annotation
 
 from sqlmodel import select
+from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
@@ -33,6 +34,7 @@ from app.models import (
     Alert,
     AlertSeverity,
     ComputeJob,  # used in the "ComputeJob" string annotation
+    TaskStatus,
     TASK_OUTCOME_TERMINAL_STATUSES,
 )
 from app.alert_policy import create_project_alert_if_allowed
@@ -1687,6 +1689,32 @@ async def _resolve_blocked_escalation_alert(
 # once the task reaches a terminal outcome.
 _STUCK_TASK_ALERT_EVENT_TYPE = "task.blocked"
 
+# Task-scoped alert families whose condition a terminal outcome falsifies, and
+# for each, the CURRENT statuses that falsify it. The per-family status set is
+# the whole point of the table: these families are NOT interchangeable.
+#
+#   ``task.blocked``      every emitter describes an in-flight stall, so any
+#                         terminal outcome ends it.
+#   ``review.escalated``  "Manual review or strategic-agent decision required"
+#                         on the chain-original task. Once that task is
+#                         terminal there is no live loop left to adjudicate —
+#                         a requeue mints fresh escalation state rather than
+#                         re-entering the old episode.
+#   ``task.failed``       asks the operator to look at a failure. COMPLETED
+#                         (retried and succeeded) and CANCELLED (deliberately
+#                         abandoned) both settle that. **FAILED does NOT** —
+#                         the task is still failed and the alert is still true,
+#                         so FAILED is deliberately absent from this set.
+#
+# Adding a family here is a claim that a terminal status makes its message
+# false. Do not add one whose alert is an audit record rather than a request
+# for attention.
+_TERMINAL_TASK_ALERT_RULES: "dict[str, frozenset]" = {
+    _STUCK_TASK_ALERT_EVENT_TYPE: TASK_OUTCOME_TERMINAL_STATUSES,
+    "review.escalated": TASK_OUTCOME_TERMINAL_STATUSES,
+    "task.failed": frozenset({TaskStatus.COMPLETED, TaskStatus.CANCELLED}),
+}
+
 # Bound the per-cycle batch so one sweep can never hold a write transaction open
 # across an unbounded backlog. Any residue is picked up on the next reaper cycle.
 _TERMINAL_TASK_ALERT_SWEEP_LIMIT = 200
@@ -1697,20 +1725,25 @@ async def sweep_resolve_terminal_task_alerts(
     *,
     limit: int = _TERMINAL_TASK_ALERT_SWEEP_LIMIT,
 ) -> int:
-    """Dismiss open "task is stuck" alerts whose task has since gone terminal.
+    """Dismiss open task-scoped alerts whose condition the task's outcome ended.
 
-    Every ``task.blocked`` emitter describes a condition that only exists while
-    the task is still in flight — parked on a precondition, aging in the queue,
-    hung in EVALUATING, or running a compute job that stopped progressing. None
-    of those can hold once the task is COMPLETED, FAILED, or CANCELLED, so an
-    alert still open against a terminal task is stating something false.
+    Each family in :data:`_TERMINAL_TASK_ALERT_RULES` asks the operator to act
+    on something that is only true while the task is still in flight — stalled,
+    awaiting review adjudication, or failed and unattended. Once the task
+    reaches a status that falsifies the family's claim, the open alert is
+    stating something that is no longer so. The rule table carries the
+    per-family status set because the families differ: ``task.failed`` is NOT
+    falsified by ``FAILED``.
 
-    Only :func:`_resolve_blocked_escalation_alert` ever retired one of these,
-    and only on the *resume* path (``blocked_task_unblock_sweeps``,
-    ``orchestrator_health``). Nothing retired them when the task instead ended
-    — which is where almost all of them end up. Measured on the live feed
-    2026-08-21: of 20 tasks holding an open ``task.blocked`` alert, 14 were
-    already terminal and exactly one was actually BLOCKED.
+    Only :func:`_resolve_blocked_escalation_alert` ever retired any of these,
+    and only for ``task.blocked`` on the *resume* path
+    (``blocked_task_unblock_sweeps``, ``orchestrator_health``). Nothing retired
+    them when the task instead ended — which is where almost all of them end
+    up. Measured on the live feed 2026-08-21, with the ``task.blocked`` rule
+    already merged but not yet deployed: 100 open alerts, ``dismissed_at`` set
+    on ZERO. Of the open task-scoped alerts, **12 of 12** ``task.failed`` named
+    an already-terminal task (8 CANCELLED, 1 COMPLETED, 3 legitimately still
+    FAILED) and **5 of 7** ``review.escalated`` named a COMPLETED task.
 
     This sweep is deliberately **condition-derived rather than
     transition-derived**: it re-reads the task's current status instead of
@@ -1718,23 +1751,34 @@ async def sweep_resolve_terminal_task_alerts(
     path that forgets to call it (the exact failure mode that left the resume
     path as the only resolver).
 
-    Clearing these also restores *notification*, not just tidiness. The create
-    paths dedupe on ``(task_id, title)`` among undismissed rows, so a stale open
-    alert silently suppresses a real new one when a terminal task is requeued
-    and gets stuck again. Under-clearing and under-notifying are the same bug.
+    Clearing these restores *notification*, not just tidiness, and the blast
+    radius is wider than one family. :func:`_maybe_create_failure_alert`
+    dedupes on ``task_id`` alone with **no title or event-type filter**, so a
+    single stale open alert of any family silently swallows that task's next
+    failure alert outright. The other create paths dedupe on
+    ``(task_id, title)``. Under-clearing and under-notifying are the same bug.
 
     Only open (``dismissed_at IS NULL``) task-scoped alerts are touched, so this
     is a safe no-op when none exists and idempotent across repeated calls.
     Returns the number of alerts dismissed.
     """
+    # One OR-ed clause per family rather than a shared status set, so a family
+    # can never inherit another's statuses -- that is what keeps a still-FAILED
+    # task's ``task.failed`` alert open while clearing its ``task.blocked`` one.
+    family_clauses = [
+        and_(
+            Alert.event_type == event_type,
+            Task.status.in_(statuses),
+        )
+        for event_type, statuses in _TERMINAL_TASK_ALERT_RULES.items()
+    ]
     rows = (
         await session.execute(
             select(Alert, Task.status)
             .join(Task, Task.id == Alert.task_id)
             .where(
                 Alert.dismissed_at.is_(None),
-                Alert.event_type == _STUCK_TASK_ALERT_EVENT_TYPE,
-                Task.status.in_(TASK_OUTCOME_TERMINAL_STATUSES),
+                or_(*family_clauses),
             )
             .limit(max(1, limit))
         )
@@ -1753,7 +1797,7 @@ async def sweep_resolve_terminal_task_alerts(
     for alert, task_status in resolved:
         logger.info(
             "[ALERTS] Dismissed stale %s alert %s for %s task %s: %s",
-            _STUCK_TASK_ALERT_EVENT_TYPE,
+            alert.event_type,
             str(alert.id)[:8],
             task_status,
             str(alert.task_id)[:8],
