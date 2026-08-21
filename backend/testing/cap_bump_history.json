@@ -4627,8 +4627,8 @@
       ],
       "test_alert_dispatch.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-21T06:33:00.302985+00:00",
+          "commit_sha": "f16a67615618404e3db43fd258cf06c310bd3f65",
+          "commit_date": "2026-08-20T23:36:38-07:00",
           "old_cap": 2750,
           "new_cap": 3300
         }
@@ -4641,6 +4641,12 @@
           "commit_date": "2026-08-19T21:32:27+00:00",
           "old_cap": 1750,
           "new_cap": 2400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-21T17:36:59.363825+00:00",
+          "old_cap": 2400,
+          "new_cap": 2850
         }
       ]
     }

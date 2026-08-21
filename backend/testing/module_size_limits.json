@@ -440,7 +440,7 @@
     "local_app_release.py": 2100,
     "blueprint_node.py": 2100,
     "local_postgres_rehearsal.py": 1850,
-    "test_guard_gate_left_shift.py": 2400,
+    "test_guard_gate_left_shift.py": 2850,
     "test-backend.sh": 1050,
     "static_release_guard.py": 750,
     "test_vitest_verification_guard.py": 1900,
