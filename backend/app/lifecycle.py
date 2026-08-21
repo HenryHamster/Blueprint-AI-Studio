@@ -1501,6 +1501,14 @@ async def lifespan(app):
     # Start Stale Branch Cleanup Service (removes old blueprint/research/plan branches)
     stale_branch_task = asyncio.create_task(stale_branch_cleanup_service())
 
+    # Start Staging Base Refresh Service. A research/plan parent cuts its
+    # rollup staging branch ONCE at spawn and hands that name to every child
+    # as base_branch; without this sweep integration advances underneath it
+    # and later children are graded against a frozen tree they cannot fix.
+    from app.staging_base_refresh import staging_base_refresh_service
+
+    staging_base_refresh_task = asyncio.create_task(staging_base_refresh_service())
+
     # Start Auto-Archive Service (archives terminal tasks older than N days)
     auto_archive_task = asyncio.create_task(auto_archive_service())
 
@@ -1951,6 +1959,7 @@ async def lifespan(app):
     _bg_tasks["gcp_image_cleanup"] = gcp_image_cleanup_task
     _bg_tasks["secret_reconciliation"] = secret_recon_task
     _bg_tasks["stale_branch_cleanup"] = stale_branch_task
+    _bg_tasks["staging_base_refresh"] = staging_base_refresh_task
     _bg_tasks["auto_archive"] = auto_archive_task
     _bg_tasks["pipeline_alert_scan"] = pipeline_alert_scan_task
     _bg_tasks["digest_precompute"] = digest_precompute_task
@@ -1989,6 +1998,7 @@ async def lifespan(app):
             "gcp_image_cleanup": gcp_image_cleanup_service,
             "secret_reconciliation": secret_reconciliation_service,
             "stale_branch_cleanup": stale_branch_cleanup_service,
+            "staging_base_refresh": staging_base_refresh_service,
             "auto_archive": auto_archive_service,
             "pipeline_alert_scan": pipeline_alert_scan_service,
             "digest_precompute": digest_precompute_service,
