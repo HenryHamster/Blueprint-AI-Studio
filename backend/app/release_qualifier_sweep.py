@@ -16,7 +16,6 @@ from __future__ import annotations
 
 
 import logging
-import traceback
 from datetime import datetime
 from typing import Any
 
@@ -72,6 +71,16 @@ from app.release_qualifier_hotfix_audit import (
     _hotfix_audit_was_attempted,  # noqa: F401 — re-exported for tests
     _reconcile_hotfix_audit_trail,
 )
+from app.release_sweep_crash_cause import (
+    _MAX_SWEEP_CRASH_STREAK,
+    _SWEEP_CRASH_EXCEPTION_CLASS_MAX,  # noqa: F401 — re-exported for tests
+    _SWEEP_CRASH_FRAME_COUNT,  # noqa: F401 — re-exported for tests
+    _SWEEP_CRASH_FRAME_MAX,  # noqa: F401 — re-exported for tests
+    _SWEEP_CRASH_MESSAGE_MAX,  # noqa: F401 — re-exported for tests
+    _bound_sweep_finalize_crash_cause,
+    _capture_sweep_finalize_crash_cause,
+    _format_sweep_finalize_crash_cause,
+)
 
 logger = logging.getLogger(__name__)
 # Matches the design-pinned JSON cap; the debounce extraction keeps us under it.
@@ -91,20 +100,6 @@ _MODULE_SIZE_GOVERNANCE_CAP: int = 2150
 # that a wedged qualification surfaces within a useful operator window.
 _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
 
-# Consecutive sweep-finalize crashes before force-finalizing the pending
-# qualification and raising an operator alert.  Mirrors _MIN_CALCIFICATION_ATTEMPTS:
-# three consecutive crashes strongly suggest a persistent bug in the finalize
-# path rather than a transient error, and the loop must self-recover.
-_MAX_SWEEP_CRASH_STREAK = 3
-
-# A crash-loop record is operator-facing durable state, not a replacement for
-# logs. Keep the captured cause bounded so a pathological exception message or
-# traceback cannot inflate the JSONB qualification record on every sweep.
-_SWEEP_CRASH_EXCEPTION_CLASS_MAX = 120
-_SWEEP_CRASH_MESSAGE_MAX = 300
-_SWEEP_CRASH_FRAME_MAX = 220
-_SWEEP_CRASH_FRAME_COUNT = 4
-
 # How long a ``serving_status="deploy_failed"`` version remains eligible for
 # serving RECOVERY.  A deploy_failed latch is not terminal-by-construction: a
 # deploy that boot-crashed and recovered, or was merely slow past the ~60-min
@@ -115,54 +110,6 @@ _SWEEP_CRASH_FRAME_COUNT = 4
 # it a genuinely dead deploy stays loudly failed forever.  24h is generous enough
 # to cover the v5 ~5h-late case with wide margin.
 _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS = 24 * 3600
-
-
-def _bound_sweep_finalize_crash_cause(cause: dict[str, Any]) -> dict[str, Any]:
-    """Keep a persisted finalize cause within its fixed JSONB budget."""
-    raw_frames = cause.get("traceback_digest")
-    frames = (
-        [str(frame)[:_SWEEP_CRASH_FRAME_MAX] for frame in raw_frames]
-        if isinstance(raw_frames, list)
-        else []
-    )[:_SWEEP_CRASH_FRAME_COUNT]
-    return {
-        "exception_class": str(cause.get("exception_class") or "unknown")[
-            :_SWEEP_CRASH_EXCEPTION_CLASS_MAX
-        ],
-        "message": str(cause.get("message") or "<no message>")[:
-            _SWEEP_CRASH_MESSAGE_MAX
-        ],
-        "traceback_digest": frames,
-    }
-
-
-def _capture_sweep_finalize_crash_cause(exc: Exception) -> dict[str, Any]:
-    """Return a bounded, operator-readable cause for a swallowed finalize error."""
-    return _bound_sweep_finalize_crash_cause(
-        {
-            "exception_class": type(exc).__name__,
-            "message": str(exc),
-            "traceback_digest": [
-                f"{frame.filename}:{frame.lineno}:{frame.name}"
-                for frame in traceback.extract_tb(exc.__traceback__)[-
-                    _SWEEP_CRASH_FRAME_COUNT:
-                ]
-            ],
-        }
-    )
-
-
-def _format_sweep_finalize_crash_cause(cause: dict[str, Any]) -> str:
-    """Render the bounded crash cause for alerts and operator notifications."""
-    exception_class = str(cause.get("exception_class") or "unknown")
-    message = str(cause.get("message") or "<no message>")
-    frames = cause.get("traceback_digest")
-    frame_text = (
-        " <- ".join(str(frame) for frame in frames)
-        if isinstance(frames, list)
-        else "<unavailable>"
-    )
-    return f"{exception_class}: {message}; traceback={frame_text}"
 
 
 async def _serving_confirmation_candidate_ids(session) -> list:
@@ -835,8 +782,18 @@ async def _check_full_suite_drift_sentinel(
                 # per project so every new automain merge does not create a new
                 # operator incident for the same unresolved integration signal.
                 reason = str(gate.get("reason") or "unknown reason")
+                # Per-PROJECT keys for BOTH states, never per-HEAD. The
+                # per-HEAD dispatch_suppression_key bounds API churn (stop
+                # re-POSTing a rejected authority tuple); it is not a
+                # notification key. A 403/404 on ci.yml dispatch is a standing
+                # repository-permission condition, identical on every HEAD, so
+                # keying per-HEAD minted one incident per automain merge for a
+                # single operator action. dispatch_outcome stays in the key:
+                # 403 and 404 are different diagnoses with different fixes.
+                outcome_label = str(gate.get("dispatch_outcome") or "unknown")
                 dedupe_key = (
-                    f"drift_sentinel:dispatch_rejected:{version.project_id}:{head_sha}"
+                    f"drift_sentinel:dispatch_rejected:{version.project_id}"
+                    f":{outcome_label}"
                     if gate_state == "dispatch_rejected"
                     else f"drift_sentinel:unavailable:{version.project_id}"
                 )
@@ -884,7 +841,11 @@ async def _check_full_suite_drift_sentinel(
                         head_sha[:8] if head_sha else "?",
                         reason,
                     )
-                elif gate_state == "unavailable":
+                else:
+                    # Refresh the standing incident for BOTH states: a
+                    # per-project key would otherwise freeze the alert on a
+                    # days-old HEAD. occurrence_count now carries how long the
+                    # condition has persisted — the signal N alerts destroyed.
                     existing.severity = AlertSeverity.WARNING
                     existing.title = title
                     existing.message = message
