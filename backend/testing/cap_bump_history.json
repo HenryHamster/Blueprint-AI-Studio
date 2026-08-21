@@ -4619,8 +4619,8 @@
       ],
       "test_size_limits_checker.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-20T08:13:56.509948+00:00",
+          "commit_sha": "d01a835fc30b6987a0725dcc760f66a83be85c1f",
+          "commit_date": "2026-08-20T01:34:52-07:00",
           "old_cap": 1750,
           "new_cap": 2100
         }

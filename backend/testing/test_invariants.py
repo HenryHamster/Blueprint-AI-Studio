@@ -5847,6 +5847,37 @@ def _stale_size_cap_message(rel_path: str, module_kind: str) -> str:
         "do not leave a missing-file exception to obscure this remediation."
     )
 
+
+def _assert_no_stale_caps(
+    caps: dict[str, int], source_root: str, module_kind: str
+) -> None:
+    """Assert every configured cap stays within the shared stale-cap policy."""
+    from app.size_limit_policy import stale_cap_limit
+
+    stale = []
+    for rel_path, cap in caps.items():
+        abs_path = os.path.join(source_root, rel_path)
+        if not os.path.exists(abs_path):
+            continue
+        with open(abs_path, encoding="utf-8") as fh:
+            actual = len(fh.readlines())
+        allowed_cap = stale_cap_limit(actual)
+        if cap > allowed_cap:
+            stale.append((rel_path, actual, cap, allowed_cap))
+    assert not stale, (
+        f"{len(stale)} {module_kind} cap(s) have drifted far above actual file size "
+        "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
+        "the file grows to an unreasonable size:\n\n"
+        + "\n".join(
+            f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
+            for r, actual, cap, allowed in stale
+        )
+        + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
+        f"and commit the updated module_size_limits.json under '{module_kind}'."
+        + "\n"
+        + format_offender_marker(r for r, _actual, _cap, _allowed in stale)
+    )
+
 class TestBackendModuleSizeGuardrails:
     """Loose upper bounds to catch runaway file growth.
 
@@ -5903,27 +5934,7 @@ class TestBackendModuleSizeGuardrails:
         Do NOT modify this test to raise the threshold.
         """
         app_root = os.path.join(os.path.dirname(__file__), "..", "app")
-        stale = []
-        for rel_path, cap in MODULE_SIZE_LIMITS.items():
-            abs_path = os.path.join(app_root, rel_path)
-            if not os.path.exists(abs_path):
-                continue
-            with open(abs_path, encoding="utf-8") as fh:
-                actual = len(fh.readlines())
-            allowed_cap = max(actual + 500, actual * 2)
-            if cap > allowed_cap:
-                stale.append((rel_path, actual, cap, allowed_cap))
-        assert not stale, (
-            f"{len(stale)} backend cap(s) have drifted far above actual file size "
-            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
-            "the file grows to an unreasonable size:\n\n"
-            + "\n".join(
-                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
-                for r, actual, cap, allowed in stale
-            )
-            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
-            "and commit the updated module_size_limits.json." + "\n" + format_offender_marker(str(offender) for offender in stale)
-        )
+        _assert_no_stale_caps(MODULE_SIZE_LIMITS, app_root, "backend")
 
 _AGENT_SRC_ROOT = (
     os.path.normpath(
@@ -5961,6 +5972,11 @@ class TestAgentModuleSizeGuardrails:
         ``_require_agent_src``) when ``agent/src`` is absent — e.g. CI's
         backend-only Docker build context."""
         self._check_agent(relative_path)
+
+    def test_no_stale_agent_caps(self):
+        """Agent caps must remain within the shared stale-cap bound."""
+        self._require_agent_src()
+        _assert_no_stale_caps(AGENT_SIZE_LIMITS, _AGENT_SRC_ROOT, "agent")
 
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
@@ -6058,6 +6074,11 @@ class TestFrontendSizeGuardrails:
         is set — these skips are preserved exactly."""
         self._check_frontend(relative_path)
 
+    def test_no_stale_frontend_caps(self):
+        """Frontend caps must remain within the shared stale-cap bound."""
+        self._require_admin_ui_src()
+        _assert_no_stale_caps(FRONTEND_SIZE_LIMITS, _ADMIN_UI_SRC_ROOT, "frontend")
+
     def test_task_detail_drawer_meta(self):
         self._check_frontend("components/TaskDetailDrawerMeta.tsx")
 
@@ -6107,27 +6128,7 @@ class TestTestFileSizeGuardrails:
         the breaching entry. Do NOT modify this test to raise the threshold.
         """
         testing_root = os.path.dirname(__file__)
-        stale = []
-        for rel_path, cap in TESTING_SIZE_LIMITS.items():
-            abs_path = os.path.join(testing_root, rel_path)
-            if not os.path.exists(abs_path):
-                continue
-            with open(abs_path, encoding="utf-8") as fh:
-                actual = len(fh.readlines())
-            allowed_cap = max(actual + 500, actual * 2)
-            if cap > allowed_cap:
-                stale.append((rel_path, actual, cap, allowed_cap))
-        assert not stale, (
-            f"{len(stale)} testing cap(s) have drifted far above actual file size "
-            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
-            "the file grows to an unreasonable size:\n\n"
-            + "\n".join(
-                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
-                for r, actual, cap, allowed in stale
-            )
-            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
-            "and commit the updated module_size_limits.json." + "\n" + format_offender_marker(str(offender) for offender in stale)
-        )
+        _assert_no_stale_caps(TESTING_SIZE_LIMITS, testing_root, "testing")
 
 def _resolve_scripts_root() -> str | None:
     """Resolve the repo's scripts/ directory across both test layouts.
@@ -6203,29 +6204,8 @@ class TestScriptsModuleSizeGuardrails:
         match the policy value returned by ``check_size_limits.py --fix`` for
         the breaching entry. Do NOT modify this test to raise the threshold.
         """
-        stale = []
         scripts_root = _require_scripts_root()
-        for rel_path, cap in SCRIPTS_SIZE_LIMITS.items():
-            abs_path = os.path.join(scripts_root, rel_path)
-            if not os.path.exists(abs_path):
-                continue
-            with open(abs_path, encoding="utf-8") as fh:
-                actual = len(fh.readlines())
-            allowed_cap = max(actual + 500, actual * 2)
-            if cap > allowed_cap:
-                stale.append((rel_path, actual, cap, allowed_cap))
-        assert not stale, (
-            f"{len(stale)} scripts cap(s) have drifted far above actual file size "
-            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
-            "the file grows to an unreasonable size:\n\n"
-            + "\n".join(
-                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
-                for r, actual, cap, allowed in stale
-            )
-            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
-            "and commit the updated module_size_limits.json."
-            + "\n" + format_offender_marker(r for r, _actual, _cap, _allowed in stale)
-        )
+        _assert_no_stale_caps(SCRIPTS_SIZE_LIMITS, scripts_root, "scripts")
 
 
 # ── Size-Guardrail Coverage (no large file may escape having a cap) ──────────

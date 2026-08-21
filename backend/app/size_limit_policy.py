@@ -439,6 +439,20 @@ def prune_ledger_for_current_caps(ledger_data: dict, caps_data: dict) -> dict:
     return result
 
 
+STALE_CAP_HEADROOM: int = 500
+STALE_CAP_MULTIPLIER: int = 2
+
+
+def stale_cap_limit(actual_line_count: int) -> int:
+    """Return the highest meaningful cap for a file of this size."""
+    if actual_line_count < 0:
+        raise ValueError("actual_line_count must be non-negative")
+    return max(
+        actual_line_count + STALE_CAP_HEADROOM,
+        actual_line_count * STALE_CAP_MULTIPLIER,
+    )
+
+
 def is_breach(count: int | None, cap: int | None) -> bool:
     """True when ``count`` breaches ``cap`` — the guardrail's fundamental predicate.
 
