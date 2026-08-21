@@ -47,6 +47,10 @@ Contract
   Empty set -> no output, exit 0. Optional ``--limit N`` truncates to the first
   N (most relevant); the overflow is reported to STDERR as
   ``deferred-unverified:`` lines (never silently dropped).
+* ``--mandatory-output PATH`` writes the matched surface sentinels to a
+  separate newline-delimited file while ``--limit`` applies only to ordinary
+  selectors. This is the merge-gate protocol: mandatory sentinels are carried
+  past the ordinary cap, and the output file is written fail-closed.
 * Robust on partial trees: any listed path absent on disk is skipped (deletions),
   and the reverse-dep scan is skipped gracefully when ``backend/testing`` is
   absent.
@@ -589,6 +593,25 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     return [entry[-1] for entry in ranked]
 
 
+def resolve_impacted_partition(
+    changed_paths, repo_root: str
+) -> "tuple[list[str], list[str]]":
+    """Return ``(ordinary, mandatory)`` impacted selectors.
+
+    ``resolve_impacted`` remains the compatibility API and preserves its
+    relevance order, including sentinels at the end. The merge-time gate uses
+    this partition so its eight-selector budget applies only to ordinary
+    relevance-ranked tests; every on-disk sentinel selected by the committed
+    surface manifest is mandatory and retained exactly once.
+    """
+    changed_list = list(changed_paths)
+    ranked = resolve_impacted(changed_list, repo_root)
+    mandatory_set = _surface_sentinels(changed_list, repo_root)
+    ordinary = [path for path in ranked if path not in mandatory_set]
+    mandatory = [path for path in ranked if path in mandatory_set]
+    return ordinary, mandatory
+
+
 def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
     """Return sorted, deduplicated first-party mock.patch() string targets from tests.
 
@@ -735,6 +758,15 @@ def main(argv=None) -> int:
         help="cap the emitted count; overflow is logged to STDERR (never dropped)",
     )
     parser.add_argument(
+        "--mandatory-output",
+        dest="mandatory_output",
+        default=None,
+        help=(
+            "write matched surface sentinels to this file; --limit applies "
+            "only to ordinary selectors"
+        ),
+    )
+    parser.add_argument(
         "--repo-root",
         dest="repo_root",
         default=None,
@@ -744,7 +776,21 @@ def main(argv=None) -> int:
 
     repo_root = args.repo_root if args.repo_root is not None else _DEFAULT_REPO_ROOT
     changed = _read_changed(args.paths, sys.stdin)
-    impacted = resolve_impacted(changed, repo_root)
+    if args.mandatory_output is not None:
+        ordinary, mandatory = resolve_impacted_partition(changed, repo_root)
+        try:
+            with open(args.mandatory_output, "w", encoding="utf-8") as fh:
+                for rel in mandatory:
+                    fh.write(rel + "\n")
+        except OSError as exc:
+            print(
+                f"mandatory selector output failed: {args.mandatory_output}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        impacted = ordinary
+    else:
+        impacted = resolve_impacted(changed, repo_root)
 
     if args.limit is not None and args.limit >= 0 and len(impacted) > args.limit:
         overflow = impacted[args.limit :]

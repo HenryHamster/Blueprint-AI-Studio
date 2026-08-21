@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --port=3001 --host=localhost",
     "build": "tsc -b && vite build",
-    "typecheck": "tsc -b --noEmit && node scripts/typecheck-tests-baseline.mjs",
+    "typecheck": "tsc -b --noEmit",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest",

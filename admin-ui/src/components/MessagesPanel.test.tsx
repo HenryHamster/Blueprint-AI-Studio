@@ -14,7 +14,6 @@ function MessagesPanel(props: MessagesPanelTestProps) {
 import type { ProjectMessage } from './MessageBubble';
 import type { StrategicStateResponse } from '../strategicStateApi';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
-import type { StrategicChatLiveState } from '../utils/strategicSessionLive';
 import {
   enqueueResidentToolHandoff,
   loadQueuedResidentToolHandoffs,
@@ -2696,24 +2695,19 @@ describe('MessagesPanel live strategist streaming', () => {
     expect(el.textContent).not.toContain('Unattributed delta');
   });
 
-  test('reports the in-flight chat live state up, and clears it when the reply persists', async () => {
-    const seen: (StrategicChatLiveState | null)[] = [];
+  test('renders live Chat awareness directly, and returns to Workday off when the reply persists', async () => {
     const transcript: StrategicSessionDelta[] = [
       delta({ id: 1, seq: 1, status: 'responding', ts: STREAM_AT }),
       delta({ id: 2, seq: 2, kind: 'command', text: 'grep release gate', ts: STREAM_AT }),
       delta({ id: 3, seq: 3, kind: 'message', text: 'Streaming answer', ts: STREAM_AT }),
     ];
-    const onChatLiveStateChange = (state: StrategicChatLiveState | null) => { seen.push(state); };
-    const el = await render(
-      { strategicSessionTranscript: transcript, onChatLiveStateChange },
-      [operatorTurn()],
-    );
+    const el = await render({ strategicSessionTranscript: transcript }, [operatorTurn()]);
 
-    expect(seen[seen.length - 1]).toEqual({
-      phase: 'streaming',
-      label: 'Replying',
-      detail: 'grep release gate',
-    });
+    const liveStatus = el.querySelector('[data-testid="conversation-workday-status"]');
+    expect(liveStatus).toHaveTextContent('Replying');
+    expect(liveStatus).toHaveTextContent('grep release gate');
+    expect(liveStatus).toHaveAttribute('data-chat-live-phase', 'streaming');
+    expect(liveStatus).not.toHaveTextContent('Workday off');
 
     _mockMessagesFetch([operatorTurn(), durableReply()]);
     await rerender({
@@ -2721,11 +2715,12 @@ describe('MessagesPanel live strategist streaming', () => {
         ...transcript,
         delta({ id: 4, seq: 4, status: 'done', ts: DURABLE_REPLY_AT }),
       ],
-      onChatLiveStateChange,
       realtimeRefreshSignal: 1,
     });
 
     await waitFor(() => expect(el.textContent).toContain('The durable strategist reply.'));
-    expect(seen[seen.length - 1]).toBeNull();
+    const settledStatus = el.querySelector('[data-testid="conversation-workday-status"]');
+    expect(settledStatus).toHaveTextContent('Workday off');
+    expect(settledStatus).not.toHaveAttribute('data-chat-live-phase');
   });
 });

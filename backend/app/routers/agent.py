@@ -5141,6 +5141,9 @@ async def agent_heartbeat(
     # and many scalar fields are conditionally written each cycle.
     _hb_load_only = load_only(
         Task.id,
+        # project_id is required by guard-suppression chain ingestion below;
+        # under raiseload=True an unloaded column raises rather than lazy-loads.
+        Task.project_id,
         Task.status,
         Task.vm_instance_id,
         Task.last_heartbeat,
@@ -5349,6 +5352,25 @@ async def agent_heartbeat(
         )
 
         record_publication_gate_receipt(task, req.publication_gate_receipt)
+        # Current-receipt ingestion is idempotent by exact task UUID plus
+        # lane/FailureIdentity; historical receipts are never replayed. Invoke
+        # it even when the receipt was unchanged: a savepoint race can leave a
+        # current receipt unrecorded and the next heartbeat is its retry seam.
+        from app.module_finding_chain import ingest_guard_suppression_receipt
+
+        # Containment matches the other two call sites (landed_signal.py,
+        # orchestrator_ci_monitor.py): chain tracking never aborts its host.
+        # The heartbeat is liveness-critical — the reaper kills agents on a
+        # 5-minute heartbeat timeout — so an ingestion fault must degrade to a
+        # log line, never a 500 that gets the live agent reaped.
+        try:
+            await ingest_guard_suppression_receipt(task, session)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "guard-suppression ingestion failed for task %s; heartbeat continues",
+                req.task_id,
+                exc_info=True,
+            )
 
     # Persist prompt fingerprint on the dedicated column. Mirror to context only
     # when needed for older readers / backfills, so repeated heartbeats stay

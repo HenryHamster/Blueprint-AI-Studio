@@ -1498,6 +1498,102 @@ async def test_heartbeat_persists_publication_gate_receipt_without_blocking(
     ]
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_ingests_guard_suppression_chain_and_contains_its_failures(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """The heartbeat is the chain-ingestion seam, and it never dies for it.
+
+    The reaper kills an agent whose heartbeat stops for 5 minutes, so a fault
+    inside chain tracking must degrade to a log line — the same containment the
+    other two call sites (landed_signal, orchestrator_ci_monitor) apply.
+    """
+    from sqlmodel import select as _select
+
+    from app.models import ModuleFindingChain
+    from app.module_finding_chain import _guard_chain_key
+
+    project = Project(name="Guard Chain Heartbeat", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-guard-chain",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-guard-chain")
+    headers = {"x-agent-token": token}
+    identity = "backend/testing/test_x.py::test_x::AssertionError"
+    receipt = {
+        "status": "passed",
+        "command": "./check test",
+        "timeout_seconds": 600,
+        "hard_timeout_seconds": 1800,
+        "elapsed_seconds": 42,
+        "deadline_extended": False,
+        "exit_code": 0,
+        "authoritative_ci_required": False,
+        "recorded_at": _utcnow().isoformat(),
+        "guard_suppressions": {
+            "backend-pytest": {
+                "state": "preexisting_test_failure",
+                "suppressed": {identity: "inherited"},
+            }
+        },
+        "guard_suppressions_counts": {"observed_lanes": 1, "kept_lanes": 1},
+    }
+
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "publication_gate_receipt": receipt},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    chains = (
+        await db_session.execute(
+            _select(ModuleFindingChain).where(
+                ModuleFindingChain.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert [chain.finding_key for chain in chains] == [
+        _guard_chain_key("backend-pytest", identity)
+    ]
+
+    # A raising ingestion must not 500 the heartbeat or reap the live agent.
+    async def _boom(_task, _session):
+        raise RuntimeError("chain subsystem is down")
+
+    monkeypatch.setattr(
+        "app.module_finding_chain.ingest_guard_suppression_receipt", _boom
+    )
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "publication_gate_receipt": {**receipt, "elapsed_seconds": 43},
+            "status_message": "still alive",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.vm_instance_id == "agent-vm-guard-chain"
+    # The rest of the heartbeat still committed its work.
+    assert (task.context or {}).get("publication_gate_receipt", {}).get(
+        "elapsed_seconds"
+    ) == 43
+
+
 def test_publication_gate_receipt_schema_bounds_attribution():
     base = {
         "status": "failed",

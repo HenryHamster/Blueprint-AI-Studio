@@ -13,12 +13,13 @@ no conftest imports. Added to the standalone smoke set via the normal
 from __future__ import annotations
 
 import json
-import re
+import unittest
 from pathlib import Path
 
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.identity_extraction import extract_python_test_ids
 
 MANIFEST_PATH = Path(__file__).resolve().parent / "conversational_workday_manifest.json"
 
@@ -42,25 +43,6 @@ REPO_ROOT = _resolve_repo_root()
 def _load_manifest() -> dict:
     with MANIFEST_PATH.open(encoding="utf-8") as fh:
         return json.load(fh)
-
-
-def _extract_python_test_ids(source: str) -> set[str]:
-    """Collect pytest node IDs from top-level functions and ``Test*`` classes."""
-    import ast
-
-    tree = ast.parse(source)
-    test_ids: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
-            test_ids.add(node.name)
-        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            test_ids.update(
-                f"{node.name}::{item.name}"
-                for item in node.body
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and item.name.startswith("test_")
-            )
-    return test_ids
 
 
 def _extract_ts_it_labels(source: str) -> set[str]:
@@ -125,12 +107,8 @@ def _extract_ts_test_labels(source: str) -> set[str]:
 
 
 def _extract_python_test_labels(source: str) -> set[str]:
-    """Extract test function names from a Python test module."""
-    return set(re.findall(
-        r"^\s*(?:async\s+)?def\s+(test_\w+)\s*\(",
-        source,
-        re.MULTILINE,
-    ))
+    """Return manifest labels derived from canonical Python identities."""
+    return {test_id.rsplit("::", 1)[-1] for test_id in extract_python_test_ids(source)}
 
 
 def _extract_test_labels(path: str, source: str) -> set[str]:
@@ -323,9 +301,11 @@ def test_all_protect_test_ids_exist_in_their_files():
             continue
         source = full_path.read_text(encoding="utf-8")
         actual_labels = _extract_test_labels(entry["path"], source)
-        for test_id in entry["test_ids"]:
-            if test_id not in actual_labels:
-                missing.append(f"{entry['path']}::{test_id}")
+        missing.extend(
+            f"{entry['path']}::{test_id}"
+            for test_id in entry["test_ids"]
+            if test_id not in actual_labels
+        )
 
     assert not missing, (
         "The following PROTECT-listed test_ids no longer exist in their files. "
@@ -352,7 +332,7 @@ def test_every_protected_file_meets_declared_test_count():
             continue
         source = full_path.read_text(encoding="utf-8")
         if path.endswith(".py"):
-            actual = _extract_python_test_ids(source)
+            actual = extract_python_test_ids(source)
         elif path.endswith((".ts", ".tsx")):
             actual = _extract_ts_it_labels(source)
             actual |= _extract_ts_it_each_labels(source)
@@ -372,6 +352,53 @@ def test_every_protected_file_meets_declared_test_count():
         + "\n".join(f"  - {item}" for item in mismatches)
         + "\n" + format_offender_marker(str(offender) for offender in mismatches)
     )
+
+
+def test_python_identity_extraction_includes_unittest_subclass_methods():
+    """The count floor includes unittest classes outside pytest's name pattern."""
+    source = (
+        "import unittest\n"
+        "class RunnerCase(unittest.TestCase):\n"
+        "    pass\n"
+        "class RunnerRegressionTests(RunnerCase):\n"
+        "    def test_protected(self): pass\n"
+        "class Helper:\n"
+        "    def test_not_collected(self): pass\n"
+    )
+
+    assert extract_python_test_ids(source) == {"RunnerRegressionTests::test_protected"}
+
+
+def test_python_identity_extraction_expands_inherited_unittest_methods():
+    """A subclass carries its inherited ``test_*`` methods under its own name.
+
+    ``unittest.TestLoader().getTestCaseNames`` reports ``test_inherited`` on
+    ``Child``, so a static universe that only reads ``Child``'s own body
+    undercounts the protected floor and silently drops duration identities.
+    The expectation is derived from the live loader rather than hardcoded, so
+    this cannot be satisfied by teaching the extractor a literal answer.
+    """
+    source = (
+        "import unittest\n"
+        "class Base(unittest.TestCase):\n"
+        "    def test_inherited(self): pass\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        "class TestOverrider(Base):\n"
+        "    def test_inherited(self): pass\n"
+        "    def test_own(self): pass\n"
+    )
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<identity-extraction-reproducer>", "exec"), namespace)
+    loader = unittest.TestLoader()
+    collector_ids = {
+        f"{name}::{method}"
+        for name in ("Base", "Child", "TestOverrider")
+        for method in loader.getTestCaseNames(namespace[name])
+    }
+
+    assert extract_python_test_ids(source) == collector_ids
+    assert "Child::test_inherited" in collector_ids
 
 
 def test_removed_backend_resident_seams_are_absent():

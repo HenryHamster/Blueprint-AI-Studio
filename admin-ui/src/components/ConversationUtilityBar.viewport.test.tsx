@@ -5,6 +5,7 @@ import {
   buildConversationWorkdayStatus,
   type ConversationWorkdayStatus,
 } from '../utils/conversationWorkdayStatus';
+import type { StrategicChatLiveState } from '../utils/strategicSessionLive';
 import { ConversationUtilityBar } from './ConversationUtilityBar';
 import { expectNoOverflowAt } from '../test/viewport';
 
@@ -28,6 +29,7 @@ describe('ConversationUtilityBar — viewport regression', () => {
     expanded: boolean;
     searchQuery?: string;
     workdayStatus?: ConversationWorkdayStatus;
+    chatLiveState?: StrategicChatLiveState;
   }) {
     host = document.createElement('div');
     host.style.width = '100%';
@@ -43,6 +45,7 @@ describe('ConversationUtilityBar — viewport regression', () => {
           searchQuery={props.searchQuery ?? ''}
           onSearchChange={() => {}}
           workdayStatus={props.workdayStatus}
+          chatLiveState={props.chatLiveState}
         />,
       );
     });
@@ -156,5 +159,16 @@ describe('ConversationUtilityBar — viewport regression', () => {
 
   test('collapsed search control does not overflow at 1280px', async () => {
     await expectNoOverflowAt(1280, () => renderBar({ expanded: false }));
+  });
+
+  test('live Chat awareness remains visible and contained at 375px', async () => {
+    await expectNoOverflowAt(375, () => renderBar({
+      expanded: false,
+      workdayStatus: buildConversationWorkdayStatus({ interactionMode: 'chat', residentActivity: null }),
+      chatLiveState: { phase: 'streaming', label: 'Replying', detail: 'grep release gate' },
+    }));
+    const line = host?.querySelector('[data-testid="conversation-workday-status"]');
+    expect(line?.textContent).toContain('Replying');
+    expect(line?.className).not.toContain('hidden');
   });
 });

@@ -557,21 +557,45 @@ function impactedResolverAvailable(): boolean {
 
 // Resolve the diff-impacted backend test files via the committed reverse-dep
 // resolver, bounded by a wall clock. Changed paths are passed as positional args
-// (execFileAsync ignores stdin). Returns the impacted repo-relative test-file
-// paths (possibly empty) on success, or null when the resolver could not be run
-// (timeout / crash / spawn error) so the caller degrades to a fall-open rather
-// than an unbounded full run.
+// (execFileAsync ignores stdin). The resolver's ordinary stdout is capped, while
+// its mandatory-output file carries matched surface sentinels that must run past
+// that cap. Returns the deduplicated repo-relative test-file paths (possibly
+// empty) on success, or null when the resolver or its mandatory partition could
+// not be read so the caller degrades to a fall-open rather than an unbounded full
+// run.
 async function resolveImpactedTestFiles(
   ws: WebSocket | null,
   changedFiles: string[],
 ): Promise<string[] | null> {
   try {
-    const out = await execFileAsync(
-      'python3',
-      [IMPACTED_RESOLVER_SCRIPT, '--limit', String(IMPACTED_TEST_CAP), ...changedFiles],
-      { cwd: WORKSPACE, timeoutMs: IMPACTED_RESOLVER_TIMEOUT },
-    );
-    return out.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const mandatoryDir = fs.mkdtempSync('/tmp/blueprint-impacted-selectors-');
+    const mandatoryOutput = `${mandatoryDir}/mandatory-selectors`;
+    let out: string;
+    let mandatory: string;
+    try {
+      out = await execFileAsync(
+        'python3',
+        [
+          IMPACTED_RESOLVER_SCRIPT,
+          '--limit', String(IMPACTED_TEST_CAP),
+          '--mandatory-output', mandatoryOutput,
+          ...changedFiles,
+        ],
+        { cwd: WORKSPACE, timeoutMs: IMPACTED_RESOLVER_TIMEOUT },
+      );
+      mandatory = fs.readFileSync(mandatoryOutput, 'utf8');
+    } finally {
+      // Cleanup cannot alter the resolver's result. The directory is unique per
+      // invocation, so a failed cleanup only leaves an inert temporary artifact.
+      try {
+        fs.rmSync(mandatoryDir, { recursive: true, force: true });
+      } catch {
+        // Best effort; resolver output has already been captured.
+      }
+    }
+    return [...new Set(
+      [...out.split(/\r?\n/), ...mandatory.split(/\r?\n/)].map(s => s.trim()).filter(Boolean),
+    )];
   } catch (e) {
     const first = e instanceof Error ? e.message.split('\n')[0] : String(e);
     sendLog(ws, `Impacted-test resolver could not run (${first}) — cannot bound the suite; will fall open instead of an unbounded full run.\n`);

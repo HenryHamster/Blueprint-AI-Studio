@@ -7,7 +7,6 @@ Called by batch-store-durations.sh to replace the inline Python heredoc:
 Also importable by other scripts.
 """
 
-import ast
 import glob
 import json
 import os
@@ -16,6 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from durations_quality import (
     IN_BAND_SETUP_MAX,
     MIN_CV,
@@ -25,30 +25,15 @@ from durations_quality import (
     in_band_setup_artifacts,
     quality_ok,
 )
+from testing.identity_extraction import extract_python_test_ids
 
 
 def _valid_test_ids(path: Path) -> set[str] | None:
     """Return collectable test IDs, or None when the file cannot be parsed."""
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        return extract_python_test_ids(path.read_text(encoding="utf-8"))
     except (OSError, SyntaxError):
         return None
-
-    valid_ids: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            for item in node.body:
-                if (
-                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and item.name.startswith("test_")
-                ):
-                    valid_ids.add(f"{node.name}::{item.name}")
-        elif (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test_")
-        ):
-            valid_ids.add(node.name)
-    return valid_ids
 
 
 def filter_current_entries(data: dict, root: str | os.PathLike[str]) -> dict:

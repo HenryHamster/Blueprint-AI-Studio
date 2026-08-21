@@ -836,13 +836,17 @@ async def corroborate_and_apply_merged_landed_signal(
     )
     if landed:
         try:
-            from app.module_finding_chain import record_merged_pr_finding_chains
+            from app.module_finding_chain import (
+                record_merged_pr_finding_chains,
+                resolve_landed_guard_suppression_remediation,
+            )
 
             await record_merged_pr_finding_chains(
                 task,
                 session,
                 pr_number=pr_number,
             )
+            await resolve_landed_guard_suppression_remediation(task, session)
         except Exception:  # noqa: BLE001 — chain tracking never aborts a merge
             logger.warning(
                 "[LANDED] module-finding-chain recording failed for task %s",

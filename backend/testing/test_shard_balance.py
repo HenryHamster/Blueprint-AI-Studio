@@ -18,7 +18,6 @@ i.e. a threshold picked to match that number is unreachable by construction.
 
 Runs under --noconftest (no DB, no conftest fixtures).
 """
-import ast
 import heapq
 import importlib.util
 import json
@@ -29,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.identity_extraction import extract_python_test_ids
 
 try:
     import tomllib
@@ -249,32 +249,13 @@ def _extract_valid_test_ids(filepath: Path) -> set:
     """
     Return the set of valid pytest node IDs for a test file, using AST.
 
-    Duplicated from test_test_durations_freshness.py::_extract_valid_test_ids
-    (not imported) because this module runs standalone under --noconftest,
-    where cross-importing another test_*.py module is not a stable dependency
-    across the CI Docker image, --standalone local runs, and Docker-less VMs.
+    Shared with the duration freshness and merge tools so all duration readers
+    model the same static collection universe.
     """
     try:
-        tree = ast.parse(filepath.read_text(encoding="utf-8"))
+        return extract_python_test_ids(filepath.read_text(encoding="utf-8"))
     except (SyntaxError, OSError):
         return set()
-
-    valid_ids: set = set()
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            for item in node.body:
-                if (
-                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and item.name.startswith("test_")
-                ):
-                    valid_ids.add(f"{node.name}::{item.name}")
-        elif (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test_")
-        ):
-            valid_ids.add(node.name)
-
-    return valid_ids
 
 
 def _enumerate_collected_test_ids() -> set:

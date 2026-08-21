@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import uuid
 from contextlib import nullcontext
+from datetime import timedelta
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
-from app.models import ModuleFindingChain, Task
+from app.models import ModuleFindingChain, ProjectMessage, Task, TaskStatus
 from app.module_finding_chain import (
     CHAIN_ESCALATION_THRESHOLD,
+    _guard_chain_key,
+    extract_guard_suppression_identities,
     find_and_mark_chain_escalation,
+    ingest_guard_suppression_receipt,
     record_merged_pr_finding_chains,
+    resolve_landed_guard_suppression_remediation,
     resolved_review_findings,
 )
 from app.review_loop_convergence import build_cross_episode_abandon_candidate
+from app.time_utils import _utcnow
 
 
 class _Result:
@@ -30,8 +37,11 @@ class _Session:
     def __init__(self):
         self.rows: list[ModuleFindingChain] = []
         self.added_tasks: list[Task] = []
+        self.messages: list[ProjectMessage] = []
 
     async def execute(self, _statement):
+        if "projectmessage" in str(_statement).lower():
+            return _Result(self.messages)
         return _Result(self.rows)
 
     def begin_nested(self):
@@ -296,6 +306,250 @@ async def test_pr_history_is_capped_but_occurrences_remain_authoritative():
     assert chain.pr_numbers == list(range(306, 326))
 
 
+def _passing_gate_receipt(*, suppressions: dict | None = None) -> dict:
+    receipt = {
+        "status": "passed",
+        "command": "./check test",
+        "timeout_seconds": 600,
+        "hard_timeout_seconds": 1800,
+        "elapsed_seconds": 5,
+        "deadline_extended": False,
+        "exit_code": 0,
+        "authoritative_ci_required": False,
+        "recorded_at": _utcnow().isoformat(),
+    }
+    if suppressions is not None:
+        receipt["guard_suppressions"] = suppressions
+        receipt["guard_suppressions_counts"] = {
+            "observed_lanes": len(suppressions),
+            "kept_lanes": len(suppressions),
+        }
+    return receipt
+
+
+def test_guard_suppression_extractor_fails_closed_for_truncation_and_staleness():
+    identity = "backend/testing/test_x.py::test_x::AssertionError"
+    cross_lane_truncated = _passing_gate_receipt(
+        suppressions={"backend-pytest": {"state": "passed", "suppressed": {}}}
+    )
+    cross_lane_truncated["guard_suppressions_counts"] = {
+        "observed_lanes": 13,
+        "kept_lanes": 1,
+    }
+    assert extract_guard_suppression_identities(cross_lane_truncated) is None
+
+    legacy_truncated = _passing_gate_receipt()
+    legacy_truncated["suppressed_failures"] = {}
+    legacy_truncated["attribution_counts"] = {
+        "suppressed_failures": {"observed": 1, "kept": 0}
+    }
+    assert extract_guard_suppression_identities(legacy_truncated) is None
+
+    stale = _passing_gate_receipt(
+        suppressions={
+            "backend-pytest": {
+                "state": "preexisting_test_failure",
+                "suppressed": {identity: "inherited"},
+            }
+        }
+    )
+    stale["recorded_at"] = (_utcnow() - timedelta(days=2)).isoformat()
+    assert extract_guard_suppression_identities(stale) is None
+
+
+def test_guard_suppression_extractor_uses_cross_lane_projection_over_legacy():
+    identity = "backend/testing/test_x.py::test_x::AssertionError"
+    receipt = _passing_gate_receipt(
+        suppressions={
+            "backend-pytest": {
+                "state": "preexisting_test_failure",
+                "suppressed": {identity: "inherited"},
+            }
+        }
+    )
+    receipt["suppressed_failures"] = {f"[backend-pytest] {identity}": "inherited"}
+    receipt["attribution_counts"] = {
+        "suppressed_failures": {"observed": 1, "kept": 1}
+    }
+
+    assert extract_guard_suppression_identities(receipt) == [("backend-pytest", identity)]
+
+
+class _ConflictOnceSession(_Session):
+    """Model a first-insert race won by another independent task."""
+
+    def __init__(self, source_task_id: str):
+        super().__init__()
+        self._source_task_id = source_task_id
+        self._conflicted = False
+
+    async def flush(self, _objects=None):
+        if self._conflicted:
+            return None
+        self._conflicted = True
+        attempted = self.rows[0]
+        self.rows[:] = [
+            ModuleFindingChain(
+                project_id=attempted.project_id,
+                finding_key=attempted.finding_key,
+                file_path=attempted.file_path,
+                summary=attempted.summary,
+                chain_kind=attempted.chain_kind,
+                suppression_lane=attempted.suppression_lane,
+                failure_identity=attempted.failure_identity,
+                source_task_ids=[self._source_task_id],
+                pr_numbers=[],
+                first_seen_pr=0,
+                last_seen_pr=0,
+                occurrences=1,
+                verified_occurrences=1,
+                status="open",
+            )
+        ]
+        raise IntegrityError("insert", {}, Exception("unique conflict"))
+
+
+@pytest.mark.asyncio
+async def test_guard_suppression_retries_current_receipt_after_insert_race():
+    project_id = uuid.uuid4()
+    identity = "backend/testing/test_x.py::test_x::AssertionError"
+    task = Task(
+        project_id=project_id,
+        context={
+            "publication_gate_receipt": _passing_gate_receipt(
+                suppressions={
+                    "backend-pytest": {
+                        "state": "preexisting_test_failure",
+                        "suppressed": {identity: "inherited"},
+                    }
+                }
+            )
+        },
+    )
+    session = _ConflictOnceSession(str(uuid.uuid4()))
+
+    touched = await ingest_guard_suppression_receipt(task, session)
+
+    assert len(touched) == 1
+    assert session.rows[0].occurrences == 2
+    assert str(task.id) in session.rows[0].source_task_ids
+    assert _guard_chain_key("backend-pytest", identity) in task.context[
+        "_guard_suppression_recorded_keys"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recurring_guard_suppression_has_one_owner_and_resolves():
+    """Three tasks with one structured baseline failure make one owned fix.
+
+    This deliberately replays the first task's heartbeat before the threshold:
+    receipt history and heartbeats are diagnostic evidence, not extra chain
+    occurrences. The remediation can resolve only after its own clean receipt
+    lands, never because an unrelated task happened to merge.
+    """
+    project_id = uuid.uuid4()
+    session = _Session()
+    suppression = {
+        "backend-pytest": {
+            "state": "preexisting_test_failure",
+            "suppressed": {
+                "backend/testing/test_x.py::test_x::AssertionError": "inherited"
+            },
+        }
+    }
+    source_tasks = [
+        Task(project_id=project_id, context={"publication_gate_receipt": _passing_gate_receipt(suppressions=suppression)})
+        for _ in range(CHAIN_ESCALATION_THRESHOLD)
+    ]
+
+    await ingest_guard_suppression_receipt(source_tasks[0], session)
+    source_tasks[0].context["publication_gate_receipt_history"] = [
+        _passing_gate_receipt(suppressions=suppression)
+    ]
+    await ingest_guard_suppression_receipt(source_tasks[0], session)  # heartbeat replay
+    for task in source_tasks[1:]:
+        await ingest_guard_suppression_receipt(task, session)
+
+    assert len(session.rows) == 1
+    chain = session.rows[0]
+    assert chain.chain_kind == "guard_suppression"
+    assert chain.occurrences == CHAIN_ESCALATION_THRESHOLD
+    assert chain.source_task_ids == [str(task.id) for task in source_tasks]
+    assert chain.remediation_task_id is not None
+    owners = [task for task in session.added_tasks if task.id == chain.remediation_task_id]
+    assert len(owners) == 1
+    owner = owners[0]
+    assert owner.context["guard_suppression_remediation_keys"] == [chain.finding_key]
+
+    # An unrelated clean landing has no authority to resolve the chain.
+    unrelated = Task(project_id=project_id, context={"publication_gate_receipt": _passing_gate_receipt()})
+    assert await resolve_landed_guard_suppression_remediation(unrelated, session) == []
+    assert chain.status == "open"
+
+    owner.context["publication_gate_receipt"] = _passing_gate_receipt()
+    resolved = await resolve_landed_guard_suppression_remediation(owner, session)
+    assert resolved == [chain]
+    assert chain.status == "resolved"
+    assert chain.resolved_by_task_id == owner.id
+
+    # Recurrence starts a new threshold window and cannot reuse the resolved
+    # owner. It reaches one new owner only after three new source tasks.
+    recurring_tasks = [
+        Task(project_id=project_id, context={"publication_gate_receipt": _passing_gate_receipt(suppressions=suppression)})
+        for _ in range(CHAIN_ESCALATION_THRESHOLD)
+    ]
+    for task in recurring_tasks:
+        await ingest_guard_suppression_receipt(task, session)
+    assert chain.status == "open"
+    assert chain.occurrences == CHAIN_ESCALATION_THRESHOLD
+    assert chain.remediation_task_id != owner.id
+    assert len([task for task in session.added_tasks if task.id == chain.remediation_task_id]) == 1
+
+
+@pytest.mark.asyncio
+async def test_landed_remediation_resolves_aggregate_escalation_message():
+    project_id = uuid.uuid4()
+    owner = Task(project_id=project_id, context={"publication_gate_receipt": _passing_gate_receipt()})
+    chain = ModuleFindingChain(
+        project_id=project_id,
+        finding_key="finding",
+        file_path="guard:backend-pytest",
+        summary="Recurring baseline guard suppression",
+        chain_kind="guard_suppression",
+        source_task_ids=[],
+        pr_numbers=[],
+        first_seen_pr=0,
+        last_seen_pr=0,
+        remediation_task_id=owner.id,
+    )
+    message = ProjectMessage(
+        project_id=project_id,
+        idempotency_key=f"guard-suppression:{project_id}:{chain.finding_key}:escalation",
+    )
+    session = _Session()
+    session.rows.append(chain)
+    session.messages.append(message)
+
+    async def _scalar(_statement):
+        return None
+
+    session.scalar = _scalar
+    assert await resolve_landed_guard_suppression_remediation(
+        Task(
+            id=owner.id,
+            project_id=project_id,
+            context={
+                "publication_gate_receipt": _passing_gate_receipt(),
+                "guard_suppression_remediation_keys": [chain.finding_key],
+            },
+        ),
+        session,
+    ) == [chain]
+    assert message.status == "resolved"
+    assert message.resolution == "guard_suppression_remediated"
+    assert message.resolved_at is not None
+
+
 def test_ordinary_two_or_three_cycle_intra_pr_convergence_does_not_escalate():
     task_rows = [
         Task(
@@ -310,3 +564,175 @@ def test_ordinary_two_or_three_cycle_intra_pr_convergence_does_not_escalate():
         for iteration in (1, 2, 3)
     ]
     assert build_cross_episode_abandon_candidate(task_rows) is None
+
+
+class _TaskStoreSession(_Session):
+    """A ledger session that can also resolve a remediation owner by id."""
+
+    def __init__(self):
+        super().__init__()
+        self.tasks: dict[uuid.UUID, Task] = {}
+
+    def add(self, value):
+        super().add(value)
+        if isinstance(value, Task):
+            self.tasks[value.id] = value
+
+    async def get(self, _model, key):
+        return self.tasks.get(key)
+
+
+def _guard_suppression(identity: str) -> dict:
+    return {
+        "backend-pytest": {
+            "state": "preexisting_test_failure",
+            "suppressed": {identity: "inherited"},
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_receipt_still_resolves_its_landed_chain():
+    """A remediation PR that sat in review past the freshness window still resolves.
+
+    The receipt is written by the owner's own ``./check`` run and read when that
+    same owner's PR merges, so it is already scoped to one task lifetime. Before
+    this, a >24h review/CI cycle stranded the chain permanently open: it could
+    never resolve (stale receipt) and never re-escalate (owner already set).
+    """
+    project_id = uuid.uuid4()
+    chain = ModuleFindingChain(
+        project_id=project_id,
+        finding_key="finding",
+        file_path="guard:backend-pytest",
+        summary="Recurring baseline guard suppression",
+        chain_kind="guard_suppression",
+        source_task_ids=[],
+        pr_numbers=[],
+        first_seen_pr=0,
+        last_seen_pr=0,
+        status="open",
+    )
+    session = _Session()
+    session.rows.append(chain)
+
+    for offset in (timedelta(days=9), -timedelta(minutes=5)):
+        # Both a long review cycle and agent-VM clock skew into the future.
+        receipt = _passing_gate_receipt()
+        receipt["recorded_at"] = (_utcnow() - offset).isoformat()
+        # Ingestion still refuses the same receipt: only resolution is exempt.
+        assert extract_guard_suppression_identities(receipt) is None
+        assert extract_guard_suppression_identities(receipt, require_fresh=False) == []
+
+        chain.status = "open"
+        chain.resolved_by_task_id = None
+        chain.resolved_at = None
+        owner = Task(
+            project_id=project_id,
+            context={
+                "publication_gate_receipt": receipt,
+                "guard_suppression_remediation_keys": [chain.finding_key],
+            },
+        )
+        chain.remediation_task_id = owner.id
+
+        assert await resolve_landed_guard_suppression_remediation(owner, session) == [chain]
+        assert chain.status == "resolved"
+        assert chain.resolved_by_task_id == owner.id
+
+
+@pytest.mark.asyncio
+async def test_resolution_still_refuses_dirty_or_malformed_owner_receipts():
+    """Freshness exemption must not weaken any other completeness rule."""
+    project_id = uuid.uuid4()
+    chain = ModuleFindingChain(
+        project_id=project_id,
+        finding_key="finding",
+        file_path="guard:backend-pytest",
+        summary="Recurring baseline guard suppression",
+        chain_kind="guard_suppression",
+        source_task_ids=[],
+        pr_numbers=[],
+        first_seen_pr=0,
+        last_seen_pr=0,
+        status="open",
+    )
+    session = _Session()
+    session.rows.append(chain)
+
+    dirty = _passing_gate_receipt(
+        suppressions=_guard_suppression("backend/testing/test_x.py::test_x::AssertionError")
+    )
+    truncated = _passing_gate_receipt(suppressions={"backend-pytest": {"state": "passed", "suppressed": {}}})
+    truncated["guard_suppressions_counts"] = {"observed_lanes": 13, "kept_lanes": 1}
+    failing = _passing_gate_receipt()
+    failing["status"] = "failed"
+    unstamped = _passing_gate_receipt()
+    unstamped.pop("recorded_at")
+    unparseable = _passing_gate_receipt()
+    unparseable["recorded_at"] = "not-a-timestamp"
+
+    for receipt in (dirty, truncated, failing, unstamped, unparseable):
+        assert extract_guard_suppression_identities(receipt, require_fresh=False) != []
+        owner = Task(
+            project_id=project_id,
+            context={
+                "publication_gate_receipt": receipt,
+                "guard_suppression_remediation_keys": [chain.finding_key],
+            },
+        )
+        chain.remediation_task_id = owner.id
+        assert await resolve_landed_guard_suppression_remediation(owner, session) == []
+        assert chain.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_recurrence_re_elects_owner_after_the_first_one_failed():
+    """A dead owner must not hold a chain open forever."""
+    project_id = uuid.uuid4()
+    identity = "backend/testing/test_x.py::test_x::AssertionError"
+    session = _TaskStoreSession()
+
+    def _source() -> Task:
+        return Task(
+            project_id=project_id,
+            context={
+                "publication_gate_receipt": _passing_gate_receipt(
+                    suppressions=_guard_suppression(identity)
+                )
+            },
+        )
+
+    def _owners() -> list[Task]:
+        return [
+            task
+            for task in session.added_tasks
+            if task.created_by == "SYSTEM_AUTO_REMEDIATION"
+        ]
+
+    for _ in range(CHAIN_ESCALATION_THRESHOLD):
+        await ingest_guard_suppression_receipt(_source(), session)
+    chain = session.rows[0]
+    first_owner_id = chain.remediation_task_id
+    assert first_owner_id is not None
+
+    # The owner is still running: a new recurrence must NOT elect a second one.
+    await ingest_guard_suppression_receipt(_source(), session)
+    assert chain.remediation_task_id == first_owner_id
+    assert len(_owners()) == 1
+
+    # A COMPLETED owner is left alone too — its landed-signal resolution may
+    # still be in flight, and a second owner would make that resolution unable
+    # to match remediation_task_id.
+    session.tasks[first_owner_id].status = TaskStatus.COMPLETED
+    await ingest_guard_suppression_receipt(_source(), session)
+    assert chain.remediation_task_id == first_owner_id
+    assert len(_owners()) == 1
+
+    # A FAILED owner is never coming back: release it and elect a new one.
+    session.tasks[first_owner_id].status = TaskStatus.FAILED
+    await ingest_guard_suppression_receipt(_source(), session)
+    assert chain.status == "open"
+    assert chain.remediation_task_id is not None
+    assert chain.remediation_task_id != first_owner_id
+    assert len(_owners()) == 2

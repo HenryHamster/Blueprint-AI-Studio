@@ -230,10 +230,10 @@ if touches "admin-ui/"; then
   # full vite bundle runs in CI after ./pr open. The build half is attributed
   # against an isolated base checkout through the shared base-attribution guard,
   # so inherited type errors warn-pass while newly introduced ones still block;
-  # unavailable attribution is fail-closed. The test-file half keeps its
-  # existing shrink-only baseline gate.
+  # unavailable attribution is fail-closed. The guard also compiles the
+  # test-file project against the base ref, so this is the complete typecheck
+  # lane.
   run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
-  run "admin-ui typecheck (test files)" bash -c 'cd "admin-ui" && node scripts/typecheck-tests-baseline.mjs'
   # The viewport-coverage invariants are NOT run as a separate step here:
   # admin-ui/src/test/viewport-coverage.test.ts asserts all five and is part of
   # the unit config's include, so the attributed vitest lane below covers them.
@@ -322,16 +322,19 @@ if touches "backend/"; then
     if [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
       _verification_stderr=$(mktemp /tmp/check_verification_resolver.XXXXXX)
       _verification_candidates=$(mktemp /tmp/check_verification_selectors.XXXXXX)
+      _verification_mandatory_candidates=$(mktemp /tmp/check_verification_mandatory.XXXXXX)
       : >"$_verification_candidates"
-      printf '%s\n' "$CHANGED" | grep -E '^backend/(testing|tests)/test_.*\.py$' | while IFS= read -r test_path; do
-        [ -f "${test_path%%::*}" ] && printf '%s\n' "$test_path"
-      done >>"$_verification_candidates" || true
+      : >"$_verification_mandatory_candidates"
       if [ "$_VERIFICATION_DIR" = "backend" ] && [ -f backend/testing/impacted_tests.py ]; then
         printf '%s\n' "$CHANGED" | python3 backend/testing/impacted_tests.py \
+          --limit 8 --mandatory-output "$_verification_mandatory_candidates" \
           >>"$_verification_candidates" 2>"$_verification_stderr"
         _verification_resolver_rc=$?
       else
         _verification_resolver_rc=0
+        printf '%s\n' "$CHANGED" | grep -E '^backend/(testing|tests)/test_.*\.py$' | while IFS= read -r test_path; do
+          [ -f "${test_path%%::*}" ] && printf '%s\n' "$test_path"
+        done >>"$_verification_candidates" || true
         while IFS= read -r changed_file; do
           [ -n "$changed_file" ] || continue
           case "$changed_file" in
@@ -353,7 +356,7 @@ if touches "backend/"; then
         cat "$_verification_stderr" >&2
         FAILED+=("$_VERIFICATION_DIR verification resolver")
       fi
-      _VERIFICATION_SELECTORS=$(
+      _VERIFICATION_ORDINARY_SELECTORS=$(
         sed 's|^backend/||' "$_verification_candidates" \
           | while IFS= read -r selector; do
               [ -n "$selector" ] || continue
@@ -361,19 +364,41 @@ if touches "backend/"; then
             done \
           | awk '!seen[$0]++'
       )
+      _VERIFICATION_MANDATORY_SELECTORS=$(
+        sed 's|^backend/||' "$_verification_mandatory_candidates" \
+          | while IFS= read -r selector; do
+              [ -n "$selector" ] || continue
+              [ -f "$_VERIFICATION_DIR/${selector%%::*}" ] && printf '%s\n' "$selector"
+            done \
+          | awk '!seen[$0]++'
+      )
+      _VERIFICATION_SELECTORS=$(printf '%s\n%s\n' \
+        "$_VERIFICATION_ORDINARY_SELECTORS" "$_VERIFICATION_MANDATORY_SELECTORS" \
+        | awk 'NF && !seen[$0]++')
       rm -f "$_verification_candidates"
+      rm -f "$_verification_mandatory_candidates"
       rm -f "$_verification_stderr"
     fi
     if [ "$_VERIFICATION_RUFF_OK" = "1" ] && [ -z "$_VERIFICATION_SELECTORS" ]; then
       echo "[check] required backend verification FAILED — no impacted pytest file/node was resolved"
       FAILED+=("$_VERIFICATION_DIR verification: no impacted pytest")
     elif [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
-      _verification_count=$(printf '%s\n' "$_VERIFICATION_SELECTORS" | grep -c '^' || true)
-      if [ "$_verification_count" -gt 8 ]; then
-        echo "[check] required backend verification: $_verification_count impacted files; running the 8 most diff-relevant (the remainder are not run here)"
+      _verification_ordinary_count=$(printf '%s\n' "$_VERIFICATION_ORDINARY_SELECTORS" | grep -c . || true)
+      _verification_mandatory_count=$(printf '%s\n' "$_VERIFICATION_MANDATORY_SELECTORS" | grep -c . || true)
+      if [ "$_verification_ordinary_count" -gt 8 ]; then
+        echo "[check] required backend verification FAILED — resolver exceeded ordinary selector cap: $_verification_ordinary_count"
+        FAILED+=("$_VERIFICATION_DIR verification: ordinary selector cap")
       fi
-      mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS" | head -n 8)
+      if [ "$_verification_mandatory_count" -gt 0 ]; then
+        echo "[check] required backend verification: retaining $_verification_mandatory_count matched surface sentinel(s) past the ordinary cap"
+      fi
+      mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS")
+      mapfile -t _verification_mandatory_selector_args < <(printf '%s\n' "$_VERIFICATION_MANDATORY_SELECTORS")
       _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
+      _verification_mandatory_selectors_encoded=""
+      if [ "$_verification_mandatory_count" -gt 0 ]; then
+        _verification_mandatory_selectors_encoded=$(printf '%s\n' "${_verification_mandatory_selector_args[@]}" | base64 | tr -d '\n')
+      fi
       _verification_postgres_flag=""
       if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
         echo "[check] required backend verification FAILED — sanctioned harness missing: $_VERIFICATION_HARNESS"
@@ -403,7 +428,7 @@ if touches "backend/"; then
         _verification_current_junit="$_verification_attribution_dir/current.xml"
         rm -f "$_verification_harness_receipt" "$_verification_current_junit"
         _verification_exit=0
-        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" BLUEPRINT_VERIFICATION_JUNIT="$_verification_current_junit" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ); then
+        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" BLUEPRINT_VERIFICATION_JUNIT="$_verification_current_junit" BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS="$_verification_mandatory_selectors_encoded" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ); then
           :
         else
           _verification_exit=$?

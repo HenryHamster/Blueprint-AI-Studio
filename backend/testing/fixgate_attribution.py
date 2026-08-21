@@ -255,7 +255,12 @@ def parse_junit_failures(
 def _test_key(failure_key: str) -> str:
     # New keys always carry ``::<failure-kind>``. Direct callers from older
     # receipts may provide the historic route::test key; retaining it here is
-    # deliberate compatibility for already-produced artifacts.
+    # deliberate compatibility for already-produced artifacts. Repeated
+    # diagnostics append an occurrence discriminator *after* the failure kind,
+    # but coverage remains keyed by the shared route/testcase identity.
+    parts = failure_key.rsplit("::", 1)
+    if len(parts) == 2 and re.fullmatch(r"occurrence=[1-9]\d*", parts[1]):
+        failure_key = parts[0]
     parts = failure_key.rsplit("::", 1)
     return parts[0] if len(parts) == 2 and parts[1] in {"failure", "error"} else failure_key
 

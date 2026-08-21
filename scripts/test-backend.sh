@@ -498,6 +498,9 @@ fi
 if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ] && [ "$USE_DOCKER" = "1" ]; then
   DOCKER_ARGS+=(-e "BLUEPRINT_STATIC_GUARD_SELECTORS=$BLUEPRINT_STATIC_GUARD_SELECTORS")
 fi
+if [ -n "${BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS:-}" ] && [ "$USE_DOCKER" = "1" ]; then
+  DOCKER_ARGS+=(-e "BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS=$BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS")
+fi
 
 ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
   USE_TEST_POSTGRES=$([ "$USE_POSTGRES" = "1" ] && echo true || echo false) \
@@ -508,6 +511,9 @@ ENV_VARS="DATABASE_URL=${PG_DSN:-postgresql+asyncpg://x:x@localhost/x} \
   GITHUB_PAT_ENCRYPTION_KEY=$TEST_ENCRYPTION_KEY \
   AGENT_JWT_SECRET=ci-test-secret-min-32-bytes-xxxxx \
   WS_TICKET_SECRET=ci-test-ws-secret-min-32-bytes-xx"
+if [ -n "${BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS:-}" ]; then
+  ENV_VARS="$ENV_VARS BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS=$BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS"
+fi
 
 _run() {
   # _run <cmd...> — runs inside Docker or directly, with env vars set
@@ -813,9 +819,36 @@ if [ $# -gt 0 ]; then
       exit 2
     }
     verification_selector_count=0
+    verification_ordinary_selector_count=0
+    verification_mandatory_selector_count=0
+    verification_mandatory_selectors=()
+    if [ -n "${BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS:-}" ]; then
+      verification_mandatory_tmp=$(mktemp /tmp/blueprint-mandatory-selectors.XXXXXX)
+      if ! printf '%s' "$BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS" | base64 --decode >"$verification_mandatory_tmp"; then
+        rm -f "$verification_mandatory_tmp"
+        echo "ERROR: malformed mandatory verification selector allowlist" >&2
+        exit 2
+      fi
+      mapfile -t verification_mandatory_selectors <"$verification_mandatory_tmp"
+      rm -f "$verification_mandatory_tmp"
+    fi
+    verification_is_mandatory() {
+      local candidate="$1" mandatory
+      for mandatory in "${verification_mandatory_selectors[@]}"; do
+        [ "$candidate" = "$mandatory" ] && return 0
+      done
+      return 1
+    }
     for selector in "$@"; do
       case "$selector" in
-        testing/test_*.py|testing/test_*.py::*) verification_selector_count=$((verification_selector_count + 1)) ;;
+        testing/test_*.py|testing/test_*.py::*)
+          verification_selector_count=$((verification_selector_count + 1))
+          if verification_is_mandatory "$selector"; then
+            verification_mandatory_selector_count=$((verification_mandatory_selector_count + 1))
+          else
+            verification_ordinary_selector_count=$((verification_ordinary_selector_count + 1))
+          fi
+          ;;
         *)
           echo "ERROR: unsupported verification pytest argument: $selector" >&2
           exit 2
@@ -826,8 +859,12 @@ if [ $# -gt 0 ]; then
       echo "ERROR: verification evidence requires a targeted testing/test_*.py file or node" >&2
       exit 2
     }
-    [ "$verification_selector_count" -le 8 ] || {
-      echo "ERROR: verification evidence is bounded to at most 8 targeted selectors" >&2
+    [ "$verification_ordinary_selector_count" -le 8 ] || {
+      echo "ERROR: verification evidence is bounded to at most 8 ordinary targeted selectors" >&2
+      exit 2
+    }
+    [ "$verification_mandatory_selector_count" -eq "${#verification_mandatory_selectors[@]}" ] || {
+      echo "ERROR: every mandatory verification selector must be carried exactly once" >&2
       exit 2
     }
     rm -f "$BLUEPRINT_VERIFICATION_RESULT_FILE"

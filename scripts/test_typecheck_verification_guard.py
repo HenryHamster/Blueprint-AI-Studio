@@ -173,6 +173,28 @@ def test_inherited_diagnostic_that_moved_lines_keeps_its_identity(
     assert "FAILED" not in output
 
 
+def test_extra_identical_diagnostic_blocks_as_a_new_occurrence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A second same-file TS diagnostic is new even though its position is not identity."""
+
+    _stub_environment(
+        monkeypatch,
+        tmp_path,
+        current_output=f"{_INHERITED}\n{_INHERITED_MOVED}",
+        base_output=_INHERITED,
+    )
+
+    assert _run(tmp_path) == 1
+    output = capsys.readouterr().out
+    assert "WARN suppressed baseline diagnostic" in output
+    assert (
+        "new diagnostic: agent/src/example.ts::error TS2345: Argument of type 'A' is "
+        "not assignable to parameter of type 'B'.::error::occurrence=2"
+    ) in output
+    assert "FAILED state=type_failure new_diagnostic_count=1" in output
+
+
 def test_fixed_inherited_diagnostic_does_not_block(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -428,8 +450,8 @@ def test_solution_reference_drift_blocks(
     assert "FAILED state=project_configuration_mismatch" in capsys.readouterr().out
 
 
-def test_parse_diagnostics_keys_by_file_code_and_message_only(tmp_path: Path) -> None:
-    """Identity excludes position; related information and summaries are not identity."""
+def test_parse_diagnostics_preserves_multiplicity_without_position(tmp_path: Path) -> None:
+    """Identity excludes position while retaining each repeated diagnostic occurrence."""
 
     output = (
         "src/example.ts(12,5): error TS2345: bad argument\n"
@@ -446,11 +468,46 @@ def test_parse_diagnostics_keys_by_file_code_and_message_only(tmp_path: Path) ->
     assert sorted(parsed.report.failures) == [
         "<global>::error TS18003: No inputs were found in config file.::error",
         "agent/src/example.ts::error TS2345: bad argument::error",
+        "agent/src/example.ts::error TS2345: bad argument::error::occurrence=2",
     ]
-    assert parsed.locations["agent/src/example.ts::error TS2345: bad argument::error"] == [
-        "12:5",
-        "99:2",
-    ]
+    assert parsed.locations[
+        "agent/src/example.ts::error TS2345: bad argument::error"
+    ] == ["12:5"]
+    assert parsed.locations[
+        "agent/src/example.ts::error TS2345: bad argument::error::occurrence=2"
+    ] == ["99:2"]
+
+
+def test_parse_diagnostics_routes_repeated_identical_failures_by_testcase(
+    tmp_path: Path,
+) -> None:
+    """Repeated inherited diagnostics remain present testcases, not coverage loss."""
+
+    output = (
+        "src/example.ts(12,5): error TS2345: bad argument\n"
+        "src/example.ts(99,2): error TS2345: bad argument\n"
+    )
+    current = guard._parse_diagnostics(
+        output, project_root=tmp_path / "agent", tree_root=tmp_path, label="current"
+    )
+    baseline = guard._parse_diagnostics(
+        output, project_root=tmp_path / "agent", tree_root=tmp_path, label="baseline"
+    )
+
+    attributed = guard.attribute_reports(current.report, baseline.report)
+
+    assert current.report.test_routes == {
+        "agent/src/example.ts::error TS2345: bad argument"
+    }
+    assert attributed.disappeared_failures == {}
+    assert attributed.suppressed_failures == {
+        "agent/src/example.ts::error TS2345: bad argument::error": (
+            "agent/src/example.ts: error TS2345: bad argument"
+        ),
+        "agent/src/example.ts::error TS2345: bad argument::error::occurrence=2": (
+            "agent/src/example.ts: error TS2345: bad argument"
+        ),
+    }
 
 
 def test_parse_diagnostics_rejects_an_unrecognized_line(tmp_path: Path) -> None:

@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Literal
@@ -35,6 +36,11 @@ Surface = Literal["backend", "agent", "admin-ui"]
 # single source of truth for both, so a rule change is one edit observed by
 # the local invariant tests and the remote gate together.
 BRANCH_LITERAL_ALLOWLIST_PATH = "backend/testing/branch_literal_allowlist.json"
+
+
+def normalize_source_anchor(source: str) -> str:
+    """Normalize a source line for a line-number-independent allowlist key."""
+    return " ".join(source.strip().split())
 
 
 def _allowlist_file_path() -> Path:
@@ -111,15 +117,23 @@ def _surface_allowlist_from_json(
             if not isinstance(item, dict):
                 continue
             path = item.get("path")
-            line = item.get("line")
             pattern = item.get("pattern")
-            if not isinstance(path, str) or not isinstance(line, int) or not isinstance(pattern, str):
+            source = item.get("source")
+            count = item.get("count")
+            if (
+                not isinstance(path, str)
+                or not isinstance(pattern, str)
+                or not isinstance(source, str)
+                or not isinstance(count, int)
+                or count < 1
+            ):
                 continue
             entries.append(
                 BranchLiteralAllowEntry(
                     path=path,
-                    line=line,
                     pattern=pattern,
+                    source=normalize_source_anchor(source),
+                    count=count,
                     rationale=str(item.get("rationale", "")),
                 )
             )
@@ -141,8 +155,9 @@ class BranchLiteralPattern:
 @dataclass(frozen=True)
 class BranchLiteralAllowEntry:
     path: str
-    line: int
     pattern: str
+    source: str
+    count: int
     rationale: str
 
 
@@ -407,8 +422,24 @@ def _strip_typescript_lines(lines: list[str]) -> list[str]:
     return stripped
 
 
-def _allow_key(entry: BranchLiteralAllowEntry | BranchLiteralOffender) -> str:
-    return f"{entry.path}::{entry.line}::{entry.pattern}"
+def _allow_key(path: str, pattern: str, source: str) -> tuple[str, str, str]:
+    return path, pattern, normalize_source_anchor(source)
+
+
+def _scanned_lines(
+    file_path: Path, config: BranchLiteralSurfaceConfig
+) -> list[tuple[int, str]]:
+    raw_lines = file_path.read_text(encoding="utf-8").split("\n")
+    lines = (
+        [_strip_python_line(line) for line in raw_lines]
+        if config.comment_style == "python"
+        else _strip_typescript_lines(raw_lines)
+    )
+    return [
+        (index, line)
+        for index, line in enumerate(lines, start=1)
+        if line.strip()
+    ]
 
 
 def scan_branch_literal_surface(
@@ -417,24 +448,22 @@ def scan_branch_literal_surface(
 ) -> BranchLiteralScanResult:
     config = SURFACE_CONFIGS[surface]
     root_path = Path(root)
-    allow_set = {_allow_key(entry) for entry in config.allowlist}
+    allow_counts = {
+        _allow_key(entry.path, entry.pattern, entry.source): entry.count
+        for entry in config.allowlist
+    }
+    observed_counts: Counter[tuple[str, str, str]] = Counter()
     offenders: list[BranchLiteralOffender] = []
     files_scanned = 0
 
     for file_path in _iter_source_files(root_path, config):
         files_scanned += 1
         rel = file_path.relative_to(root_path).as_posix()
-        raw_lines = file_path.read_text(encoding="utf-8").split("\n")
-        lines = (
-            [_strip_python_line(line) for line in raw_lines]
-            if config.comment_style == "python"
-            else _strip_typescript_lines(raw_lines)
-        )
-        for index, line in enumerate(lines, start=1):
-            if not line.strip():
-                continue
+        for index, line in _scanned_lines(file_path, config):
             for pattern in config.patterns:
                 if pattern.regex.search(line):
+                    allow_key = _allow_key(rel, pattern.name, line)
+                    observed_counts[allow_key] += 1
                     offender = BranchLiteralOffender(
                         surface=surface,
                         path=rel,
@@ -442,7 +471,7 @@ def scan_branch_literal_surface(
                         pattern=pattern.name,
                         snippet=line.strip()[:160],
                     )
-                    if _allow_key(offender) not in allow_set:
+                    if observed_counts[allow_key] > allow_counts.get(allow_key, 0):
                         offenders.append(offender)
 
     stale_allowlist = _find_stale_allowlist_entries(surface, root_path, config)
@@ -465,20 +494,30 @@ def _find_stale_allowlist_entries(
     for entry in config.allowlist:
         file_path = root / entry.path
         try:
-            lines = file_path.read_text(encoding="utf-8").split("\n")
+            scanned_lines = _scanned_lines(file_path, config)
         except FileNotFoundError:
-            line = ""
-        else:
-            line = lines[entry.line - 1] if entry.line - 1 < len(lines) else ""
+            scanned_lines = []
         pattern = patterns_by_name.get(entry.pattern)
-        if pattern is None or not pattern.regex.search(line):
+        matches = [
+            (line_number, line)
+            for line_number, line in scanned_lines
+            if pattern is not None
+            and pattern.regex.search(line)
+            and normalize_source_anchor(line) == entry.source
+        ]
+        if len(matches) != entry.count:
+            first_line = matches[0][0] if matches else 0
+            found = (
+                f"{len(matches)} occurrence(s); "
+                f"{normalize_source_anchor(matches[0][1]) if matches else ''}"
+            )
             stale.append(
                 StaleBranchLiteralAllowEntry(
                     surface=surface,
                     path=entry.path,
-                    line=entry.line,
+                    line=first_line,
                     pattern=entry.pattern,
-                    found=line.strip()[:120],
+                    found=found[:120],
                 )
             )
     return stale

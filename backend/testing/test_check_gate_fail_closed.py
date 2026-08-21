@@ -557,6 +557,142 @@ def test_attributed_gate_names_unavailable_baseline_and_blocks(tmp_path: Path) -
     assert "cannot resolve base ref" in verdict["error"]
 
 
+def test_rendered_gate_carries_all_matched_sentinels_past_ordinary_cap(tmp_path: Path) -> None:
+    """The rendered gate sends eight ordinary tests plus every sentinel to harness."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scripts = repo / "scripts"
+    backend = repo / "backend"
+    (backend / "app").mkdir(parents=True)
+    (backend / "testing").mkdir(parents=True)
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "impacted_tests.py",
+        backend / "testing" / "impacted_tests.py",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py",
+        backend / "testing" / "fixgate_attribution.py",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "backend" / "testing" / "drift_sentinel_surfaces.json",
+        backend / "testing" / "drift_sentinel_surfaces.json",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "scripts" / "backend_verification_guard.py",
+        scripts / "backend_verification_guard.py",
+    )
+    (scripts / "backend-test-route.sh").write_text(
+        "select_backend_test_route() { printf '%s\n' --postgres; }\n",
+        encoding="utf-8",
+    )
+    (scripts / "record_selectors.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "selectors = sys.argv[2:]\n"
+        "Path(os.environ['SELECTOR_LOG']).write_text(json.dumps(selectors), encoding='utf-8')\n"
+        "cases = ''.join(f'<testcase classname=\"testing.synthetic\" name=\"{s}\" />' for s in selectors)\n"
+        "Path(os.environ['BLUEPRINT_VERIFICATION_JUNIT']).write_text(f'<testsuite tests=\"{len(selectors)}\">{cases}</testsuite>', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    harness = scripts / "test-backend.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\nexec python3 scripts/record_selectors.py \"$@\"\n",
+        encoding="utf-8",
+    )
+    harness.chmod(harness.stat().st_mode | stat.S_IXUSR)
+    sentinel_paths = [
+        "backend/testing/test_event_sentinel.py",
+        "backend/testing/test_tree_sentinel.py",
+    ]
+    for path in sentinel_paths:
+        (repo / path).write_text("def test_inventory(): pass\n", encoding="utf-8")
+    for index in range(12):
+        (backend / "testing" / f"test_fanout_{index:02d}.py").write_text(
+            "from app.changed import VALUE\n", encoding="utf-8"
+        )
+    (backend / "app" / "changed.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (backend / "testing" / "drift_sentinel_surfaces.json").write_text(
+        json.dumps(
+            {
+                "surfaces": [
+                    {
+                        "glob": "backend/app/**/*.py",
+                        "sentinels": sentinel_paths,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "branch", "automain")
+    (backend / "app" / "changed.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    fragment = (
+        _REPO_ROOT / "agent" / "src" / "prompts" / "check_backend_verification.sh"
+    ).read_text(encoding="utf-8")
+    for token, value in {
+        "@DIR_RE@": "backend",
+        "@PYTHON_PATH_RE@": r"^backend/.*\.py$",
+        "@TEST_PATH_RE@": r"^backend/(testing|tests)/test_.*\.py$",
+        "@SELECTOR_PREFIX_RE@": "backend/",
+        "@DIR@": "backend",
+        "@HARNESS@": "scripts/test-backend.sh",
+    }.items():
+        fragment = fragment.replace(token, value)
+    gate = repo / "attributed-sentinel-gate.sh"
+    gate.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        "FAILED=()\n"
+        "BASE=automain\n"
+        "_VERIFY_TASK_ID=sentinel-retention\n"
+        "_VERIFY_RECEIPT=\"$WORKSPACE/receipt.json\"\n"
+        "_VERIFY_HARNESS_RECEIPT=\"$WORKSPACE/harness-receipt.json\"\n"
+        "_VERIFY_CAPABILITY_RECEIPT=\"$WORKSPACE/capability-receipt.txt\"\n"
+        "CHANGED='backend/app/changed.py'\n"
+        + fragment
+        + "\nif ! declare -p FAILED | grep -q '=()$'; then exit 1; fi\n",
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"ruff\" ]; then exit 0; fi\n"
+        f"exec {sys.executable} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    selector_log = tmp_path / "selectors.json"
+    env = os.environ | {
+        "WORKSPACE": str(repo),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SELECTOR_LOG": str(selector_log),
+    }
+    result = subprocess.run(
+        ["bash", str(gate)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    selectors = json.loads(selector_log.read_text(encoding="utf-8"))
+    assert [selector for selector in selectors if "fanout" in selector] == [
+        f"testing/test_fanout_{i:02d}.py" for i in range(8)
+    ]
+    assert [selector for selector in selectors if "sentinel" in selector] == [
+        "testing/test_event_sentinel.py",
+        "testing/test_tree_sentinel.py",
+    ]
+    assert len(selectors) == len(set(selectors)) == 10
+
+
 def test_uuid_bearing_baseline_failure_is_attributed_preexisting() -> None:
     """A run-generated UUID in a traceback must not defeat baseline suppression.
 

@@ -2101,7 +2101,9 @@ class TestProjectVerificationRuntimeContract:
         assert "BLUEPRINT_VERIFICATION_RESULT_FILE" in harness
         assert 'USE_TEST_POSTGRES:-' in harness
         assert 'testing/test_*.py|testing/test_*.py::*' in harness
-        assert 'verification_selector_count" -le 8' in harness
+        assert 'verification_ordinary_selector_count" -le 8' in harness
+        assert "BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS" in harness
+        assert "every mandatory verification selector must be carried exactly once" in harness
         assert (
             'VERIFICATION_HOST_JUNIT="$VERIFICATION_OUTPUT_DIR/'
             '${VERIFICATION_JUNIT_NAME:-junit.xml}"'

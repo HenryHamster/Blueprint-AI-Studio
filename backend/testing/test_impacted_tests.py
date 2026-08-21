@@ -1058,6 +1058,63 @@ def test_main_limit_defers_overflow_to_stderr(tmp_path, capsys):
     assert stderr == ["deferred-unverified: backend/testing/test_mod2.py"]
 
 
+def test_capped_impacted_selection_retains_surface_sentinels(tmp_path, capsys):
+    """The ordinary cap never drops a matched sentinel from the gate payload."""
+    root = str(tmp_path)
+    _make_tree(root)
+    for index in range(12):
+        _write(
+            root,
+            f"backend/testing/test_fanout_{index:02d}.py",
+            "from app.foo import bar\n",
+        )
+    for name in ("test_tree_sentinel.py", "test_event_sentinel.py"):
+        _write(root, f"backend/testing/{name}", "def test_inventory(): pass\n")
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/**/*.py",
+                "sentinels": [
+                    "backend/testing/test_tree_sentinel.py",
+                    "backend/testing/test_event_sentinel.py",
+                    "backend/testing/test_tree_sentinel.py",
+                ],
+            }
+        ],
+    )
+
+    ordinary, mandatory = impacted_tests.resolve_impacted_partition(
+        ["backend/app/foo.py"], root
+    )
+    assert len(ordinary) == 12
+    assert mandatory == [
+        "backend/testing/test_event_sentinel.py",
+        "backend/testing/test_tree_sentinel.py",
+    ]
+
+    mandatory_output = os.path.join(root, "mandatory.txt")
+    rc = impacted_tests.main(
+        [
+            "backend/app/foo.py",
+            "--limit",
+            "8",
+            "--mandatory-output",
+            mandatory_output,
+            "--repo-root",
+            root,
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ordinary[:8]
+    assert captured.err.splitlines() == [
+        f"deferred-unverified: {path}" for path in ordinary[8:]
+    ]
+    with open(mandatory_output, encoding="utf-8") as fh:
+        assert fh.read().splitlines() == mandatory
+
+
 def test_directly_changed_tests_rank_first(tmp_path):
     root = str(tmp_path)
     _make_tree(root)

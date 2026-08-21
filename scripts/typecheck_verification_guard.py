@@ -80,11 +80,8 @@ SUITES = {
             ("-p", "tsconfig.test.json", "--noEmit"),
         ),
         source_programs=("tsconfig.app.json", "tsconfig.node.json"),
-        # The shrink-only ``tsconfig.test.baseline.json`` snapshot never runs a
-        # base compile, so the test project is ALSO checked here for real and
-        # attributed. The two are complementary and both stay armed: the
-        # snapshot bounds the test program's error count, this lane proves no
-        # error in it is new relative to base.
+        # Compile the test project against the base ref as part of this same
+        # attributed lane, so inherited test-file errors cannot block a task.
         extra_programs=("tsconfig.test.json",),
         solution="tsconfig.json",
     ),
@@ -125,6 +122,30 @@ class CompileResult:
 
     report: JUnitReport = field(default_factory=JUnitReport)
     locations: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DiagnosticIdentity:
+    """One occurrence of a structured TypeScript diagnostic.
+
+    ``FailureIdentity`` intentionally omits the source position so line motion
+    does not turn inherited diagnostics into new failures.  A compiler can
+    nevertheless emit the same structured diagnostic more than once, and each
+    occurrence must remain independently attributable.  The ordinal is local
+    to that position-free identity, so it preserves multiplicity without
+    making line or column part of the comparison contract.
+    """
+
+    failure: FailureIdentity
+    occurrence: int
+
+    @property
+    def key(self) -> str:
+        # Keep every existing single-diagnostic receipt key stable.  Only a
+        # repeated occurrence needs a discriminator for the shared attributor.
+        if self.occurrence == 1:
+            return self.failure.key
+        return f"{self.failure.key}::occurrence={self.occurrence}"
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -305,13 +326,15 @@ def _parse_diagnostics(
 ) -> CompileResult:
     """Convert ``tsc --pretty false`` output into route-keyed failure identities.
 
-    Identity is (repo-relative file, severity + TS code + message).  Line and
-    column are deliberately excluded from the key so that unrelated line motion
-    elsewhere in a file cannot re-key an inherited diagnostic; they are kept
-    only as reporting context.
+    The base identity is (repo-relative file, severity + TS code + message).
+    Line and column are deliberately excluded so unrelated line motion cannot
+    re-key an inherited diagnostic; they are kept only as reporting context.
+    Repeated base identities receive an occurrence ordinal, preserving the
+    diagnostic count for the shared report attributor.
     """
 
     result = CompileResult()
+    occurrences: dict[str, int] = {}
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
         if not line.strip():
@@ -339,10 +362,17 @@ def _parse_diagnostics(
         message = _normalize_message(match.group("message"))
         testcase = f"{match.group('severity')} {match.group('code')}: {message}"
         identity = FailureIdentity(route=route, testcase=testcase, kind="error")
+        occurrence = occurrences.get(identity.key, 0) + 1
+        occurrences[identity.key] = occurrence
+        diagnostic = DiagnosticIdentity(identity, occurrence)
+        # ``test_routes`` is the route/testcase roster consumed by the shared
+        # attributor's coverage check.  ``diagnostic.key`` also includes the
+        # failure kind and (for repeats) an occurrence discriminator, which
+        # belongs only to the failure map.
         result.report.test_routes.add(identity.test_key)
-        result.report.failures[identity.key] = f"{route}: {testcase}"
+        result.report.failures[diagnostic.key] = f"{route}: {testcase}"
         if location:
-            result.locations.setdefault(identity.key, []).append(location)
+            result.locations.setdefault(diagnostic.key, []).append(location)
     return result
 
 

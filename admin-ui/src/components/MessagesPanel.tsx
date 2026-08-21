@@ -48,7 +48,6 @@ import {
   computeStrategicSessionActivity,
   computeStrategicStreamingTurn,
   scopeStrategicTranscript,
-  type StrategicChatLiveState,
 } from '../utils/strategicSessionLive';
 import { StrategicStreamingPreview } from './StrategicStreamingPreview';
 import { buildConversationWorkdayStatus, type ConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
@@ -434,12 +433,6 @@ export interface MessagesPanelProps {
    * an empty buffer) yields exactly the poll-only rendering.
    */
   strategicSessionTranscript?: StrategicSessionDelta[];
-  /**
-   * Reports the derived Chat-mode in-flight state so the header's
-   * StrategicSessionControl can render the same live affordance the thread
-   * shows, instead of deriving a second one.
-   */
-  onChatLiveStateChange?: (state: StrategicChatLiveState | null) => void;
   /** Record a successful operator interaction with Strategic workbench state. */
   onStrategicInteraction?: () => void | Promise<void>;
   /** Open the Strategic context workspace from the minimal Strategic composer. */
@@ -521,7 +514,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, active = true, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onWorkdayStatusChange, strategicSessionTranscript, onChatLiveStateChange, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, active = true, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, strategicSessionTranscript, onStrategicInteraction, onWorkdayStatusChange, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -1310,14 +1303,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     () => computeStrategicChatLiveState(strategicStreamingTurn, strategicLiveActivity),
     [strategicStreamingTurn, strategicLiveActivity],
   );
-  useEffect(() => {
-    onChatLiveStateChange?.(strategicChatLiveState);
-  }, [strategicChatLiveState, onChatLiveStateChange]);
+  // Hoisted out of the Workday-status memo: the utility bar needs the same
+  // single mode value to decide which readout owns the shared status slot.
+  // A plain string — memoizing it would buy no referential stability.
+  const strategicInteractionMode = strategicWorkbenchState?.interaction_mode
+    ?? currentStrategicState?.workbench?.interaction_mode
+    ?? currentStrategicState?.work_session?.mode
+    ?? 'chat';
   const conversationWorkdayStatus = useMemo(() => {
-    const interactionMode = strategicWorkbenchState?.interaction_mode
-      ?? currentStrategicState?.workbench?.interaction_mode
-      ?? currentStrategicState?.work_session?.mode
-      ?? 'chat';
+    const interactionMode = strategicInteractionMode;
     const residentActivity = computeResidentActivityState(
       scopedSessionTranscript,
       conversationMessages,
@@ -1331,7 +1325,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       residentTaskId: currentStrategicState?.resident_session?.task_id,
       conversationMessages,
     });
-  }, [conversationMessages, currentStrategicState, scopedSessionTranscript, strategicWorkbenchState?.interaction_mode]);
+  }, [conversationMessages, currentStrategicState, scopedSessionTranscript, strategicInteractionMode]);
   useEffect(() => {
     onWorkdayStatusChange?.(conversationWorkdayStatus);
   }, [conversationWorkdayStatus, onWorkdayStatusChange]);
@@ -3020,6 +3014,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
           expanded={chatChromeExpanded} onExpand={() => persistChatChrome(true)} onCollapse={() => persistChatChrome(false)}
           searchQuery={searchQuery} onSearchChange={setSearchQuery}
           workdayStatus={conversationWorkdayStatus}
+          chatLiveState={strategicChatLiveState}
+          interactionMode={strategicInteractionMode}
           detailRevealed={chatDetailRevealed} onToggleDetail={persistChatDetailRevealed}
         />
       )}

@@ -5453,6 +5453,45 @@ class TestBranchLiteralComplianceScanner:
         ]
         assert offenders[0].snippet == 'branch = "main"'
 
+    def test_allowlist_survives_unrelated_line_insertion(self, tmp_path, monkeypatch):
+        """A structural source anchor remains valid when its line number moves."""
+        from dataclasses import replace
+
+        from app.branch_literal_compliance import (
+            BranchLiteralAllowEntry,
+            SURFACE_CONFIGS,
+            scan_branch_literal_surface,
+        )
+
+        agent_src = tmp_path / "agent"
+        agent_src.mkdir()
+        source = "const base = task.baseBranch ?? 'main';"
+        entry = BranchLiteralAllowEntry(
+            path="runner.ts",
+            pattern="fallback-main",
+            source=source,
+            count=1,
+            rationale="test structural anchor",
+        )
+        config = replace(SURFACE_CONFIGS["agent"], allowlist=(entry,))
+        monkeypatch.setitem(SURFACE_CONFIGS, "agent", config)
+
+        runner = agent_src / "runner.ts"
+        runner.write_text(source + "\n", encoding="utf-8")
+        before = scan_branch_literal_surface("agent", agent_src)
+        runner.write_text("// unrelated edit\n" + source + "\n", encoding="utf-8")
+        after = scan_branch_literal_surface("agent", agent_src)
+
+        assert before.offenders == []
+        assert before.stale_allowlist == []
+        assert after.offenders == []
+        assert after.stale_allowlist == []
+
+        runner.write_text(source + "\n" + source + "\n", encoding="utf-8")
+        duplicated = scan_branch_literal_surface("agent", agent_src)
+        assert len(duplicated.offenders) == 1
+        assert len(duplicated.stale_allowlist) == 1
+
 # ── Self-repo branch resolution guard ──────────────────────────────────────
 
 class TestSelfRepoBranchResolution:
@@ -13792,20 +13831,9 @@ def test_no_callers_pass_raise_on_size_limit_false():
     The default is ``raise_on_size_limit=True``, which is the intended behavior
     per this direction's goal ('writes fail loudly instead of truncating'). A
     caller that passes ``False`` opts back into the legacy silent-truncation
-    behavior. If a legitimate caller needs this, add it to the allowlist below
-    with a documented rationale.
+    behavior. If a legitimate caller needs this, the guard must be deliberately
+    changed with a documented rationale rather than pinned to a source line.
     """
-    # Allowlist: (rel_path, lineno, rationale). Keep as close to empty as possible — no caller
-    # should silence the size-cap guard.
-    _ALLOWLIST: frozenset[tuple[str, int, str]] = frozenset({
-        (
-            "app/efficiency_snapshot.py",
-            307,
-            "Telemetry mirror: silently skip the stale snapshot write when "
-            "the design_doc container is full — crashing the telemetry sync "
-            "is worse than a slightly stale efficiency snapshot.",
-        ),
-    })
     app_dir = BACKEND_ROOT / "app"
     # Known aliases for with_design_doc_locked in production code
     _ALIASES: frozenset[str] = frozenset({
@@ -13854,14 +13882,9 @@ def test_no_callers_pass_raise_on_size_limit_false():
             for kw in node.keywords:
                 if kw.arg == "raise_on_size_limit":
                     if isinstance(kw.value, ast.Constant) and kw.value.value is False:
-                        allowlisted = any(
-                            a[0] == rel and a[1] == node.lineno
-                            for a in _ALLOWLIST
+                        offenders.append(
+                            f"  {rel}:{node.lineno}: passes raise_on_size_limit=False to {func_name}"
                         )
-                        if not allowlisted:
-                            offenders.append(
-                                f"  {rel}:{node.lineno}: passes raise_on_size_limit=False to {func_name}"
-                            )
 
     assert not offenders, (
         "The following call site(s) pass ``raise_on_size_limit=False`` to "
