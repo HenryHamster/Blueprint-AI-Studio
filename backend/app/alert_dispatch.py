@@ -33,6 +33,7 @@ from app.models import (
     Alert,
     AlertSeverity,
     ComputeJob,  # used in the "ComputeJob" string annotation
+    TASK_OUTCOME_TERMINAL_STATUSES,
 )
 from app.alert_policy import create_project_alert_if_allowed
 from app.notification import _send_webhook_notification
@@ -1674,6 +1675,96 @@ async def _resolve_blocked_escalation_alert(
             {"alert_id": str(alert.id), "title": alert.title},
         )
     return len(open_alerts)
+
+
+# Alert event type shared by every "this task is stuck right now" emitter:
+#   * ``reaper_sweeps``            -> "Task stalled in queue: …"      (QUEUED too long)
+#   * ``recovery_evaluating``      -> "Task … stuck evaluating"       (EVALUATING too long)
+#   * ``_maybe_create_precondition_blocker_alert`` -> "Precondition blocker: …"
+#   * ``_maybe_create_blocked_escalation_alert``   -> "Task permanently blocked: …"
+#   * the compute no-progress watchdog             -> job made no measurable progress
+# Every one of them asserts an *in-flight* condition, so none can still be true
+# once the task reaches a terminal outcome.
+_STUCK_TASK_ALERT_EVENT_TYPE = "task.blocked"
+
+# Bound the per-cycle batch so one sweep can never hold a write transaction open
+# across an unbounded backlog. Any residue is picked up on the next reaper cycle.
+_TERMINAL_TASK_ALERT_SWEEP_LIMIT = 200
+
+
+async def sweep_resolve_terminal_task_alerts(
+    session: AsyncSession,
+    *,
+    limit: int = _TERMINAL_TASK_ALERT_SWEEP_LIMIT,
+) -> int:
+    """Dismiss open "task is stuck" alerts whose task has since gone terminal.
+
+    Every ``task.blocked`` emitter describes a condition that only exists while
+    the task is still in flight — parked on a precondition, aging in the queue,
+    hung in EVALUATING, or running a compute job that stopped progressing. None
+    of those can hold once the task is COMPLETED, FAILED, or CANCELLED, so an
+    alert still open against a terminal task is stating something false.
+
+    Only :func:`_resolve_blocked_escalation_alert` ever retired one of these,
+    and only on the *resume* path (``blocked_task_unblock_sweeps``,
+    ``orchestrator_health``). Nothing retired them when the task instead ended
+    — which is where almost all of them end up. Measured on the live feed
+    2026-08-21: of 20 tasks holding an open ``task.blocked`` alert, 14 were
+    already terminal and exactly one was actually BLOCKED.
+
+    This sweep is deliberately **condition-derived rather than
+    transition-derived**: it re-reads the task's current status instead of
+    hooking each way a task can end, so it cannot be defeated by a termination
+    path that forgets to call it (the exact failure mode that left the resume
+    path as the only resolver).
+
+    Clearing these also restores *notification*, not just tidiness. The create
+    paths dedupe on ``(task_id, title)`` among undismissed rows, so a stale open
+    alert silently suppresses a real new one when a terminal task is requeued
+    and gets stuck again. Under-clearing and under-notifying are the same bug.
+
+    Only open (``dismissed_at IS NULL``) task-scoped alerts are touched, so this
+    is a safe no-op when none exists and idempotent across repeated calls.
+    Returns the number of alerts dismissed.
+    """
+    rows = (
+        await session.execute(
+            select(Alert, Task.status)
+            .join(Task, Task.id == Alert.task_id)
+            .where(
+                Alert.dismissed_at.is_(None),
+                Alert.event_type == _STUCK_TASK_ALERT_EVENT_TYPE,
+                Task.status.in_(TASK_OUTCOME_TERMINAL_STATUSES),
+            )
+            .limit(max(1, limit))
+        )
+    ).all()
+    if not rows:
+        return 0
+
+    now = _utcnow()
+    resolved: list[tuple[Alert, str]] = []
+    for alert, task_status in rows:
+        alert.dismissed_at = now
+        session.add(alert)
+        resolved.append((alert, str(getattr(task_status, "value", task_status))))
+    await session.commit()
+
+    for alert, task_status in resolved:
+        logger.info(
+            "[ALERTS] Dismissed stale %s alert %s for %s task %s: %s",
+            _STUCK_TASK_ALERT_EVENT_TYPE,
+            str(alert.id)[:8],
+            task_status,
+            str(alert.task_id)[:8],
+            alert.title,
+        )
+        await broadcast_to_project(
+            str(alert.project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(resolved)
 
 
 async def _maybe_create_blocked_escalation_alert(

@@ -21,6 +21,7 @@ from app.alert_dispatch import (
     _fmt_duration_seconds,
     _maybe_create_blocked_escalation_alert,
     _maybe_create_escalation_alert,
+    _maybe_create_precondition_blocker_alert,
     _maybe_create_local_runner_hold_alert,
     _maybe_create_migration_slot_contention_alert,
     _maybe_create_pool_payoff_alert,
@@ -32,6 +33,7 @@ from app.alert_dispatch import (
     _resolve_runner_degraded_alert,
     _runner_escalation_last_notified,
     _runner_outage_escalated_keys,
+    sweep_resolve_terminal_task_alerts,
 )
 from app.models import Alert, AlertSeverity
 from app.time_utils import _utcnow
@@ -2621,3 +2623,236 @@ async def test_module_finding_chain_alert_two_distinct_concerns_on_same_pr_both_
     assert len(alerts) == 2
     titles = {alert.title for alert in alerts}
     assert len(titles) == 2  # distinct titles -- not just distinct rows
+
+
+# ── sweep_resolve_terminal_task_alerts (stale "task is stuck" reconcile) ──────
+#
+# Every ``task.blocked`` emitter asserts an in-flight condition. Measured on the
+# live feed 2026-08-21: of 20 tasks holding an open ``task.blocked`` alert, 14
+# were already terminal and exactly one was actually BLOCKED. Nothing retired
+# them on the termination path.
+
+
+async def _open_stuck_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == "task.blocked",
+        Alert.dismissed_at.is_(None),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+async def _stuck_alert_for(db_session, project_id, status, title):
+    """Persist one terminal-or-live task carrying one open task.blocked alert."""
+    task = make_task(project_id=project_id, status=status)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message="stuck",
+        task_id=task.id,
+        event_type="task.blocked",
+    )
+    db_session.add(alert)
+    await db_session.commit()
+    await db_session.refresh(alert)
+    return task, alert
+
+
+@pytest.mark.parametrize("terminal_status", ["COMPLETED", "FAILED", "CANCELLED"])
+@pytest.mark.asyncio
+async def test_stuck_alert_is_dismissed_once_its_task_goes_terminal(
+    db_session, mocker, terminal_status
+):
+    """A task that ended cannot still be stalled, blocked, or stuck evaluating."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _task, alert = await _stuck_alert_for(
+        db_session, project.id, terminal_status, "Task stalled in queue: widget"
+    )
+
+    dismissed = await sweep_resolve_terminal_task_alerts(db_session)
+
+    assert dismissed == 1
+    await db_session.refresh(alert)
+    assert (
+        alert.dismissed_at is not None
+    ), f"a {terminal_status} task's stuck-alert must not stay open"
+    assert await _open_stuck_alerts(db_session, project.id) == []
+    bcast.assert_awaited_once()
+    assert bcast.await_args.args[1] == "alert_dismissed"
+
+
+@pytest.mark.parametrize(
+    "live_status", ["QUEUED", "IN_PROGRESS", "EVALUATING", "BLOCKED"]
+)
+@pytest.mark.asyncio
+async def test_stuck_alert_survives_while_its_task_is_still_in_flight(
+    db_session, mocker, live_status
+):
+    """Control leg: a non-terminal task keeps its alert. Never resolve live signal."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _task, alert = await _stuck_alert_for(
+        db_session, project.id, live_status, "Precondition blocker: precondition"
+    )
+
+    dismissed = await sweep_resolve_terminal_task_alerts(db_session)
+
+    assert dismissed == 0
+    await db_session.refresh(alert)
+    assert (
+        alert.dismissed_at is None
+    ), f"a {live_status} task is still in flight — its alert is real signal"
+    assert len(await _open_stuck_alerts(db_session, project.id)) == 1
+    bcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_other_event_types_alone(db_session, mocker):
+    """Scope pin: a task.failed alert on a FAILED task is TRUE and must survive."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id, status="FAILED")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    other = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.ERROR,
+        title="Task failed: widget",
+        message="failed",
+        task_id=task.id,
+        event_type="task.failed",
+    )
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 0
+    await db_session.refresh(other)
+    assert other.dismissed_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_is_idempotent_and_does_not_reopen_or_restamp(db_session, mocker):
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _task, alert = await _stuck_alert_for(
+        db_session, project.id, "CANCELLED", "Task permanently blocked: precondition"
+    )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    await db_session.refresh(alert)
+    first_stamp = alert.dismissed_at
+    assert first_stamp is not None
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 0
+    await db_session.refresh(alert)
+    assert alert.dismissed_at == first_stamp, "a second pass must not re-stamp"
+    assert bcast.await_count == 1, "a resolved alert must not re-broadcast"
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_stale_alert_restores_notification_for_a_requeued_task(
+    db_session, mocker
+):
+    """The second-order payoff: under-clearing causes under-NOTIFYING.
+
+    ``_maybe_create_precondition_blocker_alert`` dedupes on ``(task_id, title)``
+    among undismissed rows. So while a stale alert stays open, a task that is
+    requeued and blocks again on the same blocker raises NOTHING — the operator
+    loses the new incident to the corpse of the old one. Resolving on terminal
+    is what makes the next real block audible again.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task, stale = await _stuck_alert_for(
+        db_session, project.id, "CANCELLED", "Precondition blocker: precondition"
+    )
+
+    # Without the sweep the fresh incident is swallowed by the stale row.
+    task.status = "BLOCKED"
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    suppressed = await _maybe_create_precondition_blocker_alert(
+        task,
+        db_session,
+        blocker_kind="precondition",
+        detail="blocked again",
+        severity=AlertSeverity.WARNING,
+    )
+    assert suppressed is False, "stale open alert suppresses the real new one"
+
+    # Resolve the corpse the way the sweep would have, then retry.
+    task.status = "CANCELLED"
+    db_session.add(task)
+    await db_session.commit()
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    await db_session.refresh(stale)
+    assert stale.dismissed_at is not None
+
+    task.status = "BLOCKED"
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    audible = await _maybe_create_precondition_blocker_alert(
+        task,
+        db_session,
+        blocker_kind="precondition",
+        detail="blocked again",
+        severity=AlertSeverity.WARNING,
+    )
+    assert audible is True, "once the corpse is cleared the new incident alerts"
+    assert len(await _open_stuck_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_batch_is_bounded_and_drains_across_cycles(db_session, mocker):
+    """A backlog must not be held in one write transaction — and must still drain."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(5):
+        await _stuck_alert_for(
+            db_session, project.id, "CANCELLED", "Task stalled in queue: widget"
+        )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session, limit=2) == 2
+    assert len(await _open_stuck_alerts(db_session, project.id)) == 3
+    assert await sweep_resolve_terminal_task_alerts(db_session, limit=2) == 2
+    assert await sweep_resolve_terminal_task_alerts(db_session, limit=2) == 1
+    assert await _open_stuck_alerts(db_session, project.id) == []
