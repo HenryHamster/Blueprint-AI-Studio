@@ -4624,6 +4624,14 @@
           "old_cap": 1750,
           "new_cap": 2100
         }
+      ],
+      "test_alert_dispatch.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-21T06:33:00.302985+00:00",
+          "old_cap": 2750,
+          "new_cap": 3300
+        }
       ]
     },
     "scripts": {

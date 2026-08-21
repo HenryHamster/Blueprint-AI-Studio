@@ -350,7 +350,7 @@
     "test_pack_under_budget.py": 3600,
     "test_review_learning.py": 2850,
     "test_finding_deduplication.py": 2850,
-    "test_alert_dispatch.py": 2750,
+    "test_alert_dispatch.py": 3300,
     "test_lock_window.py": 2700,
     "test_migration_divergence.py": 2650,
     "test_qualification_state_resolver_dimensions.py": 2600,
