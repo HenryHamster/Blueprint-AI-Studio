@@ -19711,3 +19711,265 @@ class TestShouldSkipInitialReview:
         # Any scope that is not 'large' is treated as not requiring review.
         skip, _ = should_skip_initial_review(True, "unknown")
         assert skip is True
+
+
+# ---------------------------------------------------------------------------
+# Stuck detection requires a fix to have actually landed between the two
+# reviews being compared.
+#
+# A stuck verdict is a claim about the FIX agent failing to converge. When both
+# compared passes reviewed the SAME head they examined byte-identical code, so
+# two reviewers agreeing is consistency, not a standoff. The live instance that
+# motivated this: NeurIPS PR #1777 -- a stale-target discard left its finding in
+# the ledger, the respawned exact-target review re-raised the same true defect
+# in fresh words, and the rephrase fallback scored that pair at 75% and parked
+# the chain. Both entries read b118029a..ea7e8087. ZERO fix attempts were ever
+# spawned; the park suppressed the very fix both reviewers were asking for.
+# ---------------------------------------------------------------------------
+
+_SAME_HEAD = "ea7e8087d300fee4d595d3bd4f26ac87a079aac3"
+_ADVANCED_HEAD = "0b6875a47b963469a81577b15f4bf391f6df9bba"
+
+
+async def _run_stuck_pair(
+    db_session,
+    mocker,
+    *,
+    prior_head,
+    current_head,
+    prior_issues,
+    current_issues,
+    prior_feedback="needs error handling",
+    current_feedback="needs error handling",
+):
+    """Drive one review->review pair through the spawn path.
+
+    ``prior_head=None`` omits ``reviewed_head_sha`` from the prior history
+    entry entirely, which is how entries whose sha could not be resolved look
+    on disk -- the field is written conditionally.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    prior_entry = {
+        "iteration": 0,
+        "feedback": prior_feedback,
+        "issues": prior_issues,
+    }
+    if prior_head is not None:
+        prior_entry["reviewed_head_sha"] = prior_head
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 1777,
+                "branch": "plan/0507c2b6",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 1777,
+                "branch": "plan/0507c2b6",
+                "base_branch": "main",
+                "review_history": [prior_entry],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=1777,
+        branch="plan/0507c2b6",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Try again",
+        current_feedback=current_feedback,
+        current_issues=current_issues,
+        reviewed_head_sha=current_head,
+    )
+    await db_session.refresh(original_task)
+    return result, original_task
+
+
+# The canonical rephrase pair already used by
+# test_stuck_cycle_detects_rephrased_issue: token Jaccard 0.71, comfortably over
+# the 0.68 issue threshold. Reusing it deliberately -- every test below then
+# differs ONLY in the head shas, so the head-advance guard is the single
+# variable and none of these cases re-tests the similarity math. (The real
+# #1777 descriptions scored 0.75 in production; quoting them here at reviewable
+# length drops the overlap to 0.45 and would silently stop exercising the
+# detector at all.)
+_REPHRASED_PRIOR = [_issue("Error handling code missing in payment processor", "MAJOR")]
+_REPHRASED_CURR = [_issue("Payment processor code lacks error handling", "MAJOR")]
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_suppressed_when_no_fix_landed_between_reviews(
+    db_session, mocker
+):
+    """The PR #1777 shape: two reviews of the SAME head, same defect rephrased.
+
+    Nothing changed between the passes, so the repetition carries no signal
+    about convergence and must not park the chain. The fix both reviewers asked
+    for has to be allowed to spawn.
+    """
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head=_SAME_HEAD,
+        prior_issues=_REPHRASED_PRIOR,
+        current_issues=_REPHRASED_CURR,
+    )
+
+    assert result is not None, (
+        "Two reviews of an unchanged head must not be scored as a stuck cycle "
+        "-- no fix attempt intervened, so there is nothing to converge on yet"
+    )
+    assert original_task.requires_approval is not True
+    assert "stuck" not in (original_task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_still_fires_when_a_fix_advanced_the_head(db_session, mocker):
+    """Control: the detector must keep working when a fix DID land in between.
+
+    Identical issue pair to the suppression test above -- only the head differs.
+    That isolates the head-advance guard as the single cause of the difference.
+    """
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head=_ADVANCED_HEAD,
+        prior_issues=_REPHRASED_PRIOR,
+        current_issues=_REPHRASED_CURR,
+    )
+
+    assert result is None, (
+        "A fix landed and the reviewer re-raised the same issue -- that is the "
+        "genuine stuck cycle this detector exists for"
+    )
+    assert "stuck" in (original_task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_not_suppressed_when_prior_entry_lacks_head_sha(
+    db_session, mocker
+):
+    """Fail toward the pre-existing behaviour: a missing sha proves nothing.
+
+    ``reviewed_head_sha`` is written conditionally, so history entries can
+    legitimately lack it. An absent sha must not be read as "the head did not
+    move" -- that would silently disable the detector on every such chain.
+    """
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=None,
+        current_head=_SAME_HEAD,
+        prior_issues=_REPHRASED_PRIOR,
+        current_issues=_REPHRASED_CURR,
+    )
+
+    assert result is None, (
+        "Without both shas the guard cannot prove the head stood still, so "
+        "detection must run exactly as it did before"
+    )
+    assert "stuck" in (original_task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_not_suppressed_when_current_head_sha_missing(
+    db_session, mocker
+):
+    """Mirror of the prior-side fail-safe, for the current review pass."""
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head="",
+        prior_issues=_REPHRASED_PRIOR,
+        current_issues=_REPHRASED_CURR,
+    )
+
+    assert result is None, (
+        "An empty current sha is not proof the head stood still either"
+    )
+    assert "stuck" in (original_task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_exact_repeat_suppressed_when_head_did_not_advance(db_session, mocker):
+    """The guard sits above BOTH legs, so the exact-match leg is covered too.
+
+    Byte-identical issue text on an unchanged head is the strongest form of
+    "the reviewer is consistent", and the weakest possible evidence that the
+    fix agent is stuck -- it has not been asked to do anything yet.
+    """
+    same = [_issue("Payment processor lacks error handling", "CRITICAL")]
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head=_SAME_HEAD,
+        prior_issues=same,
+        current_issues=list(same),
+    )
+
+    assert result is not None, (
+        "Exact-repeat detection must also require that a fix intervened"
+    )
+    assert "stuck" not in (original_task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_text_fallback_stuck_also_requires_head_advance(db_session, mocker):
+    """The log-scraping fallback leg is guarded by the same condition.
+
+    With no structured issues on either side the detector compares raw feedback
+    text. Repeating feedback about an unchanged head is just as uninformative
+    as a repeating structured issue.
+    """
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head=_SAME_HEAD,
+        prior_issues=[],
+        current_issues=[],
+        prior_feedback="LaTeX escaping is missing on the reachability footnote",
+        current_feedback="LaTeX escaping is missing on the reachability footnote",
+    )
+
+    assert result is not None, (
+        "Text-fallback stuck detection must require a fix attempt in between"
+    )
+    assert "stuck" not in (original_task.latest_status_message or "").lower()
