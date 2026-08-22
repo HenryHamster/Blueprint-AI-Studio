@@ -829,4 +829,113 @@ describe('durable unshipped-work checkpoint retry transition', () => {
       `git push --force-with-lease origin "${workBranch}"`,
     );
   });
+
+  // A task retried long after its checkpoint was written can have its merge base
+  // outside BOTH the shallow clone (DEFAULT_CLONE_DEPTH) and the --depth=100
+  // checkpoint fetch. Observed in production on NeurIPS task 0396aaee: the merge
+  // base sat 213 commits behind main, `git merge --squash` died with
+  // "refusing to merge unrelated histories", and because git refuses before
+  // touching the index the worktree stayed clean — so the conflict-preserving
+  // branch rethrew and all three retries reproduced it byte for byte.
+  it('deepens a shallow clone when the checkpoint merge base is out of reach', async () => {
+    const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
+    let deepened = false;
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${workBranch}`;
+      if (args[0] === 'show') return checkpointMessage;
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') {
+        return deepened ? 'false' : 'true';
+      }
+      if (args[0] === 'merge-base') {
+        if (!deepened) throw new Error('fatal: no merge base found');
+        return 'a'.repeat(40);
+      }
+      if (args[0] === 'fetch' && args.includes('--unshallow')) {
+        deepened = true;
+        return '';
+      }
+      if (args[0] === 'merge' && args[1] === '--squash') {
+        // Real git's behaviour: it refuses outright while the base is unreachable.
+        if (!deepened) throw new Error('fatal: refusing to merge unrelated histories');
+        return '';
+      }
+      return '';
+    });
+    const listOpen = vi.fn().mockResolvedValue([]);
+    const log = vi.fn();
+
+    const result = await prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      { git: gitOps, listOpenPullRequestsForBranch: listOpen, sendLog: log },
+    );
+
+    expect(result.restoredCheckpoint).toBe(true);
+    expect(gitOps).toHaveBeenCalledWith(['fetch', '--no-tags', '--unshallow', 'origin']);
+    expect(gitOps).toHaveBeenCalledWith([
+      'fetch', '--no-tags', 'origin',
+      `+refs/heads/${workBranch}:refs/remotes/origin/${workBranch}`,
+    ]);
+    expect(gitOps).toHaveBeenCalledWith([
+      'merge', '--squash', '--no-commit', `origin/${workBranch}`,
+    ]);
+    // The remote checkpoint must survive: it is the lease target for ./pr.
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+  });
+
+  it('does not deepen when the checkpoint merge base is already reachable', async () => {
+    const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${workBranch}`;
+      if (args[0] === 'show') return checkpointMessage;
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return 'true';
+      if (args[0] === 'merge-base') return 'b'.repeat(40);
+      return '';
+    });
+
+    const result = await prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
+        sendLog: vi.fn(),
+      },
+    );
+
+    expect(result.restoredCheckpoint).toBe(true);
+    // The common retry keeps paying only the cheap --depth=100 fetch.
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--unshallow'))).toBe(false);
+  });
+
+  it('refuses the squash restore when histories stay unrelated after deepening', async () => {
+    const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${workBranch}`;
+      if (args[0] === 'show') return checkpointMessage;
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return 'true';
+      if (args[0] === 'merge-base') throw new Error('fatal: no merge base found');
+      return '';
+    });
+
+    await expect(prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      {
+        git: gitOps,
+        listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
+        sendLog: vi.fn(),
+      },
+    )).rejects.toThrow(/shares no history with main/);
+
+    // Squashing unrelated trees would fabricate a diff — it must never be attempted.
+    expect(gitOps.mock.calls.some(([args]) => args[0] === 'merge')).toBe(false);
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+  });
 });
