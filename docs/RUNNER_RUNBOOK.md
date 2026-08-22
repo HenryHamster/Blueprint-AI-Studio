@@ -954,6 +954,15 @@ production use.
 | `agent: DECLINED` | no isolation boundary — install bubblewrap |
 | `compute: CLAIMED via ...` | runtime shown; confirms compute jobs can run |
 | `compute: DECLINED` | no sandbox; install bubblewrap or a container runtime |
+| `verification` | `CAPABLE` once the verification toolchain is provisioned; `INCAPABLE - verification toolchain bootstrap incomplete` on a host that has not booted a runner yet |
+
+`--check` **probes; it never provisions.** The verification toolchain is a
+venv built by `provision-verification-toolchain.sh` (a `python3 -m venv`
+plus two full `pip install --requirement` passes, minutes on a cold host).
+A preflight reports readiness rather than manufacturing it, so on a host
+that has never run a runner the `verification` line reads `INCAPABLE` and
+the toolchain is built by the next real boot. That is expected, not a
+fault; `verification` does not affect the exit code below.
 
 **Exit codes:** `blueprint-runner check` exits 0 when the orchestrator is
 reachable, the token is valid/401, and at least one task class is claimable.

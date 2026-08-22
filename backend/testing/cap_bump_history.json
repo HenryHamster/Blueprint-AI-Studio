@@ -4632,6 +4632,14 @@
           "old_cap": 2750,
           "new_cap": 3300
         }
+      ],
+      "test_generated_shell.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-22T23:27:00.900818+00:00",
+          "old_cap": 2400,
+          "new_cap": 2850
+        }
       ]
     },
     "scripts": {
@@ -4651,8 +4659,8 @@
       ],
       "test_vitest_verification_guard.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-22T22:33:25.178062+00:00",
+          "commit_sha": "5c1818cbd29052bd25a2839ebdfc1436896f0075",
+          "commit_date": "2026-08-22T15:40:02-07:00",
           "old_cap": 1900,
           "new_cap": 2300
         }
