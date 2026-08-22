@@ -315,6 +315,28 @@ describe('writeCheckHelper — direct invocation', () => {
     );
   }, 15_000);
 
+  it('uses the repo-backed reverse import index for scoped viewport selection', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-viewport-reverse-index',
+      workBranch: 'blueprint/check-viewport-reverse-index',
+      baseBranch: 'main',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toContain(
+      'python3 scripts/viewport_scope.py --repo-root "$WORKSPACE" --changed-files-file /tmp/check_viewport_changed.txt > /tmp/check_viewport_tests.txt',
+    );
+    expect(script).toContain('DIRECT relative imports from viewport tests to changed');
+    expect(script).toContain('one level only');
+    expect(script).toContain('if [ "$FULL_SCOPE" = "1" ] || [ -n "$NON_COMPONENT" ]; then');
+    expect(script).toContain('--current-files $VIEWPORT_FILTER');
+    expect(script).not.toContain('vt="${f%.tsx}.viewport.test.tsx"');
+  });
+
   it('emits a generic no-op fallback (no Blueprint blocks) for a foreign repo with no buildConfig', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({

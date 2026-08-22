@@ -910,6 +910,8 @@ _BACKEND_VERIFICATION_FRAGMENT = (
 )
 _TRACKED_CHECK = _BLUEPRINT_ROOT / "check"
 _DEFAULT_CHECK = _BLUEPRINT_ROOT / "scripts" / "check-default.sh"
+_CHECK_HELPER = _BLUEPRINT_ROOT / "agent" / "src" / "prompts" / "check-helper.ts"
+_VIEWPORT_SCOPE = _BLUEPRINT_ROOT / "scripts" / "viewport_scope.py"
 
 
 def _render_backend_verification_fragment() -> str:
@@ -965,6 +967,61 @@ def test_packer_requires_codex_cli_with_gpt_5_6_picker():
     assert 'test \\"$codex_version\\" = 0.144.1' in gate
     assert "|| { echo" in gate
     assert "exit 1; }" in gate
+
+
+def test_generated_viewport_gate_uses_repo_backed_reverse_import_index():
+    source = _CHECK_HELPER.read_text(encoding="utf-8")
+    invocation = (
+        'python3 scripts/viewport_scope.py --repo-root "$WORKSPACE" '
+        '--changed-files-file /tmp/check_viewport_changed.txt '
+        '> /tmp/check_viewport_tests.txt'
+    )
+    assert invocation in source
+    assert "DIRECT relative imports" in source
+    assert "one level only" in source
+    assert "vt=\"${f%.tsx}.viewport.test.tsx\"" not in source
+    assert _VIEWPORT_SCOPE.is_file()
+
+
+@pytest.mark.parametrize(
+    ("component", "expected_count", "required_test"),
+    [
+        (
+            "admin-ui/src/components/HeaderBar.tsx",
+            2,
+            "admin-ui/src/components/WorkbenchComposition.viewport.test.tsx",
+        ),
+        (
+            "admin-ui/src/components/DashboardMetricCardsPrimitives.tsx",
+            1,
+            "admin-ui/src/components/StrategicContextRail.viewport.test.tsx",
+        ),
+        ("admin-ui/src/components/TaskCard.tsx", 7, None),
+        ("admin-ui/src/components/VersionLifecyclePanel.tsx", 1, None),
+        ("admin-ui/src/App.tsx", 0, None),
+    ],
+)
+def test_viewport_scope_selects_direct_imports(
+    component: str, expected_count: int, required_test: str | None
+):
+    result = subprocess.run(
+        [
+            "python3",
+            str(_VIEWPORT_SCOPE),
+            "--repo-root",
+            str(_BLUEPRINT_ROOT),
+            "--changed-files-file",
+            "/dev/stdin",
+        ],
+        input=f"{component}\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    selected = result.stdout.splitlines()
+    assert len(selected) == expected_count
+    if required_test is not None:
+        assert required_test in selected
 
 
 def test_packer_pins_claude_cli_with_version_gate():
