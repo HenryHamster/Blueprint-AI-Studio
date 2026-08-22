@@ -2015,6 +2015,12 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
+    # This assertion covers the approval-gated stuck-cycle contract.  The
+    # runtime setting is mutable in CI/test processes, so pin the gate on for
+    # this focused test instead of inheriting unrelated process configuration.
+    from app import review_pipeline
+
+    mocker.patch.dict(review_pipeline._runtime_config, {"require_approval_gates": True})
     # This test exercises synchronous stuck-cycle detection on a REQUEST_CHANGES
     # verdict (concrete repeated CRITICAL issue): reviews finalize synchronously,
     # so the verdict reaches the stuck-cycle suppression path directly.
@@ -2028,13 +2034,13 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
         pr_number=99,
         branch="blueprint/task-stuck0001",
         base_sha="stuck-base-99",
-        head_sha="stuck-head-99",
+        head_sha="stuck-head-100",
     )
     review_target = {
         "project_id": str(project.id),
         "pr_number": 99,
         "base_sha": "stuck-base-99",
-        "head_sha": "stuck-head-99",
+        "head_sha": "stuck-head-100",
     }
 
     original_task = Task(
@@ -2108,7 +2114,7 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
             "feedback": "Still missing validation",
             "issues": [repeated_issue],
             "reviewed_base_sha": "stuck-base-99",
-            "reviewed_head_sha": "stuck-head-99",
+            "reviewed_head_sha": "stuck-head-100",
         }
     )
     await _status(
