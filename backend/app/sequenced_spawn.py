@@ -80,6 +80,62 @@ def landing_gate_ok(
     return landed_on_branch(dep_task, branch, project)
 
 
+async def landing_gate_satisfied(
+    dep_task: Task,
+    branch: str,
+    project: Project | None,
+    session: Any,
+    verify_pr_merged: Any,
+) -> bool:
+    """Gate check that can also consult VERIFIED merge truth, not just context.
+
+    :func:`landing_gate_ok` answers from the dependency's PERSISTED context
+    alone (``landed_on_branch`` bottoms out in ``has_landed_signal``, a pure
+    context read). That is right whenever the signal was written -- but it
+    makes a MISSING signal indistinguishable from "never landed", and nothing
+    on the gate path can tell those apart. So a COMPLETED dependency whose PR
+    provably merged into *branch* holds its dependent QUEUED forever.
+
+    That is not hypothetical: the signal writer races. The acceptance-gate
+    backfill sweep is a ONE-SHOT latch (it excludes rows already carrying
+    ``_backfill_checked_at``), so a sweep that checks a task seconds BEFORE
+    its PR merges stamps the latch, loses the race, and permanently excludes
+    that task from ever being re-checked. The dependent then sits QUEUED with
+    no reconciler that can reach it, and it is INVISIBLE: it is filtered out
+    of ``eligible_ids`` before the orchestrator's "N queued" line is computed.
+
+    The heuristic path below this gate already carries the equivalent
+    defense-in-depth for its own COMPLETED-non-landed case -- the cross-base
+    branch consults lineage and shared-staging rather than holding on a bare
+    missing signal. The gate path ``continue``s above all of that, so it never
+    got one. This is that missing counterpart: consult the SAME GitHub-aware
+    ``verify_pr_merged`` the ungated same-base path already uses.
+
+    FAIL-CLOSED AND BRANCH-EXACT BY CONSTRUCTION. ``verify_pr_merged`` answers
+    "this PR merged", NOT "merged into *branch*" -- its boolean alone must
+    never release a gate. It is used only to drive the authoritative landing
+    stamp: it calls ``merged_pr_counts_as_integration_landing`` and stamps via
+    ``corroborate_and_mark_landed_on_integration`` ONLY when the merge really
+    puts the dep's work where the gate requires it. The original context
+    predicate is then re-asked, and that re-ask is the release condition. A
+    merge that landed on some other branch stamps nothing and still holds; so
+    does a dep with no PR artifact at all.
+
+    Do not "simplify" the trailing re-ask into ``return await
+    verify_pr_merged(...)``: that would make the gate branch-blind and release
+    a dependent onto a base its dependency never reached.
+    """
+    if landing_gate_ok(dep_task, branch, project):
+        return True
+    # Only a COMPLETED dep can be blocked on a missing signal; anything else is
+    # legitimately still in flight and must keep holding without a GitHub call.
+    if dep_task.status != TaskStatus.COMPLETED:
+        return False
+    if not await verify_pr_merged(dep_task, session):
+        return False
+    return landing_gate_ok(dep_task, branch, project)
+
+
 async def apply_declared_release_base(dependent: Task, session: Any) -> None:
     """Repoint ``base_branch`` to a declared ``release_base_branch``.
 
