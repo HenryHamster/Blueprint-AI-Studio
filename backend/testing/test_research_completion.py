@@ -23688,3 +23688,148 @@ class TestObjectiveGapResidualCompletionDebt:
         category_key = _cd.objective_gap_dedupe_key(version.id, "c-1a2b3c4d")
         assert residual_key != category_key
         assert _cd.OBJECTIVE_GAP_RESIDUAL_KEY not in ("c-1a2b3c4d",)
+
+
+@_pytest.mark.asyncio
+async def test_admission_refused_challenger_spawn_never_mints_awaiting_marker(
+    db_session, mocker
+):
+    """REGRESSION: a challenger spawn refused by automatic-task ADMISSION must
+    not leave an ``awaiting_adversarial_grader`` marker behind.
+
+    ``spawn_forward_quality_grader`` returns None for two causes that are not
+    interchangeable: its single-shot guard saw a durable marker (a challenger
+    IS in flight), or admission refused the spawn before any grader row was
+    created (nothing is in flight, and nothing will be). Recording the second
+    as an awaiting marker states something false: the re-entry guard reads it
+    as "in flight" and no-ops every re-dispatch, and
+    ``_sweep_stranded_sidecar_sources`` selects on marker PRESENCE, so the row
+    is loaded and skipped on every cycle while occupying a slot of the bounded
+    per-cycle sweep budget. No sidecar exists to publish a verdict and no UUID
+    exists to bind, so neither path can ever clear it.
+
+    Fail-closed is preserved independently: no high-stakes child may spawn.
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    project, direction, task = await _grader_project_and_task(
+        db_session, "d-adv-admit01"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Risky migration rewrite")
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    # Admission refusal, exercised through the real policy function rather than
+    # a patched spawn helper: a paused project is one of the four documented
+    # AUTOMATIC_TASK_CREATION refusals, and it returns None *before* the
+    # awaiting marker is written.
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert "awaiting_adversarial_grader" not in (task.context or {}), (
+        "Admission refused the spawn before any grader row existed, so there is "
+        "nothing to await. A marker here wedges the source: the re-entry guard "
+        "no-ops forever and the stranded-sidecar sweep can never bind or clear it."
+    )
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], (
+        "The gate must stay fail-closed when no challenger could be created — "
+        f"high-stakes work must not spawn ungated, got {[c.id for c in children]}"
+    )
+    assert task.status == TaskStatus.EVALUATING
+
+
+@_pytest.mark.asyncio
+async def test_in_flight_challenger_still_parks_on_its_exact_uuid(
+    db_session, mocker
+):
+    """The other half of the discriminator: when the spawn helper refuses a
+    second challenger because one really IS in flight, the source parks and its
+    exact sidecar UUID survives untouched.
+
+    The race this models is real: a peer completion commits the challenger and
+    its exact-UUID marker after this handler read the source context (so the
+    re-entry guard at the top of the handler saw no marker) but before
+    ``spawn_forward_quality_grader`` reads it again under the creation lock.
+    The helper's single-shot guard then returns None with the marker present.
+
+    The pinned UUID literal below is the point of the test: the marker must
+    remain the authenticated id the spawn helper recorded, never be degraded to
+    the legacy boolean compatibility shape and never be dropped.
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-adv-inflight01"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+    hs = _high_stakes_finding(direction["id"], "Risky migration rewrite")
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[hs],
+    )
+
+    in_flight_id = "3f7c1c2e-7a4b-4a1f-9a0d-2b6c8e5d4a11"
+
+    async def _peer_won_the_race(source_task, *_args, **_kwargs):
+        # Exactly what the real helper leaves behind when its single-shot guard
+        # observes a peer-committed marker: context carries the peer's exact
+        # UUID and the spawn returns None.
+        source_task.context = {
+            **(source_task.context or {}),
+            "awaiting_adversarial_grader": in_flight_id,
+        }
+        return None
+
+    mocker.patch(
+        "app.task_evaluators.spawn_forward_quality_grader",
+        side_effect=_peer_won_the_race,
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert task.context.get("awaiting_adversarial_grader") == in_flight_id, (
+        "An in-flight challenger's exact UUID must survive the park unchanged"
+    )
+    assert task.status == TaskStatus.EVALUATING, (
+        "A genuinely in-flight challenger must still park the source"
+    )
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == [], (
+        "Nothing may spawn while a challenger verdict is outstanding, got "
+        f"{[c.id for c in children]}"
+    )

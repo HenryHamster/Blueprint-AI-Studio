@@ -2618,30 +2618,85 @@ async def _handle_research_completion(
                 )
                 return
             else:
-                # Grader spawn returned None (single-shot guard hit / grader already in flight).
-                # Mark as awaiting and return to prevent ungated spawn of high-stakes findings.
-                # On re-entry the guard will detect this marker and no-op until the verdict arrives.
+                # ``spawn_forward_quality_grader`` returns None for two causes
+                # that are NOT interchangeable:
+                #
+                #   1. Its single-shot guard observed a durable awaiting marker
+                #      on this source — a challenger really is in flight.
+                #   2. Automatic-task admission refused the spawn before any
+                #      grader row was created (project unavailable/archived/
+                #      paused, autonomy off). Nothing is in flight, and nothing
+                #      will be for this attempt.
+                #
+                # The awaiting marker is the sound discriminator: cause 1 cannot
+                # occur without it (the guard reads exactly that key, and the
+                # verdict-key half of the guard is excluded by the enclosing
+                # ``_adversarial_verdict_raw is None``), and cause 2 returns
+                # before the marker is ever written.
+                #
+                # Under cause 2 there is nothing to await, so synthesizing a
+                # marker states something false and costs twice over:
+                #
+                #   * the re-entry guard reads it as "a challenger is in
+                #     flight" and no-ops every re-dispatch, and
+                #   * ``_sweep_stranded_sidecar_sources`` selects on marker
+                #     PRESENCE, so the row is loaded and then skipped
+                #     (``_ref is True``) on every cycle forever, consuming a
+                #     slot of the bounded per-cycle sweep budget that a
+                #     genuinely stranded sidecar needs.
+                #
+                # Neither the guard nor the sweep can ever clear it: no sidecar
+                # exists to publish a verdict, and there is no UUID to bind.
+                # Park WITHOUT a marker instead. The source is still fail-closed
+                # (no high-stakes finding spawns), the EVALUATING backstop still
+                # terminalizes it truthfully, and a requeue reopens a clean
+                # attempt rather than replaying a hold that already lapsed.
+                _awaiting_ref = (task.context or {}).get(
+                    "awaiting_adversarial_grader"
+                )
+                if _awaiting_ref:
+                    task.status = TaskStatus.EVALUATING
+                    task.latest_status_message = (
+                        "Awaiting adversarial challenge verdict before spawning "
+                        "high-stakes implementation tasks"
+                    )
+                    _ctx = dict(task.context or {})
+                    # ``spawn_forward_quality_grader`` records the exact sidecar
+                    # UUID atomically. Preserve whatever authenticated reference
+                    # is already there; never degrade it to the legacy boolean
+                    # compatibility shape.
+                    _ctx["_adversarial_challenged_hashes"] = _challenged_hashes
+                    task.context = _ctx
+                    flag_modified(task, "context")
+                    session.add(task)
+                    await session.commit()
+                    logger.info(
+                        "[RESEARCH] Task %s parked awaiting adversarial challenge "
+                        "(spawn returned None — challenger %s already in flight, "
+                        "%d high-stakes finding(s))",
+                        task.id,
+                        _awaiting_ref,
+                        len(_high_stakes),
+                    )
+                    return
                 task.status = TaskStatus.EVALUATING
                 task.latest_status_message = (
-                    "Awaiting adversarial challenge verdict before spawning "
-                    "high-stakes implementation tasks"
-                )
+                    "Adversarial challenger could not be created — automatic "
+                    "task creation is not currently admitted for this project. "
+                    "High-stakes findings are held unspawned; requeue once "
+                    "creation is admitted again."
+                )[:500]
                 _ctx = dict(task.context or {})
-                # ``spawn_forward_quality_grader`` now records the exact
-                # sidecar UUID atomically. A None return can mean its
-                # single-shot guard observed that durable marker, so never
-                # degrade it back to the legacy boolean compatibility shape.
-                if not _ctx.get("awaiting_adversarial_grader"):
-                    _ctx["awaiting_adversarial_grader"] = True
                 _ctx["_adversarial_challenged_hashes"] = _challenged_hashes
                 task.context = _ctx
                 flag_modified(task, "context")
                 session.add(task)
                 await session.commit()
-                logger.info(
-                    "[RESEARCH] Task %s parked awaiting adversarial challenge "
-                    "(spawn returned None — grader in flight or single-shot guard hit, "
-                    "%d high-stakes finding(s))",
+                logger.warning(
+                    "[RESEARCH] Task %s held: adversarial challenger spawn was "
+                    "refused by automatic-task admission before any grader was "
+                    "created (%d high-stakes finding(s)). Parked WITHOUT an "
+                    "awaiting marker — nothing is in flight to await",
                     task.id,
                     len(_high_stakes),
                 )
