@@ -1420,8 +1420,41 @@ exit ${scenario.harnessExit}
   ])('runtime: %s fails closed and cannot mint a green receipt', async (_label, scenario) => {
     const result = await runRequiredCheck(await render(), scenario);
     expect(result.status, result.stdout).not.toBe(0);
-    expect(result.receipt).toBeUndefined();
+    if (result.receipt !== undefined) {
+      const receipt = result.receipt as {
+        pytest: { exit_code: number };
+        lanes?: Record<string, { blocking?: boolean }>;
+      };
+      expect(receipt.pytest.exit_code).not.toBe(0);
+      expect(receipt.lanes?.['backend-pytest']?.blocking).toBe(true);
+    }
     expect(result.stdout).toContain('FAIL');
+  });
+  it('runtime: a blocking backend attribution receipt is retained with all buckets', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: true,
+      harnessExit: 1,
+    });
+    expect(result.status, result.stdout).not.toBe(0);
+    expect(result.receipt).toMatchObject({
+      pytest: {
+        state: 'attribution_unavailable',
+        current_exit_code: 1,
+        exit_code: 1,
+        new_failures: {},
+        suppressed_failures: {},
+        disappeared_failures: {},
+        skipped_failures: {},
+      },
+      lanes: {
+        'backend-pytest': {
+          state: 'attribution_unavailable',
+          blocking: true,
+          current_exit_code: 1,
+        },
+      },
+    });
   });
   it.each(['missing', 'syntax-invalid'] as const)(
     'runtime: %s route helper cannot mint backend capability authority', async (routeHelper) => {

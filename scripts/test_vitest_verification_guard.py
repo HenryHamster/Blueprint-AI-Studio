@@ -69,6 +69,46 @@ def _clean_execution_report() -> JUnitReport:
     return JUnitReport(test_routes={"blueprint.vitest.execution::runner"})
 
 
+def test_blocking_helper_records_the_printed_verdict_and_all_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_verification_receipt: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A blocking early-return helper leaves both durable sidecars populated."""
+
+    recorded: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        guard,
+        "record_classification",
+        lambda _lane, outcome: recorded.append(dict(outcome)),
+    )
+
+    assert (
+        guard._blocking(
+            "agent",
+            "attribution_unavailable",
+            current_exit_code=1,
+            error="current JUnit missing",
+        )
+        == 1
+    )
+
+    assert recorded[0]["state"] == "attribution_unavailable"
+    assert recorded[0]["blocking"] is True
+    assert recorded[0]["error"] == "current JUnit missing"
+    assert set(recorded[0]) >= {
+        "new_failures",
+        "suppressed_failures",
+        "disappeared_failures",
+        "skipped_failures",
+    }
+    lane = json.loads(_isolate_verification_receipt.read_text(encoding="utf-8"))["lanes"]["vitest:agent"]
+    assert lane["state"] == "attribution_unavailable"
+    assert lane["blocking"] is True
+    assert lane["current_exit_code"] == 1
+    assert "FAILED state=attribution_unavailable" in capsys.readouterr().out
+
+
 @pytest.fixture(autouse=True)
 def _seed_suite_configs(tmp_path: Path) -> None:
     """Give every synthetic repo the REAL Vitest config of each suite.

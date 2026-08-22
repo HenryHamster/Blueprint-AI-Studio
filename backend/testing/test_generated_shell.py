@@ -930,14 +930,14 @@ def _render_backend_verification_fragment() -> str:
     # the readability-guarded inline writer exists only for foreign workspaces
     # the fragment is emitted into (both halves pinned by
     # scripts/test_verification_receipt.py::test_the_backend_lane_cli_is_what_the_gates_invoke).
-    start = rendered.index("          # Prefer the Blueprint-repo-local writer")
-    tail_marker = '          if [ "$_verification_receipt_written" = "1" ]; then\n'
-    end = rendered.index(tail_marker, start) + len(tail_marker)
+    start = rendered.index("        if [ -r scripts/verification_receipt.py ]; then")
+    tail_marker = '        if [ "$_verification_receipt_written" = "1" ]; then\n'
+    end = rendered.index(tail_marker, start)
     invocation = re.search(
         r"python3 scripts/verification_receipt\.py backend-pytest[^\n]*?(?=; then)",
         rendered[start:end],
     ).group(0)
-    return rendered[:start] + f"          if {invocation}; then\n" + rendered[end:]
+    return rendered[:start] + f"        if {invocation}; then\n          _verification_receipt_written=1\n        fi\n" + rendered[end:]
 
 
 def _read_packer_hcl() -> str:
@@ -2257,12 +2257,12 @@ def test_default_check_allows_an_ordinary_skipped_test(tmp_path: Path):
     )
     script = _extract_default_backend_verification()
     # Slice the PRODUCTION counter+classifier block and run it verbatim. The
-    # end anchor is the branch that follows the classifier, so the snippet
-    # carries the real `tests > 0 && skipped == tests` decision instead of a
-    # copy in this file that would keep passing after the shell changed.
+    # End before receipt serialization: the snippet carries the real
+    # `tests > 0 && skipped == tests` decision instead of a copy in this file
+    # that would keep passing after the shell changed.
     classifier_start = script.index("        _verification_tests=")
     classifier_end = script.index(
-        '\n        if [ "$_verification_blocking" = "0" ]', classifier_start
+        "\n        _verification_selectors_json=", classifier_start
     )
     classifier = script[classifier_start:classifier_end]
     assert "_verification_state=skipped_test" in classifier, (

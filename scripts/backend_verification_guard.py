@@ -68,6 +68,36 @@ def _base_file_selectors(selectors: list[str], base_root: Path) -> list[str]:
     return sorted(selected)
 
 
+def _record_blocking_outcome(
+    lane: str, outcome: dict[str, object]
+) -> None:
+    """Persist a blocking verdict before printing it.
+
+    The guard-suppression sidecar is deliberately advisory, but a missing
+    record makes the durable publication receipt look incomplete. Keep the
+    exact structured outcome (including all four buckets) at every early
+    return; the caller's blocking exit decision remains independent of I/O.
+    """
+
+    record_classification(lane, outcome)
+
+
+def _blocking_outcome(args: argparse.Namespace, state: str, **extra: object) -> int:
+    outcome: dict[str, object] = {
+        "state": state,
+        "blocking": True,
+        "current_exit_code": args.current_exit_code,
+        "new_failures": {},
+        "suppressed_failures": {},
+        "disappeared_failures": {},
+        "skipped_failures": {},
+        **extra,
+    }
+    _record_blocking_outcome("backend", outcome)
+    print(json.dumps(outcome, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="automain")
@@ -85,8 +115,7 @@ def main(argv: list[str] | None = None) -> int:
             args.current_junit, tree_root=repo, label="current"
         )
     except RuntimeError as exc:
-        print(json.dumps({"state": "attribution_unavailable", "blocking": True, "error": str(exc)}))
-        return 0
+        return _blocking_outcome(args, "attribution_unavailable", error=str(exc))
     current_failures = current_report.failures
 
     try:
@@ -128,31 +157,21 @@ def main(argv: list[str] | None = None) -> int:
                         base_junit, tree_root=base_root, label="baseline"
                     )
                 except RuntimeError as exc:
-                    print(
-                        json.dumps(
-                            {
-                                "state": "baseline_unavailable",
-                                "blocking": True,
-                                "error": str(exc),
-                                "base_exit_code": result.returncode,
-                            }
-                        )
+                    return _blocking_outcome(
+                        args,
+                        "baseline_unavailable",
+                        error=str(exc),
+                        base_exit_code=result.returncode,
                     )
-                    return 0
                 if not is_attributable_pytest_result(
                     result.returncode, baseline_report
                 ):
-                    print(
-                        json.dumps(
-                            {
-                                "state": "baseline_unavailable",
-                                "blocking": True,
-                                "error": "baseline pytest exit code/JUnit pair is not attributable",
-                                "base_exit_code": result.returncode,
-                            }
-                        )
+                    return _blocking_outcome(
+                        args,
+                        "baseline_unavailable",
+                        error="baseline pytest exit code/JUnit pair is not attributable",
+                        base_exit_code=result.returncode,
                     )
-                    return 0
             outcome = classify_verification(
                 runtime_available=True,
                 current_exit_code=args.current_exit_code,
@@ -193,8 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(outcome, sort_keys=True))
             return 0
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(json.dumps({"state": "baseline_unavailable", "blocking": True, "error": str(exc)}))
-        return 0
+        return _blocking_outcome(args, "baseline_unavailable", error=str(exc))
 
 
 if __name__ == "__main__":
