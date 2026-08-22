@@ -1199,7 +1199,15 @@ async def _check_candidate_task_deps(
             any_failed = True
             break
         if _gate_branch:
-            if not _seqdep.landing_gate_ok(effective_dt, _gate_branch, _gate_proj):
+            # Verified-merge fallback lives inside the helper: a COMPLETED dep
+            # whose landing signal was never stamped is re-checked against the
+            # same GitHub-aware verification the ungated same-base path uses,
+            # then re-asked branch-exactly. Without it a provably-merged dep
+            # holds its dependent QUEUED forever (and invisibly, since the
+            # dependent never reaches eligible_ids).
+            if not await _seqdep.landing_gate_satisfied(
+                effective_dt, _gate_branch, _gate_proj, session, verify_pr_merged
+            ):
                 all_met = False
             continue
         # A cross-base dependency only reaches the dependent's base when it lands

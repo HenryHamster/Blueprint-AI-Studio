@@ -163,6 +163,167 @@ class TestRequireDepsLandedOnGate:
         assert result == "waiting", f"in-flight dep must hold, got {result!r}"
 
     @pytest.mark.asyncio
+    async def test_verified_merge_releases_gate_when_signal_never_stamped(
+        self, db_session
+    ):
+        """The production wedge shape.
+
+        A COMPLETED dep whose PR provably merged INTO the gate branch, but
+        whose landing signal was never persisted (the acceptance-gate backfill
+        is a one-shot latch and can stamp itself seconds BEFORE the merge
+        lands, permanently excluding the row from re-check), must not hold its
+        dependent forever. The gate has to consult the same GitHub-aware
+        verification the ungated same-base path uses.
+        """
+        project = make_project(name="Seq Verified Merge", user_id="u1")
+        await _persist(db_session, project)
+
+        # COMPLETED, has a PR, but carries NO landing marker of any kind.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "A", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            context={"_backfill_checked_at": "2026-08-10T09:37:41.159350+00:00"},
+        )
+        await _persist(db_session, dep)
+
+        candidate = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "refactor",
+                    "prompt": "B builds on A",
+                    "base_branch": "main",
+                    "require_deps_landed_on": "main",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        await _persist(db_session, candidate)
+
+        # Baseline: a verifier that finds nothing must still hold.
+        async def _verify_nothing(_task, _session):
+            return False
+
+        result, _ = await _check_candidate_task_deps(
+            candidate, [dep], [dep.id], db_session, _verify_nothing
+        )
+        assert result == "waiting", (
+            f"unverified dep must keep holding the gate, got {result!r}"
+        )
+
+        # Real verification discovers the merge on the gate branch and stamps
+        # the landing signal (what corroborate_and_mark_landed_on_integration
+        # does when merged_pr_counts_as_integration_landing allows it).
+        async def _verify_and_stamp(task, _session):
+            task.context = {**(task.context or {}), "landed_on_integration": True}
+            return True
+
+        result, _ = await _check_candidate_task_deps(
+            candidate, [dep], [dep.id], db_session, _verify_and_stamp
+        )
+        assert result == "eligible", (
+            "a dep whose PR verifiably merged into the gate branch must release "
+            f"the dependent instead of wedging it forever, got {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_verified_merge_onto_other_branch_still_holds_gate(self, db_session):
+        """Branch-exactness pin for the verified-merge fallback.
+
+        ``verify_pr_merged`` answers "this PR merged", NOT "merged into the
+        gate branch". Its boolean alone must never open the gate: the fallback
+        releases only when re-asking the branch-exact context predicate now
+        succeeds. This pins the trailing re-ask so the fallback cannot be
+        simplified into ``return await verify_pr_merged(...)``, which would
+        release a dependent onto a base its dependency never reached.
+        """
+        project = make_project(name="Seq Merged Elsewhere", user_id="u1")
+        await _persist(db_session, project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "A", "base_branch": "plan/other"}],
+            status=TaskStatus.COMPLETED,
+        )
+        await _persist(db_session, dep)
+
+        candidate = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "B",
+                    "base_branch": "main",
+                    "require_deps_landed_on": "main",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        await _persist(db_session, candidate)
+
+        # Merged — but onto a branch that is not the gate branch, so the real
+        # verification path stamps NO landing signal.
+        async def _verify_merged_elsewhere(_task, _session):
+            return True
+
+        result, _ = await _check_candidate_task_deps(
+            candidate, [dep], [dep.id], db_session, _verify_merged_elsewhere
+        )
+        assert result == "waiting", (
+            "a merge that did not land on the gate branch must not release the "
+            f"dependent, got {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_in_flight_dep_does_not_consult_github(self, db_session):
+        """The fallback is reachable only for COMPLETED deps.
+
+        An in-flight dep is legitimately unlanded, so it must keep holding
+        without spending a GitHub verification on every dispatch cycle.
+        """
+        project = make_project(name="Seq No GH Call", user_id="u1")
+        await _persist(db_session, project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "A", "base_branch": "main"}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        await _persist(db_session, dep)
+
+        candidate = make_task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "B",
+                    "base_branch": "main",
+                    "require_deps_landed_on": "main",
+                }
+            ],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        await _persist(db_session, candidate)
+
+        calls: list[object] = []
+
+        async def _counting_verify(task, _session):
+            calls.append(task.id)
+            return True
+
+        result, _ = await _check_candidate_task_deps(
+            candidate, [dep], [dep.id], db_session, _counting_verify
+        )
+        assert result == "waiting", f"in-flight dep must hold, got {result!r}"
+        assert calls == [], (
+            f"in-flight dep must not trigger PR verification, got {len(calls)} call(s)"
+        )
+
+    @pytest.mark.asyncio
     async def test_non_integration_branch_landing(self, db_session):
         """A gate naming a campaign/staging branch is satisfied by a PR that
         merged into that branch (resolve_pr_landing_branch), not by merges
