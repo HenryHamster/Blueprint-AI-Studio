@@ -11,6 +11,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -30,6 +31,7 @@ from testing.fixgate_attribution import (  # noqa: E402
     classify_verification,
     extract_base,
     parse_junit_report,
+    _test_key,
     test_route_coverage_gaps,
 )
 from verification_receipt import record_lane, vitest_lane  # noqa: E402
@@ -310,6 +312,38 @@ def _current_file_selectors(
     return sorted(selectors)
 
 
+def _route_source(test_route: str) -> str:
+    """Return the suite-relative source file from a Vitest test route."""
+
+    return test_route.split("::", 1)[0]
+
+
+def _coverage_failures(
+    current_report: JUnitReport,
+    baseline_report: JUnitReport,
+    current_selectors: list[str] | None,
+) -> dict[str, str]:
+    """Check baseline-failing routes without confusing repair with deletion.
+
+    An unscoped run covers the whole suite. For an explicitly scoped run, the
+    baseline must be made from the same file scope; if it is not, fail closed
+    rather than silently dropping an out-of-scope baseline failure.
+    """
+
+    if current_selectors is not None:
+        current_scope = set(current_selectors)
+        baseline_scope = {
+            _route_source(_test_key(key)) for key in baseline_report.failures
+        }
+        outside_scope = sorted(baseline_scope - current_scope)
+        if outside_scope:
+            raise RuntimeError(
+                "baseline report contains failing routes outside current scope: "
+                + ",".join(outside_scope)
+            )
+    return cast(dict[str, str], test_route_coverage_gaps(current_report, baseline_report))
+
+
 def _tail(output: str, *, lines: int = 80) -> str:
     return "\n".join(output.splitlines()[-lines:])
 
@@ -413,7 +447,7 @@ def _record(
     """
 
     coverage_failures = coverage_failures or {}
-    new_failures = dict(outcome.get("new_failures") or {})
+    new_failures = dict(cast(dict[str, str], outcome.get("new_failures") or {}))
     new_failures.update(
         {f"{route}::coverage": detail for route, detail in coverage_failures.items()}
     )
@@ -691,11 +725,12 @@ def main(argv: list[str] | None = None) -> int:
             current_report=current_report,
             baseline_report=baseline_report,
         )
-        coverage_failures = (
-            test_route_coverage_gaps(current_report, baseline_report)
-            if current_is_clean
-            else {}
-        )
+        try:
+            coverage_failures = _coverage_failures(
+                current_report, baseline_report, current_selectors
+            )
+        except RuntimeError as exc:
+            return _blocking("coverage_scope_unavailable", error=str(exc))
         _record(args.suite, outcome, coverage_failures=coverage_failures)
         for key in sorted(outcome.get("suppressed_failures", {})):
             print(f"[vitest-verification] WARN suppressed baseline failure: {key}")

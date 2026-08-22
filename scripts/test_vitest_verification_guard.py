@@ -298,6 +298,99 @@ def test_guard_allows_a_vanished_baseline_failure_when_the_test_route_still_runs
     assert "PASS state=baseline_failure_disappeared" in capsys.readouterr().out
 
 
+def test_guard_blocks_a_deleted_baseline_route_during_a_non_clean_current_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A repaired route may disappear from failures, but a deleted route may not.
+
+    The current run also retains an inherited failure, so this specifically
+    covers the non-clean path where the old guard skipped route coverage.
+    """
+
+    repaired = "src/repaired.test.ts::now passes::failure"
+    inherited = "src/inherited.test.ts::still fails::failure"
+    deleted = "src/deleted.test.ts::gone::failure"
+    current = JUnitReport(
+        failures={inherited: "inherited"},
+        test_routes={
+            "src/repaired.test.ts::now passes",
+            "src/inherited.test.ts::still fails",
+        },
+    )
+    baseline = JUnitReport(
+        failures={
+            repaired: "repaired on current",
+            inherited: "inherited",
+            deleted: "deleted from current",
+        },
+        test_routes={
+            "src/repaired.test.ts::now passes",
+            "src/inherited.test.ts::still fails",
+            "src/deleted.test.ts::gone",
+        },
+    )
+    recorded: list[tuple[dict[str, object], dict[str, str]]] = []
+
+    def fake_run(
+        _: Path,
+        __: guard.Suite,
+        report: Path,
+        ___: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 1, stdout="", stderr="")
+
+    def fake_report(path: Path, **_: object) -> JUnitReport:
+        if path.name.endswith("execution.xml"):
+            return _clean_execution_report()
+        return current if path.name == "current.xml" else baseline
+
+    def capture_record(
+        _: str, outcome: dict[str, object], *, coverage_failures: dict[str, str] | None = None
+    ) -> None:
+        recorded.append((outcome, coverage_failures or {}))
+
+    monkeypatch.setattr(guard, "_run_vitest", fake_run)
+    monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_load_roster", lambda *_: _permissive_roster())
+    monkeypatch.setattr(guard, "extract_base", lambda *_: None)
+    monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(guard, "parse_junit_report", fake_report)
+    monkeypatch.setattr(guard, "_record", capture_record)
+
+    assert guard.main(["--suite", "agent", "--repo-root", str(tmp_path)]) == 1
+
+    outcome, coverage_failures = recorded[0]
+    assert outcome["blocking"] is False
+    assert coverage_failures == {
+        "src/deleted.test.ts::gone": "baseline test route is absent from the current report"
+    }
+    output = capsys.readouterr().out
+    assert "WARN suppressed baseline failure: src/inherited.test.ts::still fails::failure" in output
+    assert "FAILED state=coverage_regression" in output
+
+
+def test_scoped_coverage_fails_closed_when_baseline_scope_is_wider() -> None:
+    """An explicit current scope cannot silently discard a baseline failure."""
+
+    baseline = JUnitReport(
+        failures={
+            "src/current.test.ts::inherited::failure": "inherited",
+            "src/omitted.test.ts::deleted::failure": "deleted",
+        },
+        test_routes={
+            "src/current.test.ts::inherited",
+            "src/omitted.test.ts::deleted",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="outside current scope: src/omitted.test.ts"):
+        guard._coverage_failures(
+            JUnitReport(test_routes={"src/current.test.ts::inherited"}),
+            baseline,
+            ["src/current.test.ts"],
+        )
+
+
 @pytest.mark.parametrize("suite", ["agent", "admin-ui"])
 def test_guard_blocks_a_skipped_baseline_failure_when_a_suite_test_file_changed(
     monkeypatch: pytest.MonkeyPatch,
