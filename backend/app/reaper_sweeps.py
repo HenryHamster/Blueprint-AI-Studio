@@ -2407,10 +2407,13 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
                 await session.commit()
         else:
             # Resident-owned projects have no autonomous consumer for this
-            # marker. Alert the halt, but do not persist a recovery receipt that
-            # the selected lane cannot read or act on.
+            # marker. Commit the sweep's writes before using the existing
+            # Workday auto-start arm on its own fresh session. This runs before
+            # alert deduplication so an open alert cannot suppress recovery.
+            await session.commit()
+            await _maybe_retry_resident_workday_auto_start(project_id)
             logger.info(
-                "[STRATEGIC] Liveness alert for project %s; autonomous recovery "
+                "[STRATEGIC] Liveness alert for project %s; autonomous refresh "
                 "not armed because automatic Strategic cycles are disabled",
                 project_id,
             )
@@ -2425,6 +2428,73 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         ):
             created += 1
     return created
+
+
+async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
+    """Retry the existing Workday auto-start arm after a resident halt.
+
+    The liveness sweep owns its session, so the state check and the arm both
+    use fresh sessions.  The Workday preference is the durable operator
+    authority; a project with no continuous operator remains alert-only.
+    """
+    from app.models import MessagesNoisePrefs, Project
+    from app.strategic_resident_session import (
+        _auto_start_on_workday_entry,
+        read_resident_session,
+        resident_session_is_active,
+    )
+    from app.workbench_state import get_strategic_workbench_state
+
+    operator_user_id: str | None = None
+    try:
+        async with AsyncSessionLocal() as fresh:
+            project = await fresh.get(Project, project_id)
+            if project is None or resident_session_is_active(
+                read_resident_session(project.vision)
+            ):
+                return
+            operator_rows = (
+                await fresh.execute(
+                    select(MessagesNoisePrefs.user_id)
+                    .where(MessagesNoisePrefs.project_id == project_id)
+                    .order_by(MessagesNoisePrefs.user_id.asc())
+                )
+            ).all()
+            for (user_id,) in operator_rows:
+                workbench = await get_strategic_workbench_state(
+                    fresh, user_id, project_id
+                )
+                if workbench.get("interaction_mode") == "continuous":
+                    operator_user_id = str(user_id)
+                    break
+    except Exception:
+        logger.warning(
+            "[STRATEGIC] resident liveness recovery state read failed for project %s",
+            project_id,
+            exc_info=True,
+        )
+        return
+
+    if operator_user_id is None:
+        return
+
+    try:
+        await _auto_start_on_workday_entry(
+            project_id,
+            operator_user_id=operator_user_id,
+            session_factory=AsyncSessionLocal,
+        )
+        logger.info(
+            "[STRATEGIC] resident liveness recovery attempted Workday auto-start "
+            "for project %s",
+            project_id,
+        )
+    except Exception:
+        logger.warning(
+            "[STRATEGIC] resident liveness recovery auto-start failed for project %s",
+            project_id,
+            exc_info=True,
+        )
 
 
 # ── Step 20: Orphaned cross-base children that can never land ─────────────────
