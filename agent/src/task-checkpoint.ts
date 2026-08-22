@@ -40,6 +40,73 @@ export function parseTaskCheckpointCommitMessage(
   return { taskId, baseCommit };
 }
 
+/**
+ * Deepen a shallow clone on demand so a checkpoint squash-restore can find its
+ * merge base.
+ *
+ * Task workspaces are cloned shallow (``DEFAULT_CLONE_DEPTH``) and the
+ * checkpoint ref below is fetched at ``--depth=100``. When a task is retried
+ * long after its checkpoint was written, the true merge base can sit outside
+ * BOTH shallow boundaries — the observed production case was a merge base 213
+ * commits behind ``main``. Git then reports
+ * ``fatal: refusing to merge unrelated histories`` and, because it refuses
+ * before touching the index, the worktree stays clean: the conflict-preserving
+ * branch in ``prepareTaskWorkBranch`` sees no ``status`` output and rethrows.
+ * Every retry reproduces it byte for byte, so the task dies permanently with
+ * its unshipped work still sitting on the remote.
+ *
+ * ``audits.ts``, ``audit-challenge.ts`` and ``merge-grade.ts`` already clone at
+ * depth 0 for exactly this long-diverged case. Deepening on demand is the same
+ * defense applied lazily, so the common recent-checkpoint retry keeps paying
+ * only the cheap shallow fetch.
+ *
+ * Deliberately probe by exit status rather than by output: ``git merge-base``
+ * exits non-zero when no base is reachable, which is the only signal that
+ * distinguishes "outside the shallow window" from "genuinely unrelated". If a
+ * base is still unreachable after unshallowing the histories really are
+ * disjoint, and refusing is correct — a squash across unrelated trees would
+ * fabricate a diff. The remote checkpoint is left intact either way.
+ */
+function ensureCheckpointMergeBase(
+  git: (args: string[]) => string,
+  baseBranch: string,
+  workBranch: string,
+  ws: WebSocket | null,
+  sendLog: (ws: WebSocket | null, content: string) => void,
+): void {
+  let shallow = false;
+  try {
+    shallow = git(['rev-parse', '--is-shallow-repository']).trim() === 'true';
+  } catch { /* older git or non-repo probe failure — nothing to deepen */ }
+  if (!shallow) return;
+
+  try {
+    git(['merge-base', 'HEAD', `origin/${workBranch}`]);
+    return;
+  } catch { /* merge base is outside the shallow window — deepen below */ }
+
+  sendLog(
+    ws,
+    `Checkpoint merge base for ${workBranch} is outside the shallow clone window; ` +
+    'fetching full history before restoring.\n',
+  );
+  git(['fetch', '--no-tags', '--unshallow', 'origin']);
+  git([
+    'fetch', '--no-tags', 'origin',
+    `+refs/heads/${workBranch}:refs/remotes/origin/${workBranch}`,
+  ]);
+
+  try {
+    git(['merge-base', 'HEAD', `origin/${workBranch}`]);
+  } catch {
+    throw new Error(
+      `Checkpoint branch ${workBranch} shares no history with ${baseBranch} even after ` +
+      'fetching full history; refusing to squash unrelated trees. The remote checkpoint ' +
+      'is left intact for manual recovery.',
+    );
+  }
+}
+
 export interface PrepareTaskWorkBranchOpts {
   owner: string;
   repo: string;
@@ -105,6 +172,10 @@ export async function prepareTaskWorkBranch(
     const checkpoint = parseTaskCheckpointCommitMessage(remoteMessage, taskId);
     if (checkpoint) {
       git(['checkout', '-b', workBranch]);
+      // A retry long after the checkpoint was written can leave the merge base
+      // outside both shallow boundaries; without this the squash below fails
+      // with "unrelated histories" on a clean tree and rethrows forever.
+      ensureCheckpointMergeBase(git, baseBranch, workBranch, ws, sendLog);
       try {
         git(['merge', '--squash', '--no-commit', `origin/${workBranch}`]);
         sendLog(
