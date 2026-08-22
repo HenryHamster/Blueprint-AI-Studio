@@ -256,8 +256,9 @@ def _runnable_changed_test_files(
     no longer holds them, so `_current_file_selectors` rejects them -- and a
     test the diff removes has no current-side behavior left to prove. Keeping
     them would make a delete or rename an unclearable scope block. Their
-    baseline failures are still handled downstream: the unscoped
-    `changed_test_files` roster runs them against the extracted base tree.
+    baseline failures are still handled downstream: the scoped baseline
+    selector set unions the changed paths that still exist in the extracted
+    base tree, while the unscoped `changed_test_files` roster runs them there.
     """
 
     return [
@@ -321,7 +322,7 @@ def _route_source(test_route: str) -> str:
 def _coverage_failures(
     current_report: JUnitReport,
     baseline_report: JUnitReport,
-    current_selectors: list[str] | None,
+    baseline_selectors: list[str] | None,
 ) -> dict[str, str]:
     """Check baseline-failing routes without confusing repair with deletion.
 
@@ -330,15 +331,15 @@ def _coverage_failures(
     rather than silently dropping an out-of-scope baseline failure.
     """
 
-    if current_selectors is not None:
-        current_scope = set(current_selectors)
+    if baseline_selectors is not None:
+        executed_scope = set(baseline_selectors)
         baseline_scope = {
             _route_source(_test_key(key)) for key in baseline_report.failures
         }
-        outside_scope = sorted(baseline_scope - current_scope)
+        outside_scope = sorted(baseline_scope - executed_scope)
         if outside_scope:
             raise RuntimeError(
-                "baseline report contains failing routes outside current scope: "
+                "baseline report contains failing routes outside executed scope: "
                 + ",".join(outside_scope)
             )
     return cast(dict[str, str], test_route_coverage_gaps(current_report, baseline_report))
@@ -587,7 +588,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             base_ref = _base_ref(repo, args.base)
             roster = _load_roster(repo, suite)
-            if current_is_clean:
+            if current_selectors is not None or current_is_clean:
                 changed_test_files = _changed_test_files(repo, base_ref, suite, roster)
                 roster_config_changed = suite.config_path in _changed_files(repo, base_ref)
             else:
@@ -622,7 +623,19 @@ def main(argv: list[str] | None = None) -> int:
             base_root = temp / "base"
             base_root.mkdir()
             extract_base(repo, base_ref, base_root)
-            if current_is_clean:
+            if current_selectors is not None:
+                # Vitest's JUnit routes are suite-relative but its selector
+                # roster is intentionally empty. An explicit caller scope is
+                # therefore the only trustworthy current-side file set. Add
+                # raw changed paths as well so deleted/pre-rename files that
+                # exist only in base remain in the route-coverage obligation.
+                scoped_paths = [
+                    f"{suite.directory}/{relative}" for relative in current_selectors
+                ]
+                base_selectors = _base_file_selectors(
+                    scoped_paths + changed_test_files, suite, roster, base_root
+                )
+            elif current_is_clean:
                 if current_report.skipped_routes:
                     # A clean exit with skipped tests cannot prove that the
                     # candidate preserved the base suite's executable scope.
@@ -727,7 +740,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             coverage_failures = _coverage_failures(
-                current_report, baseline_report, current_selectors
+                current_report,
+                baseline_report,
+                base_selectors if current_selectors is not None else None,
             )
         except RuntimeError as exc:
             return _blocking("coverage_scope_unavailable", error=str(exc))

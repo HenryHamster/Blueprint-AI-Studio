@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -370,7 +371,7 @@ def test_guard_blocks_a_deleted_baseline_route_during_a_non_clean_current_run(
 
 
 def test_scoped_coverage_fails_closed_when_baseline_scope_is_wider() -> None:
-    """An explicit current scope cannot silently discard a baseline failure."""
+    """Coverage is checked against the selectors the baseline actually ran."""
 
     baseline = JUnitReport(
         failures={
@@ -383,12 +384,14 @@ def test_scoped_coverage_fails_closed_when_baseline_scope_is_wider() -> None:
         },
     )
 
-    with pytest.raises(RuntimeError, match="outside current scope: src/omitted.test.ts"):
-        guard._coverage_failures(
-            JUnitReport(test_routes={"src/current.test.ts::inherited"}),
-            baseline,
-            ["src/current.test.ts"],
-        )
+    gaps = guard._coverage_failures(
+        JUnitReport(test_routes={"src/current.test.ts::inherited"}),
+        baseline,
+        ["src/current.test.ts", "src/omitted.test.ts"],
+    )
+    assert gaps == {
+        "src/omitted.test.ts::deleted": "baseline test route is absent from the current report"
+    }
 
 
 @pytest.mark.parametrize("suite", ["agent", "admin-ui"])
@@ -1116,6 +1119,154 @@ def _write_viewport_test(root: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch()
     _write_suite_config(root, "admin-ui-viewport")
+
+
+_VIEWPORT_DELETED_TEST = "admin-ui/src/components/Deleted.viewport.test.tsx"
+_VIEWPORT_INHERITED = "src/components/Widget.viewport.test.tsx::inherited::failure"
+_VIEWPORT_REPAIRED = "src/components/Widget.viewport.test.tsx::repaired::failure"
+_VIEWPORT_DELETED = "src/components/Deleted.viewport.test.tsx::deleted::failure"
+_VIEWPORT_OUTSIDE = "src/components/Other.viewport.test.tsx::outside::failure"
+_VIEWPORT_NEW = "src/components/Widget.viewport.test.tsx::new::failure"
+
+
+def _viewport_report(failures: dict[str, str], *extra_routes: str) -> JUnitReport:
+    return JUnitReport(
+        failures=failures,
+        test_routes={key.rsplit("::", 1)[0] for key in failures} | set(extra_routes),
+    )
+
+
+@pytest.mark.parametrize(
+    ("current", "baseline", "changed", "expected_exit", "expected_state"),
+    [
+        pytest.param(
+            _viewport_report({_VIEWPORT_INHERITED: "inherited"}),
+            _viewport_report({_VIEWPORT_INHERITED: "inherited", _VIEWPORT_OUTSIDE: "unrelated base failure"}),
+            [_VIEWPORT_TEST],
+            0,
+            "preexisting_test_failure",
+        ),
+        pytest.param(
+            _viewport_report({_VIEWPORT_INHERITED: "inherited"}),
+            _viewport_report({_VIEWPORT_INHERITED: "inherited", _VIEWPORT_DELETED: "deleted base failure"}),
+            [_VIEWPORT_TEST, _VIEWPORT_DELETED_TEST],
+            1,
+            "coverage_regression",
+        ),
+        pytest.param(
+            _viewport_report({_VIEWPORT_INHERITED: "inherited"}, "src/components/Widget.viewport.test.tsx::repaired"),
+            _viewport_report({_VIEWPORT_INHERITED: "inherited", _VIEWPORT_REPAIRED: "repaired base failure"}),
+            [_VIEWPORT_TEST],
+            0,
+            "baseline_failure_disappeared",
+        ),
+        pytest.param(
+            _viewport_report({_VIEWPORT_NEW: "introduced failure"}),
+            _viewport_report({_VIEWPORT_OUTSIDE: "unrelated base failure"}),
+            [_VIEWPORT_TEST],
+            1,
+            "test_failure",
+        ),
+    ],
+)
+def test_scoped_viewport_reaches_an_attributed_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    current: JUnitReport,
+    baseline: JUnitReport,
+    changed: list[str],
+    expected_exit: int,
+    expected_state: str,
+) -> None:
+    """A scoped browser lane attributes its executed base scope, not full-base debt."""
+
+    _write_viewport_test(tmp_path)
+    runs: list[tuple[Path, list[str] | None]] = []
+    recorded: list[dict[str, object]] = []
+    reports: dict[str, JUnitReport] = {}
+    def fake_run(
+        root: Path,
+        _: guard.Suite,
+        report: Path,
+        __: Path,
+        selectors: list[str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        runs.append((root, selectors))
+        if report.name == "current.xml":
+            result = current
+        elif selectors is None:
+            result = baseline
+        else:
+            selected = set(selectors)
+            result = JUnitReport(
+                failures={key: detail for key, detail in baseline.failures.items() if key.split("::", 1)[0] in selected},
+                test_routes={route for route in baseline.test_routes if route.split("::", 1)[0] in selected},
+            )
+        reports[report.name] = result
+        return subprocess.CompletedProcess(
+            [], 1 if result.failures else 0, stdout="", stderr=""
+        )
+
+    def fake_extract(_: Path, __: str, destination: Path) -> None:
+        _write_viewport_test(destination)
+        deleted = destination / _VIEWPORT_DELETED_TEST
+        deleted.parent.mkdir(parents=True, exist_ok=True)
+        deleted.touch()
+
+    def fake_report(path: Path, **_: object) -> JUnitReport:
+        if path.name.endswith("execution.xml"):
+            return _clean_execution_report()
+        if path.name == "current.xml":
+            return current
+        return reports["baseline.xml"]
+    monkeypatch.setattr(guard, "_run_vitest", fake_run)
+    monkeypatch.setattr(guard, "_base_ref", lambda *_: "origin/automain")
+    monkeypatch.setattr(guard, "_changed_test_files", lambda *_: changed)
+    monkeypatch.setattr(guard, "_changed_files", lambda *_: [])
+    monkeypatch.setattr(guard, "_install_base", lambda *_: subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(guard, "_install_base_browser", lambda *_: subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(guard, "extract_base", fake_extract)
+    monkeypatch.setattr(guard, "parse_junit_report", fake_report)
+    monkeypatch.setattr(
+        guard,
+        "_record",
+        lambda _, outcome, **__: recorded.append(outcome),
+    )
+
+    result = guard.main(
+        [
+            "--suite",
+            "admin-ui-viewport",
+            "--repo-root",
+            str(tmp_path),
+            "--current-files",
+            _VIEWPORT_TEST,
+        ]
+    )
+
+    assert result == expected_exit
+    output = capsys.readouterr().out
+    assert f"state={expected_state}" in output and "coverage_scope_unavailable" not in output
+    assert runs[0][1] == ["src/components/Widget.viewport.test.tsx"]
+    assert runs[1][1] == (
+        [
+            "src/components/Deleted.viewport.test.tsx",
+            "src/components/Widget.viewport.test.tsx",
+        ]
+        if len(changed) > 1
+        else ["src/components/Widget.viewport.test.tsx"]
+    )
+    if len(changed) > 1:
+        assert "src/components/Deleted.viewport.test.tsx::deleted" in output
+    if expected_state == "baseline_failure_disappeared":
+        disappeared = cast(dict[str, dict[str, str]], recorded[0]["disappeared_failures"])
+        assert disappeared[_VIEWPORT_REPAIRED]["reason"] == (
+            "baseline failure no longer reproduces in current report"
+        )
+    if expected_state == "test_failure":
+        new_failures = cast(dict[str, str], recorded[0]["new_failures"])
+        assert _VIEWPORT_NEW in new_failures
 
 
 def test_viewport_and_unit_suites_own_disjoint_admin_ui_rosters() -> None:
