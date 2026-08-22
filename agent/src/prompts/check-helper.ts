@@ -675,7 +675,7 @@ if touches backend/; then
   fi
 fi
 ${buildCiFailureVerifyBlock(ciFailureSelectors, cfg.taskId)}
-${loadSizeGuardrailScript()}`;
+`;
   // Stack-block selection (ordered, most specific first):
   //  1. build_config with directories  → config-driven per-directory blocks.
   //  2. no build_config, Blueprint self-repo → the hardcoded admin-ui/agent/
@@ -697,6 +697,11 @@ ${loadSizeGuardrailScript()}`;
   } else {
     stackBlocks = genericNoConfigStackBlock(cfg.owner, cfg.repo);
   }
+  // The size guardrail is a Blueprint self-repo invariant, not a property of
+  // the hardcoded stack blocks. Resolved build_config directories select the
+  // config-driven stack above, so keep this always-on lane outside that branch
+  // or a self-repo task silently loses its cap enforcement.
+  const sizeGuardrailBlock = isSelfRepo ? loadSizeGuardrailScript() : '';
   // Success-path visual-acceptance capture+upload. Keyed to capability signal
   // rather than generated-string identity: can this stack actually capture
   // visual evidence? Blueprint self-repo YES (has viewport harness), config-driven
@@ -735,7 +740,7 @@ else
   exit 1
 fi
 `;
-  const script = header + stackBlocks + buildRequiredBackendVerificationBlock(cfg) + visualCaptureBlock + footer;
+  const script = header + stackBlocks + buildRequiredBackendVerificationBlock(cfg) + sizeGuardrailBlock + visualCaptureBlock + footer;
   // For Blueprint self-repo, `check` is a committed static entrypoint that
   // delegates to `.check-task` when present. Write the per-task generated
   // script there (gitignored) so the tracked `check` file stays clean and

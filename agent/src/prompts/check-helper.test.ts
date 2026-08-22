@@ -395,14 +395,14 @@ describe('writeCheckHelper — direct invocation', () => {
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
 
-  it('routes through buildConfigDrivenStackBlocks when buildConfig.directories is supplied', async () => {
+  it('keeps the self-repo size guardrail on the config-driven stack path', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'check-direct-3',
       workBranch: 'blueprint/check-direct-3',
       baseBranch: 'main',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: false,
       buildConfig: {
         directories: [
@@ -410,7 +410,7 @@ describe('writeCheckHelper — direct invocation', () => {
         ],
       },
     });
-    const script = capturedScripts['/tmp/workspace/check'];
+    const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
     // Config-driven path emits the dedicated comment and per-directory blocks
     // instead of the hardcoded Blueprint blocks.
@@ -424,8 +424,9 @@ describe('writeCheckHelper — direct invocation', () => {
     // shared header — what we check for is that it's not invoked here.)
     expect(script).not.toContain('if admin_ui_runtime_touched; then');
     expect(script).not.toContain('run "agent tsc');
-    // Size guardrail is a Blueprint self-repo concern, not config-driven.
-    expect(script).not.toContain('check_size_limits.py');
+    // The self-repo invariant stays armed on the config-driven path.
+    expect(script).toContain('python3 backend/testing/check_size_limits.py > "$SIZE_GR_LOG" 2>&1');
+    expect(script).toContain('size guardrail FAILED — checking baseline on origin/$BASE');
   });
 
   it('validateCfgShellSafety rejects unsafe taskId when called via writeCheckHelper', async () => {
