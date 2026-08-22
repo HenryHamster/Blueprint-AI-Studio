@@ -4643,10 +4643,18 @@
           "new_cap": 2400
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-21T17:36:59.363825+00:00",
+          "commit_sha": "5dc1e967a3346e7e41a34b2863ec5c0b8bd468b3",
+          "commit_date": "2026-08-21T10:38:20-07:00",
           "old_cap": 2400,
           "new_cap": 2850
+        }
+      ],
+      "test_vitest_verification_guard.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-22T22:33:25.178062+00:00",
+          "old_cap": 1900,
+          "new_cap": 2300
         }
       ]
     }
