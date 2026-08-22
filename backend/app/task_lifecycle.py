@@ -4156,6 +4156,7 @@ async def _process_post_commit(
                 action_taken = False
                 head_sha = ""
                 _approval_base_move_invalidates: bool | None = None
+                _approval_base_move_checked_sha: str | None = None
                 if verdict == "APPROVE":
                     # Retire the chain's lane now that the review approved — no fix
                     # will be spawned, so the lane must reach a terminal state here
@@ -4197,6 +4198,9 @@ async def _process_post_commit(
                         and reviewed_base_sha != _live_approve_target["base_sha"]
                         and reviewed_head_sha == _live_approve_target["head_sha"]
                     ):
+                        _approval_base_move_checked_sha = str(
+                            _live_approve_target["base_sha"]
+                        )
                         _approval_base_move_invalidates = (
                             await _base_move_invalidates_approval(
                                 task,
@@ -4737,7 +4741,10 @@ async def _process_post_commit(
                             or reviewed_head_sha != head_sha
                             or (
                                 reviewed_base_sha != live_base_sha
-                                and _approval_base_move_invalidates is not False
+                                and not (
+                                    _approval_base_move_invalidates is False
+                                    and _approval_base_move_checked_sha == live_base_sha
+                                )
                             )
                         )
                         if approve_target_is_stale:
