@@ -1252,6 +1252,180 @@ async def test_unmeasured_criterion_classifies_as_code_error(
     assert classify_failure(task) == CODE_ERROR
 
 
+# The unmeasured-criterion diagnostic is the sentence the research loop reads to
+# decide what to change next, so what it names has to be true. These pin the
+# boundary between "the command emitted this" and "the backend wrote this".
+#
+# Live shape from NeurIPS task 8b064053 on 2026-08-21: a job whose command wrote
+# nothing measurable still reported
+#   emitted_keys=['backend', 'command_log_text', 'command_log_truncated',
+#                 'killed_by', 'machine_type', 'result_reference',
+#                 'terminal_reason']  (declared key absent - possible case/name
+#                 mismatch)
+# Every one of those seven is a ComputeJob field. 11 of the 25 failures carrying
+# this category had a diagnostic made *entirely* of them.
+_BACKEND_ONLY_RESULT = {
+    "job_id": "job-abc",
+    "backend": "gcp",
+    "machine_type": "a2-highgpu-1g",
+    "status": "FAILED",
+    "outcome": "FAILURE",
+    "intentional_terminal": False,
+    "killed_by": None,
+    "final_cost_usd": 1.25,
+    "accrued_cost_usd": 1.25,
+    "spend_cap_usd": 5.0,
+    "terminal_reason": None,
+    "result_reference": "gs://bucket/run-1",
+}
+
+
+def test_emitted_keys_never_reports_backend_written_job_fields():
+    """A command that measured nothing must read as measuring nothing.
+
+    Reporting the ComputeJob's own fields as emitted metric keys does not just
+    add noise: it flips the diagnostic to its other branch, so the operator is
+    told a *declared key absent - possible case/name mismatch* and handed seven
+    names to compare against. There is no mismatch to find. The correct reading
+    is that the command wrote no metrics at all.
+    """
+    from app.task_evaluators import describe_emitted_compute_metric_keys
+
+    diag = describe_emitted_compute_metric_keys(json.dumps(_BACKEND_ONLY_RESULT))
+
+    assert diag.startswith("emitted_keys=[]")
+    assert "case/name mismatch" not in diag
+    for job_field in _BACKEND_ONLY_RESULT:
+        assert f"'{job_field}'" not in diag, (
+            f"job-level field {job_field!r} reported as a command-emitted metric"
+        )
+
+
+def test_emitted_keys_still_lists_metrics_the_command_did_write():
+    """Filtering job fields must not filter the signal it was hiding.
+
+    When real metrics are present the mismatch branch is the right one - this is
+    the case the diagnostic was written for - and only the command's own keys
+    belong in the list.
+    """
+    from app.task_evaluators import describe_emitted_compute_metric_keys
+
+    payload = dict(_BACKEND_ONLY_RESULT, AUC=0.81, exit_code=1, durable_file_count=3)
+
+    diag = describe_emitted_compute_metric_keys(json.dumps(payload))
+
+    assert "case/name mismatch" in diag
+    assert "'AUC'" in diag
+    assert "'exit_code'" in diag
+    # durable_* are stamped by the backend but are genuine, evaluable numbers a
+    # criterion may legitimately name, so they stay visible on purpose.
+    assert "'durable_file_count'" in diag
+    assert "'backend'" not in diag
+    assert "'machine_type'" not in diag
+
+
+def test_terminal_reason_returns_as_a_reason_not_as_a_metric_name():
+    """Filtering must not lose *why*, only stop mislabelling it.
+
+    ``terminal_reason`` and ``killed_by`` are the two job fields that answer the
+    question the empty diagnostic raises. They come back as a trailing clause,
+    which is the honest place for them - see the surface-reasons-not-just-states
+    rule this pipeline keeps re-learning.
+    """
+    from app.task_evaluators import describe_emitted_compute_metric_keys
+
+    payload = dict(
+        _BACKEND_ONLY_RESULT,
+        terminal_reason="container exited 137 before writing a result file",
+        killed_by="oom",
+    )
+
+    diag = describe_emitted_compute_metric_keys(json.dumps(payload))
+
+    assert diag.startswith("emitted_keys=[]")
+    assert "container exited 137" in diag
+    assert "killed_by='oom'" in diag
+    # Reported as a reason, never as a key the command emitted.
+    assert "'terminal_reason'" not in diag
+
+
+def test_no_termination_clause_when_the_job_offered_no_reason():
+    """A ``None`` terminal_reason must not surface as the string 'None'.
+
+    The builder writes these keys unconditionally, so most rows carry them empty.
+    An honest diagnostic says nothing rather than ``killed_by=None``.
+    """
+    from app.task_evaluators import describe_emitted_compute_metric_keys
+
+    diag = describe_emitted_compute_metric_keys(json.dumps(_BACKEND_ONLY_RESULT))
+
+    assert "killed_by" not in diag
+    assert "terminal_reason" not in diag
+    assert "None" not in diag
+
+
+def test_empty_diagnostic_says_whether_any_command_output_was_captured():
+    """Two different first questions, so two different sentences.
+
+    A captured log with no metrics means the command ran and printed something
+    unparseable - go read the log. No captured output at all means nothing of the
+    command reached the backend - go look at startup. Collapsing both into
+    "wrote no metrics" loses the fork.
+    """
+    from app.task_evaluators import describe_emitted_compute_metric_keys
+
+    with_log = describe_emitted_compute_metric_keys(
+        json.dumps(
+            dict(
+                _BACKEND_ONLY_RESULT,
+                command_log_text="Traceback (most recent call last): ...",
+                command_log_truncated=False,
+            )
+        )
+    )
+    without_log = describe_emitted_compute_metric_keys(json.dumps(_BACKEND_ONLY_RESULT))
+
+    assert "command log was captured but held no metrics" in with_log
+    assert "no command output was captured either" in without_log
+    # The embedded log body is never itself listed as an emitted metric key.
+    assert with_log.startswith("emitted_keys=[]")
+
+
+@pytest.mark.asyncio
+async def test_unmeasured_gate_reason_names_no_backend_field(
+    db_session, _quiet_compute_io
+):
+    """End-to-end: the operator-visible gate reason carries the corrected text.
+
+    The pure-function tests above pin the sentence; this pins that the sentence
+    is what actually lands on ``task.context['evaluation_gate']``, which is where
+    the 25 live NeurIPS failures were read from.
+    """
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+
+    await _handle_compute_experiment_completion(
+        task,
+        json.dumps(
+            dict(
+                _BACKEND_ONLY_RESULT,
+                terminal_reason="command exited 1",
+                command_log_text="ImportError: no module named torch",
+                command_log_truncated=False,
+            )
+        ),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.context["failure_category"] == "compute_unmeasured_criterion"
+    reason = task.context["evaluation_gate"]["reason"]
+    assert "emitted_keys=[]" in reason
+    assert "case/name mismatch" not in reason
+    assert "command exited 1" in reason
+    for job_field in ("'backend'", "'machine_type'", "'result_reference'"):
+        assert job_field not in reason
+
+
 @pytest.mark.asyncio
 async def test_unmeasured_criterion_stdout_fallback_measures_and_passes(
     db_session, _quiet_compute_io

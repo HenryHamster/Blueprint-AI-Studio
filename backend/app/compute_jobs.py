@@ -4563,7 +4563,16 @@ def build_compute_result_logs(job: ComputeJob) -> str:
     leader-owned wake worker builds this artifact straight from the job row so the
     parked task is finalized with the honest terminal outcome, final cost, and
     result reference — no agent monitoring required. Keeps the artifact shape in
-    one place, in sync with the agent's ``RESERVED_RESULT_KEYS``.
+    one place.
+
+    The job-level keys written here are plumbing, not experiment metrics, and
+    ``_COMPUTE_RESULT_NON_METRIC_KEYS`` in app/task_evaluators.py must know all
+    of them or the unmeasured-criterion diagnostic reports them as things the
+    command emitted. Adding a job-level key here means adding it there;
+    ``test_build_compute_result_logs_job_level_keys_stay_filtered`` enforces it.
+    (The older note here pointed at an agent-side ``RESERVED_RESULT_KEYS`` that
+    no longer exists anywhere in agent/src — the contract now lives in this
+    function alone.)
     """
     meta = job.polling_metadata or {}
     # status/outcome may surface as the str-enum member OR a bare string depending

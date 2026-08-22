@@ -8057,6 +8057,80 @@ def test_build_compute_result_logs_shape_metrics_and_disposition():
     assert "ignored" not in result
 
 
+def test_build_compute_result_logs_job_level_keys_stay_filtered():
+    """The builder and the unmeasured-criterion diagnostic must agree on which
+    keys are plumbing.
+
+    ``build_compute_result_logs`` writes the ComputeJob's own fields into the
+    same flat object the experiment's metrics land in.
+    ``_COMPUTE_RESULT_NON_METRIC_KEYS`` in app/task_evaluators.py is the list of
+    those fields, and nothing but a shared reader's diligence held the two
+    together - so they drifted, the builder growing to fourteen job-level keys
+    while the filter knew eight. The result was a diagnostic telling operators a
+    command had "emitted" ``backend``, ``machine_type`` and ``result_reference``,
+    and that their declared metric was therefore probably misspelled.
+
+    Adding a job-level key to the builder without adding it there fails here.
+    """
+    from app.task_evaluators import (
+        _COMPUTE_RESULT_NON_METRIC_KEYS,
+        describe_emitted_compute_metric_keys,
+    )
+
+    # Stamped by _link_terminal_artifact and deliberately NOT filtered: they are
+    # real numbers a success_criterion may name, evaluable even when the command
+    # itself died. A new key here must be a conscious "this is evaluable" call.
+    evaluable_backend_metrics = {"durable_file_count", "durable_payload_bytes"}
+
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        backend="gcp",
+        machine_type="a2-highgpu-1g",
+        status=ComputeJobStatus.FAILED,
+        outcome=ComputeJobOutcome.FAILURE,
+        terminal_reason="command exited 1",
+        result_reference="gs://bucket/run-1",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=1.25,
+        final_cost_usd=1.25,
+        polling_metadata={
+            "durable_file_count": 3,
+            "durable_payload_bytes": 4096,
+            # Plain prose on purpose: no balanced JSON object, so the stdout
+            # metric fallback contributes nothing and every remaining key is
+            # unambiguously the backend's own.
+            "command_log": {
+                "text": "ImportError: no module named torch",
+                "truncated": False,
+            },
+        },
+    )
+
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+
+    unfiltered = (
+        set(result) - _COMPUTE_RESULT_NON_METRIC_KEYS - evaluable_backend_metrics
+    )
+    assert not unfiltered, (
+        f"build_compute_result_logs writes job-level key(s) {sorted(unfiltered)} "
+        "that _COMPUTE_RESULT_NON_METRIC_KEYS (app/task_evaluators.py) does not "
+        "know about; the unmeasured-criterion diagnostic will report them as "
+        "metrics the experiment command emitted. Add them there, or add them to "
+        "evaluable_backend_metrics here if they are genuinely evaluable."
+    )
+
+    # The property that actually matters, asserted end to end: the only keys the
+    # diagnostic attributes to this run are the two evaluable backend metrics,
+    # and the job's reason for stopping is stated rather than listed as a metric.
+    diag = describe_emitted_compute_metric_keys(json.dumps(result))
+    assert diag.startswith(
+        "emitted_keys=['durable_file_count', 'durable_payload_bytes']"
+    ), diag
+    assert "terminal_reason='command exited 1'" in diag
+
+
 def test_build_compute_result_logs_embeds_command_log_text():
     """The builder embeds the bounded command-output log so downstream analysis can
     find results that live in stdout/stderr rather than in $BLUEPRINT_RESULT_FILE."""
