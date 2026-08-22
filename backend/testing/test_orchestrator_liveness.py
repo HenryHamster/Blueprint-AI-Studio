@@ -262,6 +262,46 @@ class TestStrategicLoopLiveness:
             == 1
         )
 
+    async def test_resident_owned_starvation_does_not_persist_autonomous_refresh(
+        self, db_session
+    ):
+        """A Resident-owned halt is alerted without arming an unreadable marker."""
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={"automatic_strategic_cycles_enabled": False},
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        await db_session.refresh(project)
+        assert (project.vision or {}).get("_strategic_refresh") is None
+
+        # A repeated reaper pass must remain marker-free, even while the alert
+        # is deduped. There is no autonomous consumer for this project's marker.
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+        await db_session.refresh(project)
+        assert (project.vision or {}).get("_strategic_refresh") is None
+        assert len(
+            (
+                await db_session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        ) == 1
+
     async def test_quiet_healthy_portfolio_does_not_raise_signal(self, db_session):
         """A recent intentional no-delta receipt is healthy idle, not a halt."""
         from app.reaper_sweeps import (
@@ -403,6 +443,46 @@ class TestStrategicLoopLiveness:
         await _spawn_research_task(project, db_session)
 
         assert mock_spawn.await_count == 1
+
+    async def test_wall_clock_backstop_does_not_claim_fire_for_resident_owned_project(
+        self, db_session, mocker, caplog
+    ):
+        """A disabled automatic lane cannot honestly claim a backstop firing."""
+        from app.autonomous_research import _spawn_research_task
+        from app.models import Task, TaskStatus
+
+        mocker.patch(
+            "app.autonomous_research._research_route_has_available_account",
+            return_value=True,
+        )
+        mocker.patch.dict(_ss.runtime_config, {"strategic_max_interval_minutes": 180})
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={"automatic_strategic_cycles_enabled": False},
+            vision={"purpose": "resident-owned project", "_research_spawn_count": 1},
+            directions=[],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title="Old strategic cycle",
+                payloads=[{"type": "strategic_review", "base_branch": "main"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=now - timedelta(hours=4),
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
+        await db_session.commit()
+
+        with caplog.at_level("INFO", logger="app.autonomous_research"):
+            await _spawn_research_task(project, db_session)
+
+        assert "[STRATEGIC] Wall-clock backstop firing" not in caplog.text
 
     async def test_failure_breaker_decays_before_unavailable_account_return(
         self, db_session, mocker

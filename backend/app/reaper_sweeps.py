@@ -11,6 +11,7 @@ import contextlib
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import and_, delete, func, or_
@@ -2282,6 +2283,7 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     evidence of full-cycle liveness.
     """
     from app.models import Alert, AlertSeverity, Project, StrategicCycle
+    from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
     from app.shared_state import runtime_config as _runtime_config
 
     starvation_hours = int(
@@ -2295,7 +2297,12 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
 
     project_rows = (
         await session.execute(
-            select(Project.id, Project.created_at, Project.vision).where(
+            select(
+                Project.id,
+                Project.created_at,
+                Project.vision,
+                Project.build_config,
+            ).where(
                 Project.autonomous_enabled.is_(True),
                 Project.not_archived(),
             )
@@ -2307,7 +2314,13 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     # the two batched lookups below only run over genuine candidates.
     candidate_ids: list = []
     candidate_visions: dict = {}
-    for project_id, project_created_at, project_vision in project_rows:
+    automatic_cycles_allowed: dict = {}
+    for (
+        project_id,
+        project_created_at,
+        project_vision,
+        project_build_config,
+    ) in project_rows:
         if project_created_at is not None:
             pc = project_created_at
             if pc.tzinfo is not None:
@@ -2316,6 +2329,9 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
                 continue
         candidate_ids.append(project_id)
         candidate_visions[project_id] = project_vision
+        automatic_cycles_allowed[project_id] = automatic_strategic_cycles_enabled(
+            SimpleNamespace(build_config=project_build_config)
+        )
 
     if not candidate_ids:
         return 0
@@ -2375,21 +2391,29 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             continue
         if _recent_no_delta_skip_at(candidate_visions.get(project_id), cutoff) is not None:
             continue
-        # An alert is only the operator-facing symptom. Arm the durable
-        # coalesced refresh first so the next autonomous tick can recover the
-        # loop even when the alert already exists and is therefore deduped.
-        # The helper only flushes (the caller owns the transaction), and the
-        # deduped path below skips the alert write that would otherwise commit,
-        # so commit the marker here. Without this, the very case the refresh
-        # exists for -- a project whose alert is already open -- would have its
-        # marker rolled back by a later sweep and never recover the loop.
-        if await request_strategic_refresh(
-            session,
-            project_id,
-            reason="strategic_cycle_starvation",
-            origin=ORIGIN_QUALIFICATION,
-        ):
-            await session.commit()
+        if automatic_cycles_allowed[project_id]:
+            # An alert is only the operator-facing symptom. Arm the durable
+            # coalesced refresh first so the next autonomous tick can recover
+            # the loop even when the alert already exists and is therefore
+            # deduped. The helper only flushes (the caller owns the transaction),
+            # and the deduped path below skips the alert write that would
+            # otherwise commit, so commit the marker here.
+            if await request_strategic_refresh(
+                session,
+                project_id,
+                reason="strategic_cycle_starvation",
+                origin=ORIGIN_QUALIFICATION,
+            ):
+                await session.commit()
+        else:
+            # Resident-owned projects have no autonomous consumer for this
+            # marker. Alert the halt, but do not persist a recovery receipt that
+            # the selected lane cannot read or act on.
+            logger.info(
+                "[STRATEGIC] Liveness alert for project %s; autonomous recovery "
+                "not armed because automatic Strategic cycles are disabled",
+                project_id,
+            )
         # Dedup: one open WARNING alert per project for this title.
         if project_id in projects_with_open_alert:
             continue
