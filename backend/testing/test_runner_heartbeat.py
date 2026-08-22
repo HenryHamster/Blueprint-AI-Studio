@@ -651,6 +651,28 @@ async def test_update_drain_heartbeat_keeps_unpulled_resident_pin(db_session):
     assert "runner_target_id" not in stale_marker.context
 
 
+def test_update_drain_stuck_literal_matches_shared_constant():
+    """The heartbeat writes ``event_type`` as a literal; pin it to the constant.
+
+    ``test_message_audience`` resolves an alert's ``event_type`` only from a
+    same-module ``NAME = "..."`` assignment, so the heartbeat cannot reference
+    the shared constant through its lazy cross-module import without reading
+    as an unregistered event type. It therefore spells the string out. This
+    pin fails if the literal and the shared constant ever drift apart.
+    """
+    from pathlib import Path
+
+    from app.runner_health_alerts import _RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE
+
+    src = Path(runner_mod.__file__).read_text(encoding="utf-8")
+    assert (
+        f'event_type="{_RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE}"' in src
+    ), "heartbeat alert event_type literal drifted from the shared constant"
+    from app.message_audience import _EVENT_AUDIENCE_REGISTRY
+
+    assert _RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE in _EVENT_AUDIENCE_REGISTRY
+
+
 @pytest.mark.asyncio
 async def test_update_drain_stuck_raises_one_alert_per_episode(db_session):
     """An idle runner draining past the threshold raises exactly one alert.

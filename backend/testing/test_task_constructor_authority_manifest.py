@@ -50,6 +50,7 @@ TASK_SITE_MANIFEST: dict[TaskSite, tuple[str, tuple[AuthorityProof, ...]]] = {
     ("hotfix_backmerge", "_spawn_migration_resolution_task", 1): _auto(("hotfix_backmerge", "_handle_migration_block", "acquire_automatic_task_creation_authority")),
     ("hotfix_backmerge", "_spawn_resolution_task", 1): _auto(("hotfix_backmerge", "_handle_conflict", "acquire_automatic_task_creation_authority")),
     ("issue_implementation", "_handle_issue_implementation_inner", 1): _auto(("issue_implementation", "_handle_issue_implementation_inner", "acquire_automatic_task_creation_authority")),
+    ("module_finding_chain", "_guard_remediation_task", 1): _auto(("module_finding_chain", "elect_guard_suppression_owners", "acquire_automatic_task_creation_authority")),
     ("plan_completion", "_handle_plan_completion", 1): _auto(("plan_completion", "_handle_plan_completion", "automatic_task_creation_parent_lock")),
     ("release_qualifier_audit", "_spawn_direction_merge_grade_task", 1): _auto(("release_qualifier_audit", "_spawn_direction_merge_grade_task", "_require_qualifier_task_admission")),
     ("release_qualifier_audit", "_spawn_qualifier_walkthrough_task", 1): _auto(("release_qualifier_audit", "_spawn_qualifier_walkthrough_task", "_require_qualifier_task_admission")),
@@ -98,6 +99,7 @@ STRUCTURAL_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("hotfix_backmerge", "_spawn_ci_fix_task"): {("hotfix_backmerge", "_handle_ci_failure")},
     ("hotfix_backmerge", "_spawn_migration_resolution_task"): {("hotfix_backmerge", "_handle_migration_block")},
     ("hotfix_backmerge", "_spawn_resolution_task"): {("hotfix_backmerge", "_handle_conflict")},
+    ("module_finding_chain", "_guard_remediation_task"): {("module_finding_chain", "elect_guard_suppression_owners")},
     ("review_pipeline", "_handle_lane_checkpoint_recovery"): {("review_pipeline", "_spawn_pipeline_task")},
     ("review_pipeline", "_spawn_verify_tests_task"): {("review_pipeline", "_spawn_pipeline_task")},
     ("strategic_spawn_requests", "_task_from_specification"): {("strategic_spawn_requests", "_dispatch_request")},
@@ -220,7 +222,7 @@ def test_every_production_task_constructor_is_exactly_classified() -> None:
     assert actual == set(TASK_SITE_MANIFEST)
     classes = [classification for classification, _proofs in TASK_SITE_MANIFEST.values()]
     assert classes.count("manual_or_terminal") == 9
-    assert classes.count("automatic_or_mixed") == 50
+    assert classes.count("automatic_or_mixed") == 51
 
 
 def test_every_automatic_constructor_has_executable_authority_proof() -> None:

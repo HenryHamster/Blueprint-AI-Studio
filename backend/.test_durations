@@ -14713,7 +14713,7 @@
   "testing/test_research_actionability.py::test_extended_rates_generalized_calibration": 0.0018395710012555355,
   "testing/test_research_actionability.py::test_extended_rates_none_when_no_findings": 0.00172227499751898,
   "testing/test_research_completion.py::TestAcceptanceEvidencePropagation::test_acceptance_evidence_survives_batch_cap_truncation": 0.6256779080013075,
-  "testing/test_research_completion.py::TestAcceptanceEvidencePropagation::test_criterion_carrying_finding_with_named_test_evidence_spawns": 0.6829279580015282,
+  "testing/test_research_completion.py::TestAcceptanceEvidencePropagation::test_criterion_carrying_finding_with_any_valid_evidence_spawns": 0.6829279580015282,
   "testing/test_research_completion.py::TestAcceptanceEvidencePropagation::test_criterion_carrying_finding_without_named_test_is_rejected": 0.7017549840020365,
   "testing/test_research_completion.py::TestAcceptanceEvidencePropagation::test_criterion_keys_warning_injected_into_research_context": 0.7008149439971021,
   "testing/test_research_completion.py::TestAcceptanceEvidencePropagation::test_design_child_payload_annotations_include_capability_proof_status": 0.6193717930000275,

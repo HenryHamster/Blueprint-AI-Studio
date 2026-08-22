@@ -3,20 +3,27 @@ from __future__ import annotations
 import uuid
 from contextlib import nullcontext
 from datetime import timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.models import ModuleFindingChain, ProjectMessage, Task, TaskStatus
+from app.models import ModuleFindingChain, Project, ProjectMessage, Task, TaskStatus
 from app.module_finding_chain import (
     CHAIN_ESCALATION_THRESHOLD,
     _guard_chain_key,
+    elect_guard_suppression_owners,
     extract_guard_suppression_identities,
     find_and_mark_chain_escalation,
     ingest_guard_suppression_receipt,
     record_merged_pr_finding_chains,
     resolve_landed_guard_suppression_remediation,
     resolved_review_findings,
+)
+from app.task_locking import (
+    AUTOMATIC_TASK_CREATION_ALLOWED,
+    AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
 )
 from app.review_loop_convergence import build_cross_episode_abandon_candidate
 from app.time_utils import _utcnow
@@ -475,10 +482,20 @@ async def test_recurring_guard_suppression_has_one_owner_and_resolves():
     assert chain.chain_kind == "guard_suppression"
     assert chain.occurrences == CHAIN_ESCALATION_THRESHOLD
     assert chain.source_task_ids == [str(task.id) for task in source_tasks]
+    # Ingestion records evidence and nothing else. It runs inside the agent
+    # heartbeat, which already holds its own Task row FOR UPDATE and therefore
+    # cannot hold the Project admission a Task INSERT requires.
+    assert chain.remediation_task_id is None
+    assert _remediation_owners(session) == []
+
+    assert len(await _elect(session)) == 1
     assert chain.remediation_task_id is not None
     owners = [task for task in session.added_tasks if task.id == chain.remediation_task_id]
     assert len(owners) == 1
     owner = owners[0]
+    # An owned chain is no longer a candidate, so the sweep is idempotent.
+    assert await _elect(session) == []
+    assert _remediation_owners(session) == [owner]
     assert owner.context["guard_suppression_remediation_keys"] == [chain.finding_key]
 
     # An unrelated clean landing has no authority to resolve the chain.
@@ -502,6 +519,8 @@ async def test_recurring_guard_suppression_has_one_owner_and_resolves():
         await ingest_guard_suppression_receipt(task, session)
     assert chain.status == "open"
     assert chain.occurrences == CHAIN_ESCALATION_THRESHOLD
+    assert chain.remediation_task_id is None
+    assert len(await _elect(session)) == 1
     assert chain.remediation_task_id != owner.id
     assert len([task for task in session.added_tasks if task.id == chain.remediation_task_id]) == 1
 
@@ -564,6 +583,30 @@ def test_ordinary_two_or_three_cycle_intra_pr_convergence_does_not_escalate():
         for iteration in (1, 2, 3)
     ]
     assert build_cross_episode_abandon_candidate(task_rows) is None
+
+
+def _remediation_owners(session) -> list[Task]:
+    """Only the elected owners; ingestion also re-adds its own source task."""
+    return [
+        task
+        for task in session.added_tasks
+        if task.created_by == "SYSTEM_AUTO_REMEDIATION"
+    ]
+
+
+async def _elect(session, decision: str = AUTOMATIC_TASK_CREATION_ALLOWED) -> list[Task]:
+    """Drive the leader-owned election sweep against a ledger fake session.
+
+    The Project admission itself is stubbed here because these fakes have no
+    project table; ``test_owner_election_honours_real_project_authority`` and
+    ``test_owner_election_refuses_a_paused_project`` exercise the real
+    ``acquire_automatic_task_creation_authority`` against the database.
+    """
+    with patch(
+        "app.task_locking.acquire_automatic_task_creation_authority",
+        new=AsyncMock(return_value=decision),
+    ):
+        return await elect_guard_suppression_owners(session)
 
 
 class _TaskStoreSession(_Session):
@@ -713,11 +756,13 @@ async def test_recurrence_re_elects_owner_after_the_first_one_failed():
     for _ in range(CHAIN_ESCALATION_THRESHOLD):
         await ingest_guard_suppression_receipt(_source(), session)
     chain = session.rows[0]
+    assert await _elect(session)
     first_owner_id = chain.remediation_task_id
     assert first_owner_id is not None
 
     # The owner is still running: a new recurrence must NOT elect a second one.
     await ingest_guard_suppression_receipt(_source(), session)
+    assert await _elect(session) == []
     assert chain.remediation_task_id == first_owner_id
     assert len(_owners()) == 1
 
@@ -726,13 +771,128 @@ async def test_recurrence_re_elects_owner_after_the_first_one_failed():
     # to match remediation_task_id.
     session.tasks[first_owner_id].status = TaskStatus.COMPLETED
     await ingest_guard_suppression_receipt(_source(), session)
+    assert await _elect(session) == []
     assert chain.remediation_task_id == first_owner_id
     assert len(_owners()) == 1
 
-    # A FAILED owner is never coming back: release it and elect a new one.
+    # A FAILED owner is never coming back: ingestion releases it and the next
+    # sweep elects a new one under the project's authority.
     session.tasks[first_owner_id].status = TaskStatus.FAILED
     await ingest_guard_suppression_receipt(_source(), session)
+    assert chain.remediation_task_id is None
+    assert await _elect(session)
     assert chain.status == "open"
     assert chain.remediation_task_id is not None
     assert chain.remediation_task_id != first_owner_id
     assert len(_owners()) == 2
+
+
+def _mature_chain(project_id) -> ModuleFindingChain:
+    """A persisted chain that is open, at threshold, and unowned."""
+    return ModuleFindingChain(
+        project_id=project_id,
+        finding_key=_guard_chain_key("backend-pytest", "backend/testing/test_x.py::test_x::AssertionError"),
+        file_path="guard:backend-pytest",
+        summary="Recurring baseline guard suppression",
+        chain_kind="guard_suppression",
+        suppression_lane="backend-pytest",
+        failure_identity="backend/testing/test_x.py::test_x::AssertionError",
+        source_task_ids=[],
+        pr_numbers=[],
+        first_seen_pr=0,
+        last_seen_pr=0,
+        occurrences=CHAIN_ESCALATION_THRESHOLD,
+        verified_occurrences=CHAIN_ESCALATION_THRESHOLD,
+        status="open",
+    )
+
+
+@pytest.mark.asyncio
+async def test_election_denied_by_project_authority_elects_nothing():
+    """A refused admission leaves the chain intact for a later sweep."""
+    session = _Session()
+    chain = _mature_chain(uuid.uuid4())
+    session.rows.append(chain)
+
+    assert await _elect(session, AUTOMATIC_TASK_CREATION_PROJECT_PAUSED) == []
+    assert chain.remediation_task_id is None
+    assert _remediation_owners(session) == []
+
+    assert len(await _elect(session)) == 1
+    assert chain.remediation_task_id is not None
+
+
+@pytest.mark.asyncio
+async def test_owner_election_honours_real_project_authority(db_session):
+    """The sweep takes the real Project admission before inserting the owner."""
+    project = Project(name="guard election", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+    chain = _mature_chain(project.id)
+    db_session.add(chain)
+    await db_session.commit()
+
+    elected = await elect_guard_suppression_owners(db_session)
+    await db_session.commit()
+
+    assert len(elected) == 1
+    owners = list(
+        (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert [task.created_by for task in owners] == ["SYSTEM_AUTO_REMEDIATION"]
+    assert owners[0].status == TaskStatus.QUEUED
+    assert owners[0].context["guard_suppression_remediation_keys"] == [
+        chain.finding_key
+    ]
+    await db_session.refresh(chain)
+    assert chain.remediation_task_id == owners[0].id
+
+    # Owned chains are no longer candidates, so re-running the sweep is a no-op.
+    assert await elect_guard_suppression_owners(db_session) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", ["paused", "archived"])
+async def test_owner_election_refuses_a_project_that_cannot_take_new_work(
+    db_session, blocked
+):
+    """A paused or archived project must not accumulate latent queued work.
+
+    This is exactly the invariant the earlier heartbeat-side election could not
+    hold: it ran behind the reporting task's row lock and so never consulted the
+    project at all. Electing here, under the Project lock, is what makes the
+    remediation owner an ordinary admitted automatic task.
+    """
+    project = Project(
+        name=f"guard election {blocked}",
+        user_id="test-user-123",
+        **{blocked: True},
+    )
+    db_session.add(project)
+    await db_session.flush()
+    chain = _mature_chain(project.id)
+    db_session.add(chain)
+    await db_session.commit()
+
+    assert await elect_guard_suppression_owners(db_session) == []
+    await db_session.commit()
+
+    await db_session.refresh(chain)
+    assert chain.remediation_task_id is None
+    assert (
+        list(
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        == []
+    )
+

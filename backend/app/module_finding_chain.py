@@ -28,6 +28,7 @@ GUARD_SUPPRESSION_CHAIN_KIND = "guard_suppression"
 _TASK_RECORDED_GUARD_KEYS = "_guard_suppression_recorded_keys"
 _TASK_RECORDED_GUARD_KEYS_MAX_ENTRIES = 1024
 GUARD_SUPPRESSION_RECEIPT_FRESHNESS = timedelta(days=1)
+GUARD_SUPPRESSION_ELECTION_BATCH = 25
 
 
 def _guard_chain_key(lane: str, identity: str) -> str:
@@ -409,15 +410,12 @@ async def _ingest_guard_suppression_receipt_once(
                 # forever behind a dead owner and its aggregate operator message
                 # can never close.
                 await _release_terminal_remediation_owner(session, chain)
-            if (
-                chain.status == "open"
-                and int(chain.verified_occurrences or 0) >= CHAIN_ESCALATION_THRESHOLD
-                and chain.remediation_task_id is None
-            ):
-                owner = _guard_remediation_task(chain)
-                chain.remediation_task_id = owner.id
-                session.add(owner)
-                await _post_guard_suppression_escalation(session, chain, owner)
+            # Owner election deliberately does NOT happen here; see
+            # ``elect_guard_suppression_owners``. This runs inside
+            # ``agent_heartbeat``, which already holds the reporting Task row
+            # FOR UPDATE, so taking the Project admission lock behind it would
+            # invert the canonical Project -> Task order on the fleet's
+            # liveness-critical path. Ingestion only records evidence.
             session.add(chain)
             if chain not in touched:
                 touched.append(chain)
@@ -463,6 +461,85 @@ async def _release_terminal_remediation_owner(
             owner.status,
         )
         chain.remediation_task_id = None
+
+
+def _chain_awaits_remediation_owner(chain: ModuleFindingChain) -> bool:
+    """Return whether this persisted chain row is due an owner right now."""
+    return (
+        chain.chain_kind == GUARD_SUPPRESSION_CHAIN_KIND
+        and chain.status == "open"
+        and chain.remediation_task_id is None
+        and int(chain.verified_occurrences or 0) >= CHAIN_ESCALATION_THRESHOLD
+    )
+
+
+async def elect_guard_suppression_owners(
+    session: AsyncSession, *, limit: int = GUARD_SUPPRESSION_ELECTION_BATCH
+) -> list[Task]:
+    """Elect one remediation owner per mature chain, under Project authority.
+
+    Election is a separate leader-owned sweep rather than part of receipt
+    ingestion. Ingestion's only production caller is ``agent_heartbeat``, which
+    already holds the reporting Task row ``FOR UPDATE``; acquiring the Project
+    admission lock there would invert the canonical Project -> Task order on a
+    liveness-critical path, and skipping the lock would insert QUEUED work into
+    paused and archived projects. The election predicate is fully derivable
+    from the persisted row -- open, at threshold, unowned -- so the same
+    decision can be made here, a moment later, under the correct lock.
+
+    Bounded per invocation and idempotent: a chain that already has an owner is
+    no longer a candidate, and a project that is paused, archived, or
+    momentarily lock-contended is simply skipped until the next sweep.
+    """
+    from app.task_locking import (
+        AUTOMATIC_TASK_CREATION_ALLOWED,
+        acquire_automatic_task_creation_authority,
+    )
+
+    candidates = list(
+        (
+            await session.execute(
+                select(ModuleFindingChain)
+                .where(
+                    ModuleFindingChain.chain_kind == GUARD_SUPPRESSION_CHAIN_KIND,
+                    ModuleFindingChain.status == "open",
+                    ModuleFindingChain.remediation_task_id.is_(None),
+                    ModuleFindingChain.verified_occurrences
+                    >= CHAIN_ESCALATION_THRESHOLD,
+                )
+                .order_by(ModuleFindingChain.last_seen_at.asc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_project: dict[Any, list[ModuleFindingChain]] = {}
+    for chain in candidates:
+        # Re-assert the predicate in Python. The row is the authority, and this
+        # keeps the decision identical whether the filtering happened in SQL or
+        # the row changed between the read and this pass.
+        if _chain_awaits_remediation_owner(chain):
+            by_project.setdefault(chain.project_id, []).append(chain)
+
+    elected: list[Task] = []
+    for project_id, chains in by_project.items():
+        decision = await acquire_automatic_task_creation_authority(session, project_id)
+        if decision != AUTOMATIC_TASK_CREATION_ALLOWED:
+            logger.info(
+                "guard-suppression owner election held for project %s: %s",
+                project_id,
+                decision,
+            )
+            continue
+        for chain in chains:
+            owner = _guard_remediation_task(chain)
+            chain.remediation_task_id = owner.id
+            session.add(owner)
+            session.add(chain)
+            await _post_guard_suppression_escalation(session, chain, owner)
+            elected.append(owner)
+    return elected
 
 
 async def resolve_landed_guard_suppression_remediation(

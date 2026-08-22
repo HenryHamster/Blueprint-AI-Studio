@@ -1843,10 +1843,7 @@ async def heartbeat(
                 from app.main import _current_sha
 
                 # Lazy: app.alert_dispatch imports this router's package.
-                from app.alert_dispatch import (
-                    _RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE,
-                    _update_drain_stuck_dedupe_key,
-                )
+                from app.alert_dispatch import _update_drain_stuck_dedupe_key
 
                 _runner_label = runner.hostname or f"runner {str(runner_id)[:8]}"
                 session.add(
@@ -1867,7 +1864,14 @@ async def heartbeat(
                             "(main), deploy a main-reachable revision."
                         )[:1000],
                         source="runner",
-                        event_type=_RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE,
+                        # Literal, not the imported constant: the audience
+                        # scanner (test_message_audience) resolves event_type
+                        # only from same-module `NAME = "..."` assignments, so
+                        # a cross-module import reads as an unregistered type
+                        # and the registration in message_audience.py cannot be
+                        # verified. Pinned against the shared constant by
+                        # test_update_drain_stuck_literal_matches_constant.
+                        event_type="runner.update_drain_stuck",
                         # Deterministic per-runner key so the recovery path can
                         # find and dismiss this exact incident. Without it the
                         # row was unfindable and every episode left a permanent
