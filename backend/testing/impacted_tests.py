@@ -79,65 +79,6 @@ import json
 import os
 import re
 import sys
-try:
-    from testing.fixgate_attribution import (
-        JUnitReport,
-        attribute_failure_maps,
-        classify_verification as _classify_verification,
-        parse_junit_failures as _parse_junit_failures,
-    )
-except ModuleNotFoundError:  # direct ``python backend/testing/impacted_tests.py``
-    from fixgate_attribution import (  # type: ignore[no-redef]
-        JUnitReport,
-        attribute_failure_maps,
-        classify_verification as _classify_verification,
-        parse_junit_failures as _parse_junit_failures,
-    )
-
-
-def parse_junit_failures(path: str | os.PathLike[str]) -> dict[str, str]:
-    """Return failed JUnit testcase identities and their diagnostic details."""
-    return _parse_junit_failures(path)
-
-
-def attribute_new_failures(
-    current: dict[str, str],
-    baseline: dict[str, str],
-    *,
-    current_root: str | os.PathLike[str] | None = None,
-    baseline_root: str | os.PathLike[str] | None = None,
-) -> dict[str, str]:
-    """Keep only failures newly introduced by the current tree."""
-    return attribute_failure_maps(
-        current,
-        baseline,
-        current_root=current_root,
-        baseline_root=baseline_root,
-    ).new_failures
-
-
-def classify_backend_verification(
-    *,
-    runtime_available: bool,
-    current_exit_code: int,
-    current_failures: dict[str, str],
-    baseline_failures: dict[str, str] | None = None,
-    current_root: str | os.PathLike[str] | None = None,
-    baseline_root: str | os.PathLike[str] | None = None,
-    current_report: JUnitReport | None = None,
-    baseline_report: JUnitReport | None = None,
-) -> dict[str, object]:
-    """Compatibility entrypoint for the shared publication attribution."""
-    return _classify_verification(
-        runtime_available=runtime_available,
-        current_exit_code=current_exit_code,
-        current_failures=current_failures,
-        baseline_failures=baseline_failures,
-        current_report=current_report,
-        baseline_report=baseline_report,
-        current_root=current_root,
-        baseline_root=baseline_root,
-    )
 
 # Maximum BFS depth for transitive importer expansion. The ``seen_mods`` dedup
 # set already guarantees termination on cyclic graphs; this cap bounds scan cost

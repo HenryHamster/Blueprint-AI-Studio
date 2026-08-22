@@ -24,6 +24,7 @@ import static_release_guard  # noqa: E402
 import typecheck_verification_guard  # noqa: E402
 import vitest_verification_guard  # noqa: E402
 from testing.fixgate_attribution import (  # noqa: E402
+    JUnitReport,
     classify_verification,
     format_offender_marker,
 )
@@ -2050,11 +2051,15 @@ def test_an_unwritable_receipt_does_not_change_the_static_corpus_verdict(
 
 def _suppressing_outcome() -> dict[str, object]:
     """Return a real classify_verification outcome that suppresses a failure."""
+    report = JUnitReport(
+        failures={"testing/test_x.py::test_fails::failure": "boom"},
+        test_routes={"testing/test_x.py::test_fails"},
+    )
     outcome = classify_verification(
         runtime_available=True,
         current_exit_code=1,
-        current_failures={"testing/test_x.py::test_fails": "boom"},
-        baseline_failures={"testing/test_x.py::test_fails": "boom"},
+        current_report=report,
+        baseline_report=report,
     )
     assert outcome["state"] == "preexisting_test_failure"
     assert outcome["suppressed_failures"], "fixture must actually suppress something"

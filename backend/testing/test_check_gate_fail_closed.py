@@ -27,8 +27,11 @@ import pytest
 from testing.fixgate_attribution import (
     JUnitReport,
     _normalize_failure_detail,
-    attribute_failure_maps,
+    attribute_reports,
     classify_verification,
+    format_offender_marker,
+    parse_junit_report,
+    test_route_coverage_gaps as route_coverage_gaps,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -566,7 +569,7 @@ def test_normalize_preserves_a_genuinely_different_line_number() -> None:
     )
 
 
-def test_attribute_failure_maps_suppresses_task_counter_only_difference() -> None:
+def test_attribute_reports_suppress_task_counter_only_difference() -> None:
     """End-to-end: a failure identical except for the pytest-asyncio Task
     counter and the truncated checkout path must be classified as
     pre-existing (suppressed), not a new failure introduced by this diff."""
@@ -579,10 +582,63 @@ def test_attribute_failure_maps_suppresses_task_counter_only_difference() -> Non
         key: "future = <Task finished name='Task-7290' "
         "coro=<x() done...main-check2/backend/testing/test_x.py:16451>>"
     }
-    attribution = attribute_failure_maps(current, baseline)
+    attribution = attribute_reports(
+        _failure_report(
+            key, _normalize_failure_detail(current[key], tree_root=None)
+        ),
+        _failure_report(
+            key, _normalize_failure_detail(baseline[key], tree_root=None)
+        ),
+    )
 
     assert attribution.new_failures == {}
     assert key in attribution.suppressed_failures
+
+
+def test_repaired_baseline_failure_is_distinguishable_from_a_deleted_route() -> None:
+    """Only lossless reports can distinguish repair, deletion, and skip states."""
+    key = "backend/testing/test_old.py::test_existing::failure"
+    route = "backend/testing/test_old.py::test_existing"
+    baseline = _failure_report(key, "inherited")
+    repaired = JUnitReport(test_routes={route})
+    deleted = JUnitReport(test_routes={"backend/testing/test_other.py::test_ok"})
+    skipped = JUnitReport(test_routes={route}, skipped_routes={route})
+
+    repaired_outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_report=repaired,
+        baseline_report=baseline,
+    )
+    deleted_outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_report=deleted,
+        baseline_report=baseline,
+    )
+    skipped_outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_report=skipped,
+        baseline_report=baseline,
+    )
+
+    assert repaired_outcome["state"] == "baseline_failure_disappeared"
+    assert repaired_outcome["disappeared_failures"][key]["reason"] == (
+        "baseline failure no longer reproduces in current report"
+    )
+    assert route_coverage_gaps(repaired, baseline) == {}
+    assert deleted_outcome["state"] == "baseline_failure_disappeared"
+    assert deleted_outcome["disappeared_failures"][key]["reason"] == (
+        "baseline failing route absent from current report"
+    )
+    assert route_coverage_gaps(deleted, baseline) == {
+        route: "baseline test route is absent from the current report"
+    }
+    assert skipped_outcome["state"] == "baseline_failure_skipped"
+    assert route_coverage_gaps(skipped, baseline) == {
+        route: "baseline test route is skipped in the current report"
+    }
 
 
 def test_attributed_gate_blocks_a_failure_introduced_by_the_diff() -> None:
@@ -590,7 +646,6 @@ def test_attributed_gate_blocks_a_failure_introduced_by_the_diff() -> None:
     outcome = classify_verification(
         runtime_available=True,
         current_exit_code=1,
-        current_failures={key: "introduced"},
         current_report=_failure_report(key, "introduced"),
         baseline_report=JUnitReport(test_routes={"backend/testing/test_changed.py::test_new"}),
     )
@@ -606,7 +661,6 @@ def test_attributed_gate_blocks_when_a_baseline_failure_disappears() -> None:
     outcome = classify_verification(
         runtime_available=True,
         current_exit_code=0,
-        current_failures={},
         current_report=JUnitReport(test_routes={"backend/testing/test_other.py::test_ok"}),
         baseline_report=_failure_report(key),
     )
@@ -623,7 +677,6 @@ def test_attributed_gate_blocks_when_a_baseline_failure_becomes_skipped() -> Non
     outcome = classify_verification(
         runtime_available=True,
         current_exit_code=0,
-        current_failures={},
         current_report=current,
         baseline_report=_failure_report(key),
     )
@@ -834,7 +887,6 @@ def test_uuid_bearing_baseline_failure_is_attributed_preexisting() -> None:
     outcome = classify_verification(
         runtime_available=True,
         current_exit_code=1,
-        current_failures={key: current_detail},
         current_report=_failure_report(key, current_detail),
         baseline_report=_failure_report(key, baseline_detail),
     )
@@ -862,3 +914,207 @@ def test_normalize_uuid_does_not_erase_a_genuinely_different_failure_reason() ->
         tree_root=None,
     )
     assert current != baseline
+
+
+# --- Current-side attributability -------------------------------------------
+#
+# ``is_attributable_pytest_result`` gates ``classify_verification`` before any
+# baseline comparison happens. If pytest's exit code and its JUnit report
+# disagree, the report is not trustworthy evidence about the current tree, so
+# no identity in it may be attributed away against a baseline — not even one
+# that matches the baseline exactly. These pin the CURRENT side of that
+# property; ``test_guard_gate_left_shift.py`` covers the baseline side.
+
+
+def test_zero_exit_with_reported_failures_is_execution_failure() -> None:
+    """pytest reporting failures while exiting 0 is a broken run, not a pass."""
+    key = "backend/testing/test_x.py::test_fails::failure"
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=0,
+        current_report=_failure_report(key),
+        baseline_report=JUnitReport(),
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+@pytest.mark.parametrize("exit_code", [2, 3, 4, 5, 137, -15])
+def test_abnormal_current_exit_cannot_suppress_a_matching_failure(
+    exit_code: int,
+) -> None:
+    """An abnormal exit is never attributed away, even against an identical
+    baseline failure. Collection errors, OOM kills (137) and SIGTERM (-15) all
+    truncate the run, so the report cannot prove the identity is inherited."""
+    key = "backend/testing/test_x.py::test_fails::failure"
+    report = _failure_report(key)
+
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=exit_code,
+        current_report=report,
+        baseline_report=report,
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+@pytest.mark.parametrize("exit_code", [1, 2, 3, 4, 5, 137, -15])
+def test_nonzero_exit_with_a_clean_report_is_execution_failure(
+    exit_code: int,
+) -> None:
+    """A clean JUnit report cannot explain a non-zero exit; fail closed."""
+    report = JUnitReport(test_routes={"backend/testing/test_x.py::test_passes"})
+
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=exit_code,
+        current_report=report,
+        baseline_report=report,
+    )
+
+    assert outcome == {
+        "state": "execution_failure",
+        "blocking": True,
+        "new_failures": {},
+    }
+
+
+# --- Offender-set identity ---------------------------------------------------
+#
+# Aggregate guard failures ("N offenders: ...") render prose whose counts and
+# ordering change while the underlying inherited violation does not. The
+# BLUEPRINT_OFFENDERS marker gives those failures a stable set identity, and
+# ``attribute_reports`` suppresses one only when the current offender set is a
+# SUBSET of the baseline's. That subset rule is what decides whether a failing
+# identity may publish, so it is pinned in both directions below.
+
+
+def _offender_report(key: str, prose: str, offenders: list[str]) -> JUnitReport:
+    detail = f"{prose}\n{format_offender_marker(offenders)}"
+    test_key = key.rsplit("::", 1)[0]
+    return JUnitReport(failures={key: detail}, test_routes={test_key})
+
+
+def test_offender_set_subset_is_attributed_to_baseline() -> None:
+    """Changing diagnostics or removing an old offender stays pre-existing."""
+    key = "backend/testing/test_invariants.py::test_backend::failure"
+    current = _offender_report(key, "current counts", ["app/a.py"])
+    baseline = _offender_report(key, "baseline counts", ["app/a.py", "app/old.py"])
+
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "preexisting_test_failure"
+    assert outcome["blocking"] is False
+    assert outcome["new_failures"] == {}
+    assert outcome["suppressed_failures"][key]["detail"] == current.failures[key]
+
+
+def test_offender_set_new_path_remains_blocking() -> None:
+    """One added offender blocks even though the rest of the set is inherited."""
+    key = "backend/testing/test_invariants.py::test_backend::failure"
+    current = _offender_report(key, "current", ["app/a.py", "app/new.py"])
+    baseline = _offender_report(key, "baseline", ["app/a.py"])
+
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == {key: current.failures[key]}
+
+
+def test_offender_marker_includes_snapshot_entry_identity() -> None:
+    """A second bad entry with the same field must not be suppressed as inherited."""
+    key = (
+        "backend/testing/test_event_type_invariants.py"
+        "::test_snapshot_has_required_fields::failure"
+    )
+    current = _offender_report(
+        key,
+        "Event type 'new_event' missing fields: {'audience'}",
+        ["new_event:audience"],
+    )
+    baseline = _offender_report(
+        key,
+        "Event type 'old_event' missing fields: {'audience'}",
+        ["old_event:audience"],
+    )
+
+    outcome = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_report=current,
+        baseline_report=baseline,
+    )
+
+    assert outcome["state"] == "test_failure"
+    assert outcome["blocking"] is True
+    assert outcome["new_failures"] == {key: current.failures[key]}
+
+
+def _write_junit(tmp_path: Path, failure_body: str) -> Path:
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        '<testsuite><testcase classname="testing.test_x" name="test_old">'
+        f"<failure>{failure_body}</failure>"
+        "</testcase></testsuite>",
+        encoding="utf-8",
+    )
+    return report
+
+
+def test_junit_parser_extracts_offender_set_marker(tmp_path: Path) -> None:
+    """The marker must survive the XML round trip into ``offender_sets``."""
+    report = _write_junit(
+        tmp_path, 'counts\nBLUEPRINT_OFFENDERS: ["app/a.py", "app/b.py"]'
+    )
+
+    parsed = parse_junit_report(report)
+
+    assert parsed.offender_sets == {
+        "testing.test_x::test_old::failure": frozenset({"app/a.py", "app/b.py"})
+    }
+
+
+def test_offender_marker_formatter_is_deterministic_and_parseable(
+    tmp_path: Path,
+) -> None:
+    """Producers must emit a sorted, de-duplicated marker the parser reads back.
+
+    The literal pin matters: the marker is the wire format between guard
+    producers and the differential gate, so a change in separators, ordering,
+    or dedup silently re-partitions every inherited failure identity.
+    """
+    marker = format_offender_marker(["app/z.py", "app/a.py", "app/z.py"])
+
+    assert marker == 'BLUEPRINT_OFFENDERS: ["app/a.py","app/z.py"]'
+
+    parsed = parse_junit_report(_write_junit(tmp_path, f"human diagnostic\n{marker}"))
+
+    assert parsed.offender_sets == {
+        "testing.test_x::test_old::failure": frozenset({"app/a.py", "app/z.py"})
+    }
+
+
+def test_offender_marker_formatter_rejects_ambiguous_identities() -> None:
+    """A newline inside an identity would forge extra marker lines."""
+    with pytest.raises(ValueError, match="single-line"):
+        format_offender_marker(["app/a.py\napp/b.py"])

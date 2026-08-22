@@ -316,34 +316,6 @@ def attribute_reports(current: JUnitReport, baseline: JUnitReport) -> Attributio
     )
 
 
-def _report_from_failures(
-    failures: dict[str, str], *, tree_root: str | os.PathLike[str] | None = None
-) -> JUnitReport:
-    root_path = Path(tree_root).resolve() if tree_root is not None else None
-    return JUnitReport(
-        failures={
-            key: _normalize_failure_detail(detail, tree_root=root_path)
-            for key, detail in failures.items()
-        },
-        test_routes={_test_key(key) for key in failures},
-    )
-
-
-def attribute_failure_maps(
-    current: dict[str, str],
-    baseline: dict[str, str],
-    *,
-    current_root: str | os.PathLike[str] | None = None,
-    baseline_root: str | os.PathLike[str] | None = None,
-) -> Attribution:
-    """Compatibility adapter for callers that already have failure maps."""
-
-    return attribute_reports(
-        _report_from_failures(current, tree_root=current_root),
-        _report_from_failures(baseline, tree_root=baseline_root),
-    )
-
-
 def test_route_coverage_gaps(current: JUnitReport, baseline: JUnitReport) -> dict[str, str]:
     """Return independently observable test-route coverage losses.
 
@@ -383,25 +355,18 @@ def classify_verification(
     *,
     runtime_available: bool,
     current_exit_code: int,
-    current_failures: dict[str, str],
-    baseline_failures: dict[str, str] | None = None,
-    current_report: JUnitReport | None = None,
+    current_report: JUnitReport,
     baseline_report: JUnitReport | None = None,
-    current_root: str | os.PathLike[str] | None = None,
-    baseline_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """Return a fail-closed publication verdict for a differential run."""
+    """Return a verdict from lossless JUnit reports, failing closed on no base."""
 
     if not runtime_available:
         return {"state": "runtime_unavailable", "blocking": True, "new_failures": {}}
 
-    current_report = current_report or _report_from_failures(
-        current_failures, tree_root=current_root
-    )
     if not is_attributable_pytest_result(current_exit_code, current_report):
         return {"state": "execution_failure", "blocking": True, "new_failures": {}}
 
-    if baseline_failures is None and baseline_report is None:
+    if baseline_report is None:
         if current_exit_code == 0:
             return {"state": "passed", "blocking": False, "new_failures": {}}
         return {
@@ -410,9 +375,6 @@ def classify_verification(
             "new_failures": current_report.failures,
         }
 
-    baseline_report = baseline_report or _report_from_failures(
-        baseline_failures or {}, tree_root=baseline_root
-    )
     if current_exit_code == 0 and not baseline_report.failures:
         return {
             "state": "passed",
@@ -489,7 +451,6 @@ __all__ = [
     "Attribution",
     "FailureIdentity",
     "JUnitReport",
-    "attribute_failure_maps",
     "attribute_reports",
     "classify_verification",
     "extract_base",

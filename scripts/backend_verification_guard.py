@@ -156,7 +156,6 @@ def main(argv: list[str] | None = None) -> int:
             outcome = classify_verification(
                 runtime_available=True,
                 current_exit_code=args.current_exit_code,
-                current_failures=current_failures,
                 current_report=current_report,
                 baseline_report=baseline_report,
             )
