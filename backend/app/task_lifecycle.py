@@ -696,7 +696,7 @@ async def _resolve_live_review_target(
                 "base_sha": base_sha,
                 "head_sha": head_sha,
             }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.info(
             "[REVIEW PIPELINE] Could not resolve immutable review target for "
             "PR #%s (task %s): %s — using legacy same-chain dedup",
@@ -705,6 +705,77 @@ async def _resolve_live_review_target(
             exc,
         )
     return None
+
+
+async def _base_move_invalidates_approval(
+    task: Task,
+    session: AsyncSession,
+    *,
+    reviewed_base_sha: str,
+    reviewed_head_sha: str,
+    live_base_sha: str,
+    live_head_sha: str,
+) -> bool:
+    """Return whether a moved base still makes an approval stale.
+
+    A base move is material only when the files changed by that move overlap
+    the files in the reviewed ``reviewed_base_sha..reviewed_head_sha`` diff.
+    File-level overlap is deliberately conservative: it may re-review two
+    independent edits in one file, but it cannot prove that line-level edits
+    compose safely.  Missing provenance, a compare failure, malformed output,
+    or GitHub's capped compare response all return ``True`` so an indeterminate
+    result keeps the existing fail-closed stale-approval behavior.
+
+    This is not a replacement for the immutable head/base fence.  It only
+    prevents unrelated base traffic from invalidating an otherwise exact
+    approval; a changed head remains stale at the caller.
+    """
+    if reviewed_base_sha == live_base_sha:
+        return False
+    if (
+        not reviewed_base_sha
+        or not reviewed_head_sha
+        or not live_base_sha
+        or reviewed_head_sha != live_head_sha
+    ):
+        return True
+
+    try:
+        from app.github_refs import get_changed_files_with_patches_between_refs
+        from app.routers.agent import get_github_token_for_task
+
+        token, owner, repo = await get_github_token_for_task(task.id, session)
+        project_id = str(task.project_id) if task.project_id else None
+        base_move = await get_changed_files_with_patches_between_refs(
+            token,
+            owner,
+            repo,
+            reviewed_base_sha,
+            live_base_sha,
+            project_id=project_id,
+        )
+        reviewed_diff = await get_changed_files_with_patches_between_refs(
+            token,
+            owner,
+            repo,
+            reviewed_base_sha,
+            reviewed_head_sha,
+            project_id=project_id,
+        )
+        if base_move is None or reviewed_diff is None:
+            return True
+
+        base_files = {row["filename"] for row in base_move}
+        reviewed_files = {row["filename"] for row in reviewed_diff}
+        return bool(base_files & reviewed_files)
+    except Exception as exc:
+        logger.warning(
+            "[REVIEW PIPELINE] Could not compare moved base against reviewed "
+            "PR diff for task %s — keeping approval stale: %s",
+            task.id,
+            exc,
+        )
+        return True
 
 
 async def _persist_stale_review_evidence(
@@ -4192,6 +4263,7 @@ async def _process_post_commit(
 
                 action_taken = False
                 head_sha = ""
+                _approval_base_move_invalidates: bool | None = None
                 if verdict == "APPROVE":
                     # Retire the chain's lane now that the review approved — no fix
                     # will be spawned, so the lane must reach a terminal state here
@@ -4229,10 +4301,28 @@ async def _process_post_commit(
                         await session.commit()
                         return {"status": "accepted"}
                     if (
+                        reviewed_base_sha
+                        and reviewed_base_sha != _live_approve_target["base_sha"]
+                        and reviewed_head_sha == _live_approve_target["head_sha"]
+                    ):
+                        _approval_base_move_invalidates = (
+                            await _base_move_invalidates_approval(
+                                task,
+                                session,
+                                reviewed_base_sha=reviewed_base_sha,
+                                reviewed_head_sha=reviewed_head_sha,
+                                live_base_sha=str(_live_approve_target["base_sha"]),
+                                live_head_sha=str(_live_approve_target["head_sha"]),
+                            )
+                        )
+                    if (
                         not reviewed_head_sha
                         or not reviewed_base_sha
                         or reviewed_head_sha != _live_approve_target["head_sha"]
-                        or reviewed_base_sha != _live_approve_target["base_sha"]
+                        or (
+                            reviewed_base_sha != _live_approve_target["base_sha"]
+                            and _approval_base_move_invalidates is not False
+                        )
                     ):
                         task.status = TaskStatus.COMPLETED
                         task.latest_status_message = (
@@ -4753,7 +4843,10 @@ async def _process_post_commit(
                             not reviewed_head_sha
                             or not reviewed_base_sha
                             or reviewed_head_sha != head_sha
-                            or reviewed_base_sha != live_base_sha
+                            or (
+                                reviewed_base_sha != live_base_sha
+                                and _approval_base_move_invalidates is not False
+                            )
                         )
                         if approve_target_is_stale:
                             # Do not let an APPROVE issued for a different
