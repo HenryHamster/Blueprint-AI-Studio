@@ -70,6 +70,7 @@ from app.research_finding_contract import (  # noqa: F401 — re-exported privat
     _normalize_research_acceptance_evidence,
     _normalize_research_finding_types,
     _parse_strict_research_findings,
+    _partition_research_findings,
     _prepare_research_metadata_targets,
     _research_contract_rejection_receipts,
     _research_finding_contract_errors,
@@ -1441,34 +1442,29 @@ async def _handle_research_completion(
     _recovered_findings_source: str | None = None
     insights = await _parse_research_insights(str(task.id))
     # Agent JSON sometimes contains non-dict entries (bare strings, nulls).
-    # The downstream .get() loop would AttributeError and the handler-failed
-    # branch in task_lifecycle would terminally FAIL a research task that
-    # actually completed. Legacy tasks keep the historical drop behavior; a
-    # task claimed under the strict producer contract must fail the whole
-    # artifact, matching the TypeScript validator instead of silently routing
-    # only the well-shaped subset.
+    # Strict output is partitioned per finding so malformed siblings are
+    # quarantined without discarding well-formed findings from the same array.
     if findings:
-        _non_object_findings = [
-            (index, finding)
-            for index, finding in enumerate(findings)
-            if not isinstance(finding, dict)
-        ]
-        if _non_object_findings and _research_output_contract_enabled(task):
-            _stamp_research_contract_rejections(
-                task,
-                [
-                    {
-                        "index": index,
-                        "source": "agent_output",
-                        "type": type(finding).__name__,
-                        "title": str(finding or "")[:200],
-                        "errors": ["finding_must_be_an_object"],
-                    }
-                    for index, finding in _non_object_findings[:20]
-                ],
+        if _research_output_contract_enabled(task):
+            _prepare_research_metadata_targets(
+                [finding for finding in findings if isinstance(finding, dict)],
+                parent_direction_id=_parent_metadata_direction_id,
+                valid_direction_ids=_valid_metadata_direction_ids,
             )
-            findings = []
-            _research_output_invalid = True
+            findings, _contract_rejections = _partition_research_findings(
+                findings,
+                source="agent_output",
+                valid_direction_ids=_valid_metadata_direction_ids,
+            )
+            if _contract_rejections:
+                logger.warning(
+                    "[RESEARCH] Task %s quarantined %d finding(s) that violated "
+                    "the strict findings contract",
+                    task.id,
+                    len(_contract_rejections),
+                )
+                _stamp_research_contract_rejections(task, _contract_rejections)
+            _research_output_invalid = not findings
         else:
             findings = [f for f in findings if isinstance(f, dict)]
             if not findings:
@@ -1597,52 +1593,39 @@ async def _handle_research_completion(
         # findings. Validate them at the trust boundary as well: otherwise a
         # legacy/tampered plan_output can bypass the fresh-artifact contract and
         # fall through to the generic create/plan branch below.
-        _types_valid, _invalid_finding_type = _normalize_research_finding_types(
-            findings
-        )
-        if not _types_valid:
-            logger.error(
-                "[RESEARCH] Task %s recovered unsupported finding type %r from %s; "
-                "refusing to route stored output",
-                task.id,
-                _invalid_finding_type,
-                _recovered_findings_source,
-            )
-            if _recovered_findings_source == "finalized_replay":
-                # The task already has an authoritative terminal receipt. Do
-                # not rewrite historical status/output on a post-commit replay;
-                # simply make the replay a durable fail-closed no-op.
-                task.context = {
-                    **(task.context or {}),
-                    "research_replay_invalid_type": _invalid_finding_type,
-                }
-                flag_modified(task, "context")
-                session.add(task)
-                await session.commit()
-                return
-            findings = []
-            _research_output_invalid = True
-        elif _research_output_contract_enabled(task):
+        if _research_output_contract_enabled(task):
             _prepare_research_metadata_targets(
                 findings,
                 parent_direction_id=_parent_metadata_direction_id,
                 valid_direction_ids=_valid_metadata_direction_ids,
             )
-            _contract_rejections = _research_contract_rejection_receipts(
+            findings, _contract_rejections = _partition_research_findings(
                 findings,
                 source=str(_recovered_findings_source),
                 valid_direction_ids=_valid_metadata_direction_ids,
             )
             if _contract_rejections:
-                logger.error(
-                    "[RESEARCH] Task %s recovered %d finding(s) from %s that "
-                    "violate the strict evidence contract; refusing to route "
-                    "stored output",
+                logger.warning(
+                    "[RESEARCH] Task %s quarantined %d recovered finding(s) from %s "
+                    "that violated the strict evidence contract",
                     task.id,
                     len(_contract_rejections),
                     _recovered_findings_source,
                 )
                 _stamp_research_contract_rejections(task, _contract_rejections)
+            _research_output_invalid = not findings
+        else:
+            _types_valid, _invalid_finding_type = _normalize_research_finding_types(
+                findings
+            )
+            if not _types_valid:
+                logger.error(
+                    "[RESEARCH] Task %s recovered unsupported finding type %r from %s; "
+                    "refusing to route stored output",
+                    task.id,
+                    _invalid_finding_type,
+                    _recovered_findings_source,
+                )
                 findings = []
                 _research_output_invalid = True
     if (
@@ -5097,10 +5080,10 @@ async def _handle_research_completion(
             )
         # When the direction carries active acceptance criteria, inject a
         # criterion_keys warning into the spawned task's prompt_suffix so the
-        # implementing agent knows findings must declare named_test evidence.
-        # Without this upfront signal the research agent unknowingly omits the
-        # evidence field and the spawn loop hard-rejects the finding, wasting
-        # one full research cycle per occurrence.
+        # implementing agent knows findings must declare one of the legal
+        # acceptance-evidence kinds. Without this upfront signal the research
+        # agent unknowingly omits the evidence field and the spawn loop rejects
+        # the finding, wasting one full research cycle per occurrence.
         _suffix_crit_dir_id = direction_id or _parent_direction_id
         _suffix_criterion_ids = _direction_criterion_cache.get(
             _suffix_crit_dir_id or "", []
@@ -5108,12 +5091,13 @@ async def _handle_research_completion(
         if _suffix_criterion_ids:
             _criterion_suffix = (
                 "\n\nCRITICAL: This direction has active acceptance criteria. "
-                "Every finding must declare acceptance_evidence with "
-                "kind 'named_test' and a test_path naming the test that "
+                "Every finding must declare a valid acceptance_evidence "
+                "declaration (named_test, observable_behavior, "
+                "downstream_artifact, visual, or coverage_delta) that "
                 "verifies the change. Findings without this evidence are "
                 "rejected at spawn time.\n"
                 'Include in each finding:\n'
-                '  acceptance_evidence: {kind: "named_test", test_path: "path/to/test.py"}'
+                '  acceptance_evidence: {kind: "<legal kind>", ...}'
             )
             _combined_suffix = (
                 _combined_suffix + _criterion_suffix
@@ -5200,33 +5184,26 @@ async def _handle_research_completion(
             normalize_acceptance_evidence(finding.get("acceptance_evidence"))
         )
 
-        # Reject criterion-carrying findings that lack named_test acceptance
-        # evidence. The spawned task inherits criterion_ids from the direction,
-        # but without a named_test declaration the acceptance pipeline records 0
-        # proven-verdict rows, leaving criterion coverage perpetually uncovered.
-        # PR #13528 added a non-blocking provenance warning here; the direction's
-        # retirement condition requires a hard rejection so the spawn is blocked
-        # and the finding never becomes work that cannot close the coverage loop.
+        # Reject criterion-carrying findings that lack any normalized legal
+        # acceptance evidence. The spawned task inherits criterion_ids from the
+        # direction, and the acceptance gate has merge-time verifiers for every
+        # legal evidence kind; requiring named_test here would discard valid
+        # visual, coverage, behavior, and downstream-artifact routes.
         _crit_eff_dir_id = direction_id or parent_direction_id
         _crit_criterion_ids = _direction_criterion_cache.get(
             _crit_eff_dir_id or "", []
         )
-        if _crit_criterion_ids:
-            _has_named_test = (
-                _payload_acceptance_evidence is not None
-                and _payload_acceptance_evidence.get("kind") == "named_test"
+        if _crit_criterion_ids and _payload_acceptance_evidence is None:
+            _criterion_evidence_rejected.append(finding)
+            logger.warning(
+                "[RESEARCH] Rejecting finding %r (task %s): criterion-carrying "
+                "direction %s but finding lacks valid acceptance_evidence; "
+                "not spawning.",
+                finding.get("title") or finding.get("description", "")[:60],
+                task.id,
+                _crit_eff_dir_id,
             )
-            if not _has_named_test:
-                _criterion_evidence_rejected.append(finding)
-                logger.warning(
-                    "[RESEARCH] Rejecting finding %r (task %s): criterion-carrying "
-                    "direction %s but finding lacks acceptance_evidence:{kind:named_test}; "
-                    "not spawning.",
-                    finding.get("title") or finding.get("description", "")[:60],
-                    task.id,
-                    _crit_eff_dir_id,
-                )
-                continue
+            continue
 
         if task_type == "compute_experiment":
             # Build + validate the compute_experiment payload from the launch

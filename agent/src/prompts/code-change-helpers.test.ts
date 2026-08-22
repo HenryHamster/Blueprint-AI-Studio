@@ -1015,6 +1015,11 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     }
   });
 
+  it('generated_blocked_guidance_does_not_treat_attributed_baseline_debt_as_a_precondition', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js'); writeCodeChangeHelpers(cfg); const blocked = capturedScripts['/tmp/workspace/blocked'];
+    expect(blocked).toMatch(/Named, structured baseline-attributed failures are publication-safe[\s\S]*publish the receipt/); expect(blocked).not.toContain('A repo-wide gate fails on files your PR did not touch');
+  });
+
   // needs exec bit: runs a generated bash helper + PATH-resolved curl stub (mode 0o755)
   it.skipIf(!SUPPORTS_EXEC_BIT)('emits a normalized need in the payload when --needs-task is given an exact ref', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');

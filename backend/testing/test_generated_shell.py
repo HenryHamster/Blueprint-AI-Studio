@@ -2101,7 +2101,9 @@ class TestProjectVerificationRuntimeContract:
         assert "BLUEPRINT_VERIFICATION_RESULT_FILE" in harness
         assert 'USE_TEST_POSTGRES:-' in harness
         assert 'testing/test_*.py|testing/test_*.py::*' in harness
-        assert 'verification_selector_count" -le 8' in harness
+        assert 'verification_ordinary_selector_count" -le 8' in harness
+        assert "BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS" in harness
+        assert "every mandatory verification selector must be carried exactly once" in harness
         assert (
             'VERIFICATION_HOST_JUNIT="$VERIFICATION_OUTPUT_DIR/'
             '${VERIFICATION_JUNIT_NAME:-junit.xml}"'
@@ -2247,23 +2249,55 @@ def test_default_check_allows_an_ordinary_skipped_test(tmp_path: Path):
         "<testsuite tests=\"2\"><testcase/><testcase><skipped/></testcase></testsuite>",
         encoding="utf-8",
     )
-    script = _extract_default_backend_verification()
-    classifier_start = script.index("        _verification_tests=")
-    classifier_end = script.index("\n        if [ \"$_verification_state\"", classifier_start)
-    classifier = script[classifier_start:classifier_end]
-    result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            classifier
-            + '\nif [ "$_verification_tests" -gt 0 ] && [ "$_verification_skipped" -eq "$_verification_tests" ]; then printf skipped_test; else printf passed; fi',
-        ],
-        env={**os.environ, "_verification_current_junit": str(junit)},
-        capture_output=True,
-        text=True,
-        check=True,
+    all_skipped = tmp_path / "all-skips.xml"
+    all_skipped.write_text(
+        "<testsuite tests=\"2\"><testcase><skipped/></testcase>"
+        "<testcase><skipped/></testcase></testsuite>",
+        encoding="utf-8",
     )
-    assert result.stdout == "passed"
+    script = _extract_default_backend_verification()
+    # Slice the PRODUCTION counter+classifier block and run it verbatim. The
+    # end anchor is the branch that follows the classifier, so the snippet
+    # carries the real `tests > 0 && skipped == tests` decision instead of a
+    # copy in this file that would keep passing after the shell changed.
+    classifier_start = script.index("        _verification_tests=")
+    classifier_end = script.index(
+        '\n        if [ "$_verification_blocking" = "0" ]', classifier_start
+    )
+    classifier = script[classifier_start:classifier_end]
+    assert "_verification_state=skipped_test" in classifier, (
+        "extracted snippet no longer contains the skipped_test classifier — "
+        "the anchors here drifted from scripts/check-default.sh"
+    )
+
+    def _classify(junit_path: Path) -> str:
+        # Written to a file, not passed via `bash -c`: MSYS bash on Windows
+        # drops variable state across newlines in a -c argument, which silently
+        # made the old form assert against empty variables.
+        runner = tmp_path / f"classify-{junit_path.stem}.sh"
+        runner.write_text(
+            "_verification_state=passed\n_verification_blocking=0\n"
+            + classifier
+            + '\nprintf %s "$_verification_state"\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        proc = subprocess.run(
+            ["bash", runner.as_posix()],
+            env={
+                **os.environ,
+                "_verification_current_junit": junit_path.as_posix(),
+            },
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return proc.stdout
+
+    # Mixed pass/skip stays passing...
+    assert _classify(junit) == "passed"
+    # ...and the classifier is not vacuous: an all-skipped run still trips it.
+    assert _classify(all_skipped) == "skipped_test"
 
 
 class TestVmSelfDestructTtl:

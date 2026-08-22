@@ -1430,7 +1430,7 @@ runtime_config: Dict = {
 }
 
 
-def config_get(key: str):
+def config_get(key: str) -> Any:
     """Get a runtime config value by its registered key.
 
     The ``runtime_config`` dict IS the registry — every callable key has a

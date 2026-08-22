@@ -104,7 +104,12 @@ QUALIFICATION_DIMENSIONS: tuple[QualificationDimension, ...] = (
     ),
     QualificationDimension(
         "criterion_coverage", "Criterion Coverage",
-        blocker_codes=("criterion_coverage_incomplete",),
+        blocker_codes=(
+            "criterion_coverage_incomplete",
+            "candidate_authorship_range_identical",
+            "candidate_operator_authorship_evidence_missing",
+            "candidate_operator_authorship_nonzero",
+        ),
     ),
     QualificationDimension(
         "debt_pressure", "Debt Pressure",

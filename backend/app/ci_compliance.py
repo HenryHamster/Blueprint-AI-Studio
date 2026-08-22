@@ -62,6 +62,7 @@ from app.branch_literal_compliance import (
     BRANCH_LITERAL_ALLOWLIST_PATH,
     CI_AGENT_FORBIDDEN_RE,  # noqa: F401 — re-exported for module-level identity checks
     CI_AGENT_PAREN_FALLBACK_RE,
+    normalize_source_anchor,
     strip_typescript_with_linenos,
 )
 from app.json_extract import async_json_loads
@@ -483,8 +484,8 @@ async def _scan_branch_literals(
 
     ``rules`` is the branch-literal allowlist read AT THE CANDIDATE REF (see
     :func:`_load_branch_literal_rules_at_ref`): ``{"backend":
-    {"allowlisted_filenames": [...]}, "agent": {"allowlist": [{path, line,
-    pattern, rationale}, ...]}}``. Suppressions come from the candidate ref,
+    {"allowlisted_filenames": [...]}, "agent": {"allowlist": [{path, pattern,
+    source, count, rationale}, ...]}}``. Suppressions come from the candidate ref,
     never from in-process config, so a file whose allowlist entry ships in the
     same commit can clear the gate.
 
@@ -525,21 +526,26 @@ async def _scan_branch_literals(
     if not isinstance(agent_cfg, dict):
         agent_cfg = {}
     agent_prefix = _SECTION_PREFIXES["agent"]
-    _agent_allowset: set[str] = set()
+    _agent_allow_counts: dict[tuple[str, str, str], int] = {}
     raw_agent_allow = agent_cfg.get("allowlist")
     if isinstance(raw_agent_allow, list):
         for item in raw_agent_allow:
             if not isinstance(item, dict):
                 continue
             a_path = item.get("path")
-            a_line = item.get("line")
             a_pattern = item.get("pattern")
+            a_source = item.get("source")
+            a_count = item.get("count")
             if (
                 isinstance(a_path, str)
-                and isinstance(a_line, int)
                 and isinstance(a_pattern, str)
+                and isinstance(a_source, str)
+                and isinstance(a_count, int)
+                and a_count > 0
             ):
-                _agent_allowset.add(f"{a_path}::{a_line}::{a_pattern}")
+                _agent_allow_counts[
+                    (a_path, a_pattern, normalize_source_anchor(a_source))
+                ] = a_count
     # Scan exclusion suffixes mirror SURFACE_CONFIGS['agent'].exclude_suffixes
     # (agent/src test/d.ts files are not production sources).
     agent_exclude_suffixes = (".test.ts", ".d.ts")
@@ -578,6 +584,7 @@ async def _scan_branch_literals(
     texts = await asyncio.gather(*(_fetch(path) for _, path, _ in all_entries))
 
     violations: list[dict] = []
+    observed_agent_allow_counts: dict[tuple[str, str, str], int] = {}
     for (section, _path, rel), text in zip(all_entries, texts):
         if text is None:
             continue
@@ -595,8 +602,11 @@ async def _scan_branch_literals(
                 cleaned = _strip_agent_paren_fallbacks(line)
                 for pat in AGENT_PATTERNS:
                     if pat.regex.search(cleaned):
-                        allow_key = f"{rel}::{lineno}::{pat.name}"
-                        if allow_key not in _agent_allowset:
+                        allow_key = (rel, pat.name, normalize_source_anchor(cleaned))
+                        observed_agent_allow_counts[allow_key] = (
+                            observed_agent_allow_counts.get(allow_key, 0) + 1
+                        )
+                        if observed_agent_allow_counts[allow_key] > _agent_allow_counts.get(allow_key, 0):
                             violations.append(
                                 {
                                     "section": "agent",
@@ -607,8 +617,11 @@ async def _scan_branch_literals(
                             )
                 for pat_name, pat_re in _AGENT_SUPPLEMENTAL_PATTERNS:
                     if pat_re.search(cleaned):
-                        allow_key = f"{rel}::{lineno}::{pat_name}"
-                        if allow_key not in _agent_allowset:
+                        allow_key = (rel, pat_name, normalize_source_anchor(cleaned))
+                        observed_agent_allow_counts[allow_key] = (
+                            observed_agent_allow_counts.get(allow_key, 0) + 1
+                        )
+                        if observed_agent_allow_counts[allow_key] > _agent_allow_counts.get(allow_key, 0):
                             violations.append(
                                 {
                                     "section": "agent",

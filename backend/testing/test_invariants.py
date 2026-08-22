@@ -17,6 +17,7 @@ import subprocess
 import symtable
 import sys
 import tokenize
+from collections import Counter
 from functools import cache
 from pathlib import Path
 
@@ -5452,6 +5453,45 @@ class TestBranchLiteralComplianceScanner:
         ]
         assert offenders[0].snippet == 'branch = "main"'
 
+    def test_allowlist_survives_unrelated_line_insertion(self, tmp_path, monkeypatch):
+        """A structural source anchor remains valid when its line number moves."""
+        from dataclasses import replace
+
+        from app.branch_literal_compliance import (
+            BranchLiteralAllowEntry,
+            SURFACE_CONFIGS,
+            scan_branch_literal_surface,
+        )
+
+        agent_src = tmp_path / "agent"
+        agent_src.mkdir()
+        source = "const base = task.baseBranch ?? 'main';"
+        entry = BranchLiteralAllowEntry(
+            path="runner.ts",
+            pattern="fallback-main",
+            source=source,
+            count=1,
+            rationale="test structural anchor",
+        )
+        config = replace(SURFACE_CONFIGS["agent"], allowlist=(entry,))
+        monkeypatch.setitem(SURFACE_CONFIGS, "agent", config)
+
+        runner = agent_src / "runner.ts"
+        runner.write_text(source + "\n", encoding="utf-8")
+        before = scan_branch_literal_surface("agent", agent_src)
+        runner.write_text("// unrelated edit\n" + source + "\n", encoding="utf-8")
+        after = scan_branch_literal_surface("agent", agent_src)
+
+        assert before.offenders == []
+        assert before.stale_allowlist == []
+        assert after.offenders == []
+        assert after.stale_allowlist == []
+
+        runner.write_text(source + "\n" + source + "\n", encoding="utf-8")
+        duplicated = scan_branch_literal_surface("agent", agent_src)
+        assert len(duplicated.offenders) == 1
+        assert len(duplicated.stale_allowlist) == 1
+
 # ── Self-repo branch resolution guard ──────────────────────────────────────
 
 class TestSelfRepoBranchResolution:
@@ -5846,6 +5886,37 @@ def _stale_size_cap_message(rel_path: str, module_kind: str) -> str:
         "do not leave a missing-file exception to obscure this remediation."
     )
 
+
+def _assert_no_stale_caps(
+    caps: dict[str, int], source_root: str, module_kind: str
+) -> None:
+    """Assert every configured cap stays within the shared stale-cap policy."""
+    from app.size_limit_policy import stale_cap_limit
+
+    stale = []
+    for rel_path, cap in caps.items():
+        abs_path = os.path.join(source_root, rel_path)
+        if not os.path.exists(abs_path):
+            continue
+        with open(abs_path, encoding="utf-8") as fh:
+            actual = len(fh.readlines())
+        allowed_cap = stale_cap_limit(actual)
+        if cap > allowed_cap:
+            stale.append((rel_path, actual, cap, allowed_cap))
+    assert not stale, (
+        f"{len(stale)} {module_kind} cap(s) have drifted far above actual file size "
+        "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
+        "the file grows to an unreasonable size:\n\n"
+        + "\n".join(
+            f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
+            for r, actual, cap, allowed in stale
+        )
+        + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
+        f"and commit the updated module_size_limits.json under '{module_kind}'."
+        + "\n"
+        + format_offender_marker(r for r, _actual, _cap, _allowed in stale)
+    )
+
 class TestBackendModuleSizeGuardrails:
     """Loose upper bounds to catch runaway file growth.
 
@@ -5902,27 +5973,7 @@ class TestBackendModuleSizeGuardrails:
         Do NOT modify this test to raise the threshold.
         """
         app_root = os.path.join(os.path.dirname(__file__), "..", "app")
-        stale = []
-        for rel_path, cap in MODULE_SIZE_LIMITS.items():
-            abs_path = os.path.join(app_root, rel_path)
-            if not os.path.exists(abs_path):
-                continue
-            with open(abs_path, encoding="utf-8") as fh:
-                actual = len(fh.readlines())
-            allowed_cap = max(actual + 500, actual * 2)
-            if cap > allowed_cap:
-                stale.append((rel_path, actual, cap, allowed_cap))
-        assert not stale, (
-            f"{len(stale)} backend cap(s) have drifted far above actual file size "
-            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
-            "the file grows to an unreasonable size:\n\n"
-            + "\n".join(
-                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
-                for r, actual, cap, allowed in stale
-            )
-            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
-            "and commit the updated module_size_limits.json." + "\n" + format_offender_marker(str(offender) for offender in stale)
-        )
+        _assert_no_stale_caps(MODULE_SIZE_LIMITS, app_root, "backend")
 
 _AGENT_SRC_ROOT = (
     os.path.normpath(
@@ -5960,6 +6011,11 @@ class TestAgentModuleSizeGuardrails:
         ``_require_agent_src``) when ``agent/src`` is absent — e.g. CI's
         backend-only Docker build context."""
         self._check_agent(relative_path)
+
+    def test_no_stale_agent_caps(self):
+        """Agent caps must remain within the shared stale-cap bound."""
+        self._require_agent_src()
+        _assert_no_stale_caps(AGENT_SIZE_LIMITS, _AGENT_SRC_ROOT, "agent")
 
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
@@ -6057,6 +6113,11 @@ class TestFrontendSizeGuardrails:
         is set — these skips are preserved exactly."""
         self._check_frontend(relative_path)
 
+    def test_no_stale_frontend_caps(self):
+        """Frontend caps must remain within the shared stale-cap bound."""
+        self._require_admin_ui_src()
+        _assert_no_stale_caps(FRONTEND_SIZE_LIMITS, _ADMIN_UI_SRC_ROOT, "frontend")
+
     def test_task_detail_drawer_meta(self):
         self._check_frontend("components/TaskDetailDrawerMeta.tsx")
 
@@ -6106,27 +6167,7 @@ class TestTestFileSizeGuardrails:
         the breaching entry. Do NOT modify this test to raise the threshold.
         """
         testing_root = os.path.dirname(__file__)
-        stale = []
-        for rel_path, cap in TESTING_SIZE_LIMITS.items():
-            abs_path = os.path.join(testing_root, rel_path)
-            if not os.path.exists(abs_path):
-                continue
-            with open(abs_path, encoding="utf-8") as fh:
-                actual = len(fh.readlines())
-            allowed_cap = max(actual + 500, actual * 2)
-            if cap > allowed_cap:
-                stale.append((rel_path, actual, cap, allowed_cap))
-        assert not stale, (
-            f"{len(stale)} testing cap(s) have drifted far above actual file size "
-            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
-            "the file grows to an unreasonable size:\n\n"
-            + "\n".join(
-                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
-                for r, actual, cap, allowed in stale
-            )
-            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
-            "and commit the updated module_size_limits.json." + "\n" + format_offender_marker(str(offender) for offender in stale)
-        )
+        _assert_no_stale_caps(TESTING_SIZE_LIMITS, testing_root, "testing")
 
 def _resolve_scripts_root() -> str | None:
     """Resolve the repo's scripts/ directory across both test layouts.
@@ -6202,29 +6243,8 @@ class TestScriptsModuleSizeGuardrails:
         match the policy value returned by ``check_size_limits.py --fix`` for
         the breaching entry. Do NOT modify this test to raise the threshold.
         """
-        stale = []
         scripts_root = _require_scripts_root()
-        for rel_path, cap in SCRIPTS_SIZE_LIMITS.items():
-            abs_path = os.path.join(scripts_root, rel_path)
-            if not os.path.exists(abs_path):
-                continue
-            with open(abs_path, encoding="utf-8") as fh:
-                actual = len(fh.readlines())
-            allowed_cap = max(actual + 500, actual * 2)
-            if cap > allowed_cap:
-                stale.append((rel_path, actual, cap, allowed_cap))
-        assert not stale, (
-            f"{len(stale)} scripts cap(s) have drifted far above actual file size "
-            "(cap > max(actual+500, actual*2)) — the guardrail won't fire until "
-            "the file grows to an unreasonable size:\n\n"
-            + "\n".join(
-                f"  {r}: {actual} lines, cap {cap} (allowed ≤ {allowed})"
-                for r, actual, cap, allowed in stale
-            )
-            + "\n\nTighten each cap: run ``python3 backend/testing/check_size_limits.py --fix`` "
-            "and commit the updated module_size_limits.json."
-            + "\n" + format_offender_marker(r for r, _actual, _cap, _allowed in stale)
-        )
+        _assert_no_stale_caps(SCRIPTS_SIZE_LIMITS, scripts_root, "scripts")
 
 
 # ── Size-Guardrail Coverage (no large file may escape having a cap) ──────────
@@ -13479,67 +13499,177 @@ class TestProblemModelWritePathInvariants:
     """
 
     # Manual allowlist of safe write sites.
-    # Key: (rel_path_from_app, lineno). Each entry is the reviewed safety
-    # rationale — the scanner does NOT classify; it only discovers.
-    # When changing a file, update these line numbers.
-    _SAFE_SITES: dict[tuple[str, int], str] = {
+    #
+    # Key: (rel_path_from_app, enclosing_qualname, unparsed_RHS_expression).
+    # Value: (expected_occurrences, reviewed safety rationale).
+    #
+    # The key is deliberately NOT the line number.  A line-number key made this
+    # invariant fire on every unrelated edit ABOVE a write site: the same write
+    # path was reported simultaneously as an unlisted new site and a stale
+    # allowlist entry, with nothing about the sanitization actually changed.
+    # That false positive is a recurring automain-CI-red generator and it has
+    # already produced at least one no-op "refresh the line numbers" fix PR
+    # (#17591) whose entire content was renumbering.  Eleven of the twenty-two
+    # entries were stale again by the time this was rewritten.
+    #
+    # (file, enclosing function, RHS expression) is stable under line drift and
+    # under moving a function within its module, while still changing — and so
+    # still demanding review — when the write path itself changes: a different
+    # enclosing function, a different right-hand side, or a different number of
+    # writes of the same expression inside one function.  Pinning the RHS
+    # expression source is also strictly more self-certifying than pinning a
+    # line number: the reviewed value is now visible in the allowlist.
+    #
+    # The scanner does NOT classify; it only discovers.
+    _SAFE_SITES: dict[tuple[str, str, str], tuple[int, str]] = {
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1291): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", "with_problem_model_locked", "problem_model"): (
+            1,
+            "sanitize_problem_model_raw(...) -> project.problem_model write-back inside with_problem_model_locked",
+        ),
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
-        ("lifecycle.py", 505): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
+        ("lifecycle.py", "_heal_poisoned_problem_models", "sanitized"): (
+            1,
+            "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
+        ),
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
-        ("direction_lifecycle.py", 846): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        (
+            "direction_lifecycle.py",
+            "_process_direction_lifecycle_locked._reconcile_retired_gap",
+            "_reconciled",
+        ): (
+            1,
+            "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        ),
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
-        ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
-        # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5436): "apply_agent_update inline-sanitizes both current and proposed",
-        # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5473): "apply_agent_update result, then _normalize_active_moves_writeback",
+        (
+            "direction_lifecycle.py",
+            "_process_direction_lifecycle_locked._reconcile_gap_status",
+            "result['problem_model']",
+        ): (
+            1,
+            "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
+        ),
+        # strategic_completion.py: apply_agent_update write-back, and the same
+        # value re-assigned after _normalize_active_moves_writeback.
+        ("strategic_completion.py", "_handle_strategic_completion", "new_pm_raw"): (
+            2,
+            "apply_agent_update inline-sanitizes both current and proposed; second write is the same result after _normalize_active_moves_writeback",
+        ),
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 7156): "parse_problem_model(…) validated pydantic model_dump",
+        (
+            "strategic_completion.py",
+            "_handle_strategic_completion",
+            "_pm_model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(...) validated pydantic model_dump",
+        ),
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
-        ("reaper_sweeps.py", 1278): "parse_problem_model(…) validated pydantic model_dump",
+        (
+            "reaper_sweeps.py",
+            "sweep_auto_clear_moot_pending_confirmations",
+            "model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(...) validated pydantic model_dump",
+        ),
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
-        ("reaper_sweeps.py", 1406): "parse_problem_model(…) validated pydantic model_dump",
+        (
+            "reaper_sweeps.py",
+            "sweep_decay_stale_pending_confirmations",
+            "model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(...) validated pydantic model_dump",
+        ),
         # admin_projects.py: validated.model_dump()
-        (
-            "routers/admin_projects.py",
-            878,
-        ): "apply_user_intent_patch(sanitize_problem_model_raw(...)) validated model_dump",
+        ("routers/admin_projects.py", "update_project", "validated.model_dump()"): (
+            1,
+            "apply_user_intent_patch(sanitize_problem_model_raw(...)) validated model_dump",
+        ),
         # admin_projects.py: current_model.model_dump()
         (
             "routers/admin_projects.py",
-            1296,
-        ): "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
+            "dismiss_pending_confirmation",
+            "current_model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
+        ),
         # admin_projects.py: current_model.model_dump()
         (
             "routers/admin_projects.py",
-            1408,
-        ): "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
+            "accept_pending_confirmation",
+            "current_model.model_dump()",
+        ): (
+            1,
+            "parse_problem_model(sanitize_problem_model_raw(...)) validated model_dump",
+        ),
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
-        ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
+        ("routers/admin_onboard.py", "_seed_strategic_intent", "pm.model_dump()"): (
+            1,
+            "pm parsed from ProblemModel, model_dump",
+        ),
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 1966): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2393): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2843): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2957): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3214): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4888): "apply_agent_update result",
-        # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4916): "apply_agent_update result, then _normalize_active_moves_writeback",
-        # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5456): "validated current_model pydantic model_dump",
-        # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5539): "validated current_model pydantic model_dump",
+        (
+            "routers/admin_agent_ops.py",
+            "strategic_operation",
+            "_gap_reconcile['problem_model']",
+        ): (
+            5,
+            "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ),
+        # admin_agent_ops.py: apply_agent_update write-back, and the same value
+        # re-assigned after _normalize_active_moves_writeback.
+        ("routers/admin_agent_ops.py", "strategic_operation", "new_pm_raw"): (
+            2,
+            "apply_agent_update result; second write is the same result after _normalize_active_moves_writeback",
+        ),
+        # admin_agent_ops.py: current_model.model_dump() (pending_confirm and
+        # resolve_pending_confirm ops)
+        (
+            "routers/admin_agent_ops.py",
+            "strategic_operation",
+            "current_model.model_dump()",
+        ): (
+            2,
+            "validated current_model pydantic model_dump",
+        ),
     }
+
+    @staticmethod
+    def _enclosing_qualnames(tree: ast.AST) -> dict[ast.AST, str]:
+        """Map every node to the dotted qualname of its enclosing def/class scopes.
+
+        ``ast`` gives no parent pointers, so walk the tree once and record the
+        scope chain each node sits inside.  A module-level node maps to "".
+        """
+        out: dict[ast.AST, str] = {}
+
+        def walk(node: ast.AST, prefix: tuple[str, ...]) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    inner = (*prefix, child.name)
+                    out[child] = ".".join(inner)
+                    walk(child, inner)
+                else:
+                    out[child] = ".".join(prefix)
+                    walk(child, prefix)
+
+        walk(tree, ())
+        return out
 
     def test_all_problem_model_write_paths_are_sanitized(self):
         """Every ``project.problem_model = <expr>`` in ``backend/app/`` must
         be in the reviewed allowlist of safe sanitized write paths."""
         app_dir = BACKEND_ROOT / "app"
-        discovered: dict[tuple[str, int], str] = {}
-        # (rel_path, lineno) -> friendly description of the RHS
+        # (rel_path, enclosing qualname, unparsed RHS) -> occurrence count
+        discovered: Counter = Counter()
+        # Keep one representative line per key purely for the failure message.
+        first_lineno: dict[tuple[str, str, str], int] = {}
 
         for py_file in sorted(app_dir.rglob("*.py")):
             source = py_file.read_text(encoding="utf-8")
@@ -13550,52 +13680,66 @@ class TestProblemModelWritePathInvariants:
                 tree = ast.parse(source, filename=str(py_file))
             except SyntaxError:
                 continue
+            qualnames = self._enclosing_qualnames(tree)
 
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Assign):
                     continue
                 for tgt in node.targets:
                     if isinstance(tgt, ast.Attribute) and tgt.attr == "problem_model":
-                        lineno = node.lineno
-                        key = (rel, lineno)
-                        if isinstance(node.value, ast.Call) and isinstance(
-                            node.value.func, ast.Attribute
-                        ):
-                            desc = f"{node.value.func.attr}() call"
-                        elif isinstance(node.value, ast.Call) and isinstance(
-                            node.value.func, ast.Name
-                        ):
-                            desc = f"{node.value.func.id}(...) call"
-                        elif isinstance(node.value, ast.Name):
-                            desc = f"variable `{node.value.id}`"
-                        elif isinstance(node.value, ast.Subscript):
-                            desc = "subscript expression"
-                        elif isinstance(node.value, ast.Dict):
-                            desc = "dict literal"
-                        else:
-                            desc = type(node.value).__name__
-                        discovered[key] = desc
+                        key = (rel, qualnames.get(node, ""), ast.unparse(node.value))
+                        discovered[key] += 1
+                        first_lineno.setdefault(key, node.lineno)
+
+        def _fmt(key: tuple[str, str, str]) -> str:
+            rel, qual, expr = key
+            where = f"{rel}:{first_lineno[key]}" if key in first_lineno else rel
+            return f"  {where} in {qual or '<module>'}(): project.problem_model = {expr}"
 
         # Everything discovered must be in the allowlist
         missing = set(discovered) - set(self._SAFE_SITES)
         assert not missing, (
-            f"{len(missing)} project.problem_model = <expr> site(s) found "
+            f"{len(missing)} project.problem_model = <expr> write path(s) found "
             "that are NOT in the reviewed SAFE_SITES allowlist.\n"
             "Each new write path must be reviewed for packer-marker sanitization "
-            "and added to TestProblemModelWritePathInvariants._SAFE_SITES.\n\n"
-            "Unlisted sites:\n"
-            + "\n".join(
-                f"  {rel}:{ln} ({discovered.get((rel, ln), '?')})"
-                for (rel, ln) in sorted(missing)
-            ) + "\n" + format_offender_marker(str(offender) for offender in missing)
+            "and added to TestProblemModelWritePathInvariants._SAFE_SITES.\n"
+            "The key is (file, enclosing function, RHS expression) — NOT a line "
+            "number — so this fires only when a write path genuinely changed.\n\n"
+            "Unlisted write paths:\n"
+            + "\n".join(_fmt(key) for key in sorted(missing)) + "\n"
+            + format_offender_marker(str(offender) for offender in sorted(missing))
         )
 
-        # Warn about stale allowlist entries (sites that no longer exist)
+        # Allowlist entries whose write path no longer exists
         stale = set(self._SAFE_SITES) - set(discovered)
         assert not stale, (
             f"{len(stale)} SAFE_SITES entry/entries no longer found in the codebase. "
             "Remove or update these stale allowlist entries:\n"
-            + "\n".join(f"  {rel}:{ln}" for (rel, ln) in sorted(stale)) + "\n" + format_offender_marker(str(offender) for offender in stale)
+            + "\n".join(
+                f"  {rel} in {qual or '<module>'}(): project.problem_model = {expr}"
+                for (rel, qual, expr) in sorted(stale)
+            ) + "\n"
+            + format_offender_marker(str(offender) for offender in sorted(stale))
+        )
+
+        # The number of writes of a given expression inside a given function is
+        # itself reviewed state: adding a sixth _gap_reconcile write, or
+        # deleting one, changes the surface even though the key is unchanged.
+        miscounted = sorted(
+            (key, self._SAFE_SITES[key][0], discovered[key])
+            for key in set(self._SAFE_SITES) & set(discovered)
+            if self._SAFE_SITES[key][0] != discovered[key]
+        )
+        assert not miscounted, (
+            f"{len(miscounted)} allowlisted write path(s) changed occurrence count. "
+            "A write path was added to or removed from a function that already "
+            "had one; re-review the sanitization and update the count:\n"
+            + "\n".join(
+                f"  {rel} in {qual or '<module>'}(): "
+                f"project.problem_model = {expr} — allowlisted {expected}, found {found}"
+                for ((rel, qual, expr), expected, found) in miscounted
+            ) + "\n"
+            + format_offender_marker(str(key) for (key, _e, _f) in miscounted)
         )
 
 
@@ -13687,20 +13831,9 @@ def test_no_callers_pass_raise_on_size_limit_false():
     The default is ``raise_on_size_limit=True``, which is the intended behavior
     per this direction's goal ('writes fail loudly instead of truncating'). A
     caller that passes ``False`` opts back into the legacy silent-truncation
-    behavior. If a legitimate caller needs this, add it to the allowlist below
-    with a documented rationale.
+    behavior. If a legitimate caller needs this, the guard must be deliberately
+    changed with a documented rationale rather than pinned to a source line.
     """
-    # Allowlist: (rel_path, lineno, rationale). Keep as close to empty as possible — no caller
-    # should silence the size-cap guard.
-    _ALLOWLIST: frozenset[tuple[str, int, str]] = frozenset({
-        (
-            "app/efficiency_snapshot.py",
-            307,
-            "Telemetry mirror: silently skip the stale snapshot write when "
-            "the design_doc container is full — crashing the telemetry sync "
-            "is worse than a slightly stale efficiency snapshot.",
-        ),
-    })
     app_dir = BACKEND_ROOT / "app"
     # Known aliases for with_design_doc_locked in production code
     _ALIASES: frozenset[str] = frozenset({
@@ -13749,14 +13882,9 @@ def test_no_callers_pass_raise_on_size_limit_false():
             for kw in node.keywords:
                 if kw.arg == "raise_on_size_limit":
                     if isinstance(kw.value, ast.Constant) and kw.value.value is False:
-                        allowlisted = any(
-                            a[0] == rel and a[1] == node.lineno
-                            for a in _ALLOWLIST
+                        offenders.append(
+                            f"  {rel}:{node.lineno}: passes raise_on_size_limit=False to {func_name}"
                         )
-                        if not allowlisted:
-                            offenders.append(
-                                f"  {rel}:{node.lineno}: passes raise_on_size_limit=False to {func_name}"
-                            )
 
     assert not offenders, (
         "The following call site(s) pass ``raise_on_size_limit=False`` to "

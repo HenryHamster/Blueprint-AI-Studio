@@ -35,16 +35,19 @@
     if [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
       _verification_stderr=$(mktemp /tmp/check_verification_resolver.XXXXXX)
       _verification_candidates=$(mktemp /tmp/check_verification_selectors.XXXXXX)
+      _verification_mandatory_candidates=$(mktemp /tmp/check_verification_mandatory.XXXXXX)
       : >"$_verification_candidates"
-      printf '%s\n' "$CHANGED" | grep -E '@TEST_PATH_RE@' | while IFS= read -r test_path; do
-        [ -f "${test_path%%::*}" ] && printf '%s\n' "$test_path"
-      done >>"$_verification_candidates" || true
+      : >"$_verification_mandatory_candidates"
       if [ "$_VERIFICATION_DIR" = "backend" ] && [ -f backend/testing/impacted_tests.py ]; then
         printf '%s\n' "$CHANGED" | python3 backend/testing/impacted_tests.py \
+          --limit 8 --mandatory-output "$_verification_mandatory_candidates" \
           >>"$_verification_candidates" 2>"$_verification_stderr"
         _verification_resolver_rc=$?
       else
         _verification_resolver_rc=0
+        printf '%s\n' "$CHANGED" | grep -E '@TEST_PATH_RE@' | while IFS= read -r test_path; do
+          [ -f "${test_path%%::*}" ] && printf '%s\n' "$test_path"
+        done >>"$_verification_candidates" || true
         while IFS= read -r changed_file; do
           [ -n "$changed_file" ] || continue
           case "$changed_file" in
@@ -66,7 +69,7 @@
         cat "$_verification_stderr" >&2
         FAILED+=("$_VERIFICATION_DIR verification resolver")
       fi
-      _VERIFICATION_SELECTORS=$(
+      _VERIFICATION_ORDINARY_SELECTORS=$(
         sed 's|^@SELECTOR_PREFIX_RE@||' "$_verification_candidates" \
           | while IFS= read -r selector; do
               [ -n "$selector" ] || continue
@@ -74,19 +77,41 @@
             done \
           | awk '!seen[$0]++'
       )
+      _VERIFICATION_MANDATORY_SELECTORS=$(
+        sed 's|^@SELECTOR_PREFIX_RE@||' "$_verification_mandatory_candidates" \
+          | while IFS= read -r selector; do
+              [ -n "$selector" ] || continue
+              [ -f "$_VERIFICATION_DIR/${selector%%::*}" ] && printf '%s\n' "$selector"
+            done \
+          | awk '!seen[$0]++'
+      )
+      _VERIFICATION_SELECTORS=$(printf '%s\n%s\n' \
+        "$_VERIFICATION_ORDINARY_SELECTORS" "$_VERIFICATION_MANDATORY_SELECTORS" \
+        | awk 'NF && !seen[$0]++')
       rm -f "$_verification_candidates"
+      rm -f "$_verification_mandatory_candidates"
       rm -f "$_verification_stderr"
     fi
     if [ "$_VERIFICATION_RUFF_OK" = "1" ] && [ -z "$_VERIFICATION_SELECTORS" ]; then
       echo "[check] required backend verification FAILED — no impacted pytest file/node was resolved"
       FAILED+=("$_VERIFICATION_DIR verification: no impacted pytest")
     elif [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
-      _verification_count=$(printf '%s\n' "$_VERIFICATION_SELECTORS" | grep -c '^' || true)
-      if [ "$_verification_count" -gt 8 ]; then
-        echo "[check] required backend verification: $_verification_count impacted files; running the 8 most diff-relevant (the remainder are not run here)"
+      _verification_ordinary_count=$(printf '%s\n' "$_VERIFICATION_ORDINARY_SELECTORS" | grep -c . || true)
+      _verification_mandatory_count=$(printf '%s\n' "$_VERIFICATION_MANDATORY_SELECTORS" | grep -c . || true)
+      if [ "$_verification_ordinary_count" -gt 8 ]; then
+        echo "[check] required backend verification FAILED — resolver exceeded ordinary selector cap: $_verification_ordinary_count"
+        FAILED+=("$_VERIFICATION_DIR verification: ordinary selector cap")
       fi
-      mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS" | head -n 8)
+      if [ "$_verification_mandatory_count" -gt 0 ]; then
+        echo "[check] required backend verification: retaining $_verification_mandatory_count matched surface sentinel(s) past the ordinary cap"
+      fi
+      mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS")
+      mapfile -t _verification_mandatory_selector_args < <(printf '%s\n' "$_VERIFICATION_MANDATORY_SELECTORS")
       _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
+      _verification_mandatory_selectors_encoded=""
+      if [ "$_verification_mandatory_count" -gt 0 ]; then
+        _verification_mandatory_selectors_encoded=$(printf '%s\n' "${_verification_mandatory_selector_args[@]}" | base64 | tr -d '\n')
+      fi
       _verification_postgres_flag=""
       if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
         echo "[check] required backend verification FAILED — sanctioned harness missing: $_VERIFICATION_HARNESS"
@@ -116,7 +141,7 @@
         _verification_current_junit="$_verification_attribution_dir/current.xml"
         rm -f "$_verification_harness_receipt" "$_verification_current_junit"
         _verification_exit=0
-        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" BLUEPRINT_VERIFICATION_JUNIT="$_verification_current_junit" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ); then
+        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" BLUEPRINT_VERIFICATION_JUNIT="$_verification_current_junit" BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS="$_verification_mandatory_selectors_encoded" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ); then
           :
         else
           _verification_exit=$?
@@ -138,12 +163,14 @@
         _verification_attribution_file="$_verification_attribution_dir/attribution.json"
         printf '%s' "$_verification_attribution" >"$_verification_attribution_file"
         _verification_state=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state","attribution_unavailable"))' 2>/dev/null || printf attribution_unavailable)
+        _verification_blocking=$(printf '%s' "$_verification_attribution" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("blocking", True) else "0")' 2>/dev/null || printf 1)
         _verification_tests=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for _ in ET.parse(sys.argv[1]).getroot().iter("testcase")))' "$_verification_current_junit" 2>/dev/null || printf 0)
         _verification_skipped=$(python3 -c 'import sys,xml.etree.ElementTree as ET; print(sum(1 for c in ET.parse(sys.argv[1]).getroot().iter("testcase") if c.find("skipped") is not None))' "$_verification_current_junit" 2>/dev/null || printf 0)
         if [ "$_verification_tests" -gt 0 ] && [ "$_verification_skipped" -eq "$_verification_tests" ]; then
           _verification_state=skipped_test
+          _verification_blocking=1
         fi
-        if [ "$_verification_state" = "passed" ] || [ "$_verification_state" = "preexisting_test_failure" ]; then
+        if [ "$_verification_blocking" = "0" ]; then
           echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK — state=$_verification_state"
           _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
           # Prefer the Blueprint-repo-local writer (it merges this lane into the

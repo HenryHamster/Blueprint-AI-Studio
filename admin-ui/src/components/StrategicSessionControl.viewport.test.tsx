@@ -1,4 +1,4 @@
-import { afterEach, describe, test } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { StrategicSessionControl } from './StrategicSessionControl';
@@ -41,6 +41,13 @@ describe('StrategicSessionControl — viewport regression', () => {
           />,
         );
       });
+
+      const chatToggle = host?.querySelector('[aria-label="Switch Strategic mode to Chat"]');
+      const workdayToggle = host?.querySelector('[aria-label="Switch Strategic mode to Workday"]');
+      expect(chatToggle).toHaveTextContent('Chat');
+      expect(workdayToggle).toHaveTextContent('Workday');
+      expect(chatToggle?.querySelector('.sr-only')).toBeNull();
+      expect(workdayToggle?.querySelector('.sr-only')).toBeNull();
     });
   });
 

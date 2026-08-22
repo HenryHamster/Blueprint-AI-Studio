@@ -4047,6 +4047,31 @@ async def _spawn_pipeline_task(
     if task_type == "fix" and iteration >= 2 and len(new_review_history) >= 2:
         prev_entry = new_review_history[-2]
         curr_entry = new_review_history[-1]
+        # A stuck verdict is a claim that the FIX agent is not converging, so
+        # it only carries meaning when a fix attempt actually intervened
+        # between the two reviews being compared. When both passes reviewed the
+        # same head they examined byte-identical code, and two reviewers
+        # agreeing about an unchanged diff is consistency -- not a standoff.
+        #
+        # This is not hypothetical. A stale-target discard leaves its finding
+        # in the ledger; the respawned exact-target review re-raises the same
+        # true defect in fresh words; the rephrase fallback below then scores
+        # that pair as churn. Live instance: NeurIPS PR #1777, both passes at
+        # b118029a..ea7e8087, parked 'stuck' on 75% rephrase similarity with
+        # ZERO fix attempts ever spawned -- the park suppressed the very fix
+        # both reviewers were asking for.
+        #
+        # Fail toward the pre-existing behaviour: suppress only when both
+        # entries carry a head sha AND the shas match. A missing sha proves
+        # nothing about whether the code moved, so it must not disable the
+        # detector.
+        _prev_reviewed_head = str(prev_entry.get("reviewed_head_sha") or "").strip()
+        _curr_reviewed_head = str(curr_entry.get("reviewed_head_sha") or "").strip()
+        _head_advanced_between_reviews = not (
+            _prev_reviewed_head
+            and _curr_reviewed_head
+            and _prev_reviewed_head == _curr_reviewed_head
+        )
         prev_issues_list = prev_entry.get("issues") or []
         curr_issues_list = curr_entry.get("issues") or []
         # ``pending_disposition`` marks an issue a review disposed
@@ -4081,7 +4106,17 @@ async def _spawn_pipeline_task(
         is_stuck = False
         stuck_detail = ""
 
-        if curr_critical_major and prev_critical_major:
+        if not _head_advanced_between_reviews:
+            # Same head on both passes: no fix landed in between, so repetition
+            # is expected and says nothing about convergence. The iteration cap
+            # remains the honest backstop for real non-convergence.
+            logger.info(
+                "[PIPELINE] Skipping stuck detection on %s - both reviews "
+                "examined head %s, no fix attempt intervened",
+                str(source_task.id)[:8],
+                _curr_reviewed_head[:9],
+            )
+        elif curr_critical_major and prev_critical_major:
             matched_count = sum(
                 1 for desc in curr_critical_major if desc in prev_critical_major
             )

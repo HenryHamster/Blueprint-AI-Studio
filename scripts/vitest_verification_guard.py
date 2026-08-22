@@ -30,6 +30,7 @@ from testing.fixgate_attribution import (  # noqa: E402
     classify_verification,
     extract_base,
     parse_junit_report,
+    test_route_coverage_gaps,
 )
 from verification_receipt import record_lane, vitest_lane  # noqa: E402
 
@@ -398,7 +399,12 @@ def _blocking(state: str, **extra: object) -> int:
     return 1
 
 
-def _record(suite_name: str, outcome: dict[str, object]) -> None:
+def _record(
+    suite_name: str,
+    outcome: dict[str, object],
+    *,
+    coverage_failures: dict[str, str] | None = None,
+) -> None:
     """Persist this lane's attribution to the shared multi-lane sidecar.
 
     Advisory by construction: `record_lane` never raises and its return value
@@ -406,11 +412,16 @@ def _record(suite_name: str, outcome: dict[str, object]) -> None:
     red (or green).
     """
 
+    coverage_failures = coverage_failures or {}
+    new_failures = dict(outcome.get("new_failures") or {})
+    new_failures.update(
+        {f"{route}::coverage": detail for route, detail in coverage_failures.items()}
+    )
     record_lane(
         vitest_lane(suite_name),
-        state=str(outcome["state"]),
-        blocking=bool(outcome.get("blocking", False)),
-        new_failures=outcome.get("new_failures"),
+        state="coverage_regression" if coverage_failures else str(outcome["state"]),
+        blocking=bool(outcome.get("blocking", False) or coverage_failures),
+        new_failures=new_failures,
         suppressed_failures=outcome.get("suppressed_failures"),
         disappeared_failures=outcome.get("disappeared_failures"),
         skipped_failures=outcome.get("skipped_failures"),
@@ -555,7 +566,12 @@ def main(argv: list[str] | None = None) -> int:
         # config that DEFINES the roster, cannot have made a baseline failure
         # disappear or become skipped. Keep this cheap path, but only after
         # proving the suite's test-file diff (roster included) is empty.
-        if current_is_clean and not changed_test_files and not roster_config_changed:
+        if (
+            current_is_clean
+            and not changed_test_files
+            and not roster_config_changed
+            and not current_report.skipped_routes
+        ):
             outcome = classify_verification(
                 runtime_available=True,
                 current_exit_code=current.returncode,
@@ -573,7 +589,15 @@ def main(argv: list[str] | None = None) -> int:
             base_root.mkdir()
             extract_base(repo, base_ref, base_root)
             if current_is_clean:
-                if roster_config_changed:
+                if current_report.skipped_routes:
+                    # A clean exit with skipped tests cannot prove that the
+                    # candidate preserved the base suite's executable scope.
+                    print(
+                        "[vitest-verification] baseline scoped to the full suite: "
+                        "current report contains skipped test routes"
+                    )
+                    base_selectors = None
+                elif roster_config_changed:
                     # The roster itself moved (an include/exclude glob
                     # changed). We cannot safely narrow to individual files -
                     # a newly excluded file wouldn't even be in this list -
@@ -668,7 +692,12 @@ def main(argv: list[str] | None = None) -> int:
             current_report=current_report,
             baseline_report=baseline_report,
         )
-        _record(args.suite, outcome)
+        coverage_failures = (
+            test_route_coverage_gaps(current_report, baseline_report)
+            if current_is_clean
+            else {}
+        )
+        _record(args.suite, outcome, coverage_failures=coverage_failures)
         for key in sorted(outcome.get("suppressed_failures", {})):
             print(f"[vitest-verification] WARN suppressed baseline failure: {key}")
         # Additive and fail-open: the WARN lines above are unchanged and the
@@ -676,6 +705,11 @@ def main(argv: list[str] | None = None) -> int:
         _record_suppressions(args.suite, outcome)
         if current_execution_error:
             return _blocking("execution_failure")
+        if coverage_failures:
+            return _blocking(
+                "coverage_regression",
+                test_routes=",".join(sorted(coverage_failures)),
+            )
         state = str(outcome["state"])
         if bool(outcome["blocking"]):
             return _blocking(state)

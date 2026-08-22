@@ -14,7 +14,7 @@ import sys
 import pytest
 
 import app.size_limit_policy as slp
-from app.size_limit_policy import bump_size_limit
+from app.size_limit_policy import bump_size_limit, stale_cap_limit
 from testing import check_size_limits as csl
 
 
@@ -70,6 +70,28 @@ def _build_repo(tmp_path, *, backend=None, agent=None, frontend=None, scripts=No
 
 def _run(json_path, repo_root, *extra):
     return csl.main(["--json", json_path, "--repo-root", repo_root, *extra])
+
+
+@pytest.mark.parametrize(
+    ("actual_line_count", "expected_limit"),
+    [
+        (0, 500),
+        (1, 501),
+        (250, 750),
+        (251, 751),
+        (1000, 2000),
+    ],
+)
+def test_stale_cap_limit_uses_shared_headroom_policy(
+    actual_line_count, expected_limit
+):
+    """The stale-cap bound keeps both small and large files meaningful."""
+    assert stale_cap_limit(actual_line_count) == expected_limit
+
+
+def test_stale_cap_limit_rejects_negative_line_count():
+    with pytest.raises(ValueError, match="non-negative"):
+        stale_cap_limit(-1)
 
 
 def test_check_flags_real_breach_nonzero(tmp_path):

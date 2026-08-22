@@ -830,6 +830,24 @@ describe('writeDoneHelper — --warn-out-of-scope does not bypass the check gate
     expect(prFileBlock).toContain('exit 2');
   });
 
+  it('generated ./done distinguishes receipt-backed inherited failures from blocking failures', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'done-guidance-attribution',
+      workBranch: 'blueprint/done-guidance-attribution',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toContain('records named inherited failures');
+    expect(doneScript).toContain('verification receipt');
+    expect(doneScript).toContain('Do not use this flag to');
+    expect(doneScript).toContain('new, unattributed, execution, or explicit coverage failures');
+    expect(doneScript).not.toContain('ship despite ./check failures');
+  });
+
   it('--warn-out-of-scope flag is parsed but does not skip the PR URL file requirement', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers({

@@ -1087,11 +1087,20 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     );
     // waitFor only retries on THROW — a falsy return resolves immediately, so
     // the find() must be asserted inside the callback to actually wait.
+    //
+    // Wait for ENABLED, not merely present.  The button carries
+    // `disabled={submitting || uploading}`, and fireEvent.click on a disabled
+    // button is a silent no-op with no retry — so a single click landing
+    // during mount-time reconciliation drops the abandon entirely and the
+    // sessionStorage assertion below then times out.  That is exactly how
+    // this test went red on promotion CI at ca5064d70 (loaded self-hosted
+    // runner) while passing the whole 1922-test shard locally.
     const abandon = await waitFor(() => {
       const button = [...container.querySelectorAll('button')]
         .find(candidate => candidate.textContent?.trim() === 'Abandon pending message');
       expect(button).toBeTruthy();
-      return button!;
+      expect((button as HTMLButtonElement).disabled).toBe(false);
+      return button as HTMLButtonElement;
     });
     fireEvent.click(abandon);
     await waitFor(() => expect(sessionStorage.getItem('optimisticSend:test-user%40example.com:proj-abandon')).toBeNull());

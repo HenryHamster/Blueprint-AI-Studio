@@ -13,12 +13,14 @@ no conftest imports. Added to the standalone smoke set via the normal
 from __future__ import annotations
 
 import json
-import re
+import unittest
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.identity_extraction import count_python_test_ids, extract_python_test_ids
 
 MANIFEST_PATH = Path(__file__).resolve().parent / "conversational_workday_manifest.json"
 
@@ -41,26 +43,7 @@ REPO_ROOT = _resolve_repo_root()
 
 def _load_manifest() -> dict:
     with MANIFEST_PATH.open(encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def _extract_python_test_ids(source: str) -> set[str]:
-    """Collect pytest node IDs from top-level functions and ``Test*`` classes."""
-    import ast
-
-    tree = ast.parse(source)
-    test_ids: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
-            test_ids.add(node.name)
-        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            test_ids.update(
-                f"{node.name}::{item.name}"
-                for item in node.body
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and item.name.startswith("test_")
-            )
-    return test_ids
+        return cast(dict, json.load(fh))
 
 
 def _extract_ts_it_labels(source: str) -> set[str]:
@@ -125,12 +108,8 @@ def _extract_ts_test_labels(source: str) -> set[str]:
 
 
 def _extract_python_test_labels(source: str) -> set[str]:
-    """Extract test function names from a Python test module."""
-    return set(re.findall(
-        r"^\s*(?:async\s+)?def\s+(test_\w+)\s*\(",
-        source,
-        re.MULTILINE,
-    ))
+    """Return manifest labels derived from canonical Python identities."""
+    return {test_id.rsplit("::", 1)[-1] for test_id in extract_python_test_ids(source)}
 
 
 def _extract_test_labels(path: str, source: str) -> set[str]:
@@ -174,6 +153,39 @@ def _find_completeness_violations(manifest: dict, repo_root: Path) -> list[dict]
                 }
             )
     return violations
+
+
+def _protected_test_count(path: str, source: str) -> int | None:
+    """Return the collector-faithful test count for a protected source file."""
+    if path.endswith(".py"):
+        return count_python_test_ids(source)
+    if path.endswith((".ts", ".tsx")):
+        return len(
+            _extract_ts_it_labels(source)
+            | _extract_ts_it_each_labels(source)
+            | _extract_ts_test_labels(source)
+        )
+    return None
+
+
+def _find_test_count_mismatches(manifest: dict, repo_root: Path) -> list[str]:
+    """Return protected entries whose declared count is not an exact snapshot."""
+    mismatches: list[str] = []
+    for entry in manifest["protect"]:
+        path = entry["path"]
+        full_path = repo_root / path
+        if not full_path.exists():
+            continue
+        actual = _protected_test_count(path, full_path.read_text(encoding="utf-8"))
+        if actual is None:
+            mismatches.append(f"{path}: unsupported test file type")
+            continue
+        declared_count = entry["test_count"]
+        if actual != declared_count:
+            mismatches.append(
+                f"{path}: actual={actual}, declared_exact={declared_count}"
+            )
+    return mismatches
 
 
 # ---------------------------------------------------------------------------
@@ -323,9 +335,11 @@ def test_all_protect_test_ids_exist_in_their_files():
             continue
         source = full_path.read_text(encoding="utf-8")
         actual_labels = _extract_test_labels(entry["path"], source)
-        for test_id in entry["test_ids"]:
-            if test_id not in actual_labels:
-                missing.append(f"{entry['path']}::{test_id}")
+        missing.extend(
+            f"{entry['path']}::{test_id}"
+            for test_id in entry["test_ids"]
+            if test_id not in actual_labels
+        )
 
     assert not missing, (
         "The following PROTECT-listed test_ids no longer exist in their files. "
@@ -337,41 +351,94 @@ def test_all_protect_test_ids_exist_in_their_files():
 
 
 def test_every_protected_file_meets_declared_test_count():
-    """Every protected file must retain at least its manifest test count.
+    """Every protected file must match its manifest test count exactly.
 
     The manifest's hand-picked ``test_ids`` remain a forward existence contract;
-    this data-driven count floor closes the reverse gap, so deleting an
-    undeclared test from any protected file fails without hardcoding file paths.
+    this data-driven exact snapshot closes both directions of the reverse gap,
+    so adding or deleting an undeclared test fails without hardcoding paths.
     """
     manifest = _load_manifest()
-    mismatches: list[str] = []
-    for entry in manifest["protect"]:
-        path = entry["path"]
-        full_path = REPO_ROOT / path
-        if not full_path.exists():
-            continue
-        source = full_path.read_text(encoding="utf-8")
-        if path.endswith(".py"):
-            actual = _extract_python_test_ids(source)
-        elif path.endswith((".ts", ".tsx")):
-            actual = _extract_ts_it_labels(source)
-            actual |= _extract_ts_it_each_labels(source)
-            actual |= _extract_ts_test_labels(source)
-        else:
-            mismatches.append(f"{path}: unsupported test file type")
-            continue
-        declared_count = entry["test_count"]
-        if len(actual) < declared_count:
-            mismatches.append(
-                f"{path}: actual={len(actual)}, declared_floor={declared_count}"
-            )
+    mismatches = _find_test_count_mismatches(manifest, REPO_ROOT)
 
     assert not mismatches, (
-        "Protected test files must retain their declared test-count floor; "
-        "update conversational_workday_manifest.json after an intentional test removal:\n"
+        "Protected test files must match their declared test-count snapshot; "
+        "update conversational_workday_manifest.json after an intentional inventory change:\n"
         + "\n".join(f"  - {item}" for item in mismatches)
         + "\n" + format_offender_marker(str(offender) for offender in mismatches)
     )
+
+
+def test_new_floor_slack_relative_to_integration_branch_fails():
+    """An integration-branch count lag is reported as a protected mismatch."""
+    manifest = _load_manifest()
+    entry = next(
+        item for item in manifest["protect"]
+        if item["path"] == "backend/testing/test_reaper.py"
+    )
+    actual = _protected_test_count(
+        entry["path"],
+        (REPO_ROOT / entry["path"]).read_text(encoding="utf-8"),
+    )
+    assert actual is not None and actual > 1
+
+    integration_branch_manifest = json.loads(json.dumps(manifest))
+    integration_entry = next(
+        item for item in integration_branch_manifest["protect"]
+        if item["path"] == entry["path"]
+    )
+    integration_entry["test_count"] = actual - 1
+
+    assert _find_test_count_mismatches(
+        integration_branch_manifest, REPO_ROOT
+    ) == [f"{entry['path']}: actual={actual}, declared_exact={actual - 1}"]
+
+
+def test_python_identity_extraction_includes_unittest_subclass_methods():
+    """The count floor includes unittest classes outside pytest's name pattern."""
+    source = (
+        "import unittest\n"
+        "class RunnerCase(unittest.TestCase):\n"
+        "    pass\n"
+        "class RunnerRegressionTests(RunnerCase):\n"
+        "    def test_protected(self): pass\n"
+        "class Helper:\n"
+        "    def test_not_collected(self): pass\n"
+    )
+
+    assert extract_python_test_ids(source) == {"RunnerRegressionTests::test_protected"}
+    assert count_python_test_ids(source) == 1
+
+
+def test_python_identity_extraction_expands_inherited_unittest_methods():
+    """A subclass carries its inherited ``test_*`` methods under its own name.
+
+    ``unittest.TestLoader().getTestCaseNames`` reports ``test_inherited`` on
+    ``Child``, so a static universe that only reads ``Child``'s own body
+    undercounts the protected floor and silently drops duration identities.
+    The expectation is derived from the live loader rather than hardcoded, so
+    this cannot be satisfied by teaching the extractor a literal answer.
+    """
+    source = (
+        "import unittest\n"
+        "class Base(unittest.TestCase):\n"
+        "    def test_inherited(self): pass\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        "class TestOverrider(Base):\n"
+        "    def test_inherited(self): pass\n"
+        "    def test_own(self): pass\n"
+    )
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<identity-extraction-reproducer>", "exec"), namespace)
+    loader = unittest.TestLoader()
+    collector_ids = {
+        f"{name}::{method}"
+        for name in ("Base", "Child", "TestOverrider")
+        for method in loader.getTestCaseNames(namespace[name])
+    }
+
+    assert extract_python_test_ids(source) == collector_ids
+    assert "Child::test_inherited" in collector_ids
 
 
 def test_removed_backend_resident_seams_are_absent():

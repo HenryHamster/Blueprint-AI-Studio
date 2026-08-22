@@ -1999,10 +1999,18 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     task must be marked requires_approval=True.
 
     Setup: a review task at iteration=1 whose review_loop already carries a
-    prior review_history entry with the same CRITICAL issue. When the review
-    completes with REQUEST_CHANGES (same issue), _spawn_pipeline_task is called
-    with task_type="fix" at iteration=2. new_review_history will have 2 entries
-    with matching CRITICAL issues → stuck-cycle detection fires.
+    prior review_history entry with the same CRITICAL issue, reviewed at an
+    EARLIER head. When the review completes with REQUEST_CHANGES (same issue)
+    at the current head, _spawn_pipeline_task is called with task_type="fix" at
+    iteration=2. new_review_history will have 2 entries with matching CRITICAL
+    issues across two different heads → stuck-cycle detection fires.
+
+    The two heads must differ: a stuck verdict is a claim that the FIX agent is
+    not converging, so it only carries meaning when a fix attempt actually
+    landed between the two reviews being compared (#17627). Two reviews of a
+    byte-identical head agreeing with each other is consistency, and
+    ``test_stuck_cycle_suppressed_when_no_fix_landed_between_reviews`` in
+    test_review_pipeline.py pins that it is NOT parked as stuck.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
@@ -2053,7 +2061,10 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
         "feedback": "Still missing validation",
         "issues": [repeated_issue],
         "reviewed_base_sha": "stuck-base-99",
-        "reviewed_head_sha": "stuck-head-99",
+        # An EARLIER head than the current pass: a fix attempt landed between
+        # the two reviews, which is what makes the repeat evidence of
+        # non-convergence rather than of an unchanged diff.
+        "reviewed_head_sha": "stuck-head-98",
         "target_verified_by_backend": True,
     }
 

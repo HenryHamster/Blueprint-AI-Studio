@@ -189,9 +189,11 @@ failing, and scope creep into unrelated files. Apply these additional checks:
        as the authoritative gate: "Local DB/Docker unavailable; standalone smoke
        passed; CI runs the full suite on this PR."
    A complete fix sitting unpushed because tests cannot run locally is a stranded
-   delivery — push it and let CI verify. \`./blocked\` is only for cases where
-   no code edit can fix the problem (e.g. a missing upstream dependency or a
-   repo-wide gate failure on files you did not touch).
+   delivery — push it and let CI verify. Named, structured baseline-attributed
+   failures are publishable with the verification receipt; new, unattributed,
+   execution, attribution, and explicit coverage failures remain blocking.
+   \`./blocked\` is only for cases where no code edit can fix the problem (e.g.
+   a missing upstream dependency or another genuine precondition failure).
 7. ${ANTI_HEDGE_FOCUS}
 `;
 

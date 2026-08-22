@@ -78,14 +78,16 @@ def _rules_json() -> str:
                 "allowlist": [
                     {
                         "path": "prompts/review-prompt.ts",
-                        "line": 336,
                         "pattern": "fallback-main",
+                        "source": "const rollupGuidance = buildRollupReviewGuidance(options.branch || '', options.baseBranch || 'main');",
+                        "count": 1,
                         "rationale": "defensive display default downstream of resolveBaseBranch",
                     },
                     {
                         "path": "prompts/review-prompt.ts",
-                        "line": 121,
                         "pattern": "fallback-main",
+                        "source": "const base = baseBranch ?? 'main';",
+                        "count": 1,
                         "rationale": "local-variable defensive default",
                     },
                 ]
@@ -1189,7 +1191,7 @@ async def test_supplemental_pattern_respects_allowlist(mocker):
     """An allowlist entry for a supplemental pattern suppresses its violation.
 
     Mirrors the canonical AGENT_PATTERNS allowlist behaviour: a
-    path::line::pattern entry in the branch_literal_allowlist.json served AT
+    path::pattern::source entry in the branch_literal_allowlist.json served AT
     THE CANDIDATE REF must suppress a supplemental ('equality-loose-main')
     match too.
     """
@@ -1204,8 +1206,9 @@ async def test_supplemental_pattern_respects_allowlist(mocker):
             "allowlist": [
                 {
                     "path": "helpers/allowlisted.ts",
-                    "line": 2,
                     "pattern": "equality-loose-main",
+                    "source": "if (branch == 'main') { return true; }",
+                    "count": 1,
                     "rationale": "test allowlist of supplemental pattern",
                 }
             ]
@@ -1219,7 +1222,7 @@ async def test_supplemental_pattern_respects_allowlist(mocker):
 
 @pytest.mark.asyncio
 async def test_evaluator_allows_agent_allowlisted_entry(mocker):
-    """Violations at allowlisted path+line+pattern are suppressed.
+    """Violations at allowlisted path+pattern+source are suppressed.
 
     The allowlist is read AT THE CANDIDATE REF from branch_literal_allowlist.json
     (the ``_rules_json()`` default in ``_fake_reader``), so the first real
@@ -1232,10 +1235,9 @@ async def test_evaluator_allows_agent_allowlisted_entry(mocker):
     # the at-ref rules file both derive from the same checked-in JSON, so the
     # entry here is present in the default rules body.
     allow_entry = agent_config.allowlist[0]
-    # Build a source with the flagged pattern on the exact allowlisted line.
-    lines = [""] * allow_entry.line
-    lines[allow_entry.line - 1] = "  const b = opts.base ?? 'main';"
-    offending_ts = "\n".join(lines)
+    # Add an unrelated line above the anchored source to prove line insertion
+    # does not invalidate the allowlist.
+    offending_ts = f"// unrelated edit\n{allow_entry.source}\n"
 
     agent_path = f"agent/src/{allow_entry.path}"
     bodies = {
@@ -1259,10 +1261,10 @@ async def test_evaluator_allows_agent_allowlisted_entry(mocker):
     agent_violations = [
         v
         for v in result["branch_literal_violations"]
-        if v["section"] == "agent" and v["line"] == allow_entry.line
+        if v["section"] == "agent"
     ]
     assert agent_violations == [], (
-        f"allowlisted entry at {allow_entry.path}:{allow_entry.line} must not trigger a violation"
+        f"allowlisted entry at {allow_entry.path}:{allow_entry.source} must not trigger a violation"
     )
 
 
@@ -1302,8 +1304,9 @@ async def test_candidate_ref_only_allowlist_entries_clear_the_gate(mocker):
             "allowlist": [
                 {
                     "path": "handlers/new-feature.ts",
-                    "line": 2,
                     "pattern": "fallback-main",
+                    "source": "const base = opts.base ?? 'main';",
+                    "count": 1,
                     "rationale": "shipped in the same commit as the file",
                 }
             ]

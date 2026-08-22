@@ -10,14 +10,16 @@
     "allowlist": [
       {
         "path": "prompts/review-prompt.ts",
-        "line": 336,
         "pattern": "fallback-main",
+        "source": "const rollupGuidance = buildRollupReviewGuidance(options.branch || '', options.baseBranch || 'main');",
+        "count": 1,
         "rationale": "buildRollupReviewGuidance is downstream of resolveBaseBranch; the options.baseBranch fallback is a defensive display default."
       },
       {
         "path": "prompts/review-prompt.ts",
-        "line": 121,
         "pattern": "fallback-main",
+        "source": "const base = baseBranch ?? 'main';",
+        "count": 1,
         "rationale": "Local-variable defensive default downstream of resolveBaseBranch; live callers supply a resolved baseBranch."
       }
     ]
@@ -26,14 +28,16 @@
     "allowlist": [
       {
         "path": "components/NewTaskModal.tsx",
-        "line": 434,
         "pattern": "fallback-main",
+        "source": "placeholder={integrationBranch || \"main\"}",
+        "count": 1,
         "rationale": "The resolved per-project integrationBranch is preferred; main is only shown as the input placeholder when unavailable."
       },
       {
         "path": "components/ProjectBuildConfigSection.tsx",
-        "line": 688,
         "pattern": "fallback-blueprint",
+        "source": "Leading segment of agent task branches, e.g. <code className=\"font-mono text-neutral-400\">{(taskBranchNamespace.trim() || 'blueprint')}/task-…</code>.",
+        "count": 1,
         "rationale": "Display-only example prefers the user-entered taskBranchNamespace; blueprint is shown only when that display value is empty."
       }
     ]

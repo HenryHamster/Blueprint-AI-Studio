@@ -794,13 +794,30 @@ class TestAutoPauseAlerts:
 
 
 class TestAutoResumeAlerts:
-    """Tests for _create_auto_resume_alerts."""
+    """Tests for _create_auto_resume_alerts.
+
+    The contract these assert changed on 2026-08-21: a resume announcement is
+    routed through alert policy instead of constructing ``Alert(...)`` directly,
+    so the non-flapping branch no longer leaves a durable row behind. What it
+    still does -- dismiss the paired pause WARNING -- is unchanged and still
+    pinned below.
+    """
 
     @pytest.mark.asyncio
-    async def test_creates_info_alert_and_dismisses_pause_warnings(
+    async def test_dismisses_pause_warnings_without_minting_a_durable_row(
         self, db_session, mocker
     ):
-        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        """The dismissal is the signal; the INFO row was only ever accumulation.
+
+        (Previously ``test_creates_info_alert_and_dismisses_pause_warnings``,
+        which additionally asserted the durable INFO row. That row is what
+        alert policy has always said should not exist -- ``deployment.auto_resume``
+        carries ``route=ROUTE_TIMELINE`` -- and 473 undismissed copies of it were
+        open on the live feed. The dismissal half of the assertion is unchanged.)
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -832,20 +849,28 @@ class TestAutoResumeAlerts:
         assert len(pause_alerts) == 1
         assert pause_alerts[0].dismissed_at is not None
 
-        # Resume alert should exist
+        # ...and no durable resume row is left in its place.
         resume_alerts = await _undismissed_alerts(
             db_session,
             project_id=project.id,
-            severity=AlertSeverity.INFO,
+            event_type="deployment.auto_resume",
         )
-        assert len(resume_alerts) == 1
-        assert "auto-resumed" in resume_alerts[0].title.lower()
+        assert resume_alerts == [], (
+            "a clean resume is a timeline notice, not a standing alert"
+        )
 
     @pytest.mark.asyncio
-    async def test_resume_without_prior_pause_still_creates_info_alert(
+    async def test_resume_without_prior_pause_creates_nothing_at_all(
         self, db_session, mocker
     ):
-        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        """The unpaired case: no WARNING to dismiss, so the call is a no-op.
+
+        This is the shape that produced most of the backlog -- a resume with
+        nothing to clear still charged one permanent row per project.
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -854,16 +879,14 @@ class TestAutoResumeAlerts:
         await _create_auto_resume_alerts(db_session)
         await db_session.commit()
 
-        alerts = await _undismissed_alerts(
-            db_session, project_id=project.id, severity=AlertSeverity.INFO
-        )
-        assert len(alerts) == 1
-        assert "auto-resumed" in alerts[0].title.lower()
+        assert await _all_alerts(db_session, project_id=project.id) == []
 
     @pytest.mark.asyncio
     async def test_dismisses_multiple_pause_warnings(self, db_session, mocker):
         """If somehow multiple pause warnings exist, all should be dismissed."""
-        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -898,15 +921,22 @@ class TestAutoResumeAlerts:
         )
         assert all(w.dismissed_at is not None for w in warnings)
 
-        # One INFO resume alert
+        # No INFO resume row in their place.
         infos = await _undismissed_alerts(
             db_session, project_id=project.id, severity=AlertSeverity.INFO
         )
-        assert len(infos) == 1
+        assert infos == []
 
     @pytest.mark.asyncio
     async def test_resume_across_multiple_projects(self, db_session, mocker):
-        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        """Per-project fan-out is exactly where the accumulation compounded.
+
+        Seven projects x 77 resume bursts is how 473 open rows happened; the
+        pause dismissal still has to reach every project.
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
         p1 = make_project(name="Project A")
         p2 = make_project(name="Project B")
         db_session.add(p1)
@@ -922,12 +952,12 @@ class TestAutoResumeAlerts:
         await db_session.commit()
 
         for pid in (p1.id, p2.id):
-            # Each project gets an INFO alert
+            # No project gets a durable resume row...
             infos = await _undismissed_alerts(
-                db_session, project_id=pid, severity=AlertSeverity.INFO
+                db_session, project_id=pid, event_type="deployment.auto_resume"
             )
-            assert len(infos) == 1
-            # Each project's pause alert is dismissed
+            assert infos == []
+            # ...and every project's pause alert is dismissed
             warnings = (
                 (
                     await db_session.execute(
@@ -941,6 +971,256 @@ class TestAutoResumeAlerts:
                 .all()
             )
             assert all(w.dismissed_at is not None for w in warnings)
+
+    # -- flapping stays durable, and stops multiplying -------------------------
+
+    @pytest.mark.asyncio
+    async def test_flapping_resume_still_creates_one_durable_error_alert(
+        self, db_session, mocker
+    ):
+        """Policy routing must not silence the branch that IS action-required.
+
+        ``deployment.flapping_resume`` carries the default policy
+        (``route=ROUTE_ALERT``) at ERROR severity, so the same call that now
+        creates nothing for a clean resume must still create a real row here.
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _create_auto_resume_alerts(db_session, flapping=True)
+        await db_session.commit()
+
+        rows = await _undismissed_alerts(
+            db_session,
+            project_id=project.id,
+            event_type="deployment.flapping_resume",
+        )
+        assert len(rows) == 1, "a flapping resume is action-required and must persist"
+        assert rows[0].severity == AlertSeverity.ERROR
+        assert "flapping" in rows[0].title.lower()
+        assert rows[0].dedupe_key == f"deployment.flapping_resume:{project.id}"
+
+    @pytest.mark.asyncio
+    async def test_repeated_flapping_updates_one_row_instead_of_stacking(
+        self, db_session, mocker
+    ):
+        """The dedupe key is what keeps the durable branch from becoming noise.
+
+        Three flapping events used to leave three rows per project. They should
+        leave one row whose ``occurrence_count`` says it happened three times --
+        strictly more information in strictly less feed.
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        for _ in range(3):
+            await _create_auto_resume_alerts(db_session, flapping=True)
+            await db_session.commit()
+
+        rows = await _undismissed_alerts(
+            db_session,
+            project_id=project.id,
+            event_type="deployment.flapping_resume",
+        )
+        assert len(rows) == 1, "three flapping events must not leave three rows"
+        assert rows[0].occurrence_count == 3
+
+    @pytest.mark.asyncio
+    async def test_clean_resume_does_not_clear_a_standing_flapping_alert(
+        self, db_session, mocker
+    ):
+        """Scope pin on the supersede: one healthy resume does not refute flapping.
+
+        A clean resume says "this cycle was fine". It says nothing about the
+        rapid pause/resume pattern the flapping alert is reporting, so it must
+        leave that alert exactly where it is. The two predicates that hold this
+        line -- same family, and no dedupe key -- are each individually
+        sufficient here, so this fails only when a supersede drops both and
+        starts clearing whatever happens to be open.
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _create_auto_resume_alerts(db_session, flapping=True)
+        await db_session.commit()
+
+        await _create_auto_resume_alerts(db_session, flapping=False)
+        await db_session.commit()
+
+        rows = await _undismissed_alerts(
+            db_session,
+            project_id=project.id,
+            event_type="deployment.flapping_resume",
+        )
+        assert len(rows) == 1, "a clean resume must not dismiss a flapping alert"
+        assert rows[0].dismissed_at is None
+
+    # -- clearing the backlog the old emitter left behind -----------------------
+
+    @pytest.mark.asyncio
+    async def test_pre_dedupe_resume_backlog_is_retired_on_the_next_resume(
+        self, db_session, mocker
+    ):
+        """473 rows are already in the table; nothing else can ever reach them.
+
+        They were written by the old emitter, so they carry no ``dedupe_key``
+        and the upsert can neither find nor supersede them. They name no task,
+        so the terminal-task sweep does not see them. And a resume is a
+        point-in-time event, so no condition-derived resolver can falsify one.
+        The next resume of the same family is the only thing that can, and does.
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        for _ in range(3):
+            db_session.add(
+                make_alert(
+                    project_id=project.id,
+                    severity="INFO",
+                    title="Pipeline auto-resumed: all external dependencies healthy.",
+                    message="Pipeline auto-resumed: all external dependencies healthy.",
+                    event_type="deployment.auto_resume",
+                )
+            )
+        await db_session.commit()
+
+        await _create_auto_resume_alerts(db_session)
+        await db_session.commit()
+
+        assert (
+            await _undismissed_alerts(
+                db_session,
+                project_id=project.id,
+                event_type="deployment.auto_resume",
+            )
+            == []
+        ), "the pre-dedupe backlog must be retired, and nothing new minted"
+
+    @pytest.mark.asyncio
+    async def test_pre_dedupe_flapping_backlog_collapses_onto_the_deduped_row(
+        self, db_session, mocker
+    ):
+        """The durable family needs the same cleanup, and still ends up audible.
+
+        Two legacy flapping rows plus a fresh flapping event must converge on
+        one open row -- the deduped one -- not three, and not zero.
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        for _ in range(2):
+            db_session.add(
+                make_alert(
+                    project_id=project.id,
+                    severity="ERROR",
+                    title=(
+                        "Pipeline auto-resumed (FLAPPING): rapid pause/resume "
+                        "cycles detected."
+                    ),
+                    message="legacy",
+                    event_type="deployment.flapping_resume",
+                )
+            )
+        await db_session.commit()
+
+        await _create_auto_resume_alerts(db_session, flapping=True)
+        await db_session.commit()
+
+        rows = await _undismissed_alerts(
+            db_session,
+            project_id=project.id,
+            event_type="deployment.flapping_resume",
+        )
+        assert len(rows) == 1
+        assert rows[0].dedupe_key == f"deployment.flapping_resume:{project.id}"
+
+    @pytest.mark.asyncio
+    async def test_supersede_never_reaches_outside_the_resume_families(
+        self, db_session, mocker
+    ):
+        """Scope pin: the supersede matches on event_type, never on "looks stale".
+
+        A dedupe_key-less open alert is the normal shape for most producers in
+        this codebase. Sweeping on that shape alone would clear half the feed.
+        """
+        mocker.patch(
+            "app.deploy_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        bystanders = []
+        for event_type in ("task.blocked", "release.ci_unresolved", "runner.degraded"):
+            row = make_alert(
+                project_id=project.id,
+                severity="ERROR",
+                title=f"Unrelated {event_type}",
+                message="still true",
+                event_type=event_type,
+            )
+            db_session.add(row)
+            bystanders.append(row)
+        await db_session.commit()
+
+        await _create_auto_resume_alerts(db_session)
+        await db_session.commit()
+
+        for row in bystanders:
+            await db_session.refresh(row)
+            assert row.dismissed_at is None, (
+                f"{row.event_type} has nothing to do with a pipeline resume"
+            )
+
+    @pytest.mark.asyncio
+    async def test_auto_resume_policy_is_not_a_durable_alert_route(self):
+        """Pin the contract this whole change leans on.
+
+        Every behavioural test above would keep passing if someone flipped
+        ``deployment.auto_resume`` to ``ROUTE_ALERT`` *and* reverted the emitter
+        in the same diff -- the emitter would simply start creating rows again.
+        Assert the policy directly so the two cannot certify each other.
+        """
+        from app.alert_policy import ROUTE_ALERT, get_alert_event_policy
+
+        resume = get_alert_event_policy("deployment.auto_resume")
+        assert resume.route != ROUTE_ALERT, (
+            "a resume notice is a timeline event; making it durable re-opens "
+            "the 473-row accumulation this fix closed"
+        )
+        assert resume.action_required is False
+
+        flapping = get_alert_event_policy("deployment.flapping_resume")
+        assert flapping.route == ROUTE_ALERT, (
+            "flapping is the branch that must stay durable and action-required"
+        )
+        assert flapping.action_required is True
 
 
 # ---------------------------------------------------------------------------

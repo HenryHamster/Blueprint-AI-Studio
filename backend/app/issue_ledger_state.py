@@ -6,6 +6,8 @@ import hashlib
 import json
 from typing import Any
 
+from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
+
 
 ISSUE_LEDGER_MAX_RESOLVED = 30
 ISSUE_LEDGER_SCHEMA_VERSION = 1
@@ -87,6 +89,43 @@ def issue_ledger_complete_for_history(
         and normalized.get("complete") is True
         and tail is not None
         and normalized.get("through_entry_key") == _history_entry_key(tail)
+    )
+
+
+def issue_ledger_lineage_proof_unsatisfiable(
+    ledger: object, review_history: list | None
+) -> bool:
+    """Return whether no future review can ever restore this ledger's proof.
+
+    ``build_issue_ledger`` can only stamp ``complete=True`` when either the
+    durable seed was already complete and its ``through_entry_key`` is still
+    inside the retained window, or the seed carries no lineage marker at all
+    and the history is still under ``REVIEW_HISTORY_MAX_ENTRIES``.  Once a
+    ledger is stamped ``complete=False`` *with* a marker while the history is
+    at the cap, both branches are closed permanently: the seed can never
+    become complete again, the marker can never be dropped, and review history
+    only ever grows.  The ledger is latched.
+
+    That matters because the merge gate turns an unproven lineage into a
+    binding ``BP-ledger-proof-incomplete`` blocker.  A blocker no commit can
+    fix and no reviewer can refute is not a review finding -- it is an
+    unsatisfiable gate, and re-reviewing the PR against it is pure burn.  On
+    NeurIPS PR #1769 that cost 65 byte-identical APPROVE reviews across 78
+    attempts before an unrelated plateau heuristic stopped it, and the stop
+    was then recorded as agent ``semantic_nonconvergence`` -- blaming the fix
+    agent for a gate it could not satisfy.
+
+    Only the provably-permanent case returns True.  A markerless seed under
+    the cap self-heals on the next build and must keep retrying.
+    """
+    normalized = normalize_issue_ledger(ledger)
+    if normalized is None:
+        return False
+    history = [entry for entry in (review_history or []) if isinstance(entry, dict)]
+    return bool(
+        normalized.get("through_entry_key")
+        and normalized.get("complete") is not True
+        and len(history) >= REVIEW_HISTORY_MAX_ENTRIES
     )
 
 

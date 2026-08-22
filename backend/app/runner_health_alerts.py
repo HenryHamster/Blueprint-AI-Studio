@@ -58,6 +58,7 @@ def _fmt_duration_seconds(seconds: "float | int | None") -> str:
 # rebuilds the SAME key to find the open alert to dismiss.
 _RUNNER_DEACTIVATED_EVENT_TYPE = "runner.deactivated"
 _RUNNER_DEGRADED_EVENT_TYPE = "runner.degraded"
+_RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE = "runner.update_drain_stuck"
 
 # Escalation: re-notify at 1h if a runner-deactivated alert stays unresolved,
 # then again every 4h. Ephemeral in-memory tracking — clears on restart, which
@@ -79,6 +80,10 @@ def _runner_deactivated_dedupe_key(runner_id: "uuid.UUID | str") -> str:
 
 def _runner_degraded_dedupe_key(runner_id: "uuid.UUID | str") -> str:
     return f"{_RUNNER_DEGRADED_EVENT_TYPE}:{runner_id}"
+
+
+def _update_drain_stuck_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_UPDATE_DRAIN_STUCK_EVENT_TYPE}:{runner_id}"
 
 
 async def _maybe_create_runner_deactivated_alert(
@@ -364,6 +369,59 @@ async def _resolve_runner_deactivated_alert(
         if alert.dedupe_key:
             _runner_escalation_last_notified.pop(alert.dedupe_key, None)
             _runner_outage_escalated_keys.discard(alert.dedupe_key)
+    return len(open_alerts)
+
+
+async def _resolve_update_drain_stuck_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss the stuck-update-drain alert for a runner that left the drain.
+
+    The heartbeat handler raises one ``runner.update_drain_stuck`` WARNING per
+    drain episode and clears the episode markers (``update_draining_since`` /
+    ``update_drain_alerted_at``) the moment a heartbeat reports
+    ``update_draining=False``.  Until now it cleared only the markers: the
+    alert stayed open forever, still asserting "the self-update is failing
+    repeatedly" about a runner that had already self-updated and gone back to
+    claiming work (iconlab, 2026-08-20 -- the alert read 218 minutes stale
+    while the runner journal showed it healthy on the hinted SHA).  An alert
+    that cannot clear is not a weaker signal than one that spams; it is a
+    lying one, and it trains the operator to ignore the whole feed.
+
+    Mirrors :func:`_resolve_runner_deactivated_alert`: look the open alert up
+    by the deterministic ``dedupe_key`` the create path uses, stamp
+    ``dismissed_at``, commit, and broadcast one ``alert_dismissed`` so the
+    operator UI drops it without waiting for a poll.  Only open
+    (``dismissed_at IS NULL``) alerts are touched, so this is an idempotent
+    no-op when none exists -- which is the common case, because most drains
+    finish well inside the alert threshold.  Returns how many were dismissed.
+    Best-effort contract: the caller wraps this so a resolve failure never
+    aborts the heartbeat that triggered it.
+    """
+    dedupe_key = _update_drain_stuck_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
     return len(open_alerts)
 
 

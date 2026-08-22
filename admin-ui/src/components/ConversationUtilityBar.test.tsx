@@ -2,7 +2,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, test } from 'vitest';
 import type { StrategicStateTaskFocus, StrategicStateTaskFocusItem } from '../strategicStateApi';
-import type { ResidentActivityState } from '../utils/strategicSessionLive';
+import type { ResidentActivityState, StrategicChatLiveState } from '../utils/strategicSessionLive';
 import type { ProjectMessage } from '../types/messages';
 import {
   buildConversationWorkdayStatus,
@@ -92,7 +92,11 @@ function strategicMessage(
   } as ProjectMessage;
 }
 
-function renderBar(workdayStatus: ConversationWorkdayStatus) {
+function renderBar(
+  workdayStatus: ConversationWorkdayStatus,
+  chatLiveState?: StrategicChatLiveState,
+  interactionMode?: string,
+) {
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -105,6 +109,8 @@ function renderBar(workdayStatus: ConversationWorkdayStatus) {
         searchQuery=""
         onSearchChange={() => {}}
         workdayStatus={workdayStatus}
+        chatLiveState={chatLiveState}
+        interactionMode={interactionMode}
       />,
     );
   });
@@ -637,5 +643,71 @@ describe('ConversationUtilityBar Workday status', () => {
     const age = rendered.querySelector('[data-testid="conversation-workday-age"]');
 
     expect(age?.textContent).toBe('5m ago');
+  });
+
+  test('renders the live Chat turn in the same awareness slot instead of Workday off', () => {
+    const workdayStatus = buildConversationWorkdayStatus({ interactionMode: 'chat', residentActivity: null });
+    const rendered = renderBar(workdayStatus, {
+      phase: 'streaming',
+      label: 'Replying',
+      detail: 'grep release gate',
+    });
+    const line = rendered.querySelector('[data-testid="conversation-workday-status"]');
+
+    expect(line).toHaveTextContent('Replying');
+    expect(line).toHaveTextContent('grep release gate');
+    expect(line).not.toHaveTextContent('Workday off');
+    expect(line).toHaveAttribute('data-chat-live-phase', 'streaming');
+    expect(line).not.toHaveAttribute('data-workday-state');
+    expect(line).toHaveAttribute('aria-label', 'Strategic reply status');
+    expect(line?.className).not.toContain('hidden');
+  });
+
+  test('the Workday readout still owns the slot in continuous mode, even while a chat live state is non-null', () => {
+    // `computeStrategicChatLiveState` is non-null for exactly the lifecycles
+    // the Workday Resident runs under ('working'/'responding'), and App renders
+    // ONE MessagesPanel for both modes. Without the mode gate the operator sees
+    // a generic 'Working' chip instead of the Workday readout — losing
+    // data-workday-state, the compact/full label, the detail and the age stamp.
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    const workdayStatus = buildConversationWorkdayStatus({
+      interactionMode: 'continuous',
+      residentActivity: activity({
+        phase: 'executing',
+        durablePhase: 'working',
+        label: 'Working',
+        detail: 'Investigating the flaky vitest suite',
+        startMs: fiveMinutesAgo,
+      }),
+    });
+    const rendered = renderBar(
+      workdayStatus,
+      { phase: 'streaming', label: 'Replying', detail: 'grep release gate' },
+      'continuous',
+    );
+    const line = rendered.querySelector('[data-testid="conversation-workday-status"]');
+
+    expect(line).toHaveAttribute('data-workday-state', 'working');
+    expect(line).not.toHaveAttribute('data-chat-live-phase');
+    expect(line).not.toHaveAttribute('aria-label', 'Strategic reply status');
+    expect(line).toHaveTextContent('Workday working');
+    expect(line).toHaveTextContent('Investigating the flaky vitest suite');
+    expect(line).not.toHaveTextContent('Replying');
+    expect(line).not.toHaveTextContent('grep release gate');
+    expect(rendered.querySelector('[data-testid="conversation-workday-age"]')?.textContent).toBe('5m ago');
+  });
+
+  test('the chat affordance still owns the slot in chat mode when the mode is passed explicitly', () => {
+    const workdayStatus = buildConversationWorkdayStatus({ interactionMode: 'chat', residentActivity: null });
+    const rendered = renderBar(
+      workdayStatus,
+      { phase: 'streaming', label: 'Replying', detail: 'grep release gate' },
+      'chat',
+    );
+    const line = rendered.querySelector('[data-testid="conversation-workday-status"]');
+
+    expect(line).toHaveAttribute('data-chat-live-phase', 'streaming');
+    expect(line).toHaveTextContent('Replying');
+    expect(line).not.toHaveTextContent('Workday off');
   });
 });

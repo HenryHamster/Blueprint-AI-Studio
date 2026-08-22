@@ -1,5 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 // Proves the durable no-CI verify-gate safety net:
@@ -97,7 +97,11 @@ function parsedVerdict(): { detected: boolean; passed: boolean; setupFailed?: bo
 function driveExecFileAsync(resolverOut: string): void {
   vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
     if (cmd === 'git' && args.includes('--name-only')) return Promise.resolve('backend/app/ci_resolution.py\n');
-    if (cmd === 'python3' && args[0] === 'backend/testing/impacted_tests.py') return Promise.resolve(resolverOut);
+    if (cmd === 'python3' && args[0] === 'backend/testing/impacted_tests.py') {
+      const mandatoryIndex = args.indexOf('--mandatory-output');
+      writeFileSync(args[mandatoryIndex + 1], '');
+      return Promise.resolve(resolverOut);
+    }
     return Promise.resolve('');
   });
 }
@@ -151,6 +155,37 @@ describe('handleVerifyTests — bounded/fall-open safety net', () => {
     expect(lastPostedPayload().status).toBe('COMPLETED');
     expect(parsedVerdict().detected).toBe(true);
     expect(parsedVerdict().passed).toBe(true);
+  });
+
+  it('(2a) retains a matched surface sentinel past eight ordinary impacted selections', async () => {
+    const ordinary = Array.from(
+      { length: 8 },
+      (_, index) => `backend/testing/test_ordinary_${index + 1}.py`,
+    );
+    const sentinel = 'backend/testing/test_drift_sentinel.py';
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
+      if (cmd === 'git' && args.includes('--name-only')) return Promise.resolve('backend/app/ci_resolution.py\n');
+      if (cmd === 'python3' && args[0] === 'backend/testing/impacted_tests.py') {
+        const mandatoryIndex = args.indexOf('--mandatory-output');
+        expect(args).toContain('--limit');
+        expect(args[args.indexOf('--limit') + 1]).toBe('8');
+        expect(mandatoryIndex).toBeGreaterThan(-1);
+        writeFileSync(args[mandatoryIndex + 1], `${sentinel}\n`);
+        return Promise.resolve(`${ordinary.join('\n')}\n`);
+      }
+      return Promise.resolve('');
+    });
+    vi.mocked(detectTestRunners).mockReturnValue([BARE_PYTEST]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+
+    await handleVerifyTests('t2a', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const opts = vi.mocked(testFixLoop).mock.calls[0][8] as { runnersOverride?: Array<{ args: string[] }> };
+    expect(opts.runnersOverride?.[0].args).toEqual([
+      '-m', 'pytest',
+      ...ordinary.map(path => path.replace('backend/', '')),
+      sentinel.replace('backend/', ''),
+    ]);
   });
 
   it('(2b) an unbounded pytest runner with NO impacted files falls open — the suite never runs (no vacuous pass)', async () => {

@@ -2365,15 +2365,33 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
 
     created = 0
     from app.alert_dispatch import _maybe_create_strategic_cycle_liveness_alert
+    from app.strategic_trigger import (
+        ORIGIN_QUALIFICATION,
+        request_strategic_refresh,
+    )
 
     for project_id in candidate_ids:
         if project_id in recent_completions:
             continue
+        if _recent_no_delta_skip_at(candidate_visions.get(project_id), cutoff) is not None:
+            continue
+        # An alert is only the operator-facing symptom. Arm the durable
+        # coalesced refresh first so the next autonomous tick can recover the
+        # loop even when the alert already exists and is therefore deduped.
+        # The helper only flushes (the caller owns the transaction), and the
+        # deduped path below skips the alert write that would otherwise commit,
+        # so commit the marker here. Without this, the very case the refresh
+        # exists for -- a project whose alert is already open -- would have its
+        # marker rolled back by a later sweep and never recover the loop.
+        if await request_strategic_refresh(
+            session,
+            project_id,
+            reason="strategic_cycle_starvation",
+            origin=ORIGIN_QUALIFICATION,
+        ):
+            await session.commit()
         # Dedup: one open WARNING alert per project for this title.
         if project_id in projects_with_open_alert:
-            continue
-
-        if _recent_no_delta_skip_at(candidate_visions.get(project_id), cutoff) is not None:
             continue
         if await _maybe_create_strategic_cycle_liveness_alert(
             project_id,

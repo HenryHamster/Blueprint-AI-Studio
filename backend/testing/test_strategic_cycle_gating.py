@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import app.shared_state as _shared_state
 from app.autonomous_research import _spawn_research_task
 from app.models import (
     MessageType,
@@ -178,6 +179,50 @@ async def test_empty_delta_short_circuits_before_context_assembly(db_session, mo
     assert skips[0]["watermark"] is not None
     assert skips[0]["signals"]["new_merges"] == 0
     assert skips[0]["signals"]["new_user_messages"] == 0
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_overdue_project_is_not_skipped_by_the_no_delta_gate(
+    db_session, mocker
+):
+    """The caller's overdue backstop must survive the no-delta gate."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch.dict(
+        _shared_state.runtime_config, {"strategic_max_interval_minutes": 180}
+    )
+
+    project = _gate_project(name="Overdue Quiet Project")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _add_completed_cycle(
+        db_session, project.id, started_at=_utcnow() - timedelta(hours=4)
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Old strategic task",
+            payloads=[{"type": "strategic_review", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=_utcnow() - timedelta(hours=4),
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.await_count == 1
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_strategic_no_delta_skip_count") is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -223,18 +223,21 @@ def _run_backend_guard_with_baseline(
     current_exit_code: int,
     baseline_junit_text: str,
     baseline_exit_code: int,
+    selectors: tuple[str, ...] = ("testing/test_x.py",),
 ) -> dict[str, object]:
     repo = tmp_path / "repo"
     base_tree = tmp_path / "base"
     harness = base_tree / "scripts" / "test-backend.sh"
     route_helper = base_tree / "scripts" / "backend-test-route.sh"
-    selector = base_tree / "backend" / "testing" / "test_x.py"
     repo.mkdir()
-    current_selector = repo / "backend" / "testing" / "test_x.py"
-    current_selector.parent.mkdir(parents=True)
-    current_selector.write_text("def test_passes(): assert True\n", encoding="utf-8")
     harness.parent.mkdir(parents=True)
-    selector.parent.mkdir(parents=True)
+    for selected in selectors:
+        base_selector = base_tree / "backend" / selected
+        current_selector = repo / "backend" / selected
+        base_selector.parent.mkdir(parents=True, exist_ok=True)
+        current_selector.parent.mkdir(parents=True, exist_ok=True)
+        base_selector.write_text("def test_passes(): assert True\n", encoding="utf-8")
+        current_selector.write_text("def test_passes(): assert True\n", encoding="utf-8")
     harness.write_text(
         "cat > \"$BLUEPRINT_VERIFICATION_JUNIT\" <<'XML'\n"
         f"{baseline_junit_text}\n"
@@ -243,7 +246,6 @@ def _run_backend_guard_with_baseline(
         encoding="utf-8",
     )
     route_helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    selector.write_text("def test_passes(): assert True\n", encoding="utf-8")
 
     monkeypatch.setattr(
         backend_verification_guard, "_base_ref", lambda _repo, _base: "automain"
@@ -264,7 +266,7 @@ def _run_backend_guard_with_baseline(
             f"--current-exit-code={current_exit_code}",
             "--route=--sandbox-postgres",
             "--harness=scripts/test-backend.sh",
-            "testing/test_x.py",
+            *selectors,
         ]
     )
 
@@ -346,6 +348,88 @@ def test_backend_guard_accepts_exit_one_matching_baseline_failure(
     assert outcome["state"] == "preexisting_test_failure"
     assert outcome["blocking"] is False
     assert outcome["new_failures"] == {}
+
+
+def test_coverage_gaps_are_scoped_to_routes_that_carried_a_baseline_failure() -> None:
+    """A green baseline route may be renamed away; a failing one may not.
+
+    The coverage guard exists to stop a lane from retiring an INHERITED FAILURE
+    by dropping or skipping its route. Charging every baseline route would make
+    any ordinary test rename, deletion, or reparametrization a blocking
+    coverage_regression even when the baseline was entirely green.
+    """
+    from testing.fixgate_attribution import JUnitReport, test_route_coverage_gaps
+
+    green_baseline = JUnitReport(failures={}, test_routes={"t.py::test_old"})
+    renamed_current = JUnitReport(failures={}, test_routes={"t.py::test_new"})
+    assert test_route_coverage_gaps(renamed_current, green_baseline) == {}
+
+    failing_baseline = JUnitReport(
+        failures={"t.py::test_old": "inherited"},
+        test_routes={"t.py::test_old", "t.py::test_green"},
+    )
+    # The green sibling disappearing is not a gap; the failing route is.
+    assert test_route_coverage_gaps(
+        JUnitReport(failures={}, test_routes={"t.py::test_old"}), failing_baseline
+    ) == {}
+    gaps = test_route_coverage_gaps(renamed_current, failing_baseline)
+    assert set(gaps) == {"t.py::test_old"}
+    skipped = test_route_coverage_gaps(
+        JUnitReport(
+            failures={},
+            test_routes={"t.py::test_old"},
+            skipped_routes={"t.py::test_old"},
+        ),
+        failing_baseline,
+    )
+    assert set(skipped) == {"t.py::test_old"}
+
+
+@pytest.mark.parametrize(
+    "current_junit_text",
+    [
+        '<testsuite tests="1" failures="0"><testcase classname="testing.test_a" name="test_passes" /></testsuite>',
+        '<testsuite tests="2" failures="0" skipped="1">'
+        '<testcase classname="testing.test_a" name="test_passes" />'
+        '<testcase classname="testing.test_b" name="test_inherited">'
+        '<skipped message="selection regression" /></testcase></testsuite>',
+    ],
+)
+def test_backend_guard_blocks_partial_loss_of_baseline_test_route(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    current_junit_text: str,
+) -> None:
+    """A clean partial run cannot hide an inherited failure by dropping its route."""
+
+    outcome = _run_backend_guard_with_baseline(
+        tmp_path,
+        capsys,
+        monkeypatch,
+        current_junit_text=current_junit_text,
+        current_exit_code=0,
+        baseline_junit_text=(
+            '<testsuite tests="2" failures="1">'
+            '<testcase classname="testing.test_a" name="test_passes" />'
+            '<testcase classname="testing.test_b" name="test_inherited">'
+            '<failure message="inherited">inherited</failure>'
+            "</testcase></testsuite>"
+        ),
+        baseline_exit_code=1,
+        selectors=("testing/test_a.py", "testing/test_b.py"),
+    )
+
+    route = "backend/testing/test_b.py::test_inherited"
+    assert outcome["state"] == "coverage_regression"
+    assert outcome["blocking"] is True
+    assert set(outcome["coverage_failures"]) == {route}
+    assert outcome["new_failures"] == {
+        f"{route}::coverage": {
+            "detail": outcome["coverage_failures"][route],
+            "reason": "baseline test route coverage regressed",
+        }
+    }
 
 
 def _prepare_backend_verification_docker_harness(tmp_path: Path) -> tuple[Path, Path]:
@@ -1240,21 +1324,14 @@ def test_changed_harness_invocation_cannot_hide_base_corpus_failure(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert "changed static test harness made base corpus failure(s) disappear" in output
+    assert "changed static test harness runs against a failing base corpus" in output
     assert "[static guard] PASS" not in output
 
 
-@pytest.mark.parametrize(
-    ("current_state", "expected_reason"),
-    [
-        ("partial_preexisting", "failure(s) disappear"),
-        ("partial_skipped", "failure(s) become skipped"),
-    ],
-)
+@pytest.mark.parametrize("current_state", ["partial_preexisting", "partial_skipped"])
 def test_changed_harness_partial_invocation_cannot_hide_base_corpus_failure(
     tmp_path: Path,
     current_state: str,
-    expected_reason: str,
 ) -> None:
     """A retained old failure cannot conceal another omitted baseline failure."""
 
@@ -1298,7 +1375,7 @@ def test_changed_harness_partial_invocation_cannot_hide_base_corpus_failure(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert expected_reason in output
+    assert "changed static test harness runs against a failing base corpus" in output
     assert "[static guard] PASS" not in output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     assert len(calls) == 2
@@ -1363,8 +1440,8 @@ def test_deleted_node_in_unchanged_corpus_file_blocks_a_clean_current_run(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert "baseline failures disappeared" in output
-    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::failure" in output
+    assert "static corpus coverage regressed" in output
+    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::coverage" in output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     assert len(calls) == 2, _offender_detail(calls)
     assert calls[1].replace("base.xml", "current.xml") == calls[0]
@@ -1388,8 +1465,8 @@ def test_deleted_base_failing_corpus_test_blocks_a_clean_current_run(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert "baseline failures disappeared" in output
-    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::failure" in output
+    assert "static corpus coverage regressed" in output
+    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::coverage" in output
     assert "task-deleted-corpus-test-123" in output
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert len(calls) == 2, _offender_detail(calls)
@@ -1410,7 +1487,7 @@ def test_renamed_base_failing_corpus_test_blocks_a_clean_current_run(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::failure" in output
+    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::coverage" in output
 
 
 def test_skipped_base_failing_corpus_test_blocks_with_same_route_identity(
@@ -1430,8 +1507,8 @@ def test_skipped_base_failing_corpus_test_blocks_with_same_route_identity(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert "baseline failures became skipped" in output
-    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::failure" in output
+    assert "static corpus coverage regressed" in output
+    assert "scripts/test_preexisting_roster.py::test_roster_preexisting::coverage" in output
     assert len(call_log.read_text(encoding="utf-8").splitlines()) == 2
 
 
@@ -1489,7 +1566,7 @@ def test_deleted_node_with_surviving_failure_runs_full_baseline_and_blocks(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert "made base corpus failure(s) disappear" in output
+    assert "static corpus coverage regressed" in output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     assert len(calls) == 2, _offender_detail(calls)
     assert calls[1].replace("base.xml", "current.xml") == calls[0]
@@ -1594,7 +1671,7 @@ def test_changed_harness_cannot_hide_a_base_corpus_failure(tmp_path: Path) -> No
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert "changed static test roster made base corpus" in output
+    assert "changed static test roster runs against a failing base corpus" in output
 
 
 def test_baseline_scopes_to_current_failures_and_survives_roster_drift(
@@ -1770,10 +1847,10 @@ def test_collection_error_alongside_resolvable_failure_charges_only_the_new_one(
     assert "test_preexisting" not in new_line
 
 
-def test_static_lane_blocks_on_baseline_failure_disappeared(
+def test_static_lane_allows_an_unchanged_harness_to_resolve_baseline_debt(
     tmp_path: Path,
 ) -> None:
-    """A disappeared baseline failure blocks even with an UNCHANGED harness.
+    """Disappeared identities remain receipted but do not block by themselves.
 
     A failure whose selector cannot be derived forces an UNSCOPED baseline —
     the current tree fails on ``<collection>::conftest::error`` (empty
@@ -1782,12 +1859,9 @@ def test_static_lane_blocks_on_baseline_failure_disappeared(
     also exposes ``test_roster_preexisting`` and the ``test_collect_boom``
     collection error, neither of which the current tree reports at all.
 
-    Before this guard called the shared ``classify_verification`` classifier,
-    static_release_guard.py re-implemented the verdict and only treated a
-    disappeared/skipped baseline failure as blocking when ``harness_changed``
-    was true — so this exact scenario (harness untouched, two baseline
-    failures silently gone) used to pass clean. The other four verification
-    lanes block on disappearance unconditionally; the static lane must too.
+    The harness, inventory, and source remain unchanged. No independent
+    coverage or roster guard fires, so resolving an inherited failure is green
+    while the structured receipt still names every disappeared identity.
     """
     fake_bin, repo = _prepare_docker_attribution_repo(
         tmp_path, "collect_opaque", base_state="collect_base"
@@ -1798,13 +1872,13 @@ def test_static_lane_blocks_on_baseline_failure_disappeared(
     )
 
     output = result.stdout + result.stderr
-    assert result.returncode != 0, output
+    assert result.returncode == 0, output
     assert "unresolvable failure id(s)" in output
-    assert "made base corpus failure(s) disappear" in output
-    assert "[static guard] PASS" not in output
+    assert "[static guard] PASS" in output
     # The two failures that ARE identical to the baseline (the opaque
     # collection error and the ordinary preexisting failure) are still
-    # suppressed rather than charged as new — only the disappearance blocks.
+    # suppressed rather than charged as new, and unrelated vanished baseline
+    # identities are receipt evidence rather than synthetic new failures.
     assert "test_newly_introduced" not in output
     calls = [line.split("|", 1)[1] for line in call_log.read_text().splitlines()]
     baseline = [arg for arg in calls[1].split() if not arg.startswith("-")]

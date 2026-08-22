@@ -12,6 +12,7 @@ import tempfile
 import warnings
 from pathlib import Path
 from testing.fixgate_attribution import format_offender_marker
+from testing.identity_extraction import extract_python_test_ids
 
 BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
@@ -331,33 +332,18 @@ def _extract_valid_test_ids(filepath: Path) -> set:
 
     Recognises two forms:
     - Top-level async/sync functions named test_* → bare function name
-    - Methods named test_* inside a class named Test* → "ClassName::method"
+    - Methods named test_* on a collectable top-level class →
+      "ClassName::method", including methods inherited from module-local
+      bases (a unittest subclass reports them under its own name)
 
-    Only looks one level deep (module body → class body), matching pytest's
-    default collection behaviour.  Does not expand @pytest.mark.parametrize
-    variants — callers must strip the "[param]" suffix before lookup.
+    Only top-level classes are collection roots, matching pytest's default
+    behaviour.  Does not expand @pytest.mark.parametrize variants — callers
+    must strip the "[param]" suffix before lookup.
     """
     try:
-        tree = ast.parse(filepath.read_text(encoding="utf-8"))
+        return extract_python_test_ids(filepath.read_text(encoding="utf-8"))
     except (SyntaxError, OSError):
         return set()
-
-    valid_ids: set = set()
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            for item in node.body:
-                if (
-                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and item.name.startswith("test_")
-                ):
-                    valid_ids.add(f"{node.name}::{item.name}")
-        elif (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test_")
-        ):
-            valid_ids.add(node.name)
-
-    return valid_ids
 
 
 def test_durations_no_stale_entries() -> None:
@@ -470,7 +456,7 @@ def test_extract_valid_test_ids_async_methods_in_class() -> None:
 
 
 def test_extract_valid_test_ids_non_test_class_excluded() -> None:
-    """Methods in classes NOT named Test* are not collected."""
+    """Methods in plain, non-``TestCase`` classes are not collected."""
     p = _write_tmp_py(
         "class Helper:\n"
         "    def test_this_is_not_collected(self): pass\n"
@@ -479,6 +465,18 @@ def test_extract_valid_test_ids_non_test_class_excluded() -> None:
     )
     result = _extract_valid_test_ids(p)
     assert result == set()
+
+
+def test_extract_valid_test_ids_indirect_unittest_class() -> None:
+    """A module-local ``TestCase`` subclass is collectable despite its name."""
+    p = _write_tmp_py(
+        "import unittest\n"
+        "class BaseCase(unittest.TestCase): pass\n"
+        "class RunnerRegressionTests(BaseCase):\n"
+        "    def test_collected(self): pass\n"
+    )
+
+    assert _extract_valid_test_ids(p) == {"RunnerRegressionTests::test_collected"}
 
 
 def test_extract_valid_test_ids_mixed_module() -> None:

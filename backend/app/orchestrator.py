@@ -531,6 +531,7 @@ _last_zone_health_persist: datetime = _utcnow()
 _last_anomaly_state_persist: datetime = _utcnow()
 _last_anomaly_sweep: datetime = _utcnow()
 _last_strategic_spawn_drain: datetime | None = None
+_last_guard_suppression_election: datetime | None = None
 # C3: regression dispatch + EVALUATING-timeout recovery now run as dedicated
 # background tasks (lifecycle.py) on their own schedules. These two module
 # attributes are retained for back-compat (tests / metrics) but are no longer
@@ -1301,6 +1302,7 @@ async def orchestrator_worker():
     global _last_pool_refresh, _last_usage_meter_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
     global _last_strategic_spawn_drain
+    global _last_guard_suppression_election
     global \
         _last_orphan_check, \
         _last_post_commit_sweep, \
@@ -1467,6 +1469,28 @@ async def orchestrator_worker():
                         "[ORCHESTRATOR] Strategic deferred-spawn drain failed"
                     )
                 _last_strategic_spawn_drain = _utcnow()
+
+            # Guard-suppression chains elect their remediation owner here, not
+            # on the heartbeat that ingested the receipt. That heartbeat already
+            # holds the reporting Task row FOR UPDATE, so it cannot take the
+            # Project admission lock behind it without inverting the canonical
+            # Project -> Task order. This leader-owned bounded sweep is the only
+            # place a mature chain becomes queued work, and it is the place the
+            # project's pause/archive authority is honoured.
+            if _is_cadence_due(_last_guard_suppression_election, 300):
+                try:
+                    from app.module_finding_chain import (
+                        elect_guard_suppression_owners,
+                    )
+
+                    async with AsyncSessionLocal() as _guard_election_session:
+                        await elect_guard_suppression_owners(_guard_election_session)
+                        await _guard_election_session.commit()
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Guard-suppression owner election failed"
+                    )
+                _last_guard_suppression_election = _utcnow()
 
             # First-cycle awaits are the most common silent-hang site: connection
             # pool exhaustion, row-level locks from a previously OOM'd instance,

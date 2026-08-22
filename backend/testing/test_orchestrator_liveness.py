@@ -23,7 +23,7 @@ import app.orchestrator as _orch
 import app.orchestrator_liveness as _liv
 import app.shared_state as _ss
 from app.time_utils import _utcnow
-from app.models import Alert, StrategicCycle
+from app.models import Alert, Project, StrategicCycle
 from testing.factories import make_project
 
 
@@ -169,6 +169,12 @@ class TestStrategicLoopLiveness:
         monkeypatch.setattr("app.alert_dispatch.broadcast_to_project", record_broadcast)
         assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
 
+        await db_session.refresh(project)
+        refresh_marker = (project.vision or {}).get("_strategic_refresh")
+        assert refresh_marker is not None
+        assert refresh_marker["origin"] == "qualification"
+        assert refresh_marker["reason"] == "strategic_cycle_starvation"
+
         alert = (
             await db_session.execute(
                 select(Alert).where(
@@ -191,6 +197,71 @@ class TestStrategicLoopLiveness:
             )
         ]
 
+    async def test_deduped_alert_still_commits_the_strategic_refresh(
+        self, db_session
+    ):
+        """The refresh marker must survive when the alert is deduped away.
+
+        ``request_strategic_refresh`` only flushes, and the deduped path skips
+        the alert write that owns the commit. Without an explicit commit the
+        marker is discarded by the next sweep's rollback — precisely the case
+        the refresh exists for.
+        """
+        from app.models import AlertSeverity
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        project_id = project.id
+        db_session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=_STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                message="pre-existing open stall alert",
+                event_type="research.strategic_cycle_liveness",
+            )
+        )
+        await db_session.commit()
+
+        # Deduped: no new alert is created for this project.
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+
+        # Simulate the reaper's next sweep rolling back its own transaction:
+        # a committed marker survives, an uncommitted one would vanish.
+        await db_session.rollback()
+        vision = (
+            await db_session.execute(
+                select(Project.vision).where(Project.id == project_id)
+            )
+        ).scalars().one()
+        marker = (vision or {}).get("_strategic_refresh")
+        assert marker is not None
+        assert marker["reason"] == "strategic_cycle_starvation"
+        assert marker["origin"] == "qualification"
+        assert (
+            len(
+                (
+                    await db_session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                        )
+                    )
+                ).scalars().all()
+            )
+            == 1
+        )
+
     async def test_quiet_healthy_portfolio_does_not_raise_signal(self, db_session):
         """A recent intentional no-delta receipt is healthy idle, not a halt."""
         from app.reaper_sweeps import (
@@ -212,6 +283,8 @@ class TestStrategicLoopLiveness:
         await db_session.commit()
 
         assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+        await db_session.refresh(project)
+        assert (project.vision or {}).get("_strategic_refresh") is None
         assert not (
             await db_session.execute(
                 select(Alert).where(

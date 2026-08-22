@@ -637,8 +637,10 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
 #     "error while loading shared libraries: libatk-1.0.so.0",
 #     "No module named 'ruff'", "playwright is not installed",
 #     "command not found: <tool>"). No code edit can fix this.
-#   - A repo-wide gate fails on files your PR did not touch (baseline
-#     debt — pre-existing lint/test failures unrelated to your change).
+#
+# Named, structured baseline-attributed failures are publication-safe: let
+# ./pr open pass and publish the receipt. Do not use ./blocked for inherited
+# failures, new/unattributed failures, execution failures, or coverage gaps.
 #
 # Don't use for ordinary lint/test failures Claude can fix — keep
 # iterating with ./check instead. Don't use for "I don't know how to fix

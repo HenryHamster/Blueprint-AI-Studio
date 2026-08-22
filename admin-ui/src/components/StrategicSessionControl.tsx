@@ -2,7 +2,6 @@ import { AlertTriangle, Infinity as InfinityIcon, LoaderCircle, MessageSquare, P
 import type { LucideIcon } from 'lucide-react';
 import type { StrategicResidentRunnerOption } from '../strategicStateApi';
 import { WORKDAY_STATE_PRESENTATION, type ConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
-import type { StrategicChatLiveState } from '../utils/strategicSessionLive';
 
 export type StrategicInteractionMode = 'chat' | 'continuous';
 
@@ -17,15 +16,6 @@ export interface StrategicSessionControlProps {
   // label/detail; sessionState/sessionActive above are Start/Stop button
   // affordance inputs only, not a second display vocabulary.
   workdayStatus?: ConversationWorkdayStatus | null;
-  /**
-   * The in-flight Chat-turn affordance, derived by MessagesPanel from the same
-   * live transcript the conversation thread renders. This is deliberately NOT a
-   * ConversationWorkdayStatus: Workday's status vocabulary describes Continuous
-   * Resident autonomy (which is `off` in Chat mode and says nothing about a chat
-   * turn being in flight). Null when nothing is in flight, in which case Chat
-   * mode renders only the mode toggle, exactly as before.
-   */
-  chatLiveState?: StrategicChatLiveState | null;
   sessionBusy?: boolean;
   sessionRunners?: StrategicResidentRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
@@ -60,7 +50,6 @@ export function StrategicSessionControl({
   sessionActive = false,
   sessionState,
   workdayStatus,
-  chatLiveState,
   sessionBusy = false,
   sessionRunners,
   sessionSelectedRunnerId,
@@ -105,33 +94,14 @@ export function StrategicSessionControl({
               aria-label={`Switch Strategic mode to ${label}`}
               title={`Strategic mode: ${label}`}
               onClick={() => { if (!selected) onModeChange?.(value); }}
-              className={`${compact ? 'h-11 w-11 sm:h-7 sm:w-7' : 'min-h-9 px-2'} inline-flex items-center justify-center gap-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50 ${selected ? 'bg-workbench-panel text-neutral-100' : 'text-neutral-400 hover:bg-workbench-hover hover:text-neutral-100'}`}
+              className={`${compact ? 'min-h-11 shrink-0 whitespace-nowrap px-2 sm:min-h-7' : 'min-h-9 px-2'} inline-flex items-center justify-center gap-1.5 rounded text-xs font-semibold transition-colors disabled:opacity-50 ${selected ? 'bg-workbench-panel text-neutral-100' : 'text-neutral-400 hover:bg-workbench-hover hover:text-neutral-100'}`}
             >
               <Icon className="h-3.5 w-3.5" aria-hidden="true" />
-              <span className={compact ? 'sr-only' : undefined}>{label}</span>
+              <span>{label}</span>
             </button>
           );
         })}
       </div>
-
-      {selectedMode === 'chat' && chatLiveState && (
-        // Reuse the shared Workday PRESENTATION tokens (not its state
-        // vocabulary) so the two live affordances look like one system.
-        <span
-          className={`hidden min-h-7 min-w-0 max-w-64 items-center gap-1.5 rounded border px-2 text-xs sm:inline-flex ${WORKDAY_STATE_PRESENTATION.working.tone}`}
-          role="status"
-          aria-live="polite"
-          aria-label="Strategic reply status"
-          title={chatLiveState.detail ? `${chatLiveState.label} · ${chatLiveState.detail}` : chatLiveState.label}
-          data-testid="strategic-chat-live-status"
-          data-chat-live-phase={chatLiveState.phase}
-        >
-          <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-          <span className="truncate">
-            {chatLiveState.detail ? `${chatLiveState.label} · ${chatLiveState.detail}` : chatLiveState.label}
-          </span>
-        </span>
-      )}
 
       {selectedMode === 'continuous' && (
         <>

@@ -35,6 +35,7 @@ from testing.fixgate_attribution import (  # noqa: E402
     extract_base,
     is_attributable_pytest_result,
     parse_junit_report,
+    test_route_coverage_gaps,
 )
 
 
@@ -159,6 +160,29 @@ def main(argv: list[str] | None = None) -> int:
                 current_report=current_report,
                 baseline_report=baseline_report,
             )
+            coverage_failures = test_route_coverage_gaps(current_report, baseline_report)
+            if coverage_failures:
+                # Differential attribution intentionally permits an inherited
+                # failure to disappear.  Dropping or skipping the underlying
+                # test route is separate execution-scope evidence, so preserve
+                # it as a blocking structured identity rather than charging it
+                # to the inherited failure itself.
+                outcome = {
+                    **outcome,
+                    "state": "coverage_regression",
+                    "blocking": True,
+                    "new_failures": {
+                        **dict(outcome.get("new_failures", {})),
+                        **{
+                            f"{route}::coverage": {
+                                "detail": detail,
+                                "reason": "baseline test route coverage regressed",
+                            }
+                            for route, detail in coverage_failures.items()
+                        },
+                    },
+                    "coverage_failures": coverage_failures,
+                }
             outcome["current_failures"] = current_failures
             outcome["baseline_selectors"] = base_selectors
             outcome["current_exit_code"] = args.current_exit_code

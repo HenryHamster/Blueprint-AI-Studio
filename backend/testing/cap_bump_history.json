@@ -4619,10 +4619,18 @@
       ],
       "test_size_limits_checker.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-20T08:13:56.509948+00:00",
+          "commit_sha": "d01a835fc30b6987a0725dcc760f66a83be85c1f",
+          "commit_date": "2026-08-20T01:34:52-07:00",
           "old_cap": 1750,
           "new_cap": 2100
+        }
+      ],
+      "test_alert_dispatch.py": [
+        {
+          "commit_sha": "f16a67615618404e3db43fd258cf06c310bd3f65",
+          "commit_date": "2026-08-20T23:36:38-07:00",
+          "old_cap": 2750,
+          "new_cap": 3300
         }
       ]
     },
@@ -4633,6 +4641,12 @@
           "commit_date": "2026-08-19T21:32:27+00:00",
           "old_cap": 1750,
           "new_cap": 2400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-21T17:36:59.363825+00:00",
+          "old_cap": 2400,
+          "new_cap": 2850
         }
       ]
     }

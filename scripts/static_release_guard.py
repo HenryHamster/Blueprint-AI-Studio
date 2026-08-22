@@ -37,6 +37,7 @@ from testing.fixgate_attribution import (  # noqa: E402
     extract_base,
     is_attributable_pytest_result,
     parse_junit_report,
+    test_route_coverage_gaps,
 )
 from verification_receipt import (  # noqa: E402
     LANE_STATIC_CORPUS,
@@ -182,6 +183,25 @@ def _static_roster_changed(base_harness: Path, current_harness: Path) -> bool:
             return True
         fingerprints.append(source[start:end])
     return fingerprints[0] != fingerprints[1]
+
+
+def _static_coverage_failures(
+    current: JUnitReport,
+    baseline: JUnitReport,
+    *,
+    harness_changed: bool,
+    roster_changed: bool,
+) -> dict[str, str]:
+    """Return independent static-corpus coverage and harness protections."""
+
+    coverage = {
+        f"{route}::coverage": detail
+        for route, detail in test_route_coverage_gaps(current, baseline).items()
+    }
+    if harness_changed and baseline.failures:
+        subject = "changed static test roster" if roster_changed else "changed static test harness"
+        coverage["<harness>"] = f"{subject} runs against a failing base corpus"
+    return coverage
 
 
 def _standalone_corpus_inventory(repo: Path) -> set[str]:
@@ -516,33 +536,38 @@ def main(argv: list[str] | None = None) -> int:
                             )
                             disappeared = verification["disappeared_failures"]
                             skipped = verification["skipped_failures"]
-                            if harness_changed:
-                                reason = (
-                                    "changed static test roster"
-                                    if roster_changed
-                                    else "changed static test harness"
+                            new_failures.update(verification["new_failures"])
+                            coverage_failures = (
+                                _static_coverage_failures(
+                                    current_report,
+                                    baseline_report,
+                                    harness_changed=harness_changed,
+                                    roster_changed=roster_changed,
                                 )
-                                if disappeared or skipped or baseline_report.failures:
-                                    suffix = "become skipped" if skipped and not disappeared else "disappear"
-                                    new_failures["<harness>"] = (
-                                        f"{reason} made base corpus failure(s) {suffix}"
-                                    )
-                            else:
-                                for key, failure in {
-                                    **disappeared,
-                                    **skipped,
-                                }.items():
-                                    new_failures[key] = failure["detail"]
-                                if disappeared:
-                                    print(
-                                        "[static guard] baseline failures disappeared: "
-                                        f"{json.dumps(disappeared, sort_keys=True)}"
-                                    )
-                                if skipped:
-                                    print(
-                                        "[static guard] baseline failures became skipped: "
-                                        f"{json.dumps(skipped, sort_keys=True)}"
-                                    )
+                                if corpus_execution_changed
+                                else {}
+                            )
+                            new_failures.update(coverage_failures)
+                            if coverage_failures:
+                                print(
+                                    "[static guard] static corpus coverage regressed: "
+                                    f"{json.dumps(coverage_failures, sort_keys=True)}"
+                                )
+                            corpus_state = (
+                                "coverage_regression"
+                                if coverage_failures
+                                else str(verification["state"])
+                            )
+                            record_verification_lane(
+                                LANE_STATIC_CORPUS,
+                                state=corpus_state,
+                                blocking=bool(new_failures),
+                                new_failures=new_failures,
+                                suppressed_failures=verification.get("suppressed_failures"),
+                                disappeared_failures=disappeared,
+                                skipped_failures=skipped,
+                            )
+                            _record_suppressions(verification)
             else:
                 selectors, unresolved = _failed_selectors(current_junit, tree_root=repo)
                 corpus_execution_changed = (
@@ -639,31 +664,28 @@ def main(argv: list[str] | None = None) -> int:
                             new_failures = dict(outcome["new_failures"])
                             disappeared = outcome.get("disappeared_failures") or {}
                             skipped = outcome.get("skipped_failures") or {}
-                            hidden_by_harness: list[str] = []
-                            if disappeared:
-                                hidden_by_harness.append("disappear")
-                            if skipped:
-                                hidden_by_harness.append("become skipped")
-                            if hidden_by_harness and not new_failures:
-                                if harness_changed:
-                                    subject = (
-                                        "changed static test roster"
-                                        if roster_changed
-                                        else "changed static test harness"
-                                    )
-                                else:
-                                    subject = "this diff"
-                                new_failures["<harness>"] = (
-                                    f"{subject} made base corpus "
-                                    f"failure(s) {' or '.join(hidden_by_harness)}"
+                            coverage_failures = (
+                                _static_coverage_failures(
+                                    current_report,
+                                    baseline_report,
+                                    harness_changed=harness_changed,
+                                    roster_changed=roster_changed,
+                                )
+                                if corpus_execution_changed
+                                else {}
+                            )
+                            new_failures.update(coverage_failures)
+                            if coverage_failures:
+                                print(
+                                    "[static guard] static corpus coverage regressed: "
+                                    f"{json.dumps(coverage_failures, sort_keys=True)}"
                                 )
                             suppressed_failures = outcome.get("suppressed_failures") or {}
-                            if new_failures:
-                                corpus_state = "test_failure"
-                            elif suppressed_failures:
-                                corpus_state = "preexisting_test_failure"
-                            else:
-                                corpus_state = "passed"
+                            corpus_state = (
+                                "coverage_regression"
+                                if coverage_failures
+                                else str(outcome["state"])
+                            )
                             # Advisory: the receipt records what this lane
                             # relied on; it never decides the lane's verdict.
                             # `new_failures` is used rather than the raw

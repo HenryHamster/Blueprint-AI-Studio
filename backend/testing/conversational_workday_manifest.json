@@ -80,7 +80,7 @@
       "test_ids": [
         "test_workday_empty_result_retries_once_then_creates_terminal_failure"
       ],
-      "test_count": 12
+      "test_count": 14
     },
     {
       "path": "backend/testing/test_strategic_resident_continuous_liveness.py",
@@ -161,7 +161,7 @@
         "test_strategic_session_settings",
         "test_strategic_session_settings_persist_across_sync"
       ],
-      "test_count": 441
+      "test_count": 443
     },
     {
       "path": "backend/testing/test_agent_strategic_fetch.py",
@@ -173,7 +173,7 @@
         "test_strategic_create_message_note_type_not_grounded",
         "test_strategic_create_message_broadcasts_workbench_envelope"
       ],
-      "test_count": 138
+      "test_count": 139
     },
     {
       "path": "backend/testing/test_operator_workbench_contracts.py",
@@ -210,7 +210,7 @@
         "uses server availability when a Continuous session has no activity snapshot yet",
         "renders one bounded, server-derived status line with full detail in its title"
       ],
-      "test_count": 15
+      "test_count": 22
     },
     {
       "path": "admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx",
@@ -222,7 +222,7 @@
         "expanded search plus Workday status does not overflow at 375px",
         "requested and paused Workday remains truthful without hover at 375px"
       ],
-      "test_count": 6
+      "test_count": 7
     },
     {
       "path": "admin-ui/src/components/MessagesListView.viewport.test.tsx",
@@ -232,7 +232,7 @@
         "renders the server-owned Workday request receipt on the Fast acknowledgement",
         "renders the server-owned Fast-only receipt on a reply without a Workday request"
       ],
-      "test_count": 28
+      "test_count": 31
     },
     {
       "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
@@ -240,7 +240,7 @@
       "test_ids": [
         "root element carries data-testid=\"strategic-session-control\""
       ],
-      "test_count": 17
+      "test_count": 22
     },
     {
       "path": "admin-ui/src/components/StrategicSessionControl.viewport.test.tsx",
@@ -280,7 +280,7 @@
         "treats message / reasoning / kind-less as reply, activity kinds as not",
         "builds the bubble from reply-kind deltas only (activity noise excluded)"
       ],
-      "test_count": 29
+      "test_count": 37
     },
     {
       "path": "admin-ui/src/utils/pendingAttachmentStore.test.ts",
@@ -336,7 +336,7 @@
       "test_ids": [
         "test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ],
-      "test_count": 631
+      "test_count": 661
     },
     {
       "path": "agent/src/index.provider-runner.test.ts",
@@ -675,7 +675,7 @@
         "answers server fast-marked rows through the legacy Workday path when typed Fast is not activated",
         "rewinds and immediately repolls when the server advertises an older open-message floor"
       ],
-      "test_count": 126
+      "test_count": 127
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
@@ -694,7 +694,7 @@
       "test_ids": [
         "keeps chat Workday lifecycle wired to live session state and runner controls"
       ],
-      "test_count": 10
+      "test_count": 13
     },
     {
       "path": "admin-ui/src/components/StrategicContextRail.test.tsx",
@@ -723,9 +723,10 @@
         "hides the Workday activation trigger but shows its model-generated reply",
         "sends a queued tool revision with operator intent and preserves exact identity across automatic retry",
         "removing an unrelated artifact preserves the queued handoff operator intent",
-        "drains only one queued handoff and immediately shows the next after chip removal"
+        "drains only one queued handoff and immediately shows the next after chip removal",
+        "test_streaming_preview_renders_math_and_citations_like_the_durable_message"
       ],
-      "test_count": 64
+      "test_count": 76
     },
     {
       "path": "admin-ui/src/hooks/useConversation.test.tsx",
@@ -735,7 +736,7 @@
         "can acknowledge the same canonical message again on a recovery frame",
         "re-acknowledges an admitted replay after conversation navigation"
       ],
-      "test_count": 28
+      "test_count": 29
     },
     {
       "path": "admin-ui/src/components/MessagesPanel.advanced.test.tsx",
@@ -1048,7 +1049,7 @@
         "ignores absent or non-record effective policy payloads",
         "buildCompactionCheckpoint preserves effective policy authority and freshness rules"
       ],
-      "test_count": 290
+      "test_count": 297
     },
     {
       "path": "admin-ui/src/hooks/useStrategicLiveness.test.tsx",
@@ -1083,7 +1084,7 @@
         "test_classify_orphan_resident_session_exempt_from_progress_staleness",
         "test_classify_resident_session_warm_idle_not_reaped"
       ],
-      "test_count": 472
+      "test_count": 484
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",

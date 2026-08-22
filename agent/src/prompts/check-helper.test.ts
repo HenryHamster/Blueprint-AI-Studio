@@ -167,14 +167,12 @@ describe('writeCheckHelper — direct invocation', () => {
     // The admin-ui typecheck runs on the agent VM (safe, no OOM); vite bundle
     // is deferred to CI where it has room to breathe. The build half goes
     // through the shared base-attribution guard rather than a raw whole-project
-    // compile, so an inherited type error isn't blamed on this task; the
-    // test-file half keeps its shrink-only baseline gate.
+    // compile, so an inherited type error isn't blamed on this task. That guard
+    // also compiles the test-file project against the same base ref.
     expect(script).toContain(
       'run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"',
     );
-    expect(script).toContain(
-      'run "admin-ui typecheck (test files)" bash -c \'cd admin-ui && node scripts/typecheck-tests-baseline.mjs 2>&1\'',
-    );
+    expect(script).not.toContain('run "admin-ui typecheck (test files)"');
     expect(script).not.toContain('npm run typecheck 2>&1'); // no unattributed compile
     expect(script).not.toContain('npm run build 2>&1'); // no vite build on agent VM
     // The agent suite remains always-on, but its result now comes from the
@@ -232,6 +230,23 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).not.toContain('( cd admin-ui && [ -d node_modules ] || npm ci )');
     expect(script).not.toContain('( cd agent && [ -d node_modules ] || npm ci )');
   }, 15_000);
+
+  it('generated ./check guidance publishes named inherited failures but blocks un-attributed failures', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-guidance-attribution',
+      workBranch: 'blueprint/check-guidance-attribution',
+      baseBranch: 'main',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    const generated = capturedScripts['/tmp/workspace/.check-task'];
+    expect(generated).toContain('named, structured failures confirmed inherited on the');
+    expect(generated).toContain('publish through ./pr open with their verification receipt');
+    expect(generated).toContain('New or unattributed failures, execution/attribution failures');
+    expect(generated).toContain('explicit\n# coverage failures stay non-zero and block ./pr open');
+  });
 
   it('routes the admin-ui viewport lane through the attributed verification guard', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
@@ -1191,7 +1206,8 @@ fi
 if [ "$1" = "backend/testing/impacted_tests.py" ]; then
   # Match the real resolver's stdin contract. Exiting before the producer has
   # drained is racy under pipefail and can make printf report SIGPIPE (141).
-  cat >/dev/null
+  changed=$(cat)
+  case "$changed" in *backend/testing/test_bar.py*) echo backend/testing/test_bar.py ;; esac
   echo backend/testing/test_x.py
   exit 0
 fi
@@ -1832,7 +1848,8 @@ esac
 // The required backend verification fragment resolves the impacted selectors
 // and runs them once through the sanctioned Postgres harness plus the shared
 // baseline attributor. This keeps inherited failures publishable while keeping
-// introduced, disappeared, skipped, or unavailable verification states blocking.
+// introduced or unavailable verification states blocking; independent coverage
+// checks reject an all-skipped selected run.
 describe('writeCheckHelper — attributed backend verification', () => {
   let capturedScripts: Record<string, string> = {};
 
@@ -1880,7 +1897,8 @@ describe('writeCheckHelper — attributed backend verification', () => {
     expect(script).not.toContain('IMPACTED_TEST_CAP=8');
     expect(script).not.toContain('FAILED+=("impacted-test gate")');
     expect(script).not.toContain('scripts/test-backend.sh --postgres $_it_run');
-    expect(script).toContain('preexisting_test_failure');
+    expect(script).toContain('get("blocking", True)');
+    expect(script).not.toContain('"preexisting_test_failure" ]; then');
   });
 
   it('the attributed backend verification always fires for the self-repo (no constant-false guard)', async () => {
@@ -2222,29 +2240,23 @@ describe('writeCheckHelper — attributed typecheck lanes', () => {
     // detector can still say no.
     expect(laneIsUnconditional(gate, 'run "agent tsc (attributed)"')).toBe(true);
     expect(laneIsUnconditional(gate, 'run "admin-ui typecheck (attributed)"')).toBe(true);
-    expect(laneIsUnconditional(gate, 'run "admin-ui typecheck (test files)"')).toBe(true);
+    expect(gate).not.toContain('run "admin-ui typecheck (test files)"');
     expect(laneIsUnconditional(gate, 'run "agent vitest (attributed)"')).toBe(false);
     expect(laneIsUnconditional(gate, 'run "admin-ui vitest (attributed)"')).toBe(false);
   });
 
-  // The attributed build lane and the shrink-only test-file baseline are two
-  // different guarantees and BOTH stay armed: the guard compares the build
-  // program against an isolated base checkout (so inherited type errors are
-  // attributed, not blamed), while the baseline snapshot keeps the test-file
-  // program from growing new errors. Retiring either silently widens what a
-  // green ./check permits.
-  it('keeps the shrink-only admin-ui test-typecheck baseline alongside the attributed lane', async () => {
+  it('uses the attributed admin-ui test typecheck lane without a committed snapshot', async () => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realPath = await vi.importActual<typeof import('node:path')>('node:path');
     const root = realPath.resolve(process.cwd(), '..');
 
-    expect(realFs.existsSync(realPath.join(root, 'admin-ui/scripts/typecheck-tests-baseline.mjs'))).toBe(true);
-    expect(realFs.existsSync(realPath.join(root, 'admin-ui/tsconfig.test.baseline.json'))).toBe(true);
+    expect(realFs.existsSync(realPath.join(root, 'admin-ui/scripts/typecheck-tests-baseline.mjs'))).toBe(false);
+    expect(realFs.existsSync(realPath.join(root, 'admin-ui/tsconfig.test.baseline.json'))).toBe(false);
 
     const pkg = JSON.parse(
       realFs.readFileSync(realPath.join(root, 'admin-ui/package.json'), 'utf8'),
     ) as { scripts: Record<string, string> };
-    expect(pkg.scripts.typecheck).toBe('tsc -b --noEmit && node scripts/typecheck-tests-baseline.mjs');
+    expect(pkg.scripts.typecheck).toBe('tsc -b --noEmit');
 
     const defaultGate = realFs.readFileSync(
       realPath.join(root, 'scripts/check-default.sh'),
@@ -2253,7 +2265,8 @@ describe('writeCheckHelper — attributed typecheck lanes', () => {
     expect(defaultGate).toContain(
       'run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui',
     );
-    expect(defaultGate).toContain('node scripts/typecheck-tests-baseline.mjs');
+    expect(defaultGate).not.toContain('typecheck-tests-baseline');
+    expect(defaultGate).not.toContain('typecheck (test files)');
   });
 });
 

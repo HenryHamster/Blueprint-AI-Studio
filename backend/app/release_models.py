@@ -1199,7 +1199,7 @@ class AuditFindingResolution(SQLModel, table=True):
 
 
 class ModuleFindingChain(SQLModel, table=True):
-    """Project-lifetime ledger of resolved review concerns recurring by module."""
+    """Project-lifetime ledger of recurring review and guard concerns."""
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(
@@ -1241,6 +1241,39 @@ class ModuleFindingChain(SQLModel, table=True):
     file_provenance: str = Field(
         default="unverified",
         sa_column=Column(String(16), nullable=False, server_default="unverified"),
+    )
+    # ``review`` rows retain the historical behaviour above. ``guard_suppression``
+    # rows are keyed by an exact structured lane/FailureIdentity, never prose.
+    chain_kind: str = Field(
+        default="review",
+        sa_column=Column(String(32), nullable=False, server_default="review"),
+    )
+    suppression_lane: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    failure_identity: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    # Bounded task UUID provenance provides exact-task idempotency without a
+    # parallel evidence table. It is deliberately not derived from receipt history.
+    source_task_ids: list[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    remediation_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(), ForeignKey("task.id", ondelete="SET NULL"), nullable=True, index=True
+        ),
+    )
+    resolved_by_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(), ForeignKey("task.id", ondelete="SET NULL"), nullable=True
+        ),
+    )
+    resolved_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
     )
 
     __table_args__ = (

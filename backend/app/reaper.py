@@ -445,7 +445,10 @@ async def reaper_service():
         get_task_llm_account_id,
         release_max_plan_account,
     )
-    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.alert_dispatch import (
+        _maybe_create_failure_alert,
+        sweep_resolve_terminal_task_alerts,
+    )
     from app.routers.agent_status import record_task_result
     from app.broadcast import broadcast_to_project
 
@@ -2958,6 +2961,23 @@ async def reaper_service():
                     await sweep_unblock_blocked_tasks(session, now)
                 except Exception as e:
                     logger.error(f"[REAPER] Unblock sweep error: {e}", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12-b: Retire "task is stuck" alerts whose task has since
+                # gone terminal. Step 12 above resolves the escalation alert on
+                # the *resume* path; nothing resolved any of them when the task
+                # simply ended, which is where almost all of them end up. This
+                # is condition-derived (it re-reads the task's status) so no
+                # termination path can forget to call it.
+                _mark_reaper_progress()
+                try:
+                    await sweep_resolve_terminal_task_alerts(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Terminal task-alert reconcile error: {e}",
+                        exc_info=True,
+                    )
                     with contextlib.suppress(Exception):
                         await session.rollback()
 

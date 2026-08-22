@@ -5,6 +5,7 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.alert_policy import create_project_alert_if_allowed
 from app.broadcast import broadcast_to_project
 from app.models import Alert, AlertSeverity, Project
 import app.shared_state as _shared_state
@@ -233,16 +234,49 @@ async def _create_auto_resume_alerts(
     flapping: bool = False,
     recent_resume_count: int = 0,
 ) -> None:
-    """Create INFO or ERROR alerts when the pipeline auto-resumes."""
+    """Announce an auto-resume, letting alert policy decide what stays durable.
+
+    Both branches used to construct ``Alert(...)`` directly, once per project,
+    with no dedupe key and nothing that would ever dismiss them. A resume is a
+    point-in-time event rather than a standing condition, so no
+    condition-derived sweep could retire them either: measured on the live feed
+    2026-08-21, ``deployment.auto_resume`` accounted for 473 of the 1000 most
+    recent open alerts -- 77 bursts of one row per project over 16 days, every
+    one of them a notice that its own creation had already made obsolete, and
+    not one of them dismissed. That 473 is a floor, not a total: the endpoint
+    caps at 1000 and returned 1000 open rows. Counting the 30 open
+    ``deployment.flapping_resume`` rows with it, this one function is over half
+    the visible operator feed.
+
+    Alert policy already said as much. ``deployment.auto_resume`` carries
+    ``route=ROUTE_TIMELINE`` -- "timeline notice, not a durable alert row" --
+    and the emitter simply never asked. Routing through
+    :func:`create_project_alert_if_allowed` makes the policy authoritative and
+    splits the two branches on their own merits:
+
+    * a non-flapping resume (INFO, ``route=ROUTE_TIMELINE``) creates nothing
+      durable. Dismissing the paired pause WARNING was always the part that
+      carried operator signal, and that still happens.
+    * a flapping resume (ERROR, default ``route=ROUTE_ALERT``) stays durable
+      and action-required, but a per-project ``dedupe_key`` now collapses
+      repeats onto one row with a climbing ``occurrence_count`` instead of
+      minting a fresh row per event.
+
+    ``_create_halted_recovery_alerts`` in ``alert_dispatch`` already does
+    exactly this for the ``deployment.halted`` / ``deployment.halted_recovered``
+    pair. This brings the resume path in line with it.
+    """
     pause_title = "Pipeline auto-paused: external dependencies down"
     if flapping:
         resume_title = (
             "Pipeline auto-resumed (FLAPPING): rapid pause/resume cycles detected."
         )
         severity = AlertSeverity.ERROR
+        event_type = "deployment.flapping_resume"
     else:
         resume_title = "Pipeline auto-resumed: all external dependencies healthy."
         severity = AlertSeverity.INFO
+        event_type = "deployment.auto_resume"
     now = _utcnow()
     project_ids = (
         await session.execute(select(Project.id).limit(10000))
@@ -270,15 +304,42 @@ async def _create_auto_resume_alerts(
     for warning in all_existing_warnings:
         warning.dismissed_at = now
         session.add(warning)
+    # Retire the pre-dedupe backlog of this same family. Rows minted by the old
+    # emitter carry no dedupe_key, so the upsert below can neither find nor
+    # supersede them and they would stay open forever. Deliberately scoped to
+    # the family being emitted: a clean resume must never clear a standing
+    # FLAPPING alert, because one healthy resume does not refute the pattern
+    # that alert is reporting.
+    superseded_notices = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.event_type == event_type,
+                    Alert.dedupe_key.is_(None),
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for superseded in superseded_notices:
+        superseded.dismissed_at = now
+        session.add(superseded)
     for project_id in project_ids:
-        alert = Alert(
+        alert, _created, _decision = await create_project_alert_if_allowed(
+            session,
             project_id=project_id,
+            event_type=event_type,
             severity=severity,
             title=resume_title,
             message=resume_title,
-            event_type="deployment.flapping_resume" if flapping else "deployment.auto_resume",
+            source="deploy_health_alerts",
+            dedupe_key=f"{event_type}:{project_id}",
         )
-        session.add(alert)
+        if alert is None:
+            continue
         await broadcast_to_project(
             str(project_id),
             "alert_created",

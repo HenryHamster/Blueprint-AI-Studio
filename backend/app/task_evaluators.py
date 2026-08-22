@@ -1019,10 +1019,55 @@ def _parse_artifact_json(artifact_text: str | None) -> dict | None:
 
 # Fields that are always present in a COMPUTE_RESULT but are NOT
 # experiment-emitted metric keys (they are operational/job-level fields).
+#
+# Every one of these is written unconditionally by ``build_compute_result_logs``
+# (app/compute_jobs.py) from the ComputeJob row itself — describing the job, not
+# anything the experiment command measured. Listing them as "keys the command
+# emitted" is a misattribution that sends the reader hunting for a metric-naming
+# bug that is not there, so they are filtered out of the diagnostic below.
+#
+# That builder is the authority for this set, and the two used to drift because
+# nothing held them together: the builder writes 14 job-level keys, this filter
+# knew 8 of them. ``test_build_compute_result_logs_job_level_keys_stay_filtered``
+# in testing/test_compute.py now fails when a new job-level key is added there
+# without being added here.
 _COMPUTE_RESULT_NON_METRIC_KEYS: frozenset[str] = (
     _RESERVED_COMPUTE_RESULT_KEYS
-    | frozenset({"outcome", "status", "job_id", "intentional_terminal"})
+    | frozenset(
+        {
+            "outcome",
+            "status",
+            "job_id",
+            "intentional_terminal",
+            "backend",
+            "machine_type",
+            "killed_by",
+            "terminal_reason",
+            "result_reference",
+            "command_log_text",
+            "command_log_truncated",
+        }
+    )
 )
+
+
+def _describe_compute_termination(obj: dict) -> str:
+    """Trailing clause naming how the job ended, when the artifact says so.
+
+    ``killed_by`` and ``terminal_reason`` are filtered out of ``emitted_keys``
+    because they are job-level fields rather than experiment metrics, but they
+    are also the two fields that answer *why nothing was measured*. Dropping them
+    silently would trade a misleading diagnostic for an uninformative one, so
+    they come back here as a reason rather than as a fake metric name.
+    """
+    parts = []
+    for key in ("killed_by", "terminal_reason"):
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}={value.strip()[:160]!r}")
+    if not parts:
+        return ""
+    return "; " + ", ".join(parts)
 
 
 def describe_emitted_compute_metric_keys(artifact_text: str | None) -> str:
@@ -1038,14 +1083,34 @@ def describe_emitted_compute_metric_keys(artifact_text: str | None) -> str:
       a traceback with no terminal JSON block).
     * result parsed but declared key absent → command completed, wrote a result,
       but the metric name differs (case mismatch, typo) or was never written.
+
+    Only keys the *command* contributed are reported. The backend writes a dozen
+    job-level fields into the same object; counting those as emitted metrics
+    turns the empty case — which is the common one — into a false "the name must
+    be wrong" claim, complete with a list of key names to go compare against.
     """
     obj = _parse_artifact_json(artifact_text)
     if obj is None:
         return "no COMPUTE_RESULT parsed — experiment likely crashed before emitting result"
     emitted = sorted(k for k in obj if k not in _COMPUTE_RESULT_NON_METRIC_KEYS)
+    termination = _describe_compute_termination(obj)
     if not emitted:
-        return "emitted_keys=[] (command wrote no experiment metrics to COMPUTE_RESULT)"
-    return f"emitted_keys={emitted!r} (declared key absent — possible case/name mismatch)"
+        # Whether a command log was captured separates "the command ran and
+        # printed nothing measurable" from "nothing of the command reached us at
+        # all" — different first questions for whoever picks this up.
+        log_note = (
+            "its command log was captured but held no metrics"
+            if "command_log_text" in obj
+            else "no command output was captured either"
+        )
+        return (
+            "emitted_keys=[] (command wrote no experiment metrics to "
+            f"COMPUTE_RESULT; {log_note}){termination}"
+        )
+    return (
+        f"emitted_keys={emitted!r} (declared key absent — possible case/name "
+        f"mismatch){termination}"
+    )
 
 
 # ---------------------------------------------------------------------------

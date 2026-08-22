@@ -346,13 +346,17 @@ async def _apply_ci_merged_landed_signal(
     )
     if landed:
         try:
-            from app.module_finding_chain import record_merged_pr_finding_chains
+            from app.module_finding_chain import (
+                record_merged_pr_finding_chains,
+                resolve_landed_guard_suppression_remediation,
+            )
 
             await record_merged_pr_finding_chains(
                 ci_task,
                 session,
                 pr_number=review_loop.get("pr_number"),
             )
+            await resolve_landed_guard_suppression_remediation(ci_task, session)
         except Exception:
             logger.warning(
                 "[CI MONITOR] module-finding-chain recording failed for task %s",

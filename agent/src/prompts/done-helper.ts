@@ -18,21 +18,23 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 # wrapper exits cleanly without re-doing commit/push.
 #
 # Usage:
-#   ./done                                     # standard: ./check must pass
-#   ./done --warn-out-of-scope "<reason>"      # judgment-call escape hatch:
-#       ship despite ./check failures when those failures are PRE-EXISTING
-#       on origin/${cfg.baseBranch} and out of scope for this PR. Posts a FEEDBACK
-#       project message describing the pre-existing issues + your reason
+#   ./done                                     # standard: ./pr open already passed ./check
+#                                              # and records named inherited failures
+#                                              # in the verification receipt
+#   ./done --warn-out-of-scope "<reason>"      # report an explicitly
+#       out-of-scope pre-existing issue in an edited file after ./pr open
+#       passes. Posts a FEEDBACK project message describing the issue + reason
 #       so strategic/operators can spawn cleanup work later. The reason
 #       text MUST name the specific gate(s) and file(s) that failed and
 #       explain why fixing them is out of scope for this change (i.e.
 #       the failure already existed on the base branch and remediating
 #       it would require unrelated work beyond this task's diff).
 #
-#       USE ./blocked INSTEAD when the failure requires introducing a
-#       new bug or precondition (missing package, infra gap, agent
-#       can't even start the work). --warn-out-of-scope is for issues
-#       that already existed on the base branch BEFORE this PR.
+#       Named, structured baseline-attributed failures do not need this flag:
+#       ./pr open may publish them with its receipt. Do not use this flag to
+#       waive new, unattributed, execution, or explicit coverage failures;
+#       those must remain blocked by ./pr open. Use ./blocked only for a
+#       genuine missing precondition or toolchain/system failure.
 #
 #   ./done --already-done "<reason>"           # no-op / already-satisfied exit:
 #       AFFIRMATIVELY signal that the task's deliverable ALREADY EXISTS on
@@ -421,9 +423,10 @@ if [ -n "$WARN_OUT_OF_SCOPE_REASON" ]; then
   WARN_MSG="[shipped via ./done --warn-out-of-scope by task ${cfg.taskId}]
 PR: $PR_URL
 
-The agent shipped this diff despite ./check failures, asserting that
-the failures are pre-existing on origin/${cfg.baseBranch} and out of
-scope for this PR. Reason given:
+The agent shipped this diff after ./pr open's verification gate, reporting
+an explicitly out-of-scope pre-existing issue in an edited file. Named,
+structured baseline-attributed failures are already recorded in the PR's
+verification receipt and do not require this flag. Reason given:
 
 $WARN_OUT_OF_SCOPE_REASON
 

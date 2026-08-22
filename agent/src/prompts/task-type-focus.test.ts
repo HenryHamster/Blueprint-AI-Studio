@@ -251,6 +251,14 @@ describe('FIX_TASK_FOCUS — content invariants', () => {
       const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
       expect(FIX_TASK_FOCUS).toContain('stranded');
     });
+
+    it('publishes attributed baseline debt while keeping new failures blocking', async () => {
+      const { FIX_TASK_FOCUS } = await import('./task-type-focus.js');
+      expect(FIX_TASK_FOCUS).toContain('baseline-attributed');
+      expect(FIX_TASK_FOCUS).toContain('verification receipt');
+      expect(FIX_TASK_FOCUS).toContain('new, unattributed');
+      expect(FIX_TASK_FOCUS).not.toContain('repo-wide gate failure on files you did not touch');
+    });
   });
 });
 

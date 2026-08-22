@@ -11,10 +11,17 @@ from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
 from app.issue_ledger import (
     build_issue_ledger,
     issue_ledger_complete_for_history,
+    issue_ledger_lineage_proof_unsatisfiable,
 )
 from app.models import Task, _utcnow
+from app.review_loop_convergence import REVIEW_LOOP_ABANDON_CANDIDATE_KEY
 
 logger = logging.getLogger(__name__)
+
+# The synthetic blocker raised when the durable ledger cannot prove it covers
+# every review row.  Unlike every other entry in the open set it describes the
+# bookkeeping, not the diff, so no commit fixes it and no reviewer refutes it.
+LEDGER_PROOF_INCOMPLETE_ISSUE_ID = "BP-ledger-proof-incomplete"
 
 
 def review_target_matches_merge_identity(
@@ -70,7 +77,7 @@ async def _enforce_authoritative_review_merge_gate(
     if not ledger_proof_complete and len(history) >= REVIEW_HISTORY_MAX_ENTRIES:
         ledger["open"].append(
             {
-                "issue_id": "BP-ledger-proof-incomplete",
+                "issue_id": LEDGER_PROOF_INCOMPLETE_ISSUE_ID,
                 "severity": "major",
                 "description": "durable blocker ledger missing after history compaction",
             }
@@ -163,6 +170,63 @@ async def _enforce_authoritative_review_merge_gate(
         )
     task.context = {**source_context, "review_loop": gated_loop}
     flag_modified(task, "context")
+
+    # A latched ledger cannot be argued with.  Once the durable proof is
+    # unsatisfiable (see ``issue_ledger_lineage_proof_unsatisfiable``) the
+    # synthetic ``BP-ledger-proof-incomplete`` blocker is re-minted on every
+    # single pass, so spawning another exact-target review buys nothing: the
+    # reviewer verifies the same clean delta, returns the same verdict, and the
+    # gate refuses it again.  Hand the PR to an operator instead of burning
+    # review budget against a gate that no review can satisfy, and record the
+    # true reason so the stop is not later misread as the fix agent failing to
+    # converge.  Fail-closed is unchanged -- nothing merges here either way.
+    lineage_unsatisfiable = issue_ledger_lineage_proof_unsatisfiable(
+        ledger, history
+    )
+    if lineage_unsatisfiable:
+        gated_loop["ledger_lineage_unsatisfiable"] = True
+        task.context = {
+            **source_context,
+            "review_loop": gated_loop,
+            REVIEW_LOOP_ABANDON_CANDIDATE_KEY: {
+                "status": "abandon_candidate",
+                "reason": "ledger_lineage_unsatisfiable",
+                "scope": "ledger-proof",
+                "pr_number": pr_number,
+                "detail": (
+                    "The durable issue ledger is stamped complete=false with a "
+                    "lineage marker while the retained review history is at its "
+                    "cap, so build_issue_ledger can never restore the proof and "
+                    f"{LEDGER_PROOF_INCOMPLETE_ISSUE_ID} is re-raised on every "
+                    "merge-gate pass. No commit fixes it and no review refutes "
+                    "it; an operator must adjudicate the ledger."
+                ),
+                "open_issue_ids": [
+                    str(blocker.get("issue_id") or "")
+                    for blocker in open_blockers
+                    if isinstance(blocker, dict)
+                ],
+                "review_history_entries": len(history),
+                "recorded_at": _utcnow().isoformat(),
+            },
+        }
+        flag_modified(task, "context")
+        task.latest_status_message = (
+            f"Merge held for PR #{pr_number}: the durable issue ledger can no "
+            "longer prove it covers every review row, so no review can clear "
+            "the gate. Operator adjudication required."
+        )
+        session.add(task)
+        logger.error(
+            "[CI] Merge permanently held for PR #%s: issue-ledger lineage proof "
+            "is unsatisfiable (%d retained review rows, %d open blocker(s)); "
+            "suppressed the exact-target review respawn and escalated to "
+            "operator adjudication",
+            pr_number,
+            len(history),
+            len(open_blockers),
+        )
+        return False
 
     review_task_id = ""
     if target_identity_is_exact:

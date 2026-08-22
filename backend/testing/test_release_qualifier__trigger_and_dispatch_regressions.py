@@ -423,3 +423,196 @@ async def test_head_marker_failure_degrades_to_legacy_fire(db_session, mocker):
         version.id, session_factory=_shared_session_factory(db_session)
     ) is True
     run_mock.assert_awaited_once()
+
+
+def _rejected_gate(owner, repo, head, outcome="rejected"):
+    """A terminal dispatch rejection verdict for ``head``."""
+    detail = (
+        "workflow is unavailable to this GitHub authority"
+        if outcome == "rejected_permanent_404"
+        else "GitHub denied this dispatch authority"
+    )
+    return {
+        "gate_state": "dispatch_rejected",
+        "head_sha": head,
+        "reason": f"ci.yml dispatch was terminally rejected: {detail}",
+        "dispatch_outcome": outcome,
+        "dispatch_retryable": False,
+        "dispatch_suppression_key": (
+            f"{owner}/{repo}:ci.yml:automain:{head}"
+        ),
+        "dispatch_ref": "automain",
+        "dispatch_workflow_file": "ci.yml",
+    }
+
+
+async def _dispatch_rejected_alerts(db_session, project_id):
+    """Every open dispatch-rejected drift-sentinel alert, as plain rows.
+
+    Column-level (not entity-level) so nothing here depends on the identity
+    map's post-commit expiry state — an expired ORM instance would refresh
+    lazily and raise ``MissingGreenlet`` under the async session.
+    """
+    return (
+        await db_session.execute(
+            select(
+                Alert.dedupe_key,
+                Alert.title,
+                Alert.message,
+                Alert.occurrence_count,
+                Alert.last_seen_at,
+            ).where(
+                Alert.project_id == project_id,
+                Alert.dedupe_key.like("drift_sentinel:dispatch_rejected:%"),
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejection_raises_one_standing_alert_not_one_per_head(
+    db_session, mocker
+):
+    """Three automain merges under one standing 403 == ONE operator incident.
+
+    The per-HEAD ``dispatch_suppression_key`` bounds API churn; it is not a
+    notification key.  When the alert borrowed that granularity, a repository
+    permission the operator must fix exactly once (``actions: write``) minted a
+    fresh WARNING on every single automain merge — an unbounded per-delta alert
+    stream for an unchanging cause.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    owner, repo = project.github_owner, project.github_repo
+    heads = ["71bfe706590e", "82c0f8176a1f", "93d1a9284b2c"]
+    side_effect = []
+    for head in heads:
+        side_effect.append(
+            {"gate_state": "no_signal", "head_sha": head, "reason": "none"}
+        )
+        side_effect.append(_rejected_gate(owner, repo, head))
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(side_effect=side_effect),
+    )
+    factory = _shared_session_factory(db_session)
+
+    for _ in heads:
+        assert (
+            await _check_full_suite_drift_sentinel(version_id, session_factory=factory)
+            is True
+        )
+
+    alerts = await _dispatch_rejected_alerts(db_session, project_id)
+    assert len(alerts) == 1, (
+        "Three automain HEADs under one standing dispatch rejection must produce "
+        f"ONE operator incident, got {len(alerts)}: "
+        f"{[a.dedupe_key for a in alerts]}"
+    )
+    key = alerts[0].dedupe_key
+    for head in heads:
+        assert head not in key, (
+            f"dedupe_key {key!r} still carries HEAD {head!r} — the alert is keyed "
+            "per-delta again and will spam once per automain merge"
+        )
+    assert key == f"drift_sentinel:dispatch_rejected:{project_id}:rejected"
+
+
+@pytest.mark.asyncio
+async def test_standing_rejection_alert_tracks_newest_head_and_counts_recurrence(
+    db_session, mocker
+):
+    """The one incident must stay CURRENT, not freeze on the first HEAD.
+
+    Collapsing the key without refreshing would trade spam for a stale alert
+    naming a HEAD from days ago.  ``occurrence_count`` is what replaces the
+    deleted alert stream as the "how long has this been broken" signal.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    owner, repo = project.github_owner, project.github_repo
+    first, newest = "71bfe706590e", "82c0f8176a1f"
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            side_effect=[
+                {"gate_state": "no_signal", "head_sha": first, "reason": "none"},
+                _rejected_gate(owner, repo, first),
+                {"gate_state": "no_signal", "head_sha": newest, "reason": "none"},
+                _rejected_gate(owner, repo, newest),
+            ]
+        ),
+    )
+    factory = _shared_session_factory(db_session)
+
+    for _ in range(2):
+        assert (
+            await _check_full_suite_drift_sentinel(version_id, session_factory=factory)
+            is True
+        )
+
+    alerts = await _dispatch_rejected_alerts(db_session, project_id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert newest[:12] in alert.message, (
+        "The standing incident must name the CURRENT HEAD; it froze on the "
+        f"first one: {alert.message!r}"
+    )
+    assert newest[:8] in alert.title
+    assert first[:12] not in alert.message
+    assert int(alert.occurrence_count or 1) == 2, (
+        "Each recurrence must bump occurrence_count — that is the only "
+        "remaining signal for how long the condition has persisted"
+    )
+    assert alert.last_seen_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_different_rejection_diagnosis_opens_its_own_incident(
+    db_session, mocker
+):
+    """403 and 404 need different operator fixes, so they stay separate.
+
+    Collapsing per-project must not collapse across DIAGNOSES: "GitHub denied
+    this authority" (grant ``actions: write``) and "workflow unavailable to this
+    authority" (the workflow file / App installation scope) are different
+    actions, and a flip between them is new information.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    owner, repo = project.github_owner, project.github_repo
+    denied_head, missing_head = "71bfe706590e", "82c0f8176a1f"
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            side_effect=[
+                {"gate_state": "no_signal", "head_sha": denied_head, "reason": "none"},
+                _rejected_gate(owner, repo, denied_head, outcome="rejected"),
+                {"gate_state": "no_signal", "head_sha": missing_head, "reason": "none"},
+                _rejected_gate(
+                    owner, repo, missing_head, outcome="rejected_permanent_404"
+                ),
+            ]
+        ),
+    )
+    factory = _shared_session_factory(db_session)
+
+    for _ in range(2):
+        assert (
+            await _check_full_suite_drift_sentinel(version_id, session_factory=factory)
+            is True
+        )
+
+    alerts = await _dispatch_rejected_alerts(db_session, project_id)
+    keys = sorted(a.dedupe_key for a in alerts)
+    assert keys == [
+        f"drift_sentinel:dispatch_rejected:{project_id}:rejected",
+        f"drift_sentinel:dispatch_rejected:{project_id}:rejected_permanent_404",
+    ], f"expected one incident per diagnosis, got {keys}"

@@ -254,8 +254,11 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
 #                   # when a baseline-warned WARN is hiding a real
 #                   # regression you want to confirm. Combine with
 #                   # 'test' (./check full test) to also run tests.
-# Exits 0 on green, non-zero on any failure. Output is the actual error tail
-# so you can act on it. Re-run after edits.
+# Exits 0 on green or on named, structured failures confirmed inherited on the
+# base branch; those publish through ./pr open with their verification receipt.
+# New or unattributed failures, execution/attribution failures, and explicit
+# coverage failures stay non-zero and block ./pr open. Output is the actual
+# error tail so you can act on it. Re-run after edits.
 
 set -uo pipefail
 ${agentTokenFn}
@@ -578,10 +581,10 @@ ${buildViewportUploadBlock(cfg.taskId)}    fi
   # half (tsc -b --noEmit) is routed through the shared base-attribution guard
   # and compared against an isolated base checkout, so an inherited type error
   # on the integration branch warn-passes instead of blocking every agent that
-  # touches admin-ui; unavailable attribution stays fail-closed. The test-file
-  # half keeps its existing shrink-only baseline gate.
+  # touches admin-ui; unavailable attribution stays fail-closed. The guard also
+  # compiles the test-file project against the base ref, so this is the complete
+  # typecheck lane.
   run "admin-ui typecheck (attributed)" python3 scripts/typecheck_verification_guard.py --suite admin-ui --base "$BASE" --repo-root "$WORKSPACE"
-  run "admin-ui typecheck (test files)" bash -c 'cd admin-ui && node scripts/typecheck-tests-baseline.mjs 2>&1'
 
   # Run the admin-ui unit suite on EVERY ./check. The guard compares its JUnit
   # identities with an isolated base checkout, so only confirmed inherited

@@ -21,6 +21,8 @@ from app.alert_dispatch import (
     _fmt_duration_seconds,
     _maybe_create_blocked_escalation_alert,
     _maybe_create_escalation_alert,
+    _maybe_create_failure_alert,
+    _maybe_create_precondition_blocker_alert,
     _maybe_create_local_runner_hold_alert,
     _maybe_create_migration_slot_contention_alert,
     _maybe_create_pool_payoff_alert,
@@ -32,6 +34,7 @@ from app.alert_dispatch import (
     _resolve_runner_degraded_alert,
     _runner_escalation_last_notified,
     _runner_outage_escalated_keys,
+    sweep_resolve_terminal_task_alerts,
 )
 from app.models import Alert, AlertSeverity
 from app.time_utils import _utcnow
@@ -2621,3 +2624,542 @@ async def test_module_finding_chain_alert_two_distinct_concerns_on_same_pr_both_
     assert len(alerts) == 2
     titles = {alert.title for alert in alerts}
     assert len(titles) == 2  # distinct titles -- not just distinct rows
+
+
+# ── sweep_resolve_terminal_task_alerts (stale "task is stuck" reconcile) ──────
+#
+# Every ``task.blocked`` emitter asserts an in-flight condition. Measured on the
+# live feed 2026-08-21: of 20 tasks holding an open ``task.blocked`` alert, 14
+# were already terminal and exactly one was actually BLOCKED. Nothing retired
+# them on the termination path.
+
+
+async def _open_stuck_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == "task.blocked",
+        Alert.dismissed_at.is_(None),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+async def _stuck_alert_for(db_session, project_id, status, title):
+    """Persist one terminal-or-live task carrying one open task.blocked alert."""
+    task = make_task(project_id=project_id, status=status)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message="stuck",
+        task_id=task.id,
+        event_type="task.blocked",
+    )
+    db_session.add(alert)
+    await db_session.commit()
+    await db_session.refresh(alert)
+    return task, alert
+
+
+@pytest.mark.parametrize("terminal_status", ["COMPLETED", "FAILED", "CANCELLED"])
+@pytest.mark.asyncio
+async def test_stuck_alert_is_dismissed_once_its_task_goes_terminal(
+    db_session, mocker, terminal_status
+):
+    """A task that ended cannot still be stalled, blocked, or stuck evaluating."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _task, alert = await _stuck_alert_for(
+        db_session, project.id, terminal_status, "Task stalled in queue: widget"
+    )
+
+    dismissed = await sweep_resolve_terminal_task_alerts(db_session)
+
+    assert dismissed == 1
+    await db_session.refresh(alert)
+    assert (
+        alert.dismissed_at is not None
+    ), f"a {terminal_status} task's stuck-alert must not stay open"
+    assert await _open_stuck_alerts(db_session, project.id) == []
+    bcast.assert_awaited_once()
+    assert bcast.await_args.args[1] == "alert_dismissed"
+
+
+@pytest.mark.parametrize(
+    "live_status", ["QUEUED", "IN_PROGRESS", "EVALUATING", "BLOCKED"]
+)
+@pytest.mark.asyncio
+async def test_stuck_alert_survives_while_its_task_is_still_in_flight(
+    db_session, mocker, live_status
+):
+    """Control leg: a non-terminal task keeps its alert. Never resolve live signal."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _task, alert = await _stuck_alert_for(
+        db_session, project.id, live_status, "Precondition blocker: precondition"
+    )
+
+    dismissed = await sweep_resolve_terminal_task_alerts(db_session)
+
+    assert dismissed == 0
+    await db_session.refresh(alert)
+    assert (
+        alert.dismissed_at is None
+    ), f"a {live_status} task is still in flight — its alert is real signal"
+    assert len(await _open_stuck_alerts(db_session, project.id)) == 1
+    bcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failure_alert_survives_while_the_task_is_still_failed(
+    db_session, mocker
+):
+    """The asymmetry the rule table exists for: FAILED does NOT clear task.failed.
+
+    ``task.blocked`` and ``review.escalated`` are falsified by every terminal
+    status. ``task.failed`` is not — on a task that is still FAILED the alert is
+    still literally true and is the operator's only standing pointer at it. A
+    shared terminal-status set across the families would silently swallow it,
+    which is why each family carries its own set in the rule table.
+
+    (This pin predates the rule table, when ``task.failed`` was simply outside
+    the sweep's single-family filter. The assertion is unchanged; only the
+    reason it holds has moved from "different event type" to "different status
+    set", so the name moved with it.)
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id, status="FAILED")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    other = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.ERROR,
+        title="Task failed: widget",
+        message="failed",
+        task_id=task.id,
+        event_type="task.failed",
+    )
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 0
+    await db_session.refresh(other)
+    assert other.dismissed_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_is_idempotent_and_does_not_reopen_or_restamp(db_session, mocker):
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _task, alert = await _stuck_alert_for(
+        db_session, project.id, "CANCELLED", "Task permanently blocked: precondition"
+    )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    await db_session.refresh(alert)
+    first_stamp = alert.dismissed_at
+    assert first_stamp is not None
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 0
+    await db_session.refresh(alert)
+    assert alert.dismissed_at == first_stamp, "a second pass must not re-stamp"
+    assert bcast.await_count == 1, "a resolved alert must not re-broadcast"
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_stale_alert_restores_notification_for_a_requeued_task(
+    db_session, mocker
+):
+    """The second-order payoff: under-clearing causes under-NOTIFYING.
+
+    ``_maybe_create_precondition_blocker_alert`` dedupes on ``(task_id, title)``
+    among undismissed rows. So while a stale alert stays open, a task that is
+    requeued and blocks again on the same blocker raises NOTHING — the operator
+    loses the new incident to the corpse of the old one. Resolving on terminal
+    is what makes the next real block audible again.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task, stale = await _stuck_alert_for(
+        db_session, project.id, "CANCELLED", "Precondition blocker: precondition"
+    )
+
+    # Without the sweep the fresh incident is swallowed by the stale row.
+    task.status = "BLOCKED"
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    suppressed = await _maybe_create_precondition_blocker_alert(
+        task,
+        db_session,
+        blocker_kind="precondition",
+        detail="blocked again",
+        severity=AlertSeverity.WARNING,
+    )
+    assert suppressed is False, "stale open alert suppresses the real new one"
+
+    # Resolve the corpse the way the sweep would have, then retry.
+    task.status = "CANCELLED"
+    db_session.add(task)
+    await db_session.commit()
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    await db_session.refresh(stale)
+    assert stale.dismissed_at is not None
+
+    task.status = "BLOCKED"
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    audible = await _maybe_create_precondition_blocker_alert(
+        task,
+        db_session,
+        blocker_kind="precondition",
+        detail="blocked again",
+        severity=AlertSeverity.WARNING,
+    )
+    assert audible is True, "once the corpse is cleared the new incident alerts"
+    assert len(await _open_stuck_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_batch_is_bounded_and_drains_across_cycles(db_session, mocker):
+    """A backlog must not be held in one write transaction — and must still drain."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(5):
+        await _stuck_alert_for(
+            db_session, project.id, "CANCELLED", "Task stalled in queue: widget"
+        )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session, limit=2) == 2
+    assert len(await _open_stuck_alerts(db_session, project.id)) == 3
+    assert await sweep_resolve_terminal_task_alerts(db_session, limit=2) == 2
+    assert await sweep_resolve_terminal_task_alerts(db_session, limit=2) == 1
+    assert await _open_stuck_alerts(db_session, project.id) == []
+
+
+# ── the other two families the same sweep now owns ────────────────────────────
+#
+# ``task.blocked`` was only the first family with this defect. Measured on the
+# same live feed 2026-08-21, with the ``task.blocked`` rule already merged but
+# not yet deployed: 12 of 12 open ``task.failed`` alerts named an
+# already-terminal task (8 CANCELLED, 1 COMPLETED, 3 legitimately still
+# FAILED), and 5 of 7 open ``review.escalated`` alerts named a COMPLETED task.
+#
+# The families are NOT interchangeable, and every test below exists to hold
+# that line: FAILED falsifies ``task.blocked`` and ``review.escalated`` but
+# NOT ``task.failed``, whose message is still true on a task that is still
+# failed.
+
+
+async def _open_alerts_of(db_session, project_id, event_type):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == event_type,
+        Alert.dismissed_at.is_(None),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+async def _alert_for(db_session, project_id, status, title, event_type):
+    """Persist one task in ``status`` carrying one open alert of ``event_type``."""
+    task = make_task(project_id=project_id, status=status)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message="condition detail",
+        task_id=task.id,
+        event_type=event_type,
+    )
+    db_session.add(alert)
+    await db_session.commit()
+    await db_session.refresh(alert)
+    return task, alert
+
+
+async def _fresh_project(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.parametrize("terminal_status", ["COMPLETED", "FAILED", "CANCELLED"])
+@pytest.mark.asyncio
+async def test_review_escalation_is_dismissed_once_its_task_goes_terminal(
+    db_session, mocker, terminal_status
+):
+    """"Manual review required" cannot be true of a task that already ended.
+
+    The alert names the chain-original task and asks for an adjudication of a
+    live review loop. Once that task is terminal the loop is over: a requeue
+    mints fresh escalation state rather than re-entering the old episode, so
+    there is nothing the operator could still decide here.
+    """
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = await _fresh_project(db_session)
+
+    _task, alert = await _alert_for(
+        db_session,
+        project.id,
+        terminal_status,
+        "Review-fix escalation: stuck cycle on PR #1777",
+        "review.escalated",
+    )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is not None, (
+        f"a {terminal_status} task has no live review loop left to adjudicate"
+    )
+    assert await _open_alerts_of(db_session, project.id, "review.escalated") == []
+    bcast.assert_awaited_once()
+    assert bcast.await_args.args[1] == "alert_dismissed"
+
+
+@pytest.mark.parametrize(
+    "live_status", ["QUEUED", "IN_PROGRESS", "EVALUATING", "BLOCKED"]
+)
+@pytest.mark.asyncio
+async def test_review_escalation_survives_while_its_task_is_still_in_flight(
+    db_session, mocker, live_status
+):
+    """Control leg: an escalation on a live chain is exactly the signal wanted.
+
+    EVALUATING is the status escalated chains actually sit in, so this leg is
+    the one that would catch an over-broad rule.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = await _fresh_project(db_session)
+
+    _task, alert = await _alert_for(
+        db_session,
+        project.id,
+        live_status,
+        "Review-fix escalation: dispute standoff on PR #1769",
+        "review.escalated",
+    )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 0
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is None, (
+        f"a {live_status} chain still needs the operator decision this asks for"
+    )
+
+
+@pytest.mark.parametrize("settled_status", ["COMPLETED", "CANCELLED"])
+@pytest.mark.asyncio
+async def test_failure_alert_is_dismissed_once_the_failure_was_settled(
+    db_session, mocker, settled_status
+):
+    """A failure alert asks for attention; COMPLETED and CANCELLED both settle it.
+
+    COMPLETED means the work was retried and succeeded. CANCELLED means it was
+    deliberately abandoned. Either way the operator has nothing left to do, and
+    on the live feed these two accounted for 9 of the 12 open ``task.failed``
+    alerts.
+    """
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = await _fresh_project(db_session)
+
+    _task, alert = await _alert_for(
+        db_session, project.id, settled_status, "Task failed: widget", "task.failed"
+    )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is not None, (
+        f"a task that is now {settled_status} no longer needs its failure alert"
+    )
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "unrelated_event_type",
+    ["deployment.auto_resume", "release.ci_unresolved", "release.calcifying"],
+)
+@pytest.mark.asyncio
+async def test_sweep_leaves_families_outside_the_rule_table_alone(
+    db_session, mocker, unrelated_event_type
+):
+    """Scope pin: only families in the rule table are touched, terminal or not.
+
+    These three are the largest open families on the live feed and none of them
+    is task-derived — their conditions live in the deployment and release
+    lanes. A terminal task must never be read as evidence about them.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = await _fresh_project(db_session)
+
+    _task, alert = await _alert_for(
+        db_session, project.id, "CANCELLED", "Unrelated condition", unrelated_event_type
+    )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 0
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is None
+
+
+@pytest.mark.asyncio
+async def test_all_three_families_clear_in_one_pass(db_session, mocker):
+    """The OR-ed query must resolve every family in a single sweep, not just one.
+
+    Written against the shape a naive rewrite produces — filtering on one family
+    and looping — which would clear one row per cycle and leave the rest.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = await _fresh_project(db_session)
+
+    await _alert_for(
+        db_session, project.id, "COMPLETED", "Task stalled in queue: a", "task.blocked"
+    )
+    await _alert_for(
+        db_session,
+        project.id,
+        "COMPLETED",
+        "Review-fix escalation: stuck cycle on PR #1",
+        "review.escalated",
+    )
+    await _alert_for(
+        db_session, project.id, "CANCELLED", "Task failed: c", "task.failed"
+    )
+    # ...and one of each that must be left behind.
+    await _alert_for(db_session, project.id, "FAILED", "Task failed: d", "task.failed")
+    await _alert_for(
+        db_session, project.id, "BLOCKED", "Task stalled in queue: e", "task.blocked"
+    )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 3
+    assert len(await _open_alerts_of(db_session, project.id, "task.failed")) == 1
+    assert len(await _open_alerts_of(db_session, project.id, "task.blocked")) == 1
+    assert await _open_alerts_of(db_session, project.id, "review.escalated") == []
+
+
+@pytest.mark.asyncio
+async def test_a_stale_alert_of_any_family_swallows_the_next_failure_alert(
+    db_session, mocker
+):
+    """The widest second-order payoff, and why this is not cosmetic.
+
+    ``_maybe_create_failure_alert`` dedupes on ``task_id`` ALONE — no title, no
+    event_type filter. So one stale open alert of ANY family silently swallows
+    that task's next failure alert outright. Here a corpse ``review.escalated``
+    row from a converged loop mutes a genuine later failure of the same task;
+    clearing it is what makes the failure audible again.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    project = await _fresh_project(db_session)
+
+    task, stale = await _alert_for(
+        db_session,
+        project.id,
+        "COMPLETED",
+        "Review-fix escalation: stuck cycle on PR #1777",
+        "review.escalated",
+    )
+
+    # The task is requeued and this time genuinely fails.
+    task.status = "FAILED"
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _maybe_create_failure_alert(task, db_session, "boom")
+    await db_session.commit()
+    assert await _open_alerts_of(db_session, project.id, "task.failed") == [], (
+        "a stale alert of an unrelated family swallows the failure alert — "
+        "_maybe_create_failure_alert dedupes on task_id with no type filter"
+    )
+
+    # Clear the corpse the way the sweep does, then let it fail again.
+    task.status = "COMPLETED"
+    db_session.add(task)
+    await db_session.commit()
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    await db_session.refresh(stale)
+    assert stale.dismissed_at is not None
+
+    task.status = "FAILED"
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await _maybe_create_failure_alert(task, db_session, "boom")
+    await db_session.commit()
+    assert len(await _open_alerts_of(db_session, project.id, "task.failed")) == 1, (
+        "once the corpse is cleared the real failure is audible again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rule_table_never_lets_a_family_inherit_another_status_set(db_session):
+    """Pin the table itself: the FAILED asymmetry is the contract, not an accident.
+
+    A future edit that collapses these onto one shared set would still pass
+    every behavioural test above for ``task.blocked`` and ``review.escalated``
+    while quietly clearing live ``task.failed`` signal. Assert the shape.
+    """
+    from app.alert_dispatch import _TERMINAL_TASK_ALERT_RULES
+    from app.models import TaskStatus
+
+    assert set(_TERMINAL_TASK_ALERT_RULES) == {
+        "task.blocked",
+        "review.escalated",
+        "task.failed",
+    }
+    assert TaskStatus.FAILED in _TERMINAL_TASK_ALERT_RULES["task.blocked"]
+    assert TaskStatus.FAILED in _TERMINAL_TASK_ALERT_RULES["review.escalated"]
+    assert TaskStatus.FAILED not in _TERMINAL_TASK_ALERT_RULES["task.failed"], (
+        "a task.failed alert on a still-FAILED task is TRUE and must survive"
+    )
+    assert _TERMINAL_TASK_ALERT_RULES["task.failed"] == {
+        TaskStatus.COMPLETED,
+        TaskStatus.CANCELLED,
+    }

@@ -135,79 +135,9 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
     a read-site's hardcoded fallback is not updated, this test fails.
     """
 
-    # Allowlist of pre-existing divergences — known stale fallbacks that were
-    # present before this test was written.  New divergences (not in this set)
-    # will cause the test to fail.  Each tuple is (relpath, lineno, key).
-    # Generated 2026-07-21; entries here document known staleness to be cleaned
-    # up in follow-up PRs.  If a registered default changes, add NEW entries
-    # here (do NOT remove the old ones without fixing the read-site).
-    _KNOWN_STALE_FALLBACKS: ClassVar[set[tuple[str, int, str]]] = {
-        ("app/anomaly_detection.py", 1170, "max_concurrent_vms"),
-        ("app/autonomous_research.py", 1017, "evaluating_pipeline_timeout_minutes"),
-        ("app/blocked_task_unblock_sweeps.py", 1499, "capability_proof_gate_mode"),
-        ("app/blocked_task_unblock_sweeps.py", 1871, "capability_proof_gate_mode"),
-        ("app/capability_execution_fence.py", 164, "capability_proof_gate_mode"),
-        ("app/capability_proof.py", 1093, "capability_proof_execution_trials_enabled"),
-        ("app/capability_proof.py", 1158, "capability_proof_execution_trials_enabled"),
-        ("app/capability_proof.py", 2226, "capability_proof_execution_trials_enabled"),
-        ("app/compute_experiment_contract.py", 563, "compute_experiment_spend_threshold_usd"),
-        ("app/deploy_health.py", 467, "max_concurrent_vms"),
-        ("app/evergreen_backlog.py", 947, "max_global_autonomous_tasks_per_hour"),
-        ("app/main.py", 1311, "max_concurrent_vms"),
-        ("app/metrics_integrity_sweep.py", 4842, "capability_proof_gate_mode"),
-        ("app/orchestrator.py", 3836, "warm_backlog_reuse_enabled"),
-        ("app/plan_completion.py", 1392, "capability_proof_gate_mode"),
-        ("app/qualification_state_resolver.py", 486, "env_preflight_enabled"),
-        ("app/release_promotion.py", 331, "env_preflight_enabled"),
-        ("app/release_qualifier.py", 2917, "env_preflight_enabled"),
-        ("app/release_qualifier.py", 3177, "capability_proof_gate_mode"),
-        ("app/release_qualifier.py", 5388, "env_preflight_enabled"),
-        ("app/release_qualifier.py", 7611, "capability_proof_gate_mode"),
-        ("app/release_qualifier.py", 8238, "env_preflight_enabled"),
-        ("app/research_completion.py", 6300, "capability_proof_gate_mode"),
-        ("app/research_completion.py", 6334, "capability_proof_gate_mode"),
-        ("app/routers/admin_health.py", 585, "warm_continuity_enabled"),
-        ("app/routers/admin_health.py", 613, "warm_backlog_reuse_enabled"),
-        ("app/routers/admin_health.py", 1167, "warm_continuity_enabled"),
-        ("app/routers/admin_health.py", 1170, "warm_backlog_reuse_enabled"),
-        ("app/routers/admin_settings.py", 520, "max_global_autonomous_tasks_per_hour"),
-        ("app/routers/admin_settings.py", 556, "structural_health_audit_mode"),
-        ("app/routers/admin_settings.py", 568, "capability_proof_gate_mode"),
-        ("app/routers/admin_settings.py", 586, "capability_proof_execution_trials_enabled"),
-        ("app/routers/admin_settings.py", 592, "metrics_integrity_sweep_max_checks"),
-        ("app/routers/admin_settings.py", 604, "completion_debt_weight_mode"),
-        ("app/routers/admin_settings.py", 693, "max_parallel_research_per_project"),
-        ("app/routers/admin_settings.py", 746, "smoketest_enabled"),
-        ("app/routers/admin_settings.py", 756, "warm_continuity_enabled"),
-        ("app/routers/admin_settings.py", 759, "warm_backlog_reuse_enabled"),
-        ("app/routers/admin_settings.py", 3394, "max_parallel_research_per_project"),
-        ("app/routers/admin_settings.py", 3448, "warm_continuity_enabled"),
-        ("app/routers/admin_settings.py", 3451, "warm_backlog_reuse_enabled"),
-        ("app/routers/admin_settings.py", 3623, "smoketest_enabled"),
-        ("app/routers/admin_settings.py", 3681, "completion_debt_weight_mode"),
-        ("app/routers/admin_settings.py", 3686, "capability_proof_gate_mode"),
-        ("app/routers/admin_settings.py", 3708, "capability_proof_execution_trials_enabled"),
-        ("app/routers/admin_warm_pool.py", 100, "max_concurrent_vms"),
-        ("app/routers/agent.py", 126, "repo_map_holdback_fraction"),
-        ("app/routers/agent.py", 142, "module_interfaces_holdback_fraction"),
-        ("app/routers/agent.py", 159, "related_tests_holdback_fraction"),
-        ("app/routers/agent.py", 176, "affected_consumers_holdback_fraction"),
-        ("app/routers/agent_status.py", 2494, "warm_continuity_enabled"),
-        ("app/routers/agent_status.py", 2908, "warm_backlog_reuse_enabled"),
-        ("app/routers/agent_warm_continuity.py", 1250, "warm_backlog_reuse_enabled"),
-        ("app/services.py", 292, "max_retained_images"),
-        ("app/services.py", 487, "auto_archive_max_terminal_tasks_per_project"),
-        ("app/services.py", 636, "auto_archive_max_terminal_tasks_per_project"),
-        ("app/strategic_spawning.py", 7408, "max_concurrent_vms"),
-        ("app/task_completion.py", 3700, "capability_proof_execution_trials_enabled"),
-        ("app/warm_pool.py", 172, "warm_pool_target_size"),
-        ("app/warm_pool_maintainer.py", 137, "warm_pool_target_size"),
-        ("app/warm_pool_maintainer.py", 1136, "max_concurrent_vms"),
-    }
-
-    # Line numbers are deliberately excluded: deletions elsewhere in a module
-    # must not turn known fallback debt into a false-positive. The literal
-    # fallback and occurrence count remain pinned so new or changed debt fails.
+    # Line numbers are deliberately excluded: edits elsewhere in a module must
+    # not turn known fallback debt into a false-positive. The literal fallback
+    # and occurrence count remain pinned so new or changed debt fails.
     _KNOWN_STALE_FALLBACK_COUNTS: ClassVar[Counter] = Counter({
         ("app/anomaly_detection.py", "max_concurrent_vms", 0): 1,
         ("app/autonomous_research.py", "evaluating_pipeline_timeout_minutes", 240): 1,
@@ -265,7 +195,9 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
         """Scan every registered key across all read-sites and assert fallbacks match."""
         import app.runtime_config_state as _rcs
 
-        registered = dict(_rcs.runtime_config)
+        registered = {
+            key: _rcs.config_get(key) for key in _rcs.runtime_config
+        }
         simple_defaults = {
             k: v for k, v in registered.items()
             if isinstance(v, _SIMPLE_TYPES)
@@ -311,6 +243,24 @@ class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
             f"{dict(unexpected)}; resolved/decreased entries that should be "
             "removed from the pinned baseline: "
             f"{dict(resolved_without_baseline_update)}"
+        )
+
+    def test_stale_fallback_identity_survives_unrelated_line_insertion(self, tmp_path):
+        """A line inserted above a fallback must not change its baseline identity."""
+        source = 'value = config.get("feature_flag", False)\n'
+        before = tmp_path / "before.py"
+        after = tmp_path / "after.py"
+        before.write_text(source, encoding="utf-8")
+        after.write_text("# unrelated edit\n" + source, encoding="utf-8")
+
+        def identity(path: pathlib.Path) -> Counter:
+            return Counter(
+                ("app/example.py", "feature_flag", fallback)
+                for _line, fallback in _collect_get_fallbacks(path, "feature_flag")
+            )
+
+        assert identity(before) == identity(after) == Counter(
+            {("app/example.py", "feature_flag", False): 1}
         )
 
 

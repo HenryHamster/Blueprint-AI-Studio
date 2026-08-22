@@ -319,6 +319,29 @@ def test_env_preflight_boot_prereq_evidence_missing_blocker_is_failed():
     assert d["env_preflight"]["reason"] == "boot_prereq_evidence_missing"
 
 
+@pytest.mark.parametrize(
+    "blocker",
+    (
+        "candidate_authorship_range_identical",
+        "candidate_operator_authorship_evidence_missing",
+        "candidate_operator_authorship_nonzero",
+    ),
+)
+def test_operator_authorship_blockers_fail_criterion_coverage(blocker):
+    """Every hard authorship blocker is visible in the operator read model."""
+    result = resolve_dimension_states(
+        {
+            "status": "not_promoted",
+            "blocker": blocker,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
+            "criterion_coverage": {"total": 1, "covered": 1},
+        }
+    )
+    dimension = _by_key(result)["criterion_coverage"]
+    assert dimension["status"] == "failed"
+    assert dimension["reason"] == blocker
+
+
 def test_env_preflight_enabled_no_manifest_is_unavailable():
     # Enabled but no env_preflight sub_score (candidate declared no manifest) →
     # unavailable, never a spurious block.
