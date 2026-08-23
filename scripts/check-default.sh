@@ -45,6 +45,35 @@ git rev-parse --git-dir >/dev/null 2>&1 || {
   exit 2
 }
 
+# Interpreter identity. Every guard lane below invokes `python3` by name. Git
+# Bash on a Windows developer host has no `python3` — the python.org installer
+# publishes `python.exe` only — so on that host this gate did not merely skip a
+# lane, it failed EVERY python-backed lane with `python3: command not found`.
+# That is the host where `bp/*` task branches are authored, and a gate that
+# cannot execute is a gate nobody runs: it is why the four stale guard-data
+# manifests behind promotion PR #17764 were never caught before automain.
+# Publish a shim on PATH instead of rewriting the call sites, because
+# `xargs python3` and `bash -c '... python3 ...'` resolve an executable and
+# would ignore a shell function or alias.
+if ! command -v python3 >/dev/null 2>&1; then
+  _PY3_FALLBACK="$(command -v python || true)"
+  if [ -z "$_PY3_FALLBACK" ]; then
+    echo "[check] ERROR: neither python3 nor python is on PATH — every guard lane below needs one" >&2
+    exit 2
+  fi
+  _PY3_SHIM_DIR="${TMPDIR:-/tmp}/blueprint-check-python3-shim.$$"
+  if ! mkdir -p "$_PY3_SHIM_DIR" \
+    || ! printf '#!/bin/sh\nexec "%s" "$@"\n' "$_PY3_FALLBACK" >"$_PY3_SHIM_DIR/python3" \
+    || ! chmod +x "$_PY3_SHIM_DIR/python3"; then
+    echo "[check] ERROR: cannot publish a python3 shim in $_PY3_SHIM_DIR" >&2
+    exit 2
+  fi
+  trap 'rm -rf "$_PY3_SHIM_DIR"' EXIT
+  PATH="$_PY3_SHIM_DIR:$PATH"
+  export PATH
+  echo "[check] python3 is absent on PATH; routing python3 to $_PY3_FALLBACK"
+fi
+
 WITH_TESTS=0
 FULL_SCOPE=0
 for arg in "$@"; do
@@ -151,6 +180,30 @@ if [ -f scripts/static_release_guard.py ]; then
 else
   echo "[check] static release guard helper is missing — refusing to skip the gate"
   FAILED+=("static release guard helper missing")
+fi
+
+# Derived-artifact freshness. The size ledger above is ONE derived artifact
+# whose guard happens to be a standalone checker, so it is the only one this
+# gate enforced unconditionally; every OTHER derived artifact in this repo (the
+# websocket emitter inventory fixture, the hand-kept WEBSOCKET_EMITTER_INVENTORY
+# dict, the conversational-Workday per-file test counts, the ranked-queue and
+# durations artifacts) is guarded by a pytest drift sentinel that ran only under
+# `./check test`. Stale guard data is self-concealing — it is attributable on
+# exactly the one PR that introduces it and inherited-then-warn-passed on every
+# PR after — so anything it slips past lands on the automain->main promotion
+# matrix, which is what killed promotion PRs #17738 and #17764. This lane runs
+# only the sentinels registered for the surfaces THIS diff touches, attributed
+# against base, so it never blocks on inherited drift.
+# Skipped under `./check test`: the attributed static corpus above already runs
+# every sentinel in the roster, so running them twice would only cost time.
+if [ "$WITH_TESTS" != "1" ]; then
+  if [ -f scripts/sentinel_freshness.py ]; then
+    run "derived-artifact freshness (registered drift sentinels)" \
+      python3 scripts/sentinel_freshness.py --base "$BASE" --repo-root "$PWD"
+  else
+    echo "[check] derived-artifact freshness helper is missing — refusing to skip the gate"
+    FAILED+=("sentinel freshness helper missing")
+  fi
 fi
 
 # Idempotent npm install guarded by package-lock IDENTITY, not the mere

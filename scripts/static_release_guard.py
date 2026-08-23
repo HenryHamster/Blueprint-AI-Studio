@@ -24,6 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from posix_bash import bash_executable, posix_path  # noqa: E402
+except ImportError:  # pragma: no cover - fixture trees are POSIX already
+    bash_executable, posix_path = (lambda: "bash"), os.fspath  # noqa: E731
+
 try:
     from guard_suppression_receipt import record_classification  # noqa: E402
 except ImportError:  # pragma: no cover - emitting is fail-open by contract
@@ -254,6 +259,8 @@ _extract_base = extract_base
 
 
 def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    if command and command[0] == "bash":
+        command = [bash_executable(), *command[1:]]
     return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
 
 
@@ -363,7 +370,7 @@ def _run_static_corpus(
 ) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
-        "BLUEPRINT_STATIC_GUARD_JUNIT": str(junit),
+        "BLUEPRINT_STATIC_GUARD_JUNIT": posix_path(junit),
         "TESTMON_NO_FETCH": "1",
     }
     if selectors is not None:

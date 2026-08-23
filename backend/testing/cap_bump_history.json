@@ -4707,6 +4707,12 @@
           "commit_date": "2026-08-23T11:02:03-07:00",
           "old_cap": 1000,
           "new_cap": 1050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-23T21:50:06.816394+00:00",
+          "old_cap": 1050,
+          "new_cap": 1075
         }
       ],
       "test_vitest_verification_guard.py": [

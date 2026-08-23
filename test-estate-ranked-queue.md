@@ -9,7 +9,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 627 | 979,336 | 26,177 | 13,674.233s (372 files) | 255 |
+| backend | 627 | 979,392 | 26,178 | 13,674.233s (372 files) | 255 |
 | admin-ui | 253 | 100,660 | 4,418 | 209.620s (253 files) | 0 |
 | agent | 125 | 111,531 | 5,882 | 72.033s (125 files) | 0 |
 
@@ -790,9 +790,9 @@ The queue includes every currently collected backend, admin-ui, and agent test f
 | 769 | G | admin-ui | `admin-ui/src/test/environment.test.ts` | 15 | 1 | under 1500 LOC | 0.001s measured | — |
 | 770 | G | admin-ui | `admin-ui/src/components/AdversarialQualityPanel.test.tsx` | 9 | 1 | under 1500 LOC | 0.001s measured | — |
 | 771 | G | backend | `backend/testing/test_service_credentials.py` | 1,489 | 30 | under 1500 LOC | unknown (no committed measurement) | — |
-| 772 | G | backend | `backend/testing/test_conversation_coordinator_two_speed.py` | 1,445 | 17 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 17 |
-| 773 | G | backend | `backend/testing/test_discovery_review_packet_budget.py` | 1,417 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
-| 774 | G | backend | `backend/testing/test_check_gate_fail_closed.py` | 1,412 | 34 | under 1500 LOC | unknown (no committed measurement) | — |
+| 772 | G | backend | `backend/testing/test_check_gate_fail_closed.py` | 1,468 | 35 | under 1500 LOC | unknown (no committed measurement) | — |
+| 773 | G | backend | `backend/testing/test_conversation_coordinator_two_speed.py` | 1,445 | 17 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 17 |
+| 774 | G | backend | `backend/testing/test_discovery_review_packet_budget.py` | 1,417 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
 | 775 | G | backend | `backend/testing/test_admin_routers__runners.py` | 1,317 | 33 | under 1500 LOC | unknown (no committed measurement) | — |
 | 776 | G | backend | `backend/testing/test_approval_exact_target_publication.py` | 1,275 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
 | 777 | G | backend | `backend/testing/test_admin_approval_merge_submission_recovery.py` | 1,272 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
