@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -367,6 +368,131 @@ def test_blueprint_python_entrypoint_help_exits_zero_cross_platform():
     )
     assert result.returncode == 0, result.stderr
     assert "Unified Blueprint operator CLI" in result.stdout
+
+
+def _write_shim(directory, name, body):
+    """Install an executable ``name`` in ``directory`` that runs ``body``."""
+    shim = Path(directory) / name
+    shim.write_bytes(("#!/bin/sh\n" + body + "\n").encode("utf-8"))
+    shim.chmod(0o755)
+    return shim
+
+
+def test_bash_launcher_does_not_require_python3_on_path(tmp_path):
+    """./blueprint must run where the interpreter is named `python`.
+
+    The launcher was a bare `exec python3 scripts/blueprint.py`. Under Git Bash
+    on Windows the Python installer provides `python` and no `python3` at all,
+    so the documented Unix entrypoint died with "exec: python3: not found" on a
+    host where a perfectly good interpreter was on PATH. Every operator command
+    routed through ./blueprint was unavailable on that platform.
+
+    Exercised against a minimal fake checkout rather than the real one so the
+    assertion is about the discovery ladder and nothing else: a real repo may
+    carry backend/.venv, which the ladder consults first and which would let
+    this pass without ever reaching PATH.
+    """
+    bash = shutil.which("bash")
+    assert bash, "these launcher tests need bash; it is the launcher's shebang"
+
+    fake_repo = tmp_path / "repo"
+    (fake_repo / "scripts").mkdir(parents=True)
+    shutil.copyfile(os.path.join(REPO_ROOT, "blueprint"), fake_repo / "blueprint")
+    (fake_repo / "scripts" / "blueprint.py").write_bytes(
+        b'print("STUB CLI REACHED")\n'
+    )
+
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    # A `python3` that exists but cannot run: the ladder must reject it on the
+    # version probe and keep walking rather than selecting it and dying later.
+    # It also shadows any real /usr/bin/python3 on a Linux CI runner, so the
+    # "no python3 available" premise holds wherever this test runs.
+    _write_shim(shims, "python3", "exit 127")
+    _write_shim(shims, "python", 'exec "%s" "$@"' % sys.executable.replace("\\", "/"))
+
+    env = dict(os.environ)
+    env.pop("BLUEPRINT_PYTHON", None)
+    env["PATH"] = str(shims) + os.pathsep + env.get("PATH", "")
+
+    result = subprocess.run(
+        [bash, str(fake_repo / "blueprint"), "--json", "status"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"launcher exited {result.returncode}\nstdout={result.stdout}\n"
+        f"stderr={result.stderr}"
+    )
+    assert "STUB CLI REACHED" in result.stdout, result.stdout
+
+
+def test_bash_launcher_reports_a_bad_blueprint_python_instead_of_falling_back(
+    tmp_path,
+):
+    """An explicit override that does not work is an error, not a suggestion.
+
+    Silently falling through to some other interpreter would run the operator's
+    command under an environment they did not choose -- the wrong venv, the
+    wrong dependency set -- and report success.
+    """
+    bash = shutil.which("bash")
+    assert bash, "these launcher tests need bash; it is the launcher's shebang"
+
+    env = dict(os.environ)
+    env["BLUEPRINT_PYTHON"] = str(tmp_path / "no-such-interpreter")
+
+    result = subprocess.run(
+        [bash, os.path.join(REPO_ROOT, "blueprint"), "--help"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 1, result.stdout
+    assert "BLUEPRINT_PYTHON" in result.stderr, result.stderr
+
+
+def test_bash_launcher_honours_an_explicit_interpreter(tmp_path):
+    """End-to-end: the real launcher reaches the real CLI via the override."""
+    bash = shutil.which("bash")
+    assert bash, "these launcher tests need bash; it is the launcher's shebang"
+
+    env = dict(os.environ)
+    env["BLUEPRINT_PYTHON"] = sys.executable
+
+    result = subprocess.run(
+        [bash, os.path.join(REPO_ROOT, "blueprint"), "--help"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Unified Blueprint operator CLI" in result.stdout
+
+
+def test_bash_and_powershell_launchers_offer_the_same_interpreters():
+    """Both launchers must resolve Python the same way, in the same order.
+
+    The two entrypoints are documented as equivalent. When only the PowerShell
+    side grew a discovery ladder, the bash side silently became Linux-only.
+    """
+    bash_source = (Path(REPO_ROOT) / "blueprint").read_text()
+    ps_source = (Path(REPO_ROOT) / "blueprint.ps1").read_text()
+
+    assert "exec python3 " not in bash_source, (
+        "the bare `exec python3` form assumes a name that does not exist on "
+        "Windows; use the discovery ladder"
+    )
+    for candidate in ("BLUEPRINT_PYTHON", "backend/.venv", "python3", "py -3"):
+        assert candidate in bash_source, candidate
+    for candidate in ("BLUEPRINT_PYTHON", r"backend\.venv", '"py"'):
+        assert candidate in ps_source, candidate
+    for launcher_source in (bash_source, ps_source):
+        assert ".codex-worktrees" in launcher_source, (
+            "a linked worktree has no venv of its own and must reuse the main "
+            "checkout's interpreter"
+        )
 
 
 def test_blueprint_powershell_launcher_contract_is_platform_neutral():
