@@ -1552,8 +1552,20 @@ async def sweep_decay_stale_unlinked_blocker_messages(
 # operator-visible outcome distinct from both 'pending' (in flight) and a
 # genuine 'responded' resolution. A message that IS claimed is owned by
 # conversation_coordinator's lease-expiry/reclaim path, not this sweep — a
-# live or expired-but-claimed lease can still be recovered by a replacement
-# generation.
+# live lease can still be completed, and a just-expired one can still be
+# recovered by a replacement generation.
+#
+# That hand-off was, for a long time, a hand-off to nobody. "Lease expiry"
+# in conversation_coordinator only makes a turn *eligible* to be re-claimed;
+# it releases nothing. Every completion route (complete_claimed_public_turn,
+# the typed Fast completion, and the generic admin reply path) refuses an
+# expired lease outright, so once a claimant died or simply moved on without
+# replying, the row sat at handling_state='claimed' with a dead lease and no
+# route could ever finish it — while this sweep skipped it on the belief the
+# coordinator owned it. Both sides deferred to the other and nothing was ever
+# emitted saying why. ``sweep_release_expired_conversation_claims`` below
+# closes that gap by actually releasing a provably dead claim back to PENDING
+# (with a recorded reason), which then makes this sweep the real backstop.
 #
 # Three shapes look identical to a naive predicate but have a designed answer
 # path that runs LATER, so they are deliberately outside this sweep:
@@ -1594,6 +1606,13 @@ STRANDED_CONVERSATION_MESSAGE_AFTER_MINUTES = 15
 # Must exceed the cadence backstop ``strategic_max_interval_minutes`` (default
 # 1440) — the effective value below takes the max of the two plus a grace hour.
 STRANDED_DEFERRED_CONVERSATION_MESSAGE_AFTER_MINUTES = 1_500
+
+# Default window after a conversation claim's lease has expired (or after a
+# lease-less legacy claim was last touched) before the claim is treated as
+# provably dead and released back to PENDING. conversation_coordinator clamps
+# every lease to at most 300 seconds and a live turn renews continuously, so a
+# lease this far past its expiry cannot belong to a running worker.
+EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES = 15
 
 # Context markers that take a row out of this sweep (or into the deferred
 # window). Resolved from the canonical definitions so a rename upstream breaks
@@ -1678,6 +1697,137 @@ def _stranded_naive_utc(value: datetime) -> datetime:
     return _coerce(value)
 
 
+async def sweep_release_expired_conversation_claims(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 25a: return provably dead operator conversation claims to PENDING.
+
+    Incident: operator messages sat at ``handling_state='claimed'`` forever,
+    held by a Resident task that simultaneously reported "waiting for operator
+    input". An expired claim lease releases NOTHING; it only permits a
+    re-claim, every completion route refuses an expired lease, and Step 25
+    skips claimed rows -- so the claim was uncompletable, released by none,
+    and silent. Counts the death in ``_conversation_turn_dead_claims`` so the
+    coordinator bound (``_OPERATOR_TURN_MAX_DEAD_CLAIMS``) ends a hopeless
+    re-claim loop in a park. ``conversation_claim_attempt`` is preserved.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.conversation_coordinator import (
+        _OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY,
+        reset_conversation_claim_for_session_handoff,
+    )
+    from app.models import MessageHandlingState, MessageSurface, ProjectMessage
+    from app.project_message_projection import message_updated_event_payload
+    from app.shared_state import runtime_config
+
+    release_after_minutes = int(
+        runtime_config.get(
+            "expired_conversation_claim_release_after_minutes",
+            EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES,
+        )
+    )
+    cutoff = now - timedelta(minutes=release_after_minutes)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.surface == MessageSurface.CONVERSATION,
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.status == "open",
+                    ProjectMessage.handling_state == MessageHandlingState.CLAIMED,
+                    # A row touched recently may be mid-claim; only a claim
+                    # that is stale on BOTH clocks is provably abandoned.
+                    ProjectMessage.updated_at <= cutoff,
+                    or_(
+                        # Legacy/lease-less claim: no completion route accepts
+                        # a NULL expiry, so it is dead on arrival.
+                        ProjectMessage.conversation_claim_expires_at.is_(None),
+                        ProjectMessage.conversation_claim_expires_at <= cutoff,
+                    ),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] expired-conversation-claim release sweep hit cap=%d — "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    released = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        if _stranded_sweep_is_excluded(dict(msg.context or {})):
+            continue
+        expired_at = msg.conversation_claim_expires_at
+        prior_task_id = msg.handled_by_task_id
+        attempt = int(msg.conversation_claim_attempt or 0)
+        prior_deaths = (msg.context or {}).get(_OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY)
+        deaths = int(prior_deaths or 0) + 1
+        reason = (
+            "claim lease "
+            + (
+                f"expired at {_stranded_naive_utc(expired_at).isoformat()}"
+                if expired_at is not None
+                else "was never recorded (legacy lease-less claim)"
+            )
+            + f" and no worker completed or reclaimed the turn; attempt={attempt}"
+            + f", dead_claims={deaths}"
+            + (f", last claimant task={prior_task_id}" if prior_task_id else "")
+            + "; released to PENDING for redelivery"
+        )
+        reset_conversation_claim_for_session_handoff(msg)
+        msg.handling_state = MessageHandlingState.PENDING
+        msg.handled_by_task_id = None
+        msg.context = {
+            **dict(msg.context or {}),
+            "_conversation_claim_released_at": now.isoformat(),
+            "_conversation_claim_release_reason": reason,
+            _OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY: deaths,
+        }
+        msg.updated_at = now
+        session.add(msg)
+        released += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] Step 25a: released expired conversation claim on message "
+            "%s (%s)",
+            msg.id,
+            reason,
+        )
+
+    if released:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 25a: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 25a: released %d expired conversation claim(s)",
+            released,
+        )
+    return released
+
+
 async def sweep_fail_stranded_pending_conversation_messages(
     session,
     now: datetime,
@@ -1709,11 +1859,11 @@ async def sweep_fail_stranded_pending_conversation_messages(
 
     System-authored rows (Workday consultation packets and results, whose claim
     lives in context) and the synthetic resident-activation prompt are excluded
-    outright. Disjoint from conversation_coordinator's claim-lease-expiry path:
-    any message that has been claimed (even with an expired lease) is left
-    alone so a replacement generation can still reclaim it. Fail-safe per
-    message, idempotent (the transition moves handling_state off PENDING), and
-    broadcasts a ``message_updated`` envelope per swept row.
+    outright. Currently-claimed rows are skipped so a replacement generation
+    can still reclaim them; a claim whose lease is provably dead is first
+    returned to PENDING by Step 25a, which is what makes this the real terminal
+    backstop. Fail-safe per message, idempotent (the transition moves
+    handling_state off PENDING), broadcasts ``message_updated`` per swept row.
 
     Returns the number of messages swept to 'failed'.
     """

@@ -87,6 +87,10 @@ from app.time_utils import (
     exponential_backoff,
     set_retry_after,
 )
+from app.operator_failure_messages import (
+    compose_provision_failure_message,
+    compose_requeue_status_message,
+)
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 from app.reaper_post_orphan_sweep import run_post_orphan_sweep
 
@@ -337,6 +341,7 @@ from app.reaper_sweeps import (
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
     sweep_fail_stranded_pending_conversation_messages,
+    sweep_release_expired_conversation_claims,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
@@ -1539,9 +1544,22 @@ async def reaper_service():
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
                             task.started_at = None
-                            task.latest_status_message = (
-                                "Dead OAuth session — account hard-disabled; "
-                                "requeued onto different account"
+                            # Same "surface reasons, not states" rule as the
+                            # agent-status requeue paths: the disposition leads,
+                            # but the evidence the reaper is holding right now
+                            # (``reap_reason`` — heartbeat age, last tools, the
+                            # pre-claim death window) is real diagnosis and used
+                            # to be dropped on the floor here. Only reap_reason
+                            # is appended; feeding the PREVIOUS
+                            # latest_status_message back in would compound the
+                            # message on every successive reap.
+                            task.latest_status_message = compose_requeue_status_message(
+                                reap_reason,
+                                disposition=(
+                                    "Dead OAuth session — account "
+                                    "hard-disabled; requeued onto "
+                                    "different account"
+                                ),
                             )
                             da_ctx = dict(task.context or {})
                             if da_acct_id:
@@ -1593,7 +1611,13 @@ async def reaper_service():
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
                             task.started_at = None
-                            task.latest_status_message = "Rate limited — requeued with exhausted account blacklisted"
+                            task.latest_status_message = compose_requeue_status_message(
+                                reap_reason,
+                                disposition=(
+                                    "Rate limited — requeued with "
+                                    "exhausted account blacklisted"
+                                ),
+                            )
                             # Blacklist the exhausted account; let the orchestrator pick another
                             # from the pool on the next cycle. If all accounts are rate-limited,
                             # the orchestrator handles that case by skipping the task and retrying
@@ -2404,39 +2428,27 @@ async def reaper_service():
                                 task.vm_stopped_at = _utcnow()
                             if is_provision_failure:
                                 ctx = task.context or {}
-                                provision_zone = ctx.get(
-                                    "provision_zone", "unknown zone"
-                                )
-                                blacklisted_accounts = (
-                                    ctx.get("blacklisted_accounts", []) or []
-                                )
-                                sticky_accounts = (
-                                    ctx.get("provision_failed_accounts", []) or []
-                                )
-                                all_blocked = list(
-                                    {*blacklisted_accounts, *sticky_accounts}
-                                )
-                                acct_id = get_task_llm_account_id(ctx) or "no account"
-                                gcp_error = provision_err or "no GCP error captured"
-                                gcp_error_short = gcp_error[:200]
-                                # Distinguish: VM created but agent died vs. GCP API failure.
-                                # vm_provisioned_at is the fact that discriminates — it is set
-                                # exactly when the cloud created the VM. provision_zone is only
-                                # a label: a pre-claim death can leave it unresolved, so it must
-                                # not drive the classification.
-                                if task.vm_provisioned_at:
-                                    label = "Agent startup failed"
-                                    detail = f"VM created in {provision_zone} but agent never claimed task"
-                                    if all_blocked:
-                                        detail += f" (blacklisted {len(all_blocked)} account(s))"
-                                else:
-                                    label = "Provision failed"
-                                    detail = f"GCP error: {gcp_error_short}"
+                                # Substrate FIRST, zone/GCP fields only after.
+                                # Blueprint's fleet is three local bwrap runners;
+                                # a runner death has no zone and no GCP error, so
+                                # the old unconditional wording pointed operators
+                                # at "zone: unknown zone" / "GCP error: no GCP
+                                # error captured" for tasks 82eb352a and 4cd822c3
+                                # that in fact died on hamsterwheel with a real
+                                # agent_failure_category_raw in context.
                                 task.latest_status_message = (
-                                    f"{label} {provision_failures}x — "
-                                    f"zone: {provision_zone}, acct: {acct_id}. "
-                                    f"{detail}. "
-                                    f"Last reap: {reap_reason}"
+                                    compose_provision_failure_message(
+                                        vm_instance_id=task.vm_instance_id,
+                                        context=ctx,
+                                        vm_provisioned_at=task.vm_provisioned_at,
+                                        provision_failures=provision_failures,
+                                        account_id=(
+                                            get_task_llm_account_id(ctx)
+                                            or "no account"
+                                        ),
+                                        provision_error=provision_err,
+                                        reap_reason=reap_reason,
+                                    )
                                 )
                             else:
                                 task.latest_status_message = f"{fail_reason.capitalize()} — last reap: {reap_reason}"
@@ -3663,12 +3675,40 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Step 25a: Expired conversation-claim release sweep — an
+                # expired claim lease grants re-claim ELIGIBILITY but releases
+                # nothing, and every completion route refuses an expired lease,
+                # so a claim whose worker died (or moved on without replying)
+                # was uncompletable by all paths and releasable by none. Return
+                # such a claim to PENDING with a recorded reason so redelivery,
+                # the coordinator's dead-claim bound, and finally Step 25 can
+                # each act. Must run BEFORE Step 25, which only sees PENDING.
+                _mark_reaper_progress()
+                try:
+                    _claims_released = await sweep_release_expired_conversation_claims(
+                        session, now
+                    )
+                    if _claims_released:
+                        logger.info(
+                            "[REAPER] Step 25a: released %d expired conversation "
+                            "claim(s)",
+                            _claims_released,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Expired-conversation-claim release sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 25: Stranded conversation message failure sweep — age out
                 # unclaimed PENDING conversation-surface messages (no runner ever
                 # claimed them, e.g. the selected runner is dead) after a bounded
                 # window so the operator gets a terminal, visible 'failed' state
-                # instead of silent, permanent PENDING. Claimed messages are left
-                # to conversation_coordinator's lease-expiry/reclaim path.
+                # instead of silent, permanent PENDING. A previously-claimed
+                # message reaches this sweep once Step 25a releases its dead lease.
                 _mark_reaper_progress()
                 try:
                     _stranded_failed = await sweep_fail_stranded_pending_conversation_messages(

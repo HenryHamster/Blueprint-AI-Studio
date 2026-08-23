@@ -19,6 +19,15 @@ TWO disposition paths, keyed on ``context.approval_hold_reason``:
     2h → ``FAILED`` behavior, with classification, failure alert, and a bounded
     defer while the review/fix chain is still actively working the PR.
 
+Inside that second path the disposition forks AGAIN on whether the hold has a PR
+behind it. Every non-destructive branch below — the merged-PR reconcile, the
+churn-halt respawn, the preserve-for-handmerge latch — derives a PR number first
+and no-ops without one, so an approval hold carrying NO PR at all used to fall
+straight through to ``FAILED``. For that shape the task row IS the work (nothing
+is durable on GitHub), which makes FAILing it the one disposition that actually
+destroys something. See ``app.recovery_evaluating_prless_hold`` (split out
+only to respect this module's size cap) — incident: research task ``70c5ec8f``.
+
 ``_handle_approval_gate_timeout`` takes the per-row locals it needs (``task``,
 ``ctx``, ``session``, ``now``) plus the runtime-config-derived spend-window
 values and returns ``True`` when it handled the row (the caller ``continue``s)
@@ -44,6 +53,10 @@ from app.admin_approval_authority import (
 from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
 from app.models import TaskStatus
 from app.spawn_calibration import SPEND_BUDGET_APPROVAL_HOLD_REASON
+from app.recovery_evaluating_prless_hold import (
+    _approval_hold_pr_number,
+    _hold_pr_less_approval_gate_timeout,
+)
 from app.recovery_evaluating_helpers import (
     _approval_gate_chain_busy,
     _dispatch_spend_hold_notification,
@@ -471,6 +484,22 @@ async def _handle_approval_gate_timeout(
 
         # Idempotent re-entry: already preserved on a prior sweep.
         if ctx.get("approval_timeout_preserved_for_handmerge"):
+            return True
+
+        # PR-LESS APPROVAL HOLD: the same non-destructive latch, for work that
+        # has no PR to hand-merge. Everything above this line needs a PR number
+        # and no-ops without one, so a hold carrying none fell straight through
+        # to the FAILED terminalization below — no alert-and-hold, no second
+        # sweep, no operator window.
+        if not _approval_hold_pr_number(task, ctx):
+            await _hold_pr_less_approval_gate_timeout(
+                task,
+                ctx,
+                session,
+                now,
+                approval_elapsed=approval_elapsed,
+                hours=hours,
+            )
             return True
 
         logger.error(

@@ -6367,6 +6367,268 @@ async def test_promote_release_branch_creation_failure_is_blocked(db_session, mo
     assert open_v.version_number == 1
 
 
+# ---------------------------------------------------------------------------
+# INCIDENT 2026-08-23 — "the engine never asks me for something it already has"
+#
+# `force-promote --candidate-sha 4b6681871` (9 chars) returned
+#   {"status": "promotion_failed", "error": "release_branch_failed", "conflict": false}
+# and `./blueprint status` showed  "detail": null.
+#
+# GitHub had answered "Object does not exist" and the engine held that string
+# the whole time.  Three defects compounded; these tests pin the two that are
+# observable end-to-end from promote() and force_promote_current_version().
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_promotion_failure_detail_reaches_the_operator_surface(
+    db_session, mocker
+):
+    """A branch-creation failure must carry GitHub's OWN reason all the way to
+    ``./blueprint status``.
+
+    The recorded detail used to be ``str(exc)[:300]``, which is the EMPTY STRING
+    for a keyword-constructed ``HTTPException`` — so ``_record_promotion_failure``'s
+    ``if detail:`` guard dropped the key and ``summarize_qualification_state``
+    reported ``detail: None``.  See testing/test_failure_reason.py for the
+    dependency-level pin of that behaviour.
+    """
+    from fastapi import HTTPException
+
+    _project, version = await _make_project_and_version(db_session)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    _patch_promote_github_defaults(mocker)
+    # EXACTLY what github_refs.create_branch now raises for GitHub's
+    # "Object does not exist" 422 — keyword-constructed, like every raise site.
+    mocker.patch(
+        "app.github.create_branch",
+        new=AsyncMock(
+            side_effect=HTTPException(
+                status_code=500,
+                detail=(
+                    "Failed to create branch 'release-v1' at '4b6681871' on "
+                    "GitHub (GitHub 422): Object does not exist"
+                ),
+            )
+        ),
+    )
+
+    result = await rq.promote(
+        db_session, version, "abcd" * 10, composite={"confidence": 0.9}
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promotion_failed"
+    assert result["error"] == "release_branch_failed"
+    # 1. The operator lever prints this dict straight back — it must not be a
+    #    state with no reason attached.
+    assert "Object does not exist" in result["detail"]
+
+    # 2. The persisted record carries it.
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["error"] == "release_branch_failed"
+    assert "Object does not exist" in lq["detail"]
+
+    # 3. ...and it survives the summarizer that `./blueprint status` reads.
+    summary = rv.summarize_qualification_state(lq)
+    assert summary["state"] == "promotion_failed"
+    assert summary["detail"] is not None, (
+        "a blocked promotion that reports no reason is the whole defect"
+    )
+    assert "Object does not exist" in summary["detail"]
+
+
+@pytest.mark.asyncio
+async def test_force_promote_resolves_an_abbreviated_candidate_sha(
+    db_session, mocker
+):
+    """REGRESSION for the incident: a 9-character ``--candidate-sha`` promotes.
+
+    ``git log`` prints abbreviated shas, so that is what an operator types.  The
+    engine holds the token, owner and repo, so it resolves the ref itself
+    instead of failing four layers deeper inside GitHub's ref-create API.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    full = "4b6681871a41b1b8955fc66b67f6b2790f692715"
+    abbreviated = "4b6681871"
+    merge_sha = "mainnew" * 5 + "00000"
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=full, main=merge_sha),
+    )
+    resolve_mock = mocker.patch(
+        "app.github.resolve_commit_sha", new=AsyncMock(return_value=full)
+    )
+    tree_mock = mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    _patch_promote_github_defaults(mocker)
+    branch_mock = mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={"merged": True, "message": "Merged", "sha": merge_sha}
+        ),
+    )
+    ci_mock = mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(
+                True,
+                {"state": "green", "resolved_sha": full, "detail": "ci green"},
+            )
+        ),
+    )
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        candidate_sha=abbreviated,
+        actor="operator-1",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted", result
+
+    # The operator's ref was resolved ONCE, at the entry point...
+    assert resolve_mock.await_count == 1
+    assert resolve_mock.call_args.args[3] == abbreviated
+    # ...so every downstream consumer keyed off the FULL sha, never the
+    # abbreviation that GitHub's ref-create API rejects.
+    assert tree_mock.call_args.args[3] == full
+    assert ci_mock.call_args.args[2] == full
+    assert branch_mock.call_args.args[4] == full
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_force_promote_reports_an_unresolvable_candidate_sha_precisely(
+    db_session, mocker
+):
+    """A ref the engine genuinely cannot resolve is an operator error — and it
+    is reported HERE, with GitHub's own message, before any branch is cut."""
+    from fastapi import HTTPException
+
+    project, _version = await _make_project_and_version(db_session, phase="stabilize")
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.resolve_commit_sha",
+        new=AsyncMock(
+            side_effect=HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not resolve 'nope' to a full 40-character commit sha "
+                    "(GitHub 422: No commit found for SHA: nope)."
+                ),
+            )
+        ),
+    )
+    branch_mock = mocker.patch("app.github.create_branch", new=_create_branch_mock())
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        candidate_sha="nope",
+        actor="operator-1",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "sha_error"
+    assert "No commit found for SHA" in result["detail"], (
+        "the operator must be told WHY, not just that it failed"
+    )
+    branch_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_force_promote_does_not_re_resolve_a_full_candidate_sha(
+    db_session, mocker
+):
+    """Guard on the fix's own regression risk: a full 40-hex sha must behave
+    exactly as it did before — no extra GitHub round-trip."""
+    project, _version = await _make_project_and_version(db_session, phase="stabilize")
+
+    full = "facec0de" * 5
+    merge_sha = "mainnew" * 5 + "00000"
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=full, main=merge_sha),
+    )
+    request_mock = mocker.patch("app.github._github_request", new=AsyncMock())
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={"merged": True, "message": "Merged", "sha": merge_sha}
+        ),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(
+                True,
+                {"state": "green", "resolved_sha": full, "detail": "ci green"},
+            )
+        ),
+    )
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        candidate_sha=full,
+        actor="operator-1",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted", result
+    # resolve_commit_sha short-circuits on a canonical sha, so the commits
+    # endpoint is never called.
+    for call in request_mock.call_args_list:
+        assert "/commits/" not in str(call), call
+
+
 @pytest.mark.asyncio
 async def test_promote_records_real_merge_sha_not_candidate(db_session, mocker):
     """The merge response SHA wins even if the target advances immediately."""

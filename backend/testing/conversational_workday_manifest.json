@@ -72,7 +72,7 @@
         "test_stale_workday_result_is_replaced_by_neutral_terminal_result",
         "test_missing_handoff_recovers_but_deleted_source_publishes_nothing"
       ],
-      "test_count": 3
+      "test_count": 4
     },
     {
       "path": "backend/testing/test_conversation_coordinator_two_speed.py",
@@ -80,7 +80,7 @@
       "test_ids": [
         "test_workday_empty_result_retries_once_then_creates_terminal_failure"
       ],
-      "test_count": 14
+      "test_count": 17
     },
     {
       "path": "backend/testing/test_strategic_resident_continuous_liveness.py",
@@ -210,7 +210,7 @@
         "uses server availability when a Continuous session has no activity snapshot yet",
         "renders one bounded, server-derived status line with full detail in its title"
       ],
-      "test_count": 22
+      "test_count": 23
     },
     {
       "path": "admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx",
@@ -280,7 +280,7 @@
         "treats message / reasoning / kind-less as reply, activity kinds as not",
         "builds the bubble from reply-kind deltas only (activity noise excluded)"
       ],
-      "test_count": 38
+      "test_count": 41
     },
     {
       "path": "admin-ui/src/utils/pendingAttachmentStore.test.ts",
@@ -1086,7 +1086,7 @@
         "test_classify_orphan_resident_session_exempt_from_progress_staleness",
         "test_classify_resident_session_warm_idle_not_reaped"
       ],
-      "test_count": 484
+      "test_count": 486
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",

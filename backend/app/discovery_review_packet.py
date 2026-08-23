@@ -41,6 +41,71 @@ DISCOVERY_REVIEW_URI_CHARS = 1_000
 DISCOVERY_REVIEW_BLOCKED_GRACE = timedelta(hours=2)
 DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS = 3
 DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS = 2_000
+# The smallest per-item slice of the digest budget that still reads as a
+# representation of that item rather than a stub. An omitted item is
+# "covered" when it is either reproduced in full or reproduced at no less
+# than this; only a cohort so numerous that even this floor cannot be paid
+# for every item leaves an item genuinely unaccounted for.
+DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS = 40
+# Which top-level snapshot keys carry decision authority -- the content the
+# reviewer must hold whole to bind advance/park/stop instead of handing the
+# question back to a human. Everything outside these sets is framing the
+# packet supplies by other means, so shortening it costs legibility, never
+# authority. See _bounded_decision_snapshot for why that distinction exists.
+#
+# The bet set is exactly the successor bet contract (``_NEXT_BET_KEYS`` in
+# discovery_review.py). It is restated here rather than imported because
+# discovery_review imports this module, and it is pinned equal to that
+# contract by test_discovery_review_packet_budget.py so the two cannot drift.
+#   * ``claim`` and ``decision_question`` are the proposition under judgement
+#     and the literal question the verdict answers; a cut changes what was
+#     asked.
+#   * ``success_evidence`` and ``retirement_condition`` are the bars for "it
+#     worked" and "stop", pre-registered before the evidence existed. Scoring
+#     evidence against a truncated bar is exactly the authority loss this gate
+#     is for.
+#   * ``mode`` (research/measure/build) decides which evidence even counts. It
+#     is one short token and never at risk; it is listed for completeness.
+# Deliberately excluded from the bet set:
+#   * ``direction`` -- direction_authority_snapshot(...), and the field that
+#     actually overflows, because it carries ``research_context``, the
+#     accumulated outcome memory research completion rewrites and grows every
+#     generation. Its identifying text reaches this reviewer twice over
+#     without it: the generation-one ``claim`` is the commissioned question
+#     or, when there is none, ``direction["text"]`` itself bounded to 2,000
+#     chars, and the receipt's ``source_parent.title`` is literally
+#     ``"Research: {direction_text}"``. When that parent is absent
+#     the packet already records missing required evidence on its own, so
+#     there is no case in which shortening ``direction`` is the reviewer's
+#     only loss. It is a mapping, so it is bounded field-aware in turn and its
+#     own proof contract (``context.success_evidence``,
+#     ``context.retirement_condition``) survives even when its prose does not.
+#   * ``alternatives`` -- a list of at most 12 options the review *may*
+#     propose. No backend code reads it; ``_normalize_next_bet`` does not
+#     constrain an ``advance`` to it. Losing options narrows imagination, not
+#     authority.
+DISCOVERY_REVIEW_BET_AUTHORITY_KEYS = frozenset(
+    {
+        "mode",
+        "claim",
+        "decision_question",
+        "success_evidence",
+        "retirement_condition",
+    }
+)
+# The intent snapshot (built in discovery_admission.ensure_discovery_cycle_for_research)
+# is framing rather than contract, with two exceptions the verdict is measured
+# against: the decision rule asks whether the work created *goal-relevant*
+# progress, so ``release_goal`` and the operator-authored ``user_purpose`` are
+# what "relevant" is judged against and must arrive whole. Excluded:
+# ``project_name``, ``purpose_source``, ``problem_model_revision`` and
+# ``release_version_id`` are identifiers and provenance, short enough to ride
+# whole anyway and not judgement inputs; ``constraints`` and
+# ``project_context`` are the unbounded operator-authored problem-model maps
+# that overflow this budget, and they bind whoever builds the next bet rather
+# than the verdict on this one; ``running_update_excerpt`` is already an
+# excerpt, bounded to 2,000 chars at the source.
+DISCOVERY_REVIEW_INTENT_AUTHORITY_KEYS = frozenset({"release_goal", "user_purpose"})
 DISCOVERY_REVIEW_RESEARCH_DETAILS = 6
 DISCOVERY_REVIEW_KNOWLEDGE_DETAILS = 6
 DISCOVERY_REVIEW_LANDED_OUTCOMES = 4
@@ -104,21 +169,319 @@ def _checksum(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _bounded_decision_snapshot(value: Any) -> tuple[dict[str, Any], bool]:
+def _json_cost(value: Any) -> int:
+    """Exact characters ``value`` contributes to a canonical JSON rendering."""
+
+    return len(_canonical_json(value))
+
+
+def _snapshot_value_text(value: Any) -> str:
+    """The prose form of a snapshot value, for when it has to be shortened.
+
+    Strings are shortened as themselves rather than as their quoted JSON so a
+    cut ``claim`` still reads as a sentence; everything else is shortened as
+    its canonical JSON so structure stays visible.
+    """
+
+    return value if isinstance(value, str) else _canonical_json(value)
+
+
+def _fit_json_text(text: str, budget: int) -> str:
+    """Longest ellipsis-marked prefix of ``text`` that *renders* inside ``budget``.
+
+    The budget is spent on the rendered form, not the raw one. JSON escaping
+    expands quotes, backslashes and control characters, so a raw-character
+    prefix is not a rendered-character bound: the pre-fix code cut a
+    canonical-JSON prefix at exactly the cap and then re-encoded that prefix
+    as a JSON string, which re-escaped every quote it had just copied, so the
+    emitted snapshot could exceed the very cap it was cut to. Binary search on
+    the prefix length is exact because escaping is per-character, which makes
+    the rendered cost monotonic in the prefix length.
+    """
+
+    if _json_cost(text) <= budget:
+        return text
+    if budget < _json_cost("…"):
+        # Not even a bare marker fits. The key still has to be present, so
+        # emit the empty string; the caller has already reserved its 2 chars.
+        return ""
+    low, high, best = 0, len(text), "…"
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = text[:mid] + "…"
+        if _json_cost(candidate) <= budget:
+            best, low = candidate, mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def _fit_snapshot_value(value: Any, budget: int, *, depth: int) -> tuple[Any, bool]:
+    """Bound one snapshot value to ``budget`` rendered chars.
+
+    Returns the bounded value and whether it was carried whole. A mapping
+    that does not fit is bounded field-aware in turn rather than flattened to
+    a prefix, so a nested authority envelope keeps all of its own keys -- this
+    is what preserves ``direction.context`` (the generation-one proof
+    contract: success_evidence, retirement_condition,
+    implementation_constraints) even when the direction's prose cannot fit.
+    """
+
+    if _json_cost(value) <= budget:
+        return value, True
+    if depth > 0 and isinstance(value, Mapping):
+        nested = _fit_mapping(value, budget, depth=depth - 1)
+        if nested is not None:
+            return nested[0], False
+    if depth > 0 and isinstance(value, list):
+        # Same reason as the mapping branch, one container down: a list that
+        # does not fit keeps its items and its length rather than collapsing
+        # into a JSON prefix that stops mid-element. A bet's ``alternatives``
+        # is the shape this exists for -- twelve options the reviewer weighs
+        # against the claim, of which a prefix cut would silently show four.
+        items = _fit_sequence(value, budget, depth=depth - 1)
+        if items is not None:
+            return items, False
+    return _fit_json_text(_snapshot_value_text(value), budget), False
+
+
+def _fit_sequence(
+    source: list[Any], budget: int, *, depth: int
+) -> list[Any] | None:
+    """Bound a list into ``budget`` rendered chars while keeping every item.
+
+    Returns ``None`` when the brackets, commas and one empty string per item
+    already exceed the budget, in which case no item-wise form exists at this
+    size and the caller falls back to a prefix of the rendered list.
+    """
+
+    items = list(source)
+    if not items:
+        return [] if budget >= 2 else None
+    # Exact frame cost: the two brackets and one comma between consecutive
+    # items. The floor is the two quotes each item needs to render as at
+    # least the empty string.
+    frame = 2 + len(items) - 1
+    floor = 2 * len(items)
+    if frame + floor > budget:
+        return None
+    wants = [max(0, _json_cost(item) - 2) for item in items]
+    return [
+        _fit_snapshot_value(item, 2 + share, depth=depth)[0]
+        for item, share in zip(
+            items,
+            _fair_share_digest_budgets(wants, budget - frame - floor),
+            strict=True,
+        )
+    ]
+
+
+def _fit_mapping(
+    source: Mapping[str, Any],
+    budget: int,
+    *,
+    authority_keys: frozenset[str] = frozenset(),
+    depth: int = 1,
+) -> tuple[dict[str, Any], list[str], list[str]] | None:
+    """Bound ``source`` into ``budget`` rendered chars while keeping every key.
+
+    Returns the bounded mapping, the keys that could not be carried whole,
+    and the subset of those cut below the legibility floor -- or ``None`` when
+    the key names plus one empty-string value each already exceed the budget,
+    in which case no field-aware form exists at this size at all.
+
+    Budget is spent decision-first: the keys in ``authority_keys`` are served
+    from the whole budget by the same max-min fair split the omitted-evidence
+    digest uses, and only what they leave behind is shared out among the rest.
+    That ordering is the point of the function. Canonical JSON sorts keys, so
+    a flat prefix cut spends the budget alphabetically: a long ``direction``
+    or ``alternatives`` silently consumed ``mode``, ``retirement_condition``
+    and ``success_evidence``, which is why the human-facing render of the
+    stranded d-f502e1a5 bet showed ``mode=?``.
+    """
+
+    normalized = {str(key): value for key, value in source.items()}
+    keys = sorted(normalized)
+    if not keys:
+        return ({}, [], []) if budget >= 2 else None
+    # Exact frame cost: the two braces, one quoted key plus its colon per
+    # entry, and one comma between consecutive entries.
+    frame = 2 + sum(_json_cost(key) + 1 for key in keys) + len(keys) - 1
+    # Every value must render as at least the empty string, or its key cannot
+    # be present at all -- and keeping every key present is the whole contract
+    # this function exists to honour.
+    floor = 2 * len(keys)
+    if frame + floor > budget:
+        return None
+    spendable = budget - frame - floor
+    wants = {key: max(0, _json_cost(normalized[key]) - 2) for key in keys}
+    bearing = [key for key in keys if key in authority_keys]
+    ancillary = [key for key in keys if key not in authority_keys]
+    shares: dict[str, int] = {}
+    bearing_shares = _fair_share_digest_budgets(
+        [wants[key] for key in bearing], spendable
+    )
+    shares.update(zip(bearing, bearing_shares, strict=True))
+    shares.update(
+        zip(
+            ancillary,
+            _fair_share_digest_budgets(
+                [wants[key] for key in ancillary],
+                spendable - sum(bearing_shares),
+            ),
+            strict=True,
+        )
+    )
+    bounded: dict[str, Any] = {}
+    shortened: list[str] = []
+    elided: list[str] = []
+    for key in keys:
+        value_budget = 2 + shares[key]
+        fitted, whole = _fit_snapshot_value(
+            normalized[key], value_budget, depth=depth
+        )
+        bounded[key] = fitted
+        if whole:
+            continue
+        shortened.append(key)
+        if value_budget < DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS:
+            # Below the shared legibility floor the value has stopped being a
+            # shortened representation of the authored text and reads as a
+            # placeholder, so report it as elided rather than merely cut.
+            elided.append(key)
+    return bounded, shortened, elided
+
+
+def _bounded_decision_snapshot(
+    value: Any, *, authority_keys: frozenset[str]
+) -> tuple[dict[str, Any], bool, str | None]:
+    """Bound one frozen intent/bet snapshot without throwing its shape away.
+
+    Returns the bounded snapshot, whether anything had to be cut, and -- when
+    a decision-bearing key could not be carried whole -- the names of the keys
+    that were lost, for the caller's authority blocker.
+
+    This used to render the snapshot to canonical JSON and, on overflow,
+    discard the structured dict entirely in favour of an 8,000-character
+    prefix of that JSON. Canonical JSON sorts keys, so the prefix cut spent
+    the budget in alphabetical order: on a successor bet
+    (claim, decision_question, direction, mode, retirement_condition,
+    success_evidence) an accumulated ``direction`` -- which carries
+    ``research_context``, the outcome memory research completion rewrites and
+    grows every generation -- ate the bet's mode and both of its
+    pre-registered bars. Worse, the resulting boolean was fed straight into
+    ``authority_blockers``, which forced ``required_evidence_omitted`` and so
+    left ``ask_operator`` as the only permitted verdict. Direction d-f502e1a5
+    stranded at ``discovery_ask_operator_awaiting_resolution`` from
+    2026-08-19 across generations four and five that way, its rendered bet
+    degraded to ``mode=?``, asking a human for authority the engine was
+    holding intact in its own database.
+
+    The bound is now spent field-aware: every top-level key survives, short
+    values ride whole, long values are shortened with an explicit ellipsis,
+    and the keys that were cut are named in the emitted form. Authority is
+    revoked only when a *decision-bearing* key could not be carried whole --
+    never because an ancillary field had to be shortened.
+    """
+
     rendered = _canonical_json(value or {})
     if len(rendered) <= DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS:
         decoded = json.loads(rendered)
-        return (decoded if isinstance(decoded, dict) else {}), False
-    return (
-        {
-            "snapshot_truncated": True,
-            "excerpt": rendered[:DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS],
-            "original_checksum": hashlib.sha256(
-                rendered.encode("utf-8")
-            ).hexdigest(),
-        },
-        True,
+        return (decoded if isinstance(decoded, dict) else {}), False, None
+    checksum = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    decoded = json.loads(rendered)
+    if isinstance(decoded, dict) and decoded:
+        keys = sorted(decoded)
+        # The honesty bookkeeping is reserved at its worst case -- every key
+        # named in both lists -- before a single character of value budget is
+        # handed out, so the emitted form is inside the cap by construction
+        # and not by a trailing cut. (A source key colliding with one of these
+        # names would be overwritten rather than dropped; the snapshot
+        # builders in discovery_admission.py author none of them, and
+        # over-reserving for a key that turns out not to be extra is safe in
+        # the only direction that matters.)
+        #
+        # Past a few hundred keys that worst case is larger than the structure
+        # it is protecting, so a second, compact form reports the same two
+        # facts as counts. Naming four hundred shortened keys is not more
+        # honest than counting them, and the alternative -- falling through to
+        # the prefix excerpt, which revokes authority -- would be strictly
+        # worse than either. The blocker string is computed from the key names
+        # regardless of which form is emitted, so the operator is still told
+        # exactly which decision-bearing field was lost.
+        for names in (True, False):
+            bookkeeping: dict[str, Any] = (
+                {"snapshot_elided_keys": keys, "snapshot_shortened_keys": keys}
+                if names
+                else {
+                    "snapshot_elided_key_count": len(keys),
+                    "snapshot_shortened_key_count": len(keys),
+                }
+            )
+            reserved = sum(
+                1 + _json_cost(key) + 1 + _json_cost(sample)
+                for key, sample in (
+                    ("original_checksum", checksum),
+                    ("snapshot_truncated", True),
+                    *bookkeeping.items(),
+                )
+            )
+            fitted = _fit_mapping(
+                decoded,
+                DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS - reserved,
+                authority_keys=authority_keys,
+                # Two levels of field-aware descent, which is what the
+                # authored shapes need and no more: the bet's ``direction``
+                # envelope is one level down and its proof contract
+                # (``direction.context``) is two.
+                depth=2,
+            )
+            if fitted is None:
+                continue
+            bounded, shortened, elided = fitted
+            bounded.update(
+                {
+                    "original_checksum": checksum,
+                    "snapshot_truncated": True,
+                    **(
+                        {
+                            "snapshot_elided_keys": elided,
+                            "snapshot_shortened_keys": shortened,
+                        }
+                        if names
+                        else {
+                            "snapshot_elided_key_count": len(elided),
+                            "snapshot_shortened_key_count": len(shortened),
+                        }
+                    ),
+                }
+            )
+            # Post-join clamp. The allocation above proves the bound, but
+            # #17723 found a real bound breach in the sibling digest at high
+            # cardinality, so measure the joined form rather than trusting the
+            # arithmetic; a breach falls through to the excerpt form below,
+            # which is bounded by construction on a single string.
+            if _json_cost(bounded) > DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS:
+                continue
+            lost = sorted(set(shortened) & authority_keys)
+            return bounded, True, (", ".join(lost) if lost else None)
+    # Reached only when the snapshot is not a JSON object at all, or when its
+    # key names alone -- before any value gets a single character -- cannot
+    # fit the cap. No field-aware form exists at that size, so fall back to
+    # the historical excerpt and say outright that the structure is gone.
+    # Authority is revoked here, because what was lost is the shape the
+    # reviewer decides from, not one shortened field inside it.
+    fallback: dict[str, Any] = {
+        "snapshot_truncated": True,
+        "snapshot_structure_omitted": True,
+        "excerpt": "",
+        "original_checksum": checksum,
+    }
+    fallback["excerpt"] = _fit_json_text(
+        rendered,
+        DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS - (_json_cost(fallback) - 2),
     )
+    return fallback, True, "the snapshot structure itself"
 
 
 def _bounded_metadata(value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -319,6 +682,121 @@ def _semantic_excerpt(value: Mapping[str, Any], *, max_chars: int) -> str:
     return _semantic_text(value)[:max_chars]
 
 
+def _fair_share_digest_budgets(lengths: list[int], budget: int) -> list[int]:
+    """Max-min fair split of ``budget`` characters across ``lengths``.
+
+    Items that want less than an equal share are settled at exactly what they
+    want and their leftover is redistributed to the items still over-budget,
+    so a cohort of short entries plus one long one spends the whole budget on
+    the long one rather than reserving idle room for entries that never
+    needed it. Every returned share is non-negative and their sum never
+    exceeds ``budget``.
+    """
+
+    shares = [0] * len(lengths)
+    if budget <= 0 or not lengths:
+        return shares
+    remaining = budget
+    unresolved = list(range(len(lengths)))
+    while unresolved:
+        share = remaining // len(unresolved)
+        settled = [index for index in unresolved if lengths[index] <= share]
+        if not settled:
+            for index in unresolved:
+                shares[index] = share
+            break
+        for index in settled:
+            shares[index] = lengths[index]
+            remaining -= lengths[index]
+        settled_set = set(settled)
+        unresolved = [index for index in unresolved if index not in settled_set]
+    return shares
+
+
+def _fit_semantic_digest(omitted: list[dict[str, Any]]) -> dict[str, Any]:
+    """Represent *every* omitted item inside the fixed digest budget.
+
+    This digest is the only field that covers all omitted items -- the
+    ``omitted_semantic_index`` above samples just
+    ``DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS`` of them -- so it is what stops
+    an omitted item from reading to the reviewer as an absent one.
+
+    It used to be built by joining every item's untruncated text and hard
+    cutting the join at ``DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS``. That
+    front-to-back spend had two production consequences, both seen live on
+    2026-08-23 when five discovery directions stranded at ``ask_operator``
+    with ``landed_outcomes:kept_1_of_8``:
+
+    * one verbose entry pushed the tail entries out of the digest entirely,
+      which is exactly the silent absence the field exists to prevent; and
+    * the resulting "incomplete" flag revoked binding authority for the whole
+      packet, so the engine asked a human to hand-supply evidence it was
+      already holding in its own database.
+
+    The budget is therefore shared out per item instead. Each entry is either
+    reproduced in full or cut to its share and marked with a trailing
+    ellipsis, so the reviewer can always tell a shortened entry from a
+    complete one, and no entry ever vanishes while another is still whole.
+    """
+
+    texts = [_semantic_text(value) for value in omitted]
+    if not texts:
+        return {
+            "digest": "",
+            "source_chars": 0,
+            "prose_complete": True,
+            "item_coverage_complete": True,
+            "elided_item_count": 0,
+            "min_item_chars": DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS,
+        }
+    # One newline separates consecutive entries; that overhead comes out of
+    # the budget first, so the shares can never render past the cap (the one
+    # remaining way to exceed it -- separators alone outgrowing the cap -- is
+    # handled after the join below).
+    separators = len(texts) - 1
+    source_chars = sum(len(text) for text in texts) + separators
+    budget = max(0, DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS - separators)
+    shares = _fair_share_digest_budgets([len(text) for text in texts], budget)
+    entries: list[str] = []
+    elided = 0
+    for text, share in zip(texts, shares):
+        if len(text) <= share:
+            entries.append(text)
+            continue
+        elided += 1
+        # Spend one character of the share on the marker so a truncated entry
+        # is never mistaken for a short-but-complete one.
+        entries.append((text[: max(0, share - 1)] + "\u2026") if share > 0 else "")
+    covered = all(
+        len(text) <= share
+        or share >= DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS
+        for text, share in zip(texts, shares)
+    )
+    digest = "\n".join(entries)
+    if len(digest) > DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS:
+        # Only reachable at a cardinality where the separators alone exceed
+        # the cap (more than DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS + 1
+        # omitted items): the budget clamps to zero, every share is zero, and
+        # the join is a wall of newlines that would itself breach the bound
+        # this field exists to respect. Clamp it, and withdraw the coverage
+        # claim -- the tail items are not in the rendered field at any width.
+        digest = digest[:DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS]
+        covered = False
+    return {
+        "digest": digest,
+        "source_chars": source_chars,
+        # Exactly the historical semantic_digest_complete rule: the
+        # untruncated join of every omitted item's text fits the cap, i.e.
+        # every item is reproduced verbatim. This is equivalent to
+        # ``elided == 0`` for every cohort whose separators fit the cap, and
+        # is correctly False for the clamped cohorts above, where they do not.
+        "prose_complete": source_chars <= DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS,
+        "item_coverage_complete": covered,
+        "elided_item_count": elided,
+        "min_item_chars": min(shares),
+    }
+
+
 def _bounded_collection_coverage(
     values: list[dict[str, Any]],
     included: list[dict[str, Any]],
@@ -363,11 +841,7 @@ def _bounded_collection_coverage(
                 **provenance,
             }
         )
-    full_semantic_digest = "\n".join(_semantic_text(value) for value in omitted)
-    semantic_digest_complete = (
-        len(full_semantic_digest) <= DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS
-    )
-    semantic_digest = full_semantic_digest[:DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS]
+    digest = _fit_semantic_digest(omitted)
     return {
         "total_count": len(values),
         "included_count": len(included),
@@ -378,10 +852,19 @@ def _bounded_collection_coverage(
         "semantic_index_total_count": len(omitted),
         "semantic_index_included_count": len(sampled_omitted),
         "semantic_index_selection": "evenly_spaced_stable_order",
-        "full_semantic_digest": semantic_digest,
+        "full_semantic_digest": digest["digest"],
         "semantic_digest_item_count": len(omitted),
-        "semantic_digest_source_chars": len(full_semantic_digest),
-        "semantic_digest_complete": semantic_digest_complete,
+        "semantic_digest_source_chars": digest["source_chars"],
+        # Full prose fidelity: every omitted item reproduced verbatim. Kept at
+        # its historical meaning and still reported, but no longer what binding
+        # authority hangs on -- see the item-coverage flag below.
+        "semantic_digest_complete": digest["prose_complete"],
+        # The authority-bearing flag: every omitted item is accounted for, in
+        # full or at the readable per-item floor. False only when the cohort is
+        # so numerous that the floor cannot be paid for every item.
+        "semantic_digest_item_coverage_complete": digest["item_coverage_complete"],
+        "semantic_digest_elided_item_count": digest["elided_item_count"],
+        "semantic_digest_min_item_chars": digest["min_item_chars"],
         "semantic_digest_order": "stable_collection_order",
     }
 
@@ -578,8 +1061,13 @@ def _assemble_receipt(
 
     The authority invariant is derived exactly as at full detail:
     ``binding_decision_allowed`` is ``not binding_action_blockers``, and a
-    blocker exists only when some collection's ``semantic_digest_complete``
-    is False -- unaffected by how many per-collection details are included.
+    blocker exists only when some collection's
+    ``semantic_digest_item_coverage_complete`` is False -- that is, only when
+    an omitted item is genuinely unaccounted for, never merely because the
+    digest had to shorten an entry's prose. Gating on prose fidelity instead
+    is what stranded five directions at ``ask_operator`` on 2026-08-23: one
+    verbose finding revoked authority over a cohort whose evidence the engine
+    already held, and a human was asked to paste it back by hand.
 
     ``authority_blockers`` carries the caller's decision-snapshot blockers
     (a truncated intent/bet authority). They are unioned in here rather than
@@ -591,7 +1079,7 @@ def _assemble_receipt(
     incomplete_collections = [
         name
         for name, coverage in evidence_coverage.items()
-        if not coverage["semantic_digest_complete"]
+        if not coverage["semantic_digest_item_coverage_complete"]
     ]
     binding_action_blockers = list(authority_blockers) + (
         [
@@ -767,10 +1255,16 @@ async def build_discovery_review_packet(
     """Build one bounded semantic receipt for the settled research parent."""
 
     now = now or _utcnow()
-    bounded_intent, intent_truncated = _bounded_decision_snapshot(
-        cycle.intent_snapshot
+    bounded_intent, intent_truncated, intent_authority_lost = (
+        _bounded_decision_snapshot(
+            cycle.intent_snapshot,
+            authority_keys=DISCOVERY_REVIEW_INTENT_AUTHORITY_KEYS,
+        )
     )
-    bounded_bet, bet_truncated = _bounded_decision_snapshot(cycle.bet_snapshot)
+    bounded_bet, bet_truncated, bet_authority_lost = _bounded_decision_snapshot(
+        cycle.bet_snapshot,
+        authority_keys=DISCOVERY_REVIEW_BET_AUTHORITY_KEYS,
+    )
     tasks = list(
         (
             await session.execute(
@@ -833,24 +1327,38 @@ async def build_discovery_review_packet(
     stranded_deliveries: list[dict[str, Any]] = []
     missing: list[str] = []
     # A truncated intent/bet snapshot is bounded, not absent: the packet still
-    # carries a deterministic excerpt plus the full authority's checksum, and
-    # the manifest flags the truncation outright. It is also unresolvable by
-    # any amount of waiting -- the "missing" evidence is the direction's own
-    # length, which no task, retry, or agent can shrink -- so recording it as
+    # carries every top-level key of the authority, shortened where it had to
+    # be, plus the full authority's checksum, and the manifest flags the
+    # truncation outright. It is also unresolvable by any amount of waiting --
+    # the "missing" evidence is the direction's own length, which no task,
+    # retry, or agent can shrink -- so recording it as
     # missing_required_evidence held the cycle in EVIDENCE_PENDING forever and
     # silently starved the direction (no review spawned, no operator asked).
     # Treat it the way the packet already treats coverage that cannot fit the
     # bounded budget: forbid binding action and still dispatch one
     # operator-question decision. required_evidence_omitted stays True either
     # way, so the "only ask_operator is permitted" invariant is unchanged.
+    #
+    # What changed on 2026-08-23: the blocker no longer hangs on *whether*
+    # something was shortened, only on whether a decision-bearing key could
+    # not be carried whole. Gating on the mere fact of truncation is what
+    # stranded d-f502e1a5 at ask_operator across two generations from
+    # 2026-08-19: the field that overflowed was the accumulated ``direction``
+    # envelope, whose text the packet already hands the reviewer through
+    # ``claim`` and ``source_parent.title``, and the engine asked a human for
+    # authority it was holding intact. The named keys are appended to the
+    # blocker so an operator reading the manifest can see which part of the
+    # authority was actually lost, instead of only that some part was.
     authority_blockers: list[str] = []
-    if intent_truncated:
+    if intent_authority_lost:
         authority_blockers.append(
-            "intent authority exceeds the bounded decision contract"
+            "intent authority exceeds the bounded decision contract: "
+            f"{intent_authority_lost}"
         )
-    if bet_truncated:
+    if bet_authority_lost:
         authority_blockers.append(
-            "bet authority exceeds the bounded decision contract"
+            "bet authority exceeds the bounded decision contract: "
+            f"{bet_authority_lost}"
         )
     if source is None:
         missing.append("source research parent is missing from the discovery cohort")
@@ -1023,10 +1531,12 @@ async def build_discovery_review_packet(
         # This keeps as many collections' authored details visible as the
         # packet budget allows instead of zeroing every collection at once
         # the moment the full-detail form overflows. Coverage counts,
-        # checksums, sampled provenance, and complete authored semantic
-        # digests stay intact at every level so binding_decision_allowed
-        # keeps depending solely on whether coverage is semantically
-        # complete, never on which detail level was chosen.
+        # checksums, sampled provenance, and per-item semantic coverage stay
+        # intact at every level, so binding_decision_allowed keeps depending
+        # solely on whether every omitted item is accounted for, never on
+        # which detail level was chosen. Reducing the level moves items from
+        # included to omitted and so shortens their digest entries; that
+        # costs prose fidelity, which is reported, but not authority.
         for level, detail_counts in enumerate(
             _progressive_detail_levels(_COLLECTION_BASE_DETAIL_COUNTS), start=1
         ):
@@ -1079,6 +1589,9 @@ async def build_discovery_review_packet(
             coverage["semantic_index_included_count"] = 0
             coverage["full_semantic_digest"] = ""
             coverage["semantic_digest_complete"] = False
+            coverage["semantic_digest_item_coverage_complete"] = False
+            coverage["semantic_digest_elided_item_count"] = coverage["omitted_count"]
+            coverage["semantic_digest_min_item_chars"] = 0
         binding_action_blockers = list(authority_blockers) + [
             "complete authored semantic coverage cannot fit the bounded decision packet"
         ]

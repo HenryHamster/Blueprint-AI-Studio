@@ -54,6 +54,10 @@ import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 import app.orchestrator as _orch
 from app.broadcast import broadcast_to_project, _sanitize_log
+from app.operator_failure_messages import (
+    compose_agent_terminal_message,
+    compose_requeue_status_message,
+)
 from app.routers.agent import verify_agent_token
 from app.sr_blind_spots import filter_disallowed_blind_spots
 from app.max_plan_pool import (
@@ -667,6 +671,78 @@ def _sanitize_log_tail(text: str, max_chars: int) -> str:
     if len(sanitized) <= max_chars:
         return sanitized
     return sanitized[-max_chars:]
+
+
+def _compose_operator_status_message(payload: AgentStatusPayload) -> str:
+    """Durable operator-facing status text for an agent status report.
+
+    Guards two live defects where ``latest_status_message`` — the ONE line an
+    operator reads on a terminal task — contradicted or shadowed the
+    structured failure the very same payload carried:
+
+    * Task ``1745bab4`` (create, deepseek-v4-flash) stored a raw NDJSON
+      provider-stream fragment that began mid-token
+      (``se_id":null,"uuid":"21ba040c-..."} {"type":"stream_event",...``)
+      while ``failure_category`` on the same report said
+      ``blocked_precondition``. Zero operator signal.
+    * Task ``075854e6`` (create, claude-sonnet-4-6) stored "No uncommitted
+      changes found — the branch is clean ..." while ``failure_category``
+      said ``rate_limited``. Two mutually exclusive stories, and the surfaced
+      one was the wrong one.
+
+    Both came from persisting the agent's last free-text line verbatim. The
+    composer leads with the structured category (persisted a few hundred
+    lines below as ``context['agent_failure_category_raw']``) and keeps the
+    free text behind it, so the message states the true reason WITHOUT
+    throwing away the detail that explains it.
+
+    A 32000-char sanitized window is handed to the composer rather than the
+    8000 that lands in the column: when the tail is all stream frames, the
+    real diagnostic often sits just above them, and stripping first then
+    trimming recovers it. Secret redaction still happens here, before any
+    composition, so nothing unsanitized can reach the composer.
+    """
+    return compose_agent_terminal_message(
+        _sanitize_log_tail(payload.logs or "", 32000),
+        failure_category=(
+            payload.failure_category if payload.status == TaskStatus.FAILED else None
+        ),
+        max_chars=8000,
+    )
+
+
+def _compose_requeue_status_message(
+    payload: AgentStatusPayload, disposition: str
+) -> str:
+    """Durable operator-facing status text for a NON-TERMINAL requeue/park.
+
+    Every branch below that returns a task to QUEUED (or parks it on a warm
+    VM) used to overwrite ``latest_status_message`` with a synthesized state
+    string — ``f"{failure_class.replace('_', ' ').title()} — requeued"`` and
+    its siblings. ``Code Error — requeued`` tells an operator nothing about
+    what broke, and the agent's own explanation had arrived in THIS request:
+    ``_compose_operator_status_message`` had already composed it onto the row
+    a thousand lines earlier, and the overwrite threw it away. It survived
+    only in the banked ``attempt_history`` snapshot, and only because
+    ``bank_task_current_attempt`` runs before the overwrite.
+
+    *disposition* is the engine's own clause and still LEADS the message, so
+    the queue still reads "requeued, not abandoned" at a glance and the
+    substring-keyed classifier fallbacks keep matching the text they matched
+    before. The shared composer supplies everything behind it, so the requeue
+    path inherits the same provider-stream-frame stripping and the same
+    category-led ordering as the terminal path instead of re-deriving them.
+
+    Reached only from the FAILED branch, so ``payload.failure_category`` is
+    always the category for THIS failure (unlike the terminal helper, which
+    also serves no-artifact COMPLETED reports and must suppress it there).
+    """
+    return compose_requeue_status_message(
+        _sanitize_log_tail(payload.logs or "", 32000),
+        failure_category=payload.failure_category,
+        disposition=disposition,
+        max_chars=8000,
+    )
 
 
 _STOPWORDS = frozenset(
@@ -1700,10 +1776,13 @@ async def update_agent_status(
     # '…' mock") almost always land at the tail of test/build output.
     # Head-slicing (previous 2000-char cap) was clipping off the useful
     # part and leaving boilerplate ("RUN v2.1.9", setup noise).
+    # The tail is composed, not stored raw: see
+    # _compose_operator_status_message for the two live cases (1745bab4,
+    # 075854e6) where the verbatim tail contradicted the reported category.
     if payload.logs and (
         not payload.artifact_type or payload.status == TaskStatus.FAILED
     ):
-        task.latest_status_message = _sanitize_log_tail(payload.logs, 8000)
+        task.latest_status_message = _compose_operator_status_message(payload)
     # Only the bounded, schema-validated helper provenance field may mint a
     # durable routing requirement. Raw logs/latest status remain useful for
     # classification, but model-authored text is never routing authority.
@@ -2790,7 +2869,9 @@ async def update_agent_status(
                                 if failure_class == "RATE_LIMIT"
                                 else "External API quota cooldown — parked on warm VM for alternate-account retarget"
                             )
-                            task.latest_status_message = park_msg
+                            task.latest_status_message = (
+                                _compose_requeue_status_message(payload, park_msg)
+                            )
                             ctx["blacklisted_accounts"] = park_blacklisted
                             ctx["parked_for_retarget"] = True
                             ctx["park_deadline"] = park_deadline.isoformat()
@@ -2828,8 +2909,9 @@ async def update_agent_status(
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
                         task.started_at = None
-                        task.latest_status_message = (
-                            f"{failure_class.replace('_', ' ').title()} — requeued"
+                        task.latest_status_message = _compose_requeue_status_message(
+                            payload,
+                            f"{failure_class.replace('_', ' ').title()} — requeued",
                         )
                         # For rate-limited tasks: check if any account is still available.
                         # If all are exhausted, set retry_after based on earliest recovery
@@ -2889,11 +2971,23 @@ async def update_agent_status(
                                 ).total_seconds() / 60
                                 set_retry_after(task, minutes_until)
                                 ctx = dict(task.context or {})
-                                task.latest_status_message = "Rate Limited — all accounts exhausted, waiting for recovery"
+                                task.latest_status_message = (
+                                    _compose_requeue_status_message(
+                                        payload,
+                                        "Rate Limited — all accounts exhausted, "
+                                        "waiting for recovery",
+                                    )
+                                )
                             else:
                                 set_retry_after(task, 5)
                                 ctx = dict(task.context or {})
-                                task.latest_status_message = "Rate Limited — all accounts exhausted, retrying in 5min"
+                                task.latest_status_message = (
+                                    _compose_requeue_status_message(
+                                        payload,
+                                        "Rate Limited — all accounts exhausted, "
+                                        "retrying in 5min",
+                                    )
+                                )
                         elif failure_class != "EXTERNAL_API":
                             task.retry_after_until = (
                                 None  # audit W1: column source of truth
@@ -3028,8 +3122,9 @@ async def update_agent_status(
                     task.context = ctx
                     task.status = TaskStatus.QUEUED
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                    task.latest_status_message = (
-                        "Dead auth session — requeued onto different account"
+                    task.latest_status_message = _compose_requeue_status_message(
+                        payload,
+                        "Dead auth session — requeued onto different account",
                     )
                     await _restore_resident_retry_binding(
                         task,
@@ -3074,7 +3169,9 @@ async def update_agent_status(
                 if payload.logs and (
                     not payload.artifact_type or payload.status == TaskStatus.FAILED
                 ):
-                    task.latest_status_message = _sanitize_log_tail(payload.logs, 8000)
+                    task.latest_status_message = _compose_operator_status_message(
+                        payload
+                    )
                 # Re-apply the structured error report (mirrors the pre-commit
                 # block at ~line 1075) so the normalize call below still sees
                 # it as the primary signal after session recovery.

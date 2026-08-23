@@ -109,9 +109,7 @@ _RELAND_ELIGIBLE_TERMINAL_STATUSES = frozenset(
 
 EvidenceState = Literal["landed", "stranded", "unknown"]
 Mergeability = Literal["clean", "conflicted", "not_applicable", "unknown"]
-ReachabilitySignal = Literal[
-    "merge_sha", "head_sha", "integration_history", "neither"
-]
+ReachabilitySignal = Literal["merge_sha", "head_sha", "integration_history", "rollup_subsumed", "neither"]
 
 ROLLUP_SUBSUMED_REASON = "content carried by a landed rollup ancestor"
 
@@ -1824,6 +1822,7 @@ async def sweep_approved_pr_stranding(
             evidence = ApprovedPrEvidence(
                 "landed",
                 "not_applicable",
+                reachability_signal="rollup_subsumed",
                 reason=ROLLUP_SUBSUMED_REASON,
                 rollup_subsumed=True,
             )

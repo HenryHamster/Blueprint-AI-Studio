@@ -39,6 +39,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import github, hotfix_policy, release_version
+from app.failure_reason import exception_reason
 from app.models import Project
 
 logger = logging.getLogger(__name__)
@@ -347,7 +348,7 @@ async def materialize_narrow_hotfix_candidate(
             "status": "commit_failed",
             "offending_files": [],
             "changed_files": paths,
-            "reason": f"{type(exc).__name__}: {exc}"[:300],
+            "reason": exception_reason(exc),
         }
     logger.warning(
         "[HOTFIX_NARROW] materialized narrow candidate %s on %s/%s@%s from "
@@ -417,7 +418,7 @@ async def check_hotfix_scope_preview(
                 token, owner, repo, integration_branch, live=True
             )
         except Exception as exc:  # noqa: BLE001
-            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+            return {"status": "sha_error", "detail": exception_reason(exc)}
     if not candidate_sha:
         return {"status": "sha_error", "detail": "empty candidate sha"}
     try:
@@ -425,7 +426,7 @@ async def check_hotfix_scope_preview(
             token, owner, repo, promotion_target, live=True
         )
     except Exception as exc:  # noqa: BLE001
-        return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+        return {"status": "sha_error", "detail": exception_reason(exc)}
     if not prior_deployed_sha:
         return {"status": "sha_error", "detail": "empty promotion-target sha"}
 

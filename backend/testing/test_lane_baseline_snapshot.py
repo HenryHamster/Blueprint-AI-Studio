@@ -137,6 +137,103 @@ class TestReadVersionLaneBaseline:
 
 class TestPersistVersionLaneBaseline:
     @pytest.mark.asyncio
+    async def test_version_baseline_persists_and_trends_convergence_counters(
+        self, db_session
+    ):
+        """Closed-version snapshots retain canonical outer-loop counters for trend use."""
+        from app.digest_metrics import compute_lane_baseline_trend
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        windows = [
+            (9, now - timedelta(days=30), now - timedelta(days=20), 4, True),
+            (10, now - timedelta(days=19), now - timedelta(days=10), 2, False),
+        ]
+        for version, opened, closed, merged_iteration, include_cap in windows:
+            original = make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                created_at=opened + timedelta(hours=1),
+            )
+            db_session.add(original)
+            await db_session.flush()
+            iteration_tasks = [
+                make_task(
+                    project_id=project.id,
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "review", "prompt": "baseline"}],
+                    context={
+                        "review_loop": {
+                            "pr_number": str(version),
+                            "original_task_id": str(original.id),
+                            "iteration": iteration,
+                        }
+                    },
+                    created_at=opened + timedelta(hours=iteration + 1),
+                )
+                for iteration in range(1, merged_iteration + 1)
+            ]
+            db_session.add_all(iteration_tasks)
+            if include_cap:
+                cap_original = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.COMPLETED,
+                    context={},
+                    created_at=opened + timedelta(hours=10),
+                )
+                db_session.add(cap_original)
+                await db_session.flush()
+                db_session.add(
+                    make_task(
+                        project_id=project.id,
+                        status=TaskStatus.FAILED,
+                        payloads=[{"type": "review", "prompt": "baseline"}],
+                        context={
+                            "review_loop": {
+                                "pr_number": f"{version}-cap",
+                                "original_task_id": str(cap_original.id),
+                                "iteration": 16,
+                            },
+                            "failure_detail": "review_cap_exhausted",
+                            "pr_rejected": True,
+                        },
+                        created_at=opened + timedelta(hours=11),
+                    )
+                )
+            await db_session.commit()
+
+            result = await persist_version_lane_baseline(
+                db_session,
+                project_id=project.id,
+                version_number=version,
+                opened_at=opened,
+                closed_at=closed,
+                terminal_status="promoted",
+            )
+            assert result is not None
+            assert result["baseline_def_version"] == "v2"
+            assert result["outer_loop_convergence"]["iteration_median"] is not None
+            assert "chains" not in result["lane_waste"]
+
+        latest = await _read_lane_baseline_row(db_session, project.id, 10)
+        prior = await _read_lane_baseline_row(db_session, project.id, 9)
+        assert latest is not None and prior is not None
+        assert latest["outer_loop_convergence"]["iteration_median"] == 2
+        assert prior["outer_loop_convergence"]["cap_exhausted_chain_count"] == 1
+        assert prior["outer_loop_convergence"]["terminal_outcome_counts"]["cap_exhausted"] == 1
+
+        trend = compute_lane_baseline_trend([latest, prior])
+        assert trend is not None
+        assert trend["outer_loop_convergence"]["iteration_median"]["classification"] == "improving"
+        assert trend["outer_loop_convergence"]["convergence_rate"]["latest"] == 1.0
+        assert trend["outer_loop_convergence"]["convergence_rate"]["classification"] == "improving"
+        assert trend["outer_loop_convergence"]["cap_exhausted_chain_count"]["delta"] == -1
+
+    @pytest.mark.asyncio
     async def test_persist_writes_baseline_to_table(self, db_session):
         """persist_version_lane_baseline stores a non-None dict in the dedicated
         project_lane_baseline table without adding a new design_doc copy."""
@@ -183,6 +280,7 @@ class TestPersistVersionLaneBaseline:
         assert "lane_iteration_distribution" in result
         assert "lane_waste" in result
         assert "relay_medians" in result
+        assert "outer_loop_convergence" in result
         assert result["pr_count"] == 1
         # Bloat sub-blobs must not be stored
         assert "relay_counts_by_lane" not in result

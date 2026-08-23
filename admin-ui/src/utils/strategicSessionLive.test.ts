@@ -12,7 +12,12 @@ import {
 import type { StrategicLiveActivity } from './strategicSessionLive';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
 import type { ProjectMessage } from '../types/messages';
-import type { StrategicResidentSessionSnapshot } from '../strategicStateApi';
+import type {
+  StrategicResidentSessionSnapshot,
+  StrategicStateCycle,
+  StrategicStateResponse,
+  StrategicStateTask,
+} from '../strategicStateApi';
 
 function delta(p: Partial<StrategicSessionDelta> & { id: number }): StrategicSessionDelta {
   return { session_id: 'ss-1', text: '', ...p };
@@ -23,6 +28,52 @@ function strategicMsg(created_at: string): ProjectMessage {
     id: `m-${created_at}`, project_id: 'p', message_type: 'NOTE' as ProjectMessage['message_type'],
     from_type: 'strategic' as ProjectMessage['from_type'], from_task_id: null, content: 'x',
     context: {}, status: 'open' as ProjectMessage['status'], resolution: null, resolved_at: null, created_at,
+  };
+}
+
+function durableStrategicState({
+  cycle = {},
+  task = {},
+  activePhase = 'strategic_review',
+}: {
+  cycle?: Partial<StrategicStateCycle>;
+  task?: Partial<StrategicStateTask> | null;
+  activePhase?: string | null;
+} = {}): StrategicStateResponse['strategic'] {
+  return {
+    active_cycle: {
+      id: 'cycle-1',
+      outcome: 'phase2_running',
+      has_active_task: true,
+      stale: false,
+      phase1_task_id: 'task-1',
+      phase2_task_id: 'task-2',
+      phase1_started_at: '2026-06-01T09:00:00Z',
+      phase1_completed_at: '2026-06-01T10:00:00Z',
+      phase2_started_at: '2026-06-01T11:00:00Z',
+      phase2_completed_at: null,
+      directions_created: 0,
+      directions_retired: 0,
+      tasks_spawned: 1,
+      vision_updated: false,
+      problem_model_changed: false,
+      running_update_changed: false,
+      ...cycle,
+    },
+    active_task: task === null ? null : {
+      id: 'task-2',
+      status: 'IN_PROGRESS',
+      title: 'Review the strategic direction',
+      task_type: 'strategic_review',
+      latest_status_message: null,
+      started_at: '2026-06-01T11:05:00Z',
+      created_at: '2026-06-01T11:00:00Z',
+      updated_at: '2026-06-01T11:30:00Z',
+      ...task,
+    },
+    active_phase: activePhase,
+    latest_cycle: null,
+    refresh: { pending: null },
   };
 }
 
@@ -514,6 +565,49 @@ describe('computeStrategicChatLiveState', () => {
       label: 'Working',
       detail: 'read release_scoring.py',
     });
+  });
+
+  it('reports durable active work when the live feed is empty after reload', () => {
+    const strategic = durableStrategicState({
+      task: { title: 'Review the strategic direction' },
+    });
+
+    expect(computeStrategicChatLiveState(null, noActivity, strategic)).toEqual({
+      phase: 'working',
+      label: 'Working',
+      detail: 'Review the strategic direction',
+      lastActivityMs: Date.parse('2026-06-01T11:30:00Z'),
+    });
+  });
+
+  it('reports a stuck chat turn when the durable cycle is active with no live task and the live feed is silent', () => {
+    const strategic = durableStrategicState({
+      cycle: { has_active_task: false, stale: true },
+      task: null,
+    });
+
+    expect(computeStrategicChatLiveState(null, noActivity, strategic)).toEqual({
+      phase: 'stuck',
+      label: 'Stuck',
+      detail: 'Strategic review',
+      lastActivityMs: Date.parse('2026-06-01T11:00:00Z'),
+    });
+  });
+
+  it('prefers live activity timestamps, then durable task timestamps over cycle start', () => {
+    const strategic = durableStrategicState({
+      task: { updated_at: '2026-06-01T11:20:00Z' },
+    });
+    const liveActivity: StrategicLiveActivity = {
+      items: [],
+      latestLifecycle: 'working',
+      lastActivityMs: Date.parse('2026-06-01T11:40:00Z'),
+    };
+
+    expect(computeStrategicChatLiveState(null, liveActivity, strategic)?.lastActivityMs)
+      .toBe(Date.parse('2026-06-01T11:40:00Z'));
+    expect(computeStrategicChatLiveState(null, noActivity, strategic)?.lastActivityMs)
+      .toBe(Date.parse('2026-06-01T11:20:00Z'));
   });
 
   it('clears once the turn closes with a done frame', () => {

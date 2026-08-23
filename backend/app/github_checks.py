@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 
 from fastapi import HTTPException, status
 
+from app.failure_reason import exception_reason
 from app.github import logger
 
 
@@ -815,7 +816,7 @@ async def get_workflow_run_for_dispatch_request(
                 timeout=10.0,
             )
         except Exception as exc:  # noqa: BLE001
-            return {"state": "unavailable", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+            return {"state": "unavailable", "detail": exception_reason(exc)}
         if response.status_code != 200:
             return {
                 "state": "unavailable",

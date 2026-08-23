@@ -173,19 +173,21 @@ function TrendRow({
   fmt: fmtVal,
 }: {
   label: string;
-  block: LaneBaselineTrendBlock;
+  // Optional: a backend payload missing a trend block must render as "—"
+  // rather than throwing and blanking the whole panel.
+  block: LaneBaselineTrendBlock | undefined;
   fmt?: (v: number) => string;
 }) {
-  const display = (v: number | null) =>
+  const display = (v: number | null | undefined) =>
     v == null ? '—' : fmtVal ? fmtVal(v) : v.toFixed(1);
 
   return (
     <tr className="border-b border-neutral-800/50">
       <td className="py-1 text-neutral-300">{label}</td>
-      <td className="py-1 text-right text-neutral-400">{display(block.prior)}</td>
-      <td className="py-1 text-right text-neutral-200">{display(block.latest)}</td>
-      <td className={`py-1 text-right font-medium ${classificationBadge(block.classification)}`}>
-        {classificationLabel(block.classification)}
+      <td className="py-1 text-right text-neutral-400">{display(block?.prior)}</td>
+      <td className="py-1 text-right text-neutral-200">{display(block?.latest)}</td>
+      <td className={`py-1 text-right font-medium ${classificationBadge(block?.classification ?? null)}`}>
+        {classificationLabel(block?.classification ?? null)}
       </td>
     </tr>
   );
@@ -234,10 +236,18 @@ function CrossVersionTrendPanel({ trend }: { trend: LaneBaselineTrend }) {
             </tr>
           </thead>
           <tbody>
-            <TrendRow label="Review p50" block={trend.lane_iterations.review.p50} />
-            <TrendRow label="Review p90" block={trend.lane_iterations.review.p90} />
-            <TrendRow label="Fix p50" block={trend.lane_iterations.fix.p50} />
-            <TrendRow label="Fix p90" block={trend.lane_iterations.fix.p90} />
+            <TrendRow label="Conflict p50" block={trend.lane_iterations.conflict.p50} />
+            <TrendRow label="Conflict p90" block={trend.lane_iterations.conflict.p90} />
+            <TrendRow label="CI p50" block={trend.lane_iterations.ci.p50} />
+            <TrendRow label="CI p90" block={trend.lane_iterations.ci.p90} />
+            <TrendRow
+              label="Review convergence p50"
+              block={trend.lane_iterations.review_convergence.p50}
+            />
+            <TrendRow
+              label="Review convergence p90"
+              block={trend.lane_iterations.review_convergence.p90}
+            />
           </tbody>
         </table>
       </div>
@@ -281,6 +291,38 @@ function CrossVersionTrendPanel({ trend }: { trend: LaneBaselineTrend }) {
           </thead>
           <tbody>
             <TrendRow label="Recovery tasks" block={trend.checkpoint_recovery_waste_total} />
+          </tbody>
+        </table>
+      </div>
+
+      <div>
+        <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+          Outer-Loop Convergence
+        </p>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-neutral-500 border-b border-neutral-800">
+              <th className="text-left py-1 font-normal">Metric</th>
+              <th className="text-right py-1 font-normal">Prior</th>
+              <th className="text-right py-1 font-normal">Latest</th>
+              <th className="text-right py-1 font-normal">Trend</th>
+            </tr>
+          </thead>
+          <tbody>
+            <TrendRow
+              label="Median cycles"
+              block={trend.outer_loop_convergence?.iteration_median}
+            />
+            <TrendRow label="P95 cycles" block={trend.outer_loop_convergence?.iteration_p95} />
+            <TrendRow
+              label="Convergence rate"
+              block={trend.outer_loop_convergence?.convergence_rate}
+              fmt={(v) => `${(v * 100).toFixed(0)}%`}
+            />
+            <TrendRow
+              label="Cap-exhausted chains"
+              block={trend.outer_loop_convergence?.cap_exhausted_chain_count}
+            />
           </tbody>
         </table>
       </div>

@@ -1563,6 +1563,7 @@ from app.github_issues import (  # noqa: F401
 from app.github_refs import (  # noqa: F401
     create_branch,
     create_tag,
+    github_error_message,
     merge_branch,
     get_branch_sha,
     get_repo_default_branch,
@@ -1579,6 +1580,11 @@ from app.github_refs import (  # noqa: F401
     get_files_changed_between_refs,
     agent_image_rebake_expected,
     AGENT_IMAGE_BAKE_PATHS,
+)
+from app.github_commit_resolution import (  # noqa: F401
+    is_full_commit_sha,
+    resolve_commit_sha,
+    FULL_COMMIT_SHA_LENGTH,
 )
 from app.github_pulls import (  # noqa: F401
     pr_is_not_behind,

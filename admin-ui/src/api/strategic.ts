@@ -874,17 +874,38 @@ export interface LaneBaselineTrend {
     task_count: LaneBaselineTrendBlock;
   };
   lane_iterations: {
-    review: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
-    fix: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
+    conflict: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
+    ci: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
+    review_convergence: { p50: LaneBaselineTrendBlock; p90: LaneBaselineTrendBlock };
   };
   waste_taxonomy_shares: Record<string, LaneBaselineTrendBlock>;
   checkpoint_recovery_waste_total: LaneBaselineTrendBlock;
+  outer_loop_convergence: {
+    iteration_median: LaneBaselineTrendBlock;
+    iteration_p95: LaneBaselineTrendBlock;
+    convergence_rate: LaneBaselineTrendBlock;
+    cap_exhausted_chain_count: LaneBaselineTrendBlock;
+  };
+}
+
+export interface LaneBaselineConvergence {
+  iteration_median: number | null;
+  iteration_p95: number | null;
+  convergence_rate: number | null;
+  cap_exhausted_chain_count: number;
+  terminal_outcome_counts: Record<string, number>;
+}
+
+export interface LaneBaseline {
+  version_number: number;
+  outer_loop_convergence?: LaneBaselineConvergence;
+  [key: string]: unknown;
 }
 
 export interface LaneBaselinesResponse {
   project_id: string;
   count: number;
-  baselines: Record<string, unknown>[];
+  baselines: LaneBaseline[];
   trend: LaneBaselineTrend | null;
 }
 

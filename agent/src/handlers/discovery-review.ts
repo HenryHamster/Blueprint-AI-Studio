@@ -128,6 +128,17 @@ function boundedSnapshotJson(value: unknown): string {
       return rendered;
     }
     const compact = JSON.stringify(value ?? {});
+    // The server bounds these snapshots field-aware to exactly this cap in
+    // its *compact* rendering, so a snapshot that lost nothing on the way
+    // here can still exceed the cap once it is indented. Re-wrapping that as
+    // a truncation excerpt would tell the reviewer its authority had been cut
+    // when it had not -- the same false signal that stranded direction
+    // d-f502e1a5 at ask_operator across two generations -- so prefer the
+    // compact rendering whenever it fits and keep the local guard for the
+    // snapshots that genuinely do not.
+    if (compact.length <= DISCOVERY_REVIEW_SNAPSHOT_PROMPT_CHARS) {
+      return compact;
+    }
     return JSON.stringify({
       snapshot_truncated: true,
       excerpt: compact.slice(0, DISCOVERY_REVIEW_SNAPSHOT_PROMPT_CHARS),

@@ -935,13 +935,19 @@ def _make_baseline(
     active: float,
     gap: float,
     task_count: float,
-    fix_p50: float,
-    fix_p90: float,
-    review_p50: float,
-    review_p90: float,
+    conflict_p50: float,
+    conflict_p90: float,
+    ci_p50: float,
+    ci_p90: float,
+    review_convergence_p50: float,
+    review_convergence_p90: float,
     waste_taxonomy: dict,
     waste_task_count: int,
     terminal_status: str = "promoted",
+    iteration_median: float | None = None,
+    iteration_p95: float | None = None,
+    convergence_rate: float | None = None,
+    cap_exhausted_chain_count: int | None = None,
 ) -> dict:
     return {
         "version_number": version_number,
@@ -954,17 +960,24 @@ def _make_baseline(
             "pr_count": 5,
         },
         "lane_iteration_distribution": {
-            "fix": {
-                "p50_iterations": fix_p50,
-                "p90_iterations": fix_p90,
-                "max_iterations": fix_p90,
+            "conflict": {
+                "p50_iterations": conflict_p50,
+                "p90_iterations": conflict_p90,
+                "max_iterations": conflict_p90,
                 "task_count": 10,
                 "pr_count": 5,
             },
-            "review": {
-                "p50_iterations": review_p50,
-                "p90_iterations": review_p90,
-                "max_iterations": review_p90,
+            "ci": {
+                "p50_iterations": ci_p50,
+                "p90_iterations": ci_p90,
+                "max_iterations": ci_p90,
+                "task_count": 10,
+                "pr_count": 5,
+            },
+            "review_convergence": {
+                "p50_iterations": review_convergence_p50,
+                "p90_iterations": review_convergence_p90,
+                "max_iterations": review_convergence_p90,
                 "task_count": 10,
                 "pr_count": 5,
             },
@@ -973,11 +986,17 @@ def _make_baseline(
             "waste_taxonomy": waste_taxonomy,
             "waste_task_count": waste_task_count,
         },
+        "outer_loop_convergence": {
+            "iteration_median": iteration_median,
+            "iteration_p95": iteration_p95,
+            "convergence_rate": convergence_rate,
+            "cap_exhausted_chain_count": cap_exhausted_chain_count,
+        },
     }
 
 
-def test_lane_baseline_cross_version_trend():
-    """compute_lane_baseline_trend returns correct deltas and classifications."""
+def test_lane_baseline_trend_uses_producer_lane_keys():
+    """Trend iteration metrics use the keys emitted by the lane diagnostic producer."""
     from app.digest_metrics import compute_lane_baseline_trend
 
     # Baselines are newest-first (latest = index 0).
@@ -987,10 +1006,12 @@ def test_lane_baseline_cross_version_trend():
         active=900.0,  # unchanged vs prior 900
         gap=900.0,  # worsened vs prior 700 (~28%)
         task_count=2.0,  # improved vs prior 3.0 (delta -1.0 > 0.5 abs)
-        fix_p50=2.0,  # improved vs prior 3.0 (delta -1.0 > 0.5 abs)
-        fix_p90=4.0,  # stable vs prior 4.2 (delta -0.2 < 0.5 abs)
-        review_p50=1.0,  # stable vs prior 1.0
-        review_p90=2.0,  # stable vs prior 2.0
+        conflict_p50=2.0,  # improved vs prior 3.0 (delta -1.0 > 0.5 abs)
+        conflict_p90=4.0,  # stable vs prior 4.2 (delta -0.2 < 0.5 abs)
+        ci_p50=1.0,  # stable vs prior 1.0
+        ci_p90=2.0,  # stable vs prior 2.0
+        review_convergence_p50=1.5,  # improved vs prior 2.5 (delta -1.0)
+        review_convergence_p90=3.0,  # improved vs prior 4.0 (delta -1.0)
         waste_taxonomy={
             "infra": 0,
             "merge_conflict": 2,
@@ -1001,6 +1022,10 @@ def test_lane_baseline_cross_version_trend():
             "unknown": 3,
         },
         waste_task_count=10,
+        iteration_median=1.5,
+        iteration_p95=3.0,
+        convergence_rate=0.8,
+        cap_exhausted_chain_count=0,
     )
     prior = _make_baseline(
         version_number=4,
@@ -1008,10 +1033,12 @@ def test_lane_baseline_cross_version_trend():
         active=900.0,
         gap=700.0,
         task_count=3.0,
-        fix_p50=3.0,
-        fix_p90=4.2,
-        review_p50=1.0,
-        review_p90=2.0,
+        conflict_p50=3.0,
+        conflict_p90=4.2,
+        ci_p50=1.0,
+        ci_p90=2.0,
+        review_convergence_p50=2.5,
+        review_convergence_p90=4.0,
         waste_taxonomy={
             "infra": 0,
             "merge_conflict": 1,
@@ -1022,6 +1049,10 @@ def test_lane_baseline_cross_version_trend():
             "unknown": 2,
         },
         waste_task_count=5,
+        iteration_median=2.5,
+        iteration_p95=4.0,
+        convergence_rate=0.6,
+        cap_exhausted_chain_count=2,
     )
 
     trend = compute_lane_baseline_trend([latest, prior])
@@ -1049,17 +1080,37 @@ def test_lane_baseline_cross_version_trend():
     assert tc["classification"] == "improving"
     assert tc["delta"] == pytest.approx(-1.0)
 
-    # fix p50 improved: delta = -1.0
-    fix_p50 = trend["lane_iterations"]["fix"]["p50"]
-    assert fix_p50["classification"] == "improving"
+    assert set(trend["lane_iterations"]) == {"conflict", "ci", "review_convergence"}
 
-    # fix p90 stable: delta = -0.2 < 0.5
-    fix_p90 = trend["lane_iterations"]["fix"]["p90"]
-    assert fix_p90["classification"] == "stable"
+    convergence = trend["outer_loop_convergence"]
+    assert convergence["iteration_median"]["classification"] == "improving"
+    assert convergence["iteration_p95"]["classification"] == "improving"
+    assert convergence["convergence_rate"]["classification"] == "improving"
+    assert convergence["cap_exhausted_chain_count"]["classification"] == "improving"
 
-    # review p50/p90 stable
-    assert trend["lane_iterations"]["review"]["p50"]["classification"] == "stable"
-    assert trend["lane_iterations"]["review"]["p90"]["classification"] == "stable"
+    # conflict p50 improved: delta = -1.0
+    conflict_p50 = trend["lane_iterations"]["conflict"]["p50"]
+    assert conflict_p50["classification"] == "improving"
+    assert conflict_p50["latest"] == pytest.approx(2.0)
+    assert conflict_p50["prior"] == pytest.approx(3.0)
+
+    # conflict p90 stable: delta = -0.2 < 0.5
+    conflict_p90 = trend["lane_iterations"]["conflict"]["p90"]
+    assert conflict_p90["classification"] == "stable"
+
+    # ci p50/p90 stable
+    assert trend["lane_iterations"]["ci"]["p50"]["classification"] == "stable"
+    assert trend["lane_iterations"]["ci"]["p90"]["classification"] == "stable"
+
+    # review convergence p50/p90 improved
+    assert (
+        trend["lane_iterations"]["review_convergence"]["p50"]["classification"]
+        == "improving"
+    )
+    assert (
+        trend["lane_iterations"]["review_convergence"]["p90"]["delta"]
+        == pytest.approx(-1.0)
+    )
 
     # lost_reasoning: latest share = 5/10 = 0.5; prior = 2/5 = 0.4; delta = +0.1 > 0.05 → declining
     lr = trend["waste_taxonomy_shares"]["lost_reasoning"]
@@ -1185,10 +1236,12 @@ def test_lane_baseline_trend_returns_none_when_fewer_than_two():
         active=500.0,
         gap=500.0,
         task_count=2.0,
-        fix_p50=2.0,
-        fix_p90=4.0,
-        review_p50=1.0,
-        review_p90=2.0,
+        conflict_p50=2.0,
+        conflict_p90=4.0,
+        ci_p50=1.0,
+        ci_p90=2.0,
+        review_convergence_p50=1.0,
+        review_convergence_p90=2.0,
         waste_taxonomy={
             "infra": 0,
             "merge_conflict": 0,

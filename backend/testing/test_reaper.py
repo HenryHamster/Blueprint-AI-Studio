@@ -1594,6 +1594,70 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_requeue_status_message_keeps_the_reap_reason(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """The reaper's non-terminal requeue used to print a state and drop its
+    own evidence.
+
+    ``latest_status_message`` was overwritten with the flat literal "Rate
+    limited — requeued with exhausted account blacklisted". The reaper was
+    holding ``reap_reason`` at that exact point — heartbeat age, last
+    heartbeat timestamp, last tool trace — and dropped it, so the operator
+    saw what the engine DID and never how it knew. Same class as the
+    ``f"{failure_class.title()} — requeued"`` overwrite on the agent-status
+    path; both now go through ``compose_requeue_status_message``.
+
+    The expected tail is read back out of the durable REAPED ``TaskHistory``
+    row rather than pattern-matched, so this is an exact-equality pin on "the
+    surfaced message carries the very reason the reaper recorded".
+    """
+    from app.models import TaskHistory
+
+    mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-rl-reason",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        context={
+            "max_plan_account_id": "acct-reason",
+            "last_error": "API Error: rate limit reached",
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    rows = (
+        (
+            await reaper_db.execute(
+                select(TaskHistory).where(
+                    TaskHistory.task_id == t.id, TaskHistory.action == "REAPED"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    recorded_reason = rows[0].details["reap_reason"]
+    assert "No heartbeat for" in recorded_reason, recorded_reason
+    assert t.latest_status_message == (
+        "Rate limited — requeued with exhausted account blacklisted: "
+        f"{recorded_reason}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reaper_account_cooldown_silent_death_free_requeue(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
@@ -2014,6 +2078,70 @@ async def test_provision_failure_message_gcp_api_failure_when_vm_never_provision
     assert "never claimed" not in msg, (
         "no VM was ever provisioned, so the message must not claim one was "
         f"created: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_provision_failure_message_on_local_runner_has_no_gcp_vocabulary(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A local-runner death must be reported in runner vocabulary, not GCP's.
+
+    Regression guard for live tasks ``82eb352a`` and ``4cd822c3``. Both ran on
+    ``hamsterwheel`` (``vm_instance_id='runner:707de5fb-…'``) and recorded a
+    real ``agent_failure_category_raw='walkthrough_harness_failed'``, yet the
+    terminal message read::
+
+        Provision failed 3x — zone: unknown zone, acct: 406bb865-….
+        GCP error: no GCP error captured. Last reap: Silent pre-claim death …
+
+    Blueprint's fleet is three local bwrap runners; there is no zone and no
+    GCP error to look up, so those two literal defaults sent the operator to
+    inspect infrastructure that was never involved while the actual cause sat
+    unread in ``task.context``. ``started_at`` is set here because the runner
+    had already pulled the pin — that is what takes the task past
+    ``_is_runner_pinned_awaiting_pull`` and into the reap path the live tasks
+    took.
+    """
+    mocker.patch("app.reaper.get_provision_error", return_value="")
+    mocker.patch("app.reaper.get_vm_zone", return_value=None)
+
+    runner_uuid = "707de5fb-1c22-4f60-8a19-9d0be2f4a3c1"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"runner:{runner_uuid}",
+        status=TaskStatus.PROVISIONING,
+        started_at=_utcnow() - timedelta(minutes=30),
+        vm_provisioned_at=_utcnow() - timedelta(minutes=7),
+        last_heartbeat=None,
+        context={
+            "provision_failures": 99,
+            "runner_hostname": "hamsterwheel",
+            "runner_target_id": runner_uuid,
+            "agent_failure_category_raw": "walkthrough_harness_failed",
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach the terminal-persist path"
+    msg = t.latest_status_message or ""
+    assert "GCP" not in msg, (
+        f"GCP vocabulary on a fleet with no GCP: {msg!r}"
+    )
+    assert "zone" not in msg.lower(), (
+        f"a local runner has no zone; 'unknown zone' reads as a finding: {msg!r}"
+    )
+    assert "hamsterwheel" in msg, f"the runner must be named: {msg!r}"
+    assert "707de5fb" in msg, f"the runner id must be named: {msg!r}"
+    assert "walkthrough_harness_failed" in msg, (
+        f"the recorded agent category is the real cause and must surface "
+        f"instead of being buried in context: {msg!r}"
     )
 
 

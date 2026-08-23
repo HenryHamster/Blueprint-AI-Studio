@@ -105,6 +105,12 @@ _NON_GENUINE_CANCELLED_DETAILS = frozenset(
         "pr_closed_non_rejection",
         "cap_exhausted_after_approve",
         "superseded_by_review_pipeline",
+        # A PR-less approval hold that nobody answered inside its 72h window and
+        # that released itself as CANCELLED (recovery_evaluating_approval, task
+        # 70c5ec8f). The direction produced work; an operator simply never looked
+        # at it. Charging that to direction health would price operator latency
+        # as a research failure and can trip a false auto-pause.
+        "approval_timeout_hold_expired",
     }
 )
 

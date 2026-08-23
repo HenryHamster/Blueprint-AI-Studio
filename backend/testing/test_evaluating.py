@@ -2160,12 +2160,28 @@ async def test_chain_active_stale_provisioning_does_not_count(eval_db):
 
 
 @pytest.mark.asyncio
-async def test_evaluating_approval_gate_hard_timeout_fails(eval_db, mocker):
-    """An approval-gated parent (requires_approval=True) whose _approval_set_at
-    is older than APPROVAL_GATE_FAIL_SECONDS (2h) must be marked FAILED by the
-    companion timeout — otherwise it stalls indefinitely because the 6h
-    backstop can be deferred by _chain_has_active_pipeline_work."""
+async def test_evaluating_approval_gate_hard_timeout_holds_pr_less_work(
+    eval_db, mocker
+):
+    """An approval-gated parent with NO PR must be HELD past 2h, never FAILED.
+
+    Incident 70c5ec8f (research, requires_approval=True, spawned by
+    AUTONOMOUS_LOOP 2026-08-22T22:58Z, dead 00:58Z): the 2h companion timeout
+    measured an operator's sleep and terminalized the row to FAILED. With no PR
+    behind it the task row WAS the work, so that disposition destroyed it — a
+    timeout is the absence of an answer, not a decision to discard.
+
+    This test previously asserted that FAILED outcome, i.e. it was guarding the
+    defect. It now pins the replacement: the row stays EVALUATING with its hold
+    intact and the PR-less hold marker stamped. The bound on that hold, and the
+    unchanged PR-carrying FAILED path, are covered by
+    ``test_pr_less_approval_hold_releases_as_cancelled_at_bound`` and the
+    ``review_loop``-PR ceiling tests below.
+    """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
 
     project = Project(name="Approval Gate Timeout", user_id="user1")
     eval_db.add(project)
@@ -2187,11 +2203,15 @@ async def test_evaluating_approval_gate_hard_timeout_fails(eval_db, mocker):
     await _check_evaluating_timeouts()
 
     await eval_db.refresh(parent)
-    assert parent.status == TaskStatus.FAILED, (
-        f"Expected FAILED after approval-gate hard timeout, got {parent.status}: "
-        f"{parent.latest_status_message!r}"
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"PR-less approval-gate timeout must HOLD, not destroy, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
     )
-    assert "approval" in (parent.latest_status_message or "").lower()
+    assert parent.requires_approval is True
+    assert (parent.context or {}).get("approval_timeout_preserved_without_pr") is True
+    assert (parent.context or {}).get("approval_timeout_hold_expires_at")
+    # An unanswered hold is not a task failure.
+    rec.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2220,6 +2240,229 @@ async def test_evaluating_approval_gate_within_window_not_failed(eval_db, mocker
 
     await eval_db.refresh(parent)
     assert parent.status == TaskStatus.EVALUATING
+
+
+# ── PR-less approval hold: park, alert, and self-release (incident 70c5ec8f) ─
+
+
+@pytest.mark.asyncio
+async def test_pr_less_approval_hold_raises_operator_alert_and_is_idempotent(
+    eval_db, mocker
+):
+    """The PR-less hold must be LOUD once and silent thereafter.
+
+    "Held, not dead" is only true if an operator can see it, so the first sweep
+    past the gate raises a WARNING ``approval.timeout_held`` alert. Later sweeps
+    inside the window must be pure no-ops — no duplicate alert, and deliberately
+    no write at all, so ``updated_at`` keeps ageing and the candidate scan's
+    ``ORDER BY updated_at ASC`` cannot starve the row behind its per-cycle cap.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    fail_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="PR-less Hold Alert", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "pr-less approval-gated parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={"_approval_set_at": _naive_utc_ago(hours=3).isoformat()},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    alerts = (
+        (await eval_db.execute(select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, [a.event_type for a in alerts]
+    assert alerts[0].event_type == "approval.timeout_held"
+    assert alerts[0].severity == AlertSeverity.WARNING
+    # A held task is NOT a failed task.
+    fail_alert.assert_not_called()
+    rec.assert_not_called()
+
+    first_expiry = parent.context.get("approval_timeout_hold_expires_at")
+    assert first_expiry
+    updated_before = parent.updated_at
+
+    # Second sweep: no duplicate alert, no rewrite, still held.
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.context.get("approval_timeout_hold_expires_at") == first_expiry
+    assert parent.updated_at == updated_before
+    alerts = (
+        (await eval_db.execute(select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_pr_less_approval_hold_releases_as_cancelled_at_bound(eval_db, mocker):
+    """The hold is BOUNDED and the bound has a defined, non-destructive terminal.
+
+    A latch with no release path is a permanent wedge — strictly worse than a
+    clean terminal. Past ``APPROVAL_TIMEOUT_PRLESS_HOLD_HOURS`` beyond the 2h
+    gate the hold releases ITSELF to a CLEAN NON-FAILURE ``CANCELLED``: hold
+    cleared, ``approval_timeout_hold_expired`` stamped for triage, and no
+    ``record_task_result(success=False)`` / failure alert — after a 72h operator
+    window an unanswered approval request is an absence of interest, not a
+    pipeline failure.
+    """
+    from app.recovery_evaluating_approval import APPROVAL_GATE_FAIL_SECONDS
+    from app.recovery_evaluating_prless_hold import (
+        APPROVAL_TIMEOUT_PRLESS_HOLD_HOURS,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    fail_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="PR-less Hold Bound", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    past_bound_hours = (
+        APPROVAL_GATE_FAIL_SECONDS / 3600 + APPROVAL_TIMEOUT_PRLESS_HOLD_HOURS + 1
+    )
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "pr-less approval-gated parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=past_bound_hours).isoformat(),
+            "approval_timeout_preserved_without_pr": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.CANCELLED, (
+        f"An expired PR-less hold must release itself, got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
+    assert parent.requires_approval is False
+    assert (parent.context or {}).get("approval_timeout_hold_expired") is True
+    assert (parent.context or {}).get(
+        "failure_detail"
+    ) == "approval_timeout_hold_expired"
+    assert "cancelled" in (parent.latest_status_message or "").lower()
+    # Released, not failed.
+    fail_alert.assert_not_called()
+    rec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_operator_decision_releases_pr_less_hold_before_the_bound(
+    eval_db, mocker
+):
+    """The hold's PRIMARY release path, end to end: an operator answering.
+
+    Park the row first (the sweep that used to FAIL it), then do what approve /
+    deny does — clear ``requires_approval`` — and sweep again. The handler now
+    returns ``False`` on its very first line, so the row rejoins the ordinary
+    recovery branches immediately instead of waiting out the 72h bound, and is
+    NOT re-terminalized on the way past.
+
+    Pinned because this, not the ceiling, is the argument that the hold cannot
+    become a permanent wedge: the mechanism that releases it is the same
+    status-driven scan that set it, with no second sweep to forget.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="PR-less Hold Released", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "pr-less approval-gated parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={"_approval_set_at": _naive_utc_ago(hours=3).isoformat()},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("approval_timeout_preserved_without_pr") is True
+
+    # Operator answers: approve/deny clears the gate.
+    parent.requires_approval = False
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"An answered hold must rejoin ordinary recovery, not be terminalized: "
+        f"{parent.status} / {parent.latest_status_message!r}"
+    )
+
+
+def test_approval_hold_pr_number_sees_every_place_a_pr_can_live():
+    """Only a hold with NO PR ANYWHERE may divert to the PR-less disposition.
+
+    The predicate is deliberately WIDER than the preserve branch's
+    ``rollup_pr_number``/payload pair: it answers "is any of this work already
+    durable outside the task row", not "which PR do I check for mergeability". A
+    parent whose PR number lives only in ``context.review_loop`` still has an
+    open PR, so it must stay on the existing PR-carrying FAILED path.
+    """
+    from app.recovery_evaluating_prless_hold import _approval_hold_pr_number
+
+    class _T:
+        def __init__(self, first_payload=None):
+            self.first_payload = first_payload or {}
+
+    task = _T()
+    assert not _approval_hold_pr_number(task, {})
+    assert _approval_hold_pr_number(task, {"rollup_pr_number": 1}) == 1
+    assert _approval_hold_pr_number(task, {"pr_number": 2}) == 2
+    assert _approval_hold_pr_number(task, {"review_loop": {"pr_number": 3}}) == 3
+    # A non-dict review_loop must not explode the predicate into a crash that
+    # would take the whole recovery sweep down.
+    assert not _approval_hold_pr_number(task, {"review_loop": "corrupt"})
+
+    assert _approval_hold_pr_number(_T({"pr_number": 4}), {}) == 4
 
 
 # ── RC-2: approval-gate timeout preserves mergeable rollup PRs ───────────────
@@ -2364,12 +2607,26 @@ async def test_approval_gate_timeout_rate_limited_lookup_preserves_not_fails(
 
 @pytest.mark.asyncio
 async def test_approval_gate_timeout_fails_non_rollup_task(eval_db, mocker):
-    """RC-2 GUARDRAIL: approval-gate timeout on a non-rollup task (no rollup PR
-    to preserve) keeps today's FAILED path unchanged."""
+    """RC-2 GUARDRAIL: approval-gate timeout on a non-rollup task whose PR is
+    NOT preservable keeps today's FAILED path unchanged.
+
+    The task carries a payload ``pr_number`` deliberately: the work is durable
+    on GitHub, so FAILing the row destroys nothing and the legacy terminalization
+    is correct. (It used to carry no PR at all, which after the 70c5ec8f fix is
+    the HELD shape — see
+    ``test_evaluating_approval_gate_hard_timeout_holds_pr_less_work``. Keeping a
+    PR here is what preserves this test's actual subject: the non-preservable
+    branch, not the PR-less one.)
+    """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.review_loop_convergence._pr_is_preservable_on_cap",
+        new_callable=AsyncMock,
+        return_value=False,
     )
     rec = mocker.patch("app.routers.agent_status.record_task_result")
 
@@ -2380,7 +2637,13 @@ async def test_approval_gate_timeout_fails_non_rollup_task(eval_db, mocker):
 
     parent = Task(
         project_id=project.id,
-        payloads=[{"type": "research", "prompt": "non-rollup approval-gated parent"}],
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "non-rollup approval-gated parent",
+                "pr_number": 9911,
+            }
+        ],
         status=TaskStatus.EVALUATING,
         requires_approval=True,
         context={"_approval_set_at": _naive_utc_ago(hours=5).isoformat()},
@@ -2711,7 +2974,14 @@ async def test_churn_halt_respawn_cap_honored_falls_through_to_preserve(
 async def test_review_escalation_hold_past_2h_still_fails_and_records(eval_db, mocker):
     """A review-escalation hold (requires_approval=True, NO approval_hold_reason
     marker) past the 2h gate must keep today's behavior EXACTLY: FAILED and a
-    failed task result recorded. Absence of the marker preserves the legacy path."""
+    failed task result recorded. Absence of the marker preserves the legacy path.
+
+    The hold carries its ``review_loop.pr_number`` — the shape a real review
+    escalation always has. That is load-bearing after the 70c5ec8f fix: work
+    already durable on a PR survives the row, so the legacy FAILED
+    terminalization is still the right disposition; only a hold with NO PR
+    anywhere behind it diverts to the non-destructive PR-less hold.
+    """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
@@ -2728,7 +2998,10 @@ async def test_review_escalation_hold_past_2h_still_fails_and_records(eval_db, m
         payloads=[{"type": "review", "prompt": "review escalation churn"}],
         status=TaskStatus.EVALUATING,
         requires_approval=True,
-        context={"_approval_set_at": _naive_utc_ago(hours=3).isoformat()},
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=3).isoformat(),
+            "review_loop": {"pr_number": 8123, "base_branch": "automain"},
+        },
     )
     eval_db.add(parent)
     await eval_db.commit()
@@ -5637,8 +5910,12 @@ async def test_handle_approval_gate_timeout_dispositions_and_contract(eval_db, m
       * a deliberate spend/budget hold past its window → CLEAN non-failure
         ``CANCELLED`` (requires_approval cleared, ``spend_approval_declined``
         stamped, NO ``record_task_result`` / failure alert);
-      * a non-marker (review-escalation) hold past 2h → ``FAILED`` with a failed
-        task result recorded and a failure alert dispatched;
+      * a non-marker (review-escalation) hold past 2h WITH a PR behind it →
+        ``FAILED`` with a failed task result recorded and a failure alert
+        dispatched;
+      * a non-marker hold past 2h with NO PR behind it → HELD (still
+        ``EVALUATING``, hold intact, PR-less marker stamped, no failure
+        accounting) — incident 70c5ec8f;
       * a non-marker hold still within the 2h window → handler returns ``False``
         and leaves the task EVALUATING (fall-through);
       * a task without ``requires_approval`` → handler returns ``False`` immediately.
@@ -5682,13 +5959,25 @@ async def test_handle_approval_gate_timeout_dispositions_and_contract(eval_db, m
         }
     )
     review_failed = _make(
-        {"_approval_set_at": _naive_utc_ago(hours=3).isoformat()},
+        {
+            "_approval_set_at": _naive_utc_ago(hours=3).isoformat(),
+            # A PR behind the hold: the work is durable on GitHub, so the legacy
+            # FAILED terminalization destroys nothing and stays correct.
+            "review_loop": {"pr_number": 8124, "base_branch": "automain"},
+        },
         ttype="review",
     )
+    pr_less_held = _make({"_approval_set_at": _naive_utc_ago(hours=3).isoformat()})
     within_window = _make({"_approval_set_at": _naive_utc_ago(minutes=30).isoformat()})
     no_approval = _make({}, requires_approval=False)
     await eval_db.commit()
-    for t in (spend_declined, review_failed, within_window, no_approval):
+    for t in (
+        spend_declined,
+        review_failed,
+        pr_less_held,
+        within_window,
+        no_approval,
+    ):
         await eval_db.refresh(t)
 
     async def _call(task):
@@ -5721,6 +6010,17 @@ async def test_handle_approval_gate_timeout_dispositions_and_contract(eval_db, m
     rec.assert_called_once()
     assert rec.call_args.kwargs.get("success") is False
     fail_alert.assert_awaited_once()
+
+    # 2b) Non-marker hold past 2h with NO PR anywhere → handled (True), but HELD
+    #     rather than destroyed: EVALUATING, hold intact, marker stamped, and NO
+    #     additional failure result/alert beyond case 2's (incident 70c5ec8f).
+    assert await _call(pr_less_held) is True
+    await eval_db.refresh(pr_less_held)
+    assert pr_less_held.status == TaskStatus.EVALUATING
+    assert pr_less_held.requires_approval is True
+    assert pr_less_held.context.get("approval_timeout_preserved_without_pr") is True
+    rec.assert_called_once()  # still only case 2's
+    fail_alert.assert_awaited_once()  # still only case 2's
 
     # 3) Non-marker hold still within the 2h window → fall through (False), untouched.
     assert _naive_utc_ago(minutes=30) > now - timedelta(

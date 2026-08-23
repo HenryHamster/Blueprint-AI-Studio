@@ -133,6 +133,47 @@ _CONTINUATION_CLAIM_ATTEMPT_CONTEXT_KEY = "_workday_continuation_claim_attempt"
 _CONVERSATION_CLAIM_IDEMPOTENCY_CONTEXT_KEY = (
     "_conversation_claim_idempotency_key"
 )
+# An operator turn whose claim has DIED this many times without ever producing
+# a public reply is answered-and-closed instead of being handed out again. The
+# private Workday consultation lane has had this backstop
+# (_WORKDAY_CONSULTATION_MAX_UNACKED_CLAIMS); the operator lane -- the one a
+# *human* is waiting on -- had none, so a turn whose worker kept dying (or kept
+# moving on without replying) churned without bound and the operator was never
+# told anything at all. Higher than the consultation cap because this bound is
+# the last resort behind ordinary reclaim and redelivery, not the first.
+_OPERATOR_TURN_MAX_DEAD_CLAIMS = 5
+# Durable per-turn count of claims that ended in a dead lease. Incremented by
+# claim_operator_messages when it reclaims over a corpse, and by the reaper's
+# expired-claim release sweep. Deliberately NOT conversation_claim_attempt:
+# that field counts every handout, including benign Resident session rebinds,
+# and is routinely in double digits on a healthy long-lived operator message.
+_OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY = "_conversation_turn_dead_claims"
+_OPERATOR_TURN_PARKED_CONTEXT_KEY = "_conversation_turn_parked"
+_OPERATOR_TURN_PARKED_REASON_CONTEXT_KEY = "_conversation_turn_parked_reason"
+_OPERATOR_TURN_PARKED_DEAD_CLAIMS_CONTEXT_KEY = "_conversation_turn_parked_deaths"
+
+
+class OperatorTurnParked(RuntimeError):
+    """A hopeless operator turn was answered-and-closed, not re-claimed.
+
+    Raised by :func:`claim_operator_messages` instead of returning ``None`` so
+    the caller cannot mistake a terminal park for an ordinary "someone else
+    holds it" conflict, and so the reason reaches the operator-facing error
+    instead of being flattened into a bare 409. The park itself is already
+    written to the session; the caller must COMMIT, not roll back.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        dead_claims: int,
+        message_ids: tuple[uuid.UUID, ...],
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.dead_claims = dead_claims
+        self.message_ids = tuple(message_ids)
 
 
 def public_reply_owner_for_task_context(
@@ -237,6 +278,100 @@ def _message_ordering() -> tuple[object, ...]:
         ProjectMessage.created_at.asc(),
         ProjectMessage.id.asc(),
     )
+
+
+def _operator_turn_parked_reason(dead_claims: int) -> str:
+    """Explain WHY the turn was closed, in words the operator can act on."""
+    return (
+        "I could not process this message. The conversation turn was handed to a "
+        f"strategist worker and its claim died {dead_claims} times without ever "
+        "producing a reply -- each lease expired with its worker gone or moved "
+        "on. Rather than hold your message open indefinitely with no answer and "
+        "no explanation, it is being closed with this one. Nothing was decided "
+        "or changed on your behalf. Send it again to retry; if this repeats, "
+        "the Strategic Resident session itself is unhealthy."
+    )
+
+
+async def _park_operator_turn(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    rows: tuple[ProjectMessage, ...],
+    claim_id: uuid.UUID,
+    task_id: uuid.UUID,
+    dead_claims: int,
+    reason: str,
+    resident_session_id: str | None,
+    now: datetime,
+) -> ProjectMessage:
+    """Answer and close a hopeless operator turn instead of stranding it.
+
+    Degrade-or-decide: the operator gets a real conversation reply saying the
+    system failed and why, and the input rows reach a terminal state, so no
+    message is left silently open forever waiting on a worker that will never
+    come back. Caller owns the transaction and every ownership check.
+    """
+    park_key = f"operator-turn-parked:{claim_id}"
+    reply = (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == park_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if reply is None:
+        sequence = await lock_project_and_next_message_sequence(session, project_id)
+        reply = await build_project_message(
+            session,
+            project_id=project_id,
+            sequence=sequence,
+            surface=MessageSurface.CONVERSATION,
+            handling_state=MessageHandlingState.RESPONDED,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            from_task_id=task_id,
+            content=reason,
+            context=stamp_message_audience(
+                {
+                    "message_role": "operator_reply",
+                    "_conversation_claim_id": str(claim_id),
+                    _OPERATOR_TURN_PARKED_CONTEXT_KEY: True,
+                    _OPERATOR_TURN_PARKED_DEAD_CLAIMS_CONTEXT_KEY: dead_claims,
+                    "_resident_reply_covered_message_ids": sorted(
+                        str(row.id) for row in rows
+                    ),
+                },
+                "question_answer",
+                message_type=MessageType.NOTE.value,
+            ),
+            idempotency_key=park_key,
+            resident_session_id=resident_session_id,
+        )
+        session.add(reply)
+    for row in rows:
+        row.context = {
+            **dict(row.context or {}),
+            _OPERATOR_TURN_PARKED_CONTEXT_KEY: True,
+            _OPERATOR_TURN_PARKED_REASON_CONTEXT_KEY: reason,
+            _OPERATOR_TURN_PARKED_DEAD_CLAIMS_CONTEXT_KEY: dead_claims,
+        }
+        row.status = "handled"
+        row.handling_state = MessageHandlingState.RESPONDED
+        row.handled_by_task_id = task_id
+        row.conversation_claim_expires_at = None
+        row.updated_at = now
+        session.add(row)
+    logger.warning(
+        "parked operator conversation turn after %d dead claims: "
+        "project=%s claim=%s messages=%s",
+        dead_claims,
+        project_id,
+        claim_id,
+        ",".join(str(row.id) for row in rows),
+    )
+    return reply
 
 
 async def claim_operator_messages(
@@ -453,6 +588,45 @@ async def claim_operator_messages(
     if existing_claim_id is None or reclaimed:
         attempt += 1
     attempt = max(1, attempt)
+    # Count only the handouts that provably ENDED BADLY: a reclaim over a
+    # corpse lease here, or a release by the reaper's expired-claim sweep. A
+    # benign rebind (Resident session handoff, which clears the claim id) is
+    # NOT a death and must never push a still-answerable turn toward the cap --
+    # that is why this is its own counter and not ``conversation_claim_attempt``,
+    # which carries every handout forward across sessions and is routinely in
+    # double digits on a healthy long-lived operator message.
+    dead_claims = max(
+        (
+            int((row.context or {}).get(_OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY) or 0)
+            for row in ordered
+        ),
+        default=0,
+    )
+    if reclaimed and lease_expired:
+        dead_claims += 1
+    if dead_claims >= _OPERATOR_TURN_MAX_DEAD_CLAIMS:
+        # This turn's claim has died _OPERATOR_TURN_MAX_DEAD_CLAIMS times
+        # without ever producing a public reply. Handing it out again repeats
+        # the same failure while the operator keeps waiting on silence, so
+        # decide instead: answer the turn with the failure and close it.
+        reason = _operator_turn_parked_reason(dead_claims)
+        await _park_operator_turn(
+            session,
+            project_id=project_id,
+            rows=ordered,
+            claim_id=existing_claim_id or claim_id,
+            task_id=task_id,
+            dead_claims=dead_claims,
+            reason=reason,
+            resident_session_id=session_id,
+            now=now,
+        )
+        await session.flush()
+        raise OperatorTurnParked(
+            reason,
+            dead_claims=dead_claims,
+            message_ids=tuple(row.id for row in ordered),
+        )
 
     for row in ordered:
         row.handling_state = MessageHandlingState.CLAIMED
@@ -462,19 +636,19 @@ async def claim_operator_messages(
         row.conversation_claim_incarnation = incarnation_id
         row.conversation_claim_expires_at = expires_at
         row.conversation_claim_attempt = attempt
+        context_updates: dict[str, Any] = {}
+        if dead_claims:
+            # Durable so the count survives process replacement -- the whole
+            # point is to bound a turn whose workers keep disappearing.
+            context_updates[_OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY] = dead_claims
         if public_reply_owner is not None:
-            row.context = {
-                **dict(row.context or {}),
-                _PUBLIC_REPLY_OWNER_CONTEXT_KEY: public_reply_owner.value,
-                **(
-                    {
-                        _CONVERSATION_CLAIM_IDEMPOTENCY_CONTEXT_KEY:
-                        normalized_claim_key
-                    }
-                    if normalized_claim_key is not None
-                    else {}
-                ),
-            }
+            context_updates[_PUBLIC_REPLY_OWNER_CONTEXT_KEY] = public_reply_owner.value
+            if normalized_claim_key is not None:
+                context_updates[_CONVERSATION_CLAIM_IDEMPOTENCY_CONTEXT_KEY] = (
+                    normalized_claim_key
+                )
+        if context_updates:
+            row.context = {**dict(row.context or {}), **context_updates}
         row.updated_at = now
         session.add(row)
     await session.flush()

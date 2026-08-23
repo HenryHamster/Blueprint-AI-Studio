@@ -402,6 +402,67 @@ async def _maybe_create_spend_hold_alert(
     )
 
 
+# Stable title for the PR-less approval-gate HOLD alert. Kept CONSTANT (the task,
+# the elapsed hours and the self-release deadline all live in the message) so
+# repeated recovery sweeps over the same hold deduplicate to exactly ONE open row.
+_APPROVAL_TIMEOUT_HOLD_ALERT_TITLE = (
+    "Approval-gate timeout: work HELD for an operator decision (not failed)"
+)
+
+
+async def _maybe_create_approval_timeout_hold_alert(
+    task: "Task",
+    session: AsyncSession,
+    message: str,
+) -> None:
+    """Announce that a PR-less approval-gate timeout PARKED work rather than killing it.
+
+    Sibling of :func:`_maybe_create_spend_hold_alert` and deliberately NOT
+    :func:`_maybe_create_failure_alert`: the task is alive and held, so the alert
+    carries WARNING severity, records no failed task result, and never enters the
+    ``task.failed`` dedup family (which would let this notice swallow the task's
+    next real failure alert).
+
+    Retirement is ``TASK_TERMINAL``. That is the whole reason for a dedicated
+    event type rather than an ad-hoc row: ``approval.timeout_held`` claims "this
+    task is waiting on you *right now*", which any terminal outcome falsifies, so
+    :func:`sweep_resolve_terminal_task_alerts` clears it automatically whether the
+    operator resolves the hold or its 72h bound releases it as CANCELLED. Nothing
+    here can leave an immortal row behind.
+
+    Raised for the PR-less approval-hold incident (research task ``70c5ec8f``,
+    2026-08-22): a 2h unattended window silently FAILed a research task whose
+    output existed only on the task row, with no operator-facing signal at all.
+
+    Caller owns the commit; this only stages the row and broadcasts
+    ``alert_created``. Best-effort dedup is by ``dedupe_key`` on the task, which
+    ignores already-dismissed rows — so a hold re-opened after a previous one was
+    retired raises a fresh alert instead of going silent.
+    """
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=task.project_id,
+        event_type="approval.timeout_held",
+        severity=AlertSeverity.WARNING,
+        title=_APPROVAL_TIMEOUT_HOLD_ALERT_TITLE,
+        message=message[:1000],
+        task_id=task.id,
+        source="recovery_evaluating.approval_gate_pr_less_hold",
+        dedupe_key=f"approval.timeout_held:{task.id}",
+    )
+    if alert is None or not created:
+        return
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+        },
+    )
+
+
 # Human-readable labels for the no-CI UNVERIFIED-merge reasons. The orchestrator
 # writes the reason KEY into review_loop["unverified_merge_reason"] at the two
 # UNVERIFIED decision sites, so keep these keys stable. The reason is NOT part of
@@ -1720,6 +1781,14 @@ _STUCK_TASK_ALERT_EVENT_TYPE = "task.blocked"
 #                         abandoned) both settle that. **FAILED does NOT** —
 #                         the task is still failed and the alert is still true,
 #                         so FAILED is deliberately absent from this set.
+#   ``approval.timeout_held``
+#                         "this PR-less approval hold is parked and waiting on
+#                         you." True only while the task is alive and held; the
+#                         hold's own 72h bound releases it as CANCELLED, and an
+#                         operator resolution ends it some other terminal way.
+#                         Every terminal status therefore falsifies it, and this
+#                         rule IS the alert's release path — see
+#                         ``recovery_evaluating_approval`` (task 70c5ec8f).
 #
 # Adding a family here is a claim that a terminal status makes its message
 # false. Do not add one whose alert is an audit record rather than a request
@@ -1728,6 +1797,7 @@ _TERMINAL_TASK_ALERT_RULES: "dict[str, frozenset]" = {
     _STUCK_TASK_ALERT_EVENT_TYPE: TASK_OUTCOME_TERMINAL_STATUSES,
     "review.escalated": TASK_OUTCOME_TERMINAL_STATUSES,
     "task.failed": frozenset({TaskStatus.COMPLETED, TaskStatus.CANCELLED}),
+    "approval.timeout_held": TASK_OUTCOME_TERMINAL_STATUSES,
 }
 
 # Bound the per-cycle batch so one sweep can never hold a write transaction open

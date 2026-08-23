@@ -1172,28 +1172,20 @@ async def get_outer_loop_chains(
 
     cutoff = _utcnow() - timedelta(hours=hours)
 
-    stmt = (
-        select(Task)
-        .where(
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-            Task.created_at >= cutoff,
-        )
-        .options(
-            load_only(
-                Task.id,
-                Task.project_id,
-                Task.status,
-                Task.context,
-                Task.created_at,
-            raiseload=True,)
-        )
-        .order_by(Task.created_at.desc())
-        .limit(_OUTER_LOOP_TASK_CAP)
+    # Fetch through the SHARED helper, not a second hand-rolled load_only(). A
+    # private projection here has no way to know what the reducer grew to read,
+    # and it drifted exactly that way: _outer_loop_chain_observation started
+    # reading first_payload (review_count) and this endpoint began raising
+    # "'Task.payloads' is not available due to raiseload=True" while every other
+    # outer-loop caller stayed green, because they all go through
+    # _fetch_outer_loop_tasks. One projection, one place to keep current.
+    tasks = await _fetch_outer_loop_tasks(
+        session,
+        cutoff=cutoff,
+        project_id=project_id,
+        limit=_OUTER_LOOP_TASK_CAP,
+        order_desc=True,
     )
-    if project_id is not None:
-        stmt = stmt.where(Task.project_id == project_id)
-
-    tasks = list((await session.execute(stmt)).scalars().all())
     if len(tasks) >= _OUTER_LOOP_TASK_CAP:
         logger.warning(
             "[OUTER-LOOP] chain drill-down task query hit the %d-row cap "

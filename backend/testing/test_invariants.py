@@ -14385,6 +14385,7 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         "test_shard_balance.py",
         "test_conversational_workday_protection.py",
         "test_vitest_durations_freshness.py",
+        "test_test_imports_checker.py",
     ]
     run_testing = run_backend / "testing"
     run_testing.mkdir()

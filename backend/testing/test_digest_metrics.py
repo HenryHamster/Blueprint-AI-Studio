@@ -29,6 +29,7 @@ from app.digest_metrics import (
     _MIGRATION_SLOT_HOLD_ALERT_SECONDS,
     compute_narrative_summary,
     compute_outer_loop_convergence,
+    compute_lane_waste_diagnostics,
     compute_dependency_health_signals,
     compute_recurring_error_clusters,
     compute_release_qualifier_infra_metrics,
@@ -3282,6 +3283,97 @@ class TestDigestMetricsModuleSeams:
                         "load time — this risks a circular import. Use a "
                         "function-local import instead."
                     )
+
+
+# ── Lane-waste convergence evidence ────────────────────────────────────────
+
+
+def test_lane_waste_reports_retarget_rereview_scope_and_converged_review_counts():
+    """Lane waste distinguishes stale re-review scope and counts only merged chains."""
+    window_start = _utcnow() - timedelta(days=1)
+    direction_id = "direction-retargeted"
+
+    merged_original = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "direction_id": direction_id},
+    )
+    merged_review = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review", "pr_number": 901}],
+        context={
+            "direction_id": direction_id,
+            "review_loop": {
+                "original_task_id": str(merged_original.id),
+                "pr_number": 901,
+                "iteration": 1,
+                "retarget_scope": "delta",
+            },
+        },
+    )
+    merged_fix = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "pr_number": 901}],
+        context={
+            "review_loop": {
+                "original_task_id": str(merged_original.id),
+                "pr_number": 901,
+                "iteration": 2,
+            }
+        },
+    )
+    merged_rereview = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review", "pr_number": 901}],
+        context={
+            "_review_stale_head": True,
+            "review_loop": {
+                "original_task_id": str(merged_original.id),
+                "pr_number": 901,
+                "iteration": 3,
+                "retarget_scope": "full",
+            },
+        },
+    )
+
+    open_original = make_task(status=TaskStatus.COMPLETED, context={})
+    open_review = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review", "pr_number": 902}],
+        context={
+            "_review_stale_target": True,
+            "review_loop": {
+                "original_task_id": str(open_original.id),
+                "pr_number": 902,
+                "iteration": 1,
+                "retarget_scope": "full",
+            },
+        },
+    )
+
+    result = compute_lane_waste_diagnostics(
+        [
+            merged_original,
+            merged_review,
+            merged_fix,
+            merged_rereview,
+            open_original,
+            open_review,
+        ],
+        window_start,
+    )
+
+    assert result["stale_head_discard_count"] == 1
+    assert result["retarget_review_scope_counts"] == {"delta": 1, "full": 2}
+    assert result["converged_review_counts"] == [2]
+    assert result["reviews_to_converge"] == {"count": 1, "median": 2, "p95": 2}
+
+    merged_chain = next(
+        row for row in result["chains"] if row["pr_number"] == 901
+    )
+    assert merged_chain["direction_id"] == direction_id
+    assert merged_chain["review_count"] == 2
+    assert merged_chain["reviews_to_converge"] == 2
+    assert merged_chain["task_count"] == 3
 
 
 # ── Auto-pause epidemic summary ────────────────────────────────────────────

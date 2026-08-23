@@ -1293,8 +1293,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     [conversationMode, scopedSessionTranscript, conversationMessages],
   );
   const strategicChatLiveState = useMemo(
-    () => computeStrategicChatLiveState(strategicStreamingTurn, strategicLiveActivity),
-    [strategicStreamingTurn, strategicLiveActivity],
+    () => computeStrategicChatLiveState(
+      strategicStreamingTurn,
+      strategicLiveActivity,
+      currentStrategicState?.strategic,
+    ),
+    [currentStrategicState?.strategic, strategicStreamingTurn, strategicLiveActivity],
   );
   // Hoisted out of the Workday-status memo: the utility bar needs the same
   // single mode value to decide which readout owns the shared status slot.

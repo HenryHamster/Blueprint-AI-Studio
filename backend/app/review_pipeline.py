@@ -1936,6 +1936,31 @@ def stale_respawn_delta_base_sha(
     return reviewed_head
 
 
+def _stale_respawn_scope(
+    *, source_context: dict[str, object], task_type: str, delta_base_sha: str
+) -> str | None:
+    """Classify a stale-target replacement review for durable diagnostics.
+
+    Only a *retarget* respawn is classified. Every retarget site stamps the
+    discarded review with ``_review_stale_head``/``_review_stale_target``
+    before spawning the replacement (review_request_changes.py,
+    task_lifecycle.py's approval and merge-path stale guards), so the marker
+    is the authoritative signal. ``delta_base_sha`` alone is NOT: the ordinary
+    post-fix re-review (task_lifecycle_fix_completion.py) always supplies a
+    delta base, and counting those as retarget-deltas would make
+    ``retarget_review_scope_counts`` measure routine re-review volume instead
+    of retarget scope.
+    """
+    if task_type != "review":
+        return None
+    if not (
+        source_context.get("_review_stale_head")
+        or source_context.get("_review_stale_target")
+    ):
+        return None
+    return "delta" if delta_base_sha else "full"
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,
@@ -3956,6 +3981,11 @@ async def _spawn_pipeline_task(
         (orig.context or {}).get("viewport_screenshots", []) if orig is not None else []
     )
 
+    retarget_scope = _stale_respawn_scope(
+        source_context=source_task.context or {},
+        task_type=task_type,
+        delta_base_sha=delta_base_sha,
+    )
     if task_type == "review":
         title = f"Review PR #{pr_number}"
         payload_data = {
@@ -3973,6 +4003,7 @@ async def _spawn_pipeline_task(
                 if delta_base_sha
                 else {}
             ),
+            **({"retarget_scope": retarget_scope} if retarget_scope else {}),
             **(
                 {
                     "cached_verdict_json": cached_verdict_json,
@@ -4695,6 +4726,7 @@ async def _spawn_pipeline_task(
             if task_type == "review" and delta_base_sha
             else {}
         ),
+        **({"retarget_scope": retarget_scope} if retarget_scope else {}),
         **(
             {"review_target": requested_review_target}
             if task_type == "review" and requested_review_target is not None

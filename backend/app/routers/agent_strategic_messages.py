@@ -1051,26 +1051,32 @@ async def claim_public_conversation_turn(
 
     from app.conversation_coordinator import (
         ConversationPublicReplyOwner,
+        OperatorTurnParked,
         claim_operator_messages,
     )
 
-    claim = await claim_operator_messages(
-        session,
-        project_id=project_id,
-        session_id=payload.session_id,
-        task_id=task.id,
-        worker_generation=payload.worker_generation,
-        incarnation_id=accepted_incarnation,
-        message_ids=payload.message_ids,
-        lease_seconds=payload.lease_seconds,
-        public_reply_owner=ConversationPublicReplyOwner(owner),
-        canonical_conversation_only=True,
-        client_claim_id=payload.client_claim_id,
-        claim_idempotency_key=payload.idempotency_key,
-        conversation_floor_sequence=resident_conversation_floor_sequence(
-            (project.vision or {}).get("_resident_strategic_session") or {}
-        ),
-    )
+    try:
+        claim = await claim_operator_messages(
+            session,
+            project_id=project_id,
+            session_id=payload.session_id,
+            task_id=task.id,
+            worker_generation=payload.worker_generation,
+            incarnation_id=accepted_incarnation,
+            message_ids=payload.message_ids,
+            lease_seconds=payload.lease_seconds,
+            public_reply_owner=ConversationPublicReplyOwner(owner),
+            canonical_conversation_only=True,
+            client_claim_id=payload.client_claim_id,
+            claim_idempotency_key=payload.idempotency_key,
+            conversation_floor_sequence=resident_conversation_floor_sequence(
+                (project.vision or {}).get("_resident_strategic_session") or {}
+            ),
+        )
+    except OperatorTurnParked as parked:
+        # A park is a committed decision with its own reason -- never a rollback.
+        await session.commit()
+        raise HTTPException(status_code=409, detail=parked.reason) from None
     if claim is None:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Turn is already claimed or changed")
@@ -2861,29 +2867,34 @@ async def claim_resident_messages(
     )
 
     from app.conversation_coordinator import (
+        OperatorTurnParked,
         claim_operator_messages,
         legacy_conversation_claim_incarnation,
     )
 
-    claim = await claim_operator_messages(
-        session,
-        project_id=project_id,
-        session_id=payload.session_id,
-        task_id=payload.task_id,
-        worker_generation=payload.worker_generation,
-        incarnation_id=(
-            payload.incarnation_id
-            or legacy_conversation_claim_incarnation(
-                payload.task_id,
-                payload.worker_generation,
-            )
-        ),
-        message_ids=payload.message_ids,
-        lease_seconds=payload.lease_seconds,
-        conversation_floor_sequence=resident_conversation_floor_sequence(
-            resident_blob
-        ),
-    )
+    try:
+        claim = await claim_operator_messages(
+            session,
+            project_id=project_id,
+            session_id=payload.session_id,
+            task_id=payload.task_id,
+            worker_generation=payload.worker_generation,
+            incarnation_id=(
+                payload.incarnation_id
+                or legacy_conversation_claim_incarnation(
+                    payload.task_id,
+                    payload.worker_generation,
+                )
+            ),
+            message_ids=payload.message_ids,
+            lease_seconds=payload.lease_seconds,
+            conversation_floor_sequence=resident_conversation_floor_sequence(
+                resident_blob
+            ),
+        )
+    except OperatorTurnParked as parked:
+        await session.commit()
+        raise HTTPException(status_code=409, detail=parked.reason) from None
     if claim is None:
         await session.rollback()
         raise HTTPException(

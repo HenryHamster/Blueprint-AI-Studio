@@ -134,6 +134,13 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "task.failed": AlertEventPolicy("task.failed"),
     "task.blocked": AlertEventPolicy("task.blocked"),
     "approval.needed": AlertEventPolicy("approval.needed"),
+    # A PR-less approval-gate timeout PARKED work instead of failing it and is
+    # waiting on an operator decision. Distinct from ``approval.needed`` (a hold
+    # opening normally) because this one is already PAST its gate and carries a
+    # self-release deadline. Retirement is TASK_TERMINAL: the claim is only true
+    # while the task is alive and held. See recovery_evaluating_approval
+    # (incident: research task 70c5ec8f, 2026-08-22).
+    "approval.timeout_held": AlertEventPolicy("approval.timeout_held"),
     "cost.ceiling_reached": AlertEventPolicy("cost.ceiling_reached"),
     "cost.spend_hold": AlertEventPolicy("cost.spend_hold"),
     "capacity.quota_exhausted": AlertEventPolicy("capacity.quota_exhausted"),
@@ -283,7 +290,12 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
 # operator event without deciding how it ends fails at import time instead of
 # creating another immortal row.
 _TASK_TERMINAL_RETIREMENT_EVENTS = frozenset(
-    {"task.failed", "task.blocked", "review.escalated"}
+    {
+        "task.failed",
+        "task.blocked",
+        "review.escalated",
+        "approval.timeout_held",
+    }
 )
 _TIMELINE_ONLY_RETIREMENT_EVENTS = frozenset(
     {

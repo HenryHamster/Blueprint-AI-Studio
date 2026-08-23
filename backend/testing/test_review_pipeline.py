@@ -67,6 +67,7 @@ from app.review_pipeline import (
     _is_verification_only_rejection,
     _max_review_iterations,
     _recent_consecutive_lane_count,
+    _stale_respawn_scope,
     _spawn_pipeline_task,
     post_merge_summary_comment,
     should_auto_approve_diff,
@@ -689,6 +690,86 @@ async def test_completed_exact_target_replays_structured_verdict(db_session, moc
     assert payload["cached_verdict_json"] == cached
     assert payload["cached_review_task_id"] == str(completed_review.id)
     assert payload["delta_base_sha"] == "reviewed-before-fix"
+    # A routine post-fix re-review carries a delta base but is NOT a retarget:
+    # the source has no stale marker, so it must not be counted as one.
+    assert "retarget_scope" not in payload
+    assert "retarget_scope" not in spawned.context["review_loop"]
+
+
+@pytest.mark.asyncio
+async def test_stale_marked_source_spawns_delta_scoped_retarget(db_session, mocker):
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    discarded_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review", "pr_number": 704, "branch": "feat/x"}],
+        context={
+            "review_loop": {"iteration": 1},
+            "_review_stale_head": True,
+            "_review_stale_target": True,
+        },
+    )
+    await _persist(db_session, discarded_review)
+
+    spawned, created = await _spawn_pipeline_task(
+        discarded_review,
+        "review",
+        db_session,
+        704,
+        "feat/x",
+        "main",
+        original_task_id=str(discarded_review.id),
+        review_target=_review_target(project.id, 704, "base-704", "head-704"),
+        delta_base_sha="reviewed-head-704",
+    )
+
+    assert created is True and spawned is not None
+    assert spawned.first_payload["retarget_scope"] == "delta"
+    assert spawned.context["review_loop"]["retarget_scope"] == "delta"
+
+
+def test_stale_respawn_scope_marks_only_stale_full_reviews():
+    assert (
+        _stale_respawn_scope(
+            source_context={"_review_stale_target": True},
+            task_type="review",
+            delta_base_sha="",
+        )
+        == "full"
+    )
+    assert (
+        _stale_respawn_scope(
+            source_context={"_review_stale_head": True},
+            task_type="review",
+            delta_base_sha="prior-head",
+        )
+        == "delta"
+    )
+    assert (
+        _stale_respawn_scope(
+            source_context={}, task_type="review", delta_base_sha=""
+        )
+        is None
+    )
+    # Routine post-fix re-review: a delta base with no stale marker is not a
+    # retarget and must not be classified as one.
+    assert (
+        _stale_respawn_scope(
+            source_context={"review_loop": {"iteration": 2}},
+            task_type="review",
+            delta_base_sha="reviewed-before-fix",
+        )
+        is None
+    )
+    assert (
+        _stale_respawn_scope(
+            source_context={"_review_stale_target": True},
+            task_type="fix",
+            delta_base_sha="prior-head",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

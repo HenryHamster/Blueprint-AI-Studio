@@ -1,4 +1,4 @@
-import { Search, ChevronUp, LoaderCircle, PanelRightOpen, PanelRightClose } from 'lucide-react';
+import { Search, ChevronUp, CircleAlert, LoaderCircle, PanelRightOpen, PanelRightClose } from 'lucide-react';
 import {
   WORKDAY_STATE_PRESENTATION,
   type ConversationWorkdayStatus,
@@ -118,13 +118,20 @@ export function ConversationUtilityBar({
             data-testid="conversation-workday-status"
             {...(workdayStatus && !chatChip ? { 'data-workday-state': workdayStatus.state } : {})}
             {...(chatChip ? { 'data-chat-live-phase': chatChip.phase } : {})}
-            aria-label={chatChip ? 'Strategic reply status' : undefined}
+            aria-label={chatChip
+              ? (chatChip.phase === 'stuck' ? 'Strategic status' : 'Strategic reply status')
+              : undefined}
             title={chatChip
               ? [chatChip.label, chatChip.detail].filter(Boolean).join(' · ')
               : workdayStatus?.title}
             className="ml-auto flex min-w-0 max-w-full flex-1 items-center justify-end gap-1.5 whitespace-nowrap rounded-md border border-neutral-800/80 bg-workbench-shell/45 px-2 py-1 text-ui-md sm:flex-initial"
           >
-            {chatChip ? (
+            {chatChip?.phase === 'stuck' ? (
+              <CircleAlert
+                className="h-3.5 w-3.5 shrink-0 text-amber-300"
+                aria-hidden="true"
+              />
+            ) : chatChip ? (
               <LoaderCircle
                 className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-300"
                 aria-hidden="true"
@@ -135,7 +142,9 @@ export function ConversationUtilityBar({
                 className={`h-1.5 w-1.5 shrink-0 rounded-full ${workdayPresentation?.dot}`}
               />
             )}
-            <span className={`min-w-0 truncate font-medium ${chatChip ? 'text-emerald-300' : workdayPresentation?.text}`}>
+            <span className={`min-w-0 truncate font-medium ${chatChip
+              ? (chatChip.phase === 'stuck' ? 'text-amber-300' : 'text-emerald-300')
+              : workdayPresentation?.text}`}>
               {chatChip ? chatChip.label : workdayStatus?.compactLabel ? (
                 <>
                   <span className="sm:hidden">{workdayStatus.compactLabel}</span>

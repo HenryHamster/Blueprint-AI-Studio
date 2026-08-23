@@ -84,13 +84,17 @@ const mockBaselinesResponse: LaneBaselinesResponse = {
       task_count: { latest: 3.2, prior: 3.8, delta: -0.6, classification: 'improving' },
     },
     lane_iterations: {
-      review: {
+      conflict: {
         p50: { latest: 1.5, prior: 2.0, delta: -0.5, classification: 'stable' },
         p90: { latest: 3.0, prior: 4.0, delta: -1.0, classification: 'improving' },
       },
-      fix: {
+      ci: {
         p50: { latest: 1.2, prior: 1.5, delta: -0.3, classification: 'stable' },
         p90: { latest: 2.5, prior: 3.0, delta: -0.5, classification: 'stable' },
+      },
+      review_convergence: {
+        p50: { latest: 1.0, prior: 1.5, delta: -0.5, classification: 'stable' },
+        p90: { latest: 2.0, prior: 3.0, delta: -1.0, classification: 'improving' },
       },
     },
     waste_taxonomy_shares: {
@@ -106,6 +110,12 @@ const mockBaselinesResponse: LaneBaselinesResponse = {
       prior: 10.0,
       delta: -4.0,
       classification: 'improving',
+    },
+    outer_loop_convergence: {
+      iteration_median: { latest: 2, prior: 4, delta: -2, classification: 'improving' },
+      iteration_p95: { latest: 3, prior: 5, delta: -2, classification: 'improving' },
+      convergence_rate: { latest: 1, prior: 0.5, delta: 0.5, classification: 'improving' },
+      cap_exhausted_chain_count: { latest: 0, prior: 1, delta: -1, classification: 'improving' },
     },
   },
 };
@@ -198,7 +208,13 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('v9 → v10')).toBeInTheDocument();
     expect(screen.getByText('Relay Medians')).toBeInTheDocument();
     expect(screen.getByText('Lane Iterations')).toBeInTheDocument();
+    expect(screen.getByText('Conflict p50')).toBeInTheDocument();
+    expect(screen.getByText('CI p90')).toBeInTheDocument();
+    expect(screen.getByText('Review convergence p50')).toBeInTheDocument();
     expect(screen.getByText('Waste Taxonomy Shares')).toBeInTheDocument();
+    expect(screen.getByText('Outer-Loop Convergence')).toBeInTheDocument();
+    expect(screen.getByText('Median cycles')).toBeInTheDocument();
+    expect(screen.getByText('Cap-exhausted chains')).toBeInTheDocument();
     // classification labels
     expect(screen.getAllByText('↓ improving').length).toBeGreaterThan(0);
   });

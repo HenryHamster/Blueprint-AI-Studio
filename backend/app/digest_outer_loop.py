@@ -226,7 +226,12 @@ def _outer_loop_chain_observation(
     chain_churn = 0
     chain_has_drift = False
     pr_number = rl0.get("pr_number")
+    direction_id = None
+    review_count = 0
     for t in chain_tasks:
+        context = t.context or {}
+        if direction_id is None and context.get("direction_id"):
+            direction_id = str(context["direction_id"])
         rl = (t.context or {}).get("review_loop") or {}
         if pr_number is None and rl.get("pr_number") is not None:
             pr_number = rl.get("pr_number")
@@ -241,6 +246,17 @@ def _outer_loop_chain_observation(
             drift.get("drift_in") or drift.get("drift_out")
         ):
             chain_has_drift = True
+        if (t.first_payload or {}).get("type") == "review":
+            review_count += 1
+
+    if direction_id is None:
+        for t in outcome_tasks:
+            candidate = (t.context or {}).get("direction_id")
+            if candidate:
+                direction_id = str(candidate)
+                break
+
+    outcome = _resolve_chain_outcome(outcome_tasks, chain_reasons)
 
     project_id = None
     for t in outcome_tasks:
@@ -250,10 +266,13 @@ def _outer_loop_chain_observation(
 
     return {
         "chain_key": key,
-        "outcome": _resolve_chain_outcome(outcome_tasks, chain_reasons),
+        "outcome": outcome,
         "max_iteration": max(chain_iters) if chain_iters else None,
         "churn_count": chain_churn,
         "has_drift": chain_has_drift,
+        "direction_id": direction_id,
+        "review_count": review_count,
+        "reviews_to_converge": review_count if outcome == "merged" else None,
         "original_task_id": str(oid) if oid else None,
         "pr_number": pr_number,
         "task_ids": [str(t.id) for t in chain_tasks],
