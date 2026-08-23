@@ -394,9 +394,11 @@
         "test_terminal_reconciler_never_restarts_superseded_or_stopped_worker",
         "test_active_one_shot_records_cycle_reason_then_completion_retries",
         "test_resident_retry_does_not_restore_task_declined_runner",
-        "test_workbench_and_work_session_arming_suppressed_during_resident_session"
+        "test_workbench_and_work_session_arming_suppressed_during_resident_session",
+        "test_operator_message_default_surface_is_the_serviced_lane",
+        "test_operator_message_default_arms_the_active_resident"
       ],
-      "test_count": 23
+      "test_count": 25
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",

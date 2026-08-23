@@ -937,3 +937,104 @@ async def test_workbench_and_work_session_arming_suppressed_during_resident_sess
         "expected ARMING_RESIDENT_SESSION"
     )
     refresh2.assert_not_awaited()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator-message delivery invariant.
+#
+# ``create_operator_project_message`` hardcodes ``from_type="user"``: every row
+# it writes is operator-authored. It used to default ``surface`` to ``activity``,
+# the display-only projection, and two of its five callers -- the two live
+# human-send routes (``admin_notifications`` POST /messages and ``directions``
+# POST /projects/{id}/messages, which is what ``blueprint messages send`` hits)
+# -- relied on that default.
+#
+# The consequence is not cosmetic labelling. Inside this same function the
+# ``arming = ARMING_RESIDENT_SESSION`` assignment is gated on
+# ``surface == CONVERSATION``, so an operator message on ``activity`` never arms
+# the active Resident. The message persists, the Resident can see it pending,
+# and nothing is ever armed to consume it.
+#
+# The 0608/0638 Postgres compat trigger cannot repair this: its ``should_project``
+# promotion requires the row to arrive with ``surface='conversation'`` already or
+# with ``sequence IS NULL``, and this function pre-allocates the sequence before
+# INSERT, so the wrong value is durable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_operator_message_default_surface_is_the_serviced_lane(db_session):
+    """An operator message created without an explicit surface is deliverable."""
+    project = Project(name="Operator channel", user_id="operator", vision={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="Why is the fleet idle?",
+        context={},
+        workbench_context=None,
+        idempotency_key=str(uuid.uuid4()),
+        include_strategic_session_snapshot=False,
+        # surface deliberately omitted -- the default is what is under test.
+    )
+
+    row = result.message
+    assert row.from_type == "user"
+    assert row.surface == MessageSurface.CONVERSATION
+    # Literal pin: the serviced lane is the string 'conversation'. Renaming the
+    # enum member must not silently re-route operator mail to a dead surface.
+    # (``row.surface`` is a bare str pre-refresh, so normalise before comparing.)
+    assert MessageSurface(row.surface) is MessageSurface.CONVERSATION
+    assert MessageSurface.CONVERSATION.value == "conversation"
+    # Pending, not terminal: the row is claimable by the Resident poll.
+    assert row.handling_state == MessageHandlingState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_operator_message_default_arms_the_active_resident(db_session):
+    """The default must arm an active Resident; the activity surface must not.
+
+    Asserted A/B in one test so it cannot pass vacuously: if the surface gate on
+    the arming branch ever stops binding, the ``activity`` leg below fails and
+    the test still catches it.
+    """
+    project, _task, _runner = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+
+    defaulted = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="Status on the promotion?",
+        context={},
+        workbench_context=None,
+        idempotency_key=str(uuid.uuid4()),
+        include_strategic_session_snapshot=False,
+        # surface deliberately omitted.
+    )
+    assert defaulted.message.surface == MessageSurface.CONVERSATION
+    assert defaulted.arming == ARMING_RESIDENT_SESSION
+
+    # Contrast leg: the display-only surface is what used to be the default, and
+    # it leaves the active Resident unarmed. This is the defect being fenced.
+    parked = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="Filed for the activity feed only.",
+        context={},
+        workbench_context=None,
+        idempotency_key=str(uuid.uuid4()),
+        surface=MessageSurface.ACTIVITY,
+        include_strategic_session_snapshot=False,
+    )
+    assert parked.message.surface == MessageSurface.ACTIVITY
+    assert parked.arming != ARMING_RESIDENT_SESSION
