@@ -41,6 +41,7 @@ from app.review_pipeline import (
     _task_is_actively_ci_waiting,
 )
 from app.review_policy_merge import attempt_policy_bound_merge
+from app.review_park_disposition import REVIEW_PARK_ABANDONED_FAILURE_DETAIL
 from app.rollup_branch_cleanup import (  # noqa: F401 — re-exported for callers/tests
     _branch_task_id_prefix,
     _classify_prs_authoritative,
@@ -809,7 +810,11 @@ async def _hold_rollup_for_branch_safety(
 # at least one positive cleanup/supersession signal — absence of signal is never
 # treated as non-genuine.
 
-_GENUINE_REJECTION_CTX_MARKERS = ("pr_rejected", "review_cap_exhausted")
+_GENUINE_REJECTION_CTX_MARKERS = (
+    "pr_rejected",
+    "review_cap_exhausted",
+    REVIEW_PARK_ABANDONED_FAILURE_DETAIL,
+)
 
 
 def _ctx_has_genuine_rejection_marker(ctx: dict | None) -> bool:
@@ -817,8 +822,12 @@ def _ctx_has_genuine_rejection_marker(ctx: dict | None) -> bool:
 
     ``pr_rejected`` is set by the review pipeline on a real CHANGES_REQUESTED /
     manual-close rejection; ``review_cap_exhausted`` (set as failure_detail by
-    ``_handle_cap_exhaustion``) is a review-quality non-convergence. Either one
-    forces the FAILED path regardless of any cleanup signal.
+    ``_handle_cap_exhaustion``) is a review-quality non-convergence; and
+    ``review_park_abandoned`` (set by
+    ``review_park_disposition.sweep_dispose_expired_review_parks``) is the same
+    conclusion reached by an expired operator-disposition window rather than by
+    the cap — the loop CONCLUDED, so it is a genuine rejection too. Any one of
+    the three forces the FAILED path regardless of any cleanup signal.
     """
     if not ctx:
         return False
@@ -1683,6 +1692,90 @@ def _rollup_review_respawn_park_message(
     )
 
 
+_TERMINAL_CHILD_FAILURE_DETAILS = (
+    "review_cap_exhausted",
+    REVIEW_PARK_ABANDONED_FAILURE_DETAIL,
+)
+
+
+def _child_failure_is_terminal_for_requeue(child) -> bool:
+    """Whether a FAILED child is past retrying, so the parent must not requeue it.
+
+    Both markers mean the review -> fix loop CONCLUDED, for mirror-image
+    reasons, and neither is fixed by cloning the child:
+
+      * ``review_cap_exhausted`` -- the cap handler auto-closed the PR, and a
+        fresh attempt hits the same merge conflict that triggered the cap;
+      * ``review_park_abandoned`` -- the operator-disposition window expired and
+        the loop was abandoned with its PR deliberately left OPEN, so a clone
+        would open a SECOND PR for work that already has one.
+
+    ``_requeue_parent_task`` skips both markers when it walks the children, so a
+    parent requeue driven only by these rows can do nothing but no-op -- it
+    would just burn one of the parent's three retries. Culling beats nursing.
+    """
+    return (child.context or {}).get(
+        "failure_detail"
+    ) in _TERMINAL_CHILD_FAILURE_DETAILS
+
+
+def _rollup_exclusion_note(
+    failed_children: list,
+    *,
+    failed_count: int,
+    cancelled_count: int,
+) -> str:
+    """The "excluded from this rollup" sentences appended to a partial rollup.
+
+    Pure, so the bucket arithmetic is directly testable. Three terminal shapes
+    are reported SEPARATELY because they mean different things to whoever reads
+    the rollup PR:
+
+      * ``review_cap_exhausted`` -- the cap handler AUTO-CLOSED the PR;
+      * ``review_park_abandoned`` -- the operator-disposition window expired and
+        ``review_park_disposition`` abandoned the task, but deliberately never
+        touched the PR, which is STILL OPEN (see ``_never_touch_the_pr`` /
+        PR #16759). Reporting these under the cap sentence would tell a reader
+        their PR was closed when it is in fact sitting open awaiting a decision;
+      * everything else -- a plain failure.
+
+    Both marker buckets are drawn from ``failed_children`` and keyed on distinct
+    ``failure_detail`` values, so they are disjoint; BOTH are subtracted so no
+    child is counted twice across the sentences.
+    """
+    cap_exhausted_children = [
+        c
+        for c in failed_children
+        if (c.context or {}).get("failure_detail") == "review_cap_exhausted"
+    ]
+    park_abandoned_children = [
+        c
+        for c in failed_children
+        if (c.context or {}).get("failure_detail")
+        == REVIEW_PARK_ABANDONED_FAILURE_DETAIL
+    ]
+    plain_failed_count = (
+        failed_count - len(cap_exhausted_children) - len(park_abandoned_children)
+    )
+    note = ""
+    if cancelled_count > 0:
+        note += f"\n\n*{cancelled_count} subtask(s) were cancelled and excluded from this rollup.*"
+    if plain_failed_count:
+        note += f"\n\n*{plain_failed_count} subtask(s) failed and were excluded from this rollup.*"
+    if cap_exhausted_children:
+        note += (
+            f"\n\n*{len(cap_exhausted_children)} subtask(s) hit the review-fix cap "
+            f"(PRs auto-closed, manual review required) and were excluded from this rollup.*"
+        )
+    if park_abandoned_children:
+        note += (
+            f"\n\n*{len(park_abandoned_children)} subtask(s) were abandoned when "
+            f"their operator-disposition window expired (PRs left OPEN for a human "
+            f"or a later re-plan) and were excluded from this rollup.*"
+        )
+    return note
+
+
 async def _check_and_trigger_rollup(
     child_task: Task, session: AsyncSession, progress_cb=None
 ) -> bool:
@@ -2532,11 +2625,14 @@ async def _check_and_trigger_rollup(
         # Before giving up on failed children, attempt retry via _requeue_parent_task.
         # Cap-exhausted children are terminal: their PR was auto-closed and a
         # fresh retry would hit the same merge conflict that triggered the cap.
+        # Park-abandoned children are terminal for the mirror-image reason: their
+        # PR is still OPEN and the review -> fix loop provably failed to converge,
+        # so a clone would open a SECOND PR for the same work. _requeue_parent_task
+        # skips both markers anyway; excluding them here stops the parent burning
+        # a _requeue_count on a requeue that can only be a no-op.
         # Exclude them from requeue; count them as failed-for-rollup-decision only.
         retriable_failed = [
-            c
-            for c in failed
-            if (c.context or {}).get("failure_detail") != "review_cap_exhausted"
+            c for c in failed if not _child_failure_is_terminal_for_requeue(c)
         ]
         if retriable_failed:
             MAX_PARENT_REQUEUES = 3
@@ -2550,7 +2646,8 @@ async def _check_and_trigger_rollup(
 
                 logger.info(
                     f"[ROLLUP] Parent {parent.id} — {len(retriable_failed)} retriable failed, "
-                    f"{len(failed) - len(retriable_failed)} cap-exhausted, "
+                    f"{len(failed) - len(retriable_failed)} terminal "
+                    f"(cap-exhausted or park-abandoned), "
                     f"{len(completed_merged)} succeeded. Requeuing failed children "
                     f"(attempt {requeue_count + 1}/{MAX_PARENT_REQUEUES}) before partial rollup."
                 )
@@ -2797,22 +2894,11 @@ async def _check_and_trigger_rollup(
             )
             return
 
-        cap_exhausted_children = [
-            c
-            for c in failed_children
-            if (c.context or {}).get("failure_detail") == "review_cap_exhausted"
-        ]
-        plain_failed_count = failed_count - len(cap_exhausted_children)
-        rollup_note = ""
-        if cancelled_count > 0:
-            rollup_note += f"\n\n*{cancelled_count} subtask(s) were cancelled and excluded from this rollup.*"
-        if plain_failed_count:
-            rollup_note += f"\n\n*{plain_failed_count} subtask(s) failed and were excluded from this rollup.*"
-        if cap_exhausted_children:
-            rollup_note += (
-                f"\n\n*{len(cap_exhausted_children)} subtask(s) hit the review-fix cap "
-                f"(PRs auto-closed, manual review required) and were excluded from this rollup.*"
-            )
+        rollup_note = _rollup_exclusion_note(
+            failed_children,
+            failed_count=failed_count,
+            cancelled_count=cancelled_count,
+        )
 
         if staging_branch and target_branch and staging_branch != target_branch:
             gh_token = owner = repo = None

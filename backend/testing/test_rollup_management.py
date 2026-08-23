@@ -6018,3 +6018,91 @@ async def test_direction_merge_grade_skipped_when_no_active_criterion_keys(
         "no grade task may be stamped on the parent context when the direction "
         "has no active criterion keys"
     )
+# ── Partial-rollup exclusion note: three terminal shapes, three sentences ────
+
+
+def _failed_child(failure_detail: str | None) -> Task:
+    """A minimal FAILED child carrying one terminal ``failure_detail``."""
+    return Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "child"}],
+        status=TaskStatus.FAILED,
+        context={"failure_detail": failure_detail} if failure_detail else {},
+    )
+
+
+def test_rollup_note_reports_park_abandoned_children_as_prs_left_open():
+    """An abandoned park gets its OWN sentence, not the cap's.
+
+    ``review_cap_exhausted`` promises "PRs auto-closed"; the disposition sweep
+    deliberately never touches the PR (``_never_touch_the_pr`` / PR #16759), so
+    folding these children into the cap sentence would tell an operator their PR
+    was closed while it is sitting open awaiting a decision.
+    """
+    from app.review_park_disposition import REVIEW_PARK_ABANDONED_FAILURE_DETAIL
+    from app.rollup_management import _rollup_exclusion_note
+
+    children = [_failed_child(REVIEW_PARK_ABANDONED_FAILURE_DETAIL)]
+    note = _rollup_exclusion_note(children, failed_count=1, cancelled_count=0)
+
+    assert "1 subtask(s) were abandoned when their operator-disposition window" in note
+    assert "PRs left OPEN" in note
+    assert "auto-closed" not in note, (
+        "an abandoned park must never be reported under the cap sentence"
+    )
+    assert "subtask(s) failed and were excluded" not in note, (
+        "a park-abandoned child must be subtracted from the plain-failure count"
+    )
+
+
+def test_rollup_note_counts_each_failed_child_exactly_once():
+    """All three buckets are disjoint and sum to ``failed_count``.
+
+    The arithmetic that matters: adding a second special-cased bucket without
+    subtracting it from ``plain_failed_count`` double-counts every abandoned
+    park in the rollup PR body.
+    """
+    from app.review_park_disposition import REVIEW_PARK_ABANDONED_FAILURE_DETAIL
+    from app.rollup_management import _rollup_exclusion_note
+
+    children = [
+        _failed_child("review_cap_exhausted"),
+        _failed_child("review_cap_exhausted"),
+        _failed_child(REVIEW_PARK_ABANDONED_FAILURE_DETAIL),
+        _failed_child("agent_timeout"),
+        _failed_child(None),
+    ]
+    note = _rollup_exclusion_note(children, failed_count=5, cancelled_count=3)
+
+    assert "3 subtask(s) were cancelled" in note
+    assert "2 subtask(s) failed and were excluded" in note
+    assert "2 subtask(s) hit the review-fix cap" in note
+    assert "1 subtask(s) were abandoned when" in note
+
+
+def test_rollup_note_is_empty_when_nothing_was_excluded():
+    from app.rollup_management import _rollup_exclusion_note
+
+    assert _rollup_exclusion_note([], failed_count=0, cancelled_count=0) == ""
+
+
+def test_park_abandoned_child_is_not_retried_by_the_parent_requeue():
+    """A park-abandoned child is terminal for the parent's retry budget.
+
+    ``_requeue_parent_task`` skips the marker anyway, so leaving it in
+    ``retriable_failed`` would only burn a ``_requeue_count`` on a requeue that
+    can do nothing but no-op -- nursing a dud instead of culling it.
+    """
+    from app.review_park_disposition import REVIEW_PARK_ABANDONED_FAILURE_DETAIL
+    from app.rollup_management import _child_failure_is_terminal_for_requeue
+
+    assert _child_failure_is_terminal_for_requeue(
+        _failed_child(REVIEW_PARK_ABANDONED_FAILURE_DETAIL)
+    )
+    # The pre-existing cap behaviour is unchanged...
+    assert _child_failure_is_terminal_for_requeue(_failed_child("review_cap_exhausted"))
+    # ...and an ordinary failure is still retriable, so the parent keeps its
+    # real retry budget for failures a fresh attempt can actually fix.
+    assert not _child_failure_is_terminal_for_requeue(_failed_child("agent_timeout"))
+    assert not _child_failure_is_terminal_for_requeue(_failed_child(None))
+

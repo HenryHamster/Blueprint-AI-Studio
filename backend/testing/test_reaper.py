@@ -21109,3 +21109,44 @@ async def test_proof_earn_loop_threads_named_test_executed_and_session(reaper_db
     finally:
         _rs._last_backing_proof_sweep = _prev_backing
         _rs._last_proof_earn_loop_sweep = _prev_earn
+@pytest.mark.asyncio
+async def test_reaper_cycle_runs_the_review_park_disposition_sweep(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Registration pin: the disposition sweep must actually run in the loop.
+
+    The whole point of ``app.review_park_disposition`` is that a review-fix park
+    stops being indefinite. A sweep that exists, is unit-tested and is never
+    wired into the reaper leaves every parked chain -- and its rollup parent, and
+    its research direction -- stranded exactly as before, and no test of the
+    sweep itself can see that. So pin BOTH halves here: the name the reaper calls
+    is the real function, and one reaper cycle actually awaits it.
+    """
+    import app.reaper as reaper_module
+    from app.review_park_disposition import sweep_dispose_expired_review_parks
+
+    assert (
+        reaper_module.sweep_dispose_expired_review_parks
+        is sweep_dispose_expired_review_parks
+    ), "the reaper must call the real sweep, not a shadowed local stub"
+
+    spy = mocker.patch.object(
+        reaper_module,
+        "sweep_dispose_expired_review_parks",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+
+    await _run_reaper_once()
+
+    assert spy.await_count == 1, (
+        "one reaper cycle must run the review-park disposition sweep exactly once"
+    )
+    session_arg, now_arg = spy.await_args.args[:2]
+    assert isinstance(session_arg, AsyncSession), (
+        "the sweep must be handed the reaper's own session"
+    )
+    assert isinstance(now_arg, datetime), (
+        "the sweep must be handed the cycle's clock, not left to read its own"
+    )
+

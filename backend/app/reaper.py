@@ -314,6 +314,7 @@ from app.reaper_evaluating_sweeps import (
     sweep_evaluating_parents,
     sweep_orphaned_direction_provider_tasks,
 )
+from app.review_park_disposition import sweep_dispose_expired_review_parks
 from app.reaper_sweeps import (
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
@@ -3092,6 +3093,23 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Escalated-blocker recovery sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12d: Disposition — DECIDE every review-fix park whose
+                # bounded operator-disposition window expired. An unbounded park
+                # ("a human owns this now") strands the chain, its rollup
+                # parent, and the whole research direction forever; this sweep
+                # abandons the task and leaves the PR OPEN. Fails closed on a
+                # park with no provenance, and never touches the PR.
+                _mark_reaper_progress()
+                try:
+                    await sweep_dispose_expired_review_parks(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Review-park disposition sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

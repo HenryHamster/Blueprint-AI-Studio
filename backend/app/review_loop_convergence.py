@@ -293,6 +293,19 @@ class _PreservabilityUnavailable(Exception):
 
 
 _REVIEW_LOOP_TERMINAL_OUTCOME_KEY = "review_loop_terminal_outcome"
+# Public alias for out-of-module readers (``app.review_park_disposition``).
+# The private name stays for every existing in-module reference.
+REVIEW_LOOP_TERMINAL_OUTCOME_KEY = _REVIEW_LOOP_TERMINAL_OUTCOME_KEY
+
+# The terminal-outcome kinds that actually PARK the chain for an operator.
+# Single source of truth: :func:`review_loop_parked_for_operator` (the function
+# that suppresses respawn) and :func:`review_loop_park_stale_head` both read it,
+# and so does the bounded disposition sweep in ``app.review_park_disposition``.
+# Deliberately NARROWER than ``_RESOLVABLE_ESCALATION_GATE_KINDS``:
+# repeat_fingerprint_halt / supersession_churn_halt raise a releasable hold but
+# do NOT stop the loop, so they are not parks and must never be disposed as if
+# they were.
+REVIEW_LOOP_PARKING_OUTCOME_KINDS = frozenset({"stuck", "standoff"})
 
 
 def _approval_hold_episode_identity(task: Task) -> dict[str, object] | None:
@@ -613,16 +626,20 @@ def review_loop_parked_for_operator(orig: Task | None) -> str | None:
     context = orig.context or {}
     abandon_candidate = context.get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
     if isinstance(abandon_candidate, dict):
-        # The existing reset-iteration-cap operation removes this marker and
-        # starts a new fenced census window. Until that explicit disposition,
-        # the PR remains operator-owned and no cap/stale-review path may resume
-        # or close it.
+        # reset-iteration-cap removes this marker and starts a new fenced census
+        # window. The park is BOUNDED, not indefinite: once the
+        # operator-disposition window expires,
+        # ``app.review_park_disposition.sweep_dispose_expired_review_parks``
+        # decides it (abandon) and terminalizes the task rather than escalating
+        # to a human forever. Until one of those two dispositions lands, the PR
+        # remains operator-owned and no cap/stale-review path may resume or
+        # close it. The disposition sweep never touches the PR either.
         return str(abandon_candidate.get("reason") or "abandon_candidate")
     outcome = context.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY)
     if not isinstance(outcome, dict) or outcome.get("resolved"):
         return None
     kind = outcome.get("kind")
-    if kind in ("stuck", "standoff"):
+    if kind in REVIEW_LOOP_PARKING_OUTCOME_KINDS:
         return str(kind)
     return None
 
@@ -662,7 +679,7 @@ def review_loop_park_stale_head(orig: Task | None, live_head_sha: str) -> bool:
     outcome = context.get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY)
     if not isinstance(outcome, dict) or outcome.get("resolved"):
         return False
-    if outcome.get("kind") not in ("stuck", "standoff"):
+    if outcome.get("kind") not in REVIEW_LOOP_PARKING_OUTCOME_KINDS:
         return False
     parked_head_sha = str(outcome.get("head_sha") or "")
     return bool(parked_head_sha) and parked_head_sha != live_head_sha
