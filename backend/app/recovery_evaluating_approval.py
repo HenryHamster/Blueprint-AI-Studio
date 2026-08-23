@@ -434,6 +434,16 @@ async def _handle_approval_gate_timeout(
                 )
             if _fence_owned:
                 _fence_state = "waiting"
+                # Snapshot identity BEFORE the adjudication attempt. Its except
+                # clause rolls back, which expires every instance in the session,
+                # so a later ``task.id`` / ``task.project_id`` is a lazy refresh —
+                # MissingGreenlet under asyncio. The log line and the broadcast
+                # below are exactly the two signals that tell an operator the
+                # hold was kept, so raising there would erase the reason for the
+                # one path whose whole job is to be observable.
+                _fence_task_id = str(task.id)
+                _fence_project_id = str(task.project_id)
+                _fence_status = task.status
                 try:
                     _fence_state = await adjudicate_descendant_operator_blocks(
                         task, session, now=now
@@ -445,25 +455,24 @@ async def _handle_approval_gate_timeout(
                     # error must NOT let this row fall through to the FAILED
                     # terminalization: hold it and retry on the next sweep.
                     _fence_state = "waiting"
-                    _fence_status = task.status
                     logger.warning(
                         f"[EVAL TIMEOUT] Fence-hold adjudication failed for "
-                        f"{str(task.id)[:8]} — keeping the hold rather "
+                        f"{_fence_task_id[:8]} — keeping the hold rather "
                         f"than failing a machine-held rollup",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()
                 logger.info(
-                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} carries a "
+                    f"[EVAL TIMEOUT] Task {_fence_task_id[:8]} carries a "
                     f"MACHINE-set rollup_lineage_fence descendant-block hold "
                     f"({hours}h old) — adjudicated {_fence_state!r}; the "
                     f"human-approval timeout does not apply to it"
                 )
                 await services.broadcast_to_project(
-                    str(task.project_id),
+                    _fence_project_id,
                     "task_updated",
-                    {"task_id": str(task.id), "status": _fence_status},
+                    {"task_id": _fence_task_id, "status": _fence_status},
                 )
                 return True
 
