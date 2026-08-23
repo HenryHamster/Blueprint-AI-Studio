@@ -472,6 +472,28 @@ def test_is_breach_missing_both_never_breaches():
     assert not slp.is_breach(None, None)
 
 
+@pytest.mark.parametrize(
+    ("count", "cap", "base_count", "expected"),
+    [
+        (1201, 1200, None, True),
+        (1201, 1200, 1200, True),
+        (1201, 1200, 1201, False),
+        (1201, 1200, 1300, False),
+        (1200, 1200, 1100, False),
+    ],
+)
+def test_is_breach_attributes_only_new_or_grown_breaches(
+    count, cap, base_count, expected
+):
+    """A baseline suppresses inherited debt but not a new/grown breach."""
+    assert slp.is_breach(count, cap, base_count=base_count) is expected
+
+
+def test_is_breach_missing_baseline_fails_closed():
+    """No baseline evidence keeps an absolute breach blocking."""
+    assert slp.is_breach(1201, 1200, base_count=None)
+
+
 def test_classify_size_record_delegates_breach_to_policy():
     """check_size_limits.classify_size_record must use the production predicate.
 

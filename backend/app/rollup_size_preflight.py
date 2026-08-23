@@ -40,6 +40,7 @@ from app.json_extract import async_json_loads
 from app.size_limit_policy import (
     SECTION_PATH_PREFIXES,
     classify_breach,
+    is_breach,
     governing_cap_source_path,
     ledger_with_pending_bumps,
     prune_ledger_for_current_caps,
@@ -298,7 +299,7 @@ async def preflight_rollup_size_caps(
                 )
                 return _result("defer", f"no content returned for {full_path} at {staging_branch}")
             line_count = len(content.splitlines())
-            if line_count > cap:
+            if is_breach(line_count, cap):
                 verdict = await asyncio.to_thread(
                     classify_breach,
                     module_key=key, current_size=line_count, section=section

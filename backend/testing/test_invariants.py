@@ -6272,6 +6272,8 @@ def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> li
     whose name ends in one of ``suffixes``, is not excluded by ``is_excluded``,
     exceeds ``_COVERAGE_THRESHOLD`` lines, and has no key in ``section``.
     Tree-relative paths use forward slashes to match the JSON key convention."""
+    from app.size_limit_policy import is_breach
+
     offenders = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
@@ -6283,7 +6285,7 @@ def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> li
                 continue
             with open(abs_path) as f:
                 count = len(f.readlines())
-            if count > _COVERAGE_THRESHOLD and rel_path not in section:
+            if is_breach(count, _COVERAGE_THRESHOLD) and rel_path not in section:
                 offenders.append((rel_path, count))
     offenders.sort(key=lambda item: item[1], reverse=True)
     return offenders

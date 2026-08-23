@@ -453,18 +453,29 @@ def stale_cap_limit(actual_line_count: int) -> int:
     )
 
 
-def is_breach(count: int | None, cap: int | None) -> bool:
-    """True when ``count`` breaches ``cap`` — the guardrail's fundamental predicate.
+def is_breach(
+    count: int | None,
+    cap: int | None,
+    *,
+    base_count: int | None = None,
+) -> bool:
+    """True when a count is a new or grown breach of a cap.
 
     A record is in breach only when BOTH ``count`` and ``cap`` are present AND
     ``count > cap``. A file absent at the ref (``count is None``) is never a
-    breach — a missing file cannot have grown past its cap. Centralized here in
-    the policy module (the documented single source of truth for the size
-    guardrail) so the standalone checker, the CI-compliance evaluator, and any
-    server-side classification agree on the comparison byte-for-byte instead of
-    re-deriving it inline.
+    breach — a missing file cannot have grown past its cap. When ``base_count``
+    is supplied, an otherwise-breaching record is inherited when its current
+    count is no larger than the baseline; missing baseline evidence is treated
+    as introduced (fail closed). This optional baseline argument keeps the
+    absolute breach and introduced-vs-inherited attribution rules in one
+    dependency-free primitive for every evaluator.
     """
-    return count is not None and cap is not None and count > cap
+    return (
+        count is not None
+        and cap is not None
+        and count > cap
+        and (base_count is None or count > base_count)
+    )
 
 
 def resolve_effective_cap(

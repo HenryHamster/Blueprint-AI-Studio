@@ -432,7 +432,7 @@ def scan_uncapped_section(
     ``repo_root`` (the default) preserves the plain threshold-only scan for
     callers that don't need governance awareness.
     """
-    from app.size_limit_policy import resolve_effective_cap
+    from app.size_limit_policy import is_breach, resolve_effective_cap
 
     offenders = []
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -449,7 +449,7 @@ def scan_uncapped_section(
             ):
                 continue
             count = count_lines(abs_path)
-            if count > _COVERAGE_THRESHOLD:
+            if is_breach(count, _COVERAGE_THRESHOLD):
                 offenders.append({"rel": rel, "path": abs_path, "count": count})
     offenders.sort(key=lambda rec: rec["count"], reverse=True)
     return offenders
@@ -613,7 +613,10 @@ def _collect_baseline_offenders(
 
 
 def _split_preexisting(
-    offenders: "list[tuple[str, dict]]", base_counts: dict
+    offenders: "list[tuple[str, dict]]",
+    base_counts: dict,
+    *,
+    default_cap: int | None = None,
 ) -> "tuple[list, list]":
     """Partition offenders into (blocking, preexisting) against baseline counts.
 
@@ -626,14 +629,17 @@ def _split_preexisting(
     ``None`` for an offender absent from the baseline (including the
     no-baseline case, where ``base_counts`` is empty and everything blocks).
     """
+    from app.size_limit_policy import is_breach
+
     blocking: list = []
     preexisting: list = []
     for section, rec in offenders:
         base_count = base_counts.get((section, rec["rel"]))
-        if base_count is not None and rec["count"] <= base_count:
-            preexisting.append((section, rec, base_count))
-        else:
+        cap = rec.get("effective_cap", rec.get("cap", default_cap))
+        if is_breach(rec["count"], cap, base_count=base_count):
             blocking.append((section, rec, base_count))
+        else:
+            preexisting.append((section, rec, base_count))
     return blocking, preexisting
 
 
@@ -1368,7 +1374,11 @@ def main(argv: list[str] | None = None) -> int:
         breaches, base_breached
     )
     if blocking_breaches:
-        from app.size_limit_policy import governance_source_relpath, resolve_effective_cap
+        from app.size_limit_policy import (
+            governance_source_relpath,
+            is_breach,
+            resolve_effective_cap,
+        )
 
         # A module already beyond its OWN governance cap cannot be repaired by
         # --fix/--force-chronic (both refuse unconditionally) — cheap AST-only
@@ -1385,7 +1395,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"[breach] {section}/{rec['rel']}: {rec['count']} lines ({cap_note}){grew}")
             governance_cap = resolve_effective_cap(rec["rel"], section, None, repo_root=args.repo_root)
-            if governance_cap is not None and rec["count"] > governance_cap:
+            if governance_cap is not None and is_breach(rec["count"], governance_cap):
                 zero_headroom.append((section, rec))
 
         fixable_count = len(blocking_breaches) - len(zero_headroom)
@@ -1417,7 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 1
 
     blocking_uncapped, preexisting_uncapped = _split_preexisting(
-        uncapped, base_uncapped
+        uncapped, base_uncapped, default_cap=_COVERAGE_THRESHOLD
     )
     if blocking_uncapped:
         for section, rec, base_count in blocking_uncapped:
