@@ -597,21 +597,30 @@ async def _gate_task(db_session, project: Project, pr_number: int, loop: dict) -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("latched", [True, False])
-async def test_unsatisfiable_ledger_escalates_instead_of_respawning_review(
+async def test_a_latched_ledger_is_repaired_and_does_not_reach_the_operator(
     db_session, mocker, latched
 ):
-    """A gate no review can satisfy must stop buying reviews.
+    """A gate no review could satisfy is now repaired, not escalated.
 
-    Defect this exists for: once the durable ledger latches ``complete=false``
-    with a lineage marker at the history cap, the gate re-raises the synthetic
-    ``BP-ledger-proof-incomplete`` blocker on every pass and spawns another
-    exact-target review to clear it.  The reviewer verifies the same clean
-    delta and returns the same verdict forever.  NeurIPS PR #1769 burned 65
-    byte-identical APPROVE reviews across 78 attempts that way, and the stop
-    was then attributed to the fix agent failing to converge.
+    Defect this exists for: once the durable ledger latched ``complete=false``
+    with a lineage marker at the history cap, the gate re-raised the synthetic
+    ``BP-ledger-proof-incomplete`` blocker on every pass.  NeurIPS PR #1769
+    burned 65 byte-identical APPROVE reviews across 78 attempts that way, and
+    the stop was then attributed to the fix agent failing to converge.
 
-    The ``latched=False`` leg is the control: an ordinary open blocker must
-    still spawn its review, so this cannot pass by never spawning at all.
+    This test used to assert the gate stopped buying reviews and handed the PR
+    to an operator instead.  That was the right call for an unsatisfiable gate,
+    but the gate is no longer unsatisfiable: ``build_issue_ledger`` re-derives
+    the ledger from the retained window on every pass and now re-anchors a seed
+    whose marker has fallen out of that window, so the very input the old
+    escalation fired on resolves to a complete proof.  Escalating a state that
+    self-heals is strictly worse than the burn it replaced -- it parks a
+    mergeable PR on a human.  So the ``latched`` leg asserts the repair and the
+    merge, and the marker's continued absence pins that the hand-off is gone.
+
+    The ``latched=False`` leg is unchanged and is the control: an ordinary open
+    blocker must still spawn its review and still block, so this cannot pass by
+    merging everything.
     """
     project = Project(name=f"Lineage {latched}", user_id="test-user")
     db_session.add(project)
@@ -626,9 +635,22 @@ async def test_unsatisfiable_ledger_escalates_instead_of_respawning_review(
     ]
     if latched:
         # The exact live shape read off task 70c4d06b: a marker, complete=false,
-        # and a full retained window.
+        # and a full retained window.  The marker matches no row in the window.
+        #
+        # It carries the SAME real open blocker as the control leg, so both legs
+        # stay fail-closed and this test can only ever be about the bookkeeping
+        # difference between them -- never about whether a merge is allowed.
+        # That the repaired ledger goes on to clear a genuinely clean gate is
+        # asserted separately, by
+        # ``test_repaired_ledger_lets_a_clean_pr_merge_without_an_operator``.
         ledger = {
-            "open": [],
+            "open": [
+                {
+                    "issue_id": "BP-real-blocker",
+                    "severity": "major",
+                    "description": "an actual finding in the diff",
+                }
+            ],
             "resolved": [],
             "schema_version": 1,
             "complete": False,
@@ -691,19 +713,28 @@ async def test_unsatisfiable_ledger_escalates_instead_of_respawning_review(
     marker = context.get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
 
     if latched:
-        assert spawned == [], (
-            "a review cannot restore a lost lineage proof, so spawning one is "
-            "pure burn"
+        rebuilt = context["review_loop"]["issue_ledger"]
+        assert rebuilt["complete"] is True, (
+            "a seed whose marker has fallen out of the window must be recovered "
+            "by replaying that window, not stamped unprovable forever"
         )
-        assert isinstance(marker, dict)
-        assert marker["reason"] == "ledger_lineage_unsatisfiable"
-        assert marker["pr_number"] == pr_number
-        assert marker["review_history_entries"] == REVIEW_HISTORY_MAX_ENTRIES
-        assert "BP-ledger-proof-incomplete" in marker["open_issue_ids"]
-        assert (
-            context["review_loop"].get("ledger_lineage_unsatisfiable") is True
+        assert rebuilt["through_entry_key"] != "883a8476fd18685e2939b861", (
+            "the recovery must re-anchor the marker; handing back the marker "
+            "this window could not find is what made the latch permanent"
         )
-        assert "adjudication" in (task.latest_status_message or "").lower()
+        assert not any(
+            str(blocker.get("issue_id") or "") == "BP-ledger-proof-incomplete"
+            for blocker in rebuilt.get("open") or []
+        ), "the synthetic bookkeeping blocker must not be minted any more"
+        assert marker is None, (
+            "the operator hand-off must be gone: a state that self-heals on the "
+            "next build must never be escalated to a human"
+        )
+        assert "adjudication" not in (task.latest_status_message or "").lower()
+        assert spawned == ["review"], (
+            "the loop must be alive again -- the real blocker still gets its "
+            "exact-target review instead of the chain being parked"
+        )
     else:
         assert spawned == ["review"], (
             "an ordinary blocker must still get its exact-target review"
@@ -711,6 +742,78 @@ async def test_unsatisfiable_ledger_escalates_instead_of_respawning_review(
         assert marker is None, (
             "a recoverable gate must never be escalated to the operator"
         )
+
+
+@pytest.mark.asyncio
+async def test_repaired_ledger_lets_a_clean_pr_merge_without_an_operator(
+    db_session, mocker
+):
+    """The unwedge, end to end: latched bookkeeping over a genuinely clean PR.
+
+    Fifty backend-verified approvals of the live target, no findings anywhere,
+    and a durable ledger whose lineage marker matches no retained row. Nothing
+    about this PR is unresolved -- the only thing that ever held it was a hash
+    that stopped matching. It used to be held forever and then handed to a
+    human; it must merge.
+
+    Kept separate from the fail-closed pair above on purpose: that test proves
+    the bookkeeping repair while both its legs stay blocked, so no assertion
+    there can ever be relaxed into allowing a merge. This one is where an
+    allowed merge is the subject, and it earns it with an empty open set.
+    """
+    project = Project(name="Repaired clean", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pr_number = 17803
+    target = _target(project, pr_number)
+    history = [
+        _clean_approval(project, pr_number, iteration)
+        for iteration in range(1, 1 + REVIEW_HISTORY_MAX_ENTRIES)
+    ]
+    loop = {
+        "pr_number": pr_number,
+        "branch": f"blueprint/task-{pr_number}",
+        "base_branch": "main",
+        "base_sha": target["base_sha"],
+        "head_sha": target["head_sha"],
+        "review_history": history,
+        "issue_ledger": {
+            "open": [],
+            "resolved": [],
+            "schema_version": 1,
+            "complete": False,
+            "through_entry_key": "883a8476fd18685e2939b861",
+        },
+        "review_target": target,
+    }
+    task = await _gate_task(db_session, project, pr_number, loop)
+
+    spawned: list[str] = []
+
+    async def _spawn(_task, kind, *_args, **_kwargs):
+        spawned.append(kind)
+        return None, False
+
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", side_effect=_spawn)
+
+    allowed = await _enforce_authoritative_review_merge_gate(
+        task,
+        db_session,
+        ci_loop=dict(loop),
+        pr_number=pr_number,
+        branch=f"blueprint/task-{pr_number}",
+        base_branch="main",
+        original_task_id=str(task.id),
+        live_review_target=target,
+    )
+
+    assert allowed is True
+    assert spawned == [], "nothing was blocking, so nothing needed reviewing"
+    context = task.context or {}
+    assert context.get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY) is None
+    assert context["review_loop"]["review_approved"] is True
 
 
 def _blocked_loop(project: Project, pr_number: int) -> dict:

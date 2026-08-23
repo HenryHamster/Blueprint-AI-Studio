@@ -11,7 +11,6 @@ from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
 from app.issue_ledger import (
     build_issue_ledger,
     issue_ledger_complete_for_history,
-    issue_ledger_lineage_proof_unsatisfiable,
 )
 from app.models import Task, _utcnow
 from app.review_loop_convergence import REVIEW_LOOP_ABANDON_CANDIDATE_KEY
@@ -200,62 +199,22 @@ async def _enforce_authoritative_review_merge_gate(
     task.context = {**source_context, "review_loop": gated_loop}
     flag_modified(task, "context")
 
-    # A latched ledger cannot be argued with.  Once the durable proof is
-    # unsatisfiable (see ``issue_ledger_lineage_proof_unsatisfiable``) the
-    # synthetic ``BP-ledger-proof-incomplete`` blocker is re-minted on every
-    # single pass, so spawning another exact-target review buys nothing: the
-    # reviewer verifies the same clean delta, returns the same verdict, and the
-    # gate refuses it again.  Hand the PR to an operator instead of burning
-    # review budget against a gate that no review can satisfy, and record the
-    # true reason so the stop is not later misread as the fix agent failing to
-    # converge.  Fail-closed is unchanged -- nothing merges here either way.
-    lineage_unsatisfiable = issue_ledger_lineage_proof_unsatisfiable(
-        ledger, history
-    )
-    if lineage_unsatisfiable:
-        gated_loop["ledger_lineage_unsatisfiable"] = True
-        task.context = {
-            **source_context,
-            "review_loop": gated_loop,
-            REVIEW_LOOP_ABANDON_CANDIDATE_KEY: {
-                "status": "abandon_candidate",
-                "reason": "ledger_lineage_unsatisfiable",
-                "scope": "ledger-proof",
-                "pr_number": pr_number,
-                "detail": (
-                    "The durable issue ledger is stamped complete=false with a "
-                    "lineage marker while the retained review history is at its "
-                    "cap, so build_issue_ledger can never restore the proof and "
-                    f"{LEDGER_PROOF_INCOMPLETE_ISSUE_ID} is re-raised on every "
-                    "merge-gate pass. No commit fixes it and no review refutes "
-                    "it; an operator must adjudicate the ledger."
-                ),
-                "open_issue_ids": [
-                    str(blocker.get("issue_id") or "")
-                    for blocker in open_blockers
-                    if isinstance(blocker, dict)
-                ],
-                "review_history_entries": len(history),
-                "recorded_at": _utcnow().isoformat(),
-            },
-        }
-        flag_modified(task, "context")
-        task.latest_status_message = (
-            f"Merge held for PR #{pr_number}: the durable issue ledger can no "
-            "longer prove it covers every review row, so no review can clear "
-            "the gate. Operator adjudication required."
-        )
-        session.add(task)
-        logger.error(
-            "[CI] Merge permanently held for PR #%s: issue-ledger lineage proof "
-            "is unsatisfiable (%d retained review rows, %d open blocker(s)); "
-            "suppressed the exact-target review respawn and escalated to "
-            "operator adjudication",
-            pr_number,
-            len(history),
-            len(open_blockers),
-        )
-        return False
+    # There used to be an "unsatisfiable ledger" escalation here.  It fired
+    # when the durable ledger carried a lineage marker, was stamped
+    # ``complete=False``, and the retained history sat at its cap -- a state
+    # ``build_issue_ledger`` could never leave, so the synthetic
+    # ``BP-ledger-proof-incomplete`` blocker was re-minted on every pass and the
+    # PR was handed to an operator to adjudicate a ledger no commit could fix
+    # and no review could refute.
+    #
+    # That state no longer exists: ``build_issue_ledger`` now RECOVERS a seed
+    # whose marker has fallen out of the window by replaying the whole retained
+    # window and re-anchoring the marker to the new tail, at any window size.
+    # Keeping the detector would be worse than deleting it -- its rule
+    # (marker + not complete + at cap) no longer implies permanence, so it would
+    # escalate a state that now self-heals on the very next build.  The gate
+    # below is what bounds a genuinely stalled loop, and it is keyed on forward
+    # motion rather than on a buffer size.
 
     # Bound the exact-target respawn.  Keyed on the immutable target, so the
     # only thing this can ever stop is a loop in which nothing is moving:

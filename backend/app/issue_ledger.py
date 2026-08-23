@@ -15,14 +15,13 @@ import hashlib
 import re
 from typing import Any
 
-from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
 from app.issue_ledger_state import (
     ISSUE_LEDGER_MAX_RESOLVED,
     ISSUE_LEDGER_SCHEMA_VERSION,
     _history_entry_key,
+    _history_entry_task_id,
     _seed_open_record,
     issue_ledger_complete_for_history,  # noqa: F401 - compatibility re-export
-    issue_ledger_lineage_proof_unsatisfiable,  # noqa: F401 - re-export
     normalize_issue_ledger,
 )
 
@@ -227,6 +226,12 @@ def build_issue_ledger(
       an existing demand, but it also cannot make an explicitly listed blocker
       disappear.
     * The returned ``open`` list is never capped or sliced.
+    * A seed whose lineage marker is absent from the retained window is
+      RECOVERED, not frozen: the whole retained window is replayed on top of the
+      seed's open records and the marker advances to the new tail, at ANY window
+      size.  The build reports that it did so via ``lineage_recovered`` on the
+      returned ledger.  Freezing was a one-way door -- no later review could
+      close anything, and no commit could clear it.
     """
     normalized_seed = (
         normalize_issue_ledger(seed_ledger) if seed_ledger is not None else None
@@ -239,38 +244,87 @@ def build_issue_ledger(
     }
     resolved: list[dict] = list((normalized_seed or {}).get("resolved", []))
     history = list(review_history or [])
-    seed_is_complete = bool(
-        normalized_seed
-        and normalized_seed.get("schema_version") == ISSUE_LEDGER_SCHEMA_VERSION
-        and normalized_seed.get("complete") is True
-        and normalized_seed.get("through_entry_key")
-    )
     entries_to_apply = history
     matching_index: int | None = None
     seed_through_key = str(
         (normalized_seed or {}).get("through_entry_key") or ""
     )
-    seed_has_lineage_marker = bool(normalized_seed is not None and seed_through_key)
+    seed_through_task_id = str(
+        (normalized_seed or {}).get("through_entry_task_id") or ""
+    )
+    seed_has_lineage_marker = bool(
+        normalized_seed is not None and (seed_through_key or seed_through_task_id)
+    )
+    # True when the seed claims a position this window cannot confirm, i.e. the
+    # window was replayed whole instead of resumed from the seed's row.  It is
+    # reported on the returned ledger so the fallback is visible rather than
+    # silent; it deliberately does NOT change what the replay concludes.  See
+    # the recovery rationale below.
+    lineage_recovered = False
     if seed_has_lineage_marker:
-        matching_index = next(
-            (
-                index
-                for index in range(len(history) - 1, -1, -1)
-                if _history_entry_key(history[index]) == seed_through_key
-            ),
-            None,
-        )
+        if seed_through_task_id:
+            matching_index = next(
+                (
+                    index
+                    for index in range(len(history) - 1, -1, -1)
+                    if _history_entry_task_id(history[index]) == seed_through_task_id
+                ),
+                None,
+            )
+        if matching_index is None and seed_through_key:
+            matching_index = next(
+                (
+                    index
+                    for index in range(len(history) - 1, -1, -1)
+                    if _history_entry_key(history[index]) == seed_through_key
+                ),
+                None,
+            )
         if matching_index is not None:
             entries_to_apply = history[matching_index + 1 :]
         else:
-            # The retained window is not demonstrably downstream of this
-            # durable seed. Replaying it on top of the seed can run older review
-            # rows "backwards" over newer open findings, manufacturing
-            # impossible resolutions (a finding introduced at iteration 5
-            # appearing fixed at iteration 1). Preserve the seed exactly and
-            # wait for an authoritative rebuild or a window containing its
-            # marker; never guess temporal ordering.
-            entries_to_apply = []
+            # LINEAGE RECOVERY.  The retained window does not contain the row
+            # this seed was stamped through, so we cannot prove the window is
+            # downstream of the seed.
+            #
+            # This used to set ``entries_to_apply = []`` and wait for "an
+            # authoritative rebuild" -- but nothing in the system performs one,
+            # and ``can_advance_marker`` below refuses to move a marker that did
+            # not match.  Those two together made lost lineage a PERMANENT,
+            # unrecoverable freeze: no later review could ever close a blocker
+            # again, the merge gate held forever, and because it respawns a
+            # review on every evaluation the PR burned model calls without
+            # bound.  Live instance: PR #17693 reached 45 history rows and 44
+            # spawned review tasks, the last 40 of them APPROVE-with-no-issues
+            # on one unchanged head, each emitting correct, backend-verified,
+            # reasoned ``refuted`` resolutions for both open blockers -- every
+            # one discarded here.  Losing the marker is routine, not exotic:
+            # ``review_request_changes`` rebuilds parent history by filtering
+            # rows out by ``review_task_id``, so the marked row can simply stop
+            # existing.
+            #
+            # Recover instead of freezing: replay the ENTIRE retained window on
+            # top of the seed's open records.  That is a full recomputation, not
+            # a partial catch-up, so it does not depend on knowing where the
+            # seed sat -- the window is applied in its own recorded order and
+            # the resulting state is the one that order implies.  Re-applying
+            # rows the seed already consumed is idempotent: each row's effect is
+            # a pure function of that row, so a second pass reaches the same
+            # raise / resolve / omission decision.  Seeding with the seed's open
+            # records keeps any blocker that only a bound-dropped row raised.
+            #
+            # The old comment feared a window that fakes ordering -- "a finding
+            # introduced at iteration 5 appears fixed at iteration 1".  The
+            # window carries its own order and is replayed in it, so that
+            # inversion does not arise here.  What it would take is rows the
+            # bound already dropped -- and those are invisible to the gate, the
+            # reviewer and the fix agent alike, so no ledger state can be proven
+            # about them and demanding one is the wedge.  Their effect survives
+            # anyway, because the replay starts from the seed's open records.
+            # The marker then advances to the new tail, so the ledger reconnects
+            # to a provable lineage instead of staying stranded forever.
+            lineage_recovered = True
+            entries_to_apply = history
     # A markerless legacy seed has no claim to a position *after* this bounded
     # history window. Rebuild conservatively from the retained reviews: seeded
     # unverified blockers cannot be closed by omission, explicit exact-target
@@ -281,12 +335,46 @@ def build_issue_ledger(
     # the retained history (or no new history was supplied). If the marker is
     # absent, replaying the retained cap may reconstruct current-looking state
     # while silently skipping rows between the seed and that window.
+    # Every path that reaches a stamp below has replayed the retained history
+    # all the way to its tail, so the stamped ledger covers that history:
+    #   * ``matching_index is not None`` -- the seed's own position is inside
+    #     this window and every row after it was applied.
+    #   * ``lineage_recovered``          -- the whole window was replayed on top
+    #     of the seed's open records.
+    #   * no lineage marker at all       -- a first build or a legacy seed; the
+    #     whole window was replayed.
+    # The disjunction is exhaustive by construction, and that is the point.  It
+    # used to carry two further conditions, and each one was a one-way door:
+    #
+    #   ``seed_is_complete`` on the first clause -- a ledger stamped
+    #   ``complete=False`` once could never be stamped complete again, because
+    #   the only way to become complete was to have been complete.  Every
+    #   ledger already persisted in that state stays wedged until this clause
+    #   goes.
+    #
+    #   ``len(history) < REVIEW_HISTORY_MAX_ENTRIES`` on the others -- losing
+    #   lineage while the window was full was unrecoverable, because history
+    #   only grows.  The merge gate then minted BP-ledger-proof-incomplete on
+    #   every pass and escalated to operator adjudication: the engine revoking
+    #   its own authority because a bounded buffer overflowed.  On NeurIPS PR
+    #   #1769 that cost 65 byte-identical APPROVE reviews over 78 attempts.
+    #
+    # "Complete" means the ledger accounts for every row of the RETAINED review
+    # history -- exactly what ``issue_ledger_complete_for_history`` asks, and
+    # the only history any consumer can read.  Rows the bound already dropped
+    # are invisible to the gate, the reviewer and the fix agent alike, so
+    # demanding proof about them is unsatisfiable the moment the window fills.
+    # Fail-closed is unchanged: coverage is not clearance.  The recovery replays
+    # on top of the seed's open records, so a blocker raised in a dropped row
+    # stays open unless the window explicitly resolves it or an authoritative,
+    # target-verified verdict inside the window is silent about it -- and the
+    # live invariant that actually moves, "this stamp still matches the current
+    # tail", is checked separately by ``issue_ledger_complete_for_history`` and
+    # still goes False the moment a new review row lands.
     lineage_complete = bool(
-        (seed_is_complete and (not history or matching_index is not None))
-        or (
-            not seed_has_lineage_marker
-            and len(history) < REVIEW_HISTORY_MAX_ENTRIES
-        )
+        matching_index is not None
+        or lineage_recovered
+        or not seed_has_lineage_marker
     )
 
     for entry in entries_to_apply:
@@ -456,6 +544,21 @@ def build_issue_ledger(
             current_by_id[issue_id] = issue
             normalized_current.append(issue)
 
+        # Closure-by-omission runs on a recovery pass too, and that is load
+        # bearing rather than lax.  A recovery replays the WHOLE retained
+        # window in order, so it is a full recomputation, and each row's effect
+        # on the ledger is a pure function of that row: replaying a row the
+        # seed already consumed reproduces the same raise / resolve / omission
+        # decision it produced the first time.  Suppressing omission here
+        # instead leaves every blocker the window raised early and dropped
+        # later permanently open -- measured on PR #17693, suppression kept two
+        # long-dead findings (first demanded at iterations 1 and 3, unmentioned
+        # by the 40 authoritative APPROVEs that followed) open forever, which is
+        # the same wedge in a new place.  The seed's open records are still
+        # folded in first, so a blocker raised only in a row the bound dropped
+        # is not lost; it closes only if a replayed authoritative, target-
+        # verified verdict is silent about it, which is exactly the inference
+        # the normal path makes.
         if verdict_is_authoritative and target_verified:
             for issue_id, prior in list(open_records.items()):
                 if issue_id in matched_open_ids:
@@ -521,8 +624,13 @@ def build_issue_ledger(
         (entry for entry in reversed(history) if isinstance(entry, dict)),
         None,
     )
-    can_advance_marker = not seed_has_lineage_marker or matching_index is not None
-    if stamp_complete and tail is not None and can_advance_marker:
+    # There is no longer a branch that declines to advance the marker.  That
+    # was the other half of the freeze: a seed whose marker did not match was
+    # given back its own stale marker, so the next build could not match it
+    # either, forever.  Every stamping path above now replays the retained
+    # history to its tail, so the tail is an honest statement of how far this
+    # ledger has been carried.
+    if stamp_complete and tail is not None:
         result.update(
             {
                 "schema_version": ISSUE_LEDGER_SCHEMA_VERSION,
@@ -530,19 +638,29 @@ def build_issue_ledger(
                 "through_entry_key": _history_entry_key(tail),
             }
         )
-    elif stamp_complete and normalized_seed is not None and not history:
-        for key in ("schema_version", "complete", "through_entry_key"):
+        tail_task_id = _history_entry_task_id(tail)
+        if tail_task_id:
+            result["through_entry_task_id"] = tail_task_id
+        if lineage_recovered:
+            # Surface the reason, not just the state.  The ledger is complete
+            # either way, but "we replayed the whole window because the seed's
+            # marker had fallen out of it" is a different fact from "we resumed
+            # exactly where the seed left off", and an operator reading a
+            # ledger should not have to re-derive which one happened.  This is
+            # a per-build observation, not durable state: ``normalize_issue_
+            # ledger`` does not carry it, so it cannot latch across builds.
+            result["lineage_recovered"] = True
+    elif stamp_complete and normalized_seed is not None:
+        # No history at all: nothing to cover, so carry the seed's own stamp
+        # through verbatim rather than inventing one.
+        for key in (
+            "schema_version",
+            "complete",
+            "through_entry_key",
+            "through_entry_task_id",
+        ):
             if key in normalized_seed:
                 result[key] = normalized_seed[key]
-    elif stamp_complete and normalized_seed is not None:
-        # Missing lineage is a durable fail-closed state. Keep the seed marker
-        # so a later authoritative window may reconnect to it, but never carry
-        # ``complete=True`` across the gap or advance the marker to rows that
-        # were deliberately not applied.
-        result["schema_version"] = ISSUE_LEDGER_SCHEMA_VERSION
-        result["complete"] = False
-        if seed_through_key:
-            result["through_entry_key"] = seed_through_key
     return result
 
 
