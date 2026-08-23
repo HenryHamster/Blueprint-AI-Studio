@@ -32,6 +32,7 @@ from app.managed_compute import (
     is_managed_compute_enabled_authoritative,
     managed_compute_denial_snapshot,
 )
+from app.runner_project_binding import resolve_local_capacity_hold
 from app.compute_backends import (
     GCP_BACKEND_NAME,
     LOCAL_GPU_BACKEND_NAME,
@@ -2605,12 +2606,18 @@ async def _hold_compute_job_for_managed_compute(
                 },
             )
         else:
+            # Distinguish "the bound fleet is busy" from "no runner is bound to
+            # this project at all" — see resolve_local_capacity_hold.
+            hold_message, runner_binding_wait = await resolve_local_capacity_hold(
+                session, live.project_id
+            )
             _set_meta(
                 live,
-                status_message="Waiting for local capacity: managed cloud execution is disabled",
+                status_message=hold_message,
                 managed_compute=managed_compute_denial_snapshot(
                     backend="gcp_compute_job"
                 ),
+                runner_binding_wait=runner_binding_wait,
             )
         await session.commit()
 

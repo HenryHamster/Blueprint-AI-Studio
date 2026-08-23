@@ -1213,6 +1213,51 @@ async def onboard_project(
     await session.commit()
     await session.refresh(project)
 
+    # A brand-new project sits on ZERO runner allow-lists, so the very first
+    # task onboarding spawns below can never be pinned to local hardware: the
+    # dispatch cache only registers a runner under its enrollment project
+    # UNIONed with its explicit ``runner_project_binding`` grants. With managed
+    # cloud execution disabled that task holds QUEUED forever until a human
+    # POSTs a binding. Grant the owner's OWN already-enrolled fleet here, before
+    # the first task exists, through the canonical binding write path. Strictly
+    # same-account (``Project.user_id``) — a runner belonging to another account
+    # is never granted. Best-effort: a failure warns, it never fails onboarding.
+    # Snapshot the id BEFORE the try: a rollback below expires the instance, so
+    # reading project.id afterwards is the MissingGreenlet defect class.
+    _binding_project_id = str(project.id)
+    try:
+        from app.runner_project_binding import grant_project_to_owner_runners
+
+        runner_bindings = await grant_project_to_owner_runners(session, project)
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        # The project row was already committed above, so it survives this
+        # rollback -- but the rollback EXPIRED the loaded instance, and the rest
+        # of onboarding below keeps reading project.*. Re-load it explicitly
+        # rather than letting a lazy refresh fire outside greenlet context.
+        try:
+            await session.refresh(project)
+        except Exception:
+            logger.exception(
+                "[ONBOARD] Failed to reload project %s after a grant rollback",
+                _binding_project_id,
+            )
+        logger.exception(
+            "[ONBOARD] Failed to auto-grant local runners to project %s — continuing",
+            _binding_project_id,
+        )
+        runner_bindings = {
+            "granted_runner_ids": [],
+            "warnings": [
+                "Could not grant this account's local runners to the new "
+                "project. Its tasks will hold QUEUED until a runner is granted "
+                "with POST /api/admin/projects/{enrollment_project_id}/runners/"
+                "{runner_id}/projects."
+            ],
+        }
+    response["runner_bindings"] = runner_bindings
+
     # Auto-spawn a repo_bootstrap task for non-self-repo, non-empty projects
     # that have not already been bootstrapped. This runs once before the first
     # strategic cycle to seed design doc sections and confirm build/test commands.

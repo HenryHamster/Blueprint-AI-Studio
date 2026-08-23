@@ -158,6 +158,7 @@ async def provision_and_handle(
         is_managed_compute_enabled_authoritative,
         managed_compute_denial_snapshot,
     )
+    from app.runner_project_binding import resolve_local_capacity_hold
 
     account_released = False
 
@@ -230,15 +231,20 @@ async def provision_and_handle(
                         "Waiting for local execution capacity (project policy: local_only)."
                     )
                 else:
+                    # Distinguish "the bound fleet is busy" from "no runner is
+                    # bound to this project at all" — see resolve_local_capacity_hold.
+                    (
+                        _hold_message,
+                        _runner_binding_wait,
+                    ) = await resolve_local_capacity_hold(hold_session, p_id)
                     held_task.context = {
                         **(held_task.context or {}),
                         "managed_compute": managed_compute_denial_snapshot(
                             backend="agent_provision"
                         ),
+                        "runner_binding_wait": _runner_binding_wait,
                     }
-                    held_task.latest_status_message = (
-                        "Waiting for local capacity: managed cloud execution is disabled"
-                    )
+                    held_task.latest_status_message = _hold_message
                 hold_session.add(held_task)
                 await hold_session.commit()
         await _release_account_once()
