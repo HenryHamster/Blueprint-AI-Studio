@@ -15140,3 +15140,119 @@ def test_script_roster_selection_uses_capability_not_ci_marker():
     ) in source
     assert '"${CI:-}" = "true"' not in source
     assert '"${CI:-}" = "1"' not in source
+
+
+# ---------------------------------------------------------------------------
+# Subprocess output must be decoded as UTF-8 explicitly.
+#
+# ``subprocess.run(..., text=True)`` with no ``encoding=`` decodes the child's
+# output with ``locale.getpreferredencoding()``.  That is cp1252 on a Windows
+# operator host and ASCII (``ANSI_X3.4-1968``) in a container with no ``LANG``.
+# A single non-ASCII byte in git/gcloud/docker output then raises
+# ``UnicodeDecodeError`` *inside subprocess's reader thread*, where nothing in
+# our code can catch it: the exception is printed as a bare traceback, the
+# thread dies, and ``communicate()`` returns EMPTY or TRUNCATED output while
+# ``returncode`` stays 0.
+#
+# That is a fail-OPEN on every gate that reads git history — observed on
+# ``check_size_limits.py``, whose cap-bump reader silently lost its history and
+# still exited 0.  A governance gate that cannot read its evidence must fail
+# closed, and it cannot even do that if it never learns the read failed.
+#
+# ``errors="replace"`` is required alongside: a genuinely undecodable byte must
+# degrade to U+FFFD in the captured text, not kill the reader thread.
+# ---------------------------------------------------------------------------
+
+_SUBPROCESS_SPAWN_FUNCS = {"run", "Popen", "check_output", "call", "check_call"}
+
+
+def _locale_decoded_subprocess_calls(root: Path) -> list[str]:
+    """``file:line`` for every text-mode subprocess call with no explicit codec."""
+    import ast as _ast
+
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            tree = _ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - unreadable source
+            continue
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name not in _SUBPROCESS_SPAWN_FUNCS:
+                continue
+            keywords = {kw.arg for kw in node.keywords}
+            if "encoding" in keywords:
+                continue
+            text_mode = any(
+                kw.arg in ("text", "universal_newlines")
+                and isinstance(kw.value, _ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            )
+            if text_mode:
+                offenders.append(f"{path.name}:{node.lineno}")
+    return offenders
+
+
+def test_backend_app_subprocess_calls_decode_utf8_explicitly():
+    """No deployed backend module may decode subprocess output with the locale codec."""
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    offenders = _locale_decoded_subprocess_calls(app_dir)
+    assert offenders == [], (
+        "text-mode subprocess call(s) in backend/app with no explicit "
+        "encoding=: "
+        + ", ".join(offenders)
+        + '. Pass encoding="utf-8", errors="replace" — otherwise a non-ASCII '
+        "byte kills subprocess's reader thread and the call returns truncated "
+        "output with returncode 0 (a fail-open on any gate reading git)."
+    )
+
+
+def test_size_governance_readers_replace_undecodable_bytes():
+    """The cap-bump/size gates must degrade an undecodable byte, never raise."""
+    import ast as _ast
+
+    backend_root = Path(__file__).resolve().parents[1]
+    guarded = [
+        backend_root / "app" / "size_limit_policy.py",
+        backend_root / "testing" / "check_size_limits.py",
+    ]
+    checked = 0
+    for path in guarded:
+        if not path.exists():  # pragma: no cover - partial checkout
+            continue
+        tree = _ast.parse(path.read_text(encoding="utf-8"))
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name not in _SUBPROCESS_SPAWN_FUNCS:
+                continue
+            literals = {
+                kw.arg: kw.value.value
+                for kw in node.keywords
+                if isinstance(kw.value, _ast.Constant)
+            }
+            if not (
+                literals.get("text") is True
+                or literals.get("universal_newlines") is True
+            ):
+                continue
+            checked += 1
+            assert literals.get("encoding") == "utf-8", (
+                f"{path.name}:{node.lineno} must decode git output as utf-8"
+            )
+            assert literals.get("errors") == "replace", (
+                f"{path.name}:{node.lineno} must pass errors='replace' so an "
+                "undecodable byte degrades instead of killing the reader thread"
+            )
+    assert checked >= 12, (
+        "expected the size-governance readers to still shell out to git; "
+        f"only found {checked} text-mode subprocess calls"
+    )

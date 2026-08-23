@@ -4568,13 +4568,24 @@ async def reset_iteration_cap(
     # just released -- with the same head, the same key, and the same count.
     # An explicit operator reset is precisely the disposition that budget was
     # escalating for, so it releases the budget too.
+    #
+    # What actually releases it is the ``iteration_reset_at`` stamp written
+    # above: the gate derives that budget from review ROWS (a context counter
+    # could not survive the ci-waiting driver row migrating), and its census
+    # excludes every row created at or before the stamp -- the same closed-
+    # episode window the per-PR cap query in review_pipeline already applies.
+    # The three keys below are the gate's read-model of that census. They are
+    # no longer authority for anything, but a stale copy of an exhausted count
+    # is exactly what an operator would read next, so drop them with it.
     from app.review_merge_gate import (
+        _SPAWN_BUDGET_CENSUS_KEY,
         _SPAWN_BUDGET_COUNT_KEY,
         _SPAWN_BUDGET_TARGET_KEY,
     )
 
     new_review_loop.pop(_SPAWN_BUDGET_COUNT_KEY, None)
     new_review_loop.pop(_SPAWN_BUDGET_TARGET_KEY, None)
+    new_review_loop.pop(_SPAWN_BUDGET_CENSUS_KEY, None)
     new_ctx["review_loop"] = new_review_loop
     # An abandon-candidate hold is a recoverable episode stop. Resetting the
     # existing iteration budget explicitly starts a fresh census window; keep

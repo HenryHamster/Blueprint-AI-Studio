@@ -454,16 +454,20 @@ def _blocking(
         for key in ("current_exit_code", "error")
         if key in recorded
     }
-    record_lane(
-        vitest_lane(suite_name),
-        state=state,
-        blocking=True,
-        new_failures=recorded.get("new_failures"),
-        suppressed_failures=recorded.get("suppressed_failures"),
-        disappeared_failures=recorded.get("disappeared_failures"),
-        skipped_failures=recorded.get("skipped_failures"),
-        extra=receipt_extra,
-    )
+    # A preceding _record call already persisted the complete attribution
+    # (including scoped coverage identities). Re-recording that same lane here
+    # would replace it with the narrower blocking payload.
+    if outcome is None:
+        record_lane(
+            vitest_lane(suite_name),
+            state=state,
+            blocking=True,
+            new_failures=recorded.get("new_failures"),
+            suppressed_failures=recorded.get("suppressed_failures"),
+            disappeared_failures=recorded.get("disappeared_failures"),
+            skipped_failures=recorded.get("skipped_failures"),
+            extra=receipt_extra,
+        )
     detail_items = [
         (key, value) for key, value in extra.items() if key != "current_exit_code"
     ]

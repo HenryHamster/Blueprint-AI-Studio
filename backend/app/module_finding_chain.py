@@ -286,13 +286,8 @@ async def ingest_guard_suppression_receipt(task: Task, session: AsyncSession) ->
     receipt = (task.context or {}).get("publication_gate_receipt")
     identities = extract_guard_suppression_identities(receipt if isinstance(receipt, Mapping) else None)
     if identities is None:
-        # Keep a bounded, visible fail-closed marker for malformed/truncated
-        # producer data rather than silently treating it as a clean result.
-        if isinstance(receipt, Mapping):
-            context = dict(task.context or {})
-            context["guard_suppression_receipt_incomplete"] = True
-            task.context = context
-            session.add(task)
+        # Fail closed for malformed/truncated producer data rather than
+        # silently treating it as a clean result.
         return []
     if not identities:
         return []
@@ -338,9 +333,6 @@ async def _ingest_guard_suppression_receipt_once(
     if not pending:
         return []
     if len(recorded | identity_keys) > _TASK_RECORDED_GUARD_KEYS_MAX_ENTRIES:
-        context["guard_suppression_receipt_incomplete"] = True
-        task.context = context
-        session.add(task)
         return []
 
     async with session.begin_nested():

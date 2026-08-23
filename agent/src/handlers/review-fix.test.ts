@@ -4468,3 +4468,137 @@ describe('handleReview — pr metadata fetch aborts on timeout', () => {
     expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalled();
   });
 });
+
+// ── handleReview: authoritative merge state ──────────────────────────────────
+// Regression: rollup PR #17720. The reviewer was given no merge signal, ran the
+// legacy 3-argument `git merge-tree` against a base that was NOT the merge base
+// (which fabricates conflict markers), and minted a MAJOR "unresolved
+// three-way conflicts" finding for a branch GitHub reported as MERGEABLE/CLEAN.
+// No fix agent can close a finding about a conflict that does not exist, so the
+// ledger plateaued at two unresolved findings for four rounds and the chain
+// parked as semantic_nonconvergence. handleReview now fetches GitHub's answer
+// and states it in the prompt as a fact.
+describe('handleReview — authoritative merge state', () => {
+  /** Mocks execFileSync so `git ls-remote` still reports the branch exists and
+   *  each successive curl to /pulls/ returns the next queued PR body. */
+  function mockPrMergeStateResponses(bodies: Array<Record<string, unknown>>): void {
+    let index = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+        return 'abc123\trefs/heads/feature\n';
+      }
+      if (cmd === 'curl' && args) {
+        const url = args[args.length - 1] || '';
+        if (url.includes('/pulls/')) {
+          const body = bodies[Math.min(index, bodies.length - 1)];
+          index += 1;
+          return JSON.stringify(body);
+        }
+      }
+      return '';
+    });
+  }
+
+  const curlPrCalls = () => vi.mocked(execFileSync).mock.calls.filter(
+    c => c[0] === 'curl' && ((c[1] as string[] | undefined)?.slice(-1)[0] || '').includes('/pulls/'),
+  );
+
+  const runReview = (taskId: string) => handleReview(
+    taskId,
+    { pr_number: 17720, branch: 'plan/129fb995', base_branch: 'research/3a85fb87', original_prompt: '' },
+    { context: { scope: 'medium' } },
+    'gh-token', 'owner', 'repo', null, statusRef(),
+  );
+
+  it('states the PR merges cleanly and forbids a self-simulated conflict finding', async () => {
+    mockPrMergeStateResponses([{
+      mergeable: true,
+      mergeable_state: 'clean',
+      base: { ref: 'research/3a85fb87' },
+      head: { sha: '20086f0aaaabbbbccccdddd0011223344556677' },
+    }]);
+
+    await runReview('task-mergestate-clean');
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('## Authoritative merge state');
+    expect(prompt).toContain('merges cleanly into `research/3a85fb87`');
+    expect(prompt).toContain('20086f0aaaabbbbccccdddd0011223344556677');
+    expect(prompt).toContain('do NOT raise a merge-conflict or "unresolved three-way conflict" finding');
+    expect(prompt).toContain('do NOT simulate the merge yourself');
+    // The exact trap that produced BP-1bf7115e95f9 is named, with the method
+    // that would have refuted it.
+    expect(prompt).toContain('fabricates conflict markers');
+    expect(prompt).toContain('git merge-base origin/research/3a85fb87 HEAD');
+    expect(prompt).toContain('git merge-tree --write-tree origin/research/3a85fb87 HEAD');
+  });
+
+  it('licenses a conflict finding when GitHub reports the PR does not merge cleanly', async () => {
+    mockPrMergeStateResponses([{
+      mergeable: false,
+      mergeable_state: 'dirty',
+      base: { ref: 'research/3a85fb87' },
+      head: { sha: 'ffee0011223344556677889900aabbccddeeff11' },
+    }]);
+
+    await runReview('task-mergestate-dirty');
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('does NOT merge cleanly into `research/3a85fb87`');
+    expect(prompt).toContain('A merge-conflict finding is legitimate here');
+    expect(prompt).toContain('name the specific conflicting files');
+    // The clean-case suppression must NOT leak into the dirty case.
+    expect(prompt).not.toContain('do NOT raise a merge-conflict or "unresolved three-way conflict" finding');
+    expect(prompt).not.toContain('do NOT simulate the merge yourself');
+  });
+
+  it('re-polls exactly once when GitHub has not computed mergeable yet, then uses the computed answer', async () => {
+    mockPrMergeStateResponses([
+      { mergeable: null, mergeable_state: 'unknown', base: { ref: 'research/3a85fb87' }, head: { sha: 'aaa1112223334445556667778889990001112223' } },
+      { mergeable: true, mergeable_state: 'clean', base: { ref: 'research/3a85fb87' }, head: { sha: 'aaa1112223334445556667778889990001112223' } },
+    ]);
+
+    await runReview('task-mergestate-repoll');
+
+    expect(curlPrCalls().length).toBe(2);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('merges cleanly into `research/3a85fb87`');
+    expect(prompt).toContain('do NOT raise a merge-conflict or "unresolved three-way conflict" finding');
+    expect(prompt).not.toContain('could not be established');
+  }, 15_000);
+
+  it('stops after one re-poll and reports the state unknown when mergeable is still null', async () => {
+    mockPrMergeStateResponses([
+      { mergeable: null, mergeable_state: 'unknown', base: { ref: 'research/3a85fb87' }, head: { sha: 'bbb1112223334445556667778889990001112223' } },
+    ]);
+
+    await runReview('task-mergestate-still-null');
+
+    // Bounded: one initial read plus exactly one re-poll, never a third.
+    expect(curlPrCalls().length).toBe(2);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('The merge state of this PR could not be established');
+    expect(prompt).toContain('not grounds to block');
+    expect(prompt).not.toContain('do NOT simulate the merge yourself');
+    expect(prompt).not.toContain('A merge-conflict finding is legitimate here');
+  }, 15_000);
+
+  it('still runs the review when the merge-state fetch throws, and reports the state unknown', async () => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+        return 'abc123\trefs/heads/feature\n';
+      }
+      if (cmd === 'curl') throw new Error('curl: (6) Could not resolve host: api.github.com');
+      return '';
+    });
+
+    // Nothing may propagate out of handleReview's merge-state step.
+    await expect(runReview('task-mergestate-throws')).resolves.toBeUndefined();
+
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalled();
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('The merge state of this PR could not be established');
+    expect(prompt).toContain('not grounds to block');
+    expect(prompt).not.toContain('do NOT simulate the merge yourself');
+  });
+});

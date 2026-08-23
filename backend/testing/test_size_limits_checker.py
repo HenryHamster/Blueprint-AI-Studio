@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
+
 import pytest
 
 import app.size_limit_policy as slp
@@ -1047,6 +1049,71 @@ def test_base_root_unreadable_baseline_fails_closed(tmp_path, capsys):
     assert "[baseline] unavailable" in out
     assert "[breach] backend/big.py" in out
 
+
+def _configure_baseline_receipts(tmp_path, monkeypatch):
+    verification_path = tmp_path / "verification-receipt.json"
+    suppression_dir = tmp_path / "suppression-receipts"
+    monkeypatch.setenv("BLUEPRINT_VERIFICATION_RECEIPT", str(verification_path))
+    monkeypatch.setenv("BLUEPRINT_GUARD_SUPPRESSION_DIR", str(suppression_dir))
+    monkeypatch.setenv("TASK_ID", "size-limits-test")
+    return verification_path, suppression_dir
+
+
+def test_base_root_run_records_suppressed_and_introduced_identities(
+    tmp_path, monkeypatch
+):
+    """The baseline size lane leaves both receipt projections with identities."""
+    repo, jp = _build_repo(tmp_path, backend={"inherited.py": (900, 800), "introduced.py": (900, 800)})
+    base_repo, _ = _build_base_repo(tmp_path, backend={"inherited.py": (900, 800), "introduced.py": (100, 800)})
+    verification_path, suppression_dir = _configure_baseline_receipts(tmp_path, monkeypatch)
+    monkeypatch.setattr(csl, "_collect_baseline_governance_findings", lambda *_args, **_kwargs: (set(), set(), set(), None))
+
+    assert _run(jp, repo, "--base-root", base_repo, "--sections", "backend") == 1
+
+    sidecar = json.loads(verification_path.read_text())
+    lane = sidecar["lanes"]["size-limits"]
+    assert lane["blocking"] is True
+    assert set(lane["suppressed_failures"]) == {"backend/inherited.py::size-cap"}
+    assert set(lane["new_failures"]) == {"backend/introduced.py::size-cap"}
+
+    import guard_suppression_receipt
+
+    aggregate = guard_suppression_receipt.aggregate("size-limits-test")
+    suppression_lane = aggregate["lanes"]["size-limits"]
+    assert suppression_lane["buckets"]["suppressed"]["entries"] == {"backend/inherited.py::size-cap": {"detail": "inherited size-cap finding"}}
+    assert (suppression_dir / "lane_size-limits.json").is_file()
+
+
+def test_base_root_unavailable_records_fail_closed_attribution(tmp_path, monkeypatch):
+    """An unreadable base records current offenders as introduced and blocking."""
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (900, 800)})
+    verification_path, suppression_dir = _configure_baseline_receipts(tmp_path, monkeypatch)
+
+    assert _run(jp, repo, "--base-root", str(tmp_path / "missing-base"), "--sections", "backend") == 1
+
+    lane = json.loads(verification_path.read_text())["lanes"]["size-limits"]
+    assert lane["state"] == "baseline_unavailable"
+    assert lane["blocking"] is True
+    assert set(lane["new_failures"]) == {"backend/big.py::size-cap"}
+    assert lane["suppressed_failures"] == {}
+
+    import guard_suppression_receipt
+
+    suppression_lane = guard_suppression_receipt.aggregate("size-limits-test")["lanes"]["size-limits"]
+    assert suppression_lane["state"] == "baseline_unavailable"
+    assert suppression_lane["buckets"]["suppressed"]["observed_count"] == 0
+    assert suppression_lane["note"].startswith("baseline unavailable:")
+    assert (suppression_dir / "lane_size-limits.json").is_file()
+
+
+def test_non_baseline_run_does_not_emit_size_attribution(tmp_path, monkeypatch):
+    """Ordinary size checks retain their existing receipt-free behavior."""
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (50, 100)})
+    verification_path, suppression_dir = _configure_baseline_receipts(tmp_path, monkeypatch)
+
+    assert _run(jp, repo, "--sections", "backend") == 0
+    assert not verification_path.exists()
+    assert not suppression_dir.exists()
 
 def test_base_root_judges_base_against_its_own_caps(tmp_path, capsys):
     # Base file is over the PR's cap but within the BASE's own (higher) cap:

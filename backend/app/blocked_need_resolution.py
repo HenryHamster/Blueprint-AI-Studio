@@ -320,6 +320,84 @@ def need_satisfied_by_completed(
     )
 
 
+# Reasons a COMPLETED foundation that MATCHED a need nevertheless did not SHIP.
+# These are the two (and only two) sub-states :func:`_foundation_shipped`
+# excludes, named so a give-up can attribute the strand to what actually
+# happened instead of to "nothing ever provided it".
+UNSHIPPED_PR_NEVER_MERGED = "pr_never_merged"
+UNSHIPPED_GHOST_MERGE = "ghost_merge_abandoned_rollup"
+
+
+def unshipped_completed_foundation_for_need(
+    task: Task,
+    need: Dict[str, Any],
+    completed_candidates: List[Task],
+    failed_parent_ids: set | None = None,
+) -> tuple | None:
+    """Return ``(provider, unshipped_reason)`` for a need a terminal task DID
+    produce but whose work never LANDED — or ``None``.
+
+    This is the EXACT complement of :func:`completed_foundation_for_need`: same
+    conservative exact-match signals (task id / finding hash / PR number /
+    explicit capability marker), same candidate set, but matched against the
+    foundations :func:`_foundation_shipped` EXCLUDES rather than the ones it
+    admits. A need that matches here is not "unprovided" — a task ran, reached
+    COMPLETED, and produced the artifact; the artifact simply never reached the
+    dependent's base.
+
+    Diagnostic only: it is deliberately NOT consulted by the resolution path
+    (an unshipped foundation must keep failing to satisfy the need — that is the
+    invariant the shipped gate exists to protect). It exists so a give-up can
+    ATTRIBUTE the strand accurately, naming the provider that did the work.
+
+    ``unshipped_reason`` is one of :data:`UNSHIPPED_PR_NEVER_MERGED` (the
+    provider carries no merge-unblock signal — its PR is open or was closed
+    unmerged) or :data:`UNSHIPPED_GHOST_MERGE` (it merged, but only into a
+    rollup staging branch whose parent then FAILED/CANCELLED, so the code never
+    reached the integration branch).
+    """
+    if not isinstance(need, dict):
+        return None
+    unshipped = [
+        c
+        for c in completed_candidates
+        if c.id != task.id and not _foundation_shipped(c, failed_parent_ids)
+    ]
+    match = _match_need(need, unshipped)
+    if match is None:
+        return None
+    if not has_merge_unblock_signal(match):
+        return match, UNSHIPPED_PR_NEVER_MERGED
+    return match, UNSHIPPED_GHOST_MERGE
+
+
+def foundation_pr_number(candidate: Task) -> int | None:
+    """Best-effort PR number a foundation task owns, or ``None``.
+
+    Reads the two canonical homes and nothing else: the leading payload's
+    ``pr_number`` (what :func:`_match_pr` matches on, written by
+    :func:`task_pr_linkage.persist_task_pr_linkage`) and, failing that, the
+    review-loop / rollup identity resolved by
+    :func:`ci_merge_helpers.effective_pr_number`. Returns ``None`` rather than
+    guessing when neither is recorded, so a caller must say the PR number is
+    unrecorded instead of inventing one.
+    """
+    direct = _candidate_pr_number(candidate)
+    if direct is not None:
+        return direct
+    from app.ci_merge_helpers import effective_pr_number
+
+    raw = effective_pr_number(candidate)
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(str(raw).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def need_matched_dead_foundation(
     task: Task, need: Dict[str, Any], dead_candidates: List[Task]
 ) -> bool:

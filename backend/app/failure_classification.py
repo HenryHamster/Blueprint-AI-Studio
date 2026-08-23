@@ -10,6 +10,7 @@ from app.execution_capability_requirements import (
     classify_execution_capability_failure_frames,
 )
 from app.time_utils import _utcnow
+from app.review_park_disposition import REVIEW_PARK_ABANDONED_FAILURE_DETAIL
 
 # Residual-remediation / fingerprinting / per-account-failure-log seam lives in
 # the sibling module; re-exported here so all callers and tests keep importing
@@ -957,7 +958,16 @@ def classify_failure_taxonomy(task: "Task") -> str:
     status_msg = (task.latest_status_message or "").lower()
     ctx = task.context or {}
 
-    if ctx.get("failure_detail") == "review_cap_exhausted":
+    # A review-fix loop that exhausted its iteration cap and one that was
+    # ABANDONED when its bounded operator-disposition window expired are the same
+    # finding: the review -> fix loop did not converge. That is review quality,
+    # not a code defect the subtask introduced. Without this the disposition
+    # sweep's rows fall through to the TAXONOMY_CODE_DEFECT default and every
+    # abandoned park is reported as a fresh code defect.
+    if ctx.get("failure_detail") in (
+        "review_cap_exhausted",
+        REVIEW_PARK_ABANDONED_FAILURE_DETAIL,
+    ):
         return TAXONOMY_REVIEW_QUALITY
 
     if any(kw in status_msg for kw in _REVIEW_QUALITY_KEYWORDS):

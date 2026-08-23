@@ -503,6 +503,11 @@ def test_operator_visible_undotted_event_types_not_conversational_must_be_explic
         "lane_checkpoint_recover",
         "lane_budget_near_exhausted",
         "pilot_auto_disabled",
+        # An expired operator-disposition window that the sweep closed out on
+        # its own.  Deliberately a ledger entry, not a conversation turn: there
+        # is no question left to answer, and routing decided-and-done notices
+        # into CONVERSATION is how that surface stops being worth reading.
+        "review_park_disposed",
         "operator_command",
         "strategic_check_in",
         "mode_knob_cut_recommended",

@@ -14,6 +14,7 @@ by the gate and harness.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shutil
@@ -41,6 +42,9 @@ if not (_REPO_ROOT / "check").exists() and Path("/repo/check").exists():
 _CHECK = _REPO_ROOT / "check"
 _DEFAULT_CHECK = _REPO_ROOT / "scripts" / "check-default.sh"
 _ROUTE_HELPER = _REPO_ROOT / "scripts" / "backend-test-route.sh"
+
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+static_release_guard = importlib.import_module("static_release_guard")
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -183,6 +187,107 @@ def test_genuine_noop_diff_still_exits_zero(tmp_path: Path) -> None:
         f"exit {result.returncode} with output:\n{combined}"
     )
     assert "PASS" in combined, f"expected the green PASS marker, got:\n{combined}"
+
+
+@pytest.mark.parametrize(
+    "case, expected_state",
+    [
+        ("changed_files", "setup_failure"),
+        ("base_extract", "base_extraction_failure"),
+        ("size", "size_failure"),
+        ("harness", "harness_unavailable"),
+        ("inventory", "corpus_inventory_failure"),
+        ("execution", "execution_failure"),
+        ("attribution", "attribution_unavailable"),
+        ("baseline", "baseline_unavailable"),
+        ("introduced_failure", "test_failure"),
+    ],
+)
+def test_static_release_guard_records_every_blocking_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, expected_state: str
+) -> None:
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    if case != "harness":
+        (scripts / "test-backend.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    receipt = tmp_path / "static-receipt.json"
+    monkeypatch.setenv("BLUEPRINT_VERIFICATION_RECEIPT", str(receipt))
+    monkeypatch.setenv("TASK_ID", "static-receipt-test")
+    monkeypatch.setattr(static_release_guard, "_changed_files", lambda *_args: ["backend/app/changed.py"])
+    monkeypatch.setattr(static_release_guard, "_base_ref", lambda *_args: "automain")
+    monkeypatch.setattr(static_release_guard, "_static_roster_changed", lambda *_args: False)
+    monkeypatch.setattr(static_release_guard, "_standalone_corpus_inventory", lambda *_args: set())
+
+    def extract_base(_repo: Path, _ref: str, destination: Path) -> None:
+        (destination / "scripts").mkdir(parents=True, exist_ok=True)
+        (destination / "scripts" / "test-backend.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (destination / "backend" / "testing").mkdir(parents=True, exist_ok=True)
+        (destination / "backend" / "testing" / "test_x.py").write_text("pass\n", encoding="utf-8")
+
+    if case == "changed_files":
+        monkeypatch.setattr(static_release_guard, "_changed_files", lambda *_args: (_ for _ in ()).throw(RuntimeError("base diff unavailable")))
+    elif case == "base_extract":
+        monkeypatch.setattr(static_release_guard, "_extract_base", lambda *_args: (_ for _ in ()).throw(RuntimeError("archive unavailable")))
+    else:
+        monkeypatch.setattr(static_release_guard, "_extract_base", extract_base)
+
+    failure_key = "backend/testing/test_x.py::test_x::failure"
+    failed = case in {"baseline", "introduced_failure"}
+    current_report = JUnitReport(
+        failures={failure_key: "introduced failure"} if failed else {},
+        test_routes={"backend/testing/test_x.py::test_x"} if failed else set(),
+        selectors={failure_key: "backend/testing/test_x.py"} if failed else {},
+    )
+
+    def parse_junit(_path: Path, *, label: str, **_kwargs: object) -> JUnitReport:
+        if case == "attribution" and label == "current":
+            raise RuntimeError("current JUnit missing")
+        if label == "current":
+            return current_report
+        return JUnitReport()
+
+    monkeypatch.setattr(static_release_guard, "parse_junit_report", parse_junit)
+    monkeypatch.setattr(
+        static_release_guard,
+        "_run_size_guard",
+        lambda *_args: subprocess.CompletedProcess([], 7 if case == "size" else 0, "size output", "size error"),
+    )
+    corpus_calls = 0
+
+    def run_corpus(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal corpus_calls
+        corpus_calls += 1
+        if case == "execution":
+            return subprocess.CompletedProcess([], 2, "runner output", "runner error")
+        if case == "baseline" and corpus_calls == 2:
+            return subprocess.CompletedProcess([], 2, "base output", "base error")
+        return subprocess.CompletedProcess(
+            [], 1 if case in {"baseline", "introduced_failure"} and corpus_calls == 1 else 0, "", ""
+        )
+
+    monkeypatch.setattr(static_release_guard, "_run_static_corpus", run_corpus)
+    if case == "inventory":
+        monkeypatch.setattr(
+            static_release_guard,
+            "_standalone_corpus_inventory",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("inventory unavailable")),
+        )
+
+    arguments = ["--repo-root", str(repo)]
+    if case == "size":
+        arguments.append("--size-only")
+    result = static_release_guard.main(arguments)
+
+    assert result != 0
+    lane = json.loads(receipt.read_text(encoding="utf-8"))["lanes"]["static-corpus"]
+    assert lane["blocking"] is True
+    assert lane["state"] == expected_state
+    assert {"new_failures", "suppressed_failures", "disappeared_failures", "skipped_failures", "error", "guard_exit_code"} <= lane.keys()
+    assert lane["error"]
+    assert lane["guard_exit_code"] != 0
+    if case == "introduced_failure":
+        assert lane["new_failures"] == {failure_key: {"detail": "introduced failure"}}
 
 
 def test_missing_static_release_guard_fails_the_lint_only_path(

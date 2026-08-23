@@ -1997,3 +1997,40 @@ def test_truncation_probe_exception_fails_closed(tmp_path, mocker):
 
     mocker.patch("app.size_limit_policy.subprocess.run", side_effect=_boom)
     assert slp._git_history_is_truncated(checkout) is True
+
+
+def test_governance_bound_breach_names_the_cap_that_actually_bound() -> None:
+    """A governed breach reports the governance cap, not the looser JSON cap.
+
+    The gate used to print the JSON number for every breach, so a module
+    stopped by its own source-declared cap produced an arithmetically false
+    comparison ("1979 > 2250") and pointed the reader at module_size_limits.json
+    -- the one file whose edit could not clear the block.
+    """
+    message = slp.describe_effective_cap_breach(
+        "backend", "approved_pr_stranding.py", 1979, 2250, 1978
+    )
+
+    assert "1979 > 1978" in message
+    assert "1979 > 2250" not in message
+    assert "backend/app/approved_pr_stranding.py" in message
+    assert "2250" in message and "NOT the binding limit" in message
+
+
+def test_json_bound_breach_reports_the_json_cap_plainly() -> None:
+    """With no tighter governance cap the effective cap IS the JSON cap."""
+    message = slp.describe_effective_cap_breach(
+        "backend", "reaper.py", 5001, 5000, 5000
+    )
+
+    assert message == "reaper.py (5001 > 5000)"
+
+
+def test_unresolvable_cap_says_so_instead_of_printing_none() -> None:
+    """A module with no resolvable cap reports that, not "> None"."""
+    message = slp.describe_effective_cap_breach(
+        "backend", "mystery.py", 42, None, None
+    )
+
+    assert "no cap resolved" in message
+    assert "None" not in message

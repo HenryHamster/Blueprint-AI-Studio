@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 
 from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
+from app.issue_ledger_state import _history_entry_key
 from app.issue_ledger import (
     _jaccard,
     _region_anchor,
@@ -12,7 +13,6 @@ from app.issue_ledger import (
     build_issue_ledger,
     ensure_issue_ids,
     issue_ledger_complete_for_history,
-    issue_ledger_lineage_proof_unsatisfiable,
 )
 
 
@@ -660,10 +660,30 @@ def test_markerless_legacy_seed_ingests_new_blocker_and_regains_lineage() -> Non
     assert issue_ledger_complete_for_history(converged, [current, approval]) is True
 
 
-def test_discontinuous_capped_history_cannot_extend_stale_seed_proof() -> None:
+def test_discontinuous_capped_history_recovers_lineage_instead_of_freezing() -> None:
+    """A window that cannot locate the seed is REPLAYED, not frozen.
+
+    This case used to assert the opposite: the seed's blocker stayed open, the
+    marker was handed back unchanged, and ``complete`` stayed False. That was
+    not conservatism, it was a one-way door -- the marker the seed got back was
+    the same one this window had just failed to find, so the next build failed
+    to find it too, forever. No later review could close anything and the merge
+    gate held the PR for an operator.
+
+    The trade this makes is explicit: when the window cannot be placed relative
+    to the seed, ordering is unknowable, so an authoritative target-verified
+    verdict that is silent about a seeded blocker closes it. Fifty verified
+    reviews saying nothing about a finding is the best evidence available, and
+    it beats blocking forever on evidence that can never arrive.
+    """
+    # Iteration 99 on purpose. ``_review`` derives ``review_task_id`` from the
+    # iteration, so a seed row numbered inside the window's range would share a
+    # task id with one of its rows, the stable anchor would MATCH, the window
+    # would be placed, and no recovery would happen -- this test would quietly
+    # stop testing recovery. It did exactly that until a mutation caught it.
     first = _review(
-        5,
-        "head-5",
+        99,
+        "head-99",
         issues=[
             {
                 "description": "future-seed blocker",
@@ -686,17 +706,156 @@ def test_discontinuous_capped_history_cannot_extend_stale_seed_proof() -> None:
         stamp_complete=True,
     )
 
-    assert rebuilt["complete"] is False
-    assert [row["description"] for row in rebuilt["open"]] == [
-        "future-seed blocker"
-    ], "older retained approvals must not resolve a finding from a future seed"
-    assert rebuilt["resolved"] == []
-    assert rebuilt["through_entry_key"] == seed_marker, (
-        "a disconnected history window must not advance the durable lineage marker"
+    assert rebuilt["open"] == []
+    assert rebuilt["complete"] is True
+    assert rebuilt["through_entry_key"] != seed_marker, (
+        "a recovery pass must re-anchor the marker to the replayed tail -- "
+        "handing back the unmatched marker is what made the loss permanent"
     )
-    assert issue_ledger_complete_for_history(
-        rebuilt, discontinuous_history
-    ) is False
+    assert issue_ledger_complete_for_history(rebuilt, discontinuous_history) is True
+
+
+def test_recovery_cannot_close_a_seeded_blocker_without_verified_authority() -> None:
+    """Recovery replays the window; it does not lower the bar for closing.
+
+    The fail-closed pin for the test above. Same unlocatable seed, but the
+    window carries no authoritative target-verified verdict -- the rows are
+    APPROVEs whose target the backend never confirmed. Silence from a review
+    that cannot prove what it read is not evidence, so the blocker stays open
+    even though lineage was recovered.
+    """
+    # Iteration 99 for the same reason as the test above: keep the seed's row
+    # genuinely unplaceable in the window rather than accidentally anchored.
+    first = _review(
+        99,
+        "head-99",
+        issues=[
+            {
+                "description": "unproven-window blocker",
+                "severity": "MAJOR",
+                "file": "scanner.py",
+                "line": 50,
+            }
+        ],
+    )
+    seed = build_issue_ledger([first], stamp_complete=True)
+    unverified_window = [
+        _review(iteration, f"head-{iteration}", verdict="APPROVE", verified=False)
+        for iteration in range(1, 1 + REVIEW_HISTORY_MAX_ENTRIES)
+    ]
+
+    rebuilt = build_issue_ledger(
+        unverified_window, seed_ledger=seed, stamp_complete=True
+    )
+
+    assert [row["description"] for row in rebuilt["open"]] == [
+        "unproven-window blocker"
+    ]
+
+
+def test_a_rewritten_tail_row_keeps_its_proof_through_the_stable_anchor() -> None:
+    """The rewrite that used to un-prove a ledger no longer does.
+
+    ``_history_entry_key`` is a content hash of the WHOLE row, so any write path
+    that enriches a row after the ledger was stamped against it breaks the
+    match -- and ``review_request_changes`` rebuilds parent history by filtering
+    rows out by ``review_task_id`` and re-appending a recomputed entry, so this
+    is routine rather than exotic.  When the hash was the only anchor, that
+    rewrite flipped ``issue_ledger_complete_for_history`` to False on a ledger
+    that had changed in no way, and the merge gate answered by minting the
+    synthetic ``BP-ledger-proof-incomplete`` blocker against a PR whose diff
+    could not possibly fix it.
+
+    ``review_task_id`` is assigned once by the backend and never rewritten, so
+    it survives exactly the rewrites the content hash does not.  Consulting it
+    first is what keeps the proof true here; falling back to the hash is what
+    keeps seeds stamped before it existed working (the test below).
+    """
+    rows = [
+        _review(1, "head-1", [_issue("first blocker", file="a.py")]),
+        _review(2, "head-2", [_issue("second blocker", file="b.py")]),
+    ]
+    seed = build_issue_ledger(rows, stamp_complete=True)
+    assert seed["through_entry_task_id"] == "review-2"
+    assert issue_ledger_complete_for_history(seed, rows) is True
+
+    # A later writer enriches the marked row in place.  Nothing about the review
+    # changed; the row's bytes did.
+    rewritten = [rows[0], {**rows[1], "reviewer_model": "added-after-the-fact"}]
+    assert _history_entry_key(rewritten[-1]) != seed["through_entry_key"], (
+        "the premise of this test is that the content hash goes stale"
+    )
+    assert issue_ledger_complete_for_history(seed, rewritten) is True, (
+        "a row rewrite must not un-prove a ledger that covers that row -- that "
+        "is what re-minted BP-ledger-proof-incomplete against an innocent diff"
+    )
+
+    # And the seed is still PLACED rather than recovered, so the next build
+    # resumes from it instead of replaying the window it already consumed.
+    third = _review(3, "head-3", verdict="APPROVE")
+    rebuilt = build_issue_ledger(
+        [*rewritten, third], seed_ledger=seed, stamp_complete=True
+    )
+    assert "lineage_recovered" not in rebuilt, (
+        "the stable anchor placed the seed, so nothing needed recovering; if "
+        "this fails the build fell back to a whole-window replay silently"
+    )
+    assert rebuilt["through_entry_task_id"] == "review-3"
+    assert issue_ledger_complete_for_history(rebuilt, [*rewritten, third]) is True
+
+
+def test_a_recovered_build_says_so_on_the_ledger_it_returns() -> None:
+    """Recovery is correct, but it is not the same event as a clean resume.
+
+    Both produce a complete ledger -- replaying the retained window on top of
+    the seed's open records reaches the state that window implies, which is the
+    whole reason recovery is safe.  That equivalence is also why the fallback
+    would otherwise be invisible: an operator staring at a complete ledger
+    could not tell that the seed's marker had fallen out of the window at all.
+    Recording it costs nothing and is the difference between a gate that
+    surfaces its reasons and one that only surfaces its state.
+    """
+    window = [_review(i, f"head-{i}", verdict="APPROVE") for i in (1, 2, 3)]
+    stranded = {
+        "open": [],
+        "resolved": [],
+        "schema_version": 1,
+        "complete": False,
+        "through_entry_key": "a-marker-no-row-in-this-window-carries",
+        "through_entry_task_id": "review-99",
+    }
+
+    recovered = build_issue_ledger(window, seed_ledger=stranded, stamp_complete=True)
+    assert recovered["lineage_recovered"] is True
+    assert recovered["complete"] is True
+
+    # It is an observation about THIS build, not durable state: feeding the
+    # recovered ledger back in as a seed must not keep re-declaring recovery,
+    # or every later build inherits a fault that was already repaired.
+    follow_up = _review(4, "head-4", verdict="APPROVE")
+    clean = build_issue_ledger(
+        [*window, follow_up], seed_ledger=recovered, stamp_complete=True
+    )
+    assert "lineage_recovered" not in clean
+    assert clean["complete"] is True
+
+
+def test_legacy_seed_without_a_task_anchor_still_matches_on_the_hash() -> None:
+    """Seeds stamped before the anchor existed must keep working unchanged."""
+    rows = [_review(1, "head-1", [_issue("legacy blocker", file="a.py")])]
+    seed = build_issue_ledger(rows, stamp_complete=True)
+    legacy_seed = {k: v for k, v in seed.items() if k != "through_entry_task_id"}
+    assert legacy_seed["through_entry_key"]
+
+    follow_up = _review(2, "head-2", verdict="APPROVE")
+    rebuilt = build_issue_ledger(
+        [*rows, follow_up], seed_ledger=legacy_seed, stamp_complete=True
+    )
+
+    # Matched on the hash: the follow-up APPROVE moved the head and closed the
+    # blocker by omission, which only happens for entries AFTER the marker.
+    assert rebuilt["open"] == []
+    assert rebuilt["complete"] is True
 
 
 def _grow_capped_history(
@@ -722,16 +881,22 @@ def _grow_capped_history(
     )
 
 
-def test_lineage_proof_lost_at_the_history_cap_never_recovers() -> None:
-    """A single seed loss at the cap latches the ledger unprovable forever.
+def test_lineage_proof_lost_at_the_history_cap_recovers_on_the_next_build() -> None:
+    """A seed loss at the cap must NOT latch the ledger unprovable forever.
 
-    This is the shape behind NeurIPS PR #1769: once ``complete=False`` is
-    stamped alongside a lineage marker while the history sits at the cap,
-    neither branch of ``build_issue_ledger``'s lineage test can ever be
-    satisfied again -- the seed cannot become complete, the marker cannot be
-    dropped, and history only grows.  The merge gate then re-raises
-    ``BP-ledger-proof-incomplete`` on every pass, so the PR is unmergeable no
-    matter how many clean reviews follow.
+    This is the shape behind NeurIPS PR #1769. It used to be permanent: once
+    ``complete=False`` was stamped alongside a lineage marker while the history
+    sat at the cap, neither branch of ``build_issue_ledger``'s lineage test
+    could ever be satisfied again -- the seed could not become complete, the
+    marker could not be dropped, and history only grows. The merge gate then
+    re-raised ``BP-ledger-proof-incomplete`` on every pass and escalated to
+    operator adjudication, which cost 65 byte-identical APPROVE reviews across
+    78 attempts before an unrelated plateau heuristic stopped it.
+
+    The cap is a context bound, not evidence. A ledger that has replayed every
+    row it can see has covered the history every consumer can see; demanding
+    proof about rows the bound already dropped is unsatisfiable by construction
+    the moment the window fills.
     """
     ledger: dict | None = None
     history: list[dict] = []
@@ -740,28 +905,45 @@ def test_lineage_proof_lost_at_the_history_cap_never_recovers() -> None:
     for iteration in range(1, loss_iteration):
         ledger, history = _grow_capped_history(ledger, history, iteration)
         assert issue_ledger_complete_for_history(ledger, history) is True
-        assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is False
 
     ledger, history = _grow_capped_history(
         ledger, history, loss_iteration, drop_seed=True
     )
+    assert len(history) == REVIEW_HISTORY_MAX_ENTRIES
+    assert issue_ledger_complete_for_history(ledger, history) is True
 
-    assert issue_ledger_complete_for_history(ledger, history) is False
-    assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is True
-
-    # Ten further perfectly clean rounds, every one seeded from the durable
-    # ledger. None of them can restore the proof.
+    # Ten further clean rounds, every one seeded from the durable ledger.
     for iteration in range(loss_iteration + 1, loss_iteration + 11):
         ledger, history = _grow_capped_history(ledger, history, iteration)
-        assert issue_ledger_complete_for_history(ledger, history) is False, (
-            f"iteration {iteration} recovered; the latch is no longer permanent "
-            "and this test's premise needs revisiting"
+        assert issue_ledger_complete_for_history(ledger, history) is True, (
+            f"iteration {iteration} lost the proof again at the cap"
         )
-        assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is True
+
+
+def test_a_latched_legacy_ledger_is_repaired_by_the_next_build() -> None:
+    """Rows already persisted ``complete=False`` at the cap must self-repair.
+
+    Requiring the seed to have been complete in order to become complete was
+    the second one-way door, and it is the one that matters for rows already in
+    the database: they are seeded from a ledger stamped ``complete=False`` by
+    the old code, and no amount of clean reviewing could lift it.
+    """
+    history = [
+        _review(iteration, f"head-{iteration}", verdict="APPROVE")
+        for iteration in range(1, 1 + REVIEW_HISTORY_MAX_ENTRIES)
+    ]
+    healthy = build_issue_ledger(history, stamp_complete=True)
+    latched = {**healthy, "complete": False}
+    assert issue_ledger_complete_for_history(latched, history) is False
+
+    repaired = build_issue_ledger(history, seed_ledger=latched, stamp_complete=True)
+
+    assert repaired["complete"] is True
+    assert issue_ledger_complete_for_history(repaired, history) is True
 
 
 def test_lineage_proof_lost_below_the_cap_self_heals_and_is_not_terminal() -> None:
-    """The same seed loss under the cap recovers, so it must not escalate."""
+    """The same seed loss under the cap recovers too."""
     ledger: dict | None = None
     history: list[dict] = []
     loss_iteration = REVIEW_HISTORY_MAX_ENTRIES // 2
@@ -774,60 +956,21 @@ def test_lineage_proof_lost_below_the_cap_self_heals_and_is_not_terminal() -> No
     )
 
     assert issue_ledger_complete_for_history(ledger, history) is True
-    assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is False
 
     for iteration in range(loss_iteration + 1, REVIEW_HISTORY_MAX_ENTRIES + 6):
         ledger, history = _grow_capped_history(ledger, history, iteration)
         assert issue_ledger_complete_for_history(ledger, history) is True
-        assert issue_ledger_lineage_proof_unsatisfiable(ledger, history) is False
 
 
-def test_lineage_unsatisfiable_requires_marker_incompleteness_and_the_cap() -> None:
-    """Each of the three conditions is load-bearing; none alone is terminal."""
-    capped = [
-        _review(iteration, f"head-{iteration}", verdict="APPROVE")
-        for iteration in range(1, 1 + REVIEW_HISTORY_MAX_ENTRIES)
-    ]
-    latched = {
-        "open": [],
-        "resolved": [],
-        "schema_version": 1,
-        "complete": False,
-        "through_entry_key": "abc123",
-    }
+def test_first_ledger_build_at_the_history_cap_is_trusted_not_latched() -> None:
+    """A loop that reaches the cap before it ever stamps a ledger is not stuck.
 
-    assert issue_ledger_lineage_proof_unsatisfiable(latched, capped) is True
-
-    # Under the cap the next build re-derives the whole retained window.
-    assert (
-        issue_ledger_lineage_proof_unsatisfiable(latched, capped[:-1]) is False
-    )
-    # A markerless seed is rebuilt conservatively instead of latching.
-    assert (
-        issue_ledger_lineage_proof_unsatisfiable(
-            {**latched, "through_entry_key": ""}, capped
-        )
-        is False
-    )
-    # A complete ledger is not a stuck one.
-    assert (
-        issue_ledger_lineage_proof_unsatisfiable(
-            {**latched, "complete": True}, capped
-        )
-        is False
-    )
-    # A malformed ledger is somebody else's fail-closed problem, not a latch.
-    assert issue_ledger_lineage_proof_unsatisfiable("not-a-ledger", capped) is False
-
-
-def test_first_ledger_build_at_the_history_cap_latches_immediately() -> None:
-    """A loop that reaches the cap before it ever stamps a ledger is born stuck.
-
-    This is the cheapest way into the latch and needs no corruption at all: a
-    rollup that inherits a long review history, or any loop whose
-    ``issue_ledger`` key was absent when the history crossed
-    ``REVIEW_HISTORY_MAX_ENTRIES``, gets ``complete=False`` stamped together
-    with a marker on its very first build -- and can never recover.
+    The cheapest way into the old latch, needing no corruption at all: a rollup
+    that inherits a long review history, or any loop whose ``issue_ledger`` key
+    was absent when the history crossed ``REVIEW_HISTORY_MAX_ENTRIES``, got
+    ``complete=False`` stamped together with a marker on its very first build.
+    A first build has no seed to be discontinuous with -- it replayed every row
+    it was given -- so there was never anything to distrust.
     """
     history = [
         _review(iteration, f"head-{iteration}", verdict="APPROVE")
@@ -836,12 +979,11 @@ def test_first_ledger_build_at_the_history_cap_latches_immediately() -> None:
 
     first = build_issue_ledger(history, stamp_complete=True)
 
-    assert first["complete"] is False
+    assert first["complete"] is True
     assert first["through_entry_key"]
-    assert issue_ledger_lineage_proof_unsatisfiable(first, history) is True
+    assert issue_ledger_complete_for_history(first, history) is True
 
-    # One entry fewer and the same first build is trusted.
-    under_cap = history[:-1]
-    healthy = build_issue_ledger(under_cap, stamp_complete=True)
-    assert healthy["complete"] is True
-    assert issue_ledger_lineage_proof_unsatisfiable(healthy, under_cap) is False
+    # A stamp only proves the history it was taken against: one more review row
+    # and the ledger is no longer a proof until it is rebuilt.
+    grown = [*history, _review(99, "head-99", verdict="APPROVE")]
+    assert issue_ledger_complete_for_history(first, grown) is False

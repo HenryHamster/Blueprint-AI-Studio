@@ -6,7 +6,6 @@ import hashlib
 import json
 from typing import Any
 
-from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
 
 
 ISSUE_LEDGER_MAX_RESOLVED = 30
@@ -21,6 +20,28 @@ def _history_entry_key(entry: object) -> str:
     structured = {key: value for key, value in entry.items() if key != "feedback"}
     encoded = json.dumps(structured, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
+def _history_entry_task_id(entry: object) -> str:
+    """Stable identity of a review-history row: the review task that wrote it.
+
+    ``_history_entry_key`` hashes the row's whole structured body, which makes
+    it a *content* fingerprint, not an identity.  review_history is a rewritable
+    list -- ``review_request_changes`` rebuilds the parent history by filtering
+    rows out by ``review_task_id`` and re-appending a recomputed entry, and any
+    write path may enrich a row after the ledger was stamped against it.  A
+    single such rewrite changes the hash, the durable lineage marker stops
+    matching anything, and (before the recovery path in ``build_issue_ledger``)
+    the ledger froze permanently.
+
+    ``review_task_id`` is assigned by the backend when the row is created and is
+    never rewritten, so it survives exactly the rewrites the content hash does
+    not.  It is stamped alongside the hash and consulted first; the hash remains
+    the fallback for rows and legacy seeds that predate this field.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    return str(entry.get("review_task_id") or "").strip()
 
 
 def normalize_issue_ledger(value: object) -> dict[str, Any] | None:
@@ -71,6 +92,12 @@ def normalize_issue_ledger(value: object) -> dict[str, Any] | None:
                 "through_entry_key": str(value["through_entry_key"]),
             }
         )
+        # Additive: the stable anchor rides alongside the legacy content hash
+        # so a seed written by this version keeps matching after a row rewrite,
+        # while a seed written before it still normalizes cleanly without one.
+        through_task_id = str(value.get("through_entry_task_id") or "").strip()
+        if through_task_id:
+            normalized["through_entry_task_id"] = through_task_id
     return normalized
 
 
@@ -83,50 +110,21 @@ def issue_ledger_complete_for_history(
         (entry for entry in reversed(review_history or []) if isinstance(entry, dict)),
         None,
     )
-    return bool(
+    if not (
         normalized
         and normalized.get("schema_version") == ISSUE_LEDGER_SCHEMA_VERSION
         and normalized.get("complete") is True
         and tail is not None
-        and normalized.get("through_entry_key") == _history_entry_key(tail)
-    )
-
-
-def issue_ledger_lineage_proof_unsatisfiable(
-    ledger: object, review_history: list | None
-) -> bool:
-    """Return whether no future review can ever restore this ledger's proof.
-
-    ``build_issue_ledger`` can only stamp ``complete=True`` when either the
-    durable seed was already complete and its ``through_entry_key`` is still
-    inside the retained window, or the seed carries no lineage marker at all
-    and the history is still under ``REVIEW_HISTORY_MAX_ENTRIES``.  Once a
-    ledger is stamped ``complete=False`` *with* a marker while the history is
-    at the cap, both branches are closed permanently: the seed can never
-    become complete again, the marker can never be dropped, and review history
-    only ever grows.  The ledger is latched.
-
-    That matters because the merge gate turns an unproven lineage into a
-    binding ``BP-ledger-proof-incomplete`` blocker.  A blocker no commit can
-    fix and no reviewer can refute is not a review finding -- it is an
-    unsatisfiable gate, and re-reviewing the PR against it is pure burn.  On
-    NeurIPS PR #1769 that cost 65 byte-identical APPROVE reviews across 78
-    attempts before an unrelated plateau heuristic stopped it, and the stop
-    was then recorded as agent ``semantic_nonconvergence`` -- blaming the fix
-    agent for a gate it could not satisfy.
-
-    Only the provably-permanent case returns True.  A markerless seed under
-    the cap self-heals on the next build and must keep retrying.
-    """
-    normalized = normalize_issue_ledger(ledger)
-    if normalized is None:
+    ):
         return False
-    history = [entry for entry in (review_history or []) if isinstance(entry, dict)]
-    return bool(
-        normalized.get("through_entry_key")
-        and normalized.get("complete") is not True
-        and len(history) >= REVIEW_HISTORY_MAX_ENTRIES
-    )
+    # Either anchor proves the ledger covers this tail.  The stable anchor is
+    # checked first because it survives a post-stamp rewrite of the row; the
+    # content hash still answers for seeds stamped before the anchor existed.
+    seed_task_id = str(normalized.get("through_entry_task_id") or "").strip()
+    tail_task_id = _history_entry_task_id(tail)
+    if seed_task_id and tail_task_id:
+        return seed_task_id == tail_task_id
+    return normalized.get("through_entry_key") == _history_entry_key(tail)
 
 
 def _seed_pending_disposition(row: dict) -> dict | None:

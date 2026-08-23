@@ -35,8 +35,35 @@ from app.task_blocked import (
     strip_fresh_attempt_context,
 )
 from app.time_utils import _utcnow
+from app.review_park_disposition import (
+    REVIEW_PARK_ABANDONED_FAILURE_DETAIL,
+    REVIEW_PARK_DISPOSED_KEY,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _park_disposition_of(task) -> dict:
+    """Return the nested park ``disposition`` breadcrumb, or ``{}``.
+
+    The disposition sweep nests its decision INSIDE the park marker it decided
+    (``review_loop_abandon_candidate`` or ``review_loop_terminal_outcome``) so
+    the reason travels with the evidence that produced it, rather than being
+    flattened into a second top-level key.
+    """
+    from app.review_loop_convergence import (
+        REVIEW_LOOP_ABANDON_CANDIDATE_KEY,
+        REVIEW_LOOP_TERMINAL_OUTCOME_KEY,
+    )
+
+    ctx = task.context or {}
+    for key in (REVIEW_LOOP_ABANDON_CANDIDATE_KEY, REVIEW_LOOP_TERMINAL_OUTCOME_KEY):
+        marker = ctx.get(key)
+        if isinstance(marker, dict):
+            disposition = marker.get(REVIEW_PARK_DISPOSED_KEY)
+            if isinstance(disposition, dict):
+                return disposition
+    return {}
 
 
 def _record_parent_failure(parent: Task, failure_class: str) -> None:
@@ -550,6 +577,27 @@ async def _requeue_parent_task(
             logger.info(
                 f"[REQUEUE] Skipping child {str(child.id)[:8]} — review_cap_exhausted, "
                 f"PR already closed. Manual requeue required."
+            )
+            continue
+
+        # Skip children abandoned when their bounded operator-disposition window
+        # expired. UNLIKE review_cap_exhausted, THE PR IS STILL OPEN: the
+        # disposition sweep deliberately never closes or merges it (see
+        # review_park_disposition._never_touch_the_pr / PR #16759). A generic
+        # clone would therefore open a SECOND PR for work that already has one
+        # sitting open, and would re-enter the exact review-fix loop that just
+        # provably failed to converge. Land or close the existing PR, or requeue
+        # deliberately, instead.
+        if (child.context or {}).get(
+            "failure_detail"
+        ) == REVIEW_PARK_ABANDONED_FAILURE_DETAIL:
+            _disposition = _park_disposition_of(child)
+            logger.info(
+                f"[REQUEUE] Skipping child {str(child.id)[:8]} — "
+                f"{REVIEW_PARK_ABANDONED_FAILURE_DETAIL}: the review park expired "
+                f"with no operator disposition and the loop was abandoned "
+                f"({_disposition.get('why') or 'no recorded reason'}). "
+                f"Its PR is still OPEN — land, close, or requeue it deliberately."
             )
             continue
 

@@ -13,7 +13,10 @@ from sqlalchemy import select
 from app import ci_compliance
 from app.auth import create_agent_token
 from app.models import Alert, Project, Task, TaskStatus
-from app.size_limit_policy import GovernanceCapExceededError
+from app.size_limit_policy import (
+    GovernanceCapExceededError,
+    describe_effective_cap_breach,
+)
 from app.strategic_spawning import (
     _maybe_spawn_ci_compliance_cap_bump_fix,
     _spawn_strategic_review,
@@ -1444,13 +1447,37 @@ def test_capped_backend_modules_within_cap_on_disk():
             rel, actual_count, cap, "backend", with_verdict=False
         )
         if result["breach"]:
-            breaches.append((rel, actual_count, cap))
+            breaches.append((rel, actual_count, cap, result["effective_cap"]))
 
+    # Report the cap that actually bound.  A module governed by its own
+    # source-declared *_SIZE_GOVERNANCE_CAP breaches below its JSON entry, and
+    # printing the JSON number produced a false comparison ("1979 > 2250") that
+    # also named the wrong file to repair.
+    governed = [
+        rel
+        for rel, _count, cap, effective_cap in breaches
+        if cap is not None and effective_cap is not None and effective_cap < cap
+    ]
+    remediation = (
+        ". Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+    if governed:
+        remediation = (
+            f". {', '.join(governed)} exceeded a source-declared governance cap: "
+            "--fix and --force-chronic refuse to bump those. Decompose the "
+            "module, or make a deliberate paired raise of the "
+            "*_SIZE_GOVERNANCE_CAP constant and the module_size_limits.json entry."
+        )
     assert not breaches, (
         "Capped backend modules exceed their caps on disk: "
-        + ", ".join(f"{rel} ({count} > {cap})" for rel, count, cap in breaches)
-        + ". Run `python3 backend/testing/check_size_limits.py --fix` and commit "
-        "the updated module_size_limits.json."
+        + ", ".join(
+            describe_effective_cap_breach(
+                "backend", rel, count, cap, effective_cap
+            )
+            for rel, count, cap, effective_cap in breaches
+        )
+        + remediation
     )
 
 

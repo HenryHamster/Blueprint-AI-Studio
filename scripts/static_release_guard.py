@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
@@ -95,6 +96,8 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         cwd=repo,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=check,
     )
 
@@ -251,7 +254,7 @@ _extract_base = extract_base
 
 
 def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, check=False)
+    return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
 
 
 def _pytest_result_is_authoritative(
@@ -491,12 +494,80 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
+    failures: list[str] = []
+    receipt_maps: dict[str, dict[str, object]] = {
+        name: {}
+        for name in (
+            "new_failures",
+            "suppressed_failures",
+            "disappeared_failures",
+            "skipped_failures",
+        )
+    }
+    receipt_extra: dict[str, object] = {}
+    receipt_state: str | None = None
+    blocking_state: str | None = None
+    blocking_error: str | None = None
+
+    def record_static_receipt(state: str, blocking: bool, **values: object) -> None:
+        """Merge this run's diagnostic facts into the advisory lane receipt."""
+
+        nonlocal receipt_state
+        receipt_state = state
+        for name in receipt_maps:
+            findings = values.pop(name, None)
+            if isinstance(findings, Mapping):
+                receipt_maps[name].update(findings)
+        metadata = values.pop("extra", None)
+        if isinstance(metadata, Mapping):
+            receipt_extra.update(metadata)
+        receipt_extra.update(
+            {name: value for name, value in values.items() if value is not None}
+        )
+        record_verification_lane(
+            LANE_STATIC_CORPUS,
+            state=state,
+            blocking=blocking,
+            new_failures=receipt_maps["new_failures"],
+            suppressed_failures=receipt_maps["suppressed_failures"],
+            disappeared_failures=receipt_maps["disappeared_failures"],
+            skipped_failures=receipt_maps["skipped_failures"],
+            extra=receipt_extra,
+        )
+
+    def mark_blocking(state: str, error: str, **values: object) -> None:
+        """Keep the root block diagnosis through later corpus receipt writes."""
+
+        nonlocal blocking_state, blocking_error
+        if blocking_state is None:
+            blocking_state = state
+            blocking_error = error
+        record_static_receipt(state, True, error=error, **values)
+
+    def blocking_exit(state: str, error: str, exit_code: int, **values: object) -> int:
+        """Write a fail-open diagnosis immediately before a fail-closed exit."""
+
+        mark_blocking(state, error, guard_exit_code=exit_code, **values)
+        return exit_code
+
+    def finish() -> int:
+        return blocking_exit(
+            blocking_state or receipt_state or "guard_failure",
+            blocking_error or f"static guard blocked: {', '.join(failures)}",
+            1,
+        )
+
+    def runner_metadata(label: str, result: subprocess.CompletedProcess[str]) -> dict[str, object]:
+        return {
+            "guard_exit_code": result.returncode,
+            "extra": {f"{label}_exit_code": result.returncode},
+        }
 
     try:
         changed = _changed_files(repo, args.base)
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"[static guard] ERROR: {exc}", file=sys.stderr)
-        return 2
+        return blocking_exit("setup_failure", str(exc), 2)
 
     size_scoped = [path for path in changed if _is_size_scope(path)]
     corpus_scoped = [path for path in changed if _is_static_scope(path)]
@@ -514,7 +585,6 @@ def main(argv: list[str] | None = None) -> int:
     for path in scoped:
         print(f"  - {path}")
 
-    failures: list[str] = []
     task_id = _task_id()
     base_ref = _base_ref(repo, args.base)
     assert base_ref is not None
@@ -525,7 +595,7 @@ def main(argv: list[str] | None = None) -> int:
             _extract_base(repo, base_ref, base_root)
         except RuntimeError as exc:
             print(f"[static guard] ERROR: {exc}", file=sys.stderr)
-            return 2
+            return blocking_exit("base_extraction_failure", str(exc), 2)
 
         if args.corpus_only:
             print("[static guard] module size guard SKIPPED (--corpus-only)")
@@ -535,15 +605,26 @@ def main(argv: list[str] | None = None) -> int:
             size_result = _run_size_guard(repo, base_root)
             if size_result.returncode != 0:
                 print("[static guard] module size guard FAILED")
+                size_failure = {
+                    "<module-size-guard>": size_result.stdout + size_result.stderr
+                }
+                mark_blocking(
+                    "size_failure",
+                    "module size guard failed",
+                    guard_exit_code=size_result.returncode,
+                    new_failures=size_failure,
+                    extra={"size_guard_exit_code": size_result.returncode},
+                )
                 try:
                     size_findings = _attributed_findings(
-                        {"<module-size-guard>": size_result.stdout + size_result.stderr},
+                        size_failure,
                         task_id=task_id,
                         source="module size guard",
                     )
                 except RuntimeError as exc:
                     print(f"[static guard] ERROR: {exc}", file=sys.stderr)
                     failures.append("module size guard attribution")
+                    mark_blocking("attribution_unavailable", str(exc))
                 else:
                     print(f"[static guard] findings: {json.dumps(size_findings)}")
                 print(size_result.stdout, end="")
@@ -558,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"[static guard] FAIL — {', '.join(failures)}",
                     file=sys.stderr,
                 )
-                return 1
+                return finish()
             print("[static guard] PASS (size-only)")
             return 0
 
@@ -581,7 +662,11 @@ def main(argv: list[str] | None = None) -> int:
         current_harness = repo / "scripts" / "test-backend.sh"
         if not current_harness.is_file() or not base_harness.is_file():
             print("[static guard] ERROR: scripts/test-backend.sh is unavailable", file=sys.stderr)
-            return 2
+            return blocking_exit(
+                "harness_unavailable",
+                "scripts/test-backend.sh is unavailable",
+                2,
+            )
 
         harness_changed = "scripts/test-backend.sh" in corpus_scoped
         roster_changed = _static_roster_changed(base_harness, current_harness)
@@ -600,6 +685,7 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError as exc:
             print(f"[static guard] ERROR: cannot inspect standalone corpus: {exc}", file=sys.stderr)
             failures.append("standalone corpus inventory")
+            mark_blocking("corpus_inventory_failure", str(exc))
             base_inventory = set()
             current_inventory = set()
         corpus_membership_changed = base_inventory != current_inventory
@@ -656,6 +742,12 @@ def main(argv: list[str] | None = None) -> int:
         current_junit = Path(temp_dir) / "current.xml"
         base_result: subprocess.CompletedProcess[str] | None = None
         current_result = _run_static_corpus(repo, current_junit)
+        # Keep finalization safe when the current JUnit report cannot be
+        # parsed. The attribution exception records the blocking receipt, and
+        # these conservative defaults ensure no later branch can treat that
+        # failed parse as authoritative or as a newly attributed failure.
+        new_failures: dict[str, str] = {}
+        corpus_authoritative = False
         try:
             current_report = parse_junit_report(
                 current_junit, tree_root=repo, label="current"
@@ -665,9 +757,13 @@ def main(argv: list[str] | None = None) -> int:
             print(current_result.stdout, end="")
             print(current_result.stderr, end="", file=sys.stderr)
             failures.append("standalone static corpus attribution")
+            mark_blocking(
+                "attribution_unavailable",
+                str(exc),
+                **runner_metadata("current", current_result),
+            )
         else:
             current_failures = current_report.failures
-            new_failures: dict[str, str] = {}
             corpus_authoritative = _pytest_result_is_authoritative(
                 current_result,
                 current_report,
@@ -675,6 +771,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not corpus_authoritative:
                 failures.append("standalone static corpus execution_failure")
+                mark_blocking(
+                    "execution_failure",
+                    "current standalone corpus result is not attributable",
+                    **runner_metadata("current", current_result),
+                )
             elif not current_failures:
                 # A changed harness is checked against the base corpus, but a
                 # normal clean candidate does not need differential subtraction.
@@ -705,6 +806,11 @@ def main(argv: list[str] | None = None) -> int:
                         print(base_result.stderr, end="", file=sys.stderr)
                         failures.append("standalone static corpus attribution")
                         corpus_authoritative = False
+                        mark_blocking(
+                            "attribution_unavailable",
+                            str(exc),
+                            **runner_metadata("baseline", base_result),
+                        )
                     else:
                         if not _pytest_result_is_authoritative(
                             base_result,
@@ -713,6 +819,11 @@ def main(argv: list[str] | None = None) -> int:
                         ):
                             failures.append("standalone static corpus baseline_unavailable")
                             corpus_authoritative = False
+                            mark_blocking(
+                                "baseline_unavailable",
+                                "baseline standalone corpus result is not attributable",
+                                **runner_metadata("baseline", base_result),
+                            )
                         else:
                             verification = classify_verification(
                                 runtime_available=True,
@@ -744,8 +855,7 @@ def main(argv: list[str] | None = None) -> int:
                                 if coverage_failures
                                 else str(verification["state"])
                             )
-                            record_verification_lane(
-                                LANE_STATIC_CORPUS,
+                            record_static_receipt(
                                 state=corpus_state,
                                 blocking=bool(new_failures),
                                 new_failures=new_failures,
@@ -831,6 +941,11 @@ def main(argv: list[str] | None = None) -> int:
                             failures.append("standalone static corpus attribution")
                             baseline_report = None
                             corpus_authoritative = False
+                            mark_blocking(
+                                "attribution_unavailable",
+                                str(exc),
+                                **runner_metadata("baseline", base_result),
+                            )
                     if baseline_report is not None:
                         if base_result is not None and not _pytest_result_is_authoritative(
                             base_result,
@@ -839,6 +954,11 @@ def main(argv: list[str] | None = None) -> int:
                         ):
                             failures.append("standalone static corpus baseline_unavailable")
                             corpus_authoritative = False
+                            mark_blocking(
+                                "baseline_unavailable",
+                                "baseline standalone corpus result is not attributable",
+                                **runner_metadata("baseline", base_result),
+                            )
                         else:
                             outcome = classify_verification(
                                 runtime_available=True,
@@ -876,8 +996,7 @@ def main(argv: list[str] | None = None) -> int:
                             # `new_failures` is used rather than the raw
                             # outcome bucket because the synthetic "<harness>"
                             # finding above is what actually blocks here.
-                            record_verification_lane(
-                                LANE_STATIC_CORPUS,
+                            record_static_receipt(
                                 state=corpus_state,
                                 blocking=bool(new_failures),
                                 new_failures=new_failures,
@@ -903,6 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
                 except RuntimeError as exc:
                     print(f"[static guard] ERROR: {exc}", file=sys.stderr)
                     failures.append("standalone static corpus attribution")
+                    mark_blocking("attribution_unavailable", str(exc))
                 else:
                     print("[static guard] standalone static corpus FAILED for this diff")
                     print(f"[static guard] new failures: {json.dumps(attributed)}")
@@ -916,7 +1036,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if failures:
         print(f"[static guard] FAIL — {', '.join(failures)}", file=sys.stderr)
-        return 1
+        return finish()
     print("[static guard] PASS")
     return 0
 

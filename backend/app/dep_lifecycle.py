@@ -224,6 +224,93 @@ async def _escalate_stranded_dependent(
     return True
 
 
+async def _escalate_unlandable_dependent(
+    dependent, foundation_info, session, broadcast_to_project, scan_label=""
+) -> bool:
+    """Surface a dependent stranded behind a COMPLETED dependency whose PR can
+    never merge on its own.
+
+    The same-base dependency gate releases a code-producing dependency only once
+    its PR is MERGED. When the review loop that owns that PR has been parked for
+    operator disposition, automatic fix spawning is deliberately stopped — and
+    the dependency is already terminal — so the PR will never merge and the gate
+    holds this dependent QUEUED forever behind a bare "Waiting on N deps"
+    message, with no reason an operator can act on.
+
+    Deliberately does NOT clear ``depends_on`` and dispatch: the dependent's base
+    genuinely lacks the prerequisite's code, which is the very invariant the
+    merge requirement exists to protect. It also does not re-drive the PR —
+    re-driving is exactly what the operator park stopped. Instead move the
+    dependent into BLOCKED+escalated NAMING the unmerged PR and the park reason,
+    and raise ONE deduplicated operator alert. Returns ``True`` when escalated.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.alert_dispatch import _maybe_create_blocked_escalation_alert
+    from app.reaper_sweeps import _BLOCKED_ESCALATED_PARK
+    from app.task_blocked import build_need, enter_blocked_state
+
+    if not isinstance(foundation_info, dict):
+        return False
+    foundation_id = str(foundation_info.get("id") or "")
+    if not foundation_id:
+        return False
+    label = str(foundation_info.get("label") or foundation_id)
+    park_reason = str(foundation_info.get("reason") or "parked_for_operator")
+    pr_number = foundation_info.get("pr_number")
+    pr_text = f"PR #{pr_number}" if pr_number else "its pull request"
+    detail = (
+        f"Stranded behind unlanded prerequisite '{label}' ({foundation_id}): that "
+        f"dependency COMPLETED but {pr_text} is still open and its review loop is "
+        f"parked for operator disposition ({park_reason}), so automatic fix "
+        f"spawning has stopped and the PR will never merge on its own. This "
+        f"dependent needs the prerequisite's merged code, so it can never "
+        f"dispatch until an operator disposes of that PR (merge it, reset the "
+        f"iteration cap to resume the loop, or cancel this dependent)"
+        f"{scan_label}."
+    )
+    enter_blocked_state(
+        dependent,
+        waiting_on=f"unlanded prerequisite {label}",
+        reason=detail,
+        source="system",
+        blocker_kind="upstream_dependency",
+        recheck_in_seconds=None,
+        escalated=True,
+        need=build_need("task", foundation_id, label=foundation_info.get("label")),
+    )
+    ctx = dict(dependent.context or {})
+    ctx["_blocked_escalated"] = True
+    dependent.context = ctx
+    dependent.recheck_after = _utcnow() + _BLOCKED_ESCALATED_PARK
+    # Overwrite the stale "Waiting on N deps: <prefix>" line. That bare message is
+    # the whole visibility defect: it is what an operator reads on the task list,
+    # and it names neither the unmerged PR nor the park that made the wait
+    # permanent. enter_blocked_state records the reason on blocked_reason /
+    # context['blocker'], but not here.
+    dependent.latest_status_message = detail
+    flag_modified(dependent, "context")
+    session.add(dependent)
+    logger.error(
+        f"[ORCHESTRATOR] Stranded dependent {dependent.id} escalated — unlanded "
+        f"prerequisite {foundation_id} ({park_reason}){scan_label}"
+    )
+    # Fires (and commits) one deduplicated ERROR alert per stranded dependent.
+    await _maybe_create_blocked_escalation_alert(
+        dependent, session, blocker_kind="upstream_dependency", detail=detail
+    )
+    await broadcast_to_project(
+        str(dependent.project_id),
+        "task_updated",
+        {
+            "task_id": str(dependent.id),
+            "status": TaskStatus.BLOCKED,
+            "message": detail,
+        },
+    )
+    return True
+
+
 async def _apply_deadlock_classification(
     classified, broadcast_to_project, eligible_ids, scan_label=""
 ) -> int:
@@ -251,6 +338,22 @@ async def _apply_deadlock_classification(
             if reason == "cascade_cancel":
                 if fix_task:
                     cancels.append((task_id, fix_task.project_id, failed_prereq))
+                    acted += 1
+                continue
+            if reason == "stranded_unlanded":
+                # Stranded behind a COMPLETED dependency whose PR can never
+                # merge on its own (its review loop is parked for operator
+                # disposition). Escalate the dependent WITH the reason; never
+                # clear deps and dispatch — its base genuinely lacks the
+                # prerequisite's code. ``item[2]`` carries the foundation
+                # descriptor dict for this classification.
+                if fix_task and await _escalate_unlandable_dependent(
+                    fix_task,
+                    failed_prereq,
+                    fix_session,
+                    broadcast_to_project,
+                    scan_label,
+                ):
                     acted += 1
                 continue
             if reason == "stranded_parked":

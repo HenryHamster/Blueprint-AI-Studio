@@ -446,6 +446,17 @@ async def test_guard_suppression_retries_current_receipt_after_insert_race():
 
 
 @pytest.mark.asyncio
+async def test_blocked_receipt_context_omits_the_removed_incomplete_flag():
+    task = Task(
+        project_id=uuid.uuid4(),
+        context={"publication_gate_receipt": {"status": "passed"}},
+    )
+
+    assert await ingest_guard_suppression_receipt(task, _Session()) == []
+    assert "guard_suppression_receipt_incomplete" not in task.context
+
+
+@pytest.mark.asyncio
 async def test_recurring_guard_suppression_has_one_owner_and_resolves():
     """Three tasks with one structured baseline failure make one owned fix.
 
@@ -895,4 +906,3 @@ async def test_owner_election_refuses_a_project_that_cannot_take_new_work(
         )
         == []
     )
-

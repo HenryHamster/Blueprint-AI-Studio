@@ -69,7 +69,7 @@ def _gcloud(*args: str) -> str | None:
     use_shell = exe.lower().endswith((".cmd", ".bat"))
     cmd = subprocess.list2cmdline([exe, *args]) if use_shell else [exe, *args]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, shell=use_shell)
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, shell=use_shell)
     except (FileNotFoundError, OSError, subprocess.SubprocessError):
         return None
     out = proc.stdout.strip()

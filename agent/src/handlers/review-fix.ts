@@ -59,6 +59,7 @@ import {
   buildReviewMasterPreamble, buildReviewDiffAccessHint,
   buildReviewCoreGuidance, buildReviewVerdictInstructions,
   buildRollupReviewGuidance, buildPlannedFilesClassificationGuidance,
+  buildReviewMergeStateSection,
   computeReviewPromptFingerprint,
 } from '../prompts/review-prompt.js';
 export {
@@ -75,6 +76,8 @@ import type { DriftSignal, ReviewHistoryEntry } from './review-fix-history.js';
 import { computeMaxFixIterations, formatTrajectorySection, formatDriftSection } from './review-fix-history.js';
 export { computeMaxFixIterations, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix-history.js';
 import { detectMigrationConflict, buildMigrationConflictGuidance, extractReservedMigrationRevision } from './review-fix-migration.js';
+import { fetchAuthoritativeMergeState } from './review-fix-merge-state.js';
+export { fetchAuthoritativeMergeState } from './review-fix-merge-state.js';
 import { resolveMigrationLayout } from './specialized.js';
 import { downloadViewportShots } from '../utils/viewport-shot-download.js';
 import { recordViewportScreenshotDownload, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
@@ -829,6 +832,15 @@ export async function handleReview(
     }
   } catch { /* best-effort, continue without PR metadata */ }
 
+  // Authoritative merge state. Without it the reviewer has been observed
+  // hand-rolling `git merge-tree` with the wrong base and minting a
+  // merge-conflict MAJOR that no fix agent can close (PR #17720). The helper
+  // never throws — an unreachable GitHub yields "unknown", which the prompt
+  // section turns into "do not raise a conflict finding".
+  const reviewMergeState = await fetchAuthoritativeMergeState({
+    ghToken, owner, repo, prNumber, ws,
+  });
+
   // The status payload's `changed_files` must describe the PR, not this
   // review's evidence range. In delta mode `reviewDiffRange` is the exact
   // two-SHA slice of the last fix and the base ref is deliberately never
@@ -1134,6 +1146,7 @@ export async function handleReview(
     taskId,
     deltaBaseSha ? undefined : baseBranch,
   );
+  const reviewMergeStateSection = buildReviewMergeStateSection(reviewMergeState, baseBranch);
   const reviewScopePreamble = deltaBaseSha ? '' : scopePreamble;
   const changedFilesLabel = deltaBaseSha
     ? `Files changed in the exact review delta (${deltaBaseSha}..HEAD):`
@@ -1163,7 +1176,7 @@ ${selfReviewBlindSpotsForPrompt}
 ${plannedFilesForPrompt}
 ${viewportScreenshotsForPrompt}
 ${reviewDiffAccessHint}
-${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewCoreGuidance}`;
+${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewMergeStateSection}${reviewCoreGuidance}`;
 
   // Parallel-review fan-out gating: per-project flag AND helper-threshold both
   // required. False positives (extra fan-out) are cheap subagent overhead;
@@ -1197,7 +1210,7 @@ ${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewC
     ['review_preamble', buildReviewMasterPreamble(prNumber, branch, baseBranch)],
     ['pr_context', `${reviewIterationContext}${deltaReviewSection}${rollupGuidance}${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}${changedFilesLabel}\n${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}`],
     ['review_meta', `${selfReviewBlindSpotsForPrompt}${plannedFilesForPrompt}${viewportScreenshotsForPrompt}${reviewDiffAccessHint}`],
-    ['review_guidance', `${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewCoreGuidance}`],
+    ['review_guidance', `${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewMergeStateSection}${reviewCoreGuidance}`],
     ['parallel_review', parallelReviewBlock],
     ['fetch_and_tools', `\n\n${reviewFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
   ]);

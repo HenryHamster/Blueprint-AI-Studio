@@ -12535,6 +12535,305 @@ async def test_never_satisfiable_cancel_stamps_unresumable_marker(reaper_db, moc
     assert marker["direction_id"] == "d-deadbeef"
 
 
+async def _completed_provider(db, project, **kwargs):
+    """A COMPLETED foundation task, unshipped unless the caller says otherwise."""
+    defaults = {
+        "project_id": project.id,
+        "title": "auth-subsystem-provider",
+        "description": "x",
+        "status": TaskStatus.COMPLETED,
+        "created_by": "test-user",
+        "requires_approval": False,
+        "payloads": [{"type": "create"}],
+        "context": {},
+        "status_log": [],
+    }
+    defaults.update(kwargs)
+    t = Task(**defaults)
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+def test_parked_reeval_cull_budget_pinned_at_24h():
+    """LITERAL pin on the give-up budget. The attribution split must never be
+    able to retime the cull: 6h x 4 parked re-evaluations = ~24h, unchanged."""
+    from app.reaper_sweeps import (
+        _BLOCKED_PARKED_REEVAL_CAP as _cap,
+        _BLOCKED_PARKED_REEVAL_INTERVAL as _interval,
+    )
+
+    assert _interval == timedelta(hours=6)
+    assert _cap == 4
+    assert _interval * _cap == timedelta(hours=24)
+
+
+@pytest.mark.asyncio
+async def test_parked_giveup_names_unlanded_provider_not_missing_foundation(
+    reaper_db, mocker
+):
+    """The give-up must NOT say "no task ever provided it" when a task DID.
+
+    Incident shape: the prerequisite was built - a task ran, COMPLETED and opened
+    a PR - but the PR never merged (its review loop is parked for operator
+    disposition), so the shipped gate correctly refuses to satisfy the need and
+    the dependent is culled at the cap. The old reason sent an operator hunting
+    for a task that does not exist. The reason must instead name the providing
+    task and its PR, and must not be stamped as missing-foundation demand.
+    """
+    from app.reaper_sweeps import (
+        GIVE_UP_PRODUCED_BUT_UNLANDED,
+        MISSING_FOUNDATION_MARKER_KEY,
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    provider = await _completed_provider(
+        reaper_db,
+        project,
+        title="fix(size): attribute merge cap breaches",
+        payloads=[{"type": "fix", "pr_number": 17707}],
+        context={},  # no pr_merged -> the PR never merged
+    )
+    need = {"kind": "task", "ref": str(provider.id)}
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on the size-cap fix",
+        blocked_at=now - timedelta(hours=30),
+        context={
+            "direction_id": "d-deadbeef",
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "size-cap fix",
+                "reason": "BLOCKER: waiting on the size-cap fix",
+                "need": need,
+            },
+            "_blocked_escalated": True,
+            "_blocked_parked_reevals": _BLOCKED_PARKED_REEVAL_CAP - 1,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    # The cull itself is unchanged - only the attribution.
+    assert t.status == TaskStatus.CANCELLED
+    message = t.latest_status_message or ""
+    assert "PR #17707" in message
+    assert "never merged" in message.lower()
+    assert "fix(size): attribute merge cap breaches" in message
+    # The false claim must be gone from every operator-facing surface.
+    assert "no task ever provided it" not in message.lower()
+    assert "never became satisfiable" not in message.lower()
+
+    marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    assert isinstance(marker, dict)
+    assert marker["give_up_class"] == GIVE_UP_PRODUCED_BUT_UNLANDED
+    assert marker["provider_task_id"] == str(provider.id)
+    assert marker["unshipped_reason"] == "pr_never_merged"
+    assert marker["need"] == need
+    assert marker["direction_id"] == "d-deadbeef"
+    # A foundation that WAS built is not demand to commission it again.
+    assert MISSING_FOUNDATION_MARKER_KEY not in marker
+
+
+@pytest.mark.asyncio
+async def test_parked_giveup_names_ghost_merge_rollup(reaper_db, mocker):
+    """Second unshipped sub-class: the provider's PR DID merge, but only into a
+    rollup staging branch whose parent then died, so the code never reached
+    integration. The reason must say that - not "no task ever provided it", and
+    not "the PR never merged" (it did)."""
+    from app.reaper_sweeps import (
+        GIVE_UP_PRODUCED_BUT_UNLANDED,
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    parent = Task(
+        project_id=project.id,
+        title="abandoned-rollup-parent",
+        description="x",
+        status=TaskStatus.CANCELLED,
+        created_by="test-user",
+        requires_approval=False,
+        payloads=[{"type": "rollup"}],
+        context={},
+        status_log=[],
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+    provider = await _completed_provider(
+        reaper_db,
+        project,
+        title="feat: staging-only child",
+        payloads=[{"type": "create", "pr_number": 4242}],
+        context={"pr_merged": True},
+        parent_task_id=parent.id,
+    )
+    need = {"kind": "task", "ref": str(provider.id)}
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on the staging-only child",
+        blocked_at=now - timedelta(hours=30),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "staging-only child",
+                "reason": "BLOCKER: waiting on the staging-only child",
+                "need": need,
+            },
+            "_blocked_escalated": True,
+            "_blocked_parked_reevals": _BLOCKED_PARKED_REEVAL_CAP - 1,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.CANCELLED
+    message = (t.latest_status_message or "").lower()
+    assert "pr #4242" in message
+    assert "ghost-merged" in message or "ghost merge" in message
+    assert "no task ever provided it" not in message
+    marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    assert marker["give_up_class"] == GIVE_UP_PRODUCED_BUT_UNLANDED
+    assert marker["unshipped_reason"] == "ghost_merge_abandoned_rollup"
+    assert marker["provider_task_id"] == str(provider.id)
+
+
+@pytest.mark.asyncio
+async def test_parked_giveup_keeps_unprovided_reason_when_no_provider_matches(
+    reaper_db, mocker
+):
+    """Over-attribution guard. An unshipped COMPLETED task that does NOT match
+    the need must never be credited as the provider: with nothing matching, the
+    give-up keeps the (correct) never-satisfiable / nothing-provided reason."""
+    from app.reaper_sweeps import (
+        GIVE_UP_NEVER_SATISFIABLE,
+        MISSING_FOUNDATION_MARKER_KEY,
+        UNRESUMABLE_CANCEL_CONTEXT_KEY,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    # Present, COMPLETED, unmerged - but unrelated to the need.
+    await _completed_provider(
+        reaper_db,
+        project,
+        title="totally-unrelated-work",
+        payloads=[{"type": "create", "pr_number": 999}],
+        context={},
+    )
+    need = {"kind": "capability", "ref": "nonexistent-capability"}
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: needs an auth subsystem",
+        blocked_at=now - timedelta(hours=30),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "auth subsystem",
+                "reason": "BLOCKER: needs an auth subsystem",
+                "need": need,
+            },
+            "_blocked_escalated": True,
+            "_blocked_parked_reevals": _BLOCKED_PARKED_REEVAL_CAP - 1,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.CANCELLED
+    message = (t.latest_status_message or "").lower()
+    assert "never became satisfiable" in message
+    assert "999" not in message
+    assert "totally-unrelated-work" not in message
+    marker = (t.context or {}).get(UNRESUMABLE_CANCEL_CONTEXT_KEY)
+    assert marker["give_up_class"] == GIVE_UP_NEVER_SATISFIABLE
+    assert "provider_task_id" not in marker
+    # A genuinely-unprovided foundation need IS still missing-foundation demand.
+    assert marker.get(MISSING_FOUNDATION_MARKER_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_blocked_escalation_detail_names_unlanded_provider(reaper_db, mocker):
+    """The escalation fires ~18h BEFORE the cull, so it is the first reason an
+    operator reads. It must not claim the prerequisite "never appeared" when a
+    task produced it and only the PR failed to land."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    provider = await _completed_provider(
+        reaper_db,
+        project,
+        title="fix(size): attribute merge cap breaches",
+        payloads=[{"type": "fix", "pr_number": 17707}],
+        context={},
+    )
+    inflight = Task(
+        project_id=project.id,
+        title="unrelated-inflight",
+        description="x",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="test-user",
+        requires_approval=False,
+        payloads=[{"type": "create"}],
+        context={},
+        status_log=[],
+    )
+    reaper_db.add(inflight)
+    await reaper_db.commit()
+    await reaper_db.refresh(inflight)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="upstream_dependency",
+        blocked_reason="BLOCKER: waiting on the size-cap fix",
+        # An already-wired edge to an unrelated in-flight task keeps the dependent
+        # on the escalate path rather than the legacy precondition machine.
+        depends_on=[str(inflight.id)],
+        blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(hours=1),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "size-cap fix",
+                "reason": "BLOCKER: waiting on the size-cap fix",
+                "need": {"kind": "task", "ref": str(provider.id)},
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert (t.context or {}).get("_blocked_escalated") is True
+    detail = ((t.context or {}).get("blocker") or {}).get("escalation_detail") or ""
+    assert "PR #17707" in detail
+    assert "WAS produced" in detail
+    assert "never appeared" not in detail.lower()
+    assert "PR #17707" in (t.latest_status_message or "")
+
+
 @pytest.mark.asyncio
 async def test_unblock_sweep_parked_capability_below_cap_stays_blocked(
     reaper_db, mocker
@@ -20810,3 +21109,44 @@ async def test_proof_earn_loop_threads_named_test_executed_and_session(reaper_db
     finally:
         _rs._last_backing_proof_sweep = _prev_backing
         _rs._last_proof_earn_loop_sweep = _prev_earn
+@pytest.mark.asyncio
+async def test_reaper_cycle_runs_the_review_park_disposition_sweep(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Registration pin: the disposition sweep must actually run in the loop.
+
+    The whole point of ``app.review_park_disposition`` is that a review-fix park
+    stops being indefinite. A sweep that exists, is unit-tested and is never
+    wired into the reaper leaves every parked chain -- and its rollup parent, and
+    its research direction -- stranded exactly as before, and no test of the
+    sweep itself can see that. So pin BOTH halves here: the name the reaper calls
+    is the real function, and one reaper cycle actually awaits it.
+    """
+    import app.reaper as reaper_module
+    from app.review_park_disposition import sweep_dispose_expired_review_parks
+
+    assert (
+        reaper_module.sweep_dispose_expired_review_parks
+        is sweep_dispose_expired_review_parks
+    ), "the reaper must call the real sweep, not a shadowed local stub"
+
+    spy = mocker.patch.object(
+        reaper_module,
+        "sweep_dispose_expired_review_parks",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+
+    await _run_reaper_once()
+
+    assert spy.await_count == 1, (
+        "one reaper cycle must run the review-park disposition sweep exactly once"
+    )
+    session_arg, now_arg = spy.await_args.args[:2]
+    assert isinstance(session_arg, AsyncSession), (
+        "the sweep must be handed the reaper's own session"
+    )
+    assert isinstance(now_arg, datetime), (
+        "the sweep must be handed the cycle's clock, not left to read its own"
+    )
+

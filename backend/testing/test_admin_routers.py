@@ -3266,6 +3266,7 @@ class TestResetIterationCap:
         what releases it.
         """
         from app.review_merge_gate import (
+            _SPAWN_BUDGET_CENSUS_KEY,
             _SPAWN_BUDGET_COUNT_KEY,
             _SPAWN_BUDGET_TARGET_KEY,
         )
@@ -3281,6 +3282,7 @@ class TestResetIterationCap:
                     "pr_number": 909,
                     _SPAWN_BUDGET_TARGET_KEY: "base-sha-909:head-sha-909",
                     _SPAWN_BUDGET_COUNT_KEY: 5,
+                    _SPAWN_BUDGET_CENSUS_KEY: {"consumed": 5},
                 },
                 "review_loop_abandon_candidate": {
                     "status": "abandon_candidate",
@@ -3301,7 +3303,14 @@ class TestResetIterationCap:
         assert loop["iteration"] == 0
         assert _SPAWN_BUDGET_COUNT_KEY not in loop
         assert _SPAWN_BUDGET_TARGET_KEY not in loop
+        assert _SPAWN_BUDGET_CENSUS_KEY not in loop
         assert "review_loop_abandon_candidate" not in parking.context
+        # What actually releases the budget now that the gate derives it from
+        # review ROWS rather than from this counter: the census excludes every
+        # row created at or before this stamp. Without it the operator's reset
+        # is a no-op and the next CI tick re-parks the PR they just freed.
+        # test_review_merge_authority.py drives that end to end.
+        assert isinstance(loop.get("iteration_reset_at"), str)
 
     @pytest.mark.asyncio
     async def test_no_pr_number_in_context_returns_400(
