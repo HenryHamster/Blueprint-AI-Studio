@@ -315,7 +315,14 @@ def compose_agent_terminal_message(
         return category
 
     prefix = f"{category} — "
-    budget = max(0, max_chars - len(prefix))
+    budget = max_chars - len(prefix)
+    if budget <= 0:
+        # The category alone already fills the budget. Return it clipped
+        # rather than falling through to a tail slice: ``free_text[-0:]`` is
+        # ``free_text``, so a zero budget would emit the WHOLE log instead of
+        # none of it, and the ``max(0, ...)`` clamp that used to sit here read
+        # as if it prevented exactly that.
+        return category[:max_chars]
     return f"{prefix}{free_text[-budget:]}"
 
 
