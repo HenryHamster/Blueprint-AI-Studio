@@ -1,6 +1,7 @@
 """Regression coverage for descendant retry and blocker propagation."""
 
 import copy
+from datetime import timedelta
 
 import pytest
 from fastapi import HTTPException
@@ -22,6 +23,7 @@ from app.rollup_lineage_fence import (
     mark_ancestor_rollups_awaiting_operator,
 )
 from app.rollup_locking import _capture_rollup_parent_snapshot
+from app.time_utils import _utcnow
 from testing.factories import make_project, make_task
 
 
@@ -713,3 +715,375 @@ async def test_partial_resolution_drops_entry_but_keeps_hold(db_session, mocker)
     blocks = parent.context["_descendant_operator_blocks"]
     assert str(child.id) not in blocks
     assert str(sibling.id) in blocks
+
+
+# ── Fence-hold ADJUDICATION ──────────────────────────────────────────────────
+#
+# Incident 2026-08-23, research task 70c5ec8f: the fence set a hold at 01:42Z
+# ("descendant 5fb05561 needs operator intervention", owner
+# "rollup_lineage_fence"), the generic 2h HUMAN-approval timeout FAILED the
+# ancestor at ~03:42Z, and the blocking descendant's PR #17693 merged at
+# 12:11Z — 8.5h after the rollup was already destroyed. A machine-set
+# dependency must never be killed by a human-approval clock, and the release
+# check must be reachable outside that one narrow timeout window.
+
+
+async def _fenced_ancestor(db_session, *, pr_number=17693, reason="review spawn failed"):
+    """Ancestor carrying a provably fence-owned descendant-block hold."""
+
+    parent, child = await _lineage(db_session)
+    await mark_ancestor_rollups_awaiting_operator(
+        child, db_session, reason=reason, pr_number=pr_number
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+    from app.rollup_lineage_fence import descendant_operator_block_hold_is_owned
+
+    assert descendant_operator_block_hold_is_owned(parent) is True
+    return parent, child
+
+
+@pytest.mark.asyncio
+async def test_fence_block_decide_window_is_pinned_to_twelve_hours():
+    """Literal pin: the bounded decide window is 12h, not "whenever"."""
+
+    from app.rollup_lineage_fence import _FENCE_BLOCK_DECIDE_AFTER_HOURS
+
+    assert _FENCE_BLOCK_DECIDE_AFTER_HOURS == 12
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_waits_and_names_the_open_blocking_pr(db_session, mocker):
+    """INCIDENT REGRESSION: a still-OPEN blocker PR means WAIT, never fail.
+
+    The hold is retained, the ancestor stays EVALUATING, and the status
+    message surfaces the reason: which descendant, which PR, why, how long.
+    """
+
+    from app.rollup_lineage_fence import adjudicate_descendant_operator_blocks
+
+    parent, child = await _fenced_ancestor(db_session)
+    _mock_github(mocker, {"merged": False, "state": "open"})
+
+    state = await adjudicate_descendant_operator_blocks(
+        parent, db_session, now=_utcnow() + timedelta(hours=9)
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert state == "waiting"
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is True
+    assert str(child.id) in parent.context["_descendant_operator_blocks"]
+    assert "_descendant_operator_blocks_decided" not in parent.context
+    message = parent.latest_status_message or ""
+    assert str(child.id)[:8] in message
+    assert "PR #17693" in message
+    assert "review spawn failed" in message
+    assert "blocked 9h" in message
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_waiting_message_is_idempotent_for_the_same_blockset(
+    db_session, mocker
+):
+    """Re-entering sweeps must not churn the row with an identical message."""
+
+    from app.rollup_lineage_fence import adjudicate_descendant_operator_blocks
+
+    parent, _child = await _fenced_ancestor(db_session)
+    _mock_github(mocker, {"merged": False, "state": "open"})
+    now = _utcnow() + timedelta(hours=9)
+
+    assert await adjudicate_descendant_operator_blocks(
+        parent, db_session, now=now
+    ) == "waiting"
+    first = parent.latest_status_message
+    assert await adjudicate_descendant_operator_blocks(
+        parent, db_session, now=now
+    ) == "waiting"
+    assert parent.latest_status_message == first
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_releases_once_the_blocking_pr_merges(db_session, mocker):
+    """The same ancestor, after the blocker's PR merges out-of-band.
+
+    #17693 merged 8.5h after the incident's ancestor was FAILED. With the
+    ancestor still alive, the very next adjudication releases the hold and
+    restores the exact prior approval state.
+    """
+
+    from app.rollup_lineage_fence import adjudicate_descendant_operator_blocks
+
+    parent, _child = await _fenced_ancestor(db_session)
+    _mock_github(mocker, {"merged": False, "state": "open"})
+    assert await adjudicate_descendant_operator_blocks(
+        parent, db_session, now=_utcnow() + timedelta(hours=2)
+    ) == "waiting"
+    await db_session.commit()
+
+    # ... and now the blocker lands.
+    _mock_github(mocker, {"merged": True, "state": "closed"})
+    state = await adjudicate_descendant_operator_blocks(
+        parent, db_session, now=_utcnow() + timedelta(hours=9)
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert state == "released"
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is False
+    assert "_descendant_operator_blocks" not in parent.context
+    assert "_descendant_operator_blocks_prior_approval" not in parent.context
+    assert "resolved out-of-band" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_decides_when_every_blocker_is_terminal_and_aged_out(
+    db_session, mocker
+):
+    """Degrade gracefully or DECIDE — never park forever, never hand it back."""
+
+    from app.rollup_lineage_fence import (
+        _FENCE_BLOCK_DECIDE_AFTER_HOURS,
+        adjudicate_descendant_operator_blocks,
+    )
+
+    parent, child = await _fenced_ancestor(db_session)
+    assert child.status == TaskStatus.FAILED  # terminal blocker
+    _mock_github(mocker, {"merged": False, "state": "open"})
+
+    state = await adjudicate_descendant_operator_blocks(
+        parent,
+        db_session,
+        now=_utcnow() + timedelta(hours=_FENCE_BLOCK_DECIDE_AFTER_HOURS + 1),
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert state == "decided"
+    assert parent.status == TaskStatus.EVALUATING  # resumed, NOT failed
+    assert parent.requires_approval is False
+    assert "_descendant_operator_blocks" not in parent.context
+    decided = parent.context["_descendant_operator_blocks_decided"]
+    assert isinstance(decided, list) and len(decided) == 1
+    record = decided[0]
+    assert record["task_id"] == str(child.id)
+    assert record["pr_number"] == 17693
+    assert record["reason"] == "review spawn failed"
+    assert record["blocked_at"] and record["decided_at"]
+    assert "terminal" in record["why"]
+    assert str(child.id)[:8] in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_waits_while_the_block_is_younger_than_the_window(
+    db_session, mocker
+):
+    """Terminal blockers alone are not enough — the window must elapse."""
+
+    from app.rollup_lineage_fence import (
+        _FENCE_BLOCK_DECIDE_AFTER_HOURS,
+        adjudicate_descendant_operator_blocks,
+    )
+
+    parent, child = await _fenced_ancestor(db_session)
+    assert child.status == TaskStatus.FAILED
+    _mock_github(mocker, {"merged": False, "state": "open"})
+
+    state = await adjudicate_descendant_operator_blocks(
+        parent,
+        db_session,
+        now=_utcnow() + timedelta(hours=_FENCE_BLOCK_DECIDE_AFTER_HOURS - 1),
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert state == "waiting"
+    assert parent.requires_approval is True
+    assert str(child.id) in parent.context["_descendant_operator_blocks"]
+    assert "_descendant_operator_blocks_decided" not in parent.context
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_waits_while_the_blocking_descendant_is_still_running(
+    db_session, mocker
+):
+    """A blocker that is still MOVING is not a stale block — wait for it.
+
+    Everything else is decidable here: the PR state reads cleanly and the
+    block is far past the window. But the descendant itself went back to
+    IN_PROGRESS, so the dependency is live and deciding would discard a real,
+    in-flight blocker. Only a TERMINAL descendant can age out.
+    """
+
+    from app.rollup_lineage_fence import (
+        _FENCE_BLOCK_DECIDE_AFTER_HOURS,
+        adjudicate_descendant_operator_blocks,
+    )
+
+    parent, child = await _fenced_ancestor(db_session)
+    child.status = TaskStatus.IN_PROGRESS
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    _mock_github(mocker, {"merged": False, "state": "open"})
+
+    state = await adjudicate_descendant_operator_blocks(
+        parent,
+        db_session,
+        now=_utcnow() + timedelta(hours=_FENCE_BLOCK_DECIDE_AFTER_HOURS + 24),
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert state == "waiting"
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is True
+    assert str(child.id) in parent.context["_descendant_operator_blocks"]
+    assert "_descendant_operator_blocks_decided" not in parent.context
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_never_decides_on_an_unreadable_github_state(
+    db_session, mocker
+):
+    """A raising/timing-out lookup is UNKNOWN — wait, never decide, never fail.
+
+    Everything else about this row is decidable (terminal blocker, block far
+    past the window); only the PR state is unreadable. Unknown is not
+    progress.
+    """
+
+    from app.rollup_lineage_fence import (
+        _FENCE_BLOCK_DECIDE_AFTER_HOURS,
+        adjudicate_descendant_operator_blocks,
+    )
+
+    parent, child = await _fenced_ancestor(db_session)
+    assert child.status == TaskStatus.FAILED
+    _mock_github(mocker, TimeoutError("github timed out"))
+
+    state = await adjudicate_descendant_operator_blocks(
+        parent,
+        db_session,
+        now=_utcnow() + timedelta(hours=_FENCE_BLOCK_DECIDE_AFTER_HOURS + 24),
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert state == "waiting"
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is True
+    assert str(child.id) in parent.context["_descendant_operator_blocks"]
+    assert "_descendant_operator_blocks_decided" not in parent.context
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_declines_a_hold_the_fence_no_longer_owns(
+    db_session, mocker
+):
+    """Ownership is structural. A newer independent episode is NOT the fence.
+
+    The keyed blocks are still in context and the reason string still reads
+    "descendant ... needs operator intervention", so a reason-match would
+    wrongly claim this row. The receipt/provenance check must decline it and
+    leave every other disposition alone.
+    """
+
+    from app.rollup_lineage_fence import adjudicate_descendant_operator_blocks
+
+    parent, child = await _fenced_ancestor(db_session)
+    establish_independent_approval_hold(
+        parent, reason="operator wants a look", owner="admin_operator"
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    _mock_github(mocker, {"merged": True, "state": "closed"})
+
+    state = await adjudicate_descendant_operator_blocks(
+        parent, db_session, now=_utcnow() + timedelta(hours=48)
+    )
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert state == "not_fenced"
+    assert parent.requires_approval is True
+    assert str(child.id) in parent.context["_descendant_operator_blocks"]
+
+
+@pytest.mark.asyncio
+async def test_adjudicate_declines_when_the_hold_receipt_is_missing(
+    db_session, mocker
+):
+    """No receipt => unproven => decline, exactly like a stranger's hold."""
+
+    from app.rollup_lineage_fence import adjudicate_descendant_operator_blocks
+
+    parent, _child = await _fenced_ancestor(db_session)
+    context = dict(parent.context or {})
+    context.pop("_descendant_operator_blocks_approval_hold", None)
+    parent.context = context
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    _mock_github(mocker, {"merged": True, "state": "closed"})
+
+    state = await adjudicate_descendant_operator_blocks(
+        parent, db_session, now=_utcnow() + timedelta(hours=48)
+    )
+    assert state == "not_fenced"
+
+
+@pytest.mark.asyncio
+async def test_reaper_sweep_adjudicates_outside_any_timeout_branch(
+    db_session, mocker
+):
+    """FAULT B: the release check must be reachable on its own cadence.
+
+    No approval-gate timeout runs here at all — the reaper sweep alone finds
+    the fenced ancestor and releases the hold once the blocker's PR merged.
+    """
+
+    from app.reaper_sweeps import sweep_release_resolved_descendant_fence_blocks
+
+    parent, _child = await _fenced_ancestor(db_session)
+    _mock_github(mocker, {"merged": True, "state": "closed"})
+
+    changed = await sweep_release_resolved_descendant_fence_blocks(
+        db_session, _utcnow()
+    )
+    await db_session.refresh(parent)
+
+    assert changed == 1
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is False
+    assert "_descendant_operator_blocks" not in parent.context
+
+
+@pytest.mark.asyncio
+async def test_reaper_sweep_skips_a_hold_the_fence_does_not_own(
+    db_session, mocker
+):
+    """The sweep must never touch a row whose latch belongs to someone else."""
+
+    from app.reaper_sweeps import sweep_release_resolved_descendant_fence_blocks
+
+    parent, child = await _fenced_ancestor(db_session)
+    establish_independent_approval_hold(
+        parent, reason="operator wants a look", owner="admin_operator"
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    _mock_github(mocker, {"merged": True, "state": "closed"})
+
+    changed = await sweep_release_resolved_descendant_fence_blocks(
+        db_session, _utcnow()
+    )
+    await db_session.refresh(parent)
+
+    assert changed == 0
+    assert parent.requires_approval is True
+    assert str(child.id) in parent.context["_descendant_operator_blocks"]

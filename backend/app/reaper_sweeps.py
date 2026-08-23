@@ -2240,6 +2240,100 @@ async def sweep_recover_stranded_escalated_blockers(
     return recovered
 
 
+# ── Rollup lineage-fence descendant-block adjudication sweep ─────────────────
+
+# Bounded batch. Each row costs at most one GitHub round-trip per distinct
+# blocked PR, and fenced ancestors are rare, so a small page is plenty.
+_FENCE_BLOCK_SWEEP_BATCH = 50
+
+
+async def sweep_release_resolved_descendant_fence_blocks(
+    session, now: datetime, *, batch_size: int = _FENCE_BLOCK_SWEEP_BATCH
+) -> int:
+    """Adjudicate machine-set descendant-block holds on their own cadence.
+
+    ``rollup_lineage_fence`` parks an ancestor rollup behind a descendant that
+    needs intervention. Until this sweep existed the ONLY code that noticed
+    the blocker resolving lived inside the approval-gate *timeout* branch of
+    ``recovery_evaluating_approval`` — a single narrow window. A blocker
+    that resolved at any other moment was never seen, and once the ancestor
+    went terminal the path was unreachable forever (incident 2026-08-23:
+    ancestor 70c5ec8f was FAILED at ~03:42Z; the blocking descendant's PR
+    #17693 merged at 12:11Z).
+
+    Runs :func:`app.rollup_lineage_fence.adjudicate_descendant_operator_blocks`
+    over EVALUATING/BLOCKED tasks carrying ``_descendant_operator_blocks``:
+    release when the blockers resolved, decide once every blocker is terminal
+    and the block aged out, otherwise re-state the wait. Ownership is proven
+    per row inside the adjudicator, so a row whose latch was taken over by an
+    independent approval episode is skipped untouched. One bad row never
+    aborts the batch.
+
+    Returns the number of ancestors actually changed.
+    """
+    from app.rollup_lineage_fence import (
+        _OPERATOR_BLOCKS_KEY,
+        adjudicate_descendant_operator_blocks,
+    )
+
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.status.in_(
+                        [TaskStatus.EVALUATING, TaskStatus.BLOCKED]
+                    ),
+                    Task.requires_approval.is_(True),
+                    Task.context[_OPERATOR_BLOCKS_KEY].isnot(None),
+                )
+                .order_by(Task.updated_at.asc())
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    changed = 0
+    for task in rows:
+        task_id = task.id
+        before_message = task.latest_status_message
+        try:
+            state = await adjudicate_descendant_operator_blocks(
+                task, session, now=now
+            )
+            if state == "not_fenced":
+                continue
+            row_changed = state in ("released", "decided") or (
+                task.latest_status_message != before_message
+            )
+            if not row_changed:
+                # Idempotent no-op: nothing to write, so do not churn the row.
+                continue
+            await session.commit()
+            changed += 1
+            logger.info(
+                "[REAPER] Lineage-fence adjudication: ancestor %s -> %s",
+                str(task_id)[:8],
+                state,
+            )
+        except Exception as e:
+            # One bad row never aborts the batch.
+            logger.error(
+                "[REAPER] Lineage-fence adjudication error on task %s: %s",
+                str(task_id)[:8],
+                e,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    return changed
+
+
 # ── Strategic cycle starvation sweep ─────────────────────────────────────────
 
 # Autonomous projects older than this window with no completed StrategicCycle

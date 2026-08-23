@@ -328,6 +328,7 @@ from app.reaper_sweeps import (
     sweep_unblock_blocked_tasks,
     sweep_recover_stranded_transient_blockers,
     sweep_recover_stranded_escalated_blockers,
+    sweep_release_resolved_descendant_fence_blocks,
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
     sweep_merge_gate_verification_degradation,
@@ -3099,7 +3100,30 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 12d: Disposition — DECIDE every review-fix park whose
+                # Step 12d: Adjudicate rollup lineage-fence descendant
+                # blocks on their OWN cadence. The fence's release check used
+                # to be reachable only from inside the approval-gate timeout
+                # branch, so a blocker that resolved at any other moment was
+                # never noticed and the ancestor stayed held until that one
+                # narrow window killed it (incident 2026-08-23: ancestor
+                # 70c5ec8f FAILED at ~03:42Z, its blocker's PR #17693 merged
+                # at 12:11Z). Releases resolved blocks, decides aged-out ones
+                # whose blockers are all terminal, and otherwise re-states the
+                # wait — it never terminalizes a row.
+                _mark_reaper_progress()
+                try:
+                    await sweep_release_resolved_descendant_fence_blocks(
+                        session, now
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Lineage-fence adjudication sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12e: Disposition — DECIDE every review-fix park whose
                 # bounded operator-disposition window expired. An unbounded park
                 # ("a human owns this now") strands the chain, its rollup
                 # parent, and the whole research direction forever; this sweep
