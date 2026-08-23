@@ -4243,25 +4243,54 @@ async def _spawn_pipeline_task(
             and prev_critical_major
         ):
             prior_responses = list(source_loop.get("fix_agent_responses") or [])
-            # Collect copied stable BP issue ids when present; retain the
-            # issue-summary fallback so older structured responses still count.
-            standoff_issue_ids: set[str] = set()
+            # Index the responses BY THE ISSUE THEY ARGUED. A response carries
+            # the stable ``issue_id`` the ledger stamped (app.issue_ledger.
+            # ensure_issue_ids) plus the summary it disputed; keep both keys so
+            # a response written before id stamping still counts via its
+            # summary, normalized the same way the description sets above are.
+            disputed_issue_ids: set[str] = set()
+            disputed_summaries: set[str] = set()
             for r in prior_responses:
                 if not isinstance(r, dict):
                     continue
                 rid = r.get("issue_id")
-                if isinstance(rid, str) and rid:
-                    standoff_issue_ids.add(rid)
-            # Re-raised description is in curr_critical_major (already lowered+stripped).
-            # If any prior response targets one of those issues, the agent disputed
-            # but the reviewer rejected — standoff.
+                if isinstance(rid, str) and rid.strip():
+                    disputed_issue_ids.add(rid.strip())
+                summary = r.get("issue_summary")
+                if isinstance(summary, str) and summary.strip():
+                    disputed_summaries.add(summary.lower().strip())
+            # A standoff means the reviewer re-raised THE ISSUE THE AGENT
+            # DISPUTED. The old test was ``standoff_issue_ids and desc in
+            # prev_critical_major``: the response set was consulted only for
+            # EMPTINESS and never matched against the issue in hand. Because
+            # ``fix_agent_responses`` accumulates across the whole chain
+            # (capped at 30), one structured response about any issue, ever,
+            # made every later repeat of any OTHER issue read as a
+            # disagreement the agent had argued.
+            #
+            # Both labels escalate identically, so this never lost work -- but
+            # it did hand the operator the wrong reason, and standoff is the
+            # stronger of the two claims ("two agents disagree" vs "the fix
+            # agent is not converging"). An operator who opens a standoff goes
+            # looking for a rationale to adjudicate; on a mislabelled row there
+            # is none to find, because the agent never filed one about this
+            # issue. Match on identity and let an unmatched repeat be what it
+            # actually is: a plain stuck cycle.
             re_raised_with_response = 0
-            for desc in curr_critical_major:
-                # Standoff currently requires at least one structured response
-                # carrying an id plus the same normalized description recurring.
-                if standoff_issue_ids and desc in prev_critical_major:
+            for issue in curr_issues_list:
+                if not isinstance(issue, dict):
+                    continue
+                if (issue.get("severity") or "").upper() not in ("CRITICAL", "MAJOR"):
+                    continue
+                if issue.get("pending_disposition"):
+                    continue
+                desc = (issue.get("description") or "").lower().strip()
+                if not desc or desc not in prev_critical_major:
+                    continue
+                iid = str(issue.get("issue_id") or "").strip()
+                if (iid and iid in disputed_issue_ids) or desc in disputed_summaries:
                     re_raised_with_response += 1
-            if re_raised_with_response > 0 and standoff_issue_ids:
+            if re_raised_with_response > 0:
                 is_standoff = True
                 standoff_detail = (
                     f"{re_raised_with_response} issue(s) re-raised after fix-agent rationale; "

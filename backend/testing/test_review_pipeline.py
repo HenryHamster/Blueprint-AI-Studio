@@ -12320,12 +12320,29 @@ async def test_standoff_creates_escalation_alert_with_standoff_reason(
         new_callable=AsyncMock,
     )
 
-    # A prior fix-agent response carrying an issue_id makes the repeated issue a
-    # standoff (dispute) rather than the agent simply not trying.
+    # The fix agent argued THIS issue and the reviewer re-raised it anyway.
+    # That identity match is what makes the repeat a dispute rather than the
+    # agent simply not trying, so the response has to name the issue.
+    #
+    # This fixture used to pass a bare ``{"issue_id": "abc123"}`` that matched
+    # nothing in the scenario, and it worked, because the leg tested only
+    # whether the response set was NON-EMPTY. That premise was the defect --
+    # ``fix_agent_responses`` accumulates for the life of the chain, so one
+    # response about any issue relabelled every later repeat of every other
+    # issue as a disagreement. The alert-labelling behaviour under test here is
+    # unchanged; only the fixture now describes a real standoff. The
+    # not-a-standoff half is pinned by
+    # test_repeat_of_an_undisputed_issue_is_stuck_not_standoff.
     original_task, source_task = await _build_stuck_scenario(
         db_session,
         pr_number=404,
-        fix_agent_responses=[{"issue_id": "abc123", "rationale": "intended"}],
+        fix_agent_responses=[
+            {
+                "issue_id": "abc123",
+                "issue_summary": "null pointer dereference",
+                "rationale": "intended",
+            }
+        ],
     )
     result, _ = await _trigger_stuck(db_session, source_task, original_task, 404)
     assert result is None
@@ -20056,6 +20073,108 @@ async def test_standoff_still_fires_when_a_fix_advanced_the_head(db_session, moc
     outcome = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
     assert outcome.get("kind") == "standoff"
     assert "rationale" in (outcome.get("detail") or "")
+
+
+# An issue the agent never argued about. Same shape as ``_REPEATED_ISSUE`` and
+# repeated across both reviews, so the generic stuck leg still catches it --
+# what must NOT happen is it being reported as a disagreement.
+_UNDISPUTED_REPEATED_ISSUE = [
+    _issue("Retry backoff is unbounded in the webhook dispatcher", "MAJOR")
+]
+
+# The agent argued about a DIFFERENT issue, earlier in the same chain.
+# ``fix_agent_responses`` accumulates for the life of the chain (capped at 30),
+# so this row is still present long after its issue was settled.
+_UNRELATED_RATIONALE = [
+    {
+        "issue_id": "BP-0009",
+        "issue_summary": "Error handling code missing in payment processor",
+        "response": "the handler is unreachable when the gateway rejects",
+        "verify_steps_ok": True,
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_repeat_of_an_undisputed_issue_is_stuck_not_standoff(db_session, mocker):
+    """A standoff must name an issue the agent actually disputed.
+
+    The leg used to test ``standoff_issue_ids and desc in prev_critical_major``
+    -- consulting the response set only for EMPTINESS, never matching it
+    against the issue in hand. Since ``fix_agent_responses`` accumulates across
+    the whole chain, one structured response about any issue, ever, made every
+    later repeat of any OTHER issue score as a disagreement the agent had
+    argued.
+
+    Here the agent argued BP-0009 (payment processor) at some earlier
+    iteration; the reviewer is now repeating an unrelated webhook-backoff
+    issue that no response ever mentions. The chain must still park -- that
+    repeat is a real stuck cycle -- but under the honest label. Both labels
+    escalate identically, so nothing is lost by getting it wrong except the
+    operator's time: standoff is the stronger claim, and someone who opens one
+    goes looking for a rationale to adjudicate that was never filed.
+    """
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head=_ADVANCED_HEAD,
+        prior_issues=_UNDISPUTED_REPEATED_ISSUE,
+        current_issues=_UNDISPUTED_REPEATED_ISSUE,
+        fix_agent_responses=_UNRELATED_RATIONALE,
+    )
+
+    assert result is None, "a repeated issue after a landed fix must still park"
+    assert original_task.requires_approval is True
+    outcome = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
+    assert outcome.get("kind") == "stuck", (
+        "the agent never disputed this issue, so there is no disagreement to "
+        f"adjudicate -- got {outcome.get('kind')!r}"
+    )
+    assert "rationale" not in (outcome.get("detail") or "")
+
+
+@pytest.mark.asyncio
+async def test_standoff_matches_on_issue_id_when_the_reviewer_reworded(
+    db_session, mocker
+):
+    """Identity matching must prefer the stable id over the prose.
+
+    ``app.issue_ledger.ensure_issue_ids`` stamps a stable ``issue_id`` onto
+    every issue, and the fix agent copies it into its response. The reviewer's
+    wording is free text and drifts between rounds, so a summary-only match
+    would drop real standoffs the moment a reviewer rephrased itself. The id
+    is the authority; the summary is the fallback for responses written before
+    ids were stamped.
+    """
+    disputed = dict(
+        _issue("Error handling code missing in payment processor", "MAJOR"),
+        issue_id="BP-0042",
+    )
+    rationale = [
+        {
+            "issue_id": "BP-0042",
+            # Deliberately NOT the reviewer's wording: only the id can match.
+            "issue_summary": "payment gateway rejection path",
+            "response": "the handler is unreachable when the gateway rejects",
+            "verify_steps_ok": True,
+        }
+    ]
+
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head=_ADVANCED_HEAD,
+        prior_issues=[disputed],
+        current_issues=[disputed],
+        fix_agent_responses=rationale,
+    )
+
+    assert result is None
+    assert original_task.requires_approval is True
+    outcome = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
+    assert outcome.get("kind") == "standoff"
 
 
 @pytest.mark.asyncio
