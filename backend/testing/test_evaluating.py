@@ -2533,6 +2533,77 @@ async def test_approval_gate_timeout_preserves_mergeable_rollup_pr(eval_db, mock
 
 
 @pytest.mark.asyncio
+async def test_approval_gate_preserves_a_pr_number_that_only_review_loop_carries(
+    eval_db, mocker
+):
+    """A ``review_loop``-only PR number must reach the preserve branch.
+
+    ``arm_ci_wait`` co-stamps the PR identity at ``context.review_loop.
+    pr_number``; ``context.rollup_pr_number`` is a different arm path's stamp
+    and the payload ``pr_number`` a third. The approval-gate preserve/reconcile
+    branches read only the latter two, so this row was invisible to them — while
+    the PR-LESS hold's predicate (``_approval_hold_pr_number``) DID see it and
+    therefore declined too. Both safety nets missed and a mergeable PR was
+    abandoned to a bare FAILED. The narrow reads now use the same derivation.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "changed_files": 3,
+            "mergeable_state": "clean",
+        },
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec = mocker.patch("app.routers.agent_status.record_task_result")
+
+    project = Project(name="ReviewLoop Only PR", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={
+            "_approval_set_at": _naive_utc_ago(hours=5).isoformat(),
+            # The ONLY place this PR's number lives. No rollup_pr_number, no
+            # payload pr_number — the shape arm_ci_wait leaves behind.
+            "review_loop": {"pr_number": 474, "ci_waiting": True},
+            "_is_rollup_review": True,
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"A mergeable PR known only to review_loop must not be FAILed, "
+        f"got {parent.status}: {parent.latest_status_message!r}"
+    )
+    assert (parent.context or {}).get(
+        "approval_timeout_preserved_for_handmerge"
+    ) is True
+    alert_mock.assert_awaited()
+    rec.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_approval_gate_timeout_rate_limited_lookup_preserves_not_fails(
     eval_db, mocker
 ):

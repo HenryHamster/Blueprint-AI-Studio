@@ -63,19 +63,20 @@ APPROVAL_TIMEOUT_PRLESS_HOLD_HOURS = 72
 def _approval_hold_pr_number(task, ctx):
     """Widest "is there a PR anywhere behind this hold?" derivation.
 
-    Deliberately WIDER than the ``rollup_pr_number`` / payload ``pr_number`` pair
-    the preserve-for-handmerge branch uses, because it answers a different
-    question. That branch asks *which PR do I check for mergeability*; this asks
-    *is any of this task's output already durable outside the task row*. A parent
-    whose PR number only lives in ``context.review_loop`` still HAS an open PR —
-    the work survives the task row either way — so it stays on the existing
-    PR-carrying disposition rather than being diverted into the PR-less hold.
+    Answers *is any of this task's output already durable outside the task row*.
+    A parent whose PR number only lives in ``context.review_loop`` still HAS an
+    open PR — the work survives the task row either way — so it stays on the
+    existing PR-carrying disposition rather than being diverted into the PR-less
+    hold.
 
-    That the preserve branch itself cannot see a ``review_loop``-only PR number
-    is a separate, pre-existing gap (a mergeable PR can still be abandoned by the
-    ceiling FAIL). Widening *this* predicate keeps the PR path byte-for-byte
-    unchanged; widening the preserve branch's own derivation is a different fix
-    and is not made here.
+    This is now also THE derivation the approval-gate merged-PR reconcile,
+    preserve-for-handmerge and churn-halt-respawn branches use (see
+    recovery_evaluating_approval.py). It was briefly wider than they were, and
+    that skew was not a harmless conservatism: a ``review_loop``-only PR number
+    was invisible to all three of them, yet visible HERE, so the PR-less hold
+    declined as well and the row fell through BOTH safety nets to a bare FAILED.
+    Keep this the single derivation — a predicate that gates a fallback must not
+    be able to see more than the paths it falls back FROM.
     """
     review_loop = ctx.get("review_loop")
     return (
