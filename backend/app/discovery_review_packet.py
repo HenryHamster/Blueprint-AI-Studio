@@ -41,6 +41,12 @@ DISCOVERY_REVIEW_URI_CHARS = 1_000
 DISCOVERY_REVIEW_BLOCKED_GRACE = timedelta(hours=2)
 DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS = 3
 DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS = 2_000
+# The smallest per-item slice of the digest budget that still reads as a
+# representation of that item rather than a stub. An omitted item is
+# "covered" when it is either reproduced in full or reproduced at no less
+# than this; only a cohort so numerous that even this floor cannot be paid
+# for every item leaves an item genuinely unaccounted for.
+DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS = 40
 DISCOVERY_REVIEW_RESEARCH_DETAILS = 6
 DISCOVERY_REVIEW_KNOWLEDGE_DETAILS = 6
 DISCOVERY_REVIEW_LANDED_OUTCOMES = 4
@@ -319,6 +325,121 @@ def _semantic_excerpt(value: Mapping[str, Any], *, max_chars: int) -> str:
     return _semantic_text(value)[:max_chars]
 
 
+def _fair_share_digest_budgets(lengths: list[int], budget: int) -> list[int]:
+    """Max-min fair split of ``budget`` characters across ``lengths``.
+
+    Items that want less than an equal share are settled at exactly what they
+    want and their leftover is redistributed to the items still over-budget,
+    so a cohort of short entries plus one long one spends the whole budget on
+    the long one rather than reserving idle room for entries that never
+    needed it. Every returned share is non-negative and their sum never
+    exceeds ``budget``.
+    """
+
+    shares = [0] * len(lengths)
+    if budget <= 0 or not lengths:
+        return shares
+    remaining = budget
+    unresolved = list(range(len(lengths)))
+    while unresolved:
+        share = remaining // len(unresolved)
+        settled = [index for index in unresolved if lengths[index] <= share]
+        if not settled:
+            for index in unresolved:
+                shares[index] = share
+            break
+        for index in settled:
+            shares[index] = lengths[index]
+            remaining -= lengths[index]
+        settled_set = set(settled)
+        unresolved = [index for index in unresolved if index not in settled_set]
+    return shares
+
+
+def _fit_semantic_digest(omitted: list[dict[str, Any]]) -> dict[str, Any]:
+    """Represent *every* omitted item inside the fixed digest budget.
+
+    This digest is the only field that covers all omitted items -- the
+    ``omitted_semantic_index`` above samples just
+    ``DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS`` of them -- so it is what stops
+    an omitted item from reading to the reviewer as an absent one.
+
+    It used to be built by joining every item's untruncated text and hard
+    cutting the join at ``DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS``. That
+    front-to-back spend had two production consequences, both seen live on
+    2026-08-23 when five discovery directions stranded at ``ask_operator``
+    with ``landed_outcomes:kept_1_of_8``:
+
+    * one verbose entry pushed the tail entries out of the digest entirely,
+      which is exactly the silent absence the field exists to prevent; and
+    * the resulting "incomplete" flag revoked binding authority for the whole
+      packet, so the engine asked a human to hand-supply evidence it was
+      already holding in its own database.
+
+    The budget is therefore shared out per item instead. Each entry is either
+    reproduced in full or cut to its share and marked with a trailing
+    ellipsis, so the reviewer can always tell a shortened entry from a
+    complete one, and no entry ever vanishes while another is still whole.
+    """
+
+    texts = [_semantic_text(value) for value in omitted]
+    if not texts:
+        return {
+            "digest": "",
+            "source_chars": 0,
+            "prose_complete": True,
+            "item_coverage_complete": True,
+            "elided_item_count": 0,
+            "min_item_chars": DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS,
+        }
+    # One newline separates consecutive entries; that overhead comes out of
+    # the budget first, so the shares can never render past the cap (the one
+    # remaining way to exceed it -- separators alone outgrowing the cap -- is
+    # handled after the join below).
+    separators = len(texts) - 1
+    source_chars = sum(len(text) for text in texts) + separators
+    budget = max(0, DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS - separators)
+    shares = _fair_share_digest_budgets([len(text) for text in texts], budget)
+    entries: list[str] = []
+    elided = 0
+    for text, share in zip(texts, shares):
+        if len(text) <= share:
+            entries.append(text)
+            continue
+        elided += 1
+        # Spend one character of the share on the marker so a truncated entry
+        # is never mistaken for a short-but-complete one.
+        entries.append((text[: max(0, share - 1)] + "\u2026") if share > 0 else "")
+    covered = all(
+        len(text) <= share
+        or share >= DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS
+        for text, share in zip(texts, shares)
+    )
+    digest = "\n".join(entries)
+    if len(digest) > DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS:
+        # Only reachable at a cardinality where the separators alone exceed
+        # the cap (more than DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS + 1
+        # omitted items): the budget clamps to zero, every share is zero, and
+        # the join is a wall of newlines that would itself breach the bound
+        # this field exists to respect. Clamp it, and withdraw the coverage
+        # claim -- the tail items are not in the rendered field at any width.
+        digest = digest[:DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS]
+        covered = False
+    return {
+        "digest": digest,
+        "source_chars": source_chars,
+        # Exactly the historical semantic_digest_complete rule: the
+        # untruncated join of every omitted item's text fits the cap, i.e.
+        # every item is reproduced verbatim. This is equivalent to
+        # ``elided == 0`` for every cohort whose separators fit the cap, and
+        # is correctly False for the clamped cohorts above, where they do not.
+        "prose_complete": source_chars <= DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS,
+        "item_coverage_complete": covered,
+        "elided_item_count": elided,
+        "min_item_chars": min(shares),
+    }
+
+
 def _bounded_collection_coverage(
     values: list[dict[str, Any]],
     included: list[dict[str, Any]],
@@ -363,11 +484,7 @@ def _bounded_collection_coverage(
                 **provenance,
             }
         )
-    full_semantic_digest = "\n".join(_semantic_text(value) for value in omitted)
-    semantic_digest_complete = (
-        len(full_semantic_digest) <= DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS
-    )
-    semantic_digest = full_semantic_digest[:DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS]
+    digest = _fit_semantic_digest(omitted)
     return {
         "total_count": len(values),
         "included_count": len(included),
@@ -378,10 +495,19 @@ def _bounded_collection_coverage(
         "semantic_index_total_count": len(omitted),
         "semantic_index_included_count": len(sampled_omitted),
         "semantic_index_selection": "evenly_spaced_stable_order",
-        "full_semantic_digest": semantic_digest,
+        "full_semantic_digest": digest["digest"],
         "semantic_digest_item_count": len(omitted),
-        "semantic_digest_source_chars": len(full_semantic_digest),
-        "semantic_digest_complete": semantic_digest_complete,
+        "semantic_digest_source_chars": digest["source_chars"],
+        # Full prose fidelity: every omitted item reproduced verbatim. Kept at
+        # its historical meaning and still reported, but no longer what binding
+        # authority hangs on -- see the item-coverage flag below.
+        "semantic_digest_complete": digest["prose_complete"],
+        # The authority-bearing flag: every omitted item is accounted for, in
+        # full or at the readable per-item floor. False only when the cohort is
+        # so numerous that the floor cannot be paid for every item.
+        "semantic_digest_item_coverage_complete": digest["item_coverage_complete"],
+        "semantic_digest_elided_item_count": digest["elided_item_count"],
+        "semantic_digest_min_item_chars": digest["min_item_chars"],
         "semantic_digest_order": "stable_collection_order",
     }
 
@@ -578,8 +704,13 @@ def _assemble_receipt(
 
     The authority invariant is derived exactly as at full detail:
     ``binding_decision_allowed`` is ``not binding_action_blockers``, and a
-    blocker exists only when some collection's ``semantic_digest_complete``
-    is False -- unaffected by how many per-collection details are included.
+    blocker exists only when some collection's
+    ``semantic_digest_item_coverage_complete`` is False -- that is, only when
+    an omitted item is genuinely unaccounted for, never merely because the
+    digest had to shorten an entry's prose. Gating on prose fidelity instead
+    is what stranded five directions at ``ask_operator`` on 2026-08-23: one
+    verbose finding revoked authority over a cohort whose evidence the engine
+    already held, and a human was asked to paste it back by hand.
 
     ``authority_blockers`` carries the caller's decision-snapshot blockers
     (a truncated intent/bet authority). They are unioned in here rather than
@@ -591,7 +722,7 @@ def _assemble_receipt(
     incomplete_collections = [
         name
         for name, coverage in evidence_coverage.items()
-        if not coverage["semantic_digest_complete"]
+        if not coverage["semantic_digest_item_coverage_complete"]
     ]
     binding_action_blockers = list(authority_blockers) + (
         [
@@ -1023,10 +1154,12 @@ async def build_discovery_review_packet(
         # This keeps as many collections' authored details visible as the
         # packet budget allows instead of zeroing every collection at once
         # the moment the full-detail form overflows. Coverage counts,
-        # checksums, sampled provenance, and complete authored semantic
-        # digests stay intact at every level so binding_decision_allowed
-        # keeps depending solely on whether coverage is semantically
-        # complete, never on which detail level was chosen.
+        # checksums, sampled provenance, and per-item semantic coverage stay
+        # intact at every level, so binding_decision_allowed keeps depending
+        # solely on whether every omitted item is accounted for, never on
+        # which detail level was chosen. Reducing the level moves items from
+        # included to omitted and so shortens their digest entries; that
+        # costs prose fidelity, which is reported, but not authority.
         for level, detail_counts in enumerate(
             _progressive_detail_levels(_COLLECTION_BASE_DETAIL_COUNTS), start=1
         ):
@@ -1079,6 +1212,9 @@ async def build_discovery_review_packet(
             coverage["semantic_index_included_count"] = 0
             coverage["full_semantic_digest"] = ""
             coverage["semantic_digest_complete"] = False
+            coverage["semantic_digest_item_coverage_complete"] = False
+            coverage["semantic_digest_elided_item_count"] = coverage["omitted_count"]
+            coverage["semantic_digest_min_item_chars"] = 0
         binding_action_blockers = list(authority_blockers) + [
             "complete authored semantic coverage cannot fit the bounded decision packet"
         ]

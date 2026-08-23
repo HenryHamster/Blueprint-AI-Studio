@@ -129,12 +129,22 @@ async def test_mixed_large_receipt_compacts_instead_of_waiting_for_evidence(db_s
     assert not any(
         entry.startswith("knowledge_outcomes:") for entry in snapshot["evidence_truncated"]
     )
-    # The full omitted-evidence digest for the truncated collections still
-    # doesn't fit its own bound, so the authority invariant correctly keeps
-    # this a non-binding, ask-the-operator decision -- but now the operator
-    # (and the review step) can actually see that landed work and findings
-    # exist, instead of being handed a packet that looks empty.
-    assert snapshot["binding_decision_allowed"] is False
+    # This assertion read ``is False`` until 2026-08-23, when the rule it
+    # encoded turned out to be a defect rather than an invariant. The omitted
+    # evidence for these truncated collections does not fit the digest bound
+    # *verbatim* -- but every omitted item is still reproduced in the digest,
+    # far above the per-item floor, because the budget is now shared out per
+    # item instead of spent front-to-back. Revoking binding authority on
+    # prose length alone is exactly what stranded five discovery directions
+    # at ask_operator that day, asking the operator to hand-supply the
+    # evidence this very packet was carrying. Prose fidelity is still
+    # measured and reported; it just no longer decides.
+    coverage = snapshot["evidence_coverage"]
+    for name in truncated_totals:
+        assert coverage[name]["semantic_digest_item_coverage_complete"] is True, name
+    for name in ("research_findings", "experiment_outcomes"):
+        assert coverage[name]["semantic_digest_complete"] is False, name
+    assert snapshot["binding_decision_allowed"] is True
 
 
 def test_progressive_degradation_retains_partial_detail_when_it_fits_budget():
@@ -530,3 +540,374 @@ async def test_oversized_intent_authority_blocks_binding_without_stranding(db_se
     ), manifest["binding_action_blockers"]
     assert manifest["missing_required_evidence"] == []
     assert manifest["binding_decision_allowed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Omitted-evidence digest: per-item coverage, not front-to-back prose.
+#
+# 2026-08-23 production incident -- the whole Blueprint research fleet went
+# idle. Five discovery directions stranded at ask_operator, each asking the
+# human operator to hand-supply research evidence the engine was already
+# holding in its own database. The stranded packets carried
+# evidence_truncated: ['research_findings:kept_1_of_8',
+# 'landed_outcomes:kept_1_of_8'].
+#
+# The defect was in the omitted-evidence digest -- the one field that is
+# supposed to account for *every* item budget pressure pushed out of
+# `included` (the omitted_semantic_index beside it samples only
+# DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS of them). It was built by joining
+# every omitted item's untruncated text and hard-cutting the join at
+# DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS, which spends the budget
+# front-to-back. Two consequences, both seen live:
+#
+#   1. one verbose entry pushed the tail entries out of the rendered digest
+#      entirely -- exactly the silent absence the field exists to prevent;
+#      and
+#   2. binding_decision_allowed was gated on semantic_digest_complete, i.e.
+#      on full *prose* fidelity, so a single long research finding revoked
+#      binding authority over a whole cohort of evidence the engine held.
+#
+# The fix shares the budget out per item (max-min fair) and moves the
+# authority gate onto semantic_digest_item_coverage_complete: authority is
+# revoked only when an omitted item is genuinely unaccounted for, never
+# merely because an entry's prose had to be shortened. These tests pin both
+# halves -- that the fix restores authority on the incident's cohort, and
+# that the floor which earns that authority cannot be quietly dissolved.
+# ---------------------------------------------------------------------------
+
+_DIGEST_COLLECTION_NAMES = (
+    "research_findings",
+    "knowledge_outcomes",
+    "landed_outcomes",
+    "experiment_outcomes",
+    "verification_summaries",
+)
+
+
+def _short_research_finding(index: int) -> dict:
+    return {
+        "id": f"research-{index}",
+        "semantic_summary": f"finding {index}: the probe moved the target metric",
+    }
+
+
+def _short_landed_outcome(index: int) -> dict:
+    return {
+        "task_id": f"landed-{index}",
+        "semantic_summary": f"landed {index}: merged into integration cleanly",
+    }
+
+
+def _digest_collections(**overrides) -> dict:
+    collections = {name: [] for name in _DIGEST_COLLECTION_NAMES}
+    collections.update(overrides)
+    return collections
+
+
+def _digest_detail_counts(**overrides) -> dict:
+    counts = dict.fromkeys(_DIGEST_COLLECTION_NAMES, 0)
+    counts.update(overrides)
+    return counts
+
+
+def _one_verbose_item_cohort() -> tuple[dict, dict]:
+    """The 2026-08-23 shape: 8 authored items per collection, 1 kept, 7 omitted,
+    exactly one of the omitted being long-form prose."""
+
+    research = (
+        [_short_research_finding(0)]
+        + [
+            {
+                "id": "research-1",
+                "semantic_summary": (
+                    "finding 1: "
+                    + ("the probe moved the target metric and here is the writeup. " * 40)
+                ),
+            }
+        ]
+        + [_short_research_finding(index) for index in range(2, 8)]
+    )
+    landed = (
+        [_short_landed_outcome(0)]
+        + [
+            {
+                "task_id": "landed-1",
+                "semantic_summary": (
+                    "landed 1: " + ("merge notes and rollout detail. " * 60)
+                ),
+            }
+        ]
+        + [_short_landed_outcome(index) for index in range(2, 8)]
+    )
+    collections = _digest_collections(
+        research_findings=research, landed_outcomes=landed
+    )
+    counts = _digest_detail_counts(research_findings=1, landed_outcomes=1)
+    return collections, counts
+
+
+def test_one_verbose_omitted_item_neither_starves_the_cohort_nor_revokes_authority():
+    # The regression itself. One long-form finding among seven omitted ones
+    # used to consume the entire digest and, worse, revoke the packet's
+    # binding authority -- the engine then asked Henry to paste back evidence
+    # it already had. Reproduce the incident's exact cohort shape
+    # (kept_1_of_8 on both research_findings and landed_outcomes) against the
+    # same pure helpers build_discovery_review_packet calls at each
+    # degradation round, and pin the two properties that closed it: every
+    # omitted item is still represented, and prose shortening alone no longer
+    # touches authority.
+    p = discovery_review_packet
+    collections, counts = _one_verbose_item_cohort()
+    included, coverage = p._evidence_coverage_for_level(
+        collections, counts, level=3
+    )
+    fixture = _packet_test_fixture()
+    receipt, blockers = p._assemble_receipt(
+        source_parent=fixture["source_parent"],
+        included=included,
+        stranded_deliveries=[],
+        evidence_coverage=coverage,
+        execution=fixture["execution"],
+        missing_reasons=[],
+        compacted=True,
+    )
+
+    # Precondition -- this really is the stranding cohort: both collections
+    # were trimmed to one included item out of eight, and the untruncated
+    # join of what fell out overflows the digest bound. That overflow *is*
+    # the old semantic_digest_complete=False condition, so under the previous
+    # behaviour this receipt came back with binding_decision_allowed False.
+    assert receipt["evidence_truncated"] == [
+        "research_findings:kept_1_of_8",
+        "landed_outcomes:kept_1_of_8",
+    ]
+    for name in ("research_findings", "landed_outcomes"):
+        assert coverage[name]["semantic_digest_source_chars"] > (
+            p.DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS
+        )
+        assert coverage[name]["semantic_digest_complete"] is False
+
+    research_digest = coverage["research_findings"]["full_semantic_digest"]
+    landed_digest = coverage["landed_outcomes"]["full_semantic_digest"]
+    # Every short omitted item is still reproduced word for word: none of
+    # them was pushed out by the verbose neighbour, which is what made an
+    # omitted item read to the reviewer as an item that never existed.
+    # research_findings keeps the *first* authored item, so its omitted set is
+    # indexes 1..7 with the verbose finding at index 1; landed_outcomes keeps
+    # the *latest*, so its omitted set is indexes 0..6, verbose one again at
+    # index 1. Both selections are part of the contract being exercised.
+    for index in range(2, 8):
+        assert _short_research_finding(index)["semantic_summary"] in research_digest
+    for index in (0, 2, 3, 4, 5, 6):
+        assert _short_landed_outcome(index)["semantic_summary"] in landed_digest
+    assert len(research_digest.split("\n")) == 7
+    assert len(landed_digest.split("\n")) == 7
+    # ...and the one entry that did have to be shortened says so, so a
+    # shortened entry is never mistaken for a short-but-complete one.
+    assert "\u2026" in research_digest
+    assert "\u2026" in landed_digest
+    for name in ("research_findings", "landed_outcomes"):
+        assert coverage[name]["semantic_digest_elided_item_count"] == 1
+        assert coverage[name]["semantic_digest_item_coverage_complete"] is True
+
+    # The authority half of the fix: every omitted item is accounted for, so
+    # there is no blocker and the decision stays binding. Under the old gate
+    # this same cohort produced binding_decision_allowed False and forced
+    # ask_operator.
+    assert blockers == []
+    assert receipt["binding_decision_allowed"] is True
+
+
+def test_pathological_omitted_cardinality_still_revokes_binding_authority():
+    # The security pin for the fix above. Loosening the authority gate is
+    # only safe because a floor still has to be paid for *every* omitted
+    # item: DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS characters each,
+    # or verbatim reproduction. A cohort numerous enough that even that floor
+    # cannot be paid genuinely does leave items unaccounted for, and must
+    # still refuse a binding decision -- otherwise this fix would have traded
+    # one silent-absence defect for a louder one.
+    #
+    # The floor is pinned with literals here on purpose. Deriving the item
+    # count from the constant it is testing would let a future change to the
+    # constant re-tune the test to itself and self-certify, and this test is
+    # the only thing standing between a lowered floor and an authority claim
+    # over evidence nobody can read.
+    p = discovery_review_packet
+    assert p.DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS == 40
+    assert p.DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS == 2_000
+
+    # One item more than the 2000-character budget can seat at the 40-char
+    # floor, spelled out in bare literals rather than derived from the
+    # constants above.
+    item_count = 2_000 // 40 + 1
+    findings = [
+        {
+            "id": f"research-{index}",
+            "semantic_summary": f"finding {index}: " + ("evidence detail. " * 12),
+        }
+        for index in range(item_count)
+    ]
+    # No item is short enough to be rescued by verbatim reproduction, so the
+    # floor is the only thing that could cover them.
+    assert all(
+        len(p._semantic_text(finding)) > 40 for finding in findings
+    )
+
+    collections = _digest_collections(research_findings=findings)
+    included, coverage = p._evidence_coverage_for_level(
+        collections, _digest_detail_counts(), level=4
+    )
+    fixture = _packet_test_fixture()
+    receipt, blockers = p._assemble_receipt(
+        source_parent=fixture["source_parent"],
+        included=included,
+        stranded_deliveries=[],
+        evidence_coverage=coverage,
+        execution=fixture["execution"],
+        missing_reasons=[],
+        compacted=True,
+    )
+
+    research_coverage = coverage["research_findings"]
+    assert research_coverage["semantic_digest_item_count"] == item_count
+    assert research_coverage["semantic_digest_min_item_chars"] < 40
+    assert research_coverage["semantic_digest_item_coverage_complete"] is False
+    assert blockers == [
+        "complete authored semantic coverage exceeds the bounded decision "
+        "packet for: research_findings"
+    ]
+    assert receipt["binding_decision_allowed"] is False
+
+
+def test_semantic_digest_never_exceeds_its_own_bound():
+    # The digest is embedded once per collection inside a receipt that must
+    # itself fit DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS, so its own cap is
+    # load-bearing for the whole packet budget -- including the newline
+    # separators between entries, which the per-item shares have to pay for.
+    # Pinned literally: a cap raised without re-deriving the per-item shares
+    # would silently start overflowing the packet.
+    p = discovery_review_packet
+    assert p.DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS == 2_000
+
+    collections, counts = _one_verbose_item_cohort()
+    _, coverage = p._evidence_coverage_for_level(collections, counts, level=3)
+    for name in ("research_findings", "landed_outcomes"):
+        assert len(coverage[name]["full_semantic_digest"]) <= 2_000
+
+    # Cardinality regimes, including the one where the separators alone would
+    # exceed the cap (more than DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS + 1
+    # omitted items leaves every per-item share at zero, so a naive join is a
+    # wall of newlines longer than the bound).
+    for item_count, prose_chars in (
+        (1, 9_000),
+        (8, 400),
+        (51, 200),
+        (1_999, 10),
+        (2_002, 30),
+        (2_500, 0),
+        (3_000, 5),
+    ):
+        omitted = [
+            {"semantic_summary": "e" * prose_chars} for _ in range(item_count)
+        ]
+        digest = p._fit_semantic_digest(omitted)
+        assert len(digest["digest"]) <= 2_000, (item_count, prose_chars)
+        assert digest["elided_item_count"] >= 0
+        assert digest["min_item_chars"] >= 0
+
+    # An empty omitted set is vacuously covered and renders nothing.
+    empty = p._fit_semantic_digest([])
+    assert empty["digest"] == ""
+    assert empty["source_chars"] == 0
+    assert empty["prose_complete"] is True
+    assert empty["item_coverage_complete"] is True
+    assert empty["elided_item_count"] == 0
+
+
+def test_fair_share_digest_budgets_redistributes_leftover_to_the_long_items():
+    # The allocation is max-min fair (water-filling), not an equal split: an
+    # equal split would reserve 33 characters for each of two 10-character
+    # entries and leave the long entry starved for room nobody needed. That
+    # waste is what made the front-to-back digest look unavoidable.
+    p = discovery_review_packet
+    assert p._fair_share_digest_budgets([10, 10, 1_000], 100) == [10, 10, 80]
+    # Two rounds of redistribution: the 1-char entry settles first, then the
+    # 20-char one, and everything left goes to the two that are still over.
+    shares = p._fair_share_digest_budgets([1, 20, 500, 500], 200)
+    assert shares[0] == 1
+    assert shares[1] == 20
+    assert shares[2] == shares[3] > 20
+    assert sum(shares) <= 200
+    # Nothing that fits is ever cut, and the budget is never overspent.
+    for lengths, budget in (
+        ([], 100),
+        ([0, 0, 0], 100),
+        ([5, 5], 100),
+        ([700, 700, 700], 2_000),
+        ([1] * 10, 3),
+    ):
+        shares = p._fair_share_digest_budgets(list(lengths), budget)
+        assert len(shares) == len(lengths)
+        assert all(share >= 0 for share in shares)
+        assert sum(shares) <= budget
+
+
+def test_fair_share_digest_budgets_handles_degenerate_budgets_and_inputs():
+    # Reachable in production: a collection whose omitted set is empty, and a
+    # cardinality so high that the separator overhead consumes the whole
+    # budget before any content is allocated. Neither may raise, loop, or
+    # hand back a negative share that would slice text backwards.
+    p = discovery_review_packet
+    assert p._fair_share_digest_budgets([], 2_000) == []
+    assert p._fair_share_digest_budgets([], 0) == []
+    assert p._fair_share_digest_budgets([100, 100], 0) == [0, 0]
+    assert p._fair_share_digest_budgets([100, 100], -25) == [0, 0]
+    assert p._fair_share_digest_budgets([0, 0], 0) == [0, 0]
+
+
+def test_semantic_digest_complete_still_means_verbatim_but_no_longer_gates_authority():
+    # semantic_digest_complete keeps its historical meaning exactly -- every
+    # omitted item reproduced word for word, i.e. the untruncated join fits
+    # the cap -- because operators and the review step read it as a fidelity
+    # signal. What changed is that it no longer *decides* anything: the
+    # authority gate moved to semantic_digest_item_coverage_complete. Pin
+    # both, so neither a silent redefinition of the flag nor a quiet
+    # re-coupling of it to authority can pass unnoticed.
+    p = discovery_review_packet
+
+    fits = [_short_research_finding(index) for index in range(5)]
+    complete = p._fit_semantic_digest(fits)
+    assert complete["prose_complete"] is True
+    assert complete["item_coverage_complete"] is True
+    assert complete["elided_item_count"] == 0
+    # Verbatim: byte-for-byte the join the pre-fix implementation produced
+    # whenever it fit its bound.
+    assert complete["digest"] == "\n".join(
+        p._semantic_text(finding) for finding in fits
+    )
+    assert complete["source_chars"] == len(complete["digest"])
+
+    # One item over the bound flips prose fidelity but not coverage...
+    collections, counts = _one_verbose_item_cohort()
+    included, coverage = p._evidence_coverage_for_level(
+        collections, counts, level=3
+    )
+    assert coverage["research_findings"]["semantic_digest_complete"] is False
+    assert (
+        coverage["research_findings"]["semantic_digest_item_coverage_complete"]
+        is True
+    )
+    # ...and the receipt built from it is still binding, which is the whole
+    # point: the 2026-08-23 stranding was authority revoked over prose.
+    fixture = _packet_test_fixture()
+    receipt, blockers = p._assemble_receipt(
+        source_parent=fixture["source_parent"],
+        included=included,
+        stranded_deliveries=[],
+        evidence_coverage=coverage,
+        execution=fixture["execution"],
+        missing_reasons=[],
+        compacted=True,
+    )
+    assert blockers == []
+    assert receipt["binding_decision_allowed"] is True
