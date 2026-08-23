@@ -358,6 +358,312 @@ async def _regular_pr_artifact(
     )
 
 
+# ---------------------------------------------------------------------------
+# Unactionable engine-escalation holds
+# ---------------------------------------------------------------------------
+#
+# ``requires_approval`` is a DECISION gate: it means "a human still has an
+# answer that changes what happens next".  Several pipeline refusal paths used
+# it as a NOTIFICATION instead, stamping the latch onto the very review/fix row
+# whose completion they were processing.  That row is already COMPLETED, so the
+# operator queue (``GET /api/admin/tasks?approval_needed=true``, i.e.
+# ``blueprint tasks list --approval-needed``) filled with rows on which
+# approving and denying produce the same outcome: nothing.  Measured on the
+# Blueprint project 2026-08-23, 182 of 184 approval-needed rows were COMPLETED,
+# reaching back to PR #15342 -- the two live decisions were invisible inside
+# the corpses.  Notification already has its own lane: every one of these sites
+# also raises a WARNING ``review.escalated`` alert and writes an explicit
+# ``latest_status_message``.
+
+APPROVAL_HOLD_RELEASED_KEY = "_approval_hold_released_because"
+
+# SECURITY/POLICY PIN.  Only an ENGINE-owned escalation may ever be released by
+# machine.  Every owner listed here mints its hold from a pipeline spawn
+# refusal, never from a human decision.  Owners that must stay OUT of this set,
+# because a person or the merge transport owns their holds:
+# ``operator``/``<operator email>`` (the explicit hold in
+# ``decide_operator_approval``), ``operator_approval_followup``,
+# ``approval_followup_refused``, ``admin_branch_safety``,
+# ``approval_merge_precheck_refused``, ``approval_merge_unsent_abort``,
+# ``approval_merge_submission_terminal``, ``approval_merge_fact_only``,
+# ``rollup_lineage_fence`` (its holds land on a live EVALUATING/BLOCKED
+# ancestor precisely so they ARE actionable), ``review_loop_convergence``
+# (``*_preserved_for_handmerge`` literally asks for a hand merge),
+# ``review_pipeline``, ``task_lifecycle``, ``ci_completion``,
+# ``orchestrator_ci_monitor``, ``migration_guard_recovery``,
+# ``rollup_management``.
+PIPELINE_ESCALATION_HOLD_OWNERS = frozenset(
+    {
+        "review_request_changes",
+        "task_lifecycle_fix_completion",
+    }
+)
+
+# SECURITY/POLICY PIN.  The reason must match TOO, not just the owner: both
+# owners above also mint SECURITY holds -- ``security_scan_blocked`` and
+# ``security_scan_failed`` in ``app.task_lifecycle_fix_completion`` -- and
+# those stay operator business no matter how dead the row is.  They are
+# deliberately absent from this set and must not be added without an
+# independent security review.
+PIPELINE_ESCALATION_HOLD_REASONS = frozenset(
+    {
+        "review_fix_spawn_refused",
+        "review_spawn_failed",
+        "review_target_unavailable",
+        "originating_task_missing",
+    }
+)
+
+# SECURITY/POLICY PIN -- row identity.  Both owners above are COMPLETED-write
+# handlers for exactly two lanes: ``app.review_request_changes`` runs under
+# ``app.task_lifecycle``'s ``elif task_type == "review"`` and
+# ``app.task_lifecycle_fix_completion`` under its ``elif task_type == "fix"``,
+# so the four reasons can only ever be stamped on a review or a fix row.
+# Pinning that here is not redundant with the owner/reason pins: it is what
+# makes the audited readers that treat "no hold" as licence to act provably
+# unreachable.  Every one of them reads a DIFFERENT row --
+#   ``app.task_lifecycle._publish_exact_review_refusal``   (chain original)
+#   ``app.task_lifecycle`` critical-approve ``orig_task``  (chain original)
+#   ``app.review_approval_gate_publication``               (chain original)
+#   ``app.ci_completion`` merge gate                       (rollup parent)
+# -- and a chain original is by construction a PR-OPENING write row:
+# ``_PR_OPENING_COMPLETION_TYPES`` is ``WRITE_TASK_TYPES - {"fix"}`` and
+# "review" is not a write type, so ``review_loop["original_task_id"]`` can
+# never name a review or fix row.  Widening this set therefore re-opens those
+# readers and needs the reachability argument re-run, not just a rename.
+PIPELINE_ESCALATION_HOLD_TASK_TYPES = frozenset({"review", "fix"})
+
+_HOLD_RELEASE_NOTE = (
+    "approval hold released: this row is already COMPLETED, so no operator "
+    "approval decision can change its outcome"
+)
+
+
+async def approval_decision_can_change_anything(
+    task: Task, session: AsyncSession
+) -> bool:
+    """Whether flipping ``requires_approval`` on this row still has an effect.
+
+    This mirrors the ``should_follow_up`` computation in
+    :func:`decide_operator_approval` exactly, because publishing a follow-up is
+    the only thing a disposition on a finished row can still cause.  A
+    COMPLETED row with a resolvable PR number publishes a review spawn /
+    critical merge / rollup merge and is therefore genuinely actionable; a
+    COMPLETED row without one only flips a boolean nobody acts on.
+
+    Fails OPEN (returns ``True``) for every state this module cannot prove
+    inert, including FAILED and CANCELLED: ``app.task_lifecycle``'s
+    ``_review_publication_identity_is_current`` keeps review-publication
+    authority on a FAILED original *because* it still carries an independent
+    hold, so a FAILED row's latch is load-bearing.
+    """
+
+    if task.status != TaskStatus.COMPLETED:
+        return True
+    context = dict(task.context or {})
+    if context.get(APPROVAL_FOLLOWUP_CLAIM_KEY):
+        # An operator already decided; the claim is the durable receipt of it.
+        return True
+    if approval_merge_is_in_flight(task):
+        return True
+    rollup_pr_number = context.get("rollup_pr_number")
+    if rollup_pr_number is not None:
+        return _parse_pr_number(str(rollup_pr_number)) is not None
+    artifact = await _regular_pr_artifact(session, task.id)
+    return _parse_pr_number(artifact.pr_url if artifact else None) is not None
+
+
+# SECURITY/POLICY PIN, ``(status-message marker, reason)``.  Episode provenance
+# landed in PR #17399 (2026-08-17); before it, all four sites below were a bare
+# ``task.requires_approval = True`` with no reason, no owner and no episode, and
+# the measured corpses reach back to PR #15342.  A bare latch cannot name its
+# owner, so the only provenance those rows carry is the status message the SAME
+# transaction wrote next to the latch.  Each marker is a verbatim substring of
+# exactly one call site and of nothing else in the tree:
+#   ``app.review_request_changes``       -- the first three
+#   ``app.task_lifecycle_fix_completion`` -- the fourth
+# The transient sibling of the fourth reads "review spawn deferred (concurrent
+# spawn)" and never set a hold, so matching on "failed (" keeps it out.  This is
+# provenance, NOT an age heuristic: a legacy row is recognised only when it
+# carries no reason, no episode and no provenance of its own, so any hold minted
+# through the seam -- by any owner -- is judged on its owner/reason instead.
+_LEGACY_ESCALATION_MESSAGE_MARKERS: tuple[tuple[str, str], ...] = (
+    ("Fix not spawned for PR #", "review_fix_spawn_refused"),
+    ("but review spawn failed (", "review_spawn_failed"),
+    (
+        "withheld: could not prove the live immutable review target",
+        "review_target_unavailable",
+    ),
+    (
+        "its originating task is missing; fix withheld for manual recovery",
+        "originating_task_missing",
+    ),
+)
+
+
+def _legacy_pipeline_escalation_reason(task: Task) -> str | None:
+    """Recognise a pre-provenance engine escalation by its co-written message."""
+
+    context = dict(task.context or {})
+    if (
+        context.get(APPROVAL_MERGE_LEDGER_KEY) is not None
+        or context.get(APPROVAL_MERGE_FACT_KEY) is not None
+    ):
+        return None
+    message = str(task.latest_status_message or "")
+    for marker, reason in _LEGACY_ESCALATION_MESSAGE_MARKERS:
+        if marker in message:
+            return reason
+    return None
+
+
+def pipeline_escalation_hold_reason(task: Task) -> str | None:
+    """Return the releasable engine-escalation reason this row's hold carries.
+
+    Fails CLOSED (``None``) for every hold this module cannot prove it owns: a
+    manual or policy hold, a live operator follow-up claim, an in-flight merge
+    intent, a review-wait timer, a row outside the two lanes that can mint
+    these reasons, an owner or reason outside the pinned allowlists above, or
+    an episode whose provenance disagrees with the context it was minted into.
+    """
+
+    if task.requires_approval is not True:
+        return None
+    task_type = (task.first_payload or {}).get("type")
+    if task_type not in PIPELINE_ESCALATION_HOLD_TASK_TYPES:
+        return None
+    context = dict(task.context or {})
+    if context.get(APPROVAL_FOLLOWUP_CLAIM_KEY) or approval_merge_is_in_flight(task):
+        return None
+    if approval_hold_provenance(task).get("review_wait_hold") is not None:
+        return None
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    episode = context.get(APPROVAL_HOLD_EPISODE_KEY)
+    reason = context.get("approval_hold_reason")
+    if provenance is None and not episode and reason is None:
+        return _legacy_pipeline_escalation_reason(task)
+    if reason not in PIPELINE_ESCALATION_HOLD_REASONS:
+        return None
+    if not (
+        isinstance(provenance, dict)
+        and provenance.get("owner") in PIPELINE_ESCALATION_HOLD_OWNERS
+        and provenance.get("reason") == reason
+        and provenance.get("episode")
+        and provenance.get("episode") == episode
+    ):
+        return None
+    return str(reason)
+
+
+def release_pipeline_escalation_approval_hold(
+    task: Task,
+    *,
+    released_by: str,
+) -> str | None:
+    """Retract one engine escalation, leaving a durable receipt behind.
+
+    Returns the released reason, or ``None`` when nothing was released.  The
+    caller owns the lock and the commit.
+
+    History is preserved, never destroyed: ``APPROVAL_HOLD_RELEASED_KEY``
+    records the exact reason, owner, releaser, row status and note, so the
+    escalation stays auditable after the latch is gone.  The tree-wide reader
+    audit behind this change found no reader that needs the latch itself on a
+    released row -- the two that come closest both fail to reach one:
+
+    * ``app.rollup_management``'s cap-exhaustion escalation only inspects
+      ``child.requires_approval`` for children it just tried to respawn, and a
+      respawn candidate must own a parseable PULL_REQUEST artifact -- which is
+      exactly the condition under which
+      :func:`approval_decision_can_change_anything` refuses to release.
+    * its ``unmerged`` filter does read ``not c.requires_approval``, and a
+      released child does re-enter that list -- deliberately.  With no PR
+      artifact it takes ``mark_unblocked_non_merge(reason=
+      "rollup_no_pr_artifact")``, the same path every normally-completed
+      review/fix child already takes, so the parent can finalize instead of
+      waiting out ``evaluating_fail_hours`` behind a corpse.
+    """
+
+    reason = pipeline_escalation_hold_reason(task)
+    if reason is None:
+        return None
+    provenance = (task.context or {}).get(APPROVAL_HOLD_PROVENANCE_KEY)
+    owner = (
+        str(provenance.get("owner"))
+        if isinstance(provenance, dict) and provenance.get("owner")
+        else None
+    )
+    consumed = consume_approval_hold_metadata(
+        task,
+        expected_episode=approval_hold_provenance(task),
+    )
+    context = dict(task.context or {})
+    if not consumed:
+        # Pre-provenance latch: there is no episode token to consume, so remove
+        # exactly the keys an episode would have owned and nothing else.
+        for key in (
+            "_approval_set_at",
+            "approval_hold_reason",
+            APPROVAL_HOLD_EPISODE_KEY,
+            APPROVAL_HOLD_PROVENANCE_KEY,
+        ):
+            context.pop(key, None)
+    context[APPROVAL_HOLD_RELEASED_KEY] = {
+        "reason": reason,
+        "owner": owner,
+        "released_by": str(released_by),
+        "released_at": _utcnow().isoformat(),
+        "task_status": _status_value(task.status),
+        "note": _HOLD_RELEASE_NOTE,
+    }
+    task.context = context
+    task.requires_approval = False
+    return reason
+
+
+def pipeline_escalation_hold_was_released(task: Task) -> bool:
+    """Whether an engine escalation on this row was retracted as unactionable.
+
+    The canonical reader for ``APPROVAL_HOLD_RELEASED_KEY``.  Nothing in
+    ``backend/app`` consumes it today -- that is the audited conclusion above,
+    not an oversight -- so any future reader that wants to distinguish "never
+    held" from "held and retracted" should come through here rather than
+    reaching into ``task.context``.
+    """
+
+    return isinstance((task.context or {}).get(APPROVAL_HOLD_RELEASED_KEY), dict)
+
+
+async def settle_unactionable_pipeline_escalation(
+    task: Task,
+    session: AsyncSession,
+    *,
+    released_by: str,
+) -> str | None:
+    """Retract an engine escalation that landed where nobody can act on it.
+
+    Returns the released reason, or ``None``.  Surfaces WHY on
+    ``latest_status_message`` per the standing "gates must emit why they
+    blocked/unblocked" rule; the caller owns the lock and the commit.
+    """
+
+    if await approval_decision_can_change_anything(task, session):
+        return None
+    reason = release_pipeline_escalation_approval_hold(
+        task,
+        released_by=released_by,
+    )
+    if reason is None:
+        return None
+    existing = str(task.latest_status_message or "").strip()
+    if _HOLD_RELEASE_NOTE not in existing:
+        suffix = f"{_HOLD_RELEASE_NOTE} ({reason})"
+        task.latest_status_message = (f"{existing} - {suffix}" if existing else suffix)[
+            :500
+        ]
+    return reason
+
+
 def _claim_matches_task(task: Task, decision: ApprovalDecision) -> bool:
     """Cheap row-local half of exact approval follow-up authority."""
 

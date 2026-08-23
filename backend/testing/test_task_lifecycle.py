@@ -7770,9 +7770,18 @@ async def test_fix_completion_declines_a_delta_when_the_base_moved(
 
 @pytest.mark.asyncio
 async def test_fix_completion_spawn_failure_creates_alert(tl_db, mocker):
-    """When a fix task completes and the review spawn returns (None, False)
-    with a terminal spawn reason, the fix task must have requires_approval=True
-    and a WARNING Alert must be created with the accurate reason label."""
+    """A terminal review-spawn refusal must escalate with the accurate reason.
+
+    BEHAVIOUR CHANGE (unactionable-approval-hold fix): this used to assert
+    ``requires_approval is True`` on the fix row.  That was the defect --
+    ``_process_post_commit`` has already written this row COMPLETED, so the
+    latch asked an operator for a decision that changes nothing, and 182 of the
+    184 rows in the live approval queue were exactly this.  The escalation
+    itself is unchanged and is what this test now pins end to end: the reason
+    label reaches ``latest_status_message`` and the WARNING alert, the hold is
+    minted through the provenance seam, and it is retracted in the same
+    transaction with a receipt naming the owner and reason.
+    """
     from app.models import Alert, AlertSeverity
 
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
@@ -7834,12 +7843,27 @@ async def test_fix_completion_spawn_failure_creates_alert(tl_db, mocker):
     await _process_post_commit(task.id, payload, _session_factory=factory)
     await session.refresh(task)
 
-    assert task.requires_approval is True, (
-        "fix task must require approval when review spawn fails"
+    from app.admin_approval_authority import APPROVAL_HOLD_RELEASED_KEY
+
+    assert task.requires_approval is not True, (
+        "a COMPLETED fix row must not be left holding an approval decision "
+        "nobody can act on"
     )
+    receipt = (task.context or {}).get(APPROVAL_HOLD_RELEASED_KEY)
+    assert isinstance(receipt, dict), (
+        "the escalation must still be recorded, as a release receipt: "
+        f"got context keys {sorted((task.context or {}).keys())}"
+    )
+    assert receipt["reason"] == "review_spawn_failed"
+    assert receipt["owner"] == "task_lifecycle_fix_completion"
+    assert receipt["task_status"] == "COMPLETED"
+    assert receipt["released_by"] == "task_lifecycle_fix_completion"
     assert "Cap Exhausted" in (task.latest_status_message or ""), (
         f"status message must mention the spawn reason, "
         f"got: {task.latest_status_message!r}"
+    )
+    assert "approval hold released" in (task.latest_status_message or ""), (
+        f"the release must say why, got: {task.latest_status_message!r}"
     )
 
     # Verify a WARNING Alert was created for the spawn failure.

@@ -364,6 +364,7 @@ from app.reaper_sweeps import (
     sweep_retire_consumed_message_attachments,
     sweep_backfill_merged_named_test_coverage,
     sweep_acceptance_verdict_healing_backfills,
+    sweep_release_unactionable_approval_holds,
     _sweep_strategic_cycle_starvation,
 )
 from app.approved_pr_stranding import sweep_approved_pr_stranding
@@ -3741,6 +3742,38 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         "[REAPER] Stranded-conversation-message fail sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 26: Unactionable engine-escalation release sweep —
+                # ``requires_approval`` is a DECISION gate, but four pipeline
+                # refusal paths stamped it onto the very review/fix row whose
+                # COMPLETED write they were processing, so approving the row
+                # changes nothing and the operator queue fills with corpses
+                # (182 of 184 rows on 2026-08-23) that bury the live decisions.
+                # The refusal sites now settle their own escalation inline; this
+                # sweep clears the already-stamped backlog and anything that
+                # becomes inert later. It fails CLOSED on every operator-owned
+                # hold and leaves a durable release receipt.
+                _mark_reaper_progress()
+                try:
+                    _holds_released = (
+                        await sweep_release_unactionable_approval_holds(
+                            session, now
+                        )
+                    )
+                    if _holds_released:
+                        logger.info(
+                            "[REAPER] Step 26: released %d unactionable "
+                            "approval hold(s)",
+                            _holds_released,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Unactionable-approval-hold release sweep error: %s",
                         e,
                         exc_info=True,
                     )

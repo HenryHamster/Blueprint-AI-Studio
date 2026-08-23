@@ -4681,6 +4681,127 @@ async def sweep_acceptance_verdict_healing_backfills(
     return total
 
 
+# Hourly cadence for the unactionable-engine-escalation release sweep (Step 26).
+# Independent timer so it is not suppressed by another sweep's timer stamp
+# earlier in the same reaper cycle.
+_UNACTIONABLE_APPROVAL_HOLD_INTERVAL_SECONDS = 3600
+# Bounded per-run work: at most this many COMPLETED approval-hold rows are
+# examined per sweep (the whole population is served by the
+# ``requires_approval = true`` partial index from migration 0275, so this scan
+# is index-only and tiny; the cap exists so one pathological project cannot
+# monopolise a reaper cycle).
+_UNACTIONABLE_APPROVAL_HOLD_SCAN_CAP = 2000
+_UNACTIONABLE_APPROVAL_HOLD_BATCH = 200
+_last_unactionable_approval_hold_sweep: datetime | None = None
+
+
+async def sweep_release_unactionable_approval_holds(session, now=None) -> int:
+    """Step 26: retract engine escalations stamped onto already-COMPLETED rows.
+
+    ``requires_approval`` is a DECISION gate.  Four pipeline refusal paths used
+    it as a NOTIFICATION, stamping the latch onto the very review/fix row whose
+    COMPLETED write they were processing, so approving and denying the row
+    produce the same outcome: nothing.  Measured on the Blueprint project
+    2026-08-23, 182 of 184 rows in the operator approval queue were COMPLETED
+    corpses and the two live decisions were invisible among them.
+    ``app.review_request_changes`` and ``app.task_lifecycle_fix_completion``
+    now settle their own escalation inline, so this sweep exists for the rows
+    already stamped before that fix and for any row that becomes inert later.
+
+    Every release goes through :func:`
+    app.admin_approval_authority.settle_unactionable_pipeline_escalation`, which
+    fails CLOSED on anything an operator owns -- a manual/policy hold, a live
+    follow-up claim, an in-flight merge intent, a review-wait timer, a
+    non-COMPLETED row, a security-scan reason, or any owner outside the pinned
+    engine allowlist -- and leaves an ``_approval_hold_released_because``
+    receipt plus a human-readable ``latest_status_message`` behind.
+
+    Hourly cadence-gated on an independent timer.  Returns the number of holds
+    released this run.
+    """
+    global _last_unactionable_approval_hold_sweep
+    from app.admin_approval_authority import (
+        settle_unactionable_pipeline_escalation,
+    )
+    from app.task_locking import task_lock
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_unactionable_approval_hold_sweep,
+        _UNACTIONABLE_APPROVAL_HOLD_INTERVAL_SECONDS,
+        _now,
+    ):
+        return 0
+    _last_unactionable_approval_hold_sweep = _now
+
+    released = 0
+    examined = 0
+    last_id: uuid.UUID | None = None
+    while examined < _UNACTIONABLE_APPROVAL_HOLD_SCAN_CAP:
+        query = (
+            select(Task.id)
+            .where(
+                Task.requires_approval.is_(True),
+                Task.status == TaskStatus.COMPLETED,
+                Task.archived.is_not(True),
+            )
+            .order_by(Task.id)
+            .limit(_UNACTIONABLE_APPROVAL_HOLD_BATCH)
+        )
+        if last_id is not None:
+            query = query.where(Task.id > last_id)
+        candidate_ids = (await session.execute(query)).scalars().all()
+        if not candidate_ids:
+            break
+        last_id = candidate_ids[-1]
+        examined += len(candidate_ids)
+
+        for task_id in candidate_ids:
+            try:
+                # Re-lock and re-read: discovery above is deliberately unlocked,
+                # so the gate must be re-evaluated against the freshly loaded
+                # row under FOR UPDATE. A contended row is simply retried next
+                # cycle.
+                async with task_lock(session, task_id, skip_locked=True) as locked:
+                    if locked is None:
+                        continue
+                    reason = await settle_unactionable_pipeline_escalation(
+                        locked,
+                        session,
+                        released_by="reaper_unactionable_approval_hold_sweep",
+                    )
+                    if reason is None:
+                        await session.rollback()
+                        continue
+                    session.add(locked)
+                    await session.commit()
+                    released += 1
+                    logger.info(
+                        "[REAPER] Step 26: released unactionable approval hold "
+                        "on COMPLETED task %s (reason=%s)",
+                        task_id,
+                        reason,
+                    )
+            except Exception:
+                logger.warning(
+                    "[REAPER] Step 26: unactionable approval-hold release failed "
+                    "for task %s:",
+                    task_id,
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(candidate_ids) < _UNACTIONABLE_APPROVAL_HOLD_BATCH:
+            break
+
+    if released:
+        logger.info(
+            "[REAPER] Step 26: released %d unactionable approval hold(s)",
+            released,
+        )
+    return released
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -4749,4 +4870,6 @@ __all__ = [
     "sweep_backfill_merged_named_test_coverage",
     "sweep_acceptance_verdict_healing_backfills",
     "_ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS",
+    "sweep_release_unactionable_approval_holds",
+    "_UNACTIONABLE_APPROVAL_HOLD_INTERVAL_SECONDS",
 ]
