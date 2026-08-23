@@ -2702,8 +2702,10 @@ async def _open_stuck_alerts(db_session, project_id):
     return (await db_session.execute(stmt)).scalars().all()
 
 
-async def _stuck_alert_for(db_session, project_id, status, title):
-    """Persist one terminal-or-live task carrying one open task.blocked alert."""
+async def _stuck_alert_for(
+    db_session, project_id, status, title, event_type="task.blocked"
+):
+    """Persist one terminal-or-live task carrying one open alert of that family."""
     task = make_task(project_id=project_id, status=status)
     db_session.add(task)
     await db_session.commit()
@@ -2714,7 +2716,7 @@ async def _stuck_alert_for(db_session, project_id, status, title):
         title=title,
         message="stuck",
         task_id=task.id,
-        event_type="task.blocked",
+        event_type=event_type,
     )
     db_session.add(alert)
     await db_session.commit()
@@ -2825,6 +2827,34 @@ async def test_failure_alert_survives_while_the_task_is_still_failed(
     assert await sweep_resolve_terminal_task_alerts(db_session) == 0
     await db_session.refresh(other)
     assert other.dismissed_at is None
+
+
+@pytest.mark.asyncio
+async def test_approval_timeout_held_alert_retires_when_the_hold_resolves(
+    db_session, mocker
+):
+    """``approval.timeout_held`` needs a CONDITION-derived release, not a manual
+    one: it claims "parked, waiting on you" (incident 70c5ec8f), and a MANUAL
+    retirement would make the row immortal once the hold ends — the alert-
+    lifecycle-vs-condition-lifecycle defect class. The rule table retires it, so
+    no call site has to remember to."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _task, alert = await _stuck_alert_for(
+        db_session,
+        project.id,
+        "CANCELLED",
+        "Approval-gate timeout: work HELD for an operator decision (not failed)",
+        event_type="approval.timeout_held",
+    )
+
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is not None
 
 
 @pytest.mark.asyncio
@@ -3209,6 +3239,15 @@ async def test_rule_table_never_lets_a_family_inherit_another_status_set(db_sess
         "task.blocked",
         "review.escalated",
         "task.failed",
+        "approval.timeout_held",
+    }
+    # "held for an operator decision" is falsified by EVERY terminal status,
+    # including the CANCELLED the hold's own 72h bound produces. Literal, not
+    # the constant, so a change to the constant cannot certify itself.
+    assert _TERMINAL_TASK_ALERT_RULES["approval.timeout_held"] == {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
     }
     assert TaskStatus.FAILED in _TERMINAL_TASK_ALERT_RULES["task.blocked"]
     assert TaskStatus.FAILED in _TERMINAL_TASK_ALERT_RULES["review.escalated"]

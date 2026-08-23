@@ -118,6 +118,7 @@
     "recovery_evaluating.py": 1206,
     "recovery_evaluating_approval.py": 800,
     "recovery_evaluating_helpers.py": 1100,
+    "recovery_evaluating_prless_hold.py": 450,
     "recovery_evaluating_strand.py": 600,
     "recovery_infrastructure.py": 450,
     "recovery_post_commit.py": 603,

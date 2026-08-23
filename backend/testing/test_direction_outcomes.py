@@ -4450,6 +4450,16 @@ def test_non_genuine_cancelled_excludes_new_markers():
     assert not _counts_as_failure(
         _cancelled_task({"prerequisite_escalated_to_parent": True})
     )
+    # approval_timeout_hold_expired — a PR-less approval hold nobody answered
+    # inside its 72h window, released as CANCELLED (incident 70c5ec8f). The
+    # direction produced work; an operator simply never looked at it. Charging
+    # that to direction health prices operator latency as a research failure.
+    assert _is_non_genuine_cancelled(
+        _cancelled_task({"failure_detail": "approval_timeout_hold_expired"})
+    )
+    assert not _counts_as_failure(
+        _cancelled_task({"failure_detail": "approval_timeout_hold_expired"})
+    )
     # CO_DEFERRED_SHELVED — co-deferred dependent shelved alongside its same-cycle-
     # deferred prerequisite. Recoverable shelving, not a failure.
     from app.failure_classification import CO_DEFERRED_SHELVED
