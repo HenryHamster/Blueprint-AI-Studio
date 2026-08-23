@@ -119,9 +119,17 @@ const SUITES = {
   },
 };
 
+// npm materialises three shims per binary on Windows: an extensionless shell
+// script (for Git Bash/WSL), a .cmd and a .ps1. A bare existsSync finds the
+// shell script first, but a Windows process cannot execute it -- spawnSync
+// fails ENOENT, the generator aborts, and the developer is left with a stale
+// artifact that CI then rejects at the promotion PR. Prefer the .cmd there.
 function findBin(candidates) {
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
+  const extensions = process.platform === 'win32' ? ['.cmd', '.exe', ''] : [''];
+  for (const candidate of candidates) {
+    for (const extension of extensions) {
+      if (fs.existsSync(candidate + extension)) return candidate + extension;
+    }
   }
   return null; // falls back to npx vitest
 }
@@ -167,11 +175,20 @@ function runVitest(suite, suiteConfig, runIndex) {
 
   console.log(`[vitest-telemetry] ${suite} run #${runIndex}: ${[cmd, ...cmdArgs].join(' ')}`);
 
-  const result = spawnSync(cmd, cmdArgs, {
+  // Node refuses to execute a .cmd shim without a shell (CVE-2024-27980), so
+  // that one case opts in -- and quotes its own arguments, because a shell
+  // re-splits them on whitespace.
+  const useShell = process.platform === 'win32' && cmd.endsWith('.cmd');
+  const spawnArgs = useShell
+    ? cmdArgs.map(arg => (/[\s"]/.test(arg) ? `"${arg}"` : arg))
+    : cmdArgs;
+
+  const result = spawnSync(cmd, spawnArgs, {
     cwd: suiteConfig.cwd,
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'inherit'],
     env: { ...process.env },
+    shell: useShell,
     // 10-minute per-run cap (agent suite takes ~4-5 min; 10 min gives headroom)
     timeout: 10 * 60 * 1000,
   });

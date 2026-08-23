@@ -178,8 +178,15 @@ class TestFailureAlert:
         await db_session.commit()
         await db_session.refresh(task)
 
-        # Pre-existing undismissed alert for this task
-        existing = make_alert(project_id=project.id, task_id=task.id, severity="ERROR")
+        # Pre-existing undismissed alert for the SAME episode. Dedup is scoped
+        # to the ``task.failed`` family: an open row in that family is the
+        # episode already on the operator's feed, so a second one adds nothing.
+        existing = make_alert(
+            project_id=project.id,
+            task_id=task.id,
+            severity="ERROR",
+            event_type="task.failed",
+        )
         db_session.add(existing)
         await db_session.commit()
 

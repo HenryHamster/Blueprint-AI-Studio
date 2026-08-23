@@ -2466,19 +2466,35 @@ def test_cap_bump_resolves_release_qualifier_audit_breach():
     )
 
 
-def test_cap_bump_resolves_task_lifecycle_breach():
-    """task_lifecycle.py must be within its cap on the real file tree.
+# The highest cap task_lifecycle.py is currently approved to carry. History:
+# PR #16787 raised it 7750 -> 8950 with no operator approval — the exact
+# failure the chronic-offender guard exists to refuse — and was reversed to
+# 7750; the 2026-08 decomposition ratchet then lowered it to 6200, the
+# canonical ``bump_size_limit(5374)``. Rollup #17663 grew the file past 6200
+# and raised the cap to 7150, the canonical ``bump_size_limit(6202)``, under
+# explicit operator approval recorded in cap_bump_history.json. The ~950 lines
+# of headroom that grant carries are slack, not a licence: the decomposition
+# debt on this module stays open and this ceiling is what stops the slack from
+# being spent silently.
+_TASK_LIFECYCLE_APPROVED_CAP = 7150
 
-    This guards the cap that was raised 7750 -> 8950 WITHOUT operator approval
-    on Blueprint's worst chronic offender (PR #16787) — the failure mode the
-    chronic-offender governance guard exists to refuse. That bump was reversed
-    to the approved 7750, and the 2026-08 task-lifecycle decomposition ratchet
-    lowered the approved cap further to 6200 — the canonical policy value
-    ``bump_size_limit(5374)``. task_lifecycle.py is at 5374 lines, so this
-    merge-test gate still proves the JSON is consistent with the actual file
-    size on disk and fails if the cap ever rises above the approved figure
-    without an explicit decision, or the file grows past it before the CI
-    invariant suite runs.
+
+def test_cap_bump_resolves_task_lifecycle_breach():
+    """task_lifecycle.py must be within an approved cap on the real file tree.
+
+    Two things are checked, and the distinction matters. The file must fit its
+    declared cap — the ordinary breach check every sibling test runs — and that
+    cap must not exceed the approved ceiling above. The second is the
+    governance half: on Blueprint's worst chronic offender a cap rise has to be
+    a decision somebody wrote down, not a side effect of running
+    ``check_size_limits.py --fix``.
+
+    The ceiling is deliberately ``<=`` rather than ``==``. An equality pin also
+    fails when a decomposition legitimately *lowers* the cap, which punishes
+    exactly the work this module owes; a ceiling refuses only the direction the
+    guard cares about. Lowering the JSON cap needs no edit here. Raising it
+    past the ceiling means editing the constant above, which puts the decision
+    in the diff where a reviewer can see it.
     """
     json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
     data = csl.load_limits(json_path)
@@ -2488,9 +2504,12 @@ def test_cap_bump_resolves_task_lifecycle_breach():
     assert target_rel in backend_caps, (
         f"{target_rel} must have a cap entry in module_size_limits.json"
     )
-    assert backend_caps[target_rel] == 6200, (
-        f"{target_rel} cap must be the approved figure 6200 (ratcheted from "
-        f"7750 after the task-lifecycle decomposition); got {backend_caps[target_rel]}"
+    assert backend_caps[target_rel] <= _TASK_LIFECYCLE_APPROVED_CAP, (
+        f"{target_rel} cap must not exceed the approved ceiling "
+        f"{_TASK_LIFECYCLE_APPROVED_CAP}; got {backend_caps[target_rel]}. "
+        "Raising it is an operator decision — record it in "
+        "cap_bump_history.json and move _TASK_LIFECYCLE_APPROVED_CAP in the "
+        "same diff."
     )
 
     # Resolve app/ as testing/'s sibling, matching the Docker harness layout
