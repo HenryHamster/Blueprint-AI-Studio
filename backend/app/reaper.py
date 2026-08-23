@@ -328,6 +328,7 @@ from app.reaper_sweeps import (
     sweep_unblock_blocked_tasks,
     sweep_recover_stranded_transient_blockers,
     sweep_recover_stranded_escalated_blockers,
+    sweep_release_resolved_descendant_fence_blocks,
     sweep_activate_staged_directions,
     sweep_stale_staged_directions,
     sweep_merge_gate_verification_degradation,
@@ -364,6 +365,7 @@ from app.reaper_sweeps import (
     sweep_retire_consumed_message_attachments,
     sweep_backfill_merged_named_test_coverage,
     sweep_acceptance_verdict_healing_backfills,
+    sweep_release_unactionable_approval_holds,
     _sweep_strategic_cycle_starvation,
 )
 from app.approved_pr_stranding import sweep_approved_pr_stranding
@@ -3098,7 +3100,30 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 12d: Disposition — DECIDE every review-fix park whose
+                # Step 12d: Adjudicate rollup lineage-fence descendant
+                # blocks on their OWN cadence. The fence's release check used
+                # to be reachable only from inside the approval-gate timeout
+                # branch, so a blocker that resolved at any other moment was
+                # never noticed and the ancestor stayed held until that one
+                # narrow window killed it (incident 2026-08-23: ancestor
+                # 70c5ec8f FAILED at ~03:42Z, its blocker's PR #17693 merged
+                # at 12:11Z). Releases resolved blocks, decides aged-out ones
+                # whose blockers are all terminal, and otherwise re-states the
+                # wait — it never terminalizes a row.
+                _mark_reaper_progress()
+                try:
+                    await sweep_release_resolved_descendant_fence_blocks(
+                        session, now
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Lineage-fence adjudication sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12e: Disposition — DECIDE every review-fix park whose
                 # bounded operator-disposition window expired. An unbounded park
                 # ("a human owns this now") strands the chain, its rollup
                 # parent, and the whole research direction forever; this sweep
@@ -3741,6 +3766,38 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         "[REAPER] Stranded-conversation-message fail sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 26: Unactionable engine-escalation release sweep —
+                # ``requires_approval`` is a DECISION gate, but four pipeline
+                # refusal paths stamped it onto the very review/fix row whose
+                # COMPLETED write they were processing, so approving the row
+                # changes nothing and the operator queue fills with corpses
+                # (182 of 184 rows on 2026-08-23) that bury the live decisions.
+                # The refusal sites now settle their own escalation inline; this
+                # sweep clears the already-stamped backlog and anything that
+                # becomes inert later. It fails CLOSED on every operator-owned
+                # hold and leaves a durable release receipt.
+                _mark_reaper_progress()
+                try:
+                    _holds_released = (
+                        await sweep_release_unactionable_approval_holds(
+                            session, now
+                        )
+                    )
+                    if _holds_released:
+                        logger.info(
+                            "[REAPER] Step 26: released %d unactionable "
+                            "approval hold(s)",
+                            _holds_released,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Unactionable-approval-hold release sweep error: %s",
                         e,
                         exc_info=True,
                     )

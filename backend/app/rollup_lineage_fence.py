@@ -6,6 +6,7 @@ import asyncio
 import copy
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -36,6 +37,20 @@ _OPERATOR_BLOCKS_KEY = "_descendant_operator_blocks"
 _PRIOR_APPROVAL_KEY = "_descendant_operator_blocks_prior_approval"
 _PRIOR_APPROVAL_STATE_KEY = "_descendant_operator_blocks_prior_approval_state"
 _OPERATOR_BLOCK_HOLD_KEY = "_descendant_operator_blocks_approval_hold"
+_DECIDED_BLOCKS_KEY = "_descendant_operator_blocks_decided"
+_FENCE_HOLD_OWNER = "rollup_lineage_fence"
+# How long a descendant block may keep an ancestor rollup parked once every
+# blocker is TERMINAL and its state is fully known.  Past this window the
+# fence DECIDES — it releases its own hold, records the still-unresolved
+# descendants on the ancestor and lets the rollup resume — instead of parking
+# forever or handing the question to a human.  A fence hold is machine-set:
+# nothing about it becomes true by waiting longer than this.
+_FENCE_BLOCK_DECIDE_AFTER_HOURS = 12
+# Tri-state classification of one keyed descendant block.  ``unknown`` is the
+# conservative state: it is NEVER progress and never permits a decision.
+_BLOCK_RESOLVED = "resolved"
+_BLOCK_OPEN = "open"
+_BLOCK_UNKNOWN = "unknown"
 _APPROVAL_STATE_KEYS = (
     "_approval_set_at",
     "approval_hold_reason",
@@ -411,6 +426,166 @@ def _release_descendant_block_entries(
     return True
 
 
+def _parse_block_timestamp(raw: object) -> datetime | None:
+    """Parse a recorded block timestamp into naive UTC, or ``None``."""
+
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _block_label(task_id: str, pr_number: object) -> str:
+    """Short operator-readable identity for one keyed descendant block."""
+
+    label = str(task_id)[:8]
+    return f"{label} (PR #{pr_number})" if pr_number else label
+
+
+def descendant_operator_block_hold_is_owned(ancestor: Task) -> bool:
+    """Whether this exact row provably carries a LIVE fence-owned hold.
+
+    Ownership is structural and must never be inferred from the hold's reason
+    text: an operator/security/spend episode can leave the same latch TRUE.
+    All three facts must agree —
+
+      * a non-empty keyed ``_descendant_operator_blocks`` map,
+      * the exact hold receipt this fence stamped when it took the latch
+        (:func:`_owns_descendant_block_hold` re-derives the live episode), and
+      * ``_approval_hold_provenance.owner == "rollup_lineage_fence"``.
+
+    Any mismatch returns ``False`` so callers fall through to whatever they
+    did before the fence existed.
+    """
+
+    context = dict(ancestor.context or {})
+    blocks = context.get(_OPERATOR_BLOCKS_KEY)
+    if not isinstance(blocks, dict) or not blocks:
+        return False
+    if not _owns_descendant_block_hold(
+        ancestor, context.get(_OPERATOR_BLOCK_HOLD_KEY)
+    ):
+        return False
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    return (
+        isinstance(provenance, dict)
+        and provenance.get("owner") == _FENCE_HOLD_OWNER
+    )
+
+
+async def _classify_descendant_blocks(
+    ancestor: Task,
+    session: AsyncSession,
+) -> dict[str, str]:
+    """Read every keyed descendant block's live state in ONE lookup pass.
+
+    Returns a ``block_id -> state`` map:
+
+      * ``resolved`` — the subject PR merged or closed, or the PR-less flagged
+        descendant is COMPLETED;
+      * ``open`` — provably still outstanding;
+      * ``unknown`` — the state could not be read at all (no GitHub
+        credentials, a lookup error or timeout, a missing task row, an
+        unparseable entry).
+
+    ``unknown`` is never progress. Both callers — the release path and the
+    adjudication path — must treat it as "keep the hold", which is why they
+    share this one function rather than each running their own GitHub
+    round-trips and risking a disagreement about the same PR.
+    """
+
+    blocks = dict((ancestor.context or {}).get(_OPERATOR_BLOCKS_KEY) or {})
+    if not blocks:
+        return {}
+
+    from app.github import get_pull_request
+    from app.routers.agent import get_github_token_for_task
+
+    gh_auth: Any = None
+    pr_state_cache: dict[int, dict | None] = {}
+
+    async def _pr_state(pr_number: int) -> str:
+        nonlocal gh_auth
+        if pr_number in pr_state_cache:
+            pr = pr_state_cache[pr_number]
+        else:
+            if gh_auth is None:
+                try:
+                    gh_auth = await get_github_token_for_task(
+                        ancestor.id, session
+                    )
+                except Exception:  # noqa: BLE001 — config failure: keep hold
+                    gh_auth = ()
+            if not gh_auth:
+                pr_state_cache[pr_number] = None
+                return _BLOCK_UNKNOWN
+            gh_token, owner, repo = gh_auth
+            try:
+                pr = await asyncio.wait_for(
+                    get_pull_request(
+                        gh_token,
+                        owner,
+                        repo,
+                        pr_number,
+                        project_id=str(ancestor.project_id),
+                    ),
+                    timeout=30,
+                )
+            except Exception:  # noqa: BLE001 — unknown state: keep hold
+                pr = None
+            pr_state_cache[pr_number] = pr
+        if not isinstance(pr, dict):
+            return _BLOCK_UNKNOWN
+        if bool(pr.get("merged")) or str(pr.get("state")) == "closed":
+            return _BLOCK_RESOLVED
+        return _BLOCK_OPEN
+
+    states: dict[str, str] = {}
+    for block_id, entry in blocks.items():
+        entry = entry if isinstance(entry, dict) else {}
+        pr_number = entry.get("pr_number")
+        if pr_number:
+            try:
+                states[block_id] = await _pr_state(int(pr_number))
+            except (TypeError, ValueError):
+                states[block_id] = _BLOCK_UNKNOWN
+            continue
+        try:
+            block_uuid = uuid.UUID(str(entry.get("task_id") or block_id))
+        except (TypeError, ValueError):
+            states[block_id] = _BLOCK_UNKNOWN
+            continue
+        descendant = await session.get(Task, block_uuid)
+        if descendant is None:
+            states[block_id] = _BLOCK_UNKNOWN
+        elif descendant.status == TaskStatus.COMPLETED:
+            states[block_id] = _BLOCK_RESOLVED
+        else:
+            states[block_id] = _BLOCK_OPEN
+    return states
+
+
+def _stamp_out_of_band_release(ancestor: Task, resolved_count: int) -> None:
+    """Record the single out-of-band release receipt both paths emit."""
+
+    ancestor.latest_status_message = (
+        "Descendant operator block(s) resolved out-of-band "
+        "(PR merged/closed or descendant completed) — released "
+        "the fence hold and restored prior approval state"
+    )
+    logger.info(
+        "[LINEAGE FENCE] Released %d resolved descendant block(s) on "
+        "ancestor %s — hold cleared without operator requeue",
+        resolved_count,
+        str(ancestor.id)[:8],
+    )
+
+
 async def release_resolved_descendant_operator_blocks(
     ancestor: Task,
     session: AsyncSession,
@@ -437,83 +612,209 @@ async def release_resolved_descendant_operator_blocks(
     blocks = dict((ancestor.context or {}).get(_OPERATOR_BLOCKS_KEY) or {})
     if not blocks:
         return False
-
-    from app.github import get_pull_request
-    from app.routers.agent import get_github_token_for_task
-
-    gh_auth = None
-    pr_state_cache: dict[int, dict | None] = {}
-
-    async def _pr_resolved(pr_number: int) -> bool:
-        nonlocal gh_auth
-        if pr_number in pr_state_cache:
-            pr = pr_state_cache[pr_number]
-        else:
-            if gh_auth is None:
-                try:
-                    gh_auth = await get_github_token_for_task(
-                        ancestor.id, session
-                    )
-                except Exception:  # noqa: BLE001 — config failure: keep hold
-                    gh_auth = ()
-            if not gh_auth:
-                pr_state_cache[pr_number] = None
-                return False
-            gh_token, owner, repo = gh_auth
-            try:
-                pr = await asyncio.wait_for(
-                    get_pull_request(
-                        gh_token,
-                        owner,
-                        repo,
-                        pr_number,
-                        project_id=str(ancestor.project_id),
-                    ),
-                    timeout=30,
-                )
-            except Exception:  # noqa: BLE001 — unknown state: keep hold
-                pr = None
-            pr_state_cache[pr_number] = pr
-        if not isinstance(pr, dict):
-            return False
-        return bool(pr.get("merged")) or str(pr.get("state")) == "closed"
-
-    resolved: list[str] = []
-    for block_id, entry in blocks.items():
-        entry = entry if isinstance(entry, dict) else {}
-        pr_number = entry.get("pr_number")
-        if pr_number:
-            try:
-                if await _pr_resolved(int(pr_number)):
-                    resolved.append(block_id)
-            except (TypeError, ValueError):
-                continue
-            continue
-        try:
-            block_uuid = uuid.UUID(str(entry.get("task_id") or block_id))
-        except (TypeError, ValueError):
-            continue
-        descendant = await session.get(Task, block_uuid)
-        if descendant is not None and descendant.status == TaskStatus.COMPLETED:
-            resolved.append(block_id)
-
+    states = await _classify_descendant_blocks(ancestor, session)
+    resolved = [
+        block_id
+        for block_id, state in states.items()
+        if state == _BLOCK_RESOLVED
+    ]
     if not resolved:
         return False
     released = _release_descendant_block_entries(ancestor, resolved)
     if released:
-        ancestor.latest_status_message = (
-            "Descendant operator block(s) resolved out-of-band "
-            "(PR merged/closed or descendant completed) — released "
-            "the fence hold and restored prior approval state"
-        )
-        logger.info(
-            "[LINEAGE FENCE] Released %d resolved descendant block(s) on "
-            "ancestor %s — hold cleared without operator requeue",
-            len(resolved),
-            str(ancestor.id)[:8],
-        )
+        _stamp_out_of_band_release(ancestor, len(resolved))
     session.add(ancestor)
     return released
+
+
+def _waiting_status_message(blocks: dict[str, Any], *, now: datetime) -> str:
+    """Name every unresolved block so the wait states its own reason."""
+
+    parts: list[str] = []
+    for block_id, raw_entry in sorted(blocks.items()):
+        entry = raw_entry if isinstance(raw_entry, dict) else {}
+        blocked_at = _parse_block_timestamp(entry.get("blocked_at"))
+        if blocked_at is None:
+            age = "blocked for an unknown duration"
+        else:
+            elapsed = max((now - blocked_at).total_seconds(), 0.0)
+            age = f"blocked {int(elapsed // 3600)}h"
+        label = _block_label(
+            str(entry.get("task_id") or block_id), entry.get("pr_number")
+        )
+        reason = str(entry.get("reason") or "no reason recorded")
+        parts.append(f"{label} — {reason} ({age})")
+    return (
+        "Waiting on descendant operator block(s); this rollup is NOT failed "
+        "and its approval hold is machine-owned, not a question for an "
+        "operator: " + "; ".join(parts)
+    )
+
+
+def _decide_descendant_operator_blocks(
+    ancestor: Task,
+    blocks: dict[str, Any],
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Release an aged-out fence hold and record WHY on the ancestor."""
+
+    decided_at = now.isoformat()
+    why = (
+        "every blocking descendant is terminal and the block aged past "
+        f"{_FENCE_BLOCK_DECIDE_AFTER_HOURS}h with no operator intervention "
+        "— the rollup resumes and reports this descendant as unresolved"
+    )
+    records: list[dict[str, Any]] = []
+    for block_id, raw_entry in sorted(blocks.items()):
+        entry = raw_entry if isinstance(raw_entry, dict) else {}
+        records.append(
+            {
+                "task_id": str(entry.get("task_id") or block_id),
+                "pr_number": entry.get("pr_number"),
+                "reason": entry.get("reason"),
+                "blocked_at": entry.get("blocked_at"),
+                "decided_at": decided_at,
+                "why": why,
+            }
+        )
+    _release_descendant_block_entries(ancestor, list(blocks))
+    context = dict(ancestor.context or {})
+    prior = context.get(_DECIDED_BLOCKS_KEY)
+    context[_DECIDED_BLOCKS_KEY] = (
+        list(prior) if isinstance(prior, list) else []
+    ) + records
+    ancestor.context = context
+    labels = ", ".join(
+        _block_label(record["task_id"], record["pr_number"])
+        for record in records
+    )
+    ancestor.latest_status_message = (
+        f"Descendant operator block(s) still unresolved after "
+        f"{_FENCE_BLOCK_DECIDE_AFTER_HOURS}h with every blocker terminal "
+        f"— decided: released the fence hold and resumed the rollup, "
+        f"reporting {labels} as unresolved"
+    )
+    logger.info(
+        "[LINEAGE FENCE] Decided %d aged-out descendant block(s) on ancestor "
+        "%s after %dh — hold released, rollup resumed, unresolved "
+        "descendants recorded at %s",
+        len(records),
+        str(ancestor.id)[:8],
+        _FENCE_BLOCK_DECIDE_AFTER_HOURS,
+        _DECIDED_BLOCKS_KEY,
+    )
+    return records
+
+
+async def adjudicate_descendant_operator_blocks(
+    ancestor: Task,
+    session: AsyncSession,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Own the whole lifecycle of a MACHINE-set descendant-block hold.
+
+    ``mark_ancestor_rollups_awaiting_operator`` establishes an approval hold
+    that is *not* a question posed to a human about this ancestor: it encodes
+    a dependency on a descendant with its own lifecycle. Running the generic
+    2h human-approval clock against it FAILS the ancestor while the blocker
+    is still moving — which resolves nothing and destroys the rollup
+    (incident 2026-08-23: research 70c5ec8f was FAILED at ~03:42Z for a fence
+    hold set at 01:42Z, and the blocking descendant's PR #17693 merged at
+    12:11Z, 8.5h after the ancestor was already dead).
+
+    The fence therefore adjudicates itself, and returns which disposition it
+    took:
+
+      * ``"not_fenced"`` — this row does not provably carry a fence hold
+        (:func:`descendant_operator_block_hold_is_owned`); the caller MUST
+        leave every other disposition exactly as it was.
+      * ``"released"`` — every block resolved on its own (PR merged or
+        closed, or the PR-less descendant completed); the hold is handed back
+        and the prior approval state restored, identically to the requeue
+        path.
+      * ``"decided"`` — every blocker is TERMINAL, every state is known,
+        and the oldest block has aged past
+        ``_FENCE_BLOCK_DECIDE_AFTER_HOURS``. Waiting longer cannot make a
+        machine-set hold truer, so the fence releases it, records the
+        still-unresolved descendants under
+        ``_descendant_operator_blocks_decided`` for the rollup to report, and
+        lets the ancestor resume normal evaluation.
+      * ``"waiting"`` — anything else, including EVERY unreadable state.
+        The hold stays, the status message names each unresolved block, and
+        the ancestor is never failed.
+
+    Unknown is never progress: a GitHub lookup that errors or times out, a
+    missing task row, or an unparseable ``blocked_at`` all keep the hold and
+    return ``"waiting"`` — never ``"decided"``, and never a failure.
+    Mutates and ``session.add``s the ancestor; the caller owns the commit.
+    """
+
+    if not descendant_operator_block_hold_is_owned(ancestor):
+        return "not_fenced"
+    if not isinstance(now, datetime):
+        now = _utcnow()
+    elif now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+
+    states = await _classify_descendant_blocks(ancestor, session)
+    resolved = [
+        block_id
+        for block_id, state in states.items()
+        if state == _BLOCK_RESOLVED
+    ]
+    if resolved and _release_descendant_block_entries(ancestor, resolved):
+        _stamp_out_of_band_release(ancestor, len(resolved))
+        session.add(ancestor)
+        return "released"
+
+    blocks = dict((ancestor.context or {}).get(_OPERATOR_BLOCKS_KEY) or {})
+    if not blocks:
+        # A partial release emptied the map without handing the latch back
+        # (a newer independent episode owns it). Nothing left to adjudicate.
+        session.add(ancestor)
+        return "waiting"
+
+    # A decision needs COMPLETE knowledge. Any unreadable state, any missing
+    # or non-terminal descendant row, any unparseable timestamp keeps the
+    # hold — the fence waits rather than guessing.
+    decidable = all(
+        states.get(block_id, _BLOCK_UNKNOWN) != _BLOCK_UNKNOWN
+        for block_id in blocks
+    )
+    oldest: datetime | None = None
+    for block_id, raw_entry in blocks.items():
+        entry = raw_entry if isinstance(raw_entry, dict) else {}
+        blocked_at = _parse_block_timestamp(entry.get("blocked_at"))
+        if blocked_at is None:
+            decidable = False
+        elif oldest is None or blocked_at < oldest:
+            oldest = blocked_at
+        try:
+            block_uuid = uuid.UUID(str(entry.get("task_id") or block_id))
+        except (TypeError, ValueError):
+            decidable = False
+            continue
+        descendant = await session.get(Task, block_uuid)
+        if descendant is None or descendant.status not in _TERMINAL_STATUSES:
+            decidable = False
+
+    if (
+        decidable
+        and oldest is not None
+        and (now - oldest).total_seconds()
+        >= _FENCE_BLOCK_DECIDE_AFTER_HOURS * 3600
+    ):
+        _decide_descendant_operator_blocks(ancestor, blocks, now=now)
+        session.add(ancestor)
+        return "decided"
+
+    message = _waiting_status_message(blocks, now=now)
+    if ancestor.latest_status_message != message:
+        ancestor.latest_status_message = message
+    session.add(ancestor)
+    return "waiting"
 
 
 async def mark_ancestor_rollups_awaiting_operator(
@@ -547,7 +848,7 @@ async def mark_ancestor_rollups_awaiting_operator(
             episode = establish_independent_approval_hold(
                 ancestor,
                 reason=f"descendant {task.id} needs operator intervention",
-                owner="rollup_lineage_fence",
+                owner=_FENCE_HOLD_OWNER,
             )
             held_context = dict(ancestor.context or {})
             held_context[_OPERATOR_BLOCK_HOLD_KEY] = _descendant_block_hold_receipt(

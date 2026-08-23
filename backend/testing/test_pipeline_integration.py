@@ -2184,15 +2184,19 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
     client: AsyncClient, db_session, mocker
 ):
     """
-    Regression test: stuck-cycle detection must still mark a task as
-    requires_approval even when original_task_id is absent from source_loop
-    and source_payload.
+    Regression test: stuck-cycle detection must still ESCALATE even when
+    original_task_id is absent from source_loop and source_payload.
 
     In this case resolved_original_id falls back to str(source_task.id) (the
     review task itself), so the review task gets flagged — the key assertion is
-    that the function does NOT silently drop the cycle (return None without
-    setting requires_approval anywhere), which was the bug introduced by
-    recomputing stuck_orig_id with an incomplete fallback chain.
+    that the function does NOT silently drop the cycle, which was the bug
+    introduced by recomputing stuck_orig_id with an incomplete fallback chain.
+
+    BEHAVIOUR CHANGE (unactionable-approval-hold fix): the escalation used to be
+    observable only as ``requires_approval is True`` on the review row, which
+    ``_process_post_commit`` has already written COMPLETED -- a decision gate
+    nobody could act on.  It is now a release receipt on the same row: a
+    strictly stronger witness, because it names the owner and the reason.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
@@ -2280,11 +2284,29 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
         f"but found fix tasks: {[t.id for t in fix_tasks]}"
     )
 
-    # The review task itself (acting as resolved_original_id fallback) must be flagged
+    # The review task itself (acting as resolved_original_id fallback) must be
+    # flagged — as a durable escalation receipt, not as a dead decision gate.
+    from app.admin_approval_authority import (
+        APPROVAL_HOLD_RELEASED_KEY,
+        PIPELINE_ESCALATION_HOLD_REASONS,
+    )
+
     await db_session.refresh(review_task)
-    assert review_task.requires_approval is True, (
+    receipt = (review_task.context or {}).get(APPROVAL_HOLD_RELEASED_KEY)
+    assert isinstance(receipt, dict), (
         "Without explicit original_task_id, resolved_original_id falls back to "
-        "source_task.id — that task must still be flagged requires_approval=True"
+        "source_task.id — that task must still record the stuck-cycle "
+        f"escalation; got context keys {sorted((review_task.context or {}).keys())}"
+    )
+    # Owner is exact; the reason is pinned to the engine set rather than one
+    # literal because which refusal fires first depends on the GitHub mocks
+    # (no usable token -> ``review_target_unavailable``), not on stuck-cycle
+    # detection.  The old bare boolean did not distinguish these either.
+    assert receipt["owner"] == "review_request_changes"
+    assert receipt["reason"] in PIPELINE_ESCALATION_HOLD_REASONS
+    assert review_task.requires_approval is not True, (
+        "the row is already COMPLETED, so it must not be left holding an "
+        "approval decision nobody can act on"
     )
 
 

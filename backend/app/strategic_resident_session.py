@@ -2576,6 +2576,40 @@ def _task_matches_resident_identity(
     )
 
 
+def resident_worker_is_healthy(
+    blob: dict[str, Any] | None,
+    task: Task | None,
+    now: datetime,
+) -> bool:
+    """Return whether a session blob has its exact, live Resident worker.
+
+    A status-only session blob is not liveness evidence: it can outlive a
+    terminal task, point at a replacement generation, or retain an old
+    heartbeat. Reuse the same identity and bounded-freshness contracts as the
+    session ensure path so the starvation sweep cannot suppress a halt from a
+    merely active-looking projection.
+    """
+    if not resident_session_is_active(blob) or task is None:
+        return False
+    task_id = (blob or {}).get("task_id")
+    session_id = (blob or {}).get("session_id")
+    if not task_id or not session_id:
+        return False
+    try:
+        worker_generation = int((blob or {}).get("worker_generation") or 1)
+    except (TypeError, ValueError):
+        return False
+    if str(task.id) != str(task_id) or task.archived:
+        return False
+    if not _task_matches_resident_identity(
+        task,
+        session_id=str(session_id),
+        worker_generation=worker_generation,
+    ):
+        return False
+    return _resident_worker_task_is_healthy(task, blob or {}, now)
+
+
 async def _resident_task_ids_for_identity(
     session: AsyncSession,
     project_id: uuid.UUID,

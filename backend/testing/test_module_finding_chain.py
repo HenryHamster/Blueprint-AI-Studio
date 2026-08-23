@@ -13,14 +13,18 @@ from app.models import ModuleFindingChain, Project, ProjectMessage, Task, TaskSt
 from app.module_finding_chain import (
     CHAIN_ESCALATION_THRESHOLD,
     _guard_chain_key,
+    _guard_remediation_task,
+    _post_guard_suppression_escalation,
     elect_guard_suppression_owners,
     extract_guard_suppression_identities,
     find_and_mark_chain_escalation,
+    guard_suppression_escalation_summary,
     ingest_guard_suppression_receipt,
     record_merged_pr_finding_chains,
     resolve_landed_guard_suppression_remediation,
     resolved_review_findings,
 )
+from app.payload_schemas import validate_internal_payload
 from app.task_locking import (
     AUTOMATIC_TASK_CREATION_ALLOWED,
     AUTOMATIC_TASK_CREATION_PROJECT_PAUSED,
@@ -45,6 +49,15 @@ class _Session:
         self.rows: list[ModuleFindingChain] = []
         self.added_tasks: list[Task] = []
         self.messages: list[ProjectMessage] = []
+        # The election sweep resolves each project's integration branch from
+        # its Project row, so the ledger fake has to model that row too.
+        self.projects: dict = {}
+        self.tasks: dict = {}
+
+    async def get(self, model, key):
+        if model is Project:
+            return self.projects.get(key)
+        return self.tasks.get(key)
 
     async def execute(self, _statement):
         if "projectmessage" in str(_statement).lower():
@@ -66,6 +79,10 @@ class _Session:
             self.rows.append(value)
         elif isinstance(value, Task):
             self.added_tasks.append(value)
+            # The owner-release path resolves a chain's owner by id. A fake that
+            # advertises ``get`` but forgets the task it just stored would report
+            # every live owner as a vanished row.
+            self.tasks[value.id] = value
 
 
 class _Nested:
@@ -605,35 +622,40 @@ def _remediation_owners(session) -> list[Task]:
     ]
 
 
-async def _elect(session, decision: str = AUTOMATIC_TASK_CREATION_ALLOWED) -> list[Task]:
+LEDGER_FAKE_INTEGRATION_BRANCH = "qualification-trunk"
+
+
+async def _elect(
+    session,
+    decision: str = AUTOMATIC_TASK_CREATION_ALLOWED,
+    integration_branch: str = LEDGER_FAKE_INTEGRATION_BRANCH,
+) -> list[Task]:
     """Drive the leader-owned election sweep against a ledger fake session.
 
     The Project admission itself is stubbed here because these fakes have no
     project table; ``test_owner_election_honours_real_project_authority`` and
     ``test_owner_election_refuses_a_paused_project`` exercise the real
     ``acquire_automatic_task_creation_authority`` against the database.
+
+    Every chain's project is registered with a *non-default* integration
+    branch. The sweep must cut the remediation from the resolver's answer, so a
+    fake that returned ``"main"`` would let a hardcoded literal pass.
     """
+    for chain in session.rows:
+        session.projects.setdefault(
+            chain.project_id,
+            Project(
+                id=chain.project_id,
+                name="ledger fake",
+                user_id="test-user-123",
+                integration_branch=integration_branch,
+            ),
+        )
     with patch(
         "app.task_locking.acquire_automatic_task_creation_authority",
         new=AsyncMock(return_value=decision),
     ):
         return await elect_guard_suppression_owners(session)
-
-
-class _TaskStoreSession(_Session):
-    """A ledger session that can also resolve a remediation owner by id."""
-
-    def __init__(self):
-        super().__init__()
-        self.tasks: dict[uuid.UUID, Task] = {}
-
-    def add(self, value):
-        super().add(value)
-        if isinstance(value, Task):
-            self.tasks[value.id] = value
-
-    async def get(self, _model, key):
-        return self.tasks.get(key)
 
 
 def _guard_suppression(identity: str) -> dict:
@@ -745,7 +767,7 @@ async def test_recurrence_re_elects_owner_after_the_first_one_failed():
     """A dead owner must not hold a chain open forever."""
     project_id = uuid.uuid4()
     identity = "backend/testing/test_x.py::test_x::AssertionError"
-    session = _TaskStoreSession()
+    session = _Session()
 
     def _source() -> Task:
         return Task(
@@ -906,3 +928,215 @@ async def test_owner_election_refuses_a_project_that_cannot_take_new_work(
         )
         == []
     )
+
+
+# The exact payload the guard-suppression spawner published in production
+# (read verbatim from the live DB on 2026-08-23). Three tasks spawned from it
+# died identically with ``[CODE_ERROR] Retries exhausted (3/3). fatal — Fatal
+# error: branch is required`` because ``FixPayload`` / the agent's ``handleFix``
+# both hard-require ``branch`` (and ``pr_number``) and neither was ever set.
+BRANCHLESS_FIX_PAYLOAD_AS_SHIPPED = {
+    "type": "fix",
+    "title": "Resolve recurring baseline guard suppression",
+    "effort": "medium",
+    "prompt": (
+        "Remove the named inherited guard failure and verify a clean "
+        "publication-gate receipt. Do not suppress or rename the identity."
+    ),
+    "execution_mode": "default",
+}
+
+
+def test_spawn_time_contract_guard_rejects_the_branchless_fix_payload():
+    """The seam the spawner now goes through refuses an unrunnable payload.
+
+    This is the class fix: a payload that omits a field its task_type requires
+    must fail loudly at spawn time, not be discovered by a claimed VM three
+    retries later.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        validate_internal_payload(
+            dict(BRANCHLESS_FIX_PAYLOAD_AS_SHIPPED),
+            "testing:guard_suppression_regression",
+        )
+
+    detail = str(excinfo.value)
+    assert "branch" in detail
+    assert "pr_number" in detail
+
+    # ...and what the spawner publishes today clears the very same gate.
+    owner = _guard_remediation_task(
+        _mature_chain(uuid.uuid4()), base_branch="qualification-trunk"
+    )
+    assert owner.first_payload != BRANCHLESS_FIX_PAYLOAD_AS_SHIPPED
+    validate_internal_payload(
+        dict(owner.first_payload), "testing:guard_suppression_regression"
+    )
+
+
+@pytest.mark.asyncio
+async def test_elected_owner_payload_is_runnable_and_cut_from_the_resolver():
+    """The elected owner carries every field its task_type requires.
+
+    Two independent pins: the payload survives the same contract validation the
+    agent's handler contract is derived from, and its base branch is the
+    project's resolved integration branch rather than the literal ``"main"``.
+    """
+    session = _Session()
+    chain = _mature_chain(uuid.uuid4())
+    session.rows.append(chain)
+
+    elected = await _elect(session, integration_branch="qualification-trunk")
+
+    assert len(elected) == 1
+    payload = elected[0].first_payload
+    # ``create``: new work off the trunk. ``fix`` is the wrong contract — it
+    # requires a pr_number and the branch of an existing PR, and this path has
+    # neither.
+    assert payload["type"] == "create"
+    assert payload["base_branch"] == "qualification-trunk"
+    assert payload["base_branch"] != "main"
+    assert payload["prompt"]
+    # Independent of the spawner: the published payload passes the contract on
+    # its own terms.
+    validate_internal_payload(dict(payload), "testing:elected_owner")
+
+
+@pytest.mark.asyncio
+async def test_owner_is_cut_from_the_project_integration_branch(db_session):
+    """The base branch comes from the resolver, against a real Project row."""
+    project = Project(
+        name="guard election branch",
+        user_id="test-user-123",
+        integration_branch="release-trunk",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(_mature_chain(project.id))
+    await db_session.commit()
+
+    elected = await elect_guard_suppression_owners(db_session)
+    await db_session.commit()
+
+    assert len(elected) == 1
+    payload = elected[0].first_payload
+    assert payload["type"] == "create"
+    # The integration trunk, not the promotion target and not the literal main.
+    assert payload["base_branch"] == "release-trunk"
+    assert payload["base_branch"] != project.promotion_target
+    assert payload["base_branch"] != "main"
+
+
+@pytest.mark.asyncio
+async def test_unrunnable_payload_is_never_published_as_an_owner(db_session):
+    """A rejected payload leaves the chain unowned and says why.
+
+    Driven through the real rejection path: the project's integration branch is
+    a genuinely invalid ref, so the contract validator refuses the payload the
+    spawner assembled. Nothing is mocked out.
+    """
+    project = Project(
+        name="guard election bad branch",
+        user_id="test-user-123",
+        integration_branch="bad..branch",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    chain = _mature_chain(project.id)
+    db_session.add(chain)
+    await db_session.commit()
+
+    assert await elect_guard_suppression_owners(db_session) == []
+    await db_session.commit()
+
+    await db_session.refresh(chain)
+    assert chain.remediation_task_id is None
+    assert (
+        list(
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        == []
+    )
+    message = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().one()
+    assert "now owns it" not in message.content
+    assert "NO remediation task owns it" in message.content
+    assert "rejected at spawn time" in message.content
+    assert message.context["remediation_task_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_failed_owner_stops_being_advertised_as_the_owner(db_session):
+    """The operator is never left reading a claim that a corpse owns the chain."""
+    project = Project(
+        name="guard election dead owner",
+        user_id="test-user-123",
+        integration_branch="qualification-trunk",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    chain = _mature_chain(project.id)
+    db_session.add(chain)
+    await db_session.commit()
+
+    elected = await elect_guard_suppression_owners(db_session)
+    await db_session.commit()
+    assert len(elected) == 1
+    owner = elected[0]
+    message = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().one()
+    assert f"remediation task {owner.id} now owns it." in message.content
+
+    owner.status = TaskStatus.FAILED
+    owner.latest_status_message = "[CODE_ERROR] Retries exhausted (3/3)."
+    db_session.add(owner)
+    await db_session.commit()
+
+    # The next sweep releases the dead owner and elects a replacement, and the
+    # single aggregate message tracks that change instead of freezing on the
+    # corpse.
+    replacements = await elect_guard_suppression_owners(db_session)
+    await db_session.commit()
+    await db_session.refresh(message)
+
+    assert len(replacements) == 1
+    assert replacements[0].id != owner.id
+    assert f"remediation task {owner.id} now owns it." not in message.content
+    assert f"remediation task {replacements[0].id} now owns it." in message.content
+    assert message.context["remediation_task_id"] == str(replacements[0].id)
+
+
+def test_escalation_summary_never_claims_an_owner_it_does_not_have():
+    owned = guard_suppression_escalation_summary(Task(id=uuid.UUID(int=7)), None)
+    assert "now owns it" in owned
+
+    unowned = guard_suppression_escalation_summary(None, "the payload was rejected")
+    assert "now owns it" not in unowned
+    assert "NO remediation task owns it: the payload was rejected" in unowned
+
+
+@pytest.mark.asyncio
+async def test_unowned_escalation_must_name_a_reason():
+    """A silent ownership retraction is as bad as a false claim."""
+
+    class _MessageSession(_Session):
+        async def scalar(self, _statement):
+            return None
+
+    with pytest.raises(ValueError, match="must name why nothing owns it"):
+        await _post_guard_suppression_escalation(
+            _MessageSession(), _mature_chain(uuid.uuid4()), None
+        )

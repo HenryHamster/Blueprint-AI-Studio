@@ -37,6 +37,7 @@ from app.admin_approval_authority import (
     APPROVAL_HOLD_PROVENANCE_KEY,
     approval_hold_provenance,
     establish_independent_approval_hold,
+    settle_unactionable_pipeline_escalation,
 )
 from app.models import Alert, AlertSeverity, Project, Task
 from app.review_pipeline import (
@@ -49,7 +50,20 @@ import app.shared_state as _shared_state
 logger = logging.getLogger(__name__)
 
 
-def _establish_fix_completion_hold(task: Task, *, reason: str) -> None:
+async def _establish_fix_completion_hold(
+    task: Task, session: AsyncSession, *, reason: str
+) -> None:
+    """Escalate a fix-completion refusal without stamping a dead row.
+
+    Same reasoning as ``app.review_request_changes``: this runs while the fix
+    row is being written COMPLETED, so a pipeline-spawn escalation lands where
+    no operator disposition can reach.  The settle is reason-scoped, so the two
+    SECURITY holds raised here -- ``security_scan_blocked`` and
+    ``security_scan_failed`` -- are never released by machine; they stay
+    operator business however dead the row is.  ``latest_status_message`` must
+    already be assigned when this is called.
+    """
+
     context = dict(task.context or {})
     provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
     if (
@@ -63,6 +77,9 @@ def _establish_fix_completion_hold(task: Task, *, reason: str) -> None:
         return
     establish_independent_approval_hold(
         task, reason=reason, owner="task_lifecycle_fix_completion"
+    )
+    await settle_unactionable_pipeline_escalation(
+        task, session, released_by="task_lifecycle_fix_completion"
     )
 
 
@@ -222,10 +239,10 @@ async def run_fix_completion(
         logger.info(f"[SECURITY] {scan_result['summary']}")
         if scan_result["blocked"]:
             scan_blocked = True
-            _establish_fix_completion_hold(
-                task, reason="security_scan_blocked"
-            )
             task.latest_status_message = scan_result["summary"]
+            await _establish_fix_completion_hold(
+                task, session, reason="security_scan_blocked"
+            )
             session.add(task)
             await session.commit()
         if scan_result["findings"]:
@@ -237,10 +254,12 @@ async def run_fix_completion(
             f"[SECURITY] Scan failed for fix PR #{pr_number}, flagging for approval: {e}",
             exc_info=True,
         )
-        _establish_fix_completion_hold(task, reason="security_scan_failed")
         task.latest_status_message = _safe_exception_message(
             e,
             "Security scan failed — review will proceed but merge requires manual approval",
+        )
+        await _establish_fix_completion_hold(
+            task, session, reason="security_scan_failed"
         )
         session.add(task)
         await session.commit()
@@ -336,8 +355,8 @@ async def run_fix_completion(
                     f"{'deferred (concurrent spawn)' if _is_transient else 'failed (' + _spawn_reason_label + ')'}"
                 )
                 if not _is_transient:
-                    _establish_fix_completion_hold(
-                        task, reason="review_spawn_failed"
+                    await _establish_fix_completion_hold(
+                        task, session, reason="review_spawn_failed"
                     )
                     from app.rollup_lineage_fence import (
                         mark_ancestor_rollups_awaiting_operator,

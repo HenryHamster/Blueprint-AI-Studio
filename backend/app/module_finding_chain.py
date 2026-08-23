@@ -13,10 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.branch_resolution import get_project_integration_branch
 from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
 from app.finding_identity import audit_finding_key
 from app.issue_ledger import ISSUE_MATCH_JACCARD_THRESHOLD, _jaccard
-from app.models import ModuleFindingChain, ProjectMessage, Task, TaskStatus
+from app.models import ModuleFindingChain, Project, ProjectMessage, Task, TaskStatus
+from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -196,29 +198,49 @@ def _receipt_is_complete_and_clean(receipt: Mapping[str, Any] | None) -> bool:
     return identities == []
 
 
-def _guard_remediation_task(chain: ModuleFindingChain) -> Task:
+GUARD_REMEDIATION_SPAWN_CONTEXT = "module_finding_chain:guard_suppression_remediation"
+
+
+def _guard_remediation_task(chain: ModuleFindingChain, *, base_branch: str) -> Task:
     """Build the one normal queued task that owns a mature chain.
 
     The active-task idempotency key is the same task-admission primitive used
     elsewhere. Persisting the selected task id on the chain makes retries and
     concurrent heartbeats converge on one owner rather than notifying per
     source task.
+
+    The payload is a ``create`` cut from *base_branch*, not a ``fix``. Guard
+    suppression is new work off the project's integration trunk: there is no
+    pre-existing PR to repair, and the ``fix`` contract demands exactly the two
+    things this path can never supply. ``FixPayload`` requires ``pr_number``
+    and ``branch``, and the agent's ``handleFix`` clones that PR branch before
+    doing anything else -- so every task this spawner emitted while it declared
+    ``type: "fix"`` without those fields died on its first line of real work
+    (``Fatal error: branch is required``) and burned all three retries. The
+    remediation path had therefore never once run.
+
+    The payload is validated through ``validate_internal_payload`` here so a
+    contract violation is a loud ``ValueError`` at spawn time instead of a
+    doomed VM discovering it three retries later.
     """
     key = f"guard-suppression:{chain.project_id}:{chain.finding_key}"
+    payload = validate_internal_payload(
+        {
+            "type": "create",
+            "effort": "medium",
+            "base_branch": base_branch,
+            "title": "Resolve recurring baseline guard suppression",
+            "prompt": (
+                "Remove the named inherited guard failure and verify a clean "
+                "publication-gate receipt. Do not suppress or rename the identity."
+            ),
+        },
+        GUARD_REMEDIATION_SPAWN_CONTEXT,
+    )
     return Task(
         project_id=chain.project_id,
         title=f"fix: resolve recurring {chain.suppression_lane or 'guard'} baseline failure",
-        payloads=[
-            {
-                "type": "fix",
-                "effort": "medium",
-                "title": "Resolve recurring baseline guard suppression",
-                "prompt": (
-                    "Remove the named inherited guard failure and verify a clean "
-                    "publication-gate receipt. Do not suppress or rename the identity."
-                ),
-            }
-        ],
+        payloads=[payload],
         context={
             "spawned_by": "guard_suppression_remediation",
             "guard_suppression_remediation_keys": [chain.finding_key],
@@ -231,50 +253,87 @@ def _guard_remediation_task(chain: ModuleFindingChain) -> Task:
     )
 
 
+def guard_suppression_escalation_summary(
+    owner: Task | None, unowned_reason: str | None
+) -> str:
+    """Render the operator-facing claim for one mature chain.
+
+    Ownership is asserted only when an owner exists. An unowned escalation
+    names why nothing owns the chain rather than silently dropping the claim:
+    "surface reasons, not states".
+    """
+    head = (
+        f"Recurring baseline guard suppression reached {CHAIN_ESCALATION_THRESHOLD} "
+        f"independent tasks"
+    )
+    if owner is not None:
+        return f"{head}; remediation task {owner.id} now owns it."
+    return f"{head}; NO remediation task owns it: {unowned_reason}"
+
+
 async def _post_guard_suppression_escalation(
-    session: AsyncSession, chain: ModuleFindingChain, owner: Task
+    session: AsyncSession,
+    chain: ModuleFindingChain,
+    owner: Task | None = None,
+    *,
+    unowned_reason: str | None = None,
 ) -> None:
-    """Emit one aggregate, audience-classified escalation for the chain."""
+    """Emit or refresh one aggregate, audience-classified escalation.
+
+    The claim must track reality. ``post_event_message`` returns an existing
+    row *unchanged* on an idempotency hit, so a message first written while a
+    task owned the chain would otherwise keep asserting that ownership after
+    the owner failed, was cancelled, or was never creatable at all. Refresh the
+    rendered content and the context on every call so the operator is never
+    left reading a claim that a corpse owns the problem.
+    """
+    if owner is None and not unowned_reason:
+        raise ValueError(
+            "an unowned guard-suppression escalation must name why nothing owns it"
+        )
     if not hasattr(session, "scalar"):
         # Lightweight unit-test sessions exercise ledger semantics without the
         # message table; production AsyncSession always owns this method.
         return
     from app.notification_dispatch import post_event_message
 
+    summary = guard_suppression_escalation_summary(owner, unowned_reason)
     message = await post_event_message(
         session,
         chain.project_id,
         "remediation_escalated",
-        (
-            f"Recurring baseline guard suppression reached {CHAIN_ESCALATION_THRESHOLD} "
-            f"independent tasks; remediation task {owner.id} now owns it."
-        ),
+        summary,
         context={
             "finding_key": chain.finding_key,
             "lane": chain.suppression_lane,
             "failure_identity": chain.failure_identity,
             "occurrences": chain.occurrences,
-            "remediation_task_id": str(owner.id),
+            "remediation_task_id": str(owner.id) if owner is not None else None,
+            "remediation_unowned_reason": unowned_reason,
         },
-        task_id=owner.id,
+        task_id=owner.id if owner is not None else None,
         idempotency_key=f"guard-suppression:{chain.project_id}:{chain.finding_key}:escalation",
     )
-    if message is not None and message.status == "resolved":
+    if message is None:
+        return
+    if message.status == "resolved":
         # The stable idempotency key is the aggregate's identity. Reopen that
         # one message for a new lifecycle instead of emitting a per-recurrence
         # operator notification.
         message.status = "open"
         message.resolution = None
         message.resolved_at = None
-        context = dict(message.context or {})
-        context.update(
-            {
-                "occurrences": chain.occurrences,
-                "remediation_task_id": str(owner.id),
-            }
-        )
-        message.context = context
-        session.add(message)
+    message.content = summary
+    context = dict(message.context or {})
+    context.update(
+        {
+            "occurrences": chain.occurrences,
+            "remediation_task_id": str(owner.id) if owner is not None else None,
+            "remediation_unowned_reason": unowned_reason,
+        }
+    )
+    message.context = context
+    session.add(message)
 
 
 async def ingest_guard_suppression_receipt(task: Task, session: AsyncSession) -> list[ModuleFindingChain]:
@@ -444,6 +503,15 @@ async def _release_terminal_remediation_owner(
         # The owner row is gone entirely — nothing can resolve the chain
         # through it, so re-election is strictly better than staying stuck.
         chain.remediation_task_id = None
+        await _post_guard_suppression_escalation(
+            session,
+            chain,
+            None,
+            unowned_reason=(
+                f"remediation task {owner_id} no longer exists; the chain is "
+                "awaiting a new owner"
+            ),
+        )
         return
     if owner.status in _DEAD_REMEDIATION_OWNER_STATUSES:
         logger.info(
@@ -453,6 +521,23 @@ async def _release_terminal_remediation_owner(
             owner.status,
         )
         chain.remediation_task_id = None
+        # Correct the operator record in the same breath. The escalation was
+        # written as an ownership claim; leaving it standing after the owner
+        # terminated tells the operator the problem is handled when nothing is
+        # handling it.
+        status_text = getattr(owner.status, "value", owner.status)
+        detail = (owner.latest_status_message or "").strip()
+        await _post_guard_suppression_escalation(
+            session,
+            chain,
+            None,
+            unowned_reason=(
+                f"remediation task {owner_id} ended {status_text} without a clean "
+                "publication-gate receipt"
+                + (f" ({detail[:200]})" if detail else "")
+                + "; the chain is awaiting a new owner"
+            ),
+        )
 
 
 def _chain_awaits_remediation_owner(chain: ModuleFindingChain) -> bool:
@@ -480,38 +565,70 @@ async def elect_guard_suppression_owners(
     decision can be made here, a moment later, under the correct lock.
 
     Bounded per invocation and idempotent: a chain that already has an owner is
-    no longer a candidate, and a project that is paused, archived, or
+    no longer an election candidate, and a project that is paused, archived, or
     momentarily lock-contended is simply skipped until the next sweep.
+
+    A second bounded pass releases owners that already terminated. Ingestion
+    releases those too, but only when a *new* receipt happens to arrive; a
+    chain whose owner died and whose lane then went quiet would otherwise sit
+    behind a corpse forever, with an operator message still claiming the
+    problem is owned.
     """
     from app.task_locking import (
         AUTOMATIC_TASK_CREATION_ALLOWED,
         acquire_automatic_task_creation_authority,
     )
 
+    def _mature(*extra) -> Any:
+        return (
+            select(ModuleFindingChain)
+            .where(
+                ModuleFindingChain.chain_kind == GUARD_SUPPRESSION_CHAIN_KIND,
+                ModuleFindingChain.status == "open",
+                ModuleFindingChain.verified_occurrences >= CHAIN_ESCALATION_THRESHOLD,
+                *extra,
+            )
+            .order_by(ModuleFindingChain.last_seen_at.asc())
+            .limit(limit)
+        )
+
+    # Two separately-bounded reads. Owned-but-dead chains must not consume the
+    # election batch budget, or a backlog of them would starve the unowned
+    # chains this sweep exists to serve.
     candidates = list(
         (
             await session.execute(
-                select(ModuleFindingChain)
-                .where(
-                    ModuleFindingChain.chain_kind == GUARD_SUPPRESSION_CHAIN_KIND,
-                    ModuleFindingChain.status == "open",
-                    ModuleFindingChain.remediation_task_id.is_(None),
-                    ModuleFindingChain.verified_occurrences
-                    >= CHAIN_ESCALATION_THRESHOLD,
-                )
-                .order_by(ModuleFindingChain.last_seen_at.asc())
-                .limit(limit)
+                _mature(ModuleFindingChain.remediation_task_id.is_(None))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    owned = list(
+        (
+            await session.execute(
+                _mature(ModuleFindingChain.remediation_task_id.is_not(None))
             )
         )
         .scalars()
         .all()
     )
     by_project: dict[Any, list[ModuleFindingChain]] = {}
-    for chain in candidates:
+    seen: set[int] = set()
+    for chain in (*owned, *candidates):
         # Re-assert the predicate in Python. The row is the authority, and this
         # keeps the decision identical whether the filtering happened in SQL or
-        # the row changed between the read and this pass.
-        if _chain_awaits_remediation_owner(chain):
+        # the row changed between the read and this pass. Ownership is
+        # deliberately NOT part of the predicate here: a dead owner is released
+        # below and the freed chain is elected in the same pass.
+        if id(chain) in seen:
+            continue
+        if (
+            chain.chain_kind == GUARD_SUPPRESSION_CHAIN_KIND
+            and chain.status == "open"
+            and int(chain.verified_occurrences or 0) >= CHAIN_ESCALATION_THRESHOLD
+        ):
+            seen.add(id(chain))
             by_project.setdefault(chain.project_id, []).append(chain)
 
     elected: list[Task] = []
@@ -524,8 +641,52 @@ async def elect_guard_suppression_owners(
                 decision,
             )
             continue
+        # The Project row carries the base branch this remediation is cut from.
+        # Resolve it through the canonical resolver: a hardcoded "main" would
+        # push new work onto the promotion target of every project whose
+        # integration trunk is something else. ``acquire_...`` already fails
+        # closed as ``project_unavailable`` when the row is missing, so a
+        # ``None`` here means a session that cannot load the project at all.
+        project = (
+            await session.get(Project, project_id) if hasattr(session, "get") else None
+        )
+        if project is None:
+            logger.warning(
+                "guard-suppression owner election skipped project %s: project row "
+                "unavailable, cannot resolve a base branch",
+                project_id,
+            )
+            continue
+        base_branch = get_project_integration_branch(project)
         for chain in chains:
-            owner = _guard_remediation_task(chain)
+            # Releasing a terminated owner is record correction, not new work,
+            # but it runs under the same admission so a paused project is never
+            # churned. A released chain becomes electable in this same pass.
+            await _release_terminal_remediation_owner(session, chain)
+            if not _chain_awaits_remediation_owner(chain):
+                continue
+            try:
+                owner = _guard_remediation_task(chain, base_branch=base_branch)
+            except (PayloadTooLargeError, ValueError) as exc:
+                # A payload the agent cannot run must never be published as an
+                # owner. Say so on the operator record instead of asserting a
+                # corpse owns the chain, and leave the chain electable for a
+                # sweep that runs once the contract is fixed.
+                logger.exception(
+                    "guard-suppression remediation payload rejected for chain %s: %s",
+                    chain.finding_key,
+                    exc,
+                )
+                await _post_guard_suppression_escalation(
+                    session,
+                    chain,
+                    None,
+                    unowned_reason=(
+                        "the remediation task payload was rejected at spawn time "
+                        f"({exc}); no runnable task could be created"
+                    ),
+                )
+                continue
             chain.remediation_task_id = owner.id
             session.add(owner)
             session.add(chain)

@@ -1255,6 +1255,7 @@ async def orchestrator_worker():
         is_managed_compute_enabled,
         managed_compute_denial_snapshot,
     )
+    from app.runner_project_binding import resolve_local_capacity_hold
     from app.vm_lifecycle import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
@@ -4590,16 +4591,27 @@ async def orchestrator_worker():
                         # snapshot instead of silently falling through.
                         if not is_managed_compute_enabled():
                             held_context = clear_task_llm_runtime_context(task.context)
+                            # Name the condition that actually bound. "No free
+                            # local slot" and "zero runners are bound to this
+                            # project" are different defects with different
+                            # remedies; a fresh project hits the second one and
+                            # the capacity wording sends the reader hunting for
+                            # a busy fleet that is in fact idle.
+                            (
+                                _hold_message,
+                                _runner_binding_wait,
+                            ) = await resolve_local_capacity_hold(
+                                session, task.project_id
+                            )
                             task.context = {
                                 **(held_context or {}),
                                 "managed_compute": managed_compute_denial_snapshot(
                                     backend="agent_dispatch"
                                 ),
+                                "runner_binding_wait": _runner_binding_wait,
                             }
                             task.llm_account_id = None
-                            task.latest_status_message = (
-                                "Waiting for local capacity: managed cloud execution is disabled"
-                            )
+                            task.latest_status_message = _hold_message
                             session.add(task)
                             await session.commit()
                             if account_id:

@@ -25,6 +25,7 @@ from app.github import (
 )
 from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_auto_fix_spawned_message
+from app.payload_schemas import validate_internal_payload
 from app.task_completion import _stamp_remediation_spawn_on_direction
 from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.time_utils import _utcnow
@@ -649,6 +650,16 @@ async def _handle_main_branch_ci_failure_inner(
     }
     if _ci_failure_selectors:
         task_payload["ci_failure_selectors"] = _ci_failure_selectors
+    # Validate the payload against its own task-type contract before anything is
+    # published. A system spawn that omits a field its handler hard-requires is
+    # otherwise only discovered by a claimed VM that dies on its first line of
+    # real work and burns all three retries -- exactly how the guard-suppression
+    # remediation path shipped a branchless ``fix`` payload that never once ran.
+    # ``validate_internal_payload`` re-raises schema and size violations, so a
+    # contract break here is a loud spawn-time failure instead of a doomed VM.
+    task_payload = validate_internal_payload(
+        task_payload, "auto_remediation:ci_failure_fix"
+    )
 
     # The webhook may spend time on GitHub and diagnostic lookups above.  Take
     # the canonical Project authority only at the publication edge, then retain

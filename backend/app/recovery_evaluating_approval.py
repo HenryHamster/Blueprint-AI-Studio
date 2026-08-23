@@ -47,6 +47,7 @@ imports are kept unchanged so test patches against ``app.services.<name>``,
 ``app.alert_dispatch._maybe_create_failure_alert`` still take effect.
 """
 
+import contextlib
 import logging
 from datetime import datetime
 
@@ -389,6 +390,91 @@ async def _handle_approval_gate_timeout(
                 {"task_id": str(task.id), "status": task.status},
             )
             return True
+
+        # A fence hold is a MACHINE-set dependency, never a human question.
+        # ``rollup_lineage_fence.mark_ancestor_rollups_awaiting_operator``
+        # establishes it autonomously to encode "a descendant of mine needs
+        # intervention" — a blocker with its own lifecycle, on its own
+        # clock. Running the generic 2h *human*-approval timeout against it
+        # FAILs the ancestor while the blocker is still moving: it resolves
+        # nothing, and it destroys the rollup. Incident 2026-08-23: research
+        # 70c5ec8f carried
+        # ``_approval_hold_provenance.owner == "rollup_lineage_fence"`` set at
+        # 01:42Z, this branch FAILED it at ~03:42Z, and the blocking
+        # descendant's PR #17693 merged at 12:11Z — 8.5h after the
+        # ancestor was already dead. The release check above is also only
+        # reachable from inside THIS timeout branch, so a blocker resolving at
+        # any other moment was never noticed at all (the reaper sweep
+        # ``sweep_release_resolved_descendant_fence_blocks`` now runs the same
+        # adjudication on its own cadence).
+        #
+        # So: adjudicate instead of terminalizing — WAIT while a blocker
+        # is non-terminal, RELEASE when they all resolved, DECIDE (release +
+        # record the unresolved descendants) once every blocker is terminal
+        # and the block aged out. Ownership is proven STRUCTURALLY (non-empty
+        # keyed blocks + the exact hold receipt + the fence's own provenance
+        # owner), never by matching a reason string, and it is proven BEFORE
+        # any I/O: if ownership does not hold, this whole branch is skipped
+        # and every disposition below applies exactly as it did before.
+        if not _fence_released:
+            _fence_owned = False
+            try:
+                from app.rollup_lineage_fence import (
+                    adjudicate_descendant_operator_blocks,
+                    descendant_operator_block_hold_is_owned,
+                )
+
+                _fence_owned = descendant_operator_block_hold_is_owned(task)
+            except Exception:
+                _fence_owned = False
+                logger.debug(
+                    f"[EVAL TIMEOUT] Fence-hold ownership check failed for "
+                    f"{str(task.id)[:8]} — falling through unchanged",
+                    exc_info=True,
+                )
+            if _fence_owned:
+                _fence_state = "waiting"
+                # Snapshot identity BEFORE the adjudication attempt. Its except
+                # clause rolls back, which expires every instance in the session,
+                # so a later ``task.id`` / ``task.project_id`` is a lazy refresh —
+                # MissingGreenlet under asyncio. The log line and the broadcast
+                # below are exactly the two signals that tell an operator the
+                # hold was kept, so raising there would erase the reason for the
+                # one path whose whole job is to be observable.
+                _fence_task_id = str(task.id)
+                _fence_project_id = str(task.project_id)
+                _fence_status = task.status
+                try:
+                    _fence_state = await adjudicate_descendant_operator_blocks(
+                        task, session, now=now
+                    )
+                    _fence_status = task.status
+                    await session.commit()
+                except Exception:
+                    # Ownership was PROVEN above, so a transient adjudication
+                    # error must NOT let this row fall through to the FAILED
+                    # terminalization: hold it and retry on the next sweep.
+                    _fence_state = "waiting"
+                    logger.warning(
+                        f"[EVAL TIMEOUT] Fence-hold adjudication failed for "
+                        f"{_fence_task_id[:8]} — keeping the hold rather "
+                        f"than failing a machine-held rollup",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+                logger.info(
+                    f"[EVAL TIMEOUT] Task {_fence_task_id[:8]} carries a "
+                    f"MACHINE-set rollup_lineage_fence descendant-block hold "
+                    f"({hours}h old) — adjudicated {_fence_state!r}; the "
+                    f"human-approval timeout does not apply to it"
+                )
+                await services.broadcast_to_project(
+                    _fence_project_id,
+                    "task_updated",
+                    {"task_id": _fence_task_id, "status": _fence_status},
+                )
+                return True
 
         # If the PR is still clean/mergeable and not yet preserved, leave it
         # open for hand-merge instead of silently abandoning it. Guard with

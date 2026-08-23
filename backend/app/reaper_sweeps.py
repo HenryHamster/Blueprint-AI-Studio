@@ -2240,6 +2240,100 @@ async def sweep_recover_stranded_escalated_blockers(
     return recovered
 
 
+# ── Rollup lineage-fence descendant-block adjudication sweep ─────────────────
+
+# Bounded batch. Each row costs at most one GitHub round-trip per distinct
+# blocked PR, and fenced ancestors are rare, so a small page is plenty.
+_FENCE_BLOCK_SWEEP_BATCH = 50
+
+
+async def sweep_release_resolved_descendant_fence_blocks(
+    session, now: datetime, *, batch_size: int = _FENCE_BLOCK_SWEEP_BATCH
+) -> int:
+    """Adjudicate machine-set descendant-block holds on their own cadence.
+
+    ``rollup_lineage_fence`` parks an ancestor rollup behind a descendant that
+    needs intervention. Until this sweep existed the ONLY code that noticed
+    the blocker resolving lived inside the approval-gate *timeout* branch of
+    ``recovery_evaluating_approval`` — a single narrow window. A blocker
+    that resolved at any other moment was never seen, and once the ancestor
+    went terminal the path was unreachable forever (incident 2026-08-23:
+    ancestor 70c5ec8f was FAILED at ~03:42Z; the blocking descendant's PR
+    #17693 merged at 12:11Z).
+
+    Runs :func:`app.rollup_lineage_fence.adjudicate_descendant_operator_blocks`
+    over EVALUATING/BLOCKED tasks carrying ``_descendant_operator_blocks``:
+    release when the blockers resolved, decide once every blocker is terminal
+    and the block aged out, otherwise re-state the wait. Ownership is proven
+    per row inside the adjudicator, so a row whose latch was taken over by an
+    independent approval episode is skipped untouched. One bad row never
+    aborts the batch.
+
+    Returns the number of ancestors actually changed.
+    """
+    from app.rollup_lineage_fence import (
+        _OPERATOR_BLOCKS_KEY,
+        adjudicate_descendant_operator_blocks,
+    )
+
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.status.in_(
+                        [TaskStatus.EVALUATING, TaskStatus.BLOCKED]
+                    ),
+                    Task.requires_approval.is_(True),
+                    Task.context[_OPERATOR_BLOCKS_KEY].isnot(None),
+                )
+                .order_by(Task.updated_at.asc())
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    changed = 0
+    for task in rows:
+        task_id = task.id
+        before_message = task.latest_status_message
+        try:
+            state = await adjudicate_descendant_operator_blocks(
+                task, session, now=now
+            )
+            if state == "not_fenced":
+                continue
+            row_changed = state in ("released", "decided") or (
+                task.latest_status_message != before_message
+            )
+            if not row_changed:
+                # Idempotent no-op: nothing to write, so do not churn the row.
+                continue
+            await session.commit()
+            changed += 1
+            logger.info(
+                "[REAPER] Lineage-fence adjudication: ancestor %s -> %s",
+                str(task_id)[:8],
+                state,
+            )
+        except Exception as e:
+            # One bad row never aborts the batch.
+            logger.error(
+                "[REAPER] Lineage-fence adjudication error on task %s: %s",
+                str(task_id)[:8],
+                e,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    return changed
+
+
 # ── Strategic cycle starvation sweep ─────────────────────────────────────────
 
 # Autonomous projects older than this window with no completed StrategicCycle
@@ -2286,6 +2380,11 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     from app.models import Alert, AlertSeverity, Project, StrategicCycle
     from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
     from app.shared_state import runtime_config as _runtime_config
+    from app.strategic_cycle import OUTCOME_COMPLETED
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_worker_is_healthy,
+    )
 
     starvation_hours = int(
         _runtime_config.get(
@@ -2348,6 +2447,7 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             )
             .where(
                 StrategicCycle.project_id.in_(candidate_ids),
+                StrategicCycle.outcome == OUTCOME_COMPLETED,
                 StrategicCycle.phase2_completed_at.is_not(None),
             )
             .group_by(StrategicCycle.project_id)
@@ -2360,8 +2460,53 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         if completed_at is not None and completed_at >= cutoff
     }
 
-    # Batched lookup 2: which candidate projects already have an open WARNING
-    # dedup alert. Replaces the per-project dedup SELECT (the second N+1).
+    # A Continuous Workday Resident deliberately keeps its cycle open for the
+    # whole session, so its cycle row cannot provide a terminal completion
+    # receipt. Batch-load the exact task named by each session projection and
+    # suppress only for a canonical, identity-matched, bounded-fresh worker.
+    resident_task_ids: list[uuid.UUID] = []
+    resident_blobs: dict[Any, dict[str, Any]] = {}
+    for project_id in candidate_ids:
+        blob = read_resident_session(candidate_visions.get(project_id))
+        if not isinstance(blob, dict):
+            continue
+        task_id = blob.get("task_id")
+        if not task_id:
+            continue
+        try:
+            task_uuid = uuid.UUID(str(task_id))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        resident_task_ids.append(task_uuid)
+        resident_blobs[project_id] = blob
+
+    resident_tasks: dict[uuid.UUID, Task] = {}
+    if resident_task_ids:
+        resident_tasks = {
+            task.id: task
+            for task in (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id.in_(candidate_ids),
+                        Task.id.in_(resident_task_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        }
+    healthy_resident_projects = {
+        project_id
+        for project_id, blob in resident_blobs.items()
+        if resident_worker_is_healthy(
+            blob,
+            resident_tasks.get(uuid.UUID(str(blob["task_id"]))),
+            now,
+        )
+    }
+
+    # Batched lookup: which candidate projects already have an open WARNING
+    # dedup alert. Replaces the per-project dedup SELECT.
     projects_with_open_alert = set(
         (
             await session.execute(
@@ -2391,6 +2536,8 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         if project_id in recent_completions:
             continue
         if _recent_no_delta_skip_at(candidate_visions.get(project_id), cutoff) is not None:
+            continue
+        if project_id in healthy_resident_projects:
             continue
         if automatic_cycles_allowed[project_id]:
             # An alert is only the operator-facing symptom. Arm the durable
@@ -2425,7 +2572,7 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             project_id,
             session,
             starvation_hours=starvation_hours,
-            last_completed_at=latest_completions.get(project_id),
+            last_successful_completed_at=latest_completions.get(project_id),
         ):
             created += 1
     return created
@@ -2442,7 +2589,7 @@ async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
     from app.strategic_resident_session import (
         _auto_start_on_workday_entry,
         read_resident_session,
-        resident_session_is_active,
+        resident_worker_is_healthy,
     )
     from app.workbench_state import get_strategic_workbench_state
 
@@ -2450,9 +2597,19 @@ async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
     try:
         async with AsyncSessionLocal() as fresh:
             project = await fresh.get(Project, project_id)
-            if project is None or resident_session_is_active(
-                read_resident_session(project.vision)
-            ):
+            if project is None:
+                return
+            resident_blob = read_resident_session(project.vision)
+            resident_task = None
+            resident_task_id = (resident_blob or {}).get("task_id")
+            if resident_task_id:
+                try:
+                    resident_task = await fresh.get(
+                        Task, uuid.UUID(str(resident_task_id))
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    resident_task = None
+            if resident_worker_is_healthy(resident_blob, resident_task, _utcnow()):
                 return
             operator_rows = (
                 await fresh.execute(
@@ -4681,6 +4838,127 @@ async def sweep_acceptance_verdict_healing_backfills(
     return total
 
 
+# Hourly cadence for the unactionable-engine-escalation release sweep (Step 26).
+# Independent timer so it is not suppressed by another sweep's timer stamp
+# earlier in the same reaper cycle.
+_UNACTIONABLE_APPROVAL_HOLD_INTERVAL_SECONDS = 3600
+# Bounded per-run work: at most this many COMPLETED approval-hold rows are
+# examined per sweep (the whole population is served by the
+# ``requires_approval = true`` partial index from migration 0275, so this scan
+# is index-only and tiny; the cap exists so one pathological project cannot
+# monopolise a reaper cycle).
+_UNACTIONABLE_APPROVAL_HOLD_SCAN_CAP = 2000
+_UNACTIONABLE_APPROVAL_HOLD_BATCH = 200
+_last_unactionable_approval_hold_sweep: datetime | None = None
+
+
+async def sweep_release_unactionable_approval_holds(session, now=None) -> int:
+    """Step 26: retract engine escalations stamped onto already-COMPLETED rows.
+
+    ``requires_approval`` is a DECISION gate.  Four pipeline refusal paths used
+    it as a NOTIFICATION, stamping the latch onto the very review/fix row whose
+    COMPLETED write they were processing, so approving and denying the row
+    produce the same outcome: nothing.  Measured on the Blueprint project
+    2026-08-23, 182 of 184 rows in the operator approval queue were COMPLETED
+    corpses and the two live decisions were invisible among them.
+    ``app.review_request_changes`` and ``app.task_lifecycle_fix_completion``
+    now settle their own escalation inline, so this sweep exists for the rows
+    already stamped before that fix and for any row that becomes inert later.
+
+    Every release goes through :func:`
+    app.admin_approval_authority.settle_unactionable_pipeline_escalation`, which
+    fails CLOSED on anything an operator owns -- a manual/policy hold, a live
+    follow-up claim, an in-flight merge intent, a review-wait timer, a
+    non-COMPLETED row, a security-scan reason, or any owner outside the pinned
+    engine allowlist -- and leaves an ``_approval_hold_released_because``
+    receipt plus a human-readable ``latest_status_message`` behind.
+
+    Hourly cadence-gated on an independent timer.  Returns the number of holds
+    released this run.
+    """
+    global _last_unactionable_approval_hold_sweep
+    from app.admin_approval_authority import (
+        settle_unactionable_pipeline_escalation,
+    )
+    from app.task_locking import task_lock
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_unactionable_approval_hold_sweep,
+        _UNACTIONABLE_APPROVAL_HOLD_INTERVAL_SECONDS,
+        _now,
+    ):
+        return 0
+    _last_unactionable_approval_hold_sweep = _now
+
+    released = 0
+    examined = 0
+    last_id: uuid.UUID | None = None
+    while examined < _UNACTIONABLE_APPROVAL_HOLD_SCAN_CAP:
+        query = (
+            select(Task.id)
+            .where(
+                Task.requires_approval.is_(True),
+                Task.status == TaskStatus.COMPLETED,
+                Task.archived.is_not(True),
+            )
+            .order_by(Task.id)
+            .limit(_UNACTIONABLE_APPROVAL_HOLD_BATCH)
+        )
+        if last_id is not None:
+            query = query.where(Task.id > last_id)
+        candidate_ids = (await session.execute(query)).scalars().all()
+        if not candidate_ids:
+            break
+        last_id = candidate_ids[-1]
+        examined += len(candidate_ids)
+
+        for task_id in candidate_ids:
+            try:
+                # Re-lock and re-read: discovery above is deliberately unlocked,
+                # so the gate must be re-evaluated against the freshly loaded
+                # row under FOR UPDATE. A contended row is simply retried next
+                # cycle.
+                async with task_lock(session, task_id, skip_locked=True) as locked:
+                    if locked is None:
+                        continue
+                    reason = await settle_unactionable_pipeline_escalation(
+                        locked,
+                        session,
+                        released_by="reaper_unactionable_approval_hold_sweep",
+                    )
+                    if reason is None:
+                        await session.rollback()
+                        continue
+                    session.add(locked)
+                    await session.commit()
+                    released += 1
+                    logger.info(
+                        "[REAPER] Step 26: released unactionable approval hold "
+                        "on COMPLETED task %s (reason=%s)",
+                        task_id,
+                        reason,
+                    )
+            except Exception:
+                logger.warning(
+                    "[REAPER] Step 26: unactionable approval-hold release failed "
+                    "for task %s:",
+                    task_id,
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(candidate_ids) < _UNACTIONABLE_APPROVAL_HOLD_BATCH:
+            break
+
+    if released:
+        logger.info(
+            "[REAPER] Step 26: released %d unactionable approval hold(s)",
+            released,
+        )
+    return released
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -4749,4 +5027,6 @@ __all__ = [
     "sweep_backfill_merged_named_test_coverage",
     "sweep_acceptance_verdict_healing_backfills",
     "_ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS",
+    "sweep_release_unactionable_approval_holds",
+    "_UNACTIONABLE_APPROVAL_HOLD_INTERVAL_SECONDS",
 ]

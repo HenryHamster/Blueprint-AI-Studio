@@ -3559,8 +3559,8 @@
           "new_cap": 2050
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-23T14:42:28.679301+00:00",
+          "commit_sha": "8d6dfdd2e330a5bb2b36a56915dbac61dee10b79",
+          "commit_date": "2026-08-23T07:32:31-07:00",
           "old_cap": 2050,
           "new_cap": 2100
         }
@@ -4667,8 +4667,8 @@
       ],
       "check_size_limits.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-23T17:47:32.117509+00:00",
+          "commit_sha": "27ad0339869496c60f5bd3f969096f8af5e78d1f",
+          "commit_date": "2026-08-23T11:02:03-07:00",
           "old_cap": 1750,
           "new_cap": 1800
         }
@@ -4703,10 +4703,16 @@
           "new_cap": 1050
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-23T01:08:46.975054+00:00",
+          "commit_sha": "27ad0339869496c60f5bd3f969096f8af5e78d1f",
+          "commit_date": "2026-08-23T11:02:03-07:00",
           "old_cap": 1000,
           "new_cap": 1050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-23T21:50:06.816394+00:00",
+          "old_cap": 1050,
+          "new_cap": 1075
         }
       ],
       "test_vitest_verification_guard.py": [

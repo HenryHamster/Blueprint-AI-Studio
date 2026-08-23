@@ -64,6 +64,47 @@ def _make_leader_db_healthy():
     _ss.external_health["failed_deps"] = []
 
 
+async def _make_resident_liveness_project(db_session, now, heartbeat_age):
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    project = make_project(
+        autonomous_enabled=True,
+        build_config={"automatic_strategic_cycles_enabled": False},
+        created_at=now - timedelta(days=3),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    task = Task(
+        project_id=project.id,
+        title="Resident liveness worker",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - heartbeat_age,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "liveness-session",
+            "_resident_worker_generation": 1,
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": "liveness-session",
+            "task_id": str(task.id),
+            "worker_generation": 1,
+            "worker_state": "ready",
+            "status": "active",
+            "stop_requested": False,
+            "started_at": (now - timedelta(days=2)).isoformat(),
+            "worker_heartbeat_at": (now - heartbeat_age).isoformat(),
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    return project
+
+
 class TestLivenessModuleExtraction:
     """The liveness heartbeat + watchdog LOGIC was extracted to
     ``app.orchestrator_liveness`` while the mutable gauges
@@ -193,7 +234,10 @@ class TestStrategicLoopLiveness:
             )
         ).scalars().one()
         assert "loop=strategic" in alert.message
-        assert f"last_completed_at={last_completed.isoformat()}" in alert.message
+        assert (
+            f"last_successful_completed_at={last_completed.isoformat()}"
+            in alert.message
+        )
         assert routed == [
             (
                 str(project.id),
@@ -321,13 +365,9 @@ class TestStrategicLoopLiveness:
         )
 
         now = _utcnow()
-        project = make_project(
-            autonomous_enabled=True,
-            build_config={"automatic_strategic_cycles_enabled": False},
-            created_at=now - timedelta(days=3),
+        project = await _make_resident_liveness_project(
+            db_session, now, timedelta(hours=2)
         )
-        db_session.add(project)
-        await db_session.commit()
         db_session.add(
             MessagesNoisePrefs(
                 user_id="workday-operator",
@@ -602,10 +642,10 @@ class TestStrategicLoopLiveness:
             )
         ).scalars().first()
 
-    async def test_phase1_completion_does_not_count_as_full_cycle_liveness(
+    async def test_failed_phase2_timestamp_does_not_count_as_full_cycle_liveness(
         self, db_session
     ):
-        """A phase-2 stall must not be masked by a recent phase-1 receipt."""
+        """A failed/cancelled phase-2 timestamp is not a success receipt."""
         from app.reaper_sweeps import (
             _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
             _sweep_strategic_cycle_starvation,
@@ -619,16 +659,16 @@ class TestStrategicLoopLiveness:
         db_session.add(project)
         await db_session.commit()
 
-        # Phase 1 completed recently, but phase 2 stalled before its completion
-        # handler ran. This is a halted full cycle, not a liveness receipt.
+        # Reconciliation records a phase-2 failure/cancellation timestamp, but
+        # that terminal failure is not a successful liveness receipt.
         db_session.add(
             StrategicCycle(
                 id=f"sc-{uuid.uuid4().hex[:8]}",
                 project_id=project.id,
-                phase1_started_at=now - timedelta(hours=2),
-                phase1_completed_at=now - timedelta(hours=1),
-                phase2_started_at=now - timedelta(hours=1),
-                outcome="stalled_phase2",
+                phase2_started_at=now - timedelta(hours=2),
+                phase2_completed_at=now - timedelta(hours=1),
+                outcome="failed_phase2",
+                cycle_metadata={"terminal_disposition": "cancelled"},
             )
         )
         await db_session.commit()
@@ -642,7 +682,37 @@ class TestStrategicLoopLiveness:
                 )
             )
         ).scalars().one()
-        assert "last_completed_at=never" in alert.message
+        assert "last_successful_completed_at=never" in alert.message
+
+    async def test_live_resident_session_is_not_reported_halted(
+        self, db_session, monkeypatch
+    ):
+        """A fresh exact Resident worker stays healthy past the cycle window."""
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+        now = _utcnow()
+        project = await _make_resident_liveness_project(
+            db_session, now, timedelta(minutes=1)
+        )
+
+        restart = AsyncMock()
+        monkeypatch.setattr(
+            "app.strategic_resident_session._auto_start_on_workday_entry",
+            restart,
+        )
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+        assert restart.await_count == 0
+        assert not (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().first()
 
     async def test_liveness_alert_routes_to_operator_action_needed(self):
         from app.message_audience import OPERATOR_ACTION_NEEDED, route_event

@@ -737,6 +737,14 @@ def test_non_backend_task_diff_breaching_size_guard_fails_check(tmp_path: Path) 
         REPO_ROOT / "scripts" / "static_release_guard.py",
         tmp_path / "scripts" / "static_release_guard.py",
     )
+    # The lint-only path also runs the derived-artifact freshness lane and fails
+    # closed without it. This fixture carries no drift-sentinel manifest, so the
+    # real helper selects nothing and skips -- which is the point: the subject
+    # here is the size guard, and the freshness lane must not perturb it.
+    shutil.copy2(
+        REPO_ROOT / "scripts" / "sentinel_freshness.py",
+        tmp_path / "scripts" / "sentinel_freshness.py",
+    )
     # The guard imports its sibling suppression-receipt emitter, so the fixture
     # tree must carry it too.
     shutil.copy2(

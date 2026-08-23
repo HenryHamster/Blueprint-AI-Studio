@@ -41,6 +41,7 @@ from app.admin_approval_authority import (
     APPROVAL_HOLD_PROVENANCE_KEY,
     approval_hold_provenance,
     establish_independent_approval_hold,
+    settle_unactionable_pipeline_escalation,
 )
 from app.branch_resolution import classify_rollup_merge_outcome
 from app.context_bounds import bound_review_history
@@ -66,7 +67,25 @@ from app.review_target_drift import _base_move_invalidates_approval
 logger = logging.getLogger(__name__)
 
 
-def _establish_request_changes_hold(task: Task, *, reason: str) -> None:
+async def _establish_request_changes_hold(
+    task: Task, session: AsyncSession, *, reason: str
+) -> None:
+    """Escalate a request-changes refusal without stamping a dead row.
+
+    ``requires_approval`` means "an operator still has an answer that changes
+    what happens next".  Every call here runs from ``_process_post_commit``
+    while this review row is being written COMPLETED, so the latch usually
+    lands somewhere no disposition can reach: approving and denying produce the
+    same outcome.  Establish the episode through the normal provenance seam,
+    then immediately settle it when it is provably inert, leaving the
+    ``_approval_hold_released_because`` receipt behind.  The operator still
+    learns about the refusal through ``latest_status_message`` and the WARNING
+    alert each call site raises -- notification never needed the decision gate.
+
+    ``latest_status_message`` must already be assigned when this is called: the
+    settle appends its reason to it.
+    """
+
     context = dict(task.context or {})
     provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
     if (
@@ -80,6 +99,9 @@ def _establish_request_changes_hold(task: Task, *, reason: str) -> None:
         return
     establish_independent_approval_hold(
         task, reason=reason, owner="review_request_changes"
+    )
+    await settle_unactionable_pipeline_escalation(
+        task, session, released_by="review_request_changes"
     )
 
 
@@ -374,12 +396,12 @@ async def run_request_changes(
     # operator attention rather than expanding to an unpinned review.
     if not head_sha or not base_sha:
         task.status = TaskStatus.COMPLETED
-        _establish_request_changes_hold(
-            task, reason="review_target_unavailable"
-        )
         task.latest_status_message = (
             f"Review changes for PR #{pr_number} withheld: could not "
             "prove the live immutable review target"
+        )
+        await _establish_request_changes_hold(
+            task, session, reason="review_target_unavailable"
         )
         task.context = {
             **(task.context or {}),
@@ -604,12 +626,12 @@ async def run_request_changes(
             ) from _revoke_lock_err
 
         if _orig is None:
-            _establish_request_changes_hold(
-                task, reason="originating_task_missing"
-            )
             task.latest_status_message = (
                 f"Review blocked PR #{pr_number}, but its originating "
                 "task is missing; fix withheld for manual recovery"
+            )
+            await _establish_request_changes_hold(
+                task, session, reason="originating_task_missing"
             )
             session.add(task)
             await session.commit()
@@ -906,8 +928,8 @@ async def run_request_changes(
             f"Fix not spawned for PR #{pr_number} — "
             f"{_fix_refusal_label}"
         )
-        _establish_request_changes_hold(
-            task, reason="review_fix_spawn_refused"
+        await _establish_request_changes_hold(
+            task, session, reason="review_fix_spawn_refused"
         )
         session.add(task)
         cap_alert_title = (

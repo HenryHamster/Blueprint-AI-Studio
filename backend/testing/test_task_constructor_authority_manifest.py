@@ -108,6 +108,55 @@ STRUCTURAL_CALLERS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("task_completion", "_spawn_act_on_verdict_followon"): {("task_completion", "_handle_compute_experiment_completion"), ("task_completion", "run_compute_wake_post_commit")},
 }
 
+# ---------------------------------------------------------------------------
+# Payload-contract ratchet.
+#
+# Project authority answers "may this task be created at all".  It says nothing
+# about whether the payload the spawner assembled is one the agent can actually
+# run.  On 2026-08-23 the guard-suppression remediation path was found to have
+# published a ``type: "fix"`` payload with no ``branch`` and no ``pr_number``
+# every single time it fired: FixPayload requires both, and the agent's
+# handleFix validates ``branch`` on its first line of real work.  Every task
+# that path ever spawned died with ``Fatal error: branch is required`` and
+# exhausted its three retries, while the operator was told a remediation task
+# "now owns it".  The seam that would have caught it -- ``validate_internal_payload``
+# -- already existed and was already used by 44 of the 60 production spawn
+# sites; this path simply never called it.
+#
+# This guard is the ratchet: every production ``Task(...)`` site must validate
+# its payload against the task_type contract, or be named here.  The listed
+# sites are DEBT, not endorsement -- each one can still publish a payload its
+# handler cannot run.  Removing an entry (by routing that spawner through the
+# validator) is always the right direction; adding one requires deliberately
+# editing this list.
+_PAYLOAD_CONTRACT_VALIDATORS = ("validate_internal_payload", "validate_task_payload")
+
+PAYLOAD_CONTRACT_UNVALIDATED: dict[tuple[str, str], str] = {
+    ("acceptance_criteria", "enroll_criterion_named_test_trial"): "debt: not yet routed through the payload-contract validator",
+    ("acceptance_criteria", "spawn_corroboration_task"): "debt: not yet routed through the payload-contract validator",
+    ("auto_review", "_handle_auto_review_inner"): "debt: not yet routed through the payload-contract validator",
+    ("capability_proof", "enroll_capability_proof_trial"): "debt: not yet routed through the payload-contract validator",
+    ("discovery_review", "maybe_close_and_spawn_discovery_review"): "debt: not yet routed through the payload-contract validator",
+    ("evergreen_backlog", "spawn_evergreen_probe"): "debt: not yet routed through the payload-contract validator",
+    ("issue_implementation", "_handle_issue_implementation_inner"): "debt: not yet routed through the payload-contract validator",
+    ("repo_bootstrap", "spawn_bootstrap_task"): "debt: not yet routed through the payload-contract validator",
+    ("routers.admin_debug", "spawn_canary_adversarial_challenge"): "debt: not yet routed through the payload-contract validator",
+    ("sr_diagnostics_endpoints", "spawn_sr_investigation"): "debt: not yet routed through the payload-contract validator",
+    ("strategic_spawn_requests", "_task_from_specification"): "debt: not yet routed through the payload-contract validator",
+    ("strategic_spawning", "_finalize_strategic_review_spawn"): "debt: not yet routed through the payload-contract validator",
+    ("task_evaluators", "spawn_finding_challenge"): "debt: not yet routed through the payload-contract validator",
+    ("task_evaluators", "spawn_forward_quality_grader"): "debt: not yet routed through the payload-contract validator",
+}
+
+# Literal pins for the two paths this ratchet was cut from.  Keeping them named
+# means a regression that re-exempts either one fails on its own line instead of
+# quietly changing a set comparison.
+PAYLOAD_CONTRACT_REQUIRED_SITES: tuple[tuple[str, str], ...] = (
+    ("module_finding_chain", "_guard_remediation_task"),
+    ("auto_remediation", "_handle_main_branch_ci_failure_inner"),
+)
+
+
 # Research children are intentionally assembled as transient ORM objects during
 # a long validation pass, then published as one batch only after a fresh
 # Project -> parent Task boundary.  Their safe ordering is boundary-before-add,
@@ -283,3 +332,39 @@ def test_structurally_gated_constructor_helpers_have_no_bypass_callers() -> None
             if function != callee and callee in _called_names(node)
         }
         assert actual_callers == expected_callers, (module, callee)
+
+
+def _validates_payload_contract(scope: ast.AST) -> bool:
+    """Whether *scope* calls a payload-contract validator (alias-tolerant)."""
+    return any(
+        name.endswith(_PAYLOAD_CONTRACT_VALIDATORS) for name in _called_names(scope)
+    )
+
+
+def test_every_production_task_constructor_validates_its_payload_contract() -> None:
+    inventories = _inventories()
+    unvalidated = {
+        (module, function)
+        for module, inventory in inventories.items()
+        for function, _line in inventory.task_lines
+        if not _validates_payload_contract(inventory.functions[function])
+    }
+
+    assert unvalidated == set(PAYLOAD_CONTRACT_UNVALIDATED), (
+        "A production Task(...) spawn site must validate its payload against the "
+        "task_type contract (validate_internal_payload / validate_task_payload) "
+        "before the row is published, or be listed in PAYLOAD_CONTRACT_UNVALIDATED "
+        "as reviewed debt. An unvalidated payload that omits a field its handler "
+        "hard-requires is only discovered by a claimed VM that dies on its first "
+        "line of real work and burns every retry.\n"
+        f"  newly unvalidated: {sorted(unvalidated - set(PAYLOAD_CONTRACT_UNVALIDATED))}\n"
+        f"  stale exemptions:  {sorted(set(PAYLOAD_CONTRACT_UNVALIDATED) - unvalidated)}"
+    )
+
+
+def test_named_remediation_spawners_validate_their_payload_contract() -> None:
+    inventories = _inventories()
+    for module, function in PAYLOAD_CONTRACT_REQUIRED_SITES:
+        assert (module, function) not in PAYLOAD_CONTRACT_UNVALIDATED, (module, function)
+        scope = inventories[module].functions[function]
+        assert _validates_payload_contract(scope), (module, function)

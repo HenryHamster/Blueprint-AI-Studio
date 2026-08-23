@@ -82,6 +82,23 @@ def _install_static_release_guard(repo: Path) -> None:
     )
 
 
+def _install_sentinel_freshness(repo: Path) -> None:
+    """Install the derived-artifact freshness helper the gate also requires.
+
+    Same contract and same reason as :func:`_install_static_release_guard`:
+    ``scripts/check-default.sh`` runs ``sentinel_freshness.py`` on the
+    lint-only path and fails closed when the helper is absent, and the real
+    helper drives the pytest harness. The subject of this module is the
+    changed-file computation, so a zero-exit stand-in is installed here and
+    the missing-helper branch is exercised separately.
+    """
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "sentinel_freshness.py").write_text(
+        "raise SystemExit(0)\n", encoding="utf-8"
+    )
+
+
 def _init_repo(repo: Path) -> None:
     """Bootstrap a minimal repo with the tracked developer gate committed."""
     repo.mkdir(parents=True, exist_ok=True)
@@ -99,6 +116,7 @@ def _init_repo(repo: Path) -> None:
     # Commit the size-guard stand-in for the same reason: an untracked helper
     # would itself become a changed file in the empty-diff tests.
     _install_static_release_guard(repo)
+    _install_sentinel_freshness(repo)
     (repo / "file.txt").write_text("hello\n", encoding="utf-8")
     _git(
         repo,
@@ -106,6 +124,7 @@ def _init_repo(repo: Path) -> None:
         "file.txt",
         "scripts/check-default.sh",
         "scripts/static_release_guard.py",
+        "scripts/sentinel_freshness.py",
     )
     _git(repo, "commit", "-q", "-m", "initial")
 
@@ -327,6 +346,43 @@ def test_missing_static_release_guard_fails_the_lint_only_path(
     )
     assert "PASS" not in combined, (
         f"the gate must not report PASS with the size guard unexecuted:\n{combined}"
+    )
+
+
+def test_missing_sentinel_freshness_helper_fails_the_lint_only_path(
+    tmp_path: Path,
+) -> None:
+    """An absent freshness helper must fail the gate, not silently skip it.
+
+    Same contract as the size-guard helper above, for the same reason: the
+    derived-artifact freshness lane is the only always-on check over checked-in
+    guard data that is NOT the module-size ledger, and stale guard data is
+    self-concealing (attributable on one PR, inherited-and-warn-passed on every
+    PR after), so a silently skipped lane surfaces first at the automain->main
+    promotion matrix.
+    """
+    bash = shutil.which("bash")
+    git = shutil.which("git")
+    if not bash:
+        pytest.skip("bash not available on this host")
+    if not git:
+        pytest.skip("git not available on this host")
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "branch", "automain")
+    _git(repo, "rm", "-q", "scripts/sentinel_freshness.py")
+    _git(repo, "commit", "-q", "-m", "drop the freshness helper")
+    result = _run_check(repo)
+
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, (
+        "a checkout missing the freshness helper must fail closed; "
+        f"got exit 0 with output:\n{combined}"
+    )
+    assert "derived-artifact freshness helper is missing" in combined, (
+        "the diagnostic must name the missing helper; "
+        f"output:\n{combined}"
     )
 
 

@@ -4411,3 +4411,262 @@ class TestOnboardWarmPool:
         data = resp.json()
         assert "warm_pool" not in data
         assert len(apply_calls) == 0
+
+
+class TestOnboardRunnerBindings:
+    """A newly onboarded project must be runnable by the fleet its owner has.
+
+    Live defect this covers: onboarding created a project bound to ZERO local
+    runners, so the very first task it spawned sat QUEUED forever behind a
+    "waiting for local capacity" message while two healthy idle runners existed.
+    The only way out was a human POSTing a runner_project_binding grant.
+    """
+
+    def _common_patches(self):
+        return (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        )
+
+    async def _make_runner(self, db_session, project_id, status="active"):
+        import uuid as _uuid
+
+        from app.models import LocalRunner, _utcnow
+
+        runner = LocalRunner(
+            project_id=project_id,
+            token_hash=_uuid.uuid4().hex,
+            status=status,
+            last_seen_at=_utcnow(),
+            capabilities={"task_types": "all", "max_concurrent": 2},
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+        return runner
+
+    async def _make_project(self, db_session, user_id, name):
+        project = Project(name=name, user_id=user_id)
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        return project
+
+    async def _bound_runner_ids(self, db_session, project_id):
+        import uuid as _uuid
+
+        from sqlmodel import select as _select
+
+        from app.models import RunnerProjectBinding
+
+        rows = await db_session.execute(
+            _select(RunnerProjectBinding.runner_id).where(
+                RunnerProjectBinding.project_id == _uuid.UUID(str(project_id))
+            )
+        )
+        return {str(rid) for rid in rows.scalars().all()}
+
+    @pytest.mark.asyncio
+    async def test_onboard_grants_owner_existing_runners_to_new_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Runners already enrolled under the caller account are bound."""
+        owner_project = await self._make_project(
+            db_session, TEST_USER_ID, "First project of the owner"
+        )
+        runner_a = await self._make_runner(db_session, owner_project.id)
+        runner_b = await self._make_runner(db_session, owner_project.id)
+
+        p1, p2, p3, p4 = self._common_patches()
+        with p1, p2, p3, p4:
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "bind-me"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        new_project_id = data["project_id"]
+
+        granted = set(data["runner_bindings"]["granted_runner_ids"])
+        assert granted == {str(runner_a.id), str(runner_b.id)}
+        assert data["runner_bindings"]["warnings"] == []
+
+        # The durable rows, not just the response.
+        assert await self._bound_runner_ids(db_session, new_project_id) == {
+            str(runner_a.id),
+            str(runner_b.id),
+        }
+
+        # And the project is therefore no longer structurally undispatchable.
+        import uuid as _uuid
+
+        from app.runner_project_binding import count_runners_allowed_for_project
+
+        assert (
+            await count_runners_allowed_for_project(
+                db_session, _uuid.UUID(new_project_id)
+            )
+            == 2
+        )
+
+    @pytest.mark.asyncio
+    async def test_onboard_with_no_owner_runners_succeeds_with_a_warning(
+        self, client: AsyncClient, db_session
+    ):
+        """No fleet is not an error, but the operator must be told."""
+        p1, p2, p3, p4 = self._common_patches()
+        with p1, p2, p3, p4:
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "no-fleet"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["runner_bindings"]["granted_runner_ids"] == []
+        warnings = data["runner_bindings"]["warnings"]
+        assert len(warnings) == 1
+        assert "No local runner is enrolled under this account" in warnings[0]
+        # The warning must name the remedy, not merely the state.
+        assert (
+            "POST /api/admin/projects/{enrollment_project_id}/runners/"
+            "{runner_id}/projects" in warnings[0]
+        )
+        assert await self._bound_runner_ids(db_session, data["project_id"]) == set()
+
+    @pytest.mark.asyncio
+    async def test_onboard_never_grants_a_runner_owned_by_another_account(
+        self, client: AsyncClient, db_session
+    ):
+        """SECURITY PIN: cross-tenant auto-grant must never happen.
+
+        A runner enrolled on a project belonging to a DIFFERENT ``user_id`` is
+        not the hardware of the onboarding caller. Auto-granting it would
+        silently hand another account machine to this project. The literal
+        assertion below (the foreign runner id is absent from the binding
+        table) is the boundary; do not relax it to a count or a subset check.
+        """
+        other_owner_project = await self._make_project(
+            db_session, "some-other-user-999", "Project of a different account"
+        )
+        foreign_runner = await self._make_runner(db_session, other_owner_project.id)
+
+        mine_project = await self._make_project(
+            db_session, TEST_USER_ID, "Existing project of the caller"
+        )
+        my_runner = await self._make_runner(db_session, mine_project.id)
+
+        p1, p2, p3, p4 = self._common_patches()
+        with p1, p2, p3, p4:
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "tenant-boundary"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        granted = set(data["runner_bindings"]["granted_runner_ids"])
+
+        assert str(foreign_runner.id) not in granted
+        assert granted == {str(my_runner.id)}
+
+        bound = await self._bound_runner_ids(db_session, data["project_id"])
+        assert str(foreign_runner.id) not in bound
+        assert bound == {str(my_runner.id)}
+
+    @pytest.mark.asyncio
+    async def test_onboard_survives_a_failing_grant_and_reports_it(
+        self, client: AsyncClient, db_session
+    ):
+        """A binding write failure warns; it never fails onboarding."""
+        owner_project = await self._make_project(
+            db_session, TEST_USER_ID, "Owner project for failure path"
+        )
+        await self._make_runner(db_session, owner_project.id)
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError("binding table unavailable")
+
+        p1, p2, p3, p4 = self._common_patches()
+        with (
+            p1,
+            p2,
+            p3,
+            p4,
+            patch("app.runner_project_binding.add_binding", _boom),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "grant-fails"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "project_id" in data
+        assert data["runner_bindings"]["granted_runner_ids"] == []
+        assert any(
+            "binding table unavailable" in w
+            for w in data["runner_bindings"]["warnings"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_a_real_onboard_binds_runners_not_a_preview(
+        self, client: AsyncClient, db_session
+    ):
+        """preview_only writes nothing; the same call for real does bind.
+
+        Both halves are asserted in one test on purpose: an "absent key" check
+        alone would pass just as happily against the unfixed code, proving
+        nothing. The contrast is the assertion.
+        """
+        owner_project = await self._make_project(
+            db_session, TEST_USER_ID, "Owner project for preview"
+        )
+        runner = await self._make_runner(db_session, owner_project.id)
+
+        p1, p2, p3, p4 = self._common_patches()
+        with p1, p2, p3, p4:
+            preview = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "preview-bind",
+                    "preview_only": True,
+                },
+            )
+
+        assert preview.status_code == 200, preview.text
+        assert "runner_bindings" not in preview.json()
+
+        p1, p2, p3, p4 = self._common_patches()
+        with p1, p2, p3, p4:
+            real = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "preview-bind"},
+            )
+
+        assert real.status_code == 200, real.text
+        data = real.json()
+        assert data["runner_bindings"]["granted_runner_ids"] == [str(runner.id)]
+        assert await self._bound_runner_ids(db_session, data["project_id"]) == {
+            str(runner.id)
+        }
