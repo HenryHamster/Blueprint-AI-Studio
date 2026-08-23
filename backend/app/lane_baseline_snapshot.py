@@ -22,7 +22,10 @@ from typing import Any, Dict, List
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app.digest_metrics import compute_lane_waste_diagnostics
+from app.digest_metrics import (
+    compute_lane_waste_diagnostics,
+    compute_outer_loop_convergence,
+)
 from app.models import ImprovementLane, Project, Task, TaskStatus, _utcnow
 from app.project_telemetry import (
     read_all_lane_baselines,
@@ -44,7 +47,7 @@ from app.routers.admin_pipeline_observability import (
 logger = logging.getLogger(__name__)
 
 DESIGN_DOC_KEY = "lane_baselines"
-BASELINE_DEF_VERSION = "v1"
+BASELINE_DEF_VERSION = "v2"
 _SNAPSHOT_PR_BREAKDOWN_LIMIT = 100
 _MAX_TASKS_PER_SNAPSHOT = 5000
 _MAX_BASELINES_STORED = 20
@@ -294,6 +297,24 @@ async def persist_version_lane_baseline(
         chain_limit=_SNAPSHOT_PR_BREAKDOWN_LIMIT,
         escalation_alerts=alerts,
     )
+    convergence = compute_outer_loop_convergence(
+        all_tasks=all_terminal_tasks,
+        escalation_alerts=alerts,
+        window_start=t_opened,
+    )
+    # Keep only scalar convergence counters and the small terminal histogram.
+    # The reducer's per-chain rows are deliberately not part of a durable
+    # version snapshot; lane_waste owns the bounded drilldown for the live
+    # window, while these counters remain available after the version closes.
+    diag["outer_loop_convergence"] = {
+        "iteration_median": convergence.get("iteration_median"),
+        "iteration_p95": convergence.get("iteration_p95"),
+        "convergence_rate": convergence.get("convergence_rate"),
+        "cap_exhausted_chain_count": (
+            (convergence.get("outcomes") or {}).get("cap_exhausted", 0)
+        ),
+        "terminal_outcome_counts": convergence.get("terminal_outcome_histogram") or {},
+    }
     diag["relay_medians"] = _compute_relay_medians(diag["per_pr_phase_breakdown"])
     diag["checkpoint_recovery_waste"] = _compute_checkpoint_recovery_waste(
         all_terminal_tasks, lanes=version_lanes

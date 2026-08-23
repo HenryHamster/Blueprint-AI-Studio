@@ -10,16 +10,22 @@ the diagnostics match ``compute_outer_loop_convergence`` exactly.
 ``mock.patch`` targets) are unchanged.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from app.digest_outer_loop import (
     _group_outer_loop_chains,
     _outer_loop_chain_observation,
+    _outer_loop_pct,
     _outer_loop_terminal_outcome,
     _scan_escalation_alerts,
 )
 from app.models import Alert, Task, TaskStatus
+from app.review_heuristics import (
+    LANE_CI,
+    LANE_CONFLICT,
+    LANE_REVIEW_CONVERGENCE,
+)
 
 # ── Lane waste taxonomy (v10 pilot baseline) ──────────────────────────────────
 # Pilot-useful classification of WHY a review/fix iteration was spent. Every
@@ -74,9 +80,11 @@ def classify_lane_waste_category(t: "Task") -> str:
     )
 
     ctx = t.context or {}
-    if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-        if ctx.get("failure_category") in INFRA_ANALYTICS_CLASSES:
-            return "infra"
+    if (
+        t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+        and ctx.get("failure_category") in INFRA_ANALYTICS_CLASSES
+    ):
+        return "infra"
     rl = ctx.get("review_loop") or {}
     drift = rl.get("drift_signal")
     if isinstance(drift, dict) and (drift.get("drift_in") or drift.get("drift_out")):
@@ -117,6 +125,9 @@ def _lane_waste_task_row(t: "Task") -> Dict[str, Any]:
         "terminal_outcome": _outer_loop_terminal_outcome(t),
         "failure_category": ctx.get("failure_category"),
         "stale_head_discard": bool(ctx.get("_review_stale_head")),
+        "retarget_scope": rl.get("retarget_scope")
+        if rl.get("retarget_scope") in ("delta", "full")
+        else None,
         "counts_toward_cap": task_counts_toward_review_cap(t),
         "iteration": int(iteration) if isinstance(iteration, (int, float)) else None,
         "created_at": t.created_at.isoformat() if t.created_at else None,
@@ -159,6 +170,9 @@ def compute_lane_waste_diagnostics(
     waste_task_count = 0
     cap_counted_total = 0
     cap_exhausted_chain_count = 0
+    stale_head_discard_count = 0
+    retarget_review_scope_counts = {"delta": 0, "full": 0}
+    converged_review_counts: List[int] = []
     chain_rows: List[Dict[str, Any]] = []
 
     alert_reasons_by_chain = {}
@@ -184,6 +198,11 @@ def compute_lane_waste_diagnostics(
             per_chain_taxonomy[row["waste_category"]] += 1
             if row["counts_toward_cap"]:
                 cap_counted += 1
+            if row["stale_head_discard"]:
+                stale_head_discard_count += 1
+            scope = row["retarget_scope"]
+            if scope in retarget_review_scope_counts:
+                retarget_review_scope_counts[scope] += 1
             created = t.created_at
             if created is not None and (
                 latest_created is None or created > latest_created
@@ -199,6 +218,8 @@ def compute_lane_waste_diagnostics(
         cap_exhausted = outcome == "cap_exhausted"
         if cap_exhausted:
             cap_exhausted_chain_count += 1
+        if obs["reviews_to_converge"] is not None:
+            converged_review_counts.append(obs["reviews_to_converge"])
 
         # Newest-first drilldown rows within the chain.
         task_rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
@@ -208,12 +229,15 @@ def compute_lane_waste_diagnostics(
                 "original_task_id": obs["original_task_id"],
                 "pr_number": obs["pr_number"],
                 "project_id": obs["project_id"],
+                "direction_id": obs["direction_id"],
                 "terminal_outcome": outcome,
                 "cap_exhausted": cap_exhausted,
                 "task_count": len(task_rows),
                 "cap_counted_iterations": cap_counted,
                 "cap_excluded_iterations": len(task_rows) - cap_counted,
                 "max_iteration": obs["max_iteration"],
+                "review_count": obs["review_count"],
+                "reviews_to_converge": obs["reviews_to_converge"],
                 "churn_count": obs["churn_count"],
                 "has_drift": obs["has_drift"],
                 "waste_totals": per_chain_taxonomy,
@@ -222,7 +246,10 @@ def compute_lane_waste_diagnostics(
             }
         )
 
-    chain_rows.sort(key=lambda r: r["_latest_created"] or datetime.min, reverse=True)
+    chain_rows.sort(
+        key=lambda r: r["_latest_created"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
     for r in chain_rows:
         r.pop("_latest_created", None)
 
@@ -233,6 +260,14 @@ def compute_lane_waste_diagnostics(
         "cap_excluded_task_count": waste_task_count - cap_counted_total,
         "chain_count": len(chains),
         "cap_exhausted_chain_count": cap_exhausted_chain_count,
+        "stale_head_discard_count": stale_head_discard_count,
+        "retarget_review_scope_counts": retarget_review_scope_counts,
+        "converged_review_counts": sorted(converged_review_counts),
+        "reviews_to_converge": {
+            "count": len(converged_review_counts),
+            "median": _outer_loop_pct(converged_review_counts, 50),
+            "p95": _outer_loop_pct(converged_review_counts, 95),
+        },
         "chain_limit": chain_limit,
         "chains_truncated": len(chain_rows) > chain_limit,
         "chains": chain_rows[:chain_limit],
@@ -254,6 +289,8 @@ def compute_lane_baseline_trend(
     - Relay medians (wall_clock, active, gap seconds): relative ±10%.
     - Relay medians task_count and lane p50/p90 iterations: absolute ±0.5.
     - Waste-taxonomy shares (category count / waste_task_count): absolute ±0.05.
+    - Outer-loop cycles and cap counts: absolute ±0.5;
+      convergence rate: absolute ±0.05.
 
     All timing and iteration metrics treat lower as better; waste shares also
     treat lower as better (less waste = improving).
@@ -341,7 +378,7 @@ def compute_lane_baseline_trend(
     diag_curr = latest.get("lane_iteration_distribution") or {}
     diag_prev = prior.get("lane_iteration_distribution") or {}
     lane_iter_trend: Dict[str, Any] = {}
-    for lane in ("review", "fix"):
+    for lane in (LANE_CONFLICT, LANE_CI, LANE_REVIEW_CONVERGENCE):
         lc = diag_curr.get(lane) or {}
         lp = diag_prev.get(lane) or {}
         lane_iter_trend[lane] = {
@@ -383,6 +420,35 @@ def compute_lane_baseline_trend(
         lower_is_better=True,
     )
 
+    convergence_curr = latest.get("outer_loop_convergence") or {}
+    convergence_prev = prior.get("outer_loop_convergence") or {}
+    convergence_trend = {
+        "iteration_median": _block(
+            convergence_curr.get("iteration_median"),
+            convergence_prev.get("iteration_median"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "iteration_p95": _block(
+            convergence_curr.get("iteration_p95"),
+            convergence_prev.get("iteration_p95"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "convergence_rate": _block(
+            convergence_curr.get("convergence_rate"),
+            convergence_prev.get("convergence_rate"),
+            threshold_abs=0.05,
+            lower_is_better=False,
+        ),
+        "cap_exhausted_chain_count": _block(
+            convergence_curr.get("cap_exhausted_chain_count"),
+            convergence_prev.get("cap_exhausted_chain_count"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+    }
+
     return {
         "latest_version": latest.get("version_number"),
         "prior_version": prior.get("version_number"),
@@ -390,4 +456,5 @@ def compute_lane_baseline_trend(
         "lane_iterations": lane_iter_trend,
         "waste_taxonomy_shares": waste_trend,
         "checkpoint_recovery_waste_total": crw_trend,
+        "outer_loop_convergence": convergence_trend,
     }
