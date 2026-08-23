@@ -3219,3 +3219,41 @@ async def test_rule_table_never_lets_a_family_inherit_another_status_set(db_sess
         TaskStatus.COMPLETED,
         TaskStatus.CANCELLED,
     }
+
+
+@pytest.mark.asyncio
+async def test_unrelated_open_alert_does_not_swallow_a_real_failure(db_session):
+    """A different family's open alert must not suppress a failure alert.
+
+    The task-only lookup this replaced treated any undismissed row on the task
+    -- ``task.blocked``, ``review.escalated`` -- as the failure episode, so the
+    real failure never reached the feed. Dedup belongs inside the episode, not
+    across every signal the task ever raised.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id, status="FAILED")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Alert(
+            project_id=project.id,
+            task_id=task.id,
+            severity=AlertSeverity.WARNING,
+            title="Task blocked",
+            message="blocked on a dependency",
+            event_type="task.blocked",
+        )
+    )
+    await db_session.commit()
+
+    await _maybe_create_failure_alert(task, db_session, "boom")
+    await db_session.commit()
+
+    assert len(await _open_alerts_of(db_session, project.id, "task.failed")) == 1
+    assert len(await _open_alerts_of(db_session, project.id, "task.blocked")) == 1

@@ -174,7 +174,7 @@ async def _age_automain_head_marker(db_session, project_id, head_sha, *, seconds
     from datetime import timedelta
 
     from app.project_telemetry import upsert_telemetry
-    from app.release_qualifier_sweep import _AUTOMAIN_HEAD_FIRST_SEEN_KEY
+    from app.release_qualifier_debounce import _AUTOMAIN_HEAD_FIRST_SEEN_KEY
     from app.time_utils import _utcnow
 
     await upsert_telemetry(
@@ -279,10 +279,8 @@ async def test_fresh_automain_head_holds_quiet_window(db_session, mocker):
     """
     from app import shared_state
     from app.project_telemetry import read_telemetry
-    from app.release_qualifier_sweep import (
-        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
-        _fire_auto_triggered_qualification,
-    )
+    from app.release_qualifier_debounce import _AUTOMAIN_HEAD_FIRST_SEEN_KEY
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
 
     shared_state.runtime_config["auto_qualification_triggers"] = "on"
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -316,10 +314,8 @@ async def test_head_move_restarts_quiet_window(db_session, mocker):
     """Another merge during the window restarts it for the newest head."""
     from app import shared_state
     from app.project_telemetry import read_telemetry
-    from app.release_qualifier_sweep import (
-        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
-        _fire_auto_triggered_qualification,
-    )
+    from app.release_qualifier_debounce import _AUTOMAIN_HEAD_FIRST_SEEN_KEY
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
 
     shared_state.runtime_config["auto_qualification_triggers"] = "on"
     project, version = await _make_project_and_version(db_session, phase="stabilize")
