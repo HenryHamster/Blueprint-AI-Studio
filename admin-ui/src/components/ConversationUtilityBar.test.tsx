@@ -713,4 +713,16 @@ describe('ConversationUtilityBar Workday status', () => {
     expect(line).toHaveTextContent('Replying');
     expect(line).not.toHaveTextContent('Workday off');
   });
+
+  test('renders stuck Chat awareness without a spinner', () => {
+    const rendered = renderBar(
+      buildConversationWorkdayStatus({ interactionMode: 'chat', residentActivity: null }),
+      { phase: 'stuck', label: 'Stuck', detail: 'Strategic review' },
+      'chat',
+    );
+    const line = rendered.querySelector('[data-testid="conversation-workday-status"]');
+    expect(line).toHaveAttribute('data-chat-live-phase', 'stuck');
+    expect(line).toHaveTextContent('Stuck');
+    expect(line?.querySelector('.animate-spin')).toBeNull();
+  });
 });

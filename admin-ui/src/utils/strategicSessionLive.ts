@@ -12,7 +12,7 @@
  */
 import type { ProjectMessage } from '../types/messages';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
-import type { StrategicResidentSessionSnapshot } from '../strategicStateApi';
+import type { StrategicResidentSessionSnapshot, StrategicStateResponse } from '../strategicStateApi';
 import type {
   StrategicResidentActivityReasonCode,
   StrategicResidentAutonomyReasonCode,
@@ -505,7 +505,7 @@ export function scopeStrategicTranscript(
  *  a `ConversationWorkdayState` — Workday's vocabulary describes the Continuous
  *  Resident's autonomy lifecycle, which is `off` in Chat mode and says nothing
  *  about a chat turn being in flight. */
-export type StrategicChatLivePhase = 'streaming' | 'working';
+export type StrategicChatLivePhase = 'streaming' | 'working' | 'stuck';
 
 export interface StrategicChatLiveState {
   phase: StrategicChatLivePhase;
@@ -527,6 +527,45 @@ function chatLiveDetail(value: string | undefined): string | undefined {
     : `${compact.slice(0, CHAT_LIVE_DETAIL_MAX_CHARS - 1)}…`;
 }
 
+function strategicPhaseLabel(phase: string | null | undefined): string {
+  if (phase === 'strategic_review') return 'Strategic review';
+  if (phase === 'design_doc_update') return 'Architecture review';
+  return 'Strategic cycle';
+}
+
+function durableStrategicActivityMs(
+  strategic: StrategicStateResponse['strategic'],
+): number | undefined {
+  const activeTask = strategic.active_task;
+  const cycle = strategic.active_cycle;
+  const candidates = [
+    activeTask?.updated_at,
+    activeTask?.started_at,
+    activeTask?.created_at,
+    strategic.active_phase === 'strategic_review' ? cycle?.phase2_started_at : null,
+    strategic.active_phase === 'design_doc_update' ? cycle?.phase1_started_at : null,
+    cycle?.phase2_started_at,
+    cycle?.phase1_started_at,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const timestamp = parseTimestamp(candidate).getTime();
+    if (!Number.isNaN(timestamp)) return timestamp;
+  }
+  return undefined;
+}
+
+function durableStrategicDetail(
+  strategic: StrategicStateResponse['strategic'],
+): string | undefined {
+  return chatLiveDetail(
+    strategic.active_task?.latest_status_message
+      ?? strategic.active_task?.title
+      ?? strategic.active_task?.task_type
+      ?? strategicPhaseLabel(strategic.active_phase),
+  );
+}
+
 /**
  * Derive the Chat-mode in-flight affordance from the SAME two live derivations
  * the conversation surface renders, so the header and the thread can never
@@ -534,29 +573,50 @@ function chatLiveDetail(value: string | undefined): string | undefined {
  *
  * `streaming` — reply/reasoning text is actively arriving (the preview bubble is
  * on screen). `working` — the turn is open (a `responding`/`working` lifecycle
- * frame with no `done` yet) but no reply text has streamed, so only the activity
- * strip has anything to show. `null` — nothing is in flight, which is also the
- * only state a non-streaming (poll-only) turn can ever produce.
+ * frame with no `done` yet), or the durable cycle still has a live task.
+ * `stuck` — the durable cycle is active but has no live task. `null` — no live
+ * or durable Chat work needs an awareness readout.
  */
 export function computeStrategicChatLiveState(
   turn: StrategicStreamingTurn | null,
   activity: StrategicLiveActivity,
+  strategic?: StrategicStateResponse['strategic'] | null,
 ): StrategicChatLiveState | null {
   const latestActivityText = activity.items[activity.items.length - 1]?.text;
+  const durableActivityMs = strategic ? durableStrategicActivityMs(strategic) : undefined;
+  const durableDetail = strategic ? durableStrategicDetail(strategic) : undefined;
   if (turn && turn.segments.length > 0) {
     return {
       phase: 'streaming',
       label: 'Replying',
-      detail: chatLiveDetail(latestActivityText),
-      ...(activity.lastActivityMs !== undefined ? { lastActivityMs: activity.lastActivityMs } : {}),
+      detail: chatLiveDetail(latestActivityText) ?? durableDetail,
+      ...((activity.lastActivityMs ?? durableActivityMs) !== undefined
+        ? { lastActivityMs: activity.lastActivityMs ?? durableActivityMs } : {}),
     };
   }
   if (activity.latestLifecycle === 'responding' || activity.latestLifecycle === 'working') {
     return {
       phase: 'working',
       label: 'Working',
-      detail: chatLiveDetail(latestActivityText),
-      ...(activity.lastActivityMs !== undefined ? { lastActivityMs: activity.lastActivityMs } : {}),
+      detail: chatLiveDetail(latestActivityText) ?? durableDetail,
+      ...((activity.lastActivityMs ?? durableActivityMs) !== undefined
+        ? { lastActivityMs: activity.lastActivityMs ?? durableActivityMs } : {}),
+    };
+  }
+  if (strategic?.active_cycle?.stale) {
+    return {
+      phase: 'stuck',
+      label: 'Stuck',
+      detail: durableDetail,
+      ...(durableActivityMs !== undefined ? { lastActivityMs: durableActivityMs } : {}),
+    };
+  }
+  if (strategic?.active_cycle && (strategic.active_cycle.has_active_task || strategic.active_task)) {
+    return {
+      phase: 'working',
+      label: 'Working',
+      detail: durableDetail,
+      ...(durableActivityMs !== undefined ? { lastActivityMs: durableActivityMs } : {}),
     };
   }
   return null;

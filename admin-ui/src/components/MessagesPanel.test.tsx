@@ -2616,7 +2616,7 @@ describe('MessagesPanel live strategist streaming', () => {
   });
 
   test('test_streaming_preview_renders_math_and_citations_like_the_durable_message', async () => {
-    const content = 'The **answer** is \\(x^2\\), and see task c0f26a99 for the grounded work.';
+    const content = 'The **answer** is \\(x^2\\), see d-dec033c2, and landed in #17493.';
     const durable = makeMsg({
       id: 'reply-markdown-1',
       sequence: 2,
@@ -2625,22 +2625,28 @@ describe('MessagesPanel live strategist streaming', () => {
       surface: 'conversation',
       created_at: DURABLE_REPLY_AT,
     });
-    const onOpenTask = vi.fn();
+    const onOpenDirection = vi.fn();
+    const githubRepo = 'HenryHamster/BlueprintAIStudio';
 
     // The durable row establishes the canonical Markdown, math, and citation
     // behavior that the ephemeral preview must match.
-    const baselineEl = await render({ onOpenTask }, [operatorTurn(), durable]);
+    const baselineEl = await render({ onOpenDirection, githubRepo }, [operatorTurn(), durable]);
     await waitFor(() => {
       expect(baselineEl.querySelector('.katex')).toBeTruthy();
       expect([...baselineEl.querySelectorAll('[data-testid="message-bubble"] button')]
-        .find(button => button.textContent?.includes('task c0f26a99')))
+        .find(button => button.textContent?.includes('d-dec033c2')))
         .toBeTruthy();
     });
     const durableCitation = [...baselineEl.querySelectorAll('[data-testid="message-bubble"] button')]
-      .find(button => button.textContent?.includes('task c0f26a99')) as HTMLButtonElement | undefined;
+      .find(button => button.textContent?.includes('d-dec033c2')) as HTMLButtonElement | undefined;
     expect(durableCitation).toBeTruthy();
     await act(async () => { durableCitation?.click(); });
-    expect(onOpenTask).toHaveBeenCalledWith('c0f26a99');
+    expect(onOpenDirection).toHaveBeenCalledWith('dec033c2');
+    const durablePr = [...baselineEl.querySelectorAll('[data-testid="message-bubble"] a')]
+      .find(anchor => anchor.textContent === '#17493');
+    expect(durablePr?.getAttribute('href'))
+      .toBe('https://github.com/HenryHamster/BlueprintAIStudio/pull/17493');
+    const durableMathHtml = baselineEl.querySelector('.katex')?.innerHTML;
     const durableList = baselineEl.querySelector('.overflow-y-auto');
     expect(durableList).toBeTruthy();
     const pollOnlyHtml = durableList?.innerHTML;
@@ -2649,26 +2655,38 @@ describe('MessagesPanel live strategist streaming', () => {
     root = null;
     host?.remove();
     host = null;
-    onOpenTask.mockClear();
+    onOpenDirection.mockClear();
 
     // The same content arrives in fragments. The preview must run it through
     // the durable renderer while remaining an ephemeral, action-free row.
     const transcript: StrategicSessionDelta[] = [
       delta({ id: 1, seq: 1, status: 'responding', ts: STREAM_AT }),
-      delta({ id: 2, seq: 2, kind: 'message', text: 'The **answer** is \\(x^2\\), and see ', ts: STREAM_AT }),
-      delta({ id: 3, seq: 3, kind: 'message', text: 'task c0f26a99 for the grounded work.', ts: STREAM_AT }),
+      delta({ id: 2, seq: 2, kind: 'reasoning', text: 'Reasoning stays **plain** \\(y^2\\) and mentions d-dec033c2 #17493.', ts: STREAM_AT }),
+      delta({ id: 3, seq: 3, kind: 'message', text: 'The **answer** is \\(x^2\\), see d-dec033c2, and ', ts: STREAM_AT }),
+      delta({ id: 4, seq: 4, kind: 'message', text: 'landed in #17493.', ts: STREAM_AT }),
     ];
-    const el = await render({ strategicSessionTranscript: transcript, onOpenTask }, [operatorTurn()]);
+    const el = await render({ strategicSessionTranscript: transcript, onOpenDirection, githubRepo }, [operatorTurn()]);
     const reply = el.querySelector('[data-testid="strategic-streaming-reply"]');
+    const reasoning = el.querySelector('[data-testid="strategic-streaming-reasoning"]');
     await waitFor(() => {
       expect(reply?.querySelector('.katex')).toBeTruthy();
       expect(reply?.querySelector('strong')?.textContent).toBe('answer');
-      expect(reply?.querySelector('button')?.textContent).toContain('task c0f26a99');
+      expect(reply?.querySelector('button')?.textContent).toContain('d-dec033c2');
+      expect(reply?.querySelector('a')?.textContent).toBe('#17493');
     });
+    expect(reply?.querySelector('.katex')?.innerHTML)
+      .toBe(durableMathHtml);
+    expect(reply?.querySelector('a')?.getAttribute('href'))
+      .toBe(durablePr?.getAttribute('href'));
+    expect(reasoning?.textContent)
+      .toBe('Reasoning stays **plain** \\(y^2\\) and mentions d-dec033c2 #17493.');
+    expect(reasoning?.className).toContain('whitespace-pre-wrap');
+    expect(reasoning?.querySelector('.katex')).toBeNull();
+    expect(reasoning?.querySelector('button, a, strong')).toBeNull();
     const previewCitation = reply?.querySelector('button') as HTMLButtonElement | null;
     expect(previewCitation).toBeTruthy();
     await act(async () => { previewCitation?.click(); });
-    expect(onOpenTask).toHaveBeenCalledWith('c0f26a99');
+    expect(onOpenDirection).toHaveBeenCalledWith('dec033c2');
     expect(el.querySelector('[data-testid="strategic-streaming-bubble"] input[type="checkbox"]')).toBeNull();
 
     // Once the canonical row arrives, the ephemeral preview retires and the
@@ -2677,12 +2695,13 @@ describe('MessagesPanel live strategist streaming', () => {
     await rerender({
       strategicSessionTranscript: [
         ...transcript,
-        delta({ id: 4, seq: 4, status: 'done', ts: DURABLE_REPLY_AT }),
+        delta({ id: 5, seq: 5, status: 'done', ts: DURABLE_REPLY_AT }),
       ],
-      onOpenTask,
+      onOpenDirection,
+      githubRepo,
       realtimeRefreshSignal: 1,
     });
-    await waitFor(() => expect(el.textContent).toContain('task c0f26a99'));
+    await waitFor(() => expect(el.textContent).toContain('#17493'));
     expect(preview(el)).toBeNull();
     expect(el.querySelector('.overflow-y-auto')?.innerHTML).toBe(pollOnlyHtml);
   });
