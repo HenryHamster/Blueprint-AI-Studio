@@ -4,23 +4,107 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-REPOSITORY_ROOT = Path(__file__).parents[2]
-_GENERATOR_SPEC = importlib.util.spec_from_file_location(
-    "generate_test_estate_ranked_queue",
-    REPOSITORY_ROOT / "scripts" / "generate_test_estate_ranked_queue.py",
+from testing.fixgate_attribution import format_offender_marker
+
+
+NL = chr(10)
+GENERATOR_RELATIVE_PATH = Path("scripts") / "generate_test_estate_ranked_queue.py"
+
+
+def _first_root_with_generator(candidates: "list[Path]") -> Path | None:
+    """Return the first candidate that actually holds the generator, else None.
+
+    Never raises. A miss here is resolved while pytest is still importing this
+    module, and an exception at that point aborts the entire collection rather
+    than this one file.
+    """
+    for root in candidates:
+        try:
+            if (root / GENERATOR_RELATIVE_PATH).is_file():
+                return root
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_repository_root() -> Path | None:
+    """Locate the repo root across local + Docker test environments.
+
+    Candidates, in order: explicit env override, the ``/repo`` bind-mount
+    (``scripts/test-backend.sh`` and the CI shards mount the repo root
+    read-only at ``/repo`` while the backend source is mounted separately at
+    ``/app``, so ``parents[2]`` resolves to ``/`` inside the container), then
+    the repo root two levels above this file (plain checkouts, non-Docker).
+    """
+    candidates: list[Path] = []
+    env_override = os.getenv("BLUEPRINT_REPO_ROOT")
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(Path("/repo"))
+    candidates.append(Path(__file__).resolve().parents[2])
+    return _first_root_with_generator(candidates)
+
+
+REPOSITORY_ROOT = _resolve_repository_root()
+
+_MISSING_ROOT_MESSAGE = (
+    "scripts/generate_test_estate_ranked_queue.py not available in this test "
+    "environment (checked BLUEPRINT_REPO_ROOT, the /repo bind-mount that "
+    "scripts/test-backend.sh and the CI shards provide, and ../.. relative to "
+    "this file)"
 )
-assert _GENERATOR_SPEC and _GENERATOR_SPEC.loader
-_GENERATOR = importlib.util.module_from_spec(_GENERATOR_SPEC)
-sys.modules[_GENERATOR_SPEC.name] = _GENERATOR
-_GENERATOR_SPEC.loader.exec_module(_GENERATOR)
-collect_test_files = _GENERATOR.collect_test_files
-main = _GENERATOR.main
-render_queue = _GENERATOR.render_queue
+
+_GENERATOR: Any = None
+
+
+def _require_generator() -> Any:
+    """Import the generator or skip — except in CI, where a miss FAILS loudly.
+
+    Resolution is deliberately deferred out of module import. Raising while
+    pytest is still collecting aborts the entire run, not just this file, so a
+    single unresolvable path takes every other test in the lane down with it.
+    """
+    global _GENERATOR
+    if _GENERATOR is not None:
+        return _GENERATOR
+    if REPOSITORY_ROOT is None:
+        if os.getenv("CI"):
+            pytest.fail(
+                _MISSING_ROOT_MESSAGE + " — refusing to skip in CI: mount the "
+                "repo root at /repo or set BLUEPRINT_REPO_ROOT so this "
+                "invariant enforces"
+            )
+        pytest.skip(_MISSING_ROOT_MESSAGE)
+    spec = importlib.util.spec_from_file_location(
+        "generate_test_estate_ranked_queue",
+        REPOSITORY_ROOT / "scripts" / "generate_test_estate_ranked_queue.py",
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _GENERATOR = module
+    return module
+
+
+def collect_test_files(*args: Any, **kwargs: Any) -> Any:
+    return _require_generator().collect_test_files(*args, **kwargs)
+
+
+def main(*args: Any, **kwargs: Any) -> Any:
+    return _require_generator().main(*args, **kwargs)
+
+
+def render_queue(*args: Any, **kwargs: Any) -> Any:
+    return _require_generator().render_queue(*args, **kwargs)
 
 
 def _write_fixture_root(root: Path) -> None:
@@ -57,10 +141,66 @@ def _write_fixture_root(root: Path) -> None:
     )
 
 
-def test_checked_in_queue_is_generated_from_current_tree() -> None:
-    assert render_queue(REPOSITORY_ROOT) == (
-        REPOSITORY_ROOT / "test-estate-ranked-queue.md"
-    ).read_text(encoding="utf-8")
+def test_repository_root_resolution_never_raises_on_a_missing_checkout(
+    tmp_path: Path,
+) -> None:
+    """A miss returns None instead of raising, so collection survives it.
+
+    The previous form resolved the generator from ``Path(__file__).parents[2]``
+    at import time. Inside the test container the backend tree is mounted at
+    ``/app``, so that expression yields ``/`` and the load raised
+    FileNotFoundError while pytest was still collecting — which aborts the
+    whole run, not just this file, and took all eight backend CI shards down.
+    """
+    assert _first_root_with_generator([tmp_path, tmp_path / "absent"]) is None
+    assert REPOSITORY_ROOT is not None
+    assert _first_root_with_generator([tmp_path, REPOSITORY_ROOT]) == REPOSITORY_ROOT
+
+
+_RANKED_ROW = re.compile(r"^\| \d+ \| \S+ \| \S+ \| `([^`]+)` \|", re.MULTILINE)
+
+
+def test_checked_in_queue_ranks_every_collected_test_file() -> None:
+    """Every current test file is ranked, and no vanished file still is.
+
+    Deliberately not byte-equality against a fresh render of the real tree.
+    The LOC and test-count columns move whenever any of ~1000 test files is
+    edited, and the rank column reshuffles when they do, so an exact match on
+    a 991-row derived document is stale within hours of being written and
+    turns a reporting artifact into a merge-conflict ratchet across every
+    concurrent branch. Byte-exact rendering is still pinned, against the
+    deterministic fixture tree in
+    ``test_check_reports_threshold_crossing_until_queue_is_regenerated`` where
+    it cannot rot. What must not rot here is coverage: a new test file missing
+    from the queue, or a deleted one still ranked, is the drift this guards.
+    """
+    generator = _require_generator()
+    assert REPOSITORY_ROOT is not None
+    queue_text = (REPOSITORY_ROOT / "test-estate-ranked-queue.md").read_text(
+        encoding="utf-8"
+    )
+    ranked = set(_RANKED_ROW.findall(queue_text))
+    assert ranked, "the checked-in queue has no ranked rows at all"
+    collected = {record.path for record in generator.collect_test_files(REPOSITORY_ROOT)}
+
+    missing = sorted(collected - ranked)
+    assert not missing, (
+        "test files exist but are absent from test-estate-ranked-queue.md; "
+        "regenerate with `python3 scripts/generate_test_estate_ranked_queue.py "
+        "--write`:" + NL
+        + NL.join(f"  - {path}" for path in missing)
+        + NL
+        + format_offender_marker(missing)
+    )
+    vanished = sorted(ranked - collected)
+    assert not vanished, (
+        "test-estate-ranked-queue.md ranks files that are no longer collected; "
+        "regenerate with `python3 scripts/generate_test_estate_ranked_queue.py "
+        "--write`:" + NL
+        + NL.join(f"  - {path}" for path in vanished)
+        + NL
+        + format_offender_marker(vanished)
+    )
 
 
 def test_generator_uses_canonical_counts_and_preserves_manifest_floor(tmp_path: Path) -> None:
