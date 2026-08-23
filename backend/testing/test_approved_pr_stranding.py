@@ -823,6 +823,10 @@ async def test_sweep_recognizes_child_subsumed_by_landed_rollup(
     assert result["stranded"] == 0
     assert result["rollup_subsumed"] == 1
     assert child.context["approved_pr_stranding"]["state"] == "landed"
+    assert (
+        child.context["approved_pr_stranding"]["reachability_signal"]
+        == "rollup_subsumed"
+    )
     assert child.context["approved_pr_stranding"]["rollup_subsumed"] is True
 
 

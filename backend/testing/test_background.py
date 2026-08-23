@@ -15,7 +15,7 @@ from app.models import (
     TaskStatus,
     get_task_lifetime_attempt_ordinal,
 )
-from app.reaper import reaper_service, _reaper_skip_counts
+from app.reaper import _reaper_skip_counts, _runtime_config, reaper_service
 from app.broadcast import broadcast_to_project, manager
 from app.branch_cleanup import _run_stale_branch_cleanup
 from app.task_lifecycle import _requeue_parent_task
@@ -32,6 +32,10 @@ from app.orchestrator import _check_candidate_task_deps
 @pytest_asyncio.fixture()
 async def reaper_db(mocker):
     """Isolated test DB for reaper tests — avoids StaticPool contention."""
+    original_startup_grace = _runtime_config.get(
+        "reaper_startup_orphan_grace_seconds"
+    )
+    _runtime_config["reaper_startup_orphan_grace_seconds"] = 0
     reaper_engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -52,9 +56,17 @@ async def reaper_db(mocker):
     async with ReaperSession() as session:
         yield session
 
-    async with reaper_engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.drop_all)
-    await reaper_engine.dispose()
+    try:
+        async with reaper_engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.drop_all)
+    finally:
+        await reaper_engine.dispose()
+        if original_startup_grace is None:
+            _runtime_config.pop("reaper_startup_orphan_grace_seconds", None)
+        else:
+            _runtime_config["reaper_startup_orphan_grace_seconds"] = (
+                original_startup_grace
+            )
 
 
 @pytest.mark.asyncio
