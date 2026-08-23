@@ -376,6 +376,7 @@
     "test_staged_directions.py": 1950,
     "test_cost_telemetry_reconciliation.py": 1900,
     "test_review_loop_convergence.py": 2800,
+    "test_review_merge_authority.py": 1650,
     "test_empty_repo_onboarding.py": 1900,
     "test_warm_pool.py": 1850,
     "test_discovery_review.py": 2100,
