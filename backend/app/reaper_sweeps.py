@@ -2286,6 +2286,11 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     from app.models import Alert, AlertSeverity, Project, StrategicCycle
     from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
     from app.shared_state import runtime_config as _runtime_config
+    from app.strategic_cycle import OUTCOME_COMPLETED
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_worker_is_healthy,
+    )
 
     starvation_hours = int(
         _runtime_config.get(
@@ -2348,6 +2353,7 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             )
             .where(
                 StrategicCycle.project_id.in_(candidate_ids),
+                StrategicCycle.outcome == OUTCOME_COMPLETED,
                 StrategicCycle.phase2_completed_at.is_not(None),
             )
             .group_by(StrategicCycle.project_id)
@@ -2360,8 +2366,53 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         if completed_at is not None and completed_at >= cutoff
     }
 
-    # Batched lookup 2: which candidate projects already have an open WARNING
-    # dedup alert. Replaces the per-project dedup SELECT (the second N+1).
+    # A Continuous Workday Resident deliberately keeps its cycle open for the
+    # whole session, so its cycle row cannot provide a terminal completion
+    # receipt. Batch-load the exact task named by each session projection and
+    # suppress only for a canonical, identity-matched, bounded-fresh worker.
+    resident_task_ids: list[uuid.UUID] = []
+    resident_blobs: dict[Any, dict[str, Any]] = {}
+    for project_id in candidate_ids:
+        blob = read_resident_session(candidate_visions.get(project_id))
+        if not isinstance(blob, dict):
+            continue
+        task_id = blob.get("task_id")
+        if not task_id:
+            continue
+        try:
+            task_uuid = uuid.UUID(str(task_id))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        resident_task_ids.append(task_uuid)
+        resident_blobs[project_id] = blob
+
+    resident_tasks: dict[uuid.UUID, Task] = {}
+    if resident_task_ids:
+        resident_tasks = {
+            task.id: task
+            for task in (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id.in_(candidate_ids),
+                        Task.id.in_(resident_task_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        }
+    healthy_resident_projects = {
+        project_id
+        for project_id, blob in resident_blobs.items()
+        if resident_worker_is_healthy(
+            blob,
+            resident_tasks.get(uuid.UUID(str(blob["task_id"]))),
+            now,
+        )
+    }
+
+    # Batched lookup: which candidate projects already have an open WARNING
+    # dedup alert. Replaces the per-project dedup SELECT.
     projects_with_open_alert = set(
         (
             await session.execute(
@@ -2391,6 +2442,8 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         if project_id in recent_completions:
             continue
         if _recent_no_delta_skip_at(candidate_visions.get(project_id), cutoff) is not None:
+            continue
+        if project_id in healthy_resident_projects:
             continue
         if automatic_cycles_allowed[project_id]:
             # An alert is only the operator-facing symptom. Arm the durable
@@ -2425,7 +2478,7 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             project_id,
             session,
             starvation_hours=starvation_hours,
-            last_completed_at=latest_completions.get(project_id),
+            last_successful_completed_at=latest_completions.get(project_id),
         ):
             created += 1
     return created
@@ -2442,7 +2495,7 @@ async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
     from app.strategic_resident_session import (
         _auto_start_on_workday_entry,
         read_resident_session,
-        resident_session_is_active,
+        resident_worker_is_healthy,
     )
     from app.workbench_state import get_strategic_workbench_state
 
@@ -2450,9 +2503,19 @@ async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
     try:
         async with AsyncSessionLocal() as fresh:
             project = await fresh.get(Project, project_id)
-            if project is None or resident_session_is_active(
-                read_resident_session(project.vision)
-            ):
+            if project is None:
+                return
+            resident_blob = read_resident_session(project.vision)
+            resident_task = None
+            resident_task_id = (resident_blob or {}).get("task_id")
+            if resident_task_id:
+                try:
+                    resident_task = await fresh.get(
+                        Task, uuid.UUID(str(resident_task_id))
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    resident_task = None
+            if resident_worker_is_healthy(resident_blob, resident_task, _utcnow()):
                 return
             operator_rows = (
                 await fresh.execute(

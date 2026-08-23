@@ -2633,7 +2633,7 @@ async def _maybe_create_strategic_cycle_liveness_alert(
     session: AsyncSession,
     *,
     starvation_hours: int,
-    last_completed_at: datetime | None,
+    last_successful_completed_at: datetime | None,
 ) -> bool:
     """Persist and broadcast the operator signal for a silent strategic loop."""
     existing = await session.execute(
@@ -2648,8 +2648,10 @@ async def _maybe_create_strategic_cycle_liveness_alert(
     if existing.scalars().first() is not None:
         return False
 
-    last_completed_label = (
-        last_completed_at.isoformat() if last_completed_at is not None else "never"
+    last_successful_completed_label = (
+        last_successful_completed_at.isoformat()
+        if last_successful_completed_at is not None
+        else "never"
     )
     alert = Alert(
         project_id=project_id,
@@ -2658,7 +2660,7 @@ async def _maybe_create_strategic_cycle_liveness_alert(
         message=(
             f"The strategic loop has not completed a cycle in the last "
             f"{starvation_hours}h. loop=strategic; "
-            f"last_completed_at={last_completed_label}. "
+            f"last_successful_completed_at={last_successful_completed_label}. "
             "A recent intentional no-delta decision was not recorded, so the "
             "loop may be halted. Inspect the strategic scheduler and runtime logs."
         )[:1000],
