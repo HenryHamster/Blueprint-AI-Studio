@@ -3,7 +3,11 @@
 These tests verify that:
 
   1. ``scripts/blueprint.py fleet`` exposes ONLY VM-pool subcommands (pool,
-     warm, accounts, zones); it has NO runner-enrollment subcommands.
+     warm, accounts, zones) plus the read/allow-list subcommands for
+     ALREADY-ENROLLED runners (runners, grant, revoke); it has NO
+     runner-enrollment subcommands, and the allow-list verbs are pinned to the
+     ``/runners/{id}/projects`` sub-resource so they cannot reach
+     ``POST /runners/register``.
   2. No top-level ``scripts/blueprint.py`` subcommand performs runner
      enrollment.
   3. ``docs/runner-install.md`` describes the admin-UI Runtime-tab enroll flow
@@ -150,22 +154,100 @@ class TestFleetSubcommandsExcludeRunnerEnrollment:
     expose it under ``fleet`` (or anywhere else).
     """
 
-    EXPECTED_FLEET_SUBCOMMANDS = {"pool", "warm", "accounts", "zones"}
+    # pool/warm/accounts/zones manage the cloud VM (Max Plan) account pool.
+    # runners/grant/revoke manage the per-project ALLOW LIST of runners that are
+    # already enrolled: `runners` is a read, and grant/revoke add or remove a
+    # RunnerProjectBinding row. None of them creates a LocalRunner, mints a
+    # runner token, or calls the enrollment endpoint — that is pinned
+    # independently (and more strictly than this inventory) by
+    # test_fleet_allow_list_verbs_are_confined_to_the_allow_list_route below,
+    # which allowlists the exact admin routes those helpers may build. Widening
+    # this set alone can therefore never smuggle enrollment into the CLI.
+    EXPECTED_FLEET_SUBCOMMANDS = {
+        "pool", "warm", "accounts", "zones", "runners", "grant", "revoke",
+    }
     FORBIDDEN_ENROLLMENT_KEYWORDS = {
         "enroll", "register", "runner-enroll", "runner-register",
         "add-runner", "create-runner",
     }
+    # Helpers implementing the fleet allow-list verbs, and the ONLY admin routes
+    # they are allowed to address. Both route shapes are f-strings, so the
+    # literals carry ``{name}`` placeholders verbatim.
+    ALLOW_LIST_HELPERS = (
+        "_fleet_runners",
+        "_fleet_grant",
+        "_fleet_revoke",
+        "_fleet_list_runners",
+        "_fleet_runner_projects_path",
+    )
+    ALLOWED_ALLOW_LIST_ROUTE = re.compile(
+        r"^/api/admin/projects/\{\w+\}/runners"          # the project's runner list
+        r"(?:/\{\w+\}/projects\{\w+\})?"               # ...and its allow-list child
+        r"(?:\?[\w=&{}]*)?$"                             # optional paging query
+    )
 
-    def test_fleet_subcommands_are_exactly_pool_warm_accounts_zones(
+    def test_fleet_subcommands_are_exactly_the_pool_and_allow_list_verbs(
         self, blueprint_ast: ast.AST
     ):
-        """fleet sub-subparser contains exactly the four pool/infra commands."""
+        """fleet sub-subparser contains exactly the pool/infra + allow-list commands."""
         found = set(_collect_fleet_subparser_names(blueprint_ast))
         assert found == self.EXPECTED_FLEET_SUBCOMMANDS, (
             f"Expected fleet subcommands to be exactly "
             f"{self.EXPECTED_FLEET_SUBCOMMANDS!r}, got {found!r}. "
             "Runner enrollment must NOT be added as a fleet subcommand — "
             "the canonical path is the admin-UI Runtime tab."
+        )
+
+    def test_fleet_allow_list_verbs_are_confined_to_the_allow_list_route(
+        self, blueprint_source: str
+    ):
+        """The allow-list helpers may address only the runner list + its child.
+
+        This is the assertion that keeps enrollment out of the CLI now that
+        EXPECTED_FLEET_SUBCOMMANDS admits runners/grant/revoke. Those verbs are
+        allowed to read ``/projects/{id}/runners`` and to add/remove bindings on
+        ``/projects/{enrollment_id}/runners/{runner_id}/projects``; any other
+        admin route — ``/runners/register`` above all — fails here regardless of
+        what the subcommand inventory says.
+        """
+        seen_routes: list[tuple[str, str]] = []
+        for name in self.ALLOW_LIST_HELPERS:
+            match = re.search(
+                rf"\ndef {name}\(.*?(?=\ndef |\Z)", blueprint_source, re.DOTALL
+            )
+            assert match is not None, (
+                f"{name} not found in scripts/blueprint.py. The fleet allow-list "
+                "helpers were renamed or removed — re-point this guard at them "
+                "rather than deleting it."
+            )
+            body = match.group()
+            # Backticks and trailing punctuation are docstring decoration, not
+            # part of the route; strip them so prose mentions are checked too.
+            seen_routes.extend(
+                (name, route.rstrip(".,;:)"))
+                for route in re.findall(r"/api/admin/[^\"'\s`]*", body)
+            )
+            for forbidden in ("register_runner", "runner_register", "runners/register"):
+                assert forbidden not in body, (
+                    f"{name} references {forbidden!r}. The fleet allow-list verbs "
+                    "must never enroll a runner; enrollment stays on "
+                    "POST /projects/{project_id}/runners/register in the admin UI."
+                )
+
+        assert seen_routes, (
+            "No /api/admin route literals found in the fleet allow-list helpers — "
+            "this guard is no longer measuring anything. Re-point it."
+        )
+        offenders = [
+            (name, route)
+            for name, route in seen_routes
+            if not self.ALLOWED_ALLOW_LIST_ROUTE.match(route)
+        ]
+        assert not offenders, (
+            f"fleet allow-list helpers build admin routes outside the runner "
+            f"allow-list sub-resource: {offenders!r}. Allowed shapes are "
+            "/api/admin/projects/{id}/runners and "
+            "/api/admin/projects/{id}/runners/{id}/projects{suffix}."
         )
 
     def test_fleet_subcommands_contain_no_enrollment_names(

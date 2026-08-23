@@ -674,6 +674,9 @@ def test_blueprint_wrapper_resolves_via_symlink(tmp_path):
 
 HELP_INVOCATIONS = [
     [],
+    ["projects"],
+    ["projects", "list"],
+    ["projects", "onboard"],
     ["agent-access"],
     ["agent-access", "whoami"],
     ["agent-access", "snapshot"],
@@ -753,6 +756,9 @@ HELP_INVOCATIONS = [
     ["fleet", "warm"],
     ["fleet", "accounts"],
     ["fleet", "zones"],
+    ["fleet", "runners"],
+    ["fleet", "grant"],
+    ["fleet", "revoke"],
     ["envelope"],
     ["envelope", "show"],
     ["envelope", "set"],
@@ -8059,3 +8065,371 @@ def test_deploy_agent_noops_without_live_approval(monkeypatch):
     )
 
     assert blueprint._deploy_agent_once(argparse.Namespace(project_id=None)) is False
+
+
+# ── projects onboard ─────────────────────────────────────────────────────────
+
+ONBOARD_PROJECT_ID = "11111111-2222-3333-4444-555555555555"
+
+
+@pytest.fixture
+def onboard_api(monkeypatch):
+    """Record every api() call and answer the onboard POST with a full response."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if path == "/api/admin/projects/onboard":
+            response = {
+                "build_config": {
+                    "has_ci": False,
+                    "requires_ci_checks": True,
+                    "test_command": "pytest",
+                    "task_branch_namespace": "widget",
+                },
+                "default_branch": "main",
+                "merge_verification_verdict": "unverified",
+            }
+            if not (body or {}).get("preview_only"):
+                response["project_id"] = ONBOARD_PROJECT_ID
+            return response
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    return calls
+
+
+def test_projects_onboard_goal_file_is_read_into_payload(onboard_api, tmp_path, capsys):
+    """--goal-file reads UTF-8 from disk and the POST body carries the goal."""
+    goal_path = tmp_path / "goal.md"
+    goal_path.write_text(
+        "Ship the widget pipeline.\n\nSecond paragraph with non-ascii: ééé.\n",
+        encoding="utf-8",
+    )
+
+    rc = blueprint.main(
+        ["projects", "onboard", "--owner", "acme", "--repo", "widget",
+         "--goal-file", str(goal_path), "--yes"]
+    )
+
+    assert rc == 0
+    posts = [(m, p, b) for m, p, b in onboard_api if m == "POST"]
+    assert posts, "expected a POST to the onboard endpoint"
+    _method, path, body = posts[0]
+    assert path == "/api/admin/projects/onboard"
+    assert body["github_owner"] == "acme"
+    assert body["github_repo"] == "widget"
+    assert body["goal"] == (
+        "Ship the widget pipeline.\n\nSecond paragraph with non-ascii: ééé."
+    )
+    capsys.readouterr()
+
+
+def test_projects_onboard_rejects_goal_over_5000_chars(onboard_api, tmp_path, capsys):
+    """A goal longer than the schema's 5000-char cap fails locally, naming the length.
+
+    5000 is pinned literally here on purpose: it mirrors
+    ``OnboardPayload.goal``'s ``max_length`` in backend/app/schemas.py, and a
+    client-side check that silently drifts from the server limit is worse than
+    no check at all.
+    """
+    oversized = "x" * 5001
+    goal_path = tmp_path / "big-goal.md"
+    goal_path.write_text(oversized, encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            ["projects", "onboard", "--owner", "acme", "--repo", "widget",
+             "--goal-file", str(goal_path), "--yes"]
+        )
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "5001" in err, err
+    assert "5000" in err, err
+    assert not [c for c in onboard_api if c[0] == "POST"], (
+        "an oversized goal must never reach the server"
+    )
+
+
+def test_projects_onboard_preview_sets_preview_only_and_does_not_prompt(
+    onboard_api, monkeypatch, capsys
+):
+    """--preview posts preview_only=True without any confirmation prompt."""
+    monkeypatch.setattr(
+        blueprint,
+        "_confirm",
+        lambda *a, **k: pytest.fail("preview must not confirm - it mutates nothing"),
+    )
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    rc = blueprint.main(
+        ["projects", "onboard", "--owner", "acme", "--repo", "widget", "--preview"]
+    )
+
+    assert rc == 0
+    posts = [(m, p, b) for m, p, b in onboard_api if m == "POST"]
+    assert posts, "preview still calls the endpoint"
+    assert posts[0][2]["preview_only"] is True
+    out = capsys.readouterr().out
+    assert "preview only" in out
+
+
+def test_projects_onboard_confirms_before_creating(onboard_api, monkeypatch, capsys):
+    """A real onboard without --yes aborts on non-interactive stdin (no POST)."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    rc = blueprint.main(
+        ["projects", "onboard", "--owner", "acme", "--repo", "widget"]
+    )
+
+    assert rc == 0
+    assert "Aborted" in capsys.readouterr().out
+    assert not [c for c in onboard_api if c[0] == "POST"]
+
+
+def test_projects_onboard_surfaces_ci_flags_and_autonomy_next_step(
+    onboard_api, capsys
+):
+    """The human renderer names project_id, default_branch, the CI flags, and the
+    explicit autonomy next step."""
+    rc = blueprint.main(
+        ["projects", "onboard", "--owner", "acme", "--repo", "widget", "--yes"]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert ONBOARD_PROJECT_ID in out
+    assert "default_branch" in out and "main" in out
+    assert "requires_ci_checks" in out
+    assert "has_ci" in out
+    # requires_ci_checks=true against has_ci=false wedges every merge.
+    assert "WARNING" in out
+    assert "system autonomy --enable" in out
+
+
+def test_projects_bare_still_lists(monkeypatch, capsys):
+    """Adding subcommands must not break the bare `projects` listing."""
+    monkeypatch.setattr(
+        blueprint,
+        "list_projects",
+        lambda: [{"id": "p-1", "name": "alpha", "status": "ACTIVE"}],
+    )
+    rc = blueprint.main(["--json", "projects"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["total"] == 1
+    assert parsed["projects"][0]["id"] == "p-1"
+
+
+# ── fleet runner <-> project bindings ────────────────────────────────────────
+
+ENROLLMENT_PID = "aaaaaaaa-0000-0000-0000-000000000001"
+LISTING_PID = "bbbbbbbb-0000-0000-0000-000000000002"
+TARGET_PID = "cccccccc-0000-0000-0000-000000000003"
+RUNNER_ID = "dddddddd-0000-0000-0000-000000000004"
+RUNNER_ID_2 = "eeeeeeee-0000-0000-0000-000000000005"
+
+
+def _runner_record(runner_id=RUNNER_ID, hostname="iconlab", enrollment=ENROLLMENT_PID):
+    return {
+        "id": runner_id,
+        "hostname": hostname,
+        "status": "active",
+        "enrollment_project_id": enrollment,
+    }
+
+
+@pytest.fixture
+def fleet_binding_api(monkeypatch):
+    """Fleet runner fixture: two projects, one runner enrolled in ENROLLMENT_PID.
+
+    The runner is listed from BOTH projects, so a CLI that keys the runner
+    sub-resource off the *listing* project instead of ``enrollment_project_id``
+    will build a path under LISTING_PID and be caught by the assertions.
+    """
+    calls = []
+    state = {"bound": []}
+
+    monkeypatch.setattr(
+        blueprint,
+        "list_projects",
+        lambda: [
+            {"id": LISTING_PID, "name": "listing"},
+            {"id": ENROLLMENT_PID, "name": "enrollment"},
+        ],
+    )
+
+    def _view():
+        projects = [{"project_id": ENROLLMENT_PID, "is_enrollment": True}]
+        projects += [{"project_id": p, "is_enrollment": False} for p in state["bound"]]
+        return {
+            "runner_id": RUNNER_ID,
+            "enrollment_project_id": ENROLLMENT_PID,
+            "projects": projects,
+        }
+
+    good_prefix = f"/api/admin/projects/{ENROLLMENT_PID}/runners/{RUNNER_ID}/projects"
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        # `calls` keeps the raw path (the URL assertions read it); routing here
+        # ignores the paging query string the listing call carries.
+        route = path.split("?", 1)[0]
+        if route.endswith("/runners") and "/api/admin/projects/" in route:
+            return [_runner_record()]
+        if not route.startswith(good_prefix):
+            # Mirrors the backend: _load_owned_runner filters on
+            # LocalRunner.project_id == project_id, so any other project 404s.
+            raise blueprint.APIError(f"404 Runner not found for path {path}")
+        if method == "GET" and route == good_prefix:
+            return _view()
+        if method == "POST" and route == good_prefix:
+            pid = (body or {}).get("project_id")
+            if pid not in state["bound"]:
+                state["bound"].append(pid)
+            return _view()
+        if method == "DELETE" and route.startswith(good_prefix + "/"):
+            removed = route.rsplit("/", 1)[-1]
+            state["bound"] = [p for p in state["bound"] if p != removed]
+            return _view()
+        raise AssertionError(f"unexpected api call: {method} {path}")
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    return SimpleNamespace(calls=calls, state=state, good_prefix=good_prefix)
+
+
+def test_fleet_grant_builds_path_from_enrollment_project_id(fleet_binding_api, capsys):
+    """The POST path is keyed by enrollment_project_id, not the listing project."""
+    rc = blueprint.main(
+        ["fleet", "grant", "--runner", RUNNER_ID, "--project-id", TARGET_PID, "--yes"]
+    )
+
+    assert rc == 0
+    posts = [(m, p, b) for m, p, b in fleet_binding_api.calls if m == "POST"]
+    assert posts, "expected a POST creating the binding"
+    _method, path, body = posts[0]
+    assert path == (
+        f"/api/admin/projects/{ENROLLMENT_PID}/runners/{RUNNER_ID}/projects"
+    )
+    assert LISTING_PID not in path
+    assert TARGET_PID not in path
+    assert body == {"project_id": TARGET_PID}
+    capsys.readouterr()
+
+
+def test_fleet_revoke_builds_path_from_enrollment_project_id(
+    fleet_binding_api, capsys
+):
+    """The DELETE path is keyed by enrollment_project_id and ends in the bound id."""
+    fleet_binding_api.state["bound"].append(TARGET_PID)
+
+    rc = blueprint.main(
+        ["fleet", "revoke", "--runner", RUNNER_ID, "--project-id", TARGET_PID, "--yes"]
+    )
+
+    assert rc == 0
+    deletes = [(m, p, b) for m, p, b in fleet_binding_api.calls if m == "DELETE"]
+    assert deletes, "expected a DELETE removing the binding"
+    assert deletes[0][1] == (
+        f"/api/admin/projects/{ENROLLMENT_PID}/runners/{RUNNER_ID}"
+        f"/projects/{TARGET_PID}"
+    )
+    assert LISTING_PID not in deletes[0][1]
+    capsys.readouterr()
+
+
+def test_fleet_grant_resolves_runner_by_hostname(fleet_binding_api, capsys):
+    """--runner accepts a hostname, not just a UUID."""
+    rc = blueprint.main(
+        ["fleet", "grant", "--runner", "iconlab", "--project-id", TARGET_PID, "--yes"]
+    )
+
+    assert rc == 0
+    posts = [(m, p, b) for m, p, b in fleet_binding_api.calls if m == "POST"]
+    assert posts
+    assert posts[0][1].startswith(f"/api/admin/projects/{ENROLLMENT_PID}/runners/")
+    capsys.readouterr()
+
+
+def test_fleet_grant_ambiguous_hostname_fails_and_lists_matches(monkeypatch, capsys):
+    """Two runners sharing a hostname fail the resolve and list both ids."""
+    monkeypatch.setattr(
+        blueprint, "list_projects", lambda: [{"id": LISTING_PID, "name": "listing"}]
+    )
+
+    def fake_api(method, path, body=None, timeout=30):
+        if path.split("?", 1)[0].endswith("/runners"):
+            return [
+                _runner_record(RUNNER_ID, "iconlab"),
+                _runner_record(RUNNER_ID_2, "iconlab"),
+            ]
+        raise AssertionError(f"ambiguous resolve must not call {method} {path}")
+
+    monkeypatch.setattr(blueprint, "api", fake_api)
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            ["fleet", "grant", "--runner", "iconlab", "--project-id", TARGET_PID,
+             "--yes"]
+        )
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "ambiguous" in err.lower()
+    assert RUNNER_ID in err
+    assert RUNNER_ID_2 in err
+
+
+def test_fleet_revoke_refuses_enrollment_binding(fleet_binding_api, capsys):
+    """Revoking the enrollment binding is refused - it would orphan the runner."""
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            ["fleet", "revoke", "--runner", RUNNER_ID, "--project-id",
+             ENROLLMENT_PID, "--yes"]
+        )
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "enrollment" in err.lower()
+    assert not [c for c in fleet_binding_api.calls if c[0] == "DELETE"]
+
+
+def test_fleet_grant_existing_binding_is_idempotent(fleet_binding_api, capsys):
+    """Granting an already-present binding reports it and succeeds without a POST."""
+    fleet_binding_api.state["bound"].append(TARGET_PID)
+
+    rc = blueprint.main(
+        ["fleet", "grant", "--runner", RUNNER_ID, "--project-id", TARGET_PID, "--yes"]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "already bound" in out.lower()
+    assert not [c for c in fleet_binding_api.calls if c[0] == "POST"]
+
+
+def test_fleet_grant_requires_a_project_id(fleet_binding_api, capsys):
+    """Without --project-id there is no binding target; fail with guidance."""
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["fleet", "grant", "--runner", RUNNER_ID, "--yes"])
+
+    assert exc.value.code == 1
+    assert "--project-id" in capsys.readouterr().err
+
+
+def test_fleet_runners_lists_hostname_status_and_bindings(fleet_binding_api, capsys):
+    """fleet runners shows hostname, status, enrollment project, and bindings."""
+    fleet_binding_api.state["bound"].append(TARGET_PID)
+
+    rc = blueprint.main(["--json", "fleet", "runners"])
+
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["total"] == 1
+    row = parsed["runners"][0]
+    assert row["hostname"] == "iconlab"
+    assert row["status"] == "active"
+    assert row["enrollment_project_id"] == ENROLLMENT_PID
+    bound_ids = {p["project_id"] for p in row["projects"]}
+    assert bound_ids == {ENROLLMENT_PID, TARGET_PID}

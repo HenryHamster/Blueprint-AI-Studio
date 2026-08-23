@@ -12,12 +12,15 @@ Every read command is human-readable by default and emits machine JSON when
 the global ``--json`` flag is passed (before or after the subcommand).
 
 Subcommand groups:
+    projects list|onboard  project inventory; onboard a repo as a new project
     status            current version phase, deploy state, promotion eligibility
     diagnostics       stuck tasks, circuit breakers, grouped failure modes
     tasks list|show   list/filter tasks, or show one by id
     versions list|show  release versions with phase/status/sha and a summary
     trials            capability-trial verdict, arm counts, days-to-decision projection
-    fleet pool|warm|accounts|zones  VM account pool, warm pool, and zone health
+    fleet pool|warm|accounts|zones|runners|grant|revoke
+                      VM account pool, warm pool, zone health, and the local
+                      runner <-> project allow-list bindings
     promote-recover   promotion + recovery operator levers (confirm before mutate)
     ops               system intervention: repair state, health reset, requeue, restart
     logs tail|errors|search|task   Cloud Logging reads (via gcloud)
@@ -32,6 +35,10 @@ Examples:
     python scripts/blueprint.py trials
     python scripts/blueprint.py fleet pool
     python scripts/blueprint.py fleet accounts --disable evan --yes
+    python scripts/blueprint.py fleet runners
+    python scripts/blueprint.py fleet grant --runner iconlab --project-id <uuid>
+    python scripts/blueprint.py projects onboard --owner acme --repo widget \
+        --goal-file goal.md
     python scripts/blueprint.py promote-recover qualify --yes
     python scripts/blueprint.py logs errors --minutes 30
 
@@ -158,7 +165,36 @@ def first_payload(task: dict) -> dict:
 
 # ── projects ─────────────────────────────────────────────────────────────────
 
+# Mirrors ``OnboardPayload.goal``'s ``max_length`` in backend/app/schemas.py.
+# Validated client-side so a long --goal-file fails with the actual length
+# instead of an opaque server 422.
+_ONBOARD_GOAL_MAX_CHARS = 5000
+
+# build_config keys worth echoing after an onboard. ``has_ci`` and
+# ``requires_ci_checks`` are printed unconditionally by _render_onboard (even
+# when detection omitted them) because their combination is a known wedge.
+_ONBOARD_NOTABLE_BUILD_FLAGS = (
+    "language",
+    "package_manager",
+    "test_command",
+    "build_command",
+    "lint_command",
+    "task_branch_namespace",
+    "repo_is_empty",
+    "detection_incomplete",
+)
+
+
 def cmd_projects(args: argparse.Namespace) -> None:
+    """Dispatch project subcommands: ``list`` (default) / ``onboard``."""
+    sub = getattr(args, "projects_cmd", None) or "list"
+    if sub == "onboard":
+        _projects_onboard(args)
+        return
+    _projects_list(args)
+
+
+def _projects_list(args: argparse.Namespace) -> None:
     """List every project with its canonical operational state. Respects ``--json``."""
     projects = list_projects()
     _emit(args, {"projects": projects, "total": len(projects)}, _render_projects)
@@ -180,6 +216,120 @@ def _render_projects(data: dict) -> None:
             or "-"
         )
         print(f"  {pid} · {name} · {status}")
+
+
+def _onboard_goal(args: argparse.Namespace) -> str | None:
+    """Resolve ``--goal`` / ``--goal-file`` into the payload's goal string.
+
+    ``--goal-file`` exists so a multi-paragraph goal never has to be shell-quoted
+    into the command line. The length ceiling is enforced here rather than left
+    to the server: a 422 names neither the offending length nor which flag
+    carried it, and the file path is exactly where an over-long goal comes from.
+    """
+    goal = getattr(args, "goal", None)
+    goal_file = getattr(args, "goal_file", None)
+    if goal_file:
+        path = Path(goal_file).expanduser()
+        try:
+            goal = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: cannot read --goal-file {path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except UnicodeDecodeError as exc:
+            print(f"ERROR: --goal-file {path} is not valid UTF-8: {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+    if goal is None:
+        return None
+    goal = goal.strip()
+    if not goal:
+        return None
+    if len(goal) > _ONBOARD_GOAL_MAX_CHARS:
+        source = f"--goal-file {goal_file}" if goal_file else "--goal"
+        print(
+            f"ERROR: {source} is {len(goal)} characters; the onboarding goal is "
+            f"capped at {_ONBOARD_GOAL_MAX_CHARS} (OnboardPayload.goal max_length). "
+            f"Trim it by {len(goal) - _ONBOARD_GOAL_MAX_CHARS} characters and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return goal
+
+
+def _projects_onboard(args: argparse.Namespace) -> None:
+    """Create a project from a GitHub repo via POST /api/admin/projects/onboard.
+
+    ``--preview`` maps to ``preview_only=True``, which the backend answers before
+    it touches the database — so it needs no confirmation. A real onboard creates
+    a Project row, so it confirms first unless ``--yes``.
+    """
+    owner = args.owner
+    repo = args.repo
+    preview = bool(getattr(args, "preview", False))
+    goal = _onboard_goal(args)
+
+    payload: dict = {
+        "github_owner": owner,
+        "github_repo": repo,
+        "preview_only": preview,
+    }
+    if getattr(args, "name", None):
+        payload["name"] = args.name
+    if goal:
+        payload["goal"] = goal
+    if getattr(args, "promotion_target", None):
+        payload["promotion_target"] = args.promotion_target
+
+    if not preview:
+        _require_write_config("projects onboard")
+        if not _confirm(
+            f"Create a new Blueprint project for {owner}/{repo}?",
+            getattr(args, "yes", False),
+        ):
+            print("Aborted.")
+            return
+
+    result = api("POST", "/api/admin/projects/onboard", payload)
+    _emit(args, result, lambda d: _render_onboard(d, owner, repo, preview))
+
+
+def _render_onboard(data: dict, owner: str, repo: str, preview: bool) -> None:
+    data = data or {}
+    build_config = data.get("build_config") or {}
+    project_id = data.get("project_id")
+    has_ci = build_config.get("has_ci")
+    requires_ci = build_config.get("requires_ci_checks")
+
+    print(f"=== ONBOARD {owner}/{repo} ===")
+    print(f"  project_id:      {project_id or '(preview only — nothing created)'}")
+    print(f"  default_branch:  {data.get('default_branch') or '?'}")
+    print(f"  merge_verdict:   {data.get('merge_verification_verdict')}")
+    print("  build_config:")
+    print(f"    has_ci:               {has_ci}")
+    print(f"    requires_ci_checks:   {requires_ci}")
+    for key in _ONBOARD_NOTABLE_BUILD_FLAGS:
+        if key in build_config:
+            print(f"    {(key + ':'):22}{build_config[key]}")
+
+    if requires_ci and not has_ci:
+        print(
+            "\n  WARNING: requires_ci_checks=true but has_ci=false. Every merge "
+            "will block\n           forever on a check that never reports. Land CI "
+            "in the repo, or\n           clear requires_ci_checks on the project's "
+            "build_config, before\n           enabling autonomy."
+        )
+
+    if preview:
+        print("\n  (preview only — no project was created)")
+        return
+
+    # Onboarding deliberately leaves autonomous_enabled=False (operator handoff);
+    # say so, and name the exact verb that starts it.
+    print("\n  Autonomy is OFF by design — onboarding hands the project to you.")
+    print(
+        f"  Start it with: blueprint --project-id {project_id or '<id>'} "
+        "system autonomy --enable"
+    )
 
 
 # ── coding-agent access ──────────────────────────────────────────────────────
@@ -852,12 +1002,19 @@ def _scoped_command_key(args: argparse.Namespace) -> tuple[str, str | None]:
     command = str(getattr(args, "command", ""))
     subcommand_attr = {
         "agent-access": "agent_access_cmd",
+        "projects": "projects_cmd",
         "tasks": "tasks_cmd",
         "directions": "directions_cmd",
         "messages": "messages_cmd",
         "strategic": "strategic_cmd",
     }.get(command)
     subcommand = getattr(args, subcommand_attr, None) if subcommand_attr else None
+    # Bare `projects` and `projects list` are the same read, so both map to the
+    # single ("projects", None) allow-list entry. `projects onboard` therefore
+    # stays outside both allow-lists and is denied for scoped credentials — it
+    # creates a project, which is a platform action, not a project-operator one.
+    if command == "projects" and subcommand == "list":
+        subcommand = None
     if subcommand is None and command in {"tasks", "directions", "messages"}:
         subcommand = "list"
     if subcommand is None and command == "agent-access":
@@ -3113,7 +3270,8 @@ def _messages_confirm_dismiss(args: argparse.Namespace) -> None:
 # ── fleet (pool / warm / accounts / zones) ────────────────────────────────────
 
 def cmd_fleet(args: argparse.Namespace) -> None:
-    """Dispatch fleet subcommands: pool / warm / accounts / zones."""
+    """Dispatch fleet subcommands: pool / warm / accounts / zones / runners /
+    grant / revoke."""
     sub = getattr(args, "fleet_cmd", None) or "pool"
     if sub == "warm":
         _fleet_warm(args)
@@ -3121,6 +3279,12 @@ def cmd_fleet(args: argparse.Namespace) -> None:
         _fleet_accounts(args)
     elif sub == "zones":
         _fleet_zones(args)
+    elif sub == "runners":
+        _fleet_runners(args)
+    elif sub == "grant":
+        _fleet_grant(args)
+    elif sub == "revoke":
+        _fleet_revoke(args)
     else:
         _fleet_pool(args)
 
@@ -3305,6 +3469,257 @@ def _render_fleet_zones(data: dict) -> None:
             print(f"  {zone:30}: {status:12} fails={fails} last_ok={last}")
     else:
         print(f"  {zones}")
+
+
+def _fleet_list_runners(project_id: str | None = None) -> list:
+    """Collect runner records, de-duplicated by runner id.
+
+    With ``project_id`` set, lists only the runners reachable from that project
+    (``GET /api/admin/projects/{id}/runners`` returns runners enrolled in OR
+    bound to it). Without one, sweeps every authorized project — necessary for
+    ``fleet grant``, because the project you are about to bind cannot see the
+    runner yet, by definition.
+    """
+    if project_id:
+        scopes = [str(project_id)]
+    else:
+        scopes = [
+            str(p.get("id")) for p in (list_projects() or []) if p.get("id")
+        ]
+    found: dict = {}
+    for pid in scopes:
+        # limit defaults to 50 server-side; ask for the documented maximum so a
+        # large fleet is not silently truncated in the listing.
+        rows, err = _safe_read(f"/api/admin/projects/{pid}/runners?limit=1000")
+        if err or not isinstance(rows, list):
+            continue
+        for row in rows:
+            runner_id = str((row or {}).get("id") or "")
+            if runner_id and runner_id not in found:
+                found[runner_id] = row
+    return list(found.values())
+
+
+def _fleet_runner_projects_path(runner: dict, suffix: str = "") -> str:
+    """Build a runner allow-list sub-resource path.
+
+    IMPORTANT — do not "simplify" this to the selected/listing project id. The
+    runner allow-list sub-resources are keyed by the runner's ENROLLMENT project
+    (``LocalRunner.project_id``, surfaced on each runner record as
+    ``enrollment_project_id``), not by whichever project you listed the runner
+    from. The backend's ``_load_owned_runner`` filters
+    ``LocalRunner.project_id == project_id``, so passing the listing project
+    returns ``404 {"error": {"code": 404, "message": "Runner not found"}}`` even
+    though the runner is plainly visible in that project's runner list.
+    """
+    enrollment = str(runner.get("enrollment_project_id") or "")
+    runner_id = str(runner.get("id") or "")
+    if not enrollment or not runner_id:
+        raise APIError(
+            "runner record is missing id/enrollment_project_id; cannot address "
+            "its project allow-list"
+        )
+    return f"/api/admin/projects/{enrollment}/runners/{runner_id}/projects{suffix}"
+
+
+def _fleet_match_runners(runners: list, query: str | None) -> list:
+    """Match ``query`` against runner id (exact), hostname (exact), then id prefix."""
+    q = str(query or "").strip().lower()
+    if not q:
+        return []
+    exact_id = [r for r in runners if str(r.get("id") or "").lower() == q]
+    if exact_id:
+        return exact_id
+    by_hostname = [r for r in runners if str(r.get("hostname") or "").lower() == q]
+    if by_hostname:
+        return by_hostname
+    return [r for r in runners if str(r.get("id") or "").lower().startswith(q)]
+
+
+def _fleet_resolve_runner(runners: list, query: str | None) -> dict:
+    """Resolve ``--runner`` (id, id prefix, or hostname) to exactly one runner.
+
+    Hostnames are not unique across the fleet, so an ambiguous match fails loudly
+    and prints every candidate rather than silently binding the wrong device.
+    """
+    matches = _fleet_match_runners(runners, query)
+    if not matches:
+        print(
+            f"ERROR: no runner matches --runner {query!r}. "
+            "Run `blueprint fleet runners` to list them.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if len(matches) > 1:
+        print(
+            f"ERROR: --runner {query!r} is ambiguous — {len(matches)} runners match:",
+            file=sys.stderr,
+        )
+        for r in matches:
+            print(
+                f"  {r.get('id')}  {r.get('hostname') or '?'}  "
+                f"[{r.get('status') or '?'}]  enrollment={r.get('enrollment_project_id')}",
+                file=sys.stderr,
+            )
+        print("Re-run with the runner id.", file=sys.stderr)
+        sys.exit(1)
+    return matches[0]
+
+
+def _fleet_binding_target(args: argparse.Namespace, action: str) -> str:
+    """The project a grant/revoke acts on, taken from the global --project-id.
+
+    ``--project-id`` / ``--project`` name the project whose access is being
+    changed; the runner is named separately by ``--runner``. Required: there is
+    no safe default for "which project should this runner serve".
+    """
+    target = getattr(args, "project_id", None)
+    if not target:
+        print(
+            f"ERROR: `fleet {action}` requires --project-id <uuid> (or --project "
+            f"<name>) — the project the runner should"
+            f"{'' if action == 'grant' else ' no longer'} serve.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return str(target)
+
+
+def _fleet_runners(args: argparse.Namespace) -> None:
+    """List runners with hostname, status, enrollment project, and bindings."""
+    runners = _fleet_list_runners(getattr(args, "project_id", None))
+    rows = []
+    for runner in runners:
+        bound, err = _safe_read(_fleet_runner_projects_path(runner))
+        rows.append({
+            "id": runner.get("id"),
+            "hostname": runner.get("hostname"),
+            "status": runner.get("status"),
+            "enrollment_project_id": runner.get("enrollment_project_id"),
+            "projects": (bound or {}).get("projects") or [],
+            "projects_error": err,
+        })
+    _emit(args, {"runners": rows, "total": len(rows)}, _render_fleet_runners)
+
+
+def _render_fleet_runners(data: dict) -> None:
+    runners = data.get("runners") or []
+    print(f"=== FLEET RUNNERS ({len(runners)}) ===")
+    if not runners:
+        print("  (none)")
+        return
+    for r in runners:
+        print(
+            f"  {r.get('id')}  {r.get('hostname') or '?'}  "
+            f"[{r.get('status') or '?'}]"
+        )
+        print(f"    enrollment: {r.get('enrollment_project_id')}")
+        if r.get("projects_error"):
+            print(f"    bound:      (unavailable: {r['projects_error']})")
+            continue
+        entries = r.get("projects") or []
+        if not entries:
+            print("    bound:      (none)")
+        for entry in entries:
+            tag = "  (enrollment)" if entry.get("is_enrollment") else ""
+            print(f"    bound:      {entry.get('project_id')}{tag}")
+
+
+def _render_runner_allow_list(data: dict) -> None:
+    data = data or {}
+    print(f"  runner:     {data.get('runner_id')}")
+    print(f"  enrollment: {data.get('enrollment_project_id')}")
+    for entry in data.get("projects") or []:
+        tag = "  (enrollment)" if entry.get("is_enrollment") else ""
+        print(f"  bound:      {entry.get('project_id')}{tag}")
+
+
+def _fleet_grant(args: argparse.Namespace) -> None:
+    """Add a project to a runner's allow-list so the fleet can dispatch to it."""
+    _require_write_config("fleet grant")
+    target = _fleet_binding_target(args, "grant")
+    # Sweep every authorized project: the target project cannot see the runner
+    # until this grant lands, so it can never be the discovery scope.
+    runner = _fleet_resolve_runner(
+        _fleet_list_runners(), getattr(args, "runner", None)
+    )
+    path = _fleet_runner_projects_path(runner)
+
+    current = api("GET", path) or {}
+    already = [
+        e for e in (current.get("projects") or [])
+        if str(e.get("project_id")) == target
+    ]
+    if already:
+        note = " (enrollment anchor)" if already[0].get("is_enrollment") else ""
+        print(
+            f"Already bound: runner {runner.get('hostname') or runner.get('id')} "
+            f"already serves {target}{note} — no change."
+        )
+        _emit(args, current, _render_runner_allow_list)
+        return
+
+    if not _confirm(
+        f"Grant runner {runner.get('hostname') or runner.get('id')} "
+        f"({runner.get('id')}) access to project {target}?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+
+    result = api("POST", path, {"project_id": target})
+    print(f"Granted: {target} -> runner {runner.get('id')}")
+    _emit(args, result, _render_runner_allow_list)
+
+
+def _fleet_revoke(args: argparse.Namespace) -> None:
+    """Remove a project from a runner's allow-list."""
+    _require_write_config("fleet revoke")
+    target = _fleet_binding_target(args, "revoke")
+    runner = _fleet_resolve_runner(
+        _fleet_list_runners(), getattr(args, "runner", None)
+    )
+    path = _fleet_runner_projects_path(runner)
+    enrollment = str(runner.get("enrollment_project_id") or "")
+
+    current = api("GET", path) or {}
+    entry = next(
+        (e for e in (current.get("projects") or [])
+         if str(e.get("project_id")) == target),
+        None,
+    )
+
+    # The enrollment project is the runner's anchor membership, not a grant.
+    # Removing it would orphan the runner (the backend rejects it 409); refuse
+    # here so the operator gets the reason instead of an HTTP error.
+    if target == enrollment or (entry is not None and entry.get("is_enrollment")):
+        print(
+            f"ERROR: {target} is runner {runner.get('id')}'s enrollment project, "
+            "not an allow-list grant. Revoking it would orphan the runner; "
+            "delete or re-enroll the runner instead.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if entry is None:
+        print(
+            f"Not bound: runner {runner.get('hostname') or runner.get('id')} does "
+            f"not serve {target} — no change."
+        )
+        _emit(args, current, _render_runner_allow_list)
+        return
+
+    if not _confirm(
+        f"Revoke runner {runner.get('hostname') or runner.get('id')} "
+        f"({runner.get('id')}) access to project {target}?",
+        getattr(args, "yes", False),
+    ):
+        print("Aborted.")
+        return
+
+    result = api("DELETE", _fleet_runner_projects_path(runner, f"/{target}"))
+    print(f"Revoked: {target} from runner {runner.get('id')}")
+    _emit(args, result, _render_runner_allow_list)
 
 
 # ── promote-recover ──────────────────────────────────────────────────────────
@@ -6181,8 +6596,44 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     # projects
-    sub.add_parser("projects", parents=[common],
-                   help="List all projects (id, name, status).")
+    p_projects = sub.add_parser(
+        "projects", parents=[common],
+        help="List all projects, or onboard a new one from a GitHub repo.",
+        description="Project inventory and onboarding. Defaults to `list` when no "
+                    "subcommand is given.")
+    projects_sub = p_projects.add_subparsers(dest="projects_cmd")
+    projects_sub.add_parser("list", parents=[common],
+                            help="List all projects (id, name, status).")
+    p_projects_onboard = projects_sub.add_parser(
+        "onboard", parents=[common],
+        help="Create a project from a GitHub repo (confirms before creating).",
+        description="POST /api/admin/projects/onboard. Detects the repo build "
+                    "config, creates the project, seeds the goal into strategic "
+                    "intent, and hands it to you with autonomy OFF. Use --preview "
+                    "to see the detected build config without creating anything.")
+    p_projects_onboard.add_argument("--owner", required=True, metavar="OWNER",
+                                    help="GitHub owner/org of the repository.")
+    p_projects_onboard.add_argument("--repo", required=True, metavar="REPO",
+                                    help="GitHub repository name.")
+    p_projects_onboard.add_argument("--name", default=None, metavar="NAME",
+                                    help="Project display name (default: owner/repo).")
+    onboard_goal = p_projects_onboard.add_mutually_exclusive_group()
+    onboard_goal.add_argument(
+        "--goal", default=None, metavar="TEXT",
+        help=f"Goal seeded into strategic intent (max {_ONBOARD_GOAL_MAX_CHARS} chars).")
+    onboard_goal.add_argument(
+        "--goal-file", dest="goal_file", default=None, metavar="PATH",
+        help="Read the goal from a UTF-8 file — use this for multi-paragraph "
+             "goals instead of shell-quoting them.")
+    p_projects_onboard.add_argument(
+        "--promotion-target", dest="promotion_target", default=None, metavar="REF",
+        help="Promotion target branch (default: the repo default branch).")
+    p_projects_onboard.add_argument(
+        "--preview", action="store_true",
+        help="Detect and print the build config without creating a project "
+             "(preview_only=true; mutates nothing, never confirms).")
+    p_projects_onboard.add_argument("--yes", action="store_true",
+                                    help="Skip the confirmation prompt.")
 
     # coding-agent access bootstrap and CLI fallback
     p_agent_access = sub.add_parser(
@@ -6900,6 +7351,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_fleet_accounts.add_argument("--yes", action="store_true",
                                   help="Skip the confirmation prompt.")
     fleet_sub.add_parser("zones", parents=[common], help="Show zone health.")
+    fleet_sub.add_parser(
+        "runners", parents=[common],
+        help="List local runners with enrollment project and project bindings.",
+        description="List fleet runners (hostname, status, enrollment project, and "
+                    "the projects each is allowed to serve). Scoped to one project "
+                    "with --project-id/--project; otherwise sweeps every authorized "
+                    "project.")
+    p_fleet_grant = fleet_sub.add_parser(
+        "grant", parents=[common],
+        help="Bind a project to a runner's allow-list (confirms before mutating).",
+        description="Add a project to a runner's per-project allow-list so the fleet "
+                    "can dispatch that project's tasks to it. The project is named by "
+                    "the global --project-id (or --project) flag; --runner accepts a "
+                    "runner id, id prefix, or hostname. Already-bound is reported and "
+                    "succeeds.")
+    p_fleet_grant.add_argument("--runner", required=True, metavar="ID_OR_HOSTNAME",
+                               help="Runner id, id prefix, or hostname.")
+    p_fleet_grant.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt.")
+    p_fleet_revoke = fleet_sub.add_parser(
+        "revoke", parents=[common],
+        help="Remove a project from a runner's allow-list (confirms before mutating).",
+        description="Remove a project from a runner's per-project allow-list. The "
+                    "project is named by the global --project-id (or --project) flag. "
+                    "The runner's enrollment project is its anchor membership and "
+                    "cannot be revoked.")
+    p_fleet_revoke.add_argument("--runner", required=True, metavar="ID_OR_HOSTNAME",
+                                help="Runner id, id prefix, or hostname.")
+    p_fleet_revoke.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt.")
 
     # health
     p_health = sub.add_parser(
