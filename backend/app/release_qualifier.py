@@ -39,6 +39,7 @@ from app import github, release_version
 from app import release_qualification_deferral as qualification_deferral
 from app import release_task_admission
 from app.database import AsyncSessionLocal, resolve_async_engine
+from app.failure_reason import exception_reason
 from app.failure_classification import (
     ADMIN_CANCEL,
     AGENT_TIMEOUT,
@@ -2523,7 +2524,7 @@ async def run_qualification(
         version.last_qualification = {
             "status": "error",
             "error": "sha_error",
-            "detail": f"{type(exc).__name__}: {exc}"[:300],
+            "detail": exception_reason(exc),
             "started_at": _utcnow().isoformat(),
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": retry_episode,
@@ -10341,9 +10342,24 @@ async def force_promote_current_version(
                 token, owner, repo, integration_branch, live=True
             )
         except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
-            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+            return {"status": "sha_error", "detail": exception_reason(exc)}
     if not candidate_sha:
         return {"status": "sha_error", "detail": "empty candidate sha"}
+    # Normalize the operator's ref to a CANONICAL full 40-hex sha before any
+    # consumer keys off it.  ``git log`` prints an abbreviated sha, so that is
+    # what a human types into ``--candidate-sha`` — and GitHub's ref-create API
+    # answers anything shorter with a 422 "Object does not exist" four layers
+    # deeper, which surfaced as a bare ``release_branch_failed`` with no reason
+    # (incident 2026-08-23).  RESOLVE rather than reject: the engine already
+    # holds the token, owner and repo, so it must not hand back a lookup it can
+    # perform itself.  A full sha returns unchanged with NO network call, so an
+    # already-canonical candidate behaves exactly as it did before.
+    try:
+        candidate_sha = await github.resolve_commit_sha(
+            token, owner, repo, candidate_sha, project_id=str(project_id)
+        )
+    except Exception as exc:  # noqa: BLE001 — an unresolvable ref IS an operator error; report it precisely
+        return {"status": "sha_error", "detail": exception_reason(exc)}
     candidate_diff_hash = compute_audited_surface_hash(
         await github.list_repo_tree_paths_at_ref(
             token, owner, repo, candidate_sha, project_id=str(project_id)

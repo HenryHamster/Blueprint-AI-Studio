@@ -23,6 +23,19 @@ _RECENT_COMMIT_MESSAGES_MAX_LIMIT = 50
 # not provide a total-file count, so a response at this limit is ambiguous.
 _GITHUB_COMPARE_FILES_MAX = 300
 
+# ``POST /git/refs`` answers 422 for at least THREE different conditions that
+# are distinguished ONLY by the response body's ``message``:
+#   * "Reference already exists" — the ref is there (benign retry, or a stale
+#     branch left by a crashed run)
+#   * "Object does not exist"    — the sha is unknown, invalid or ABBREVIATED
+#   * "Reference update failed"  — a validation / permission refusal
+# Only the first means "reuse".  Collapsing all three onto reuse is what turned
+# an abbreviated ``--candidate-sha`` into a bare ``release_branch_failed`` with
+# no reason at all (incident 2026-08-23).  Literal pin — do not soften.
+_REF_ALREADY_EXISTS_MESSAGE = "reference already exists"
+# GitHub's prose is bounded before it lands on an operator-visible record.
+_GITHUB_ERROR_MESSAGE_MAX = 200
+
 
 def _github_request(*args, **kwargs):
     """Delegate to the live ``app.github._github_request`` at call time so
@@ -32,6 +45,38 @@ def _github_request(*args, **kwargs):
     return _gh._github_request(*args, **kwargs)
 
 
+def github_error_message(response) -> str:
+    """GitHub's OWN error prose for a failed response — bounded, never ``None``.
+
+    Prefers the JSON body's ``message`` (plus any ``errors[].message`` /
+    ``errors[].code``), falling back to the raw response text.  A raise built
+    from a GitHub response that drops this leaves the operator a status code.
+    """
+    message = ""
+    extras: list[str] = []
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 — a non-JSON body is normal (HTML 5xx, empty)
+        body = None
+    if isinstance(body, dict):
+        message = str(body.get("message") or "").strip()
+        raw_errors = body.get("errors")
+        if isinstance(raw_errors, list):
+            for item in raw_errors:
+                if isinstance(item, dict):
+                    text = str(item.get("message") or item.get("code") or "").strip()
+                else:
+                    text = str(item or "").strip()
+                if text and text != message:
+                    extras.append(text)
+    if extras:
+        joined = "; ".join(extras)
+        message = f"{message} ({joined})" if message else joined
+    if not message:
+        message = str(getattr(response, "text", "") or "").strip()
+    return message[:_GITHUB_ERROR_MESSAGE_MAX]
+
+
 async def create_branch(
     token: str, owner: str, repo: str, branch_name: str, sha: str
 ) -> dict:
@@ -39,7 +84,12 @@ async def create_branch(
 
     Returns the GitHub ref object on a real create (HTTP 201).
 
-    On HTTP 422 the ref already exists — the common cause is a retry after a 502
+    HTTP 422 is AMBIGUOUS (see ``_REF_ALREADY_EXISTS_MESSAGE``): only an explicit
+    "Reference already exists" takes the reuse path below; every other 422 raises
+    an error whose ``detail`` QUOTES GitHub's own message, so the reason survives
+    into the operator record instead of flattening to a bare status code.
+
+    On the reuse 422 the common cause is a retry after a 502
     whose write actually landed, but it is ALSO what a crashed prior run leaves
     behind, and that branch can be sitting at a COMPLETELY DIFFERENT SHA.  The
     old implementation fetched the live SHA and returned a success-shaped
@@ -82,7 +132,29 @@ async def create_branch(
     )
 
     if response.status_code == 422:
-        # Branch may already exist (e.g., retry after 502 that actually succeeded)
+        # Only take the reuse path when GitHub actually SAID the reference
+        # exists.  For any other 422 (notably "Object does not exist" for an
+        # unknown/abbreviated sha) the old code probed for a branch that is not
+        # there, swallowed the 404 in a bare ``except Exception``, and fell
+        # through to a generic error discarding ``response.text`` — the one
+        # place the real reason lived.
+        github_message = github_error_message(response)
+        if _REF_ALREADY_EXISTS_MESSAGE not in github_message.lower():
+            logger.error(
+                "Failed to create branch '%s' at '%s': GitHub 422 — %s",
+                branch_name,
+                sha,
+                github_message or "<no message from GitHub>",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    f"Failed to create branch '{branch_name}' at '{sha}' on "
+                    f"GitHub (GitHub 422): "
+                    f"{github_message or '<no message from GitHub>'}"
+                ),
+            )
+        # Branch already exists (e.g., retry after 502 that actually succeeded)
         from app import github as _gh
 
         try:
@@ -118,10 +190,16 @@ async def create_branch(
             )
 
     if response.status_code != 201:
+        github_message = github_error_message(response)
         logger.error(f"Failed to create branch: {response.status_code} {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create branch '{branch_name}' on GitHub (GitHub {response.status_code}).",
+            detail=(
+                f"Failed to create branch '{branch_name}' at '{sha}' on GitHub "
+                f"(GitHub {response.status_code})"
+                + (f": {github_message}" if github_message else "")
+                + "."
+            ),
         )
 
     return response.json()

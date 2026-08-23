@@ -16,6 +16,7 @@ from sqlmodel import select
 
 from app import github, hotfix_narrow_candidate, hotfix_policy, release_version
 from app.database import AsyncSessionLocal
+from app.failure_reason import exception_reason
 # Moved out to keep this module inside its governance cap; re-exported so
 # ``release_qualifier.check_hotfix_scope_preview`` keeps resolving unchanged.
 from app.hotfix_narrow_candidate import (  # noqa: F401
@@ -367,16 +368,26 @@ async def hotfix_promote_current_version(
                 token, owner, repo, integration_branch, live=True
             )
         except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
-            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+            return {"status": "sha_error", "detail": exception_reason(exc)}
     if not candidate_sha:
         return {"status": "sha_error", "detail": "empty candidate sha"}
+    # Same normalization as force-promote: an operator-typed abbreviated sha is
+    # resolved to its canonical 40-hex form here, at the single server-side
+    # entry point, instead of dying inside GitHub's ref-create API with a bare
+    # 422 several layers deeper (incident 2026-08-23).  Full sha ⇒ no network.
+    try:
+        candidate_sha = await github.resolve_commit_sha(
+            token, owner, repo, candidate_sha, project_id=str(project_id)
+        )
+    except Exception as exc:  # noqa: BLE001 — an unresolvable ref IS an operator error
+        return {"status": "sha_error", "detail": exception_reason(exc)}
     # The prior deployed SHA is BOTH the diff base and an audit-trail field.
     try:
         prior_deployed_sha = await github.get_branch_sha(
             token, owner, repo, promotion_target, live=True
         )
     except Exception as exc:  # noqa: BLE001
-        return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+        return {"status": "sha_error", "detail": exception_reason(exc)}
     if not prior_deployed_sha:
         return {"status": "sha_error", "detail": "empty promotion-target sha"}
 

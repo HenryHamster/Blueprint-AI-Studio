@@ -40,9 +40,8 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, release_version
 from app.models import Project, QualificationVerdict
-from app.release_artifacts import (
-    get_or_create_release_deploy_artifact,
-)
+from app.release_artifacts import get_or_create_release_deploy_artifact
+from app.failure_reason import exception_reason, promotion_failure_result
 from app.notification_dispatch import post_event_message
 from app.release_merge_refusal import promotion_merge_refusal
 from app.release_scoring import _DEFAULT_POLICY, compute_composite
@@ -1171,7 +1170,7 @@ async def promote(
             "[RELEASE_QUALIFIER] promote: failed to commit before releasing "
             "the row lock for v%d (%s) — recording failure",
             _version_number,
-            exc,
+            exception_reason(exc),
         )
         try:
             await session.rollback()
@@ -1199,7 +1198,7 @@ async def promote(
             version,
             base_record,
             "lock_release_failed",
-            detail=str(exc)[:300],
+            detail=exception_reason(exc),
             lock_released=True,
         )
 
@@ -1302,14 +1301,14 @@ async def promote(
             release_branch,
             (candidate_sha or "")[:8],
             version.version_number,
-            exc,
+            exception_reason(exc),
         )
         return await _record_promotion_failure(
             session,
             version,
             base_record,
             "release_branch_failed",
-            detail=str(exc)[:300],
+            detail=exception_reason(exc),
             lock_released=True,
         )
 
@@ -1378,14 +1377,14 @@ async def promote(
         logger.warning(
             "[RELEASE_QUALIFIER] failed to open promotion PR for v%d: %s",
             version.version_number,
-            exc,
+            exception_reason(exc),
         )
         return await _record_promotion_failure(
             session,
             version,
             base_record,
             "pr_creation_failed",
-            detail=str(exc)[:300],
+            detail=exception_reason(exc),
             lock_released=True,
         )
 
@@ -1655,14 +1654,14 @@ async def promote(
             "[RELEASE_QUALIFIER] merge raised for promotion PR #%s (v%d): %s",
             pr_number,
             version.version_number,
-            exc,
+            exception_reason(exc),
         )
         return await _record_promotion_failure(
             session,
             version,
             base_record,
             "merge_error",
-            detail=str(exc)[:300],
+            detail=exception_reason(exc),
             pr_url=pr_url,
             lock_released=True,
         )
@@ -1847,7 +1846,7 @@ async def _delete_release_branch_best_effort(
             "for v%d (non-fatal): %s",
             release_branch,
             version.version_number,
-            exc,
+            exception_reason(exc),
         )
 
 
@@ -1892,7 +1891,7 @@ async def _record_promotion_failure(
     )
     if locked is None:
         # Row vanished (project deleted mid-promotion) — nothing to record.
-        return {"status": "promotion_failed", "error": error, "conflict": conflict}
+        return promotion_failure_result(error, conflict, detail)
     version = locked
     # Re-check under the re-lock (Round 9 — data integrity): a concurrent
     # finalize / crash-retry may have already PROMOTED this version while this
@@ -1987,7 +1986,7 @@ async def _record_promotion_failure(
             "conflict": conflict,
         },
     )
-    return {"status": "promotion_failed", "error": error, "conflict": conflict}
+    return promotion_failure_result(error, conflict, detail)
 
 
 async def _record_promotion_success(

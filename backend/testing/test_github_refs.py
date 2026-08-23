@@ -148,6 +148,149 @@ async def test_create_branch_non_201_raises(mocker):
         await github_refs.create_branch("t", "o", "r", "plan/x", REQUESTED)
 
     assert exc_info.value.status_code == 500
+    # The reason GitHub gave must survive INTO the error — the old message
+    # discarded response.text and reported only the numeric status.
+    assert "Not Found" in exc_info.value.detail
+
+
+# ---------------------------------------------------------------------------
+# HTTP 422 is AMBIGUOUS.  ``POST /git/refs`` answers 422 for at least three
+# different conditions, distinguished ONLY by the body's ``message``:
+#
+#   "Reference already exists"  -> the ref is there (benign retry / stale tip)
+#   "Object does not exist"     -> the sha is unknown, invalid or ABBREVIATED
+#   "Reference update failed"   -> a validation / permission refusal
+#
+# Collapsing all three onto the reuse path is what turned an abbreviated
+# ``--candidate-sha`` into a bare ``release_branch_failed`` with no reason at
+# all (incident 2026-08-23): create_branch took the 422, probed for a branch
+# that does not exist, swallowed the 404 in a bare ``except Exception`` and
+# fell through to a generic error that discarded ``response.text`` — the one
+# place the real reason lived.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_branch_422_object_does_not_exist_is_not_reuse(mocker):
+    """THE INCIDENT: an abbreviated sha 422s with "Object does not exist".
+
+    That is NOT "the reference already exists", so it must never take the reuse
+    path, and the error must QUOTE GitHub's own message.
+    """
+    from app import github_refs
+
+    request_mock = mocker.AsyncMock(
+        return_value=MockResponse(
+            422,
+            {
+                "message": "Object does not exist",
+                "documentation_url": "https://docs.github.com/rest",
+            },
+        )
+    )
+    mocker.patch("app.github._github_request", new=request_mock)
+    lookup = mocker.patch("app.github.get_branch_sha", new=mocker.AsyncMock())
+
+    with pytest.raises(HTTPException) as exc_info:
+        await github_refs.create_branch("t", "o", "r", "release-v1", "4b6681871")
+
+    assert exc_info.value.status_code == 500
+    # GitHub's own words reach the operator record verbatim.
+    assert "Object does not exist" in exc_info.value.detail
+    # ...along with WHICH branch at WHICH sha, so the abbreviated sha is visible.
+    assert "release-v1" in exc_info.value.detail
+    assert "4b6681871" in exc_info.value.detail
+    # The reuse path was never entered: no live branch lookup for a ref that
+    # does not exist (that 404 is what used to swallow the real reason).
+    lookup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_branch_422_reference_update_failed_is_not_reuse(mocker):
+    """A validation/permission 422 is also not reuse and keeps its message."""
+    from app import github_refs
+
+    mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(
+            return_value=MockResponse(422, {"message": "Reference update failed"})
+        ),
+    )
+    lookup = mocker.patch("app.github.get_branch_sha", new=mocker.AsyncMock())
+
+    with pytest.raises(HTTPException) as exc_info:
+        await github_refs.create_branch("t", "o", "r", "plan/x", REQUESTED)
+
+    assert exc_info.value.status_code == 500
+    assert "Reference update failed" in exc_info.value.detail
+    lookup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_branch_422_reference_exists_still_reuses(mocker):
+    """Regression guard on the OTHER side of the split: the documented
+    ``reused`` / ``existing_sha`` / ``sha_matches`` contract that
+    ``release_promotion.promote()`` depends on is unchanged for a genuine
+    "Reference already exists" — including GitHub's mixed-case spelling."""
+    from app import github_refs
+
+    mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(
+            return_value=MockResponse(422, {"message": "Reference already exists"})
+        ),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new=mocker.AsyncMock(return_value=STALE)
+    )
+
+    result = await github_refs.create_branch("t", "o", "r", "plan/x", REQUESTED)
+
+    assert result["reused"] is True
+    assert result["sha_matches"] is False
+    assert result["existing_sha"] == STALE
+    assert result["object"]["sha"] == STALE
+
+
+def test_github_error_message_prefers_json_message_and_is_bounded():
+    """The helper reports GitHub's prose, folds in per-field errors, and is
+    BOUNDED before it can land on an operator-visible record."""
+    from app import github_refs
+
+    assert (
+        github_refs.github_error_message(
+            MockResponse(422, {"message": "Object does not exist"})
+        )
+        == "Object does not exist"
+    )
+    detailed = github_refs.github_error_message(
+        MockResponse(
+            422,
+            {
+                "message": "Validation Failed",
+                "errors": [{"resource": "Reference", "code": "invalid"}],
+            },
+        )
+    )
+    assert "Validation Failed" in detailed
+    assert "invalid" in detailed
+
+    # No JSON body at all — fall back to the raw text rather than reporting
+    # nothing (that fallback is exactly what the old code threw away).
+    class _Unparseable(MockResponse):
+        def json(self):
+            raise ValueError("not json")
+
+    assert (
+        github_refs.github_error_message(_Unparseable(500, text="upstream exploded"))
+        == "upstream exploded"
+    )
+
+    long_text = "x" * 5000
+    bounded = github_refs.github_error_message(_Unparseable(500, text=long_text))
+    # Literal pin: the bound is 200 characters, not "some bound".
+    assert github_refs._GITHUB_ERROR_MESSAGE_MAX == 200
+    assert len(bounded) <= 200
 
 
 # ---------------------------------------------------------------------------
