@@ -572,6 +572,8 @@ def detect_local_gpu() -> dict | None:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             if proc.returncode == 0:
@@ -4121,6 +4123,8 @@ def _git_clone_ref(clone_url: str, ref: str, dest: str) -> None:
         ["git", "clone", "--depth", "1", "--branch", ref, clone_url, dest],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=600,
     )
     if proc.returncode != 0:
@@ -4129,6 +4133,8 @@ def _git_clone_ref(clone_url: str, ref: str, dest: str) -> None:
             ["git", "clone", clone_url, dest],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=900,
         )
         if proc2.returncode != 0:
@@ -4140,6 +4146,8 @@ def _git_clone_ref(clone_url: str, ref: str, dest: str) -> None:
             ["git", "-C", dest, "checkout", ref],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         if co.returncode != 0:

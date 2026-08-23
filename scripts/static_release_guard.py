@@ -96,6 +96,8 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         cwd=repo,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=check,
     )
 
@@ -252,7 +254,7 @@ _extract_base = extract_base
 
 
 def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, check=False)
+    return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
 
 
 def _pytest_result_is_authoritative(

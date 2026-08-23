@@ -3800,7 +3800,7 @@ def _fetch_logs(filter_str: str, limit: int) -> list:
         "--order=desc",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
     except subprocess.TimeoutExpired:
         print("ERROR: `gcloud logging read` timed out after 90s.", file=sys.stderr)
         return []
@@ -5608,7 +5608,7 @@ def _detect_local_gpu() -> dict:
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             )
             if result.returncode == 0 and result.stdout.strip():
                 devices = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
@@ -5620,7 +5620,7 @@ def _detect_local_gpu() -> dict:
         try:
             result = subprocess.run(
                 ["rocm-smi", "--showproductname"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             )
             if result.returncode == 0 and result.stdout.strip():
                 devices = [line.strip() for line in result.stdout.strip().splitlines()
@@ -7491,6 +7491,8 @@ def _migration_registry_config(credential_path: Path):
             input=credential_text,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         if login.returncode != 0:
@@ -7503,6 +7505,8 @@ def _migration_registry_config(credential_path: Path):
             [_MIGRATION_DOCKER, "--config", str(directory), "logout", _MIGRATION_REGISTRY],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         if logout.returncode != 0:
@@ -7556,7 +7560,7 @@ def _migration_container_command(
 
 def _run_migration_container(command: list[str], environment: dict[str, str]) -> int:
     result = subprocess.run(
-        command, capture_output=True, text=True, check=False,
+        command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         timeout=600, env=environment,
     )
     if result.stdout:
@@ -7593,7 +7597,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         with _migration_registry_config(credential_path) as config:
             pull = subprocess.run(
                 [_MIGRATION_DOCKER, "--config", str(config), "pull", image],
-                capture_output=True, text=True, check=False, timeout=600,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=600,
             )
             if pull.stdout:
                 print(pull.stdout, end="")
@@ -8299,6 +8303,8 @@ def _systemd_preflight() -> dict:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
     except OSError as exc:

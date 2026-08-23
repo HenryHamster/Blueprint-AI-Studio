@@ -672,6 +672,8 @@ def _mainline_git_ref(repo_root: str | None = None) -> str:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
                 cwd=root,
             )
@@ -697,6 +699,8 @@ def _git_shallow_file_path(repo_root: str) -> str:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             cwd=repo_root,
         )
@@ -759,6 +763,8 @@ def _git_history_is_truncated(repo_root: str | None = None) -> bool:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
                 cwd=root,
             )
@@ -880,6 +886,8 @@ def _read_git_bump_history(module_key: str) -> list[BumpRecord] | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             cwd=_REPO_ROOT,
         )
@@ -1077,6 +1085,8 @@ def rebuild_cap_bump_history_ledger(
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 cwd=_REPO_ROOT,
             )
@@ -1224,6 +1234,8 @@ def _head_reachable_cap_commits(repo_root: str) -> set[str] | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             cwd=repo_root,
         )
@@ -1284,6 +1296,8 @@ def missing_ledger_bump_records(
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             cwd=root,
         )
@@ -1674,6 +1688,8 @@ def _resolve_shas(shas: set[str], repo_root: str) -> dict[str, bool]:
             input="\n".join(sorted(shas)) + "\n",
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             cwd=repo_root,
         )
@@ -1708,6 +1724,8 @@ def _commit_in_mainline_ancestry(sha: str, repo_root: str) -> bool | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             cwd=repo_root,
         )
@@ -1741,6 +1759,8 @@ def _git_show_file_diff(sha: str, repo_root: str) -> str | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             cwd=repo_root,
         )
@@ -1766,6 +1786,8 @@ def _git_commit_parent_count(sha: str, repo_root: str) -> int | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             cwd=repo_root,
         )
@@ -1868,6 +1890,8 @@ def phantom_ledger_records(
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             cwd=root,
         )

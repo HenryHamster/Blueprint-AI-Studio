@@ -798,6 +798,8 @@ def _mainline_limits_via_git(repo_root: str) -> "tuple[dict | None, str | None]"
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             cwd=repo_root,
         )

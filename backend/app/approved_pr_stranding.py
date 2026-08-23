@@ -198,6 +198,8 @@ def _git(args: list[str], *, repo_root: str) -> subprocess.CompletedProcess[str]
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_GIT_TIMEOUT_SECONDS,
             check=False,
         )
