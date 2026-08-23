@@ -267,6 +267,37 @@ describe('packet-only decision prompt and handler', () => {
     expect(prompt.length).toBeLessThan(30_000);
   });
 
+  it('does not re-flag a server-bounded snapshot as locally truncated', () => {
+    // The server bounds bet_snapshot field-aware to 8,000 chars of *compact*
+    // JSON, which indents to more than that. Wrapping such a snapshot in the
+    // local guard would tell the reviewer its authority had been cut when
+    // every field was in fact intact -- the false signal that stranded
+    // direction d-f502e1a5 at ask_operator.
+    const bet: Record<string, unknown> = {
+      mode: 'research',
+      claim: 'c'.repeat(1_500),
+      decision_question: 'q'.repeat(4_000),
+      success_evidence: 'The stranded-direction count reaches zero.',
+      retirement_condition: 'Retire after two flat generations.',
+      snapshot_truncated: true,
+      snapshot_shortened_keys: ['direction'],
+      snapshot_elided_keys: [],
+      original_checksum: 'a'.repeat(64),
+      direction: { id: 'd-f502e1a5', text: 'd'.repeat(1_000) },
+      alternatives: Array.from(
+        { length: 60 },
+        (_unused, index) => `alternative ${index}`,
+      ),
+    };
+    const compact = JSON.stringify(bet);
+    expect(compact.length).toBeLessThanOrEqual(8_000);
+    expect(JSON.stringify(bet, null, 2).length).toBeGreaterThan(8_000);
+
+    const prompt = buildDiscoveryReviewPrompt(payload({ bet_snapshot: bet }));
+    expect(prompt).toContain(compact);
+    expect(prompt).not.toContain('"local_guard": true');
+  });
+
   it('uses one configurable routine model route in isolated text-only memory', async () => {
     vi.mocked(runIsolatedTextOnlyMemory).mockResolvedValueOnce({
       exitCode: 0,

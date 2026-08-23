@@ -1,5 +1,7 @@
 """Packet-budget progressive degradation tests for discovery review receipts."""
 
+import hashlib
+
 import pytest
 
 import app.discovery_review_packet as discovery_review_packet
@@ -418,7 +420,11 @@ def _oversized_direction(direction_key: str) -> dict:
     Sized to match the production directions this regression stranded
     (10,359-14,489 rendered chars): the bulk is ordinary authored prose --
     direction text plus the success/retirement/constraint context an operator
-    is expected to write -- not a synthetic blob.
+    is expected to write -- not a synthetic blob. ``research_context`` is the
+    field that actually grows without bound in production: it is accumulated
+    outcome memory that research completion rewrites, and every generation
+    adds to it (see direction_authority_fence_snapshot, which excludes it from
+    the authority fence for exactly that reason).
     """
 
     return {
@@ -427,6 +433,7 @@ def _oversized_direction(direction_key: str) -> dict:
         "status": "active",
         "priority": "medium",
         "paths": ["backend/app/discovery_review.py"],
+        "research_context": "Accumulated outcome memory. " * 300,
         "context": {
             "success_evidence": "The probe improves the target outcome. " * 60,
             "retirement_condition": "Retire after two probes without gain. " * 60,
@@ -435,33 +442,425 @@ def _oversized_direction(direction_key: str) -> dict:
     }
 
 
+def _stranded_generation_five_bet(direction_key: str) -> dict:
+    """The bet shape that stranded direction d-f502e1a5 at ask_operator.
+
+    A successor bet (the exact ``_NEXT_BET_KEYS`` contract plus the frozen
+    ``direction`` envelope carried forward by ``_authoritative_successor_bet``)
+    at the sizes ``_discovery_bet_snapshot`` and ``_normalize_next_bet``
+    permit: a claim bounded at 2,000 chars, a decision question bounded at
+    4,000, twelve alternatives, and an accumulated direction envelope on top.
+    Canonical JSON sorts keys, so the pre-fix prefix cut spent the budget
+    alphabetically and the tail of that ordering -- ``mode``,
+    ``retirement_condition``, ``success_evidence`` -- was what fell off the
+    end. The live symptom was a rendered bet reading ``mode=?``.
+    """
+
+    return {
+        "mode": "research",
+        "claim": (
+            "The bounded decision packet strands directions whose authority "
+            "overflows its budget. " * 20
+        )[:2_000],
+        "decision_question": (
+            "Does the field-aware bound let the reviewer bind a decision on "
+            "authority the engine already holds? " * 40
+        )[:4_000],
+        "success_evidence": (
+            "Zero directions reach discovery_ask_operator_awaiting_resolution "
+            "with a snapshot-truncation blocker over two generations."
+        ),
+        "retirement_condition": (
+            "Retire if two consecutive generations show no change in the "
+            "stranded-direction count."
+        ),
+        "direction": _oversized_direction(direction_key),
+        "alternatives": [
+            f"alternative {index}: " + ("weigh a narrower budget. " * 3)
+            for index in range(12)
+        ],
+    }
+
+
+def _deep_mapping(depth: int) -> dict:
+    node: dict = {"leaf": "z" * 40_000}
+    for level in range(depth):
+        node = {f"level_{level}": node, "sibling": "s" * 2_000}
+    return node
+
+
+# ---------------------------------------------------------------------------
+# Frozen intent/bet snapshots: field-aware bounding, not an alphabetical cut.
+#
+# Production incident, direction d-f502e1a5 on the Blueprint project. Its
+# discovery cycle stranded at discovery_ask_operator_awaiting_resolution from
+# 2026-08-19 through generations four and five. Generation four's review
+# summary read: "The packet manifest explicitly sets
+# binding_decision_allowed=false and required_evidence_omitted=true, listing
+# blockers 'bet authority exceeds the bounded decision contract'". Generation
+# five carried the same blocker.
+#
+# _bounded_decision_snapshot rendered the bet to canonical JSON and, over
+# DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS, threw the structured dict away for
+# a raw JSON *prefix*. Canonical JSON sorts keys, so the accumulated
+# `direction` envelope -- the field that grows every generation -- consumed the
+# budget and the bet's own mode and pre-registered bars fell off the end. The
+# resulting boolean went straight into authority_blockers, which set
+# required_evidence_omitted and left ask_operator as the only permitted
+# verdict. The engine asked a human to hand back authority it was holding
+# intact in its own database.
+#
+# The bound is now spent field-aware and decision-first, and authority is
+# revoked only when a decision-bearing key could not be carried whole. These
+# tests pin both halves: that the incident's shape now binds, and that the
+# gate which earns that binding still fires when the authority itself is what
+# does not fit.
+# ---------------------------------------------------------------------------
+
+
+def test_bet_authority_key_set_is_exactly_the_successor_bet_contract():
+    # The security pin for the loosened gate. Everything outside this set is
+    # allowed to be shortened without revoking authority, so the set is what
+    # decides when the engine may bind a decision at all. Two literals guard
+    # it: the bare set itself, so a silent addition or removal has to be
+    # written down here too, and equality with the successor bet contract in
+    # discovery_review.py, so a new required bet field cannot become
+    # shortenable-without-consequence just by being added over there.
+    #
+    # Never derive either side from the other: comparing the constant to
+    # itself would let any future change re-certify itself.
+    from app.discovery_review import _NEXT_BET_KEYS
+
+    bet_keys = discovery_review_packet.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+    intent_keys = discovery_review_packet.DISCOVERY_REVIEW_INTENT_AUTHORITY_KEYS
+
+    assert bet_keys == {
+        "mode",
+        "claim",
+        "decision_question",
+        "success_evidence",
+        "retirement_condition",
+    }
+    assert bet_keys == _NEXT_BET_KEYS
+    # Deliberately outside the set, and the reason each one is out matters
+    # enough to pin: `direction` is the field that overflows and whose text
+    # the packet supplies twice over by other routes, and `alternatives` is a
+    # list of options no backend code reads.
+    for key in ("direction", "alternatives"):
+        assert key not in bet_keys
+    assert intent_keys == {"release_goal", "user_purpose"}
+
+
+def test_stranded_bet_shape_keeps_every_decision_bearing_field_and_binds():
+    # The d-f502e1a5 shape itself. Everything the reviewer decides from
+    # survives whole; only the accumulated direction envelope and the
+    # alternatives list are shortened, and neither revokes authority.
+    p = discovery_review_packet
+    bet = _stranded_generation_five_bet("d-f502e1a5")
+    rendered = p._canonical_json(bet)
+    # The bound is part of the decision contract; pin it literally so a cap
+    # change cannot quietly stop exercising this path.
+    assert p.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS == 8_000
+    assert len(rendered) > 8_000
+
+    bounded, truncated, authority_lost = p._bounded_decision_snapshot(
+        bet, authority_keys=p.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+    )
+
+    # Nothing is hidden: the cut is still reported, and the full authority's
+    # checksum still travels with it.
+    assert truncated is True
+    assert bounded["snapshot_truncated"] is True
+    assert bounded["original_checksum"] == hashlib.sha256(
+        rendered.encode("utf-8")
+    ).hexdigest()
+
+    # ...but it is no longer an authority blocker, because nothing
+    # decision-bearing was lost.
+    assert authority_lost is None
+
+    # Every top-level key of the authored bet is still present. Under the
+    # prefix cut only `snapshot_truncated`, `excerpt` and `original_checksum`
+    # survived, and the reviewer saw the bet's fields only as far into the
+    # alphabet as the budget reached.
+    assert set(bet) <= set(bounded)
+    for key in (
+        "mode",
+        "claim",
+        "decision_question",
+        "success_evidence",
+        "retirement_condition",
+    ):
+        assert bounded[key] == bet[key], key
+    assert "excerpt" not in bounded
+
+    # The shortened fields are named, not silently degraded, and the direction
+    # is still a mapping with all of its own keys rather than a prose stub --
+    # including the generation-one proof contract nested inside it.
+    assert bounded["snapshot_shortened_keys"] == ["alternatives", "direction"]
+    assert bounded["snapshot_elided_keys"] == []
+    assert set(bounded["direction"]) == set(bet["direction"])
+    assert set(bounded["direction"]["context"]) == {
+        "success_evidence",
+        "retirement_condition",
+        "implementation_constraints",
+    }
+    assert len(bounded["alternatives"]) == 12
+    # A shortened value always carries the ellipsis, so the reviewer can tell
+    # it apart from a short-but-complete one.
+    assert bounded["direction"]["text"].endswith("…")
+
+    assert len(p._canonical_json(bounded)) <= 8_000
+
+
+def test_generation_one_bet_shape_also_binds_when_only_the_direction_is_cut():
+    # _discovery_bet_snapshot's own shape (direction, claim, decision_question,
+    # alternatives). Alphabetically `direction` sorts *after* claim and
+    # decision_question here, so the prefix cut would have kept those two and
+    # eaten the direction -- but it still threw the whole dict away and still
+    # revoked authority, which is the defect independent of ordering luck.
+    p = discovery_review_packet
+    bet = {
+        "direction": _oversized_direction("d-f502e1a5"),
+        "claim": "Prove the bounded mechanism moves the target metric." * 5,
+        "decision_question": (
+            "Did work on the bounded mechanism create goal-relevant, "
+            "inspectable progress?"
+        ),
+        "alternatives": [f"option {index}" for index in range(12)],
+    }
+    assert len(p._canonical_json(bet)) > 8_000
+
+    bounded, truncated, authority_lost = p._bounded_decision_snapshot(
+        bet, authority_keys=p.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+    )
+    assert truncated is True
+    assert authority_lost is None
+    assert bounded["claim"] == bet["claim"]
+    assert bounded["decision_question"] == bet["decision_question"]
+    assert bounded["alternatives"] == bet["alternatives"]
+    assert bounded["snapshot_shortened_keys"] == ["direction"]
+
+
+def test_a_cut_decision_bearing_key_still_revokes_binding_authority():
+    # The other half of the gate, and the reason loosening it is safe. When
+    # the authority itself is what does not fit -- not the envelope around it
+    # -- the reviewer genuinely cannot judge the claim it was handed, and
+    # ask_operator is the honest answer. Both offending keys are named in the
+    # blocker so an operator can see which part of the authority was lost.
+    p = discovery_review_packet
+    bet = {
+        "mode": "measure",
+        "claim": "c" * 5_000,
+        "decision_question": "q" * 5_000,
+        "success_evidence": "The metric moves.",
+        "retirement_condition": "Two flat generations.",
+    }
+    bounded, truncated, authority_lost = p._bounded_decision_snapshot(
+        bet, authority_keys=p.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+    )
+    assert truncated is True
+    assert authority_lost == "claim, decision_question"
+    # Even revoked, the packet degrades rather than disappears: the short
+    # decision-bearing fields still ride whole and the long ones are readable
+    # prefixes, not absences.
+    assert bounded["mode"] == "measure"
+    assert bounded["success_evidence"] == bet["success_evidence"]
+    assert bounded["retirement_condition"] == bet["retirement_condition"]
+    assert bounded["claim"].startswith("ccc")
+    assert bounded["claim"].endswith("…")
+    assert len(p._canonical_json(bounded)) <= 8_000
+
+
+def test_intent_authority_rests_on_goal_and_purpose_not_on_the_context_maps():
+    # The intent snapshot's unbounded fields are `constraints` and
+    # `project_context`: arbitrary operator-authored problem-model maps. They
+    # frame the decision; they are not what the verdict is measured against.
+    # `release_goal` and `user_purpose` are, because the decision rule asks
+    # whether the work created goal-relevant progress.
+    p = discovery_review_packet
+    intent = {
+        "project_name": "Blueprint",
+        "user_purpose": "Run an autonomous research engine that ships.",
+        "release_goal": "Stop directions stranding at ask_operator.",
+        "release_version_id": "v38",
+        "purpose_source": "operator",
+        "problem_model_revision": 41,
+        "running_update_excerpt": "r" * 2_000,
+        "constraints": {f"constraint_{index}": "c" * 400 for index in range(20)},
+        "project_context": {f"context_{index}": "x" * 400 for index in range(20)},
+    }
+    assert len(p._canonical_json(intent)) > 8_000
+
+    bounded, truncated, authority_lost = p._bounded_decision_snapshot(
+        intent, authority_keys=p.DISCOVERY_REVIEW_INTENT_AUTHORITY_KEYS
+    )
+    assert truncated is True
+    assert authority_lost is None
+    assert bounded["user_purpose"] == intent["user_purpose"]
+    assert bounded["release_goal"] == intent["release_goal"]
+    assert set(intent) <= set(bounded)
+    assert {"constraints", "project_context"} <= set(
+        bounded["snapshot_shortened_keys"]
+    )
+
+    # A purpose so long it cannot be carried whole *is* an authority loss:
+    # relevance is judged against it, and a truncated purpose changes what
+    # "relevant" means.
+    long_purpose = dict(intent, user_purpose="p" * 12_000)
+    _, _, purpose_lost = p._bounded_decision_snapshot(
+        long_purpose, authority_keys=p.DISCOVERY_REVIEW_INTENT_AUTHORITY_KEYS
+    )
+    assert purpose_lost == "user_purpose"
+
+
+def test_bounded_decision_snapshot_never_exceeds_its_own_bound():
+    # The post-join clamp. #17723 found a real bound breach in the sibling
+    # omitted-evidence digest at high cardinality, where the separators alone
+    # outgrew the cap; the same class applies here, where the *keys* and the
+    # honesty bookkeeping are the fixed overhead. The emitted snapshot is
+    # embedded whole into a review task payload the agent re-validates against
+    # its own contract, so a breach here is not cosmetic -- it makes the task
+    # unrunnable.
+    #
+    # Pinned with a bare literal on purpose: deriving the assertion from the
+    # constant would let a cap change re-certify itself.
+    p = discovery_review_packet
+    assert p.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS == 8_000
+
+    pathological = {
+        # Hundreds of keys, where key names and separators dominate.
+        "many_keys": {f"key_{index:04d}": "v" * 50 for index in range(400)},
+        # Enough keys that the names alone cannot fit at any value width.
+        "impossible_cardinality": {
+            f"key_{index:04d}": "v" for index in range(2_000)
+        },
+        # One multi-megabyte value.
+        "one_huge_value": {"claim": "ok", "direction": {"text": "x" * 3_000_000}},
+        # Adversarial escaping: every character doubles in the rendered form,
+        # which is what a raw-character budget would get wrong.
+        "all_escapes": {"claim": "ok", "direction": '"' * 200_000},
+        "all_backslashes": {"claim": "ok", "direction": "\\" * 200_000},
+        # Non-ASCII, where a naive byte budget and a character budget differ.
+        "astral": {"claim": "ok", "direction": "\U0001f9ea" * 100_000},
+        # Deep nesting, past the field-aware descent depth.
+        "deeply_nested": {"claim": "ok", "direction": _deep_mapping(12)},
+    }
+    for name, snapshot in pathological.items():
+        bounded, truncated, _ = p._bounded_decision_snapshot(
+            snapshot, authority_keys=p.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+        )
+        assert truncated is True, name
+        assert len(p._canonical_json(bounded)) <= 8_000, (
+            name,
+            len(p._canonical_json(bounded)),
+        )
+        assert bounded["snapshot_truncated"] is True, name
+        assert bounded["original_checksum"], name
+
+    # Below the cap nothing is touched at all: the snapshot is returned
+    # verbatim and reports no truncation.
+    small = {"mode": "build", "claim": "short"}
+    bounded, truncated, authority_lost = p._bounded_decision_snapshot(
+        small, authority_keys=p.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+    )
+    assert bounded == small
+    assert truncated is False
+    assert authority_lost is None
+
+    # A snapshot that is not a JSON object has no fields to be aware of.
+    bounded, truncated, authority_lost = p._bounded_decision_snapshot(
+        ["x" * 20_000], authority_keys=p.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+    )
+    assert truncated is True
+    assert authority_lost == "the snapshot structure itself"
+
+
+def test_key_cardinality_that_defeats_the_structure_still_revokes_authority():
+    # The floor under the loosened gate. Keeping every key is only possible
+    # while the key names plus one empty-string value each fit the cap. Past
+    # that there is no field-aware form at all, so the snapshot falls back to
+    # the historical prefix excerpt -- and when the *structure* is what was
+    # lost, rather than one shortened field inside it, authority must still be
+    # revoked. Otherwise this fix would have traded a false ask_operator for a
+    # false binding decision, which is the worse failure.
+    p = discovery_review_packet
+    assert p.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS == 8_000
+
+    # 2,000 keys named key_0000..key_1999: 8 quoted chars plus a colon and a
+    # comma each, well past 8,000 before a single value character.
+    snapshot = {f"key_{index:04d}": "v" for index in range(2_000)}
+    bounded, truncated, authority_lost = p._bounded_decision_snapshot(
+        snapshot, authority_keys=p.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+    )
+    assert truncated is True
+    assert bounded["snapshot_structure_omitted"] is True
+    assert authority_lost == "the snapshot structure itself"
+    assert len(p._canonical_json(bounded)) <= 8_000
+
+    # 400 keys still fit the structure, so authority survives and every key is
+    # present -- most of them below the legibility floor and so reported as
+    # elided rather than merely shortened. At this cardinality naming every
+    # cut key would cost more than the structure itself, so the bookkeeping
+    # switches to counts; that is a reporting form, not a loss of authority,
+    # and the decision-bearing `claim` still rides whole.
+    assert p.DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS == 40
+    dense = {f"key_{index:04d}": "v" * 200 for index in range(400)}
+    dense["claim"] = "The dense cohort still carries its claim whole."
+    bounded, truncated, authority_lost = p._bounded_decision_snapshot(
+        dense, authority_keys=p.DISCOVERY_REVIEW_BET_AUTHORITY_KEYS
+    )
+    assert truncated is True
+    assert authority_lost is None
+    assert bounded["claim"] == dense["claim"]
+    assert set(dense) <= set(bounded)
+    assert "snapshot_structure_omitted" not in bounded
+    assert bounded["snapshot_elided_key_count"] == 400
+    assert bounded["snapshot_shortened_key_count"] == 400
+    assert len(p._canonical_json(bounded)) <= 8_000
+
+
 @pytest.mark.asyncio
-async def test_oversized_bet_authority_still_spawns_an_operator_question_review(
+async def test_oversized_bet_authority_binds_instead_of_stranding_the_direction(
     db_session,
 ):
-    """A bet larger than the snapshot cap must bound, not strand, the cycle.
+    """A bet larger than the snapshot cap must bind, not hand back the question.
 
-    Production regression: four Blueprint directions (d-7c851b3f from
-    2026-08-19, d-4efbf4ef, d-f502e1a5, d-dec033c2) held their discovery
-    cycles at revision 0 -- no review task ever spawned -- because the packet
-    builder recorded snapshot truncation as *missing required evidence*. The
-    "missing" evidence was the direction's own length, so no task, retry, or
-    agent could ever supply it, and each cycle re-checked and re-held once a
-    minute indefinitely while the fleet sat idle.
+    Production regression, two of them, in the same three lines of code.
 
-    The bounded excerpt is a usable decision input: it is deterministic,
-    carries the full authority's checksum, and the manifest flags the
-    truncation outright. So the packet must do what it already does for
-    coverage that cannot fit -- forbid a binding action and dispatch one
-    operator-question decision -- instead of waiting forever.
+    First (#17669): four Blueprint directions (d-7c851b3f from 2026-08-19,
+    d-4efbf4ef, d-f502e1a5, d-dec033c2) held their discovery cycles at
+    revision 0 -- no review task ever spawned -- because the packet builder
+    recorded snapshot truncation as *missing required evidence*. The "missing"
+    evidence was the direction's own length, so no task, retry, or agent could
+    ever supply it. That leg is still pinned below:
+    missing_required_evidence stays empty and the review still spawns.
+
+    Second, and what this test asserted until 2026-08-23: having stopped
+    stranding the cycle before the review, the fix stranded it *at* the
+    review instead. Truncation went into authority_blockers, which set
+    required_evidence_omitted, which leaves ask_operator as the only permitted
+    verdict -- so d-f502e1a5 sat at discovery_ask_operator_awaiting_resolution
+    across generations four and five from 2026-08-19, its review summary
+    quoting the blocker back verbatim. The overflowing field was the
+    accumulated `direction` envelope, whose text the packet already hands the
+    reviewer through `claim` and through `source_parent.title`
+    ("Research: {direction_text}"). The engine was asking a human for
+    authority it was holding intact.
+
+    So this test is strengthened rather than repointed: the anti-stranding
+    leg it was written for is unchanged, and it now additionally proves the
+    decision binds and the advance actually lands, which the old assertions
+    could not.
     """
 
     project, cycle, source = await _cycle_with_source(db_session)
-    cycle.bet_snapshot = {
-        "hypothesis": "the mechanism helps",
-        "direction": _oversized_direction(cycle.direction_key),
-    }
-    db_session.add(cycle)
+    # The direction really is this big on the project too -- an advance
+    # revalidates the frozen commission against current direction authority,
+    # and the incident's direction was oversized in both places.
+    project.directions = [_oversized_direction(cycle.direction_key)]
+    cycle.bet_snapshot = _stranded_generation_five_bet(cycle.direction_key)
+    db_session.add_all([project, cycle])
     await db_session.flush()
 
     # The bound itself is part of the decision contract: pin it literally so a
@@ -477,35 +876,99 @@ async def test_oversized_bet_authority_still_spawns_an_operator_question_review(
 
     review = await db_session.get(Task, spawned.task_id)
     manifest = review.first_payload["evidence_packet_manifest"]
-    # Truncation is reported, and reported as a *binding* blocker...
+    # Truncation is still reported outright -- the change is which condition
+    # revokes authority, never whether a cut is disclosed.
     assert manifest["bet_snapshot_truncated"] is True
-    assert any(
-        "bet authority exceeds the bounded decision contract" in blocker
-        for blocker in manifest["binding_action_blockers"]
-    ), manifest["binding_action_blockers"]
-    # ...never as evidence still in flight, which is what stranded the cycle.
+    # ...and it is neither evidence still in flight (which stranded the cycle
+    # before the review) nor an authority blocker (which stranded it at the
+    # review).
     assert manifest["missing_required_evidence"] == []
+    assert manifest["binding_action_blockers"] == []
+    assert manifest["binding_decision_allowed"] is True
+    assert manifest["required_evidence_omitted"] is False
 
-    # The safety invariant is unchanged: binding is still forbidden, and the
-    # receipt's own copy of it agrees with the manifest's.
-    assert manifest["binding_decision_allowed"] is False
-    assert manifest["required_evidence_omitted"] is True
+    # The receipt's own copy of the authority invariant agrees with the
+    # manifest's.
     outcome = next(
         item
         for item in review.first_payload["evidence_packet"]
         if item["semantic_role"] == "parent_outcome"
     )
     snapshot = outcome["evidence_metadata"]["snapshot"]
-    assert snapshot["binding_decision_allowed"] is False
+    assert snapshot["binding_decision_allowed"] is True
     assert snapshot["missing_required_evidence"] == []
 
-    # The reviewer sees a bounded excerpt of the real authority, not a stub.
+    # The reviewer sees the real authority field by field, not a prefix.
     bet = review.first_payload["bet_snapshot"]
     assert bet["snapshot_truncated"] is True
-    assert len(bet["excerpt"]) == (
-        discovery_review_packet.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS
-    )
     assert bet["original_checksum"]
+    assert bet["mode"] == "research"
+    assert bet["claim"] == cycle.bet_snapshot["claim"]
+    assert bet["decision_question"] == cycle.bet_snapshot["decision_question"]
+    assert bet["success_evidence"] == cycle.bet_snapshot["success_evidence"]
+    assert (
+        bet["retirement_condition"] == cycle.bet_snapshot["retirement_condition"]
+    )
+    assert bet["snapshot_shortened_keys"] == ["alternatives", "direction"]
+
+    # And the binding decision actually lands, which is the whole point: the
+    # direction advances instead of waiting on an operator.
+    completed = await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="advance"),
+    )
+    await db_session.flush()
+    assert completed.id == cycle.id
+    assert cycle.state == "reviewed"
+    assert cycle.verdict == "advance"
+
+
+@pytest.mark.asyncio
+async def test_oversized_bet_claim_still_spawns_an_operator_question_review(
+    db_session,
+):
+    """When the *claim* is what overflows, ask_operator is the honest verdict.
+
+    This keeps the authority-revoked leg of the pre-2026-08-23 test alive
+    against a snapshot where the loss is real: the proposition under judgement
+    itself could not be carried whole, so the reviewer cannot bind a verdict
+    on it. required_evidence_omitted is set, only ask_operator is permitted,
+    and the cycle still gets a review rather than stranding before one.
+    """
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    cycle.bet_snapshot = {
+        "mode": "research",
+        "claim": "c" * 5_000,
+        "decision_question": "q" * 5_000,
+        "success_evidence": "The metric moves.",
+        "retirement_condition": "Two flat generations.",
+    }
+    db_session.add(cycle)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True, spawned.reason
+
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["bet_snapshot_truncated"] is True
+    assert any(
+        "bet authority exceeds the bounded decision contract" in blocker
+        for blocker in manifest["binding_action_blockers"]
+    ), manifest["binding_action_blockers"]
+    # The blocker names what was actually lost, so an operator reading the
+    # manifest can tell a truncated claim from a truncated direction envelope.
+    assert any(
+        blocker.endswith("claim, decision_question")
+        for blocker in manifest["binding_action_blockers"]
+    ), manifest["binding_action_blockers"]
+    # Bounded, never absent: the cycle is not held waiting for evidence that
+    # no task could ever produce.
+    assert manifest["missing_required_evidence"] == []
+    assert manifest["binding_decision_allowed"] is False
+    assert manifest["required_evidence_omitted"] is True
 
     with pytest.raises(DiscoveryReviewResultError, match="incomplete packet semantics"):
         await complete_discovery_review(
@@ -516,13 +979,53 @@ async def test_oversized_bet_authority_still_spawns_an_operator_question_review(
 
 
 @pytest.mark.asyncio
-async def test_oversized_intent_authority_blocks_binding_without_stranding(db_session):
-    """Same contract for the intent snapshot, the other truncated authority."""
+async def test_oversized_intent_context_binds_without_stranding(db_session):
+    """Same contract for the intent snapshot, the other truncated authority.
+
+    Until 2026-08-23 this test asserted that an oversized intent snapshot
+    revoked binding authority, for the same reason and with the same defect:
+    the field that overflowed was framing, not the goal or purpose the verdict
+    is measured against.
+    """
 
     project, cycle, source = await _cycle_with_source(db_session)
     cycle.intent_snapshot = {
-        "goal": "prove useful behavior",
-        "direction": _oversized_direction(cycle.direction_key),
+        "project_name": "Blueprint",
+        "user_purpose": "Run an autonomous research engine that ships.",
+        "release_goal": "Stop directions stranding at ask_operator.",
+        "constraints": {f"constraint_{index}": "c" * 400 for index in range(20)},
+        "project_context": {f"context_{index}": "x" * 400 for index in range(20)},
+    }
+    db_session.add(cycle)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True, spawned.reason
+
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    # Still disclosed...
+    assert manifest["intent_snapshot_truncated"] is True
+    assert manifest["bet_snapshot_truncated"] is False
+    # ...still not evidence in flight...
+    assert manifest["missing_required_evidence"] == []
+    # ...and no longer an authority blocker.
+    assert manifest["binding_action_blockers"] == []
+    assert manifest["binding_decision_allowed"] is True
+    intent = review.first_payload["intent_snapshot"]
+    assert intent["release_goal"] == cycle.intent_snapshot["release_goal"]
+    assert intent["user_purpose"] == cycle.intent_snapshot["user_purpose"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_intent_purpose_still_blocks_binding(db_session):
+    """A purpose too long to carry whole is a real authority loss."""
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    cycle.intent_snapshot = {
+        "project_name": "Blueprint",
+        "user_purpose": "p" * 12_000,
+        "release_goal": "Stop directions stranding at ask_operator.",
     }
     db_session.add(cycle)
     await db_session.flush()
@@ -533,13 +1036,14 @@ async def test_oversized_intent_authority_blocks_binding_without_stranding(db_se
     review = await db_session.get(Task, spawned.task_id)
     manifest = review.first_payload["evidence_packet_manifest"]
     assert manifest["intent_snapshot_truncated"] is True
-    assert manifest["bet_snapshot_truncated"] is False
     assert any(
-        "intent authority exceeds the bounded decision contract" in blocker
+        "intent authority exceeds the bounded decision contract: user_purpose"
+        in blocker
         for blocker in manifest["binding_action_blockers"]
     ), manifest["binding_action_blockers"]
     assert manifest["missing_required_evidence"] == []
     assert manifest["binding_decision_allowed"] is False
+    assert manifest["required_evidence_omitted"] is True
 
 
 # ---------------------------------------------------------------------------
