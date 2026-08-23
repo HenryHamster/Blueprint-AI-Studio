@@ -150,6 +150,14 @@ def _timeout_output(value: str | bytes | None) -> str:
 _FILE_BUDGET_SECONDS_DEFAULT = 25
 _FILE_BUDGET_SECONDS_OVERRIDES = {
     "test_local_runner.py": 180,
+    # 85 tests that drive scripts/static_release_guard.py end to end through a
+    # fake `docker` shim -- each one forks the real guard, which forks pytest
+    # and check_size_limits.py inside a throwaway fixture repo. Measured 42.7s
+    # in the backend test image, so the 25s default is not survivable and the
+    # cost is inherent to exercising a subprocess guard for real rather than
+    # mocking the layer under test. Budgeted at ~3x measured for slower CI
+    # hosts; a genuine wedge still trips it.
+    "test_guard_gate_left_shift.py": 120,
 }
 
 # CI's sharded pytest invocation passes ``--timeout=30`` (pytest-timeout), which

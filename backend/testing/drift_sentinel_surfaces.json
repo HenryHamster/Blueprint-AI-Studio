@@ -5,9 +5,10 @@
       "glob": "backend/app/**/*.py",
       "sentinels": [
         "backend/testing/test_websocket_emitter_inventory.py",
-        "backend/testing/test_direction_referential_guard.py"
+        "backend/testing/test_direction_referential_guard.py",
+        "backend/testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters"
       ],
-      "why": "test_websocket_emitter_inventory.py AST-scans the ENTIRE backend/app tree (read_app_sources -> app_dir.rglob('*.py')) against __fixtures__/websocket_event_inventory_v1.json and imports only backend/testing helpers, so a new emitter in any app module never selects it by import. test_direction_referential_guard.py rglobs the whole app tree for new Direction.criterion_keys writers (against KNOWN_GUARDED_WRITERS); it imports app.direction_referential_guard, so it is only import-selectable when THAT module changes, never when a new writer appears in an unrelated file. Both must run whenever any app source changes. (test_websocket_emitter_inventory.py is ALSO in scripts/test-backend.sh STANDALONE_ARGS; this registration is additive and complementary.)"
+      "why": "test_websocket_emitter_inventory.py AST-scans the ENTIRE backend/app tree (read_app_sources -> app_dir.rglob('*.py')) against __fixtures__/websocket_event_inventory_v1.json and imports only backend/testing helpers, so a new emitter in any app module never selects it by import. test_direction_referential_guard.py rglobs the whole app tree for new Direction.criterion_keys writers (against KNOWN_GUARDED_WRITERS); it imports app.direction_referential_guard, so it is only import-selectable when THAT module changes, never when a new writer appears in an unrelated file. test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters rglobs the SAME whole app tree ((BACKEND_ROOT / \"app\").rglob(\"*.py\")) against the hand-kept WEBSOCKET_EMITTER_INVENTORY dict in backend/app/workbench_contracts.py; it imports app.workbench_contracts, so the reverse-dep scan selects it only when THAT one module changes, never when the new emitter lands in some other file — the exact hole that let backend/app/recovery_evaluating_prless_hold.py reach the promotion matrix unrecorded. Registered as a NODE ID rather than a whole file: the module's other tests need the client/db_session fixtures, so a whole-file registration would ERROR on a missing fixture under the --no-postgres route instead of reporting drift. All three must run whenever any app source changes. (test_websocket_emitter_inventory.py and the node id above are ALSO in scripts/test-backend.sh STANDALONE_ARGS; these registrations are additive and complementary.)"
     },
     {
       "glob": "backend/app/notification_dispatch.py",
@@ -18,6 +19,73 @@
       "glob": "backend/app/capability_trial_verdict.py",
       "sentinels": ["backend/testing/test_event_type_invariants.py"],
       "why": "Second source file in test_event_type_invariants.py's fixed source_paths set (event_type literals for capability trial verdicts). Same rationale as backend/app/notification_dispatch.py."
+    },
+    {
+      "glob": "backend/testing/test_*.py",
+      "sentinels": [
+        "backend/testing/test_test_durations_freshness.py",
+        "backend/testing/test_test_estate_ranked_queue.py",
+        "backend/testing/test_conversational_workday_protection.py"
+      ],
+      "why": "All three sentinels read the backend test INVENTORY itself (estate_inventory.iter_backend_test_files -> backend/testing/test_*.py) instead of importing anything the changed file imports, so adding, deleting or renaming a backend test file is invisible to the reverse-dep scan: it selects the changed test file and never the guards over the inventory that file belongs to. test_test_durations_freshness.py checks the coverage fraction and re-derives every collected node id to reject stale entries in backend/.test_durations; test_test_estate_ranked_queue.py set-compares the collected inventory against test-estate-ranked-queue.md; test_conversational_workday_protection.py pins an exact per-file test COUNT for the nineteen backend/testing paths in conversational_workday_manifest.json's PROTECT list. This single glob is deliberately broader than that nineteen-file subset: the PROTECT list is edited far more often than it is stable, so nineteen literal globs here would need a manifest edit every time it moves and would fail OPEN when someone forgot. The cost is bounded and already paid elsewhere - all three are scripts/test-backend.sh STANDALONE_ARGS members that any backend/ change already runs through the static corpus; this registration additionally puts them in the targeted merge lane so the failure is attributed to the PR that caused it."
+    },
+    {
+      "glob": "backend/.test_durations",
+      "sentinels": ["backend/testing/test_test_durations_freshness.py"],
+      "why": "The artifact the sentinel validates. It is not a .py file at all, so neither the reverse-dep scan nor the conventional test_<module>.py rule can reach its guard; without this entry a regenerated or hand-edited .test_durations runs no check on .test_durations."
+    },
+    {
+      "glob": "scripts/durations_quality.py",
+      "sentinels": ["backend/testing/test_test_durations_freshness.py"],
+      "why": "test_outlier_cap_matches_durations_quality reads this file BY PATH (it parses the source to recover the outlier cap) rather than importing it, so a cap change here silently desynchronises the two definitions. Scoped to the exact file, not scripts/**, for the same reason as the scripts/test_runner_isolation.py entry below."
+    },
+    {
+      "glob": "test-estate-ranked-queue.md",
+      "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
+      "why": "The derived artifact the sentinel set-compares against the collected inventory. It is a root-level markdown file: it matches no STATIC_PATH_PREFIXES entry and sits in no import graph, so before this registration a hand-edit to the queue was the one change to it that ran none of its own guards. Repair command: python3 scripts/generate_test_estate_ranked_queue.py --write."
+    },
+    {
+      "glob": "scripts/generate_test_estate_ranked_queue.py",
+      "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
+      "why": "The sentinel loads this generator through importlib from a resolved repository root, never as a dotted module, so the reverse-dep scan cannot connect the two. Scoped to the exact file, not scripts/**."
+    },
+    {
+      "glob": "backend/testing/estate_inventory.py",
+      "sentinels": [
+        "backend/testing/test_test_durations_freshness.py",
+        "backend/testing/test_test_estate_ranked_queue.py"
+      ],
+      "why": "Both sentinels derive their expected inventory from iter_backend_test_files / is_vitest_test_path here. The module lives under backend/testing/, not backend/app/, so impacted_tests.py's reverse-dep scan (scoped to backend/app/<...>.py -> app.* importers) never even considers it a changed module - the same gap as the backend/testing/check_size_limits.py entry below."
+    },
+    {
+      "glob": "admin-ui/src/**/*.test.ts",
+      "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
+      "why": "test_test_estate_ranked_queue.py set-compares the Vitest inventory (estate_inventory.is_vitest_test_path) against test-estate-ranked-queue.md, so it fires only when a Vitest test file is ADDED or DELETED. Scoped to the five test-file globs the inventory predicate actually collects rather than to admin-ui/** so a routine component edit does not pay the guard."
+    },
+    {
+      "glob": "admin-ui/src/**/*.test.tsx",
+      "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
+      "why": "Second Vitest test-file extension collected by is_vitest_test_path for the admin-ui suite. Same rationale as admin-ui/src/**/*.test.ts."
+    },
+    {
+      "glob": "admin-ui/eslint-rules/**/*.test.js",
+      "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
+      "why": "is_vitest_test_path also collects admin-ui/eslint-rules/**/*.test.{js,ts}; a rule test added there is ranked-queue inventory and nothing under admin-ui/src/ need change with it."
+    },
+    {
+      "glob": "admin-ui/eslint-rules/**/*.test.ts",
+      "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
+      "why": "Second eslint-rules test extension collected by is_vitest_test_path. Same rationale as admin-ui/eslint-rules/**/*.test.js."
+    },
+    {
+      "glob": "agent/src/**/*.test.ts",
+      "sentinels": ["backend/testing/test_test_estate_ranked_queue.py"],
+      "why": "The agent Vitest suite's collected set (is_vitest_test_path('agent', ...) = src/**/*.test.ts). Same add/delete-only firing rationale as the admin-ui globs above."
+    },
+    {
+      "glob": "backend/testing/conversational_workday_manifest.json",
+      "sentinels": ["backend/testing/test_conversational_workday_protection.py"],
+      "why": "The manifest the sentinel validates. It is JSON, so no import edge and no conventional test_<module>.py rule reaches it: editing the PROTECT list - the change most likely to break the guard - previously selected nothing that checks the PROTECT list."
     },
     {
       "glob": "backend/alembic/versions/**/*.py",

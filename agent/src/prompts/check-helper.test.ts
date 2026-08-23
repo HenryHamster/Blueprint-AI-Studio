@@ -189,6 +189,10 @@ describe('writeCheckHelper — direct invocation', () => {
     // current failure and keeps task ownership fail-closed.
     expect(script).toContain('run "backend pytest (attributed)" python3 scripts/static_release_guard.py');
     expect(script).toContain('--corpus-only --base "$BASE" --repo-root "$WORKSPACE"');
+    // ...and it is emitted at shell TOP LEVEL (column 0), not indented inside
+    // `if touches backend/`. Its drift sentinels guard admin-ui/, agent/ and
+    // scripts/ surfaces a backend-gated lane can never see (promotion #17738).
+    expect(script).toMatch(/^if \[ "\$WITH_TESTS" = "1" \] && \[ "1" = "1" \]; then\n  run "backend pytest \(attributed\)"/m);
     expect(script).not.toContain('BPYTEST_BASELINE_FAILED');
     expect(script).not.toContain('backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR');
     // Conflict-resolution verification shares this one attributed backend lane;
@@ -418,9 +422,14 @@ describe('writeCheckHelper — direct invocation', () => {
     // shared header — what we check for is that it's not invoked here.)
     expect(script).not.toContain('if admin_ui_runtime_touched; then');
     expect(script).not.toContain('run "agent tsc');
-    // The self-repo invariant stays armed on the config-driven path.
+    // The self-repo invariants stay armed on the config-driven path.
     expect(script).toContain('run "static size guards (task diff)" env TASK_ID="${TASK_ID:-${_VERIFY_TASK_ID:-}}" python3 scripts/static_release_guard.py');
     expect(script).toContain('--size-only --base "$BASE" --repo-root "$WORKSPACE"');
+    // Including the attributed standalone static corpus, which used to be
+    // emitted ONLY by the hardcoded Blueprint backend block — so a resolved
+    // build_config made every drift sentinel it carries unreachable here.
+    expect(script).toContain('run "backend pytest (attributed)" python3 scripts/static_release_guard.py');
+    expect(script).toContain('--corpus-only --base "$BASE" --repo-root "$WORKSPACE"');
   });
 
   it('validateCfgShellSafety rejects unsafe taskId when called via writeCheckHelper', async () => {
@@ -1598,16 +1607,20 @@ describe('writeCheckHelper — ci_failure selector verify gate (static)', () => 
     // pytest gate — a CI failure can occur on a non-LTS branch where the
     // WITH_TESTS gate is off, and ./pr open gates on plain ./check there.
     const verifyAt = script.indexOf('ci_failure closed-loop verify');
-    const withTestsAt = script.indexOf('if [ "$WITH_TESTS" = "1" ]');
     expect(verifyAt).toBeGreaterThan(-1);
     // The verify block is appended after the backend `fi`, at top level.
     expect(script).toMatch(/^fi\n\n# ── ci_failure closed-loop verify/m);
-    // It is NOT nested inside the WITH_TESTS conditional.
-    if (withTestsAt > -1) {
-      // The verify block must be the LAST gate emitted (top-level), well after
-      // any WITH_TESTS-gated backend pytest run.
-      expect(verifyAt).toBeGreaterThan(withTestsAt);
-    }
+    // It is NOT nested inside a WITH_TESTS conditional. Asserted by CLOSURE
+    // rather than by index: the attributed static corpus is now an always-on
+    // lane emitted AFTER this block and it gates on WITH_TESTS itself, so a
+    // bare indexOf comparison finds THAT occurrence and would pass for the
+    // wrong reason. What must hold is that no WITH_TESTS conditional is still
+    // open where the verify block is emitted.
+    const before = script.slice(0, verifyAt);
+    const lastGate = before.lastIndexOf('[ "$WITH_TESTS" = "1" ]');
+    if (lastGate > -1) expect(before.slice(lastGate)).toMatch(/^fi$/m);
+    // Its own statements sit at column 0 — inside no conditional at all.
+    expect(script).toMatch(/^CI_FAIL_SELECTORS=\(/m);
   });
 
   it('drops shell-unsafe selectors but keeps well-formed ones (graceful degradation)', async () => {

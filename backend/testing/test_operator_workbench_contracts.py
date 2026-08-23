@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from app.workbench_contracts import (
     validate_executable_command_descriptor,
 )
 from app.workbench_state import STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY
+from testing.fixgate_attribution import format_offender_marker
 
 TEST_USER_ID = "test-user-123"
 FIXTURE_DIR = Path(__file__).parent / "__fixtures__"
@@ -621,8 +623,55 @@ def test_websocket_emitter_inventory_covers_current_emitters():
         for path in paths
     }
 
-    assert discovered_emitters == inventoried
-    assert discovered_v1_producers == inventoried_v1_producers
+    # The dict is hand-maintained and the comparisons below are set-vs-set, so
+    # a path listed twice is invisible to them. Three duplicates had silently
+    # piled up in "legacy_compatibility" by promotion #17738.
+    duplicated = {
+        category: sorted(
+            path for path, count in Counter(paths).items() if count > 1
+        )
+        for category, paths in WEBSOCKET_EMITTER_INVENTORY.items()
+        if len(set(paths)) != len(paths)
+    }
+    assert not duplicated, (
+        "WEBSOCKET_EMITTER_INVENTORY in backend/app/workbench_contracts.py "
+        f"lists the same path more than once: {duplicated}. Delete the "
+        "duplicate line(s) by hand; the set comparisons in this test cannot "
+        "see them.\n"
+        + format_offender_marker(
+            f"{category}:{path}"
+            for category, paths in sorted(duplicated.items())
+            for path in paths
+        )
+    )
+
+    # Name the artifact AND the repair. This guard is a drift sentinel: it is
+    # selected by a path glob, not by an import edge, so the person who trips it
+    # is usually editing an unrelated module and has no idea what
+    # WEBSOCKET_EMITTER_INVENTORY is. A bare set-comparison failure here cost a
+    # hand-diagnosed repair PR after promotion #17738.
+    assert discovered_emitters == inventoried, (
+        "WEBSOCKET_EMITTER_INVENTORY in backend/app/workbench_contracts.py is "
+        "stale. Not listed but emitting: "
+        f"{sorted(discovered_emitters - inventoried)}; listed but no longer "
+        f"emitting: {sorted(inventoried - discovered_emitters)}. This dict is "
+        "hand-maintained and is a SEPARATE artifact from "
+        "backend/testing/__fixtures__/websocket_event_inventory_v1.json "
+        "(regenerated with 'python backend/testing/regen_emitter_inventory.py "
+        "--fix'); add each path to the category it belongs to by hand.\n"
+        + format_offender_marker(
+            sorted(discovered_emitters ^ inventoried)
+        )
+    )
+    assert discovered_v1_producers == inventoried_v1_producers, (
+        "WEBSOCKET_EMITTER_INVENTORY['workbench_v1_producers'] in "
+        "backend/app/workbench_contracts.py is stale. Missing: "
+        f"{sorted(discovered_v1_producers - inventoried_v1_producers)}; stale: "
+        f"{sorted(inventoried_v1_producers - discovered_v1_producers)}.\n"
+        + format_offender_marker(
+            sorted(discovered_v1_producers ^ inventoried_v1_producers)
+        )
+    )
     assert WEBSOCKET_EMITTER_INVENTORY["workbench_v1"] == (
         "backend/app/workbench_events.py",
     )
