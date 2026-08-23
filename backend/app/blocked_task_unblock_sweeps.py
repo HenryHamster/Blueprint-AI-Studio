@@ -138,20 +138,32 @@ UNRESUMABLE_CANCEL_CONTEXT_KEY = "_unresumable_cancellation"
 # Observability only: stamping it changes nothing about WHEN or WHETHER a dependent
 # resumes.
 RESUME_MARKER_CONTEXT_KEY = "_blocked_resume"
-# Give-up classes — the two reasons a blocked dependent can provably never resume.
+# Give-up classes — the reasons a blocked dependent can provably never resume.
 GIVE_UP_FOUNDATION_DIED = (
     "foundation_died"  # needed foundation reached terminal FAILED/CANCELLED
 )
 GIVE_UP_NEVER_SATISFIABLE = (
-    "never_satisfiable"  # need outlived its bounded parked re-evals
+    "never_satisfiable"  # need outlived its bounded parked re-evals, unprovided
 )
+# A need that outlived the SAME bounded parked re-evals, but for which a provider
+# demonstrably EXISTS: a task ran, reached COMPLETED, and produced the artifact —
+# the artifact just never landed (its PR is open / closed-unmerged, or it ghost-
+# merged into a rollup whose parent died). Split out of GIVE_UP_NEVER_SATISFIABLE
+# because "nothing ever provided it" is FALSE for this shape and sends an operator
+# hunting for a task that does not exist, when the actionable object is a specific
+# unmerged PR. Same cull timing, same bound — only the attribution differs, and it
+# is grounded in the provider row the sweep can actually name.
+GIVE_UP_PRODUCED_BUT_UNLANDED = "produced_but_unlanded"
 
 # Need kinds that name a FOUNDATION (a sibling task / finding-hash, or an explicit
 # capability) rather than an external ref like a PR number. When one of these is
 # cancelled as never_satisfiable, no task ever provided it — the dependent was
 # stranded because the foundation was never created, which is first-class
 # missing-foundation demand (see
-# ``capability_demand.collect_missing_capability_demand``).
+# ``capability_demand.collect_missing_capability_demand``). A
+# ``produced_but_unlanded`` give-up is deliberately NOT that: its foundation was
+# built, so it must never be stamped as missing-foundation demand to commission
+# again.
 _FOUNDATION_NEED_KINDS = ("capability", "task")
 # Additive sub-key stamped onto the UNRESUMABLE_CANCEL_CONTEXT_KEY marker when a
 # never-satisfiable give-up cancelled a foundation-kind need: it flags an EXPLICIT
@@ -925,6 +937,156 @@ async def _fetch_dead_candidates(session, project_id) -> list:
     )
 
 
+async def _unlanded_provider_evidence(
+    task, needs, session, *, completed_cache: dict, dead_cache: dict | None = None
+):
+    """First residual need whose prerequisite a terminal task DID produce but
+    never LANDED — or ``None`` when no such evidence exists.
+
+    Returns ``(need, provider, unshipped_reason)``.
+
+    A need reaches ``residual`` when it matched nothing active, nothing
+    SHIPPED-completed, no knowledge document, no working registry capability and
+    no dead foundation. Two very different worlds share that bucket:
+
+      * nothing was ever built — the genuine never-satisfiable case, and
+      * something WAS built and completed, but its artifact never reached the
+        dependent's base, so the shipped gate (correctly) refused it.
+
+    Only the second world can name a provider, and it is exactly the world the
+    "no task ever provided it" give-up mis-describes. This re-runs the SAME
+    conservative matcher over the foundations the shipped gate excluded
+    (:func:`blocked_need_resolution.unshipped_completed_foundation_for_need`),
+    so the attribution rests on the identical exact signals the resolution path
+    uses — never a fuzzy guess. Called ONLY on the give-up path, so the ordinary
+    per-tick classification pays nothing for it.
+
+    ``dead_cache`` supplies the stranded-parent set that distinguishes a ghost
+    merge from a real one; when it is absent the set is fetched on demand (the
+    give-up path runs at most once per dependent).
+    """
+    from app.blocked_need_resolution import unshipped_completed_foundation_for_need
+
+    if not needs:
+        return None
+    completed = completed_cache.get(task.project_id)
+    if completed is None:
+        completed = await _fetch_completed_candidates(session, task.project_id)
+        completed_cache[task.project_id] = completed
+    if not completed:
+        return None
+    dead = None if dead_cache is None else dead_cache.get(task.project_id)
+    if dead is None:
+        dead = await _fetch_dead_candidates(session, task.project_id)
+        if dead_cache is not None:
+            dead_cache[task.project_id] = dead
+    failed_parents = {c.id for c in dead}
+    for need in needs:
+        hit = unshipped_completed_foundation_for_need(
+            task, need, completed, failed_parents
+        )
+        if hit is not None:
+            provider, unshipped_reason = hit
+            return need, provider, unshipped_reason
+    return None
+
+
+def _unlanded_giveup_texts(reevals: int, provider, unshipped_reason) -> tuple:
+    """Operator-facing ``(detail, message)`` for a produced-but-unlanded give-up.
+
+    Every clause is grounded in a field read off ``provider``: its title, its id,
+    whether it carries a merge-unblock signal, and its recorded PR number. When
+    no PR number is recorded the text SAYS the number is unrecorded rather than
+    asserting a PR that the data cannot name.
+    """
+    from app.blocked_need_resolution import (
+        UNSHIPPED_GHOST_MERGE,
+        foundation_pr_number,
+    )
+
+    provider_id = str(provider.id)
+    label = (provider.title or "").strip() or provider_id
+    pr_number = foundation_pr_number(provider)
+    pr_text = f"PR #{pr_number}" if pr_number else "its pull request"
+    if unshipped_reason == UNSHIPPED_GHOST_MERGE:
+        detail = (
+            f"Blocked need was never satisfied after {reevals} parked "
+            f"re-evaluations — but a task DID provide it: '{label}' "
+            f"({provider_id}) COMPLETED and {pr_text} merged, into a rollup "
+            "staging branch whose parent then failed or was cancelled, so the "
+            "code never reached the integration branch this task builds on "
+            "(ghost merge). Auto-cancelled: this is NOT a missing foundation — "
+            "re-land that work (re-roll it up, or re-run the provider) and "
+            "respawn this task."
+        )
+        message = (
+            f"Cancelled — prerequisite produced by {label}, but {pr_text} "
+            "ghost-merged into an abandoned rollup and never reached integration"
+        )
+        return detail, message
+    pr_clause = (
+        f"{pr_text} never merged"
+        if pr_number
+        else "no pull request number is recorded on it and it carries no merge "
+        "signal, so nothing it produced ever merged"
+    )
+    detail = (
+        f"Blocked need was never satisfied after {reevals} parked "
+        f"re-evaluations — but a task DID provide it: '{label}' ({provider_id}) "
+        f"ran, COMPLETED, and produced the prerequisite; {pr_clause}, so its "
+        "work never reached this task's base. Auto-cancelled: this is NOT a "
+        "missing foundation — dispose of that pull request (merge it, or "
+        "resolve the review loop that owns it) and respawn this task."
+    )
+    message = (
+        f"Cancelled — prerequisite produced by {label}, but {pr_text} never merged"
+    )
+    return detail, message
+
+
+def _unlanded_escalation_detail(provider, unshipped_reason) -> str:
+    """Operator-facing escalation detail for a still-BLOCKED dependent whose
+    prerequisite WAS produced but never landed.
+
+    The escalation fires ~18h before the give-up cull, so it is the FIRST thing
+    an operator reads about this strand. Same grounding rule as
+    :func:`_unlanded_giveup_texts`: every clause comes off the provider row, and
+    an unrecorded PR number is reported as unrecorded rather than invented. The
+    difference in wording is deliberate — nothing is cancelled yet, so the ask is
+    to land the artifact, which still resumes this dependent automatically.
+    """
+    from app.blocked_need_resolution import (
+        UNSHIPPED_GHOST_MERGE,
+        foundation_pr_number,
+    )
+
+    provider_id = str(provider.id)
+    label = (provider.title or "").strip() or provider_id
+    pr_number = foundation_pr_number(provider)
+    pr_text = f"PR #{pr_number}" if pr_number else "its pull request"
+    if unshipped_reason == UNSHIPPED_GHOST_MERGE:
+        return (
+            f"Prerequisite WAS produced — '{label}' ({provider_id}) COMPLETED and "
+            f"{pr_text} merged — but only into a rollup staging branch whose "
+            "parent failed or was cancelled, so the code never reached the "
+            "integration branch this task builds on. Not a missing foundation: "
+            "re-land that work (re-roll it up, or re-run the provider) and this "
+            "task resumes automatically."
+        )
+    pr_clause = (
+        f"{pr_text} has not merged"
+        if pr_number
+        else "it carries no merge signal and no pull request number is recorded "
+        "on it, so nothing it produced has merged"
+    )
+    return (
+        f"Prerequisite WAS produced — '{label}' ({provider_id}) ran and COMPLETED "
+        f"— but {pr_clause}, so its work has not reached this task's base. Not a "
+        "missing foundation: dispose of that pull request (merge it, or resolve "
+        "the review loop that owns it) and this task resumes automatically."
+    )
+
+
 async def _cancel_blocker_as_dead(
     task,
     session,
@@ -934,6 +1096,7 @@ async def _cancel_blocker_as_dead(
     pending_broadcasts: list,
     give_up_class: str,
     need=None,
+    provider_evidence: dict | None = None,
 ) -> None:
     """Terminally CANCEL a blocked dependent that can provably never resume.
 
@@ -945,10 +1108,14 @@ async def _cancel_blocker_as_dead(
     alert (so the auto-cancel is visible) and clears the blocker metadata.
 
     Stamps a durable ``UNRESUMABLE_CANCEL_CONTEXT_KEY`` marker recording the
-    ``give_up_class`` (foundation-died vs never-satisfiable), the unresolved
-    ``need``, and the originating direction, so this terminal give-up is queryable
-    and countable fleet-wide (the structured blocker metadata is otherwise cleared
-    by ``_clear_blocked_fields`` on the same transition). Observability only.
+    ``give_up_class`` (foundation-died / never-satisfiable / produced-but-
+    unlanded), the unresolved ``need``, and the originating direction, so this
+    terminal give-up is queryable and countable fleet-wide (the structured blocker
+    metadata is otherwise cleared by ``_clear_blocked_fields`` on the same
+    transition). ``provider_evidence`` additively records the provider row that
+    justifies a produced-but-unlanded attribution, so the claim in the free-text
+    reason is checkable against structured data rather than being an unverifiable
+    sentence. Observability only.
     """
     from sqlalchemy.orm.attributes import flag_modified
     from app.alert_dispatch import _maybe_create_blocked_escalation_alert
@@ -982,6 +1149,12 @@ async def _cancel_blocker_as_dead(
 
     if give_up_class == GIVE_UP_NEVER_SATISFIABLE and is_foundation_demand_need(need):
         marker[MISSING_FOUNDATION_MARKER_KEY] = True
+    # Evidence for a produced-but-unlanded attribution: the provider task that
+    # DID build the prerequisite, and why its artifact never landed. Recorded
+    # only when the caller actually resolved a provider row, so the marker can
+    # never assert a producer the data does not name.
+    if isinstance(provider_evidence, dict) and provider_evidence:
+        marker.update(provider_evidence)
     ctx[UNRESUMABLE_CANCEL_CONTEXT_KEY] = marker
     task.context = ctx
     task.status = TaskStatus.CANCELLED
@@ -1007,6 +1180,7 @@ async def _apply_needs_disposition(
     pending_broadcasts: list,
     parked: bool,
     project_authority_locked: bool = False,
+    dead_cache: dict | None = None,
 ) -> str:
     """Apply a multi-need classification (:func:`_classify_blocker_needs`).
 
@@ -1018,9 +1192,16 @@ async def _apply_needs_disposition(
     the remainder. If ANY need names a terminally dead foundation the dependent is
     cancelled; the parked re-evaluation cap applies per the parked path.
 
+    ``dead_cache`` is the per-project terminal-foundation cache. It is used ONLY
+    to attribute a give-up (it supplies the stranded-parent set that separates a
+    ghost merge from a real one); passing ``None`` costs one extra query on the
+    give-up path and changes no disposition.
+
     Returns one of:
       ``"resumed"``   — every need accounted for; task → QUEUED (caller counts it)
       ``"cancelled"`` — a dead foundation, or the parked re-eval cap was exceeded
+                        (the cap cull is unconditional; only the RECORDED REASON
+                        varies — see ``_unlanded_provider_evidence``)
       ``"held"``      — needs remain (partial / unsatisfiable / re-cut conflict /
                         enforce-gate hold); task stays BLOCKED, residual
                         re-persisted, recheck re-armed
@@ -1170,21 +1351,54 @@ async def _apply_needs_disposition(
         # No need resolved this round (and none mid-recut).
         if parked:
             # Apply the per-need parked re-evaluation cap: cancel rather than
-            # re-arm a never-satisfiable parked blocker forever.
+            # re-arm a never-satisfiable parked blocker forever. The CULL is
+            # unconditional at the cap — only the ATTRIBUTION is evidence-driven
+            # below, so this branch can never retime or skip the termination.
             reevals = int(ctx.get("_blocked_parked_reevals", 0)) + 1
             if reevals >= _BLOCKED_PARKED_REEVAL_CAP:
-                await _cancel_blocker_as_dead(
+                # Distinguish the two worlds inside ``residual`` before naming a
+                # cause. "No task ever provided it" is FALSE whenever a task ran,
+                # COMPLETED and produced the artifact that then failed to land —
+                # that operator needs a PR number, not a hunt for a task that
+                # does not exist. Only claim it when the provider row is there.
+                unlanded = await _unlanded_provider_evidence(
                     task,
+                    residual,
                     session,
-                    detail=(
+                    completed_cache=completed_cache,
+                    dead_cache=dead_cache,
+                )
+                if unlanded is not None:
+                    unlanded_need, provider, unshipped_reason = unlanded
+                    detail, message = _unlanded_giveup_texts(
+                        reevals, provider, unshipped_reason
+                    )
+                    give_up_class = GIVE_UP_PRODUCED_BUT_UNLANDED
+                    give_up_need = unlanded_need
+                    provider_evidence = {
+                        "provider_task_id": str(provider.id),
+                        "provider_title": provider.title,
+                        "unshipped_reason": unshipped_reason,
+                    }
+                else:
+                    detail = (
                         f"Blocked need was never satisfiable after {reevals} parked "
                         "re-evaluations — no task ever provided it. Auto-cancelled "
                         "(re-scope or re-point the need to retry)."
-                    ),
-                    message="Cancelled — blocked need never became satisfiable",
+                    )
+                    message = "Cancelled — blocked need never became satisfiable"
+                    give_up_class = GIVE_UP_NEVER_SATISFIABLE
+                    give_up_need = residual[0] if residual else None
+                    provider_evidence = None
+                await _cancel_blocker_as_dead(
+                    task,
+                    session,
+                    detail=detail,
+                    message=message,
                     pending_broadcasts=pending_broadcasts,
-                    give_up_class=GIVE_UP_NEVER_SATISFIABLE,
-                    need=residual[0] if residual else None,
+                    give_up_class=give_up_class,
+                    need=give_up_need,
+                    provider_evidence=provider_evidence,
                 )
                 return "cancelled"
             ctx["_blocked_parked_reevals"] = reevals
@@ -1628,6 +1842,7 @@ async def sweep_unblock_blocked_tasks(
                     now,
                     disp,
                     completed_cache=completed_cache,
+                    dead_cache=dead_cache,
                     pending_broadcasts=pending_broadcasts,
                     parked=True,
                 )
@@ -1773,6 +1988,7 @@ async def sweep_unblock_blocked_tasks(
                 now,
                 disp,
                 completed_cache=completed_cache,
+                dead_cache=dead_cache,
                 pending_broadcasts=pending_broadcasts,
                 parked=False,
             )
@@ -1784,15 +2000,34 @@ async def sweep_unblock_blocked_tasks(
                 await _commit_task_row(_bc_start)
                 continue
             if outcome == "escalate":
+                # Same attribution rule as the give-up cull 18h later: "never
+                # appeared" is FALSE when a task ran, COMPLETED and produced the
+                # prerequisite whose artifact then failed to land. Name the
+                # provider and its PR when the evidence is there; otherwise keep
+                # the unprovided wording, which is then correct.
+                _unlanded = await _unlanded_provider_evidence(
+                    task,
+                    disp["residual"],
+                    session,
+                    completed_cache=completed_cache,
+                    dead_cache=dead_cache,
+                )
+                if _unlanded is not None:
+                    _, _provider, _unshipped_reason = _unlanded
+                    _escalate_detail = _unlanded_escalation_detail(
+                        _provider, _unshipped_reason
+                    )
+                else:
+                    _escalate_detail = (
+                        "Task has unresolved prerequisites that never appeared "
+                        "within the deadline — needs operator intervention "
+                        "(re-scope, re-point the need, or recreate the foundation)."
+                    )
                 await _escalate_blocked_task(
                     task,
                     ctx,
                     blocker_kind=task.blocker_kind or "upstream dependency",
-                    detail=(
-                        "Task has unresolved prerequisites that never appeared "
-                        "within the deadline — needs operator intervention "
-                        "(re-scope, re-point the need, or recreate the foundation)."
-                    ),
+                    detail=_escalate_detail,
                 )
                 await _commit_task_row(_bc_start)
                 continue
@@ -2112,6 +2347,7 @@ async def _event_driven_unblock_project(
                 now,
                 disp,
                 completed_cache=completed_cache,
+                dead_cache=dead_cache,
                 pending_broadcasts=pending_broadcasts,
                 parked=parked,
                 project_authority_locked=True,
