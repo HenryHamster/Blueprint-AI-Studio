@@ -12,8 +12,9 @@ than the ``app.review_pipeline`` re-export) so the module owns its own tests.
 """
 
 import copy
+import json
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -153,6 +154,35 @@ def _targeted_attempt(
     return task
 
 
+def _mark_stale_discard(
+    task: Task,
+    *,
+    live_base_sha: str,
+    live_head_sha: str,
+    target_verified_by_backend: bool = False,
+) -> Task:
+    """Apply the post-persistence shape written by a stale completion.
+
+    The live ``review_target`` is retargeted for the replacement review, while
+    ``reviewed_target`` preserves the exact target that produced the history
+    receipt. Head drift does not receive ``target_verified_by_backend`` in the
+    real completion path; base drift may, when its head is unchanged.
+    """
+    loop = task.context["review_loop"]
+    loop["reviewed_target"] = copy.deepcopy(loop["review_target"])
+    loop["review_target"] = {
+        **loop["reviewed_target"],
+        "base_sha": live_base_sha,
+        "head_sha": live_head_sha,
+    }
+    if not target_verified_by_backend:
+        loop["review_history"][0].pop("target_verified_by_backend", None)
+    task.context = {**task.context, "review_loop": loop}
+    task.context["_review_stale_head"] = True
+    task.context["_review_stale_target"] = True
+    return task
+
+
 def test_cross_episode_abandon_candidate_counts_cancelled_superseded_history():
     """The PR identity carries burden across episodes and cancelled tasks,
     through the same exact-target identity path production rows take (not
@@ -260,17 +290,252 @@ def test_cross_episode_abandon_counts_supersede_discarded_generations():
             base_sha=f"stale-base-{index}",
             head_sha=f"stale-head-{index}",
         )
-        task.context = {
-            **(task.context or {}),
-            "_review_stale_head": True,
-            "_review_stale_target": True,
-        }
+        _mark_stale_discard(
+            task,
+            live_base_sha=f"stale-base-{index}",
+            live_head_sha=f"live-head-{index}",
+        )
         rows.append(task)
 
     candidate = build_cross_episode_abandon_candidate(rows, threshold=10)
     assert candidate is not None
     assert candidate["cycles"] == 10
     assert candidate["burden"] == 10
+
+
+def test_head_drift_discard_counts_after_live_target_overwrite():
+    """A head-drift discard keeps its reviewed generation after retargeting.
+
+    This is the production post-persistence shape: ``review_target`` points at
+    the live replacement head, while the history and backend snapshot still
+    identify the older head the agent actually reviewed.
+    """
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    task = _targeted_attempt(
+        project_id,
+        task_type="review",
+        status=TaskStatus.COMPLETED,
+        iteration=1,
+        original_task_id=uuid.uuid4(),
+        base_sha="reviewed-base",
+        head_sha="reviewed-head",
+    )
+    _mark_stale_discard(
+        task,
+        live_base_sha="reviewed-base",
+        live_head_sha="live-head",
+    )
+
+    loop = task.context["review_loop"]
+    assert loop["review_target"]["head_sha"] == "live-head"
+    assert loop["reviewed_target"]["head_sha"] == "reviewed-head"
+    assert loop["review_history"][0]["reviewed_head_sha"] == "reviewed-head"
+
+    candidate = build_cross_episode_abandon_candidate([task], threshold=1)
+    assert candidate is not None
+    assert candidate["cycles"] == 1
+    assert candidate["burden"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_persistence_preserves_reviewed_target_for_census(mocker):
+    """The producer keeps reviewed evidence when it rewrites the live target."""
+    from app.task_lifecycle import _persist_stale_review_evidence
+
+    project_id = uuid.uuid4()
+    task = _targeted_attempt(
+        project_id,
+        task_type="review",
+        status=TaskStatus.COMPLETED,
+        iteration=1,
+        original_task_id=uuid.uuid4(),
+        base_sha="reviewed-base",
+        head_sha="reviewed-head",
+    )
+    review_loop = copy.deepcopy(task.context["review_loop"])
+    live_target = {
+        "project_id": str(project_id),
+        "pr_number": 17224,
+        "base_sha": "reviewed-base",
+        "head_sha": "live-head",
+    }
+    mocker.patch(
+        "app.task_locking.acquire_pr_spawn_lock", new=AsyncMock()
+    )
+    session = Mock()
+
+    await _persist_stale_review_evidence(
+        task,
+        session,
+        original_task_id="",
+        pr_number=17224,
+        review_loop=review_loop,
+        review_entry=review_loop["review_history"][0],
+        live_target=live_target,
+    )
+
+    persisted_loop = task.context["review_loop"]
+    assert persisted_loop["review_target"] == live_target
+    assert persisted_loop["reviewed_target"] == review_loop["review_target"]
+
+
+def test_base_drift_discard_counts_from_preserved_reviewed_target():
+    """Base-only drift uses the preserved reviewed pair, not the live base."""
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    task = _targeted_attempt(
+        project_id,
+        task_type="review",
+        status=TaskStatus.COMPLETED,
+        iteration=1,
+        original_task_id=uuid.uuid4(),
+        base_sha="reviewed-base",
+        head_sha="same-head",
+    )
+    _mark_stale_discard(
+        task,
+        live_base_sha="live-base",
+        live_head_sha="same-head",
+        target_verified_by_backend=True,
+    )
+
+    candidate = build_cross_episode_abandon_candidate([task], threshold=1)
+    assert candidate is not None
+    assert candidate["cycles"] == 1
+
+
+def _mark_untargeted_stale_discard(task: Task) -> Task:
+    """Apply the stale-discard shape that never rewrites the live target.
+
+    The operator-park discard (``review_request_changes.py``) and the
+    defensive merge-path respawn (``task_lifecycle.py``) both set the stale
+    flags and return WITHOUT calling ``_persist_stale_review_evidence``, so no
+    ``reviewed_target`` is written and the row's own ``review_target`` still
+    holds the exact pair the agent reviewed. Every row persisted before
+    ``reviewed_target`` existed has this same shape.
+    """
+    loop = task.context["review_loop"]
+    assert "reviewed_target" not in loop
+    task.context = {
+        **task.context,
+        "review_loop": loop,
+        "_review_stale_head": True,
+        "_review_stale_target": True,
+    }
+    return task
+
+
+def test_untargeted_stale_discard_counts_from_unrewritten_review_target():
+    """A stale discard with NO ``reviewed_target`` still counts.
+
+    This is the operator-park / defensive-merge-path (and pre-``reviewed_
+    target``) shape: the stale flags are set but the row's ``review_target``
+    was never retargeted, so it IS the reviewed generation. Without a fallback
+    from ``reviewed_target`` to ``review_target`` these rows resolve to a
+    ``None`` target, drop out of ``cycles`` entirely, and the abandon signal
+    never fires for exactly the supersede population the census exists for.
+    """
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    rows = []
+    for index in range(10):
+        task = _targeted_attempt(
+            project_id,
+            task_type="review",
+            status=TaskStatus.COMPLETED,
+            iteration=index + 1,
+            original_task_id=episode,
+            base_sha=f"parked-base-{index}",
+            head_sha=f"parked-head-{index}",
+        )
+        _mark_untargeted_stale_discard(task)
+        rows.append(task)
+
+    candidate = build_cross_episode_abandon_candidate(rows, threshold=10)
+    assert candidate is not None
+    assert candidate["cycles"] == 10
+    assert candidate["burden"] == 10
+
+
+def test_untargeted_stale_discards_collapse_onto_one_reviewed_pair():
+    """Duplicate discards of ONE superseded generation stay one cycle.
+
+    Without the ``review_target`` fallback these rows carry no exact target at
+    all and fall through to the per-task-id ``legacy-review`` unit, which
+    over-counts every duplicate discard of the same reviewed pair — the other
+    failure ``review_cap_generation_identity`` promises to avoid.
+    """
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    episode = uuid.uuid4()
+    rows = [
+        _mark_untargeted_stale_discard(
+            _targeted_attempt(
+                project_id,
+                task_type="review",
+                status=TaskStatus.COMPLETED,
+                iteration=index + 1,
+                original_task_id=episode,
+                base_sha="parked-base",
+                head_sha="parked-head",
+            )
+        )
+        for index in range(3)
+    ]
+
+    assert build_cross_episode_abandon_candidate(rows, threshold=2) is None
+    candidate = build_cross_episode_abandon_candidate(rows, threshold=1)
+    assert candidate is not None
+    assert candidate["cycles"] == 1
+    assert candidate["burden"] == 3
+
+
+def test_untargeted_stale_discard_counts_from_signed_verdict_receipt():
+    """The signed-verdict branch also honours the un-rewritten target.
+
+    The operator-park discard leaves no ``review_history`` row of its own; its
+    proof of burned work is the replay-safe structured ``review_result``.
+    """
+    from app.review_loop_convergence import build_cross_episode_abandon_candidate
+
+    project_id = uuid.uuid4()
+    task = _targeted_attempt(
+        project_id,
+        task_type="review",
+        status=TaskStatus.COMPLETED,
+        iteration=1,
+        original_task_id=uuid.uuid4(),
+        base_sha="parked-base",
+        head_sha="parked-head",
+    )
+    loop = task.context["review_loop"]
+    loop.pop("review_history", None)
+    task.context = {
+        **task.context,
+        "review_loop": loop,
+        "review_result": {
+            "structured": True,
+            "verdict": "REQUEST_CHANGES",
+            "verdict_json": json.dumps(
+                {
+                    "verdict": "REQUEST_CHANGES",
+                    "reviewed_base_sha": "parked-base",
+                    "reviewed_head_sha": "parked-head",
+                }
+            ),
+        },
+    }
+    _mark_untargeted_stale_discard(task)
+
+    candidate = build_cross_episode_abandon_candidate([task], threshold=1)
+    assert candidate is not None
+    assert candidate["cycles"] == 1
 
 
 def test_cross_episode_abandon_excludes_infra_class_stale_discards():
@@ -296,12 +561,12 @@ def test_cross_episode_abandon_excludes_infra_class_stale_discards():
             base_sha=f"infra-base-{index}",
             head_sha=f"infra-head-{index}",
         )
-        task.context = {
-            **(task.context or {}),
-            "_review_stale_head": True,
-            "_review_stale_target": True,
-            "failure_category": ADMIN_CANCEL,
-        }
+        _mark_stale_discard(
+            task,
+            live_base_sha=f"live-infra-base-{index}",
+            live_head_sha=f"live-infra-head-{index}",
+        )
+        task.context["failure_category"] = ADMIN_CANCEL
         rows.append(task)
 
     assert build_cross_episode_abandon_candidate(rows, threshold=1) is None
@@ -350,11 +615,11 @@ def test_cross_episode_abandon_combines_actioned_and_discarded_generations():
             base_sha=f"discarded-base-{index}",
             head_sha=f"discarded-head-{index}",
         )
-        discarded.context = {
-            **(discarded.context or {}),
-            "_review_stale_head": True,
-            "_review_stale_target": True,
-        }
+        _mark_stale_discard(
+            discarded,
+            live_base_sha=f"live-discarded-base-{index}",
+            live_head_sha=f"live-discarded-head-{index}",
+        )
         attempts.append(discarded)
 
     # Sanity: N actioned generations alone must not already reach threshold —

@@ -15,7 +15,7 @@ import inspect
 import json
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -60,6 +60,7 @@ from app.task_lifecycle import (
     _record_parent_failure,
     _is_transient_scan_error,
     _resolve_fallback_verdict,
+    _base_move_invalidates_approval,
     park_task,
     fire_task_wakes,
     deliver_wake,
@@ -5724,8 +5725,12 @@ async def test_approve_same_head_new_base_is_stale_and_respawns_full_review(
         new_callable=AsyncMock,
         side_effect=[
             [{"filename": "app/x.py"}],
-            [{"filename": "app/x.py"}],
         ],
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "app/x.py"}],
     )
     spawned_review = type("Review", (), {"id": uuid.uuid4()})()
     spawn_mock = mocker.patch(
@@ -5797,7 +5802,7 @@ async def test_approve_same_head_unrelated_base_move_merges_without_respawn(
         review_task.id, payload_for(review_task), _session_factory=factory
     )
 
-    assert compare_mock.await_count == 2
+    assert compare_mock.await_count == 1
     spawn_mock.assert_not_awaited()
     merge_mock.assert_awaited_once()
     await session.refresh(review_task)
@@ -5849,7 +5854,6 @@ async def test_approve_same_head_second_base_move_stays_stale(
         new_callable=AsyncMock,
         side_effect=[
             [{"filename": "docs/unrelated.md"}],
-            [{"filename": "app/x.py"}],
         ],
     )
     spawned_review = type("Review", (), {"id": uuid.uuid4()})()
@@ -5864,7 +5868,7 @@ async def test_approve_same_head_second_base_move_stays_stale(
     )
 
     assert result == {"status": "accepted"}
-    assert compare_mock.await_count == 2
+    assert compare_mock.await_count == 1
     spawn_mock.assert_awaited_once()
     assert spawn_mock.await_args.args[1] == "review"
     await session.refresh(review_task)
@@ -9594,7 +9598,7 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
     )
     task.last_heartbeat = _utcnow() - timedelta(minutes=10)
     task.started_at = _utcnow() - timedelta(minutes=11)
-    task.retry_after_until = datetime(2099, 1, 1)
+    task.retry_after_until = datetime(2099, 1, 1, tzinfo=timezone.utc)
 
     # --- Park the task on the compute-job-terminal source. -------------------
     reg = await park_task(
@@ -11392,10 +11396,15 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_base_only_request_changes_is_stale_and_respawns_full_review(
+async def test_unrelated_base_move_request_changes_spawns_fix_without_respawn(
     tl_db, mocker
 ):
-    """Base-only drift changes the effective diff and invalidates guidance."""
+    """Unrelated base traffic leaves same-head defect guidance actionable."""
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "docs/unrelated.md"}],
+    )
     calls, review_task = await _run_stale_head_branch(
         tl_db,
         mocker,
@@ -11405,12 +11414,76 @@ async def test_base_only_request_changes_is_stale_and_respawns_full_review(
         live_base_sha="newbase111111",
     )
 
-    assert not any(c[0][1] == "fix" for c in calls)
+    fix_calls = [c for c in calls if c[0][1] == "fix"]
+    assert len(fix_calls) == 1
+    assert not any(c[0][1] == "review" for c in calls)
+    assert (review_task.context or {}).get("_review_stale_target") is not True
+
+
+@pytest.mark.asyncio
+async def test_same_head_request_changes_overlapping_base_move_respawns_review(
+    tl_db, mocker
+):
+    """Overlapping base traffic still discards same-head defect guidance."""
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "app/x.py"}],
+    )
+    calls, review_task = await _run_stale_head_branch(
+        tl_db,
+        mocker,
+        reviewed_head_sha="samehead00000",
+        live_head_sha="samehead00000",
+        reviewed_base_sha="oldbase000000",
+        live_base_sha="newbase111111",
+    )
+
     review_calls = [c for c in calls if c[0][1] == "review"]
     assert len(review_calls) == 1
     assert review_calls[0][1]["delta_base_sha"] == ""
-    assert review_calls[0][1]["review_target"]["base_sha"] == "newbase111111"
+    assert not any(c[0][1] == "fix" for c in calls)
     assert (review_task.context or {}).get("_review_stale_target") is True
+
+
+@pytest.mark.asyncio
+async def test_large_rollup_review_file_set_avoids_compare_cap(tl_db, mocker):
+    """Large rollups use paginated PR files while base compare stays fail-closed."""
+    session, _ = tl_db
+    project = await _make_project(session)
+    task = await _make_task(session, project.id, status=TaskStatus.COMPLETED)
+    reviewed_files = [{"filename": f"backend/app/file_{i}.py"} for i in range(301)]
+    compare_mock = mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "docs/unrelated.md"}],
+    )
+    files_mock = mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=reviewed_files,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+
+    result = await _base_move_invalidates_approval(
+        task,
+        session,
+        pr_number=7070,
+        reviewed_base_sha="oldbase000000",
+        reviewed_head_sha="samehead00000",
+        live_base_sha="newbase111111",
+        live_head_sha="samehead00000",
+    )
+
+    assert result is False
+    compare_mock.assert_awaited_once()
+    files_mock.assert_awaited_once_with(
+        "tok", "owner", "repo", 7070, project_id=str(project.id)
+    )
 
 
 @pytest.mark.asyncio

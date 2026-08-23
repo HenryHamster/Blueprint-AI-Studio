@@ -696,6 +696,10 @@ async def _persist_stale_review_evidence(
         if isinstance(row, dict) and row.get("review_task_id") != str(task.id)
     ]
     task_history = bound_review_history([*child_history, entry])
+    reviewed_target = review_loop.get("review_target")
+    preserved_reviewed_target = (
+        dict(reviewed_target) if isinstance(reviewed_target, dict) else None
+    )
     task_ledger = build_issue_ledger(
         task_history,
         **(
@@ -713,6 +717,12 @@ async def _persist_stale_review_evidence(
         "authoritative_review_required": True,
         **({"review_target": dict(live_target)} if live_target else {}),
     }
+    if preserved_reviewed_target is not None:
+        # ``review_target`` is the mutable respawn target. Keep the exact
+        # target that produced this late verdict as separate backend evidence
+        # so the cross-episode census cannot mistake the live target for the
+        # discarded generation.
+        gated_loop.setdefault("reviewed_target", preserved_reviewed_target)
     for key in ("review_not_required", "review_policy_reason", "verdict"):
         gated_loop.pop(key, None)
     task.context = {**(task.context or {}), "review_loop": gated_loop}
@@ -774,6 +784,8 @@ async def _persist_stale_review_evidence(
             **({"review_target": dict(live_target)} if live_target else {}),
         }
     )
+    if preserved_reviewed_target is not None:
+        parent_loop.setdefault("reviewed_target", preserved_reviewed_target)
     for key in ("review_not_required", "review_policy_reason", "verdict"):
         parent_loop.pop(key, None)
     orig.context = {**(orig.context or {}), "review_loop": parent_loop}
@@ -4205,6 +4217,7 @@ async def _process_post_commit(
                             await _base_move_invalidates_approval(
                                 task,
                                 session,
+                                pr_number=pr_number,
                                 reviewed_base_sha=reviewed_base_sha,
                                 reviewed_head_sha=reviewed_head_sha,
                                 live_base_sha=str(_live_approve_target["base_sha"]),
