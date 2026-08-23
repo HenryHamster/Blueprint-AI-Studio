@@ -1435,6 +1435,12 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     - 0755 persists acceptance-contract audit metadata
     - 0756 persists the fleet-wide authorship reconciliation cursor
     - 0757 persists the candidate-bound trusted-CI dispatch outbox — current schema head
+    - 0758 persists project-scoped recurring review concerns
+    - 0759 briefly seeds the candidate authorship contract
+    - 0760 adds failed ProjectMessage handling
+    - 0761 adds the candidate SHA column
+    - 0762 adds module finding-chain lifecycle fields
+    - 0763 removes untouched implicit authorship contracts
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1549,6 +1555,22 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     prepromotion_dispatch_outbox = (
         versions_dir / "0757_release_prepromotion_dispatch_outbox.py"
     ).read_text()
+    recurring_review_concerns = (
+        versions_dir / "0758_module_finding_chain.py"
+    ).read_text()
+    seeded_authorship_contract = (
+        versions_dir / "0759_seed_operator_authorship_contract.py"
+    ).read_text()
+    failed_message_handling = (
+        versions_dir / "0760_projectmessage_failed_handling_state.py"
+    ).read_text()
+    candidate_sha = (versions_dir / "0761_release_version_candidate_sha.py").read_text()
+    finding_chain_lifecycle = (
+        versions_dir / "0762_baseline_suppression_chain.py"
+    ).read_text()
+    disarm_authorship_contract = (
+        versions_dir / "0763_disarm_implicit_operator_authorship_contract.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1639,10 +1661,19 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
         "0756",
     )
     assert "releaseprepromotiondispatch" in prepromotion_dispatch_outbox
+    assert parse_revision_identifiers(recurring_review_concerns) == ("0758", "0757")
+    assert parse_revision_identifiers(seeded_authorship_contract) == ("0759", "0758")
+    assert parse_revision_identifiers(failed_message_handling) == ("0760", "0759")
+    assert parse_revision_identifiers(candidate_sha) == ("0761", "0760")
+    assert parse_revision_identifiers(finding_chain_lifecycle) == ("0762", "0761")
+    assert parse_revision_identifiers(disarm_authorship_contract) == ("0763", "0762")
+    assert "evidence_contract_updated_by = 'system:release_default'" in (
+        disarm_authorship_contract
+    )
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0762", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0762', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0763", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0763', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

@@ -222,8 +222,6 @@ async def test_run_qualification_drops_incompatible_walkthrough_probe_and_spawns
     assert blocked["canonical_evidence_keys"] == sorted(
         rq._WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS
     )
-    # "c-operator-authorship" is the default criterion open_version seeds; the
-    # rest are this test's own criteria.
     assert blocked["active_rubric_keys"] == sorted(
         [
             "c-28e29fc5",
@@ -231,7 +229,6 @@ async def test_run_qualification_drops_incompatible_walkthrough_probe_and_spawns
             "c-13867029",
             "c-635ee093",
             "c-280480cf",
-            "c-operator-authorship",
         ]
     )
     assert lq["qualify_request_blocked_at"]
@@ -496,4 +493,3 @@ async def test_walkthrough_probe_resolves_against_open_rubric_and_is_not_refused
     # Compatible probe → no drop record at all.
     assert lq.get("qualify_request_blocked") is None
     assert lq.get("qualify_request_blocked_at") is None
-

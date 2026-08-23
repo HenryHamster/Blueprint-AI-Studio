@@ -4672,6 +4672,14 @@
           "old_cap": 1750,
           "new_cap": 1800
         }
+      ],
+      "test_migration_chain.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-23T22:57:52.007549+00:00",
+          "old_cap": 1650,
+          "new_cap": 1950
+        }
       ]
     },
     "scripts": {
@@ -4709,8 +4717,8 @@
           "new_cap": 1050
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-23T21:50:06.816394+00:00",
+          "commit_sha": "9a007c6dce7283f1921c1c81fa2dca9e89294ab0",
+          "commit_date": "2026-08-23T15:21:49-07:00",
           "old_cap": 1050,
           "new_cap": 1075
         }

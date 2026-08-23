@@ -665,13 +665,13 @@ class TestCheckDirectionHealth:
         # merges (merged_prs_any_base>0) whose landed credit has not yet propagated
         # must suppress it. The raw-merge guard is scoped to the merge-rate proxy
         # ONLY — it never masks a genuine crash signal.
-        cycle = dict(
-            tasks_created=2,
-            tasks_completed=2,
-            tasks_failed=0,
-            tasks_failed_infra=0,
-            prs_merged=0,
-        )
+        cycle = {
+            "tasks_created": 2,
+            "tasks_completed": 2,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
         churning = _direction(research_history=[dict(cycle) for _ in range(5)])
         result = _check_direction_health(churning)
         assert result is not None and "Unproductive" in result  # fires w/o raw merges
@@ -9970,7 +9970,7 @@ async def test_qualify_request_side_effect_failure_does_not_break_durable_write(
     ``connection is closed`` on ``UPDATE project SET ci_compliance``), poisoned
     the session, and the commit raised ``PendingRollbackError``. The handler
     classified that as transient and requeued the WHOLE agent job, re-running a
-    5–24 min review up to ``max_retries`` times before failing — even though the
+    5-24 min review up to ``max_retries`` times before failing -- even though the
     agent's design-doc write had already landed.
 
     The fix runs the qualify side-effect AFTER the durable commit, on an isolated
@@ -10428,15 +10428,11 @@ async def test_handle_strategic_completion_applies_new_acceptance_criteria_from_
     await _handle_strategic_completion(task, logs, db_session)
 
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    # open_version seeds the operator-authorship policy criterion; it is not a
-    # strategist-authored row, so exclude it before asserting on the authored set.
-    assert any(ac.is_operator_authorship_criterion(c) for c in fetched)
-    authored = [c for c in fetched if not ac.is_operator_authorship_criterion(c)]
-    assert [c.text for c in authored] == [
+    assert [c.text for c in fetched] == [
         "All unit tests pass",
         "No unresolved P0 bugs",
     ]
-    assert all(c.created_by == "strategist" for c in authored)
+    assert all(c.created_by == "strategist" for c in fetched)
 
 
 @pytest.mark.asyncio
@@ -10513,11 +10509,8 @@ async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
 
     # Synchronous apply: criteria created during set_problem_model, not deferred.
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    # open_version seeds the operator-authorship policy criterion; exclude it.
-    assert any(ac.is_operator_authorship_criterion(c) for c in fetched)
-    authored = [c for c in fetched if not ac.is_operator_authorship_criterion(c)]
-    assert [c.text for c in authored] == criteria_texts
-    assert all(c.created_by == "strategist" for c in authored)
+    assert [c.text for c in fetched] == criteria_texts
+    assert all(c.created_by == "strategist" for c in fetched)
 
     # Context key is consumed and popped — completion handler is a no-op.
     await db_session.refresh(task)
@@ -10526,8 +10519,7 @@ async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
     # Completion handler does not create duplicate criteria.
     await _handle_strategic_completion(task, "", db_session)
     fetched2 = await ac.get_criteria_for_version(db_session, version.id)
-    authored2 = [c for c in fetched2 if not ac.is_operator_authorship_criterion(c)]
-    assert len(authored2) == len(criteria_texts)  # no duplicates
+    assert len(fetched2) == len(criteria_texts)  # no duplicates
 
 
 # ── _compute_lifetime_burn_metrics ───────────────────────────────────────────
@@ -10623,8 +10615,8 @@ class TestComputeLifetimeBurnMetrics:
         d = _direction(research_history=[], history_aggregate=agg)
         m = _compute_lifetime_burn_metrics(d)
         assert m is not None
-        assert m["lifetime_merged"] == 3  # 5 verified − 2 stranded
-        assert m["lifetime_non_merge_finished"] == 7  # 10 completed − 3 credit-merged
+        assert m["lifetime_merged"] == 3  # 5 verified - 2 stranded
+        assert m["lifetime_non_merge_finished"] == 7  # 10 completed - 3 credit-merged
         assert m["lifetime_merge_rate"] == round(3 / 10, 3)
 
 
@@ -12603,7 +12595,7 @@ class TestChallengeRejectsPortfolioOp:
     def test_absent_verdict_for_activate_direction_blocks(self):
         # No matching portfolio_operations entry → hard-block op fails closed.
         rec = self._rec([])
-        blocked, why = challenge_rejects_portfolio_op(
+        blocked, _why = challenge_rejects_portfolio_op(
             rec, "activate_direction", direction_id="d-5"
         )
         assert blocked is True
@@ -17236,7 +17228,7 @@ async def test_strategic_completion_mixed_present_citation_is_flagged(
     mocker.patch(
         "app.source_ref_validation._file_exists_at_head",
         new=AsyncMock(
-            side_effect=lambda path, **_: True if "alive.py" in path else False
+            side_effect=lambda path, **_: "alive.py" in path
         ),
     )
 
@@ -20377,10 +20369,12 @@ async def test_spawn_retirement_memos_failure_does_not_abort_commit(db_session, 
     async def _blow_up(*args, **kwargs):
         raise RuntimeError("simulated memo spawn failure")
 
-    with patch("app.strategic_completion._spawn_retirement_memos", new=_blow_up):
-        with patch("app.strategic_completion.logger") as mock_logger:
-            # Must not raise — commit must proceed
-            await _handle_strategic_completion(sr_task, "", db_session)
+    with (
+        patch("app.strategic_completion._spawn_retirement_memos", new=_blow_up),
+        patch("app.strategic_completion.logger") as mock_logger,
+    ):
+        # Must not raise — commit must proceed
+        await _handle_strategic_completion(sr_task, "", db_session)
 
     error_calls = [str(c) for c in mock_logger.error.call_args_list]
     assert any("_spawn_retirement_memos" in c or "retirement memo" in c.lower() for c in error_calls), (
@@ -20686,7 +20680,7 @@ async def test_fallback_directions_write_preserves_concurrent_add(db_session, mo
         # Simulate a concurrent writer inserting d-concurrent into the DB
         # before the delta callback fires.  The delta callback must preserve it.
         def injecting_fn(fresh: list) -> list:
-            return mutate_fn(fresh + [concurrent_dir])
+            return mutate_fn([*fresh, concurrent_dir])
 
         return await real_wdl(session, project_id, injecting_fn, **kwargs)
 
