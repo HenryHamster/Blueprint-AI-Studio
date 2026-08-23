@@ -341,6 +341,7 @@ from app.reaper_sweeps import (
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
     sweep_fail_stranded_pending_conversation_messages,
+    sweep_release_expired_conversation_claims,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
@@ -3674,12 +3675,40 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
+                # Step 25a: Expired conversation-claim release sweep — an
+                # expired claim lease grants re-claim ELIGIBILITY but releases
+                # nothing, and every completion route refuses an expired lease,
+                # so a claim whose worker died (or moved on without replying)
+                # was uncompletable by all paths and releasable by none. Return
+                # such a claim to PENDING with a recorded reason so redelivery,
+                # the coordinator's dead-claim bound, and finally Step 25 can
+                # each act. Must run BEFORE Step 25, which only sees PENDING.
+                _mark_reaper_progress()
+                try:
+                    _claims_released = await sweep_release_expired_conversation_claims(
+                        session, now
+                    )
+                    if _claims_released:
+                        logger.info(
+                            "[REAPER] Step 25a: released %d expired conversation "
+                            "claim(s)",
+                            _claims_released,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Expired-conversation-claim release sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
                 # Step 25: Stranded conversation message failure sweep — age out
                 # unclaimed PENDING conversation-surface messages (no runner ever
                 # claimed them, e.g. the selected runner is dead) after a bounded
                 # window so the operator gets a terminal, visible 'failed' state
-                # instead of silent, permanent PENDING. Claimed messages are left
-                # to conversation_coordinator's lease-expiry/reclaim path.
+                # instead of silent, permanent PENDING. A previously-claimed
+                # message reaches this sweep once Step 25a releases its dead lease.
                 _mark_reaper_progress()
                 try:
                     _stranded_failed = await sweep_fail_stranded_pending_conversation_messages(

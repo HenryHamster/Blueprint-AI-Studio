@@ -22,11 +22,14 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
+    Task,
 )
 from app.reaper_bug_message_sweeps import (
+    EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES,
     STRANDED_CONVERSATION_MESSAGE_AFTER_MINUTES,
     STRANDED_DEFERRED_CONVERSATION_MESSAGE_AFTER_MINUTES,
     sweep_fail_stranded_pending_conversation_messages,
+    sweep_release_expired_conversation_claims,
 )
 from app.project_message_projection import WAKEUP_STATE_CONTEXT_KEY
 from app.session_message_handoff import RESIDENT_HANDOFF_AT_CONTEXT_KEY
@@ -140,7 +143,19 @@ async def test_fresh_pending_conversation_message_untouched(sweep_db):
 
 @pytest.mark.asyncio
 async def test_claimed_conversation_message_untouched(sweep_db):
-    """A claimed message is left to conversation_coordinator's lease-expiry path."""
+    """Step 25 never touches a LIVE claim -- its owner can still answer.
+
+    Strengthened after the operator-message claim-deadlock incident. This test
+    previously used a claim with NO lease at all and asserted, in its own
+    docstring, that such a row was "left to conversation_coordinator's
+    lease-expiry path". That path does not exist: expiry only grants re-claim
+    eligibility and releases nothing, so the row this test constructed was in
+    reality unreachable by every code path in the system -- the exact defect
+    that left operator messages 'claimed' and unanswered forever. The case is
+    now pinned as what it should always have been (a live lease, which really
+    does belong to its owner); dead claims are covered by the Step 25a tests
+    below, which prove they are released rather than abandoned.
+    """
     project = await _make_project(sweep_db)
     old = _utcnow() - timedelta(
         minutes=STRANDED_CONVERSATION_MESSAGE_AFTER_MINUTES + 30
@@ -149,14 +164,16 @@ async def test_claimed_conversation_message_untouched(sweep_db):
         project_id=project.id,
         message_type=MessageType.NOTE,
         from_type="user",
-        content="claimed by a (possibly stalled) worker",
+        content="claimed by a worker whose lease is still live",
         status="open",
         surface=MessageSurface.CONVERSATION,
         handling_state=MessageHandlingState.CLAIMED,
         conversation_claim_id=uuid.uuid4(),
+        conversation_claim_expires_at=_utcnow() + timedelta(minutes=4),
         sequence=1,
         context={},
         created_at=old,
+        updated_at=old,
     )
     sweep_db.add(msg)
     await sweep_db.commit()
@@ -166,6 +183,10 @@ async def test_claimed_conversation_message_untouched(sweep_db):
 
     assert acted == 0
     await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.CLAIMED
+    # ...and Step 25a leaves it alone too, so a live turn is owned by exactly
+    # one sweep-free path: its claimant.
+    assert await sweep_release_expired_conversation_claims(sweep_db, _utcnow()) == 0
     assert msg.handling_state == MessageHandlingState.CLAIMED
     assert msg.status == "open"
 
@@ -506,3 +527,201 @@ async def test_recently_rereleased_row_untouched(sweep_db):
     assert acted == 0
     await sweep_db.refresh(msg)
     assert msg.handling_state == MessageHandlingState.PENDING
+
+
+# --- Step 25a: expired conversation-claim release -------------------------
+#
+# Incident (operator-message claim deadlock): operator messages sat at
+# handling_state='claimed' with no reply forever, held by a Resident task that
+# simultaneously reported "waiting for operator input". Lease expiry only made
+# the turn ELIGIBLE for re-claim; it released nothing, every completion route
+# refused an expired lease, and Step 25 skipped claimed rows -- so both sides
+# deferred to the other and 0 of the operator's messages ever reached
+# 'responded'. Step 25a is the release that closes that gap.
+
+
+async def _add_claimed_message(
+    db: AsyncSession, project: Project, **overrides
+) -> ProjectMessage:
+    """Insert a CLAIMED conversation message with claim fields populated."""
+    fields = {
+        "handling_state": MessageHandlingState.CLAIMED,
+        "conversation_claim_id": uuid.uuid4(),
+        "conversation_claim_generation": 1,
+        "conversation_claim_incarnation": uuid.uuid4(),
+        "conversation_claim_attempt": 2,
+        **overrides,
+    }
+    return await _add_message(db, project, **fields)
+
+
+@pytest.mark.asyncio
+async def test_expired_conversation_claim_is_released_to_pending(sweep_db):
+    """A provably dead claim returns to PENDING carrying its release reason."""
+    project = await _make_project(sweep_db)
+    task = Task(project_id=project.id, title="dead resident worker", payloads=[])
+    sweep_db.add(task)
+    await sweep_db.commit()
+    await sweep_db.refresh(task)
+    stale = _minutes_ago(EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES + 5)
+    msg = await _add_claimed_message(
+        sweep_db,
+        project,
+        content="operator question the claimant never answered",
+        handled_by_task_id=task.id,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        context={
+            **ARMED_CONTEXT,
+            "_conversation_claim_idempotency_key": "stale-claim-key",
+        },
+    )
+
+    acted = await sweep_release_expired_conversation_claims(sweep_db, _utcnow())
+
+    assert acted == 1
+    await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.PENDING
+    assert msg.status == "open"
+    assert msg.conversation_claim_id is None
+    assert msg.conversation_claim_expires_at is None
+    assert msg.handled_by_task_id is None
+    # The stale client identity must not survive, or the replacement worker
+    # cannot bind a fresh claim to the same immutable membership.
+    assert "_conversation_claim_idempotency_key" not in msg.context
+    # Attempt history is PRESERVED for diagnostics.
+    assert msg.conversation_claim_attempt == 2
+    # The release is a recorded DEATH, which is what the coordinator's bound
+    # counts; without it the release/re-claim loop would never terminate,
+    # because each release also resets the claim id and the coordinator then
+    # sees an ordinary fresh handout rather than a reclaim over a corpse.
+    assert msg.context.get("_conversation_turn_dead_claims") == 1
+    # Surface reasons, not states.
+    assert msg.context.get("_conversation_claim_released_at") is not None
+    reason = msg.context.get("_conversation_claim_release_reason") or ""
+    assert "expired at" in reason
+    assert "attempt=2" in reason
+    assert "dead_claims=1" in reason
+    assert str(task.id) in reason
+
+
+@pytest.mark.asyncio
+async def test_repeated_release_accumulates_dead_claims(sweep_db):
+    """The death count must ACCUMULATE, or the bound can never be reached.
+
+    Each release also clears the claim id, so the coordinator's next handout
+    looks like an ordinary fresh claim rather than a reclaim over a corpse.
+    The durable counter is the only thing that carries the failure history
+    across that boundary.
+    """
+    project = await _make_project(sweep_db)
+    stale = _minutes_ago(EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES + 5)
+    msg = await _add_claimed_message(
+        sweep_db,
+        project,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        context={**ARMED_CONTEXT, "_conversation_turn_dead_claims": 3},
+    )
+
+    assert await sweep_release_expired_conversation_claims(sweep_db, _utcnow()) == 1
+    await sweep_db.refresh(msg)
+    assert msg.context.get("_conversation_turn_dead_claims") == 4
+    assert "dead_claims=4" in (
+        msg.context.get("_conversation_claim_release_reason") or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_conversation_claim_lease_untouched(sweep_db):
+    """A claim whose lease is still in the future belongs to a live worker."""
+    project = await _make_project(sweep_db)
+    msg = await _add_claimed_message(
+        sweep_db,
+        project,
+        conversation_claim_expires_at=_utcnow() + timedelta(minutes=4),
+        created_at=_minutes_ago(600),
+        updated_at=_minutes_ago(600),
+    )
+
+    acted = await sweep_release_expired_conversation_claims(sweep_db, _utcnow())
+
+    assert acted == 0
+    await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.CLAIMED
+    assert msg.conversation_claim_id is not None
+
+
+@pytest.mark.asyncio
+async def test_just_expired_conversation_claim_within_grace_untouched(sweep_db):
+    """Inside the grace window a replacement generation may still reclaim."""
+    project = await _make_project(sweep_db)
+    recent = _minutes_ago(EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES - 5)
+    msg = await _add_claimed_message(
+        sweep_db,
+        project,
+        conversation_claim_expires_at=recent,
+        created_at=recent,
+        updated_at=recent,
+    )
+
+    acted = await sweep_release_expired_conversation_claims(sweep_db, _utcnow())
+
+    assert acted == 0
+    await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.CLAIMED
+
+
+@pytest.mark.asyncio
+async def test_leaseless_claim_is_released(sweep_db):
+    """A legacy claim with no recorded lease is dead on arrival: no completion
+    route accepts a NULL expiry, so nothing but this sweep can ever free it."""
+    project = await _make_project(sweep_db)
+    stale = _minutes_ago(EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES + 60)
+    msg = await _add_claimed_message(
+        sweep_db,
+        project,
+        conversation_claim_expires_at=None,
+        created_at=stale,
+        updated_at=stale,
+    )
+
+    acted = await sweep_release_expired_conversation_claims(sweep_db, _utcnow())
+
+    assert acted == 1
+    await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.PENDING
+    reason = msg.context.get("_conversation_claim_release_reason") or ""
+    assert "legacy lease-less claim" in reason
+
+
+@pytest.mark.asyncio
+async def test_released_claim_then_ages_out_through_step_25(sweep_db):
+    """End-to-end termination: Step 25a releases, Step 25 is then the terminal
+    backstop. Before Step 25a existed, neither sweep could touch the row and
+    the operator's message stayed 'claimed' forever with no explanation."""
+    project = await _make_project(sweep_db)
+    stale = _minutes_ago(EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES + 5)
+    msg = await _add_claimed_message(
+        sweep_db,
+        project,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        context=dict(ARMED_CONTEXT),
+    )
+
+    assert await sweep_release_expired_conversation_claims(sweep_db, _utcnow()) == 1
+    await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.PENDING
+
+    # Nobody re-claims it; the armed window then expires.
+    later = _utcnow() + timedelta(
+        minutes=STRANDED_CONVERSATION_MESSAGE_AFTER_MINUTES + 1
+    )
+    assert await sweep_fail_stranded_pending_conversation_messages(sweep_db, later) == 1
+    await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.FAILED
+    assert msg.resolution == "stranded (no runner claim within the window)"

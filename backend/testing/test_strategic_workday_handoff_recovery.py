@@ -1,4 +1,4 @@
-"""Terminal recovery regressions for typed Workday consultation handoffs."""
+"""Terminal recovery regressions for typed Workday and operator handoffs."""
 
 from __future__ import annotations
 
@@ -9,6 +9,10 @@ from httpx import AsyncClient
 from sqlalchemy import update
 from sqlmodel import select
 
+from app.conversation_coordinator import (
+    _OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY,
+    _OPERATOR_TURN_MAX_DEAD_CLAIMS,
+)
 from app.models import MessageHandlingState, ProjectMessage
 from testing.test_strategic_session_messages import (
     _activate_typed_fast_worker,
@@ -240,3 +244,64 @@ async def test_missing_handoff_recovers_but_deleted_source_publishes_nothing(
         )
     ).scalars().all()
     assert recovery_rows == []
+
+
+@pytest.mark.asyncio
+async def test_operator_turn_park_is_committed_and_returned_by_the_claim_route(
+    client: AsyncClient, db_session
+):
+    """A park must reach the operator AND survive the request.
+
+    Incident: operator conversation messages sat at handling_state='claimed'
+    forever, held by a task that reported "waiting for operator input". The
+    coordinator now DECIDES instead of re-handing out a turn whose claim has
+    died _OPERATOR_TURN_MAX_DEAD_CLAIMS times -- but the decision is written
+    into the request's session, so a route that rolled back on the raised
+    OperatorTurnParked would throw the answer away and re-enter the same loop
+    on the next poll. This pins the commit and the reason-bearing 409.
+
+    Lives here rather than in test_strategic_session_messages.py (which owns
+    the route) only because that module is at its module_size_limits.json cap.
+    """
+    project, task = await _make_resident_poll_worker(db_session)
+    project_id = project.id
+    incarnation = await _activate_typed_fast_worker(db_session, project, task)
+    inbound = await _add_typed_fast_input(db_session, project)
+    inbound.context = {
+        **dict(inbound.context or {}),
+        _OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY: _OPERATOR_TURN_MAX_DEAD_CLAIMS,
+    }
+    db_session.add(inbound)
+    await db_session.commit()
+
+    parked = await client.post(
+        f"/api/agent/projects/{project_id}/conversation/turns/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json=_typed_fast_claim_payload(
+            task, incarnation, inbound.id, client_claim_id=str(uuid.uuid4())
+        ),
+    )
+
+    assert parked.status_code == 409, parked.text
+    # Surface reasons, not states: never a bare "already claimed" 409.
+    detail = parked.json()["error"]["message"]
+    assert "could not process this message" in detail
+    assert "Send it again to retry" in detail
+
+    await db_session.refresh(inbound)
+    assert inbound.handling_state == MessageHandlingState.RESPONDED
+    assert inbound.status == "handled"
+    reply = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.from_type == "strategic",
+                    ProjectMessage.content == detail,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(reply) == 1

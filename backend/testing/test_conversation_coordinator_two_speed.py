@@ -10,7 +10,9 @@ import pytest
 from sqlmodel import select
 
 from app.conversation_coordinator import (
+    _OPERATOR_TURN_MAX_DEAD_CLAIMS,
     ConversationPublicReplyOwner,
+    OperatorTurnParked,
     abandon_fast_public_turn,
     acknowledge_workday_consultation_packet,
     claim_next_workday_consultation_packet,
@@ -22,6 +24,7 @@ from app.conversation_coordinator import (
     native_resident_reply_may_complete_claim,
     record_workday_consultation_gate_failure,
     renew_workday_consultation_packet,
+    reset_conversation_claim_for_session_handoff,
     renew_workday_consultation_continuation,
     release_workday_consultation_continuation,
     standard_fallback_is_admissible,
@@ -1239,3 +1242,204 @@ async def test_gate_failure_detail_persists_logs_and_surfaces_in_parked_reason(
     reason = parked.context.get("_workday_consultation_result_summary") or ""
     assert "Last recorded gate failure (envelope_resolution)" in reason
     assert "stale" in reason
+
+
+async def _expire_operator_claim_lease(db_session, message_id: uuid.UUID) -> None:
+    """Simulate a claimant that died (or moved on) without ever replying: push
+    the already-issued operator-turn lease into the past so the NEXT claim is a
+    reclaim, exactly like real lease expiry -- without sleeping."""
+    row = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == message_id)
+        )
+    ).scalar_one()
+    row.conversation_claim_expires_at = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    ) - timedelta(seconds=5)
+    db_session.add(row)
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_operator_turn_parks_after_max_dead_claims(db_session):
+    """Root-cause regression for the operator-message claim deadlock.
+
+    Production state: 0 of 2 operator messages ever reached 'responded' while
+    14/14 strategic messages did. The operator rows sat at
+    handling_state='claimed', held by a task that simultaneously reported
+    "waiting for operator input". The private Workday consultation lane had had
+    an unacked-claim cap for months; the operator lane -- the one a *human* is
+    waiting on -- had none, so the turn could be handed out forever and the
+    operator was never told anything at all.
+
+    An operator turn whose claim has DIED _OPERATOR_TURN_MAX_DEAD_CLAIMS times
+    without a public reply must now DECIDE: answer the operator with the
+    failure and close the turn, rather than hand the question back into the
+    same silence.
+    """
+    # Bare literal pin: the bound itself, independent of any assertion below
+    # that is phrased in terms of the constant.
+    assert _OPERATOR_TURN_MAX_DEAD_CLAIMS == 5
+
+    project, message, task = await _project_with_input(db_session)
+
+    def _claim(generation: int):
+        return claim_operator_messages(
+            db_session,
+            project_id=project.id,
+            session_id="session",
+            task_id=task.id,
+            worker_generation=generation,
+            incarnation_id=uuid.uuid4(),
+            message_ids=[message.id],
+            lease_seconds=45,
+            public_reply_owner=ConversationPublicReplyOwner.FAST,
+        )
+
+    async def _row():
+        return (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.id == message.id)
+            )
+        ).scalar_one()
+
+    # Handout 1 is fresh (no death yet); handouts 2..5 each reclaim over a
+    # corpse lease, so by the last successful claim four deaths are recorded.
+    for generation in range(1, 6):
+        claim = await _claim(generation)
+        assert claim is not None, f"handout {generation} is below the cap"
+        assert claim.attempt == generation
+        await db_session.commit()
+        row = await _row()
+        assert (row.context or {}).get("_conversation_turn_dead_claims") == (
+            generation - 1 or None
+        )
+        await _expire_operator_claim_lease(db_session, message.id)
+
+    with pytest.raises(OperatorTurnParked) as excinfo:
+        await _claim(6)
+    await db_session.commit()
+
+    parked = excinfo.value
+    assert parked.dead_claims == 5
+    assert parked.message_ids == (message.id,)
+    # Surface reasons, not states: the operator-facing text says how many
+    # claims died and what to do next.
+    assert "died 5 times" in parked.reason
+    assert "Send it again to retry" in parked.reason
+
+    row = await _row()
+    assert row.handling_state == MessageHandlingState.RESPONDED
+    assert row.status == "handled"
+    assert row.context.get("_conversation_turn_parked") is True
+    assert row.context.get("_conversation_turn_parked_deaths") == 5
+    assert "could not process this message" in (
+        row.context.get("_conversation_turn_parked_reason") or ""
+    )
+
+    replies = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_type == "strategic",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(replies) == 1
+    reply = replies[0]
+    assert reply.surface == MessageSurface.CONVERSATION
+    assert reply.handling_state == MessageHandlingState.RESPONDED
+    assert reply.content == parked.reason
+    assert reply.context["_resident_reply_covered_message_ids"] == [str(message.id)]
+
+    # Terminal: the closed turn is never handed out again, and re-claiming does
+    # not raise a second park at the operator.
+    assert await _claim(7) is None
+
+
+@pytest.mark.asyncio
+async def test_operator_turn_handouts_without_deaths_never_park(db_session):
+    """A high handout count is NOT evidence of a dead turn.
+
+    conversation_claim_attempt carries EVERY handout forward, including the
+    benign Resident session rebind that clears the claim id at session
+    handoff -- production rows routinely sit in double digits while remaining
+    perfectly answerable (see test_strategic_resident_session.py, which seeds
+    attempt=11 and expects a claim). Keying the operator-turn bound on that
+    field false-parks healthy turns, so the bound counts only claims that
+    provably ENDED BADLY. This test pins that distinction.
+    """
+    project, message, task = await _project_with_input(db_session)
+    for generation in range(1, 3 * _OPERATOR_TURN_MAX_DEAD_CLAIMS):
+        claim = await claim_operator_messages(
+            db_session,
+            project_id=project.id,
+            session_id=f"session-{generation}",
+            task_id=task.id,
+            worker_generation=generation,
+            incarnation_id=uuid.uuid4(),
+            message_ids=[message.id],
+            lease_seconds=45,
+            public_reply_owner=ConversationPublicReplyOwner.FAST,
+        )
+        assert claim is not None, f"handout {generation} must still be claimable"
+        assert claim.attempt == generation
+        await db_session.commit()
+        # Session handoff: the rebind clears the claim, exactly as
+        # reset_conversation_claim_for_session_handoff does in production.
+        row = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.id == message.id)
+            )
+        ).scalar_one()
+        reset_conversation_claim_for_session_handoff(row)
+        db_session.add(row)
+        await db_session.commit()
+
+    row = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == message.id)
+        )
+    ).scalar_one()
+    assert row.conversation_claim_attempt > _OPERATOR_TURN_MAX_DEAD_CLAIMS
+    assert (row.context or {}).get("_conversation_turn_dead_claims") is None
+    assert (row.context or {}).get("_conversation_turn_parked") is None
+
+
+@pytest.mark.asyncio
+async def test_operator_turn_same_owner_replay_does_not_burn_an_attempt(db_session):
+    """A live worker replaying its own claim must not be pushed toward the cap.
+
+    Only a FRESH handout (a new claim id, or a reclaim by a replacement owner)
+    counts against _OPERATOR_TURN_MAX_DEAD_CLAIMS; otherwise a healthy worker
+    that retries an idempotent claim call would park its own operator.
+    """
+    project, message, task = await _project_with_input(db_session)
+    incarnation_id = uuid.uuid4()
+    for _ in range(4):
+        claim = await claim_operator_messages(
+            db_session,
+            project_id=project.id,
+            session_id="session",
+            task_id=task.id,
+            worker_generation=1,
+            incarnation_id=incarnation_id,
+            message_ids=[message.id],
+            lease_seconds=45,
+            public_reply_owner=ConversationPublicReplyOwner.FAST,
+        )
+        assert claim is not None
+        assert claim.attempt == 1
+        await db_session.commit()
+
+    row = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == message.id)
+        )
+    ).scalar_one()
+    assert row.handling_state == MessageHandlingState.CLAIMED
+    assert row.context.get("_conversation_turn_parked") is None
