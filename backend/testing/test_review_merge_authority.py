@@ -1,5 +1,6 @@
 """Focused invariants for the final review/merge authority boundary."""
 
+import types
 import uuid
 from unittest.mock import AsyncMock
 
@@ -14,7 +15,10 @@ from app.review_merge_authority import (
     attempt_merge_with_authority,
     enforce_merge_authority,
 )
-from app.review_merge_gate import _enforce_authoritative_review_merge_gate
+from app.review_merge_gate import (
+    _EXACT_TARGET_REVIEW_SPAWN_BUDGET,
+    _enforce_authoritative_review_merge_gate,
+)
 
 
 @pytest.mark.parametrize(
@@ -707,3 +711,208 @@ async def test_unsatisfiable_ledger_escalates_instead_of_respawning_review(
         assert marker is None, (
             "a recoverable gate must never be escalated to the operator"
         )
+
+
+def _blocked_loop(project: Project, pr_number: int) -> dict:
+    """A gate state that is fail-closed on a real finding, not on bookkeeping.
+
+    Short history on purpose: the synthetic ``BP-ledger-proof-incomplete``
+    blocker is only minted at ``REVIEW_HISTORY_MAX_ENTRIES``, so this exercises
+    the ordinary-blocker path rather than the lineage escalation next to it.
+    """
+    target = _target(project, pr_number)
+    approval = _clean_approval(project, pr_number, 1)
+    ledger = build_issue_ledger([approval], stamp_complete=True)
+    ledger["open"] = [
+        {
+            "issue_id": "BP-real-blocker",
+            "severity": "major",
+            "description": "an actual finding in the diff",
+        }
+    ]
+    return {
+        "pr_number": pr_number,
+        "branch": f"blueprint/task-{pr_number}",
+        "base_branch": "main",
+        "base_sha": target["base_sha"],
+        "head_sha": target["head_sha"],
+        "review_history": [approval],
+        "issue_ledger": ledger,
+        "review_target": target,
+    }
+
+
+async def _drive_gate(task, db_session, pr_number: int, target: dict) -> bool:
+    """Run one merge-gate tick the way the CI monitor does.
+
+    The loop is re-read from the task's own context every time, which is the
+    only way a durable per-target budget can be observed at all.
+    """
+    return await _enforce_authoritative_review_merge_gate(
+        task,
+        db_session,
+        ci_loop=dict((task.context or {}).get("review_loop") or {}),
+        pr_number=pr_number,
+        branch=f"blueprint/task-{pr_number}",
+        base_branch="main",
+        original_task_id=str(task.id),
+        live_review_target=target,
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_target_review_respawn_is_budgeted_then_escalated(
+    db_session, mocker
+):
+    """A head that never moves cannot be re-reviewed without end.
+
+    Defect this exists for: PR #17693 took 441 exact-target review spawns over
+    9.5 hours -- one every ~66 seconds -- each occupying a slot on a
+    three-runner fleet, and nothing stopped it. The per-chain iteration cap
+    could not: it counts actioned *generations*, and
+    ``actioned_review_cap_tasks`` deliberately collapses every review of one
+    target into a single generation, so ``chain_iterations`` stayed at 1
+    forever. Nothing else was counting, and 441 identical tasks raised no
+    alert.
+
+    Re-reviewing the same target a small number of times is legitimate -- the
+    blocker set accumulates across rows, so a later reviewer can refute an
+    earlier one. Doing it without end is not: with the head pinned, every
+    spawn reads the identical diff.
+    """
+    project = Project(name="Respawn budget", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pr_number = 17693
+    target = _target(project, pr_number)
+    task = await _gate_task(
+        db_session, project, pr_number, _blocked_loop(project, pr_number)
+    )
+
+    spawned: list[str] = []
+
+    async def _spawn(_task, kind, *_args, **_kwargs):
+        spawned.append(kind)
+        return types.SimpleNamespace(id=uuid.uuid4()), True
+
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", side_effect=_spawn)
+
+    # Ten ticks against an unchanged head. The pre-fix gate spawned on every
+    # single one; there was no number of ticks that would have stopped it.
+    for _ in range(10):
+        assert await _drive_gate(task, db_session, pr_number, target) is False
+
+    assert len(spawned) == _EXACT_TARGET_REVIEW_SPAWN_BUDGET, (
+        "the gate must stop buying reviews of a diff it has already had "
+        f"adjudicated {_EXACT_TARGET_REVIEW_SPAWN_BUDGET} times"
+    )
+
+    context = task.context or {}
+    marker = context.get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY)
+    assert isinstance(marker, dict), (
+        "stopping silently would just be a quieter wedge -- the stop has to "
+        "reach an operator"
+    )
+    assert marker["reason"] == "exact_target_review_budget_exhausted"
+    assert marker["pr_number"] == pr_number
+    assert marker["spawned_reviews"] == _EXACT_TARGET_REVIEW_SPAWN_BUDGET
+    assert marker["review_target"] == {
+        "base_sha": target["base_sha"],
+        "head_sha": target["head_sha"],
+    }
+    assert "BP-real-blocker" in marker["open_issue_ids"]
+
+    # Surface the reason, not the state.
+    message = task.latest_status_message or ""
+    assert str(_EXACT_TARGET_REVIEW_SPAWN_BUDGET) in message
+    assert "unchanged head" in message
+    assert "adjudication" in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_review_still_in_flight_does_not_spend_the_respawn_budget(
+    db_session, mocker
+):
+    """Budget is spent by new reviews, not by ticks.
+
+    The gate is re-entered on every CI poll while a spawned review is still
+    running, and ``_spawn_pipeline_task`` answers those with the same active
+    row and ``created=False``. Charging them would exhaust the budget within
+    minutes against a single review that had not reported yet -- turning a
+    fix for a runaway into a brand-new false park.
+    """
+    project = Project(name="In-flight reuse", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pr_number = 17694
+    target = _target(project, pr_number)
+    task = await _gate_task(
+        db_session, project, pr_number, _blocked_loop(project, pr_number)
+    )
+
+    reused_id = uuid.uuid4()
+    calls: list[str] = []
+
+    async def _spawn(_task, kind, *_args, **_kwargs):
+        calls.append(kind)
+        return types.SimpleNamespace(id=reused_id), False
+
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", side_effect=_spawn)
+
+    ticks = _EXACT_TARGET_REVIEW_SPAWN_BUDGET * 4
+    for _ in range(ticks):
+        assert await _drive_gate(task, db_session, pr_number, target) is False
+
+    assert len(calls) == ticks, "every tick still reaches the idempotent spawn"
+    context = task.context or {}
+    assert context.get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY) is None, (
+        "one in-flight review must never be mistaken for a respawn runaway"
+    )
+    loop = context.get("review_loop") or {}
+    assert not loop.get("authoritative_review_spawns")
+
+
+@pytest.mark.asyncio
+async def test_a_landed_fix_restores_the_full_respawn_budget(db_session, mocker):
+    """The budget is scoped to the target, so real progress always clears it.
+
+    This is what keeps the cap off the healthy path: a fix commit mints a new
+    ``(base_sha, head_sha)`` and the count starts over. Only a loop in which
+    nothing whatsoever is moving can reach the escalation.
+    """
+    project = Project(name="Budget resets", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pr_number = 17695
+    target = _target(project, pr_number)
+    task = await _gate_task(
+        db_session, project, pr_number, _blocked_loop(project, pr_number)
+    )
+
+    spawned: list[str] = []
+
+    async def _spawn(_task, kind, *_args, **_kwargs):
+        spawned.append(kind)
+        return types.SimpleNamespace(id=uuid.uuid4()), True
+
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", side_effect=_spawn)
+
+    for _ in range(_EXACT_TARGET_REVIEW_SPAWN_BUDGET - 1):
+        await _drive_gate(task, db_session, pr_number, target)
+    assert len(spawned) == _EXACT_TARGET_REVIEW_SPAWN_BUDGET - 1
+
+    # A fix lands: same PR, new head.
+    moved = dict(target, head_sha="head-after-the-fix")
+    for _ in range(_EXACT_TARGET_REVIEW_SPAWN_BUDGET):
+        assert await _drive_gate(task, db_session, pr_number, moved) is False
+
+    assert len(spawned) == (_EXACT_TARGET_REVIEW_SPAWN_BUDGET * 2) - 1, (
+        "the new head gets its own full budget"
+    )
+    assert (task.context or {}).get(REVIEW_LOOP_ABANDON_CANDIDATE_KEY) is None
