@@ -483,6 +483,7 @@ _DRIFT_SENTINEL_TERMINAL_DISPATCH_KEY = "_drift_sentinel_terminal_dispatch"
 
 # Auto-qualification debounce seams; the marker key is re-exported for tests.
 from app.release_qualifier_debounce import (  # noqa: E402
+    _AUTOMAIN_HEAD_FIRST_SEEN_KEY,  # noqa: F401 — re-exported for tests
     compute_automain_head_quiet_seconds,
     find_live_qualifier_audit_task_id,
 )
