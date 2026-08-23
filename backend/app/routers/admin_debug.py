@@ -10,6 +10,7 @@ import os
 import uuid
 import asyncio
 import logging
+from collections import Counter
 from typing import Dict, List, TypedDict
 from datetime import datetime, timedelta, timezone
 
@@ -98,6 +99,32 @@ def classify_canary_spawn_gate_result(gate_record: dict | None) -> dict:
 
 
 logger = logging.getLogger(__name__)
+
+# Per-direction ``block_reason_code`` values owned by this module. The
+# discovery-admission codes come from ``DiscoveryAdmissionDecision`` and are
+# open-ended, so they are rendered verbatim rather than mapped.
+_DIRECTION_BLOCK_BUSY = "research_task_busy"
+_DIRECTION_BLOCK_REFRACTORY = "direction_refractory"
+
+_DIRECTION_BLOCK_LABELS = {
+    _DIRECTION_BLOCK_BUSY: "a running research task",
+    _DIRECTION_BLOCK_REFRACTORY: "post-research cooldown",
+    "unattributed": "an unattributed condition (report this: a direction was "
+    "ineligible with no block_reason_code)",
+}
+
+
+def _describe_direction_block(code: str) -> str:
+    """Render a direction ``block_reason_code`` for the aggregate guard text.
+
+    Unknown codes -- every discovery-admission code -- are surfaced verbatim so
+    the aggregate names the same identifier the per-direction entry carries and
+    an operator can grep for it directly.
+    """
+
+    label = _DIRECTION_BLOCK_LABELS.get(code)
+    return label if label else f"discovery admission {code}"
+
 
 router = APIRouter(
     prefix="/api/admin", tags=["admin-debug"], dependencies=[Depends(get_current_user)]
@@ -875,11 +902,11 @@ async def get_autonomy_debug(
                 entry["busy_reason"] = (
                     "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
                 )
-            entry["block_reason_code"] = "research_task_busy"
+            entry["block_reason_code"] = _DIRECTION_BLOCK_BUSY
             entry["block_reason"] = entry["busy_reason"]
             entry["next_action"] = "Wait for or unblock the owning research task."
         elif in_cooldown:
-            entry["block_reason_code"] = "direction_refractory"
+            entry["block_reason_code"] = _DIRECTION_BLOCK_REFRACTORY
             entry["block_reason"] = str(
                 refractory_info["refractory_reason"] or "Direction is in refractory."
             )
@@ -900,31 +927,42 @@ async def get_autonomy_debug(
             ),
             default=None,
         )
-        busy_count = sum(1 for d in directions_info if d.get("busy_reason"))
-        cycle_blocked_count = sum(
-            1
+        # Attribute the aggregate from the SAME per-direction ``block_reason_code``
+        # values rendered in the directions list above. It used to be tallied
+        # independently, and with the opposite precedence: the per-direction
+        # branch checks busy first, while this checked discovery admission
+        # first. A direction that is both saturated and cycle-blocked is shown
+        # as ``research_task_busy`` but was counted as cycle-blocked, so a fleet
+        # that was merely at its parallelism cap reported "All N active
+        # directions are blocked by their discovery-cycle admission state" --
+        # sending operators hunting a discovery strand that did not exist while
+        # every direction underneath said, correctly, that it was just busy.
+        reason_counts: Counter[str] = Counter(
+            str(direction.get("block_reason_code") or "unattributed")
             for direction in directions_info
-            if not direction["discovery_admission"]["can_admit_root"]
         )
+        busy_count = reason_counts.get(_DIRECTION_BLOCK_BUSY, 0)
+        cooldown_count = reason_counts.get(_DIRECTION_BLOCK_REFRACTORY, 0)
+        cycle_blocked_count = len(directions_info) - busy_count - cooldown_count
         if not directions_info:
             reason = "No active directions exist"
-        elif cycle_blocked_count == len(directions_info):
-            reason = (
-                f"All {len(directions_info)} active directions are blocked by "
-                "their discovery-cycle admission state"
-            )
-        elif busy_count == len(directions_info):
-            reason = f"All {len(directions_info)} active directions are held by running research"
-        elif cycle_blocked_count > 0:
-            reason = (
-                "No runnable direction remains; "
-                f"{cycle_blocked_count} blocked by discovery admission and "
-                f"{busy_count} held by running research"
-            )
-        elif busy_count > 0:
-            reason = f"All remaining directions in cooldown; {busy_count} held by running research"
         else:
-            reason = "All active directions are still in cooldown"
+            ranked = reason_counts.most_common()
+            dominant_code, dominant_count = ranked[0]
+            if dominant_count == len(directions_info):
+                reason = (
+                    f"All {len(directions_info)} active directions are blocked by "
+                    f"{_describe_direction_block(dominant_code)}"
+                )
+            else:
+                breakdown = "; ".join(
+                    f"{count} by {_describe_direction_block(code)}"
+                    for code, count in ranked
+                )
+                reason = (
+                    f"No runnable direction remains of {len(directions_info)}: "
+                    f"{breakdown}"
+                )
         blocking_guards.append(
             {
                 "guard": "no_eligible_directions",
@@ -932,6 +970,8 @@ async def get_autonomy_debug(
                 "time_until_eligible_seconds": min_wait,
                 "busy_direction_count": busy_count,
                 "discovery_blocked_direction_count": cycle_blocked_count,
+                "cooldown_direction_count": cooldown_count,
+                "direction_block_reason_counts": dict(reason_counts),
                 "total_active_directions": len(directions_info),
             }
         )

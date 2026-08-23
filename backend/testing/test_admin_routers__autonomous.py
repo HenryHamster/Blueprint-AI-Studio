@@ -758,6 +758,160 @@ class TestAutonomyDebug:
         assert guard["total_active_directions"] == 10
 
     @pytest.mark.asyncio
+    async def test_autonomy_debug_aggregate_matches_per_direction_block_codes(
+        self, client: AsyncClient, db_session
+    ):
+        """The aggregate reason is attributed from the codes it sits above.
+
+        A direction held by a live research task is *also* cycle-blocked (its
+        open cycle cannot admit a second root). The per-direction branch checks
+        busy first and reports ``research_task_busy``; the aggregate used to
+        tally discovery admission first and announce that all N directions were
+        "blocked by their discovery-cycle admission state" -- contradicting
+        every entry underneath it and pointing at a strand that did not exist.
+        """
+        project = await _make_project(db_session, name="AutonomyDebug Parity")
+        directions = [
+            {
+                "id": f"d-busy-{index}",
+                "text": f"Direction {index}",
+                "status": "active",
+                "priority": "medium",
+                "completion_criteria": f"Direction {index} is verified.",
+            }
+            for index in range(3)
+        ]
+        project.directions = directions
+        db_session.add(project)
+        await db_session.flush()
+        db_session.add_all(
+            [
+                DiscoveryCycle(
+                    project_id=project.id,
+                    direction_key=direction["id"],
+                    generation=1,
+                    outcome_kind="mixed",
+                    state="review_pending",
+                    bet_snapshot={"direction": dict(direction)},
+                )
+                for direction in directions
+            ]
+        )
+        db_session.add_all(
+            [
+                Task(
+                    project_id=project.id,
+                    payloads=[
+                        {
+                            "type": "research",
+                            "current_direction_id": direction["id"],
+                        }
+                    ],
+                    status=TaskStatus.IN_PROGRESS,
+                    created_by="ORCHESTRATOR",
+                )
+                for direction in directions
+            ]
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        assert {
+            direction["block_reason_code"] for direction in data["directions"]
+        } == {"research_task_busy"}
+
+        guard = next(
+            item
+            for item in data["blocking_guards"]
+            if item["guard"] == "no_eligible_directions"
+        )
+        # The defect, asserted first so a regression fails on the operator-facing
+        # sentence rather than on a missing telemetry key: every direction here
+        # says ``research_task_busy``, so the aggregate must not blame discovery.
+        assert "discovery" not in guard["reason"].lower(), guard["reason"]
+        assert guard["reason"] == (
+            "All 3 active directions are blocked by a running research task"
+        )
+        assert guard["direction_block_reason_counts"] == {"research_task_busy": 3}
+        assert guard["busy_direction_count"] == 3
+        assert guard["discovery_blocked_direction_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_autonomy_debug_aggregate_names_each_distinct_block_code(
+        self, client: AsyncClient, db_session
+    ):
+        """A mixed fleet gets a breakdown naming every code, not a lossy summary."""
+        project = await _make_project(db_session, name="AutonomyDebug Mixed")
+        directions = [
+            {
+                "id": f"d-mixed-{index}",
+                "text": f"Direction {index}",
+                "status": "active",
+                "priority": "medium",
+                "completion_criteria": f"Direction {index} is verified.",
+            }
+            for index in range(3)
+        ]
+        directions[2]["refractory_until"] = (
+            _utcnow() + timedelta(hours=1)
+        ).isoformat()
+        project.directions = directions
+        db_session.add(project)
+        await db_session.flush()
+        db_session.add(
+            DiscoveryCycle(
+                project_id=project.id,
+                direction_key=directions[1]["id"],
+                generation=1,
+                outcome_kind="mixed",
+                state="review_pending",
+                bet_snapshot={"direction": dict(directions[1])},
+            )
+        )
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[
+                    {
+                        "type": "research",
+                        "current_direction_id": directions[0]["id"],
+                    }
+                ],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        guard = next(
+            item
+            for item in data["blocking_guards"]
+            if item["guard"] == "no_eligible_directions"
+        )
+        # Every code the entries carry is named in the aggregate. Asserted before
+        # the counts so a regression fails on the sentence an operator reads.
+        for fragment in (
+            "a running research task",
+            "discovery admission discovery_review_pending",
+            "post-research cooldown",
+        ):
+            assert fragment in guard["reason"], guard["reason"]
+        assert guard["direction_block_reason_counts"] == {
+            "research_task_busy": 1,
+            "discovery_review_pending": 1,
+            "direction_refractory": 1,
+        }
+        assert guard["busy_direction_count"] == 1
+        assert guard["cooldown_direction_count"] == 1
+        assert guard["discovery_blocked_direction_count"] == 1
+
+    @pytest.mark.asyncio
     async def test_autonomy_debug_reports_global_backstop_and_project_pause(
         self, client: AsyncClient, db_session
     ):
