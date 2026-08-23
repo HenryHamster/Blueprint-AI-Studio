@@ -412,11 +412,33 @@ def _write_toolchain_marker(marker: str, digests: dict[str, str]) -> None:
             pass
 
 
-def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
+def _bootstrap_verification_toolchain(
+    *, provision: bool = True
+) -> "iso.VerificationToolchain | None":
+    """Return the verified toolchain, provisioning it when absent or stale.
+
+    ``provision=False`` turns this into a read-only probe: an already-verified
+    venv is still checked against the manifest, but a missing or stale one is
+    REPORTED rather than built. ``--check`` passes it so a preflight can never
+    spend the provisioner's budget (a ``python3 -m venv`` plus two full
+    ``pip install --requirement`` passes, allowed up to 1200s) silently
+    mutating the host. A preflight reports readiness; it does not manufacture
+    it, and an operator asking "am I ready?" must not wait out an install to
+    hear "no".
+    """
     try:
         root = _verification_toolchain_root()
         manifest, provisioner, requirements, digests = _verification_toolchain_sources()
         venv = os.path.join(root, "venv")
+        if not provision and not os.path.isdir(root):
+            # Nothing to verify and nothing to report on: say so without
+            # creating the root, so a probe leaves no trace on the host.
+            print(
+                "[runner] verification toolchain not provisioned "
+                f"({root} is absent) — it is built on the next real boot.",
+                flush=True,
+            )
+            return None
         os.makedirs(root, mode=0o700, exist_ok=True)
         os.chmod(root, 0o700)
 
@@ -444,6 +466,15 @@ def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
                     except (OSError, subprocess.SubprocessError, RuntimeError):
                         # A receipt is never proof by itself; repair it below.
                         pass
+
+                if not provision:
+                    print(
+                        "[runner] verification toolchain is not verified against "
+                        "the current manifest — it is (re)built on the next real "
+                        "boot; this probe does not provision.",
+                        flush=True,
+                    )
+                    return None
 
                 # Never provision in-place: a failed download or broken wheel
                 # leaves the previously verified venv untouched for rollback.
@@ -9304,7 +9335,10 @@ def main() -> None:
         # agent_image kept as-is; the fail-closed image-present check below applies.
 
     caps = _get_capabilities()
-    initial_verification_toolchain = _bootstrap_verification_toolchain()
+    # --check probes; it never provisions. See _bootstrap_verification_toolchain.
+    initial_verification_toolchain = _bootstrap_verification_toolchain(
+        provision=not check_mode
+    )
     _set_verification_toolchain(initial_verification_toolchain)
 
     # FAIL-CLOSED image check (Fix 3): a docker-usable box with BLUEPRINT_AGENT_IMAGE

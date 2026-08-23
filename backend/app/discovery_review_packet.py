@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import hashlib
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import uuid
 
 from sqlmodel import select
@@ -572,6 +572,7 @@ def _assemble_receipt(
     execution: dict[str, Any],
     missing_reasons: list[str],
     compacted: bool,
+    authority_blockers: Sequence[str] = (),
 ) -> tuple[dict[str, Any], list[str]]:
     """Assemble one candidate receipt at a given degradation level.
 
@@ -579,6 +580,12 @@ def _assemble_receipt(
     ``binding_decision_allowed`` is ``not binding_action_blockers``, and a
     blocker exists only when some collection's ``semantic_digest_complete``
     is False -- unaffected by how many per-collection details are included.
+
+    ``authority_blockers`` carries the caller's decision-snapshot blockers
+    (a truncated intent/bet authority). They are unioned in here rather than
+    recomputed per level because they do not vary with degradation level,
+    and they must reach the receipt so its stored authority invariant agrees
+    with the manifest's.
     """
 
     incomplete_collections = [
@@ -586,7 +593,7 @@ def _assemble_receipt(
         for name, coverage in evidence_coverage.items()
         if not coverage["semantic_digest_complete"]
     ]
-    binding_action_blockers = (
+    binding_action_blockers = list(authority_blockers) + (
         [
             "complete authored semantic coverage exceeds the bounded decision "
             f"packet for: {', '.join(incomplete_collections)}"
@@ -657,6 +664,7 @@ def _repair_zeroed_categories(
     stranded_deliveries: list[dict[str, Any]],
     execution: dict[str, Any],
     missing_reasons: list[str],
+    authority_blockers: Sequence[str] = (),
 ) -> tuple[dict[str, Any], list[str]]:
     """Never let a category with real evidence render as fully absent.
 
@@ -696,6 +704,7 @@ def _repair_zeroed_categories(
             evidence_coverage=dict(evidence_coverage),
             execution=execution,
             missing_reasons=missing_reasons,
+            authority_blockers=authority_blockers,
             compacted=True,
         )
 
@@ -730,6 +739,7 @@ def _repair_zeroed_categories(
             evidence_coverage=candidate_coverage,
             execution=execution,
             missing_reasons=missing_reasons,
+            authority_blockers=authority_blockers,
             compacted=True,
         )
         if _receipt_fits_evidence_metadata(receipt):
@@ -822,10 +832,26 @@ async def build_discovery_review_packet(
     landed: list[dict[str, Any]] = []
     stranded_deliveries: list[dict[str, Any]] = []
     missing: list[str] = []
+    # A truncated intent/bet snapshot is bounded, not absent: the packet still
+    # carries a deterministic excerpt plus the full authority's checksum, and
+    # the manifest flags the truncation outright. It is also unresolvable by
+    # any amount of waiting -- the "missing" evidence is the direction's own
+    # length, which no task, retry, or agent can shrink -- so recording it as
+    # missing_required_evidence held the cycle in EVIDENCE_PENDING forever and
+    # silently starved the direction (no review spawned, no operator asked).
+    # Treat it the way the packet already treats coverage that cannot fit the
+    # bounded budget: forbid binding action and still dispatch one
+    # operator-question decision. required_evidence_omitted stays True either
+    # way, so the "only ask_operator is permitted" invariant is unchanged.
+    authority_blockers: list[str] = []
     if intent_truncated:
-        missing.append("intent authority exceeds the bounded decision contract")
+        authority_blockers.append(
+            "intent authority exceeds the bounded decision contract"
+        )
     if bet_truncated:
-        missing.append("bet authority exceeds the bounded decision contract")
+        authority_blockers.append(
+            "bet authority exceeds the bounded decision contract"
+        )
     if source is None:
         missing.append("source research parent is missing from the discovery cohort")
     # A research parent that settled FAILED/CANCELLED never rolls its staging
@@ -986,6 +1012,7 @@ async def build_discovery_review_packet(
         evidence_coverage=evidence_coverage,
         execution=execution,
         missing_reasons=missing_reasons,
+        authority_blockers=authority_blockers,
         compacted=False,
     )
     if not _receipt_fits_evidence_metadata(receipt):
@@ -1013,6 +1040,7 @@ async def build_discovery_review_packet(
                 evidence_coverage=evidence_coverage,
                 execution=execution,
                 missing_reasons=missing_reasons,
+                authority_blockers=authority_blockers,
                 compacted=True,
             )
             if _receipt_fits_evidence_metadata(receipt):
@@ -1030,6 +1058,7 @@ async def build_discovery_review_packet(
             stranded_deliveries=stranded_deliveries,
             execution=execution,
             missing_reasons=missing_reasons,
+            authority_blockers=authority_blockers,
         )
         # _assemble_receipt always mirrors its evidence_coverage argument
         # into receipt["evidence_coverage"], so read the repaired coverage
@@ -1050,7 +1079,7 @@ async def build_discovery_review_packet(
             coverage["semantic_index_included_count"] = 0
             coverage["full_semantic_digest"] = ""
             coverage["semantic_digest_complete"] = False
-        binding_action_blockers = [
+        binding_action_blockers = list(authority_blockers) + [
             "complete authored semantic coverage cannot fit the bounded decision packet"
         ]
         receipt.update(

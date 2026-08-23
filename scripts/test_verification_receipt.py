@@ -183,6 +183,54 @@ def test_backend_lane_does_not_clobber_an_earlier_lane(tmp_path: Path) -> None:
     assert payload["ruff"]["exit_code"] == 0
 
 
+def test_blocking_backend_lane_keeps_diagnosis_but_not_a_pass_credential(
+    tmp_path: Path,
+) -> None:
+    """A blocked run survives with all attribution and a nonzero receipt code."""
+
+    path = tmp_path / "receipt.json"
+    attribution = json.dumps(
+        {
+            "state": "coverage_regression",
+            "blocking": True,
+            "current_exit_code": 0,
+            "error": "route coverage regressed",
+            "new_failures": {"test_a::coverage": "route absent"},
+            "suppressed_failures": {"test_b::failure": "inherited"},
+            "disappeared_failures": {"test_c::failure": "disappeared"},
+            "skipped_failures": {"test_d::failure": "skipped"},
+        }
+    )
+
+    receipt.record_backend_pytest(
+        receipt=path,
+        task_id="blocked-task",
+        directory="backend",
+        harness="scripts/test-backend.sh",
+        selectors_json='["testing/test_a.py"]',
+        attribution_json=attribution,
+        junit=tmp_path / "missing-current.xml",
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    lane = payload["lanes"]["backend-pytest"]
+    assert lane["state"] == "coverage_regression"
+    assert lane["blocking"] is True
+    assert lane["current_exit_code"] == 0
+    assert lane["error"] == "route coverage regressed"
+    assert set(lane) >= {
+        "new_failures",
+        "suppressed_failures",
+        "disappeared_failures",
+        "skipped_failures",
+    }
+    assert payload["pytest"]["current_exit_code"] == 0
+    assert payload["pytest"]["exit_code"] == 1
+    assert payload["pytest"]["new_failures"] == {
+        "test_a::coverage": "route absent"
+    }
+
+
 def test_a_later_lane_does_not_clobber_the_backend_block(tmp_path: Path) -> None:
     """The reverse order preserves the legacy consumer's block untouched."""
 
@@ -372,6 +420,9 @@ def test_the_backend_lane_cli_is_what_the_gates_invoke(tmp_path: Path) -> None:
     # suppressed baseline failure would otherwise blow the argv-size limit.
     for text in (default_gate, fragment):
         assert '--attribution-file "$_verification_attribution_file"' in text
+        blocking_branch = text[text.index('if [ "$_verification_blocking" != "0" ]') :]
+        assert 'FAILED+=("$_VERIFICATION_DIR verification: $_verification_state")' in blocking_branch
+        assert 'rm -f "$_VERIFY_RECEIPT"' not in blocking_branch
 
     path = tmp_path / "receipt.json"
     result = subprocess.run(

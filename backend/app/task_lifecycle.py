@@ -78,6 +78,12 @@ from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.task_lifecycle_completion_dispatch import run_completion_dispatch
 from app.task_lifecycle_fix_completion import run_fix_completion
 from app.task_lifecycle_post_commit_terminal import run_post_commit_terminal
+# Re-exported so the in-module call sites -- and any test that patches
+# ``task_lifecycle._resolve_live_review_target`` -- keep working unchanged.
+from app.review_target_drift import (  # noqa: F401
+    _base_move_invalidates_approval,
+    _resolve_live_review_target,
+)
 from app.review_request_changes import run_request_changes
 from app.rollup_locking import _lock_original_task, _OriginalTaskLockTimeout
 from app.notification_dispatch import (
@@ -662,49 +668,6 @@ def _resolve_fallback_verdict(verdict_text: str) -> str | None:
     if approve_idx > rc_idx:
         return "APPROVE"
     return "REQUEST_CHANGES"
-
-
-async def _resolve_live_review_target(
-    task: Task,
-    session: AsyncSession,
-    pr_number: int,
-) -> dict[str, str | int] | None:
-    """Return the PR's current immutable review target, when GitHub is reachable.
-
-    Target-aware review deduplication is defence in depth, so a transient
-    metadata lookup must not block the normal review lifecycle.  Callers pass
-    ``None`` on failure and retain the legacy same-chain guard in that case.
-    """
-    try:
-        from app.github import get_pull_request
-        from app.routers.agent import get_github_token_for_task
-
-        token, owner, repo = await get_github_token_for_task(task.id, session)
-        pr_data = await get_pull_request(
-            token,
-            owner,
-            repo,
-            pr_number,
-            project_id=str(task.project_id),
-        )
-        base_sha = str(pr_data.get("base", {}).get("sha", ""))
-        head_sha = str(pr_data.get("head", {}).get("sha", ""))
-        if base_sha and head_sha:
-            return {
-                "project_id": str(task.project_id),
-                "pr_number": int(pr_number),
-                "base_sha": base_sha,
-                "head_sha": head_sha,
-            }
-    except Exception as exc:  # noqa: BLE001
-        logger.info(
-            "[REVIEW PIPELINE] Could not resolve immutable review target for "
-            "PR #%s (task %s): %s — using legacy same-chain dedup",
-            pr_number,
-            task.id,
-            exc,
-        )
-    return None
 
 
 async def _persist_stale_review_evidence(
@@ -4192,6 +4155,8 @@ async def _process_post_commit(
 
                 action_taken = False
                 head_sha = ""
+                _approval_base_move_invalidates: bool | None = None
+                _approval_base_move_checked_sha: str | None = None
                 if verdict == "APPROVE":
                     # Retire the chain's lane now that the review approved — no fix
                     # will be spawned, so the lane must reach a terminal state here
@@ -4229,10 +4194,31 @@ async def _process_post_commit(
                         await session.commit()
                         return {"status": "accepted"}
                     if (
+                        reviewed_base_sha
+                        and reviewed_base_sha != _live_approve_target["base_sha"]
+                        and reviewed_head_sha == _live_approve_target["head_sha"]
+                    ):
+                        _approval_base_move_checked_sha = str(
+                            _live_approve_target["base_sha"]
+                        )
+                        _approval_base_move_invalidates = (
+                            await _base_move_invalidates_approval(
+                                task,
+                                session,
+                                reviewed_base_sha=reviewed_base_sha,
+                                reviewed_head_sha=reviewed_head_sha,
+                                live_base_sha=str(_live_approve_target["base_sha"]),
+                                live_head_sha=str(_live_approve_target["head_sha"]),
+                            )
+                        )
+                    if (
                         not reviewed_head_sha
                         or not reviewed_base_sha
                         or reviewed_head_sha != _live_approve_target["head_sha"]
-                        or reviewed_base_sha != _live_approve_target["base_sha"]
+                        or (
+                            reviewed_base_sha != _live_approve_target["base_sha"]
+                            and _approval_base_move_invalidates is not False
+                        )
                     ):
                         task.status = TaskStatus.COMPLETED
                         task.latest_status_message = (
@@ -4753,7 +4739,13 @@ async def _process_post_commit(
                             not reviewed_head_sha
                             or not reviewed_base_sha
                             or reviewed_head_sha != head_sha
-                            or reviewed_base_sha != live_base_sha
+                            or (
+                                reviewed_base_sha != live_base_sha
+                                and not (
+                                    _approval_base_move_invalidates is False
+                                    and _approval_base_move_checked_sha == live_base_sha
+                                )
+                            )
                         )
                         if approve_target_is_stale:
                             # Do not let an APPROVE issued for a different

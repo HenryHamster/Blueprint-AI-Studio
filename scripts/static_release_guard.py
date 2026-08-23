@@ -530,7 +530,6 @@ def main(argv: list[str] | None = None) -> int:
                             verification = classify_verification(
                                 runtime_available=True,
                                 current_exit_code=current_result.returncode,
-                                current_failures=current_report.failures,
                                 baseline_report=baseline_report,
                                 current_report=current_report,
                             )
@@ -657,7 +656,6 @@ def main(argv: list[str] | None = None) -> int:
                             outcome = classify_verification(
                                 runtime_available=True,
                                 current_exit_code=current_result.returncode,
-                                current_failures=current_report.failures,
                                 current_report=current_report,
                                 baseline_report=baseline_report,
                             )

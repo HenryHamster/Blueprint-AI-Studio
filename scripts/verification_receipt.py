@@ -294,7 +294,14 @@ def record_attribution(
 
 
 def _junit_counts(junit: Path) -> tuple[int, int, int]:
-    root = ET.parse(junit).getroot()
+    try:
+        root = ET.parse(junit).getroot()
+    except (OSError, ET.ParseError):
+        # A blocking attribution result is still useful when the runner did
+        # not leave a parseable JUnit file.  The attribution maps and state are
+        # the durable diagnosis; zero counts make the missing report explicit
+        # without preventing that diagnosis from being recorded.
+        return 0, 0, 0
     cases = list(root.iter("testcase"))
     skipped = sum(1 for case in cases if case.find("skipped") is not None)
     failed = sum(
@@ -319,6 +326,14 @@ def _backend_pytest_block(
     """
 
     tests, skipped, failed = _junit_counts(junit)
+    blocking = bool(attribution.get("blocking", False))
+    current_exit_code = int(attribution.get("current_exit_code", 0))
+    # ``exit_code`` was historically hard-coded to zero because this writer
+    # only ran on the passing branch.  Once blocking diagnostics are durable,
+    # a consumer must be able to reject this block on its own: a blocking
+    # result with a clean runner exit (for example route-coverage regression)
+    # still gets a nonzero credential value.
+    receipt_exit_code = current_exit_code if current_exit_code != 0 else (1 if blocking else 0)
     return {
         "command": f"USE_TEST_POSTGRES=true bash {harness} <impacted-selectors>",
         "harness": harness,
@@ -327,7 +342,7 @@ def _backend_pytest_block(
         "use_test_postgres": True,
         "postgres_sidecar": True,
         "state": attribution["state"],
-        "current_exit_code": int(attribution.get("current_exit_code", 0)),
+        "current_exit_code": current_exit_code,
         "tests": tests,
         "skipped": skipped,
         "failures": failed,
@@ -335,7 +350,7 @@ def _backend_pytest_block(
         "suppressed_failures": attribution.get("suppressed_failures", {}),
         "disappeared_failures": attribution.get("disappeared_failures", {}),
         "skipped_failures": attribution.get("skipped_failures", {}),
-        "exit_code": 0,
+        "exit_code": receipt_exit_code,
     }
 
 
@@ -369,7 +384,16 @@ def record_backend_pytest(
             suppressed_failures=attribution.get("suppressed_failures"),
             disappeared_failures=attribution.get("disappeared_failures"),
             skipped_failures=attribution.get("skipped_failures"),
-            extra={"directory": directory, "harness": harness},
+            extra={
+                "directory": directory,
+                "harness": harness,
+                "current_exit_code": int(attribution.get("current_exit_code", 0)),
+                **(
+                    {"error": str(attribution["error"])}
+                    if attribution.get("error") is not None
+                    else {}
+                ),
+            },
         ),
         top_level={
             "task_id": task_id,

@@ -436,8 +436,46 @@ def _program_files(root: Path, suite: Suite, *, label: str) -> set[str]:
     return files
 
 
-def _blocking(state: str, **extra: object) -> int:
-    detail = " ".join(f"{key}={value}" for key, value in extra.items())
+def _blocking(
+    suite_name: str,
+    state: str,
+    *,
+    outcome: dict[str, object] | None = None,
+    **extra: object,
+) -> int:
+    recorded: dict[str, object] = {
+        "state": state,
+        "blocking": True,
+        "current_exit_code": 1,
+        "new_failures": {},
+        "suppressed_failures": {},
+        "disappeared_failures": {},
+        "skipped_failures": {},
+        **(outcome or {}),
+        **extra,
+    }
+    recorded["state"] = state
+    recorded["blocking"] = True
+    record_classification(lane_name(suite_name), recorded)
+    record_lane(
+        typecheck_lane(suite_name),
+        state=state,
+        blocking=True,
+        new_failures=recorded.get("new_failures"),
+        suppressed_failures=recorded.get("suppressed_failures"),
+        disappeared_failures=recorded.get("disappeared_failures"),
+        skipped_failures=recorded.get("skipped_failures"),
+        extra={
+            key: recorded[key]
+            for key in ("current_exit_code", "error")
+            if key in recorded
+        },
+    )
+    detail_items = [
+        (key, value) for key, value in extra.items() if key != "current_exit_code"
+    ]
+    detail_items.append(("current_exit_code", recorded["current_exit_code"]))
+    detail = " ".join(f"{key}={value}" for key, value in detail_items)
     print(
         f"[typecheck-verification] FAILED state={state}{(' ' + detail) if detail else ''}"
     )
@@ -456,20 +494,25 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _verify_declared_programs(repo, suite)
     except RuntimeError as exc:
-        return _blocking("project_configuration_mismatch", error=str(exc))
+        return _blocking(args.suite, "project_configuration_mismatch", error=str(exc))
 
     try:
         current = _compile_suite(repo, suite, label="current")
     except ExecutionDisagreement as exc:
-        return _blocking("execution_failure", error=str(exc))
+        return _blocking(args.suite, "execution_failure", error=str(exc))
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        return _blocking("attribution_unavailable", error=str(exc))
+        return _blocking(args.suite, "attribution_unavailable", error=str(exc))
 
     try:
         base_ref = _base_ref(repo, args.base)
         changed_configs = _changed_program_configs(repo, base_ref, suite)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        return _blocking("baseline_unavailable", error=str(exc))
+        return _blocking(
+            args.suite,
+            "baseline_unavailable",
+            current_exit_code=1 if current.report.failures else 0,
+            error=str(exc),
+        )
 
     # A clean current compile can only be hiding an inherited diagnostic if the
     # checked program itself narrowed, and the program can only narrow through
@@ -491,15 +534,28 @@ def main(argv: list[str] | None = None) -> int:
             install = _install_base(base_root, suite)
             if install.returncode != 0:
                 return _blocking(
-                    "baseline_unavailable", base_install_exit_code=install.returncode
+                    args.suite,
+                    "baseline_unavailable",
+                    current_exit_code=1 if current.report.failures else 0,
+                    base_install_exit_code=install.returncode,
                 )
             baseline = _compile_suite(base_root, suite, label="baseline")
             base_programs = _program_files(base_root, suite, label="baseline")
             current_programs = _program_files(repo, suite, label="current")
         except ExecutionDisagreement as exc:
-            return _blocking("baseline_unavailable", error=str(exc))
+            return _blocking(
+                args.suite,
+                "baseline_unavailable",
+                current_exit_code=1 if current.report.failures else 0,
+                error=str(exc),
+            )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            return _blocking("baseline_unavailable", error=str(exc))
+            return _blocking(
+                args.suite,
+                "baseline_unavailable",
+                current_exit_code=1 if current.report.failures else 0,
+                error=str(exc),
+            )
 
     # ``classify_verification``'s disappeared/skipped states model a test
     # roster: a baseline failure whose route is absent from the current report
@@ -531,7 +587,11 @@ def main(argv: list[str] | None = None) -> int:
         """
 
         record_attribution(
-            typecheck_lane(args.suite), attributed, state=state, blocking=blocking
+            typecheck_lane(args.suite),
+            attributed,
+            state=state,
+            blocking=blocking,
+            extra={"current_exit_code": 1 if current.report.failures else 0},
         )
         _record_suppressions(
             args.suite,
@@ -545,12 +605,34 @@ def main(argv: list[str] | None = None) -> int:
 
     if shrunk:
         record("coverage_shrink", blocking=True)
-        return _blocking("coverage_shrink", files=",".join(shrunk))
+        return _blocking(
+            args.suite,
+            "coverage_shrink",
+            outcome={
+                "new_failures": attributed.new_failures,
+                "suppressed_failures": attributed.suppressed_failures,
+                "disappeared_failures": attributed.disappeared_failures,
+                "skipped_failures": attributed.skipped_failures,
+                "current_exit_code": 1 if current.report.failures else 0,
+            },
+            files=",".join(shrunk),
+        )
     if attributed.new_failures:
         record("type_failure", blocking=True)
         for key in sorted(attributed.new_failures):
             print(f"[typecheck-verification] new diagnostic: {key}")
-        return _blocking("type_failure", new_diagnostic_count=len(attributed.new_failures))
+        return _blocking(
+            args.suite,
+            "type_failure",
+            outcome={
+                "new_failures": attributed.new_failures,
+                "suppressed_failures": attributed.suppressed_failures,
+                "disappeared_failures": attributed.disappeared_failures,
+                "skipped_failures": attributed.skipped_failures,
+                "current_exit_code": 1,
+            },
+            new_diagnostic_count=len(attributed.new_failures),
+        )
 
     state = "preexisting_type_failure" if current.report.failures else "passed"
     record(state, blocking=False)

@@ -898,12 +898,13 @@ def _strategic_backstop_due(
     *,
     max_interval_minutes: int | float,
 ) -> bool:
-    """Return whether the wall-clock strategic backstop has elapsed.
+    """Return whether an automatic strategic backstop interval has elapsed.
 
     This safety net is independent of the strategic failure breaker. The
     breaker suppresses routine retries after repeated failures; it must not
-    suppress the liveness mechanism whose job is to force another opportunity
-    for the strategic loop to run.
+    suppress an eligible automatic liveness check. This predicate only reports
+    elapsed time; its caller must apply the existing automatic Strategic
+    admission policy before claiming a backstop firing or creating a cycle.
     """
     if max_interval_minutes <= 0 or last_strategic_at is None:
         return False
@@ -1414,14 +1415,15 @@ async def _spawn_research_task_inner(
             project.vision, now, min_interval_seconds=_refresh_min_interval
         ):
             force_strategic = True
-    # Wall-clock backstop: must drive force_strategic so it bypasses the
-    # `not active_directions` early return below. Without this promotion, when
-    # every active direction has an in-flight child (busy_direction_ids),
-    # _process_direction_lifecycle empties active_directions and we return here
-    # — never reaching the strategic spawn block, no matter how long since the
-    # last cycle. Hit on 2026-05-26 (deploy 00195): backstop never fired despite
-    # last strategic being 2h+ old, because both directions were busy.
-    if not force_strategic:
+    # Wall-clock backstop: when the autonomous Strategic lane owns authorship,
+    # drive force_strategic so it bypasses the `not active_directions` early
+    # return below. Without this promotion, when every active direction has an
+    # in-flight child (busy_direction_ids), _process_direction_lifecycle empties
+    # active_directions and we return here — never reaching the strategic spawn
+    # block, no matter how long since the last cycle. Resident-owned projects
+    # deliberately skip this check: their autonomous loop cannot satisfy the
+    # firing claim without racing the Resident lane.
+    if automatic_strategic_cycles_allowed and not force_strategic:
         strategic_max_interval = _runtime_config.get(
             "strategic_max_interval_minutes", 1_440
         )

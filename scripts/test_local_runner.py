@@ -444,6 +444,53 @@ class TestVerificationToolchain(unittest.TestCase):
             self.assertEqual(receipt["provisioner_sha256"], "provisioner-digest")
             self.assertEqual(receipt["requirements_sha256"], "requirements-digest")
 
+    def test_probe_mode_reports_a_stale_toolchain_instead_of_provisioning(self):
+        """`--check` must never pay the provisioner's install budget.
+
+        Same stale state as
+        ``test_stale_backend_only_venv_is_repaired_from_manifest_provisioner``,
+        which provisions and returns a toolchain - the only difference here is
+        ``provision=False``. Drop the probe guard and the mocked provisioner
+        succeeds in this case too, so this fails.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            sources = self._sources(root)
+            stale_python = Path(root, "venv", "bin", "python")
+            stale_python.parent.mkdir(parents=True)
+            stale_python.touch()
+            Path(root, "requirements.sha256").write_text("backend-only")
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root):
+                with patch.object(local_runner, "_verification_toolchain_sources", return_value=sources):
+                    with patch.object(
+                        local_runner.subprocess, "run",
+                        side_effect=self._successful_provisioner,
+                    ) as run:
+                        toolchain = local_runner._bootstrap_verification_toolchain(
+                            provision=False
+                        )
+
+            self.assertIsNone(toolchain)
+            provision_calls = [
+                call.args[0] for call in run.call_args_list
+                if call.args[0][0] == "bash" and "--verify" not in call.args[0]
+            ]
+            self.assertEqual(provision_calls, [])
+            self.assertFalse(Path(root, "toolchain.json").exists())
+
+    def test_probe_mode_leaves_no_trace_when_the_root_is_absent(self):
+        """A probe on a host that has never run a runner creates nothing."""
+        with tempfile.TemporaryDirectory() as parent:
+            root = os.path.join(parent, "verification-toolchain")
+            sources = self._sources(parent)
+            with patch.object(local_runner, "_verification_toolchain_root", return_value=root):
+                with patch.object(local_runner, "_verification_toolchain_sources", return_value=sources):
+                    with patch.object(local_runner.subprocess, "run") as run:
+                        self.assertIsNone(
+                            local_runner._bootstrap_verification_toolchain(provision=False)
+                        )
+            run.assert_not_called()
+            self.assertFalse(os.path.exists(root))
+
     def test_matching_manifest_and_provisioner_receipt_is_verified_without_reinstall(self):
         with tempfile.TemporaryDirectory() as root:
             sources = self._sources(root)
@@ -1752,6 +1799,14 @@ class TestCheckModePreflightEndToEnd(_LocalRunnerTestCase):
         # on the test box can't mask a "missing token" case.
         with tempfile.TemporaryDirectory() as tmp:
             env["BLUEPRINT_CREDENTIAL_DIR"] = tmp
+            # Point the verification toolchain at an empty dir too. --check must
+            # PROBE it, never build it: provisioning is `python3 -m venv` plus two
+            # full `pip install --requirement` passes, minutes of work on a cold
+            # host. Doing that here also kept this boot's cost dependent on
+            # whatever the test box happened to have in ~/.blueprint, which is how
+            # it intermittently blew the budget below in CI.
+            toolchain_root = os.path.join(tmp, "verification-toolchain")
+            env["BLUEPRINT_RUNNER_VERIFICATION_TOOLCHAIN"] = toolchain_root
             cls._result = subprocess.run(
                 [sys.executable, str(Path(__file__).parent / "local_runner.py"), "--check"],
                 env=env,
@@ -1761,6 +1816,7 @@ class TestCheckModePreflightEndToEnd(_LocalRunnerTestCase):
                 # The budget this protects is the whole file's, not this call's.
                 timeout=120,
             )
+            cls._toolchain_root_created = os.path.exists(toolchain_root)
         cls._combined = cls._result.stdout + cls._result.stderr
 
     def test_check_exits_1_when_prereqs_are_missing(self):
@@ -1771,6 +1827,18 @@ class TestCheckModePreflightEndToEnd(_LocalRunnerTestCase):
         self.assertIn("BLUEPRINT_RUNNER_TOKEN", self._combined)
         self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", self._combined)
         self.assertIn("2 missing prerequisite(s)", self._combined)
+
+    def test_check_probes_the_verification_toolchain_without_provisioning(self):
+        """A preflight reports readiness; it must not manufacture it.
+
+        Paired with the unit cases in ``TestVerificationToolchain``: those prove
+        the probe mode exists, this proves ``--check`` actually asks for it.
+        """
+        self.assertIn("verification toolchain not provisioned", self._combined)
+        self.assertFalse(
+            self._toolchain_root_created,
+            msg="--check created the verification-toolchain root; a probe must not",
+        )
 
     def test_check_still_runs_preflight_probes_despite_missing_prereqs(self):
         """Probes must still run and print, rather than a bare first-fail exit."""

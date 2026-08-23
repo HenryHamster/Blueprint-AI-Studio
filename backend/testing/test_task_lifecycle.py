@@ -5703,7 +5703,7 @@ def _patch_approve_merge_env(mocker):
 async def test_approve_same_head_new_base_is_stale_and_respawns_full_review(
     tl_db, mocker
 ):
-    """PR17355 regression: approval authority is the exact base+head pair."""
+    """An interacting base move still invalidates the exact approval target."""
 
     session, factory = tl_db
     project = await _make_project(session)
@@ -5718,6 +5718,14 @@ async def test_approve_same_head_new_base_is_stale_and_respawns_full_review(
             "state": "open",
             "merged": False,
         },
+    )
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new_callable=AsyncMock,
+        side_effect=[
+            [{"filename": "app/x.py"}],
+            [{"filename": "app/x.py"}],
+        ],
     )
     spawned_review = type("Review", (), {"id": uuid.uuid4()})()
     spawn_mock = mocker.patch(
@@ -5740,6 +5748,173 @@ async def test_approve_same_head_new_base_is_stale_and_respawns_full_review(
         "base_sha": "new-base-456",
         "head_sha": "abc123",
     }
+    await session.refresh(review_task)
+    assert (review_task.context or {}).get("_review_stale_target") is True
+    await session.refresh(original)
+    assert ((original.context or {}).get("review_loop") or {}).get(
+        "review_approved"
+    ) is not True
+
+
+@pytest.mark.asyncio
+async def test_approve_same_head_unrelated_base_move_merges_without_respawn(
+    tl_db, mocker
+):
+    """Unrelated base traffic does not discard an otherwise exact approval."""
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    _, review_task = await _setup_approve_merge(session, project)
+    _patch_approve_merge_env(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "abc123", "ref": "feat/x"},
+            "base": {"sha": "new-base-456", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    compare_mock = mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new_callable=AsyncMock,
+        side_effect=[
+            [{"filename": "docs/unrelated.md"}],
+            [{"filename": "app/x.py"}],
+        ],
+    )
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task", new_callable=AsyncMock
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    assert compare_mock.await_count == 2
+    spawn_mock.assert_not_awaited()
+    merge_mock.assert_awaited_once()
+    await session.refresh(review_task)
+    assert (review_task.context or {}).get("_review_stale_target") is not True
+
+
+@pytest.mark.asyncio
+async def test_approve_same_head_second_base_move_stays_stale(
+    tl_db, mocker
+):
+    """A second base move cannot reuse the first move's unrelated verdict."""
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    _patch_approve_merge_env(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {
+                "head": {"sha": "abc123", "ref": "feat/x"},
+                "base": {"sha": "base123", "ref": "main"},
+                "state": "open",
+                "merged": False,
+            },
+            {
+                "head": {"sha": "abc123", "ref": "feat/x"},
+                "base": {"sha": "base123", "ref": "main"},
+                "state": "open",
+                "merged": False,
+            },
+            {
+                "head": {"sha": "abc123", "ref": "feat/x"},
+                "base": {"sha": "new-base-456", "ref": "main"},
+                "state": "open",
+                "merged": False,
+            },
+            {
+                "head": {"sha": "abc123", "ref": "feat/x"},
+                "base": {"sha": "new-base-789", "ref": "main"},
+                "state": "open",
+                "merged": False,
+            },
+        ],
+    )
+    compare_mock = mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new_callable=AsyncMock,
+        side_effect=[
+            [{"filename": "docs/unrelated.md"}],
+            [{"filename": "app/x.py"}],
+        ],
+    )
+    spawned_review = type("Review", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    result = await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    assert result == {"status": "accepted"}
+    assert compare_mock.await_count == 2
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.args[1] == "review"
+    await session.refresh(review_task)
+    assert (review_task.context or {}).get("_review_stale_target") is True
+    await session.refresh(original)
+    assert ((original.context or {}).get("review_loop") or {}).get(
+        "review_approved"
+    ) is not True
+
+
+@pytest.mark.asyncio
+async def test_approve_same_head_indeterminate_base_compare_stays_stale(
+    tl_db, mocker
+):
+    """A failed base interaction comparison keeps the approval fail-closed."""
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    _patch_approve_merge_env(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "abc123", "ref": "feat/x"},
+            "base": {"sha": "new-base-456", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    spawned_review = type("Review", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    result = await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    assert result == {"status": "accepted"}
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.args[1] == "review"
+    assert spawn_mock.await_args.kwargs["delta_base_sha"] == ""
     await session.refresh(review_task)
     assert (review_task.context or {}).get("_review_stale_target") is True
     await session.refresh(original)

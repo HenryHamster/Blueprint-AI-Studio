@@ -116,6 +116,46 @@ def _run(repo: Path, suite: str = "agent") -> int:
     return guard.main(["--suite", suite, "--base", "automain", "--repo-root", str(repo)])
 
 
+def test_blocking_helper_records_the_printed_verdict_and_all_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_verification_receipt: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A blocking early-return helper leaves both durable sidecars populated."""
+
+    recorded: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        guard,
+        "record_classification",
+        lambda _lane, outcome: recorded.append(dict(outcome)),
+    )
+
+    assert (
+        guard._blocking(
+            "agent",
+            "baseline_unavailable",
+            current_exit_code=1,
+            error="base install failed",
+        )
+        == 1
+    )
+
+    assert recorded[0]["state"] == "baseline_unavailable"
+    assert recorded[0]["blocking"] is True
+    assert recorded[0]["error"] == "base install failed"
+    assert set(recorded[0]) >= {
+        "new_failures",
+        "suppressed_failures",
+        "disappeared_failures",
+        "skipped_failures",
+    }
+    lane = json.loads(_isolate_verification_receipt.read_text(encoding="utf-8"))["lanes"]["typecheck:agent"]
+    assert lane["state"] == "baseline_unavailable"
+    assert lane["blocking"] is True
+    assert lane["current_exit_code"] == 1
+    assert "FAILED state=baseline_unavailable" in capsys.readouterr().out
+
+
 def test_inherited_diagnostic_is_attributed_to_base(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

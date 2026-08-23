@@ -441,10 +441,11 @@ if admin_ui_runtime_touched; then
 
   # Viewport gate: scoped run through the shared attributed guard.
   #
-  # 1) SCOPING: by default, run only the viewport tests whose component
-  #    .tsx (or .viewport.test.tsx) was touched. Repo-wide viewport stays
-  #    a CI/main concern; on PRs we don't want pre-existing overflow or
-  #    import drift in untouched components to block unrelated fixes.
+  # 1) SCOPING: by default, run the changed viewport tests, component
+  #    namesakes, and viewport tests that directly import a changed component
+  #    through a relative specifier. Repo-wide viewport stays a CI/main
+  #    concern; on PRs we don't want pre-existing overflow or import drift in
+  #    unrelated components to block unrelated fixes.
   #    If a non-component admin-ui file changed (shared types, App.tsx,
   #    package.json, src/test/*), fall back to the full suite — that
   #    edit could break any component.
@@ -462,6 +463,7 @@ if admin_ui_runtime_touched; then
   #    failure.
   ADMIN_UI_CHANGED=$(printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/' || true)
   NON_COMPONENT=$(printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -vE '^admin-ui/src/components/[^/]+\\.(viewport\\.test\\.tsx|tsx)$' || true)
+  VIEWPORT_SCOPE_FAILED=0
 
   # Check for new admin-ui components without viewport tests.
   # Uses process substitution (\`done < <(...)\`) so the loop runs in the
@@ -494,16 +496,20 @@ if admin_ui_runtime_touched; then
 
   : > /tmp/check_viewport_tests.txt
   if [ "$FULL_SCOPE" = "0" ] && [ -z "$NON_COMPONENT" ]; then
-    printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.viewport\\.test\\.tsx$' | while IFS= read -r f; do
-      [ -f "$f" ] && printf '%s\\n' "\${f#admin-ui/}" >> /tmp/check_viewport_tests.txt
-    done
-    printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.tsx$' | grep -v '\\.viewport\\.test\\.tsx$' | while IFS= read -r f; do
-      vt="\${f%.tsx}.viewport.test.tsx"
-      [ -f "$vt" ] && printf '%s\\n' "\${vt#admin-ui/}" >> /tmp/check_viewport_tests.txt
-    done
+    # The index follows DIRECT relative imports from viewport tests to changed
+    # components, one level only. It intentionally does not follow
+    # component-to-component imports: that would expand most edits to the full
+    # suite and defeat this scoped feedback loop.
+    printf '%s\\n' "$ADMIN_UI_CHANGED" > /tmp/check_viewport_changed.txt
+    if ! python3 scripts/viewport_scope.py --repo-root "$WORKSPACE" --changed-files-file /tmp/check_viewport_changed.txt > /tmp/check_viewport_tests.txt; then
+      echo "[check] viewport scope index failed — refusing to run an incomplete viewport scope" >&2
+      FAILED+=("viewport scope index")
+      VIEWPORT_SCOPE_FAILED=1
+    fi
   fi
   VIEWPORT_FILTER=$(sort -u /tmp/check_viewport_tests.txt 2>/dev/null | tr '\\n' ' ' | sed 's/ *$//')
   VIEWPORT_RUN=1
+  [ "$VIEWPORT_SCOPE_FAILED" = "1" ] && VIEWPORT_RUN=0
   if [ "$FULL_SCOPE" = "0" ] && [ -z "$NON_COMPONENT" ] && [ -z "$VIEWPORT_FILTER" ]; then
     echo "[check] no viewport test matches changed components, skipping viewport suite"
     VIEWPORT_RUN=0
@@ -669,7 +675,7 @@ if touches backend/; then
   fi
 fi
 ${buildCiFailureVerifyBlock(ciFailureSelectors, cfg.taskId)}
-${loadSizeGuardrailScript()}`;
+`;
   // Stack-block selection (ordered, most specific first):
   //  1. build_config with directories  → config-driven per-directory blocks.
   //  2. no build_config, Blueprint self-repo → the hardcoded admin-ui/agent/
@@ -691,6 +697,11 @@ ${loadSizeGuardrailScript()}`;
   } else {
     stackBlocks = genericNoConfigStackBlock(cfg.owner, cfg.repo);
   }
+  // The size guardrail is a Blueprint self-repo invariant, not a property of
+  // the hardcoded stack blocks. Resolved build_config directories select the
+  // config-driven stack above, so keep this always-on lane outside that branch
+  // or a self-repo task silently loses its cap enforcement.
+  const sizeGuardrailBlock = isSelfRepo ? loadSizeGuardrailScript() : '';
   // Success-path visual-acceptance capture+upload. Keyed to capability signal
   // rather than generated-string identity: can this stack actually capture
   // visual evidence? Blueprint self-repo YES (has viewport harness), config-driven
@@ -729,7 +740,7 @@ else
   exit 1
 fi
 `;
-  const script = header + stackBlocks + buildRequiredBackendVerificationBlock(cfg) + visualCaptureBlock + footer;
+  const script = header + stackBlocks + buildRequiredBackendVerificationBlock(cfg) + sizeGuardrailBlock + visualCaptureBlock + footer;
   // For Blueprint self-repo, `check` is a committed static entrypoint that
   // delegates to `.check-task` when present. Write the per-task generated
   // script there (gitignored) so the tracked `check` file stays clean and

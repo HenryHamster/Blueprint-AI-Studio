@@ -356,7 +356,7 @@
     "test_qualification_state_resolver_dimensions.py": 2600,
     "test_deploy_health.py": 2550,
     "test_health_zone_pool.py": 2500,
-    "test_generated_shell.py": 2400,
+    "test_generated_shell.py": 2850,
     "test_message_audience.py": 3750,
     "test_alerts.py": 2300,
     "test_strategic_context_package.py": 2250,
@@ -443,7 +443,7 @@
     "test_guard_gate_left_shift.py": 2850,
     "test-backend.sh": 1050,
     "static_release_guard.py": 750,
-    "test_vitest_verification_guard.py": 1900,
+    "test_vitest_verification_guard.py": 2300,
     "test_bootstrap_local_app_release.py": 1700
   }
 }

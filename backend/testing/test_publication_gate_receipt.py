@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from app.models import Task, TaskStatus
+from app.module_finding_chain import _receipt_is_complete_and_clean
 from app.schemas import PublicationGateReceipt
 from app.task_blocked import (
     GUARD_SUPPRESSIONS_MAX_BYTES,
@@ -123,6 +124,28 @@ def test_attribution_fields_round_trip_through_sanitize_and_record():
     assert persisted["suppressed_failures"] == raw["suppressed_failures"]
     assert "unknown" not in persisted
     assert sanitize_publication_gate_receipt(persisted) == persisted
+
+
+def test_blocking_gate_receipt_is_never_clean_publication_evidence():
+    """Persisted blocking attribution cannot satisfy a clean-gate consumer."""
+
+    raw = {
+        **_legacy_receipt(),
+        "status": "failed",
+        "exit_code": 1,
+        "attribution_state": "coverage_regression",
+        "new_failures": {"[backend-pytest] test_a::coverage": "route absent"},
+        "suppressed_failures": {},
+        "disappeared_failures": {},
+        "skipped_failures": {},
+    }
+
+    sanitized = sanitize_publication_gate_receipt(raw)
+
+    assert sanitized is not None
+    assert sanitized["status"] == "failed"
+    assert sanitized["attribution_state"] == "coverage_regression"
+    assert not _receipt_is_complete_and_clean(sanitized)
 
 
 def test_over_cap_identity_count_and_string_lengths_are_deterministically_truncated():

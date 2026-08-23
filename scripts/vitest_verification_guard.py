@@ -11,6 +11,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -30,6 +31,7 @@ from testing.fixgate_attribution import (  # noqa: E402
     classify_verification,
     extract_base,
     parse_junit_report,
+    _test_key,
     test_route_coverage_gaps,
 )
 from verification_receipt import record_lane, vitest_lane  # noqa: E402
@@ -254,8 +256,9 @@ def _runnable_changed_test_files(
     no longer holds them, so `_current_file_selectors` rejects them -- and a
     test the diff removes has no current-side behavior left to prove. Keeping
     them would make a delete or rename an unclearable scope block. Their
-    baseline failures are still handled downstream: the unscoped
-    `changed_test_files` roster runs them against the extracted base tree.
+    baseline failures are still handled downstream: the scoped baseline
+    selector set unions the changed paths that still exist in the extracted
+    base tree, while the unscoped `changed_test_files` roster runs them there.
     """
 
     return [
@@ -308,6 +311,38 @@ def _current_file_selectors(
             raise RuntimeError(f"--current-files entry does not exist: {path}")
         selectors.add(normalized[len(prefix) :])
     return sorted(selectors)
+
+
+def _route_source(test_route: str) -> str:
+    """Return the suite-relative source file from a Vitest test route."""
+
+    return test_route.split("::", 1)[0]
+
+
+def _coverage_failures(
+    current_report: JUnitReport,
+    baseline_report: JUnitReport,
+    baseline_selectors: list[str] | None,
+) -> dict[str, str]:
+    """Check baseline-failing routes without confusing repair with deletion.
+
+    An unscoped run covers the whole suite. For an explicitly scoped run, the
+    baseline must be made from the same file scope; if it is not, fail closed
+    rather than silently dropping an out-of-scope baseline failure.
+    """
+
+    if baseline_selectors is not None:
+        executed_scope = set(baseline_selectors)
+        baseline_scope = {
+            _route_source(_test_key(key)) for key in baseline_report.failures
+        }
+        outside_scope = sorted(baseline_scope - executed_scope)
+        if outside_scope:
+            raise RuntimeError(
+                "baseline report contains failing routes outside executed scope: "
+                + ",".join(outside_scope)
+            )
+    return cast(dict[str, str], test_route_coverage_gaps(current_report, baseline_report))
 
 
 def _tail(output: str, *, lines: int = 80) -> str:
@@ -393,8 +428,47 @@ def _print_result(label: str, result: subprocess.CompletedProcess[str]) -> None:
         print(f"[vitest-verification] {label} output:\n{output}")
 
 
-def _blocking(state: str, **extra: object) -> int:
-    detail = " ".join(f"{key}={value}" for key, value in extra.items())
+def _blocking(
+    suite_name: str,
+    state: str,
+    *,
+    outcome: dict[str, object] | None = None,
+    **extra: object,
+) -> int:
+    recorded: dict[str, object] = {
+        "state": state,
+        "blocking": True,
+        "current_exit_code": 1,
+        "new_failures": {},
+        "suppressed_failures": {},
+        "disappeared_failures": {},
+        "skipped_failures": {},
+        **(outcome or {}),
+        **extra,
+    }
+    recorded["state"] = state
+    recorded["blocking"] = True
+    record_classification(lane_name(suite_name), recorded)
+    receipt_extra = {
+        key: recorded[key]
+        for key in ("current_exit_code", "error")
+        if key in recorded
+    }
+    record_lane(
+        vitest_lane(suite_name),
+        state=state,
+        blocking=True,
+        new_failures=recorded.get("new_failures"),
+        suppressed_failures=recorded.get("suppressed_failures"),
+        disappeared_failures=recorded.get("disappeared_failures"),
+        skipped_failures=recorded.get("skipped_failures"),
+        extra=receipt_extra,
+    )
+    detail_items = [
+        (key, value) for key, value in extra.items() if key != "current_exit_code"
+    ]
+    detail_items.append(("current_exit_code", recorded["current_exit_code"]))
+    detail = " ".join(f"{key}={value}" for key, value in detail_items)
     print(f"[vitest-verification] FAILED state={state}{(' ' + detail) if detail else ''}")
     return 1
 
@@ -413,7 +487,7 @@ def _record(
     """
 
     coverage_failures = coverage_failures or {}
-    new_failures = dict(outcome.get("new_failures") or {})
+    new_failures = dict(cast(dict[str, str], outcome.get("new_failures") or {}))
     new_failures.update(
         {f"{route}::coverage": detail for route, detail in coverage_failures.items()}
     )
@@ -425,6 +499,11 @@ def _record(
         suppressed_failures=outcome.get("suppressed_failures"),
         disappeared_failures=outcome.get("disappeared_failures"),
         skipped_failures=outcome.get("skipped_failures"),
+        extra=(
+            {"current_exit_code": outcome["current_exit_code"]}
+            if "current_exit_code" in outcome
+            else None
+        ),
     )
 
 
@@ -501,12 +580,14 @@ def main(argv: list[str] | None = None) -> int:
                 - {f"{suite.directory}/{relative}" for relative in current_selectors}
             )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            return _blocking("current_scope_unavailable", error=str(exc))
+            return _blocking(args.suite, "current_scope_unavailable", error=str(exc))
         if scoped_out:
             # The caller's scope omits a suite test file this diff changed, so
             # a clean scoped run would prove nothing about it.
             return _blocking(
-                "current_scope_incomplete", unrun_changed_test_files=",".join(scoped_out)
+                args.suite,
+                "current_scope_incomplete",
+                unrun_changed_test_files=",".join(scoped_out),
             )
 
     with tempfile.TemporaryDirectory(prefix="blueprint-vitest-verification-") as temp_dir:
@@ -536,10 +617,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except RuntimeError as exc:
-            return _blocking("attribution_unavailable", error=str(exc))
+            return _blocking(args.suite, "attribution_unavailable", error=str(exc))
 
         if not _valid_exit_report_pair(current.returncode, current_report.failures):
             return _blocking(
+                args.suite,
                 "execution_failure",
                 current_exit_code=current.returncode,
                 current_failure_count=len(current_report.failures),
@@ -553,14 +635,14 @@ def main(argv: list[str] | None = None) -> int:
         try:
             base_ref = _base_ref(repo, args.base)
             roster = _load_roster(repo, suite)
-            if current_is_clean:
+            if current_selectors is not None or current_is_clean:
                 changed_test_files = _changed_test_files(repo, base_ref, suite, roster)
                 roster_config_changed = suite.config_path in _changed_files(repo, base_ref)
             else:
                 changed_test_files = []
                 roster_config_changed = False
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            return _blocking("baseline_unavailable", error=str(exc))
+            return _blocking(args.suite, "baseline_unavailable", error=str(exc))
 
         # A clean current run with no changed test file, and no change to the
         # config that DEFINES the roster, cannot have made a baseline failure
@@ -575,12 +657,13 @@ def main(argv: list[str] | None = None) -> int:
             outcome = classify_verification(
                 runtime_available=True,
                 current_exit_code=current.returncode,
-                current_failures=current_report.failures,
+                current_report=current_report,
             )
             state = str(outcome["state"])
+            outcome = {**outcome, "current_exit_code": current.returncode}
             _record(args.suite, outcome)
             if bool(outcome["blocking"]):
-                return _blocking(state)
+                return _blocking(args.suite, state, outcome=outcome)
             print(f"[vitest-verification] PASS state={state}")
             return 0
 
@@ -588,7 +671,19 @@ def main(argv: list[str] | None = None) -> int:
             base_root = temp / "base"
             base_root.mkdir()
             extract_base(repo, base_ref, base_root)
-            if current_is_clean:
+            if current_selectors is not None:
+                # Vitest's JUnit routes are suite-relative but its selector
+                # roster is intentionally empty. An explicit caller scope is
+                # therefore the only trustworthy current-side file set. Add
+                # raw changed paths as well so deleted/pre-rename files that
+                # exist only in base remain in the route-coverage obligation.
+                scoped_paths = [
+                    f"{suite.directory}/{relative}" for relative in current_selectors
+                ]
+                base_selectors = _base_file_selectors(
+                    scoped_paths + changed_test_files, suite, roster, base_root
+                )
+            elif current_is_clean:
                 if current_report.skipped_routes:
                     # A clean exit with skipped tests cannot prove that the
                     # candidate preserved the base suite's executable scope.
@@ -639,13 +734,16 @@ def main(argv: list[str] | None = None) -> int:
                 _print_result(f"{args.suite} baseline install", install)
                 if install.returncode != 0:
                     return _blocking(
-                        "baseline_unavailable", base_install_exit_code=install.returncode
+                        args.suite,
+                        "baseline_unavailable",
+                        base_install_exit_code=install.returncode,
                     )
                 if suite.requires_browser:
                     browser = _install_base_browser(base_root, suite)
                     _print_result(f"{args.suite} baseline browser", browser)
                     if browser.returncode != 0:
                         return _blocking(
+                            args.suite,
                             "baseline_unavailable",
                             base_browser_install_exit_code=browser.returncode,
                         )
@@ -673,46 +771,64 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 if baseline_execution_error:
-                    return _blocking("baseline_execution_failure", base_exit_code=baseline.returncode)
+                    return _blocking(
+                        args.suite,
+                        "baseline_execution_failure",
+                        base_exit_code=baseline.returncode,
+                    )
                 if not _valid_exit_report_pair(
                     baseline.returncode, baseline_report.failures
                 ):
                     return _blocking(
+                        args.suite,
                         "baseline_unavailable",
                         base_exit_code=baseline.returncode,
                         base_failure_count=len(baseline_report.failures),
                     )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            return _blocking("baseline_unavailable", error=str(exc))
+            return _blocking(args.suite, "baseline_unavailable", error=str(exc))
 
         outcome = classify_verification(
             runtime_available=True,
             current_exit_code=current.returncode,
-            current_failures=current_report.failures,
             current_report=current_report,
             baseline_report=baseline_report,
         )
-        coverage_failures = (
-            test_route_coverage_gaps(current_report, baseline_report)
-            if current_is_clean
-            else {}
-        )
+        try:
+            coverage_failures = _coverage_failures(
+                current_report,
+                baseline_report,
+                base_selectors if current_selectors is not None else None,
+            )
+        except RuntimeError as exc:
+            return _blocking(args.suite, "coverage_scope_unavailable", error=str(exc))
+        outcome = {**outcome, "current_exit_code": current.returncode}
         _record(args.suite, outcome, coverage_failures=coverage_failures)
         for key in sorted(outcome.get("suppressed_failures", {})):
             print(f"[vitest-verification] WARN suppressed baseline failure: {key}")
         # Additive and fail-open: the WARN lines above are unchanged and the
         # receipt cannot affect the state/exit decision made below.
-        _record_suppressions(args.suite, outcome)
         if current_execution_error:
-            return _blocking("execution_failure")
+            return _blocking(
+                args.suite, "execution_failure", current_exit_code=current.returncode
+            )
         if coverage_failures:
             return _blocking(
+                args.suite,
                 "coverage_regression",
+                outcome=outcome,
+                current_exit_code=current.returncode,
                 test_routes=",".join(sorted(coverage_failures)),
             )
         state = str(outcome["state"])
         if bool(outcome["blocking"]):
-            return _blocking(state)
+            return _blocking(
+                args.suite,
+                state,
+                outcome=outcome,
+                current_exit_code=current.returncode,
+            )
+        _record_suppressions(args.suite, outcome)
         print(f"[vitest-verification] PASS state={state}")
         return 0
 

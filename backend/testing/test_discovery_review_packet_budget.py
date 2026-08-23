@@ -3,10 +3,14 @@
 import pytest
 
 import app.discovery_review_packet as discovery_review_packet
-from app.discovery_review import maybe_close_and_spawn_discovery_review
+from app.discovery_review import (
+    DiscoveryReviewResultError,
+    complete_discovery_review,
+    maybe_close_and_spawn_discovery_review,
+)
 from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
 from app.models import Artifact, ArtifactType, Task, TaskStatus
-from testing.test_discovery_review import _cycle_with_source
+from testing.test_discovery_review import _cycle_with_source, _result
 
 
 @pytest.mark.asyncio
@@ -396,3 +400,133 @@ def test_under_budget_receipt_is_unchanged_without_a_marker():
     assert receipt["knowledge_outcomes"] == []
     assert "receipt_compacted_to_budget" not in receipt
     assert "evidence_truncated" not in receipt
+
+
+def _oversized_direction(direction_key: str) -> dict:
+    """A direction whose authored authority alone overflows the snapshot cap.
+
+    Sized to match the production directions this regression stranded
+    (10,359-14,489 rendered chars): the bulk is ordinary authored prose --
+    direction text plus the success/retirement/constraint context an operator
+    is expected to write -- not a synthetic blob.
+    """
+
+    return {
+        "id": direction_key,
+        "text": "Prove the bounded mechanism. " + ("Constraint detail. " * 400),
+        "status": "active",
+        "priority": "medium",
+        "paths": ["backend/app/discovery_review.py"],
+        "context": {
+            "success_evidence": "The probe improves the target outcome. " * 60,
+            "retirement_condition": "Retire after two probes without gain. " * 60,
+            "implementation_constraints": "Reuse the current runtime. " * 60,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_oversized_bet_authority_still_spawns_an_operator_question_review(
+    db_session,
+):
+    """A bet larger than the snapshot cap must bound, not strand, the cycle.
+
+    Production regression: four Blueprint directions (d-7c851b3f from
+    2026-08-19, d-4efbf4ef, d-f502e1a5, d-dec033c2) held their discovery
+    cycles at revision 0 -- no review task ever spawned -- because the packet
+    builder recorded snapshot truncation as *missing required evidence*. The
+    "missing" evidence was the direction's own length, so no task, retry, or
+    agent could ever supply it, and each cycle re-checked and re-held once a
+    minute indefinitely while the fleet sat idle.
+
+    The bounded excerpt is a usable decision input: it is deterministic,
+    carries the full authority's checksum, and the manifest flags the
+    truncation outright. So the packet must do what it already does for
+    coverage that cannot fit -- forbid a binding action and dispatch one
+    operator-question decision -- instead of waiting forever.
+    """
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    cycle.bet_snapshot = {
+        "hypothesis": "the mechanism helps",
+        "direction": _oversized_direction(cycle.direction_key),
+    }
+    db_session.add(cycle)
+    await db_session.flush()
+
+    # The bound itself is part of the decision contract: pin it literally so a
+    # silent cap change cannot quietly stop exercising this path.
+    assert discovery_review_packet.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS == 8_000
+    assert len(
+        discovery_review_packet._canonical_json(cycle.bet_snapshot)
+    ) > discovery_review_packet.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True, spawned.reason
+    assert spawned.reason == "spawned"
+
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    # Truncation is reported, and reported as a *binding* blocker...
+    assert manifest["bet_snapshot_truncated"] is True
+    assert any(
+        "bet authority exceeds the bounded decision contract" in blocker
+        for blocker in manifest["binding_action_blockers"]
+    ), manifest["binding_action_blockers"]
+    # ...never as evidence still in flight, which is what stranded the cycle.
+    assert manifest["missing_required_evidence"] == []
+
+    # The safety invariant is unchanged: binding is still forbidden, and the
+    # receipt's own copy of it agrees with the manifest's.
+    assert manifest["binding_decision_allowed"] is False
+    assert manifest["required_evidence_omitted"] is True
+    outcome = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "parent_outcome"
+    )
+    snapshot = outcome["evidence_metadata"]["snapshot"]
+    assert snapshot["binding_decision_allowed"] is False
+    assert snapshot["missing_required_evidence"] == []
+
+    # The reviewer sees a bounded excerpt of the real authority, not a stub.
+    bet = review.first_payload["bet_snapshot"]
+    assert bet["snapshot_truncated"] is True
+    assert len(bet["excerpt"]) == (
+        discovery_review_packet.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS
+    )
+    assert bet["original_checksum"]
+
+    with pytest.raises(DiscoveryReviewResultError, match="incomplete packet semantics"):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=_result(cycle, review, action="advance"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_oversized_intent_authority_blocks_binding_without_stranding(db_session):
+    """Same contract for the intent snapshot, the other truncated authority."""
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    cycle.intent_snapshot = {
+        "goal": "prove useful behavior",
+        "direction": _oversized_direction(cycle.direction_key),
+    }
+    db_session.add(cycle)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True, spawned.reason
+
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["intent_snapshot_truncated"] is True
+    assert manifest["bet_snapshot_truncated"] is False
+    assert any(
+        "intent authority exceeds the bounded decision contract" in blocker
+        for blocker in manifest["binding_action_blockers"]
+    ), manifest["binding_action_blockers"]
+    assert manifest["missing_required_evidence"] == []
+    assert manifest["binding_decision_allowed"] is False
