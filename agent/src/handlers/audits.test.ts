@@ -116,6 +116,7 @@ import { recordFormatRepairAttempt, recordFormatRepairSuccess, getLlmTelemetry, 
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
+import { extractTestDeclaration, extractTypeScriptTestDeclarations } from '../utils/test-identities.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -126,6 +127,50 @@ const WS = null;
 const STATUS_REF = () => ({ value: '' });
 const BASE_TASK = { title: 'Test Task', description: '', context: {}, project_context: {} };
 const BASE_PAYLOAD = { base_branch: 'main' };
+
+describe('shared TypeScript test identity extraction', () => {
+  it('preserves a multiline backtick .each label from a complete diff chunk', () => {
+    const source = [
+      '-it.each([',
+      '-  [1],',
+      '-])(',
+      '-  `renders value $value`,',
+      '-  () => {},',
+      '-);',
+    ].join('\n');
+
+    expect(extractTestDeclaration(source)).toEqual({
+      identifier: 'renders value $value',
+      isDeclaration: true,
+    });
+    expect(extractTypeScriptTestDeclarations(source)).toEqual([{
+      identifier: 'renders value $value',
+      isDeclaration: true,
+    }]);
+  });
+
+  it('keeps multiline .each labels attached to their own declaration', () => {
+    const source = [
+      'test.each([',
+      '  [1],',
+      '])(',
+      '  `renders first $value`,',
+      '  () => {},',
+      ');',
+      'it.each([',
+      '  [2],',
+      '])(',
+      '  `renders second $value`,',
+      '  () => {},',
+      ');',
+    ].join('\n');
+
+    expect(extractTypeScriptTestDeclarations(source)).toEqual([
+      { identifier: 'renders first $value', isDeclaration: true },
+      { identifier: 'renders second $value', isDeclaration: true },
+    ]);
+  });
+});
 
 // ── handleSecurityAudit — JSON extraction fallback ────────────────────────────
 describe('handleSecurityAudit — JSON extraction fallback', () => {
@@ -1078,9 +1123,41 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     });
   });
 
-  // ── Gap-2: it(/describe( double-counting ──────────────────────────────────
-  describe('computed_test_erosion — no double-counting of it(/describe( lines', () => {
+  // ── Gap-2: declaration-aware test counting ────────────────────────────────
+  describe('computed_test_erosion — declaration-aware test counting', () => {
     beforeEach(() => vi.clearAllMocks());
+
+    it('test_count_delta_ignores_describe_blocks_and_regex_test_calls', async () => {
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return '';
+        if (Array.isArray(a) && a[0] === 'diff') {
+          return [
+            '+describe(\'suite\', () => {',
+            '+  const result = subject.test(input);',
+            '+  const matches = TEST_FN_RE.test(line);',
+            '+  test(\'counts direct test declarations\', () => {});',
+            '+  it(\'counts direct it declarations\', () => {});',
+            '+  async def test_python_case():',
+            '+});',
+          ].join('\n');
+        }
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: { test_count_delta: number };
+      };
+      expect(stored.computed_test_erosion?.test_count_delta).toBe(3);
+    });
 
     it('an added it( line increments test_count_delta but not assertion_delta', async () => {
       vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
@@ -1107,6 +1184,34 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       // it( is a test-function declaration, not an assertion.
       expect(stored.computed_test_erosion?.test_count_delta).toBe(1);
       expect(stored.computed_test_erosion?.assertion_delta).toBe(0);
+    });
+
+    it('counts backtick and parameterized Vitest declarations', async () => {
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return '';
+        if (Array.isArray(a) && a[0] === 'diff') {
+          return [
+            '+  it(`backtick declaration`, () => {});',
+            "+  it.each([['case']])('parameterized it %s', () => {});",
+            '+  test.each([[1]])(`parameterized test $value`, () => {});',
+          ].join('\n');
+        }
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: { test_count_delta: number };
+      };
+      expect(stored.computed_test_erosion?.test_count_delta).toBe(3);
     });
   });
 
@@ -1461,6 +1566,59 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       };
       const entry = stored.computed_test_erosion?.deleted_test_file_classifications?.find(
         c => c.path === 'backend/testing/test_async_thing.py'
+      );
+      expect(entry?.classification).toBe('dead_code_removal');
+      expect(entry?.rationale).toContain('1/1');
+    });
+
+    it('matches multiline parameterized backtick test labels when a test file relocates', async () => {
+      const nameStatus = [
+        'D\tadmin-ui/src/components/Old.test.tsx',
+        'A\tadmin-ui/src/components/New.test.tsx',
+      ].join('\n') + '\n';
+      const diffText = [
+        'diff --git a/admin-ui/src/components/Old.test.tsx b/admin-ui/src/components/Old.test.tsx',
+        '--- a/admin-ui/src/components/Old.test.tsx',
+        '+++ /dev/null',
+        '-it.each([',
+        '-  [1],',
+        '-])(',
+        '-  `renders value $value`,',
+        '-  () => {}',
+        '-);',
+        'diff --git a/admin-ui/src/components/New.test.tsx b/admin-ui/src/components/New.test.tsx',
+        '--- /dev/null',
+        '+++ b/admin-ui/src/components/New.test.tsx',
+        '+it.each([',
+        '+  [1],',
+        '+])(',
+        '+  `renders value $value`,',
+        '+  () => {}',
+        '+);',
+      ].join('\n') + '\n';
+
+      vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+        const a = args as string[];
+        if (Array.isArray(a) && a[0] === 'diff' && a[1] === '--name-status') return nameStatus;
+        if (Array.isArray(a) && a[0] === 'diff') return diffText;
+        return Buffer.from('');
+      });
+      vi.mocked(readHandlerOutput).mockReturnValue({
+        audit_score: 1,
+        test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+        findings: [],
+      });
+
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+      const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+      const stored = JSON.parse(call.logs as string) as {
+        computed_test_erosion?: {
+          deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
+        };
+      };
+      const entry = stored.computed_test_erosion?.deleted_test_file_classifications?.find(
+        c => c.path === 'admin-ui/src/components/Old.test.tsx'
       );
       expect(entry?.classification).toBe('dead_code_removal');
       expect(entry?.rationale).toContain('1/1');

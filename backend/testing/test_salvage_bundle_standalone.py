@@ -2653,12 +2653,31 @@ def test_needs_action_strip_confirmation_chips_are_actionable():
         "MessagesPanel.tsx must call dismissPendingConfirmation from the "
         "needs-action strip chip (not only from StrategicContextRail)"
     )
-    # After accept/dismiss the attention model must be refreshed.
-    assert "refreshStrategicState" in source, (
-        "MessagesPanel.tsx must call refreshStrategicState after accept/dismiss "
-        "so the needs-action strip re-evaluates immediately without waiting for "
-        "the next poll cycle"
-    )
+    # After accept/dismiss the attention model must be refreshed. The refresh
+    # is the `onStrategicStateRefresh` prop -- renamed from the local
+    # `refreshStrategicState` this pin was originally written against, so the
+    # old identifier check was pinning a name that no longer exists rather than
+    # the behaviour. Scope the check to each handler body: a bare whole-file
+    # substring passes on any of the dozen unrelated refresh call sites.
+    for api_call, label in (
+        ("await acceptPendingConfirmation(", "accept"),
+        ("await dismissPendingConfirmation(", "dismiss"),
+    ):
+        start = source.find(api_call)
+        assert start != -1, (
+            f"MessagesPanel.tsx must call {label}PendingConfirmation from the "
+            "needs-action strip chip"
+        )
+        end = source.find("} catch {", start)
+        assert end != -1, (
+            f"the needs-action {label} handler must keep its try/catch so a "
+            "failed call surfaces a toast instead of silently resolving"
+        )
+        assert "onStrategicStateRefresh" in source[start:end], (
+            f"MessagesPanel.tsx must fire onStrategicStateRefresh inside the "
+            f"needs-action {label} handler so the strip re-evaluates "
+            "immediately without waiting for the next poll cycle"
+        )
 
 
 # --------------------------------------------------------------------------- #

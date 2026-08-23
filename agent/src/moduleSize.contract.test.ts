@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isModuleSizeBreach } from './moduleSizePolicy.js';
 
 const MODULE_SIZE_LIMITS_RELATIVE = 'backend/testing/module_size_limits.json';
 
@@ -91,14 +92,14 @@ describe('agent section: module_size_limits.json cap enforcement', () => {
       const content = readFileSync(abs, 'utf-8');
       const count = countLines(content);
       expect(
-        count,
+        isModuleSizeBreach(count, cap),
         `${relPath} has ${count} lines (limit: ${cap}).\n\n` +
           `This file exceeded its cap in backend/testing/module_size_limits.json.\n` +
           `If your change legitimately grew this file, run:\n` +
           `  python3 backend/testing/check_size_limits.py --fix\n` +
           `to bump the cap via the canonical policy, then commit the JSON edit.\n` +
           `Do NOT refactor or extract code in this PR.`,
-      ).toBeLessThanOrEqual(cap);
+      ).toBe(false);
     });
   }
 });
@@ -119,7 +120,7 @@ describe('agent section: no uncapped large files (module_size_limits.json)', () 
           if (rel in agentCaps) continue;
           const content = readFileSync(abs, 'utf-8');
           const count = countLines(content);
-          if (count > COVERAGE_THRESHOLD) {
+          if (isModuleSizeBreach(count, COVERAGE_THRESHOLD)) {
             offenders.push({ rel, count });
           }
         }
@@ -142,5 +143,14 @@ describe('agent section: no uncapped large files (module_size_limits.json)', () 
         `Run: python3 backend/testing/check_size_limits.py --fix\n` +
         `to add the cap entry, then commit the JSON edit.`,
     ).toHaveLength(0);
+  });
+});
+
+describe('agent module-size comparison contract', () => {
+  it('uses strict greater-than and treats missing values as clean', () => {
+    expect(isModuleSizeBreach(1201, 1200)).toBe(true);
+    expect(isModuleSizeBreach(1200, 1200)).toBe(false);
+    expect(isModuleSizeBreach(null, 1200)).toBe(false);
+    expect(isModuleSizeBreach(1201, null)).toBe(false);
   });
 });

@@ -8,6 +8,8 @@ import { buildMessageStrategicContextDescriptor } from '../utils/strategicContex
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 import { AttachmentPreviewModal } from './AttachmentPreviewModal';
 import { MessageAttachments } from './MessageAttachments';
+import { ConsultationProgressRow } from './ConsultationProgressRow';
+import type { ConsultationIndexRow } from '../consultationDetailApi';
 import { invalidateMessageAttachmentDownloadUrl } from '../strategicStateApi';
 
 export type { ProjectMessage, ProjectMessageContext } from '../types/messages';
@@ -219,6 +221,8 @@ export interface MessageBubbleProps {
   onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => void;
   onOpenStrategicContext?: () => void;
   currentActorUserId?: string | null;
+  /** Collapsed Workday-consultation progress, keyed by the public reply id. */
+  consultationRows?: Map<string, ConsultationIndexRow> | null;
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -247,6 +251,7 @@ export const MessageBubble = memo(function MessageBubble({
   onReply,
   onOpenStrategicContext,
   currentActorUserId,
+  consultationRows = null,
 }: MessageBubbleProps) {
   const [previewAttachment, setPreviewAttachment] = useState<MessageAttachment | null>(null);
   const [attachmentResolutionVersion, setAttachmentResolutionVersion] = useState(0);
@@ -442,6 +447,14 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           )}
         </div>
+
+        {workdayRequested && msg.project_id && (
+          <ConsultationProgressRow
+            projectId={msg.project_id}
+            consultationId={msg.id}
+            row={consultationRows?.get(msg.id) ?? null}
+          />
+        )}
 
         {/* Linked indicator (for linked messages) */}
         {showOpsChrome && msg.status === 'linked' && (

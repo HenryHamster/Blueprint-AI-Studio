@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from app.models import Task, TaskStatus
 from app.operator_attention import _task_attention_item
+from app.rollup_size_preflight import SizeCapPreflightResult
 from app.terminal_rollup_pr_sweep import (
     TERMINAL_ROLLUP_PR_ATTENTION_KEY,
     TERMINAL_ROLLUP_PR_SWEEP_REQUEUES_KEY,
@@ -33,7 +34,9 @@ def _files(*paths: str) -> list[dict]:
     return [{"filename": p, "status": "added"} for p in paths]
 
 
-def _open_rollup_pr_detail(*, mergeable_state: str = "clean") -> dict:
+def _open_rollup_pr_detail(
+    *, mergeable_state: str = "clean", head_sha: str = "deadbeef"
+) -> dict:
     """Exact immutable target used by multi-attempt rollup merge fixtures."""
     return {
         "additions": 5,
@@ -43,7 +46,7 @@ def _open_rollup_pr_detail(*, mergeable_state: str = "clean") -> dict:
         "mergeable": True,
         "mergeable_state": mergeable_state,
         "base": {"sha": "base-sha", "ref": "research/conflict-base"},
-        "head": {"sha": "deadbeef", "ref": "research/conflict-stg"},
+        "head": {"sha": head_sha, "ref": "research/conflict-stg"},
     }
 
 
@@ -151,7 +154,7 @@ def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("ok", None),
+        return_value=SizeCapPreflightResult("ok", None, "reviewed-rollup-head"),
     )
     return mock_merge, mock_spawn
 
@@ -527,7 +530,9 @@ async def test_rollup_size_cap_breach_auto_bumped_defers(cleanup_db, mocker):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("bumped", "models.py: 500 -> 750"),
+        return_value=SizeCapPreflightResult(
+            "bumped", "models.py: 500 -> 750", "reviewed-rollup-head"
+        ),
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -555,7 +560,11 @@ async def test_rollup_size_cap_breach_hold_when_cap_exhausted(cleanup_db, mocker
     mock_preflight = mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("hold", "auto-bump budget exhausted; breach: models.py: 500 -> 750"),
+        return_value=SizeCapPreflightResult(
+            "hold",
+            "auto-bump budget exhausted; breach: models.py: 500 -> 750",
+            "reviewed-rollup-head",
+        ),
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -581,6 +590,71 @@ async def test_rollup_size_cap_breach_hold_when_cap_exhausted(cleanup_db, mocker
     await cleanup_db.refresh(parent)
     assert parent.requires_approval is True
     assert "size" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_assembled_rollup_size_breach_cannot_merge(cleanup_db, mocker):
+    """An over-cap scripts change in the assembled tree is a merge hold.
+
+    This is deliberately an auto-merge-path test: the assertion is on the
+    actual GitHub merge submission, not merely the preflight's status value.
+    """
+    mock_merge, _ = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("scripts/test_guard_gate_left_shift.py"),
+    )
+    preflight = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=SizeCapPreflightResult(
+            "hold",
+            "scripts/test_guard_gate_left_shift.py: 2440 lines exceeds cap 2400",
+            "reviewed-rollup-head",
+        ),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    preflight.assert_awaited_once()
+    assert preflight.await_args.kwargs["expected_head_sha"] == "reviewed-rollup-head"
+    mock_merge.assert_not_awaited()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "size-cap" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_assembled_rollup_old_size_verdict_cannot_authorize_new_head(
+    cleanup_db, mocker
+):
+    """A verdict for an older tip is rejected before merge submission."""
+    mock_merge, _ = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/testing/test_rollup_management.py"),
+    )
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=SizeCapPreflightResult("ok", None, "stale-rollup-head"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_merge.assert_not_awaited()
+    await cleanup_db.refresh(parent)
+    assert "immutable merge head" in (parent.latest_status_message or "")
 
 
 @pytest.mark.asyncio
@@ -792,6 +866,11 @@ async def test_clean_pr_sha_mismatch_skips_update_branch(cleanup_db, mocker):
     mock_upd = mocker.patch(
         "app.github.update_branch_with_sha_retry",
         new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=SizeCapPreflightResult("ok", None, "head-sha-111"),
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -3037,7 +3116,7 @@ def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("ok", None),
+        return_value=SizeCapPreflightResult("ok", None, "deadbeef"),
     )
 
 
@@ -3145,7 +3224,7 @@ def _mock_repoll_or_escalation_landing_deps(mocker, *, get_pr_side_effect, merge
     mocker.patch("app.github.list_versions_at_ref", new_callable=AsyncMock, return_value=[])
     mocker.patch("app.github.is_ancestor_of", new_callable=AsyncMock, return_value=False)
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
-    mocker.patch(
+    merge = mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
         side_effect=merge_side_effect,
@@ -3185,8 +3264,105 @@ def _mock_repoll_or_escalation_landing_deps(mocker, *, get_pr_side_effect, merge
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("ok", None),
+        return_value=SizeCapPreflightResult("ok", None, "deadbeef"),
     )
+    return merge
+
+
+@pytest.mark.asyncio
+async def test_repoll_does_not_merge_head_that_moved_after_size_cap_preflight(
+    cleanup_db, mocker
+):
+    """A clean re-poll may not reuse the original cap verdict for a new head."""
+    from app.rollup_management import _check_and_trigger_rollup
+
+    moved_head = "over-cap-head"
+    merge = _mock_repoll_or_escalation_landing_deps(
+        mocker,
+        # The original head is cap-cleared and the first merge fails.  GitHub
+        # then reports clean on a different head; its authority read agrees
+        # with that new head, so the old implementation submits a second merge.
+        get_pr_side_effect=[
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(head_sha=moved_head),
+            _open_rollup_pr_detail(head_sha=moved_head),
+        ],
+        merge_side_effect=[
+            {"merged": False, "message": "transient failure"},
+            {"merged": False, "message": "must not be submitted"},
+        ],
+    )
+    project = await _make_project(
+        cleanup_db, integration_branch="research/conflict-base"
+    )
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    assert merge.await_count == 1, "moved head must defer for a fresh cap preflight"
+
+
+@pytest.mark.asyncio
+async def test_escalation_does_not_merge_head_that_moved_after_size_cap_preflight(
+    cleanup_db, mocker
+):
+    """The persistent-empty escalation has the same immutable-head requirement."""
+    from app.rollup_management import _check_and_trigger_rollup
+
+    moved_head = "over-cap-head"
+    merge = _mock_repoll_or_escalation_landing_deps(
+        mocker,
+        # Three empty re-polls exhaust the inline retry.  The escalation read
+        # then sees a new head, followed by an agreeing authority read; that
+        # must not turn the old size-cap verdict into authority for the new head.
+        get_pr_side_effect=[
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(head_sha=moved_head),
+            _open_rollup_pr_detail(head_sha=moved_head),
+        ],
+        merge_side_effect=[
+            {"merged": False, "message": "transient failure"},
+            {"merged": False, "message": "must not be submitted"},
+        ],
+    )
+    project = await _make_project(
+        cleanup_db, integration_branch="research/conflict-base"
+    )
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            "_merge_deferred_count": 4,
+            "_merge_deferred_state": "empty",
+        },
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    assert merge.await_count == 1, "moved head must defer for a fresh cap preflight"
 
 
 @pytest.mark.asyncio

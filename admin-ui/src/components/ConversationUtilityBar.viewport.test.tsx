@@ -165,10 +165,16 @@ describe('ConversationUtilityBar — viewport regression', () => {
     await expectNoOverflowAt(375, () => renderBar({
       expanded: false,
       workdayStatus: buildConversationWorkdayStatus({ interactionMode: 'chat', residentActivity: null }),
-      chatLiveState: { phase: 'streaming', label: 'Replying', detail: 'grep release gate' },
+      chatLiveState: {
+        phase: 'streaming',
+        label: 'Replying',
+        detail: 'grep release gate',
+        lastActivityMs: Date.now() - 5 * 60 * 1000,
+      },
     }));
     const line = host?.querySelector('[data-testid="conversation-workday-status"]');
     expect(line?.textContent).toContain('Replying');
+    expect(line?.textContent).toContain('5m ago');
     expect(line?.className).not.toContain('hidden');
   });
 });

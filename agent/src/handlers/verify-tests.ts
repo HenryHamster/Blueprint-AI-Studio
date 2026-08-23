@@ -31,7 +31,7 @@ import {
   type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
   type DeclaredAcceptanceTest,
 } from '../utils/test-runners.js';
-import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
+import { captureTestBaseline, testFixLoop, type TestFailureBaseline } from '../utils/test-fix-loop.js';
 
 // Cap the failing-test output we ship in the verdict. Mirrors the smoketest
 // error-log tail size — enough to diagnose a failure without bloating the
@@ -63,6 +63,10 @@ interface VerifyTestsResult {
   // pass / undetected fall-open — it fails the gate closed in the same spirit as
   // setupFailed while staying distinguishable in the artifact.
   partialSetupFailed?: boolean;
+  // A base/current report or canonical attribution comparison could not be
+  // obtained. This is distinct from runner setup: merging a failed suite with
+  // no structured baseline evidence is never a clean or no-baseline verdict.
+  verificationUnverified?: boolean;
   // Set when the stored test command was STALE (it ran but executed no real
   // tests, or its command was gone) and auto-detection found a DIFFERENT, real
   // suite in the cloned workspace that actually executed. When true,
@@ -242,8 +246,9 @@ type StaleCommandRecovery =
   | null;
 
 interface BaseTestCaptureResult {
-  baselineFailures?: Set<string>;
+  baselineFailures?: TestFailureBaseline;
   restoreError?: string;
+  verificationError?: string;
 }
 
 // The verify gate runs on the PR head, but the existing baseline helper assumes
@@ -271,16 +276,19 @@ async function captureBaseTestFailures(
       { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT },
     );
   } catch (error) {
-    sendLog(ws, `Could not check out origin/${baseBranch} for test baseline — proceeding without baseline: ${error instanceof Error ? error.message : String(error)}\n`);
-    return {};
+    const verificationError = `Could not check out origin/${baseBranch} for structured test baseline: ${error instanceof Error ? error.message : String(error)}`;
+    sendLog(ws, `${verificationError}\n`);
+    return { verificationError };
   }
 
-  let baselineFailures: Set<string> | null = null;
+  let baselineFailures: TestFailureBaseline | null = null;
+  let verificationError: string | undefined;
   let restoreError: string | undefined;
   try {
     baselineFailures = await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
   } catch (error) {
-    sendLog(ws, `Test baseline capture failed — proceeding without baseline: ${error instanceof Error ? error.message : String(error)}\n`);
+    verificationError = `Structured test baseline capture failed: ${error instanceof Error ? error.message : String(error)}`;
+    sendLog(ws, `${verificationError}\n`);
   } finally {
     try {
       await execFileAsync(
@@ -294,7 +302,10 @@ async function captureBaseTestFailures(
   }
 
   if (restoreError) return { restoreError };
-  return { baselineFailures: baselineFailures ?? undefined };
+  if (verificationError || baselineFailures === null) {
+    return { verificationError: verificationError ?? 'Structured test baseline was unavailable.' };
+  }
+  return { baselineFailures };
 }
 
 async function runVerifyLoop(
@@ -303,7 +314,7 @@ async function runVerifyLoop(
   model: string | undefined,
   effort: string | undefined,
   buildConfig: BuildConfig | undefined,
-  baselineFailures: Set<string> | undefined,
+  baselineFailures: TestFailureBaseline | undefined,
   runnersOverride?: TestRunner[],
   retryStatusLabel = 'detected suite',
   changedLineCounts?: Record<string, number>,
@@ -1081,7 +1092,7 @@ async function recoverFromStaleCommand(
   ws: WebSocket | null, statusRef: { value: string },
   model: string | undefined, effort: string | undefined,
   buildConfig: BuildConfig | undefined, storedRunners: TestRunner[],
-  baselineFailures: Set<string> | undefined,
+  baselineFailures: TestFailureBaseline | undefined,
 ): Promise<StaleCommandRecovery> {
   const autoRunners = detectAutoTestRunners();
   // Never re-invoke a stored runner we already know is dead: drop any
@@ -1200,13 +1211,14 @@ async function postVerifySetupFailure(
   taskId: string, owner: string, repo: string,
   ws: WebSocket | null, summary: string,
   buildConfig: BuildConfig | undefined,
-  markers: { setupFailed?: boolean; partialSetupFailed?: boolean } = { setupFailed: true },
+  markers: { setupFailed?: boolean; partialSetupFailed?: boolean; verificationUnverified?: boolean } = { setupFailed: true },
 ): Promise<void> {
   const setupResult = await attachAcceptanceProbe(ws, buildConfig, {
     detected: false,
     passed: false,
     setupFailed: markers.setupFailed || undefined,
     partialSetupFailed: markers.partialSetupFailed || undefined,
+    verificationUnverified: markers.verificationUnverified || undefined,
     tests: [],
     output: summary.slice(-VERIFY_TESTS_OUTPUT_LIMIT),
   });
@@ -1350,10 +1362,13 @@ export async function handleVerifyTests(
     const baselineCapture = await captureBaseTestFailures(
       ws, statusRef, buildConfig, baseBranch, earlyPrDiff.changedFiles,
     );
-    if (baselineCapture.restoreError) {
+    if (baselineCapture.restoreError || baselineCapture.verificationError) {
       statusRef.value = 'Reporting test baseline checkout failure...';
       await postVerifySetupFailure(
-        taskId, owner, repo, ws, baselineCapture.restoreError, buildConfig,
+        taskId, owner, repo, ws,
+        baselineCapture.restoreError ?? baselineCapture.verificationError ?? 'Structured test baseline was unavailable.',
+        buildConfig,
+        baselineCapture.verificationError ? { verificationUnverified: true } : undefined,
       );
       return;
     }
@@ -1366,7 +1381,16 @@ export async function handleVerifyTests(
       changedLineCounts,
     );
 
-    if (loop.timedOut) {
+    if (loop.verificationUnverified) {
+      statusRef.value = 'Reporting structured test attribution failure...';
+      await postVerifySetupFailure(
+        taskId, owner, repo, ws,
+        loop.failureSummary ?? 'Structured test attribution was unavailable.',
+        buildConfig,
+        { verificationUnverified: true },
+      );
+      return;
+    } else if (loop.timedOut) {
       // WALL-CLOCK kill of the WHOLE suite: the test command runs an
       // unbounded/oversized suite that reaches pytest collection then dies at the
       // runner wall clock (SIGTERM). This is NOT a transient setup blip to retry

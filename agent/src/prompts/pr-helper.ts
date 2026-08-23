@@ -241,8 +241,9 @@ if [ -n "$SHOTS_SECTION" ]; then
   BODY=$(printf '%s\\n\\n%s' "$BODY" "$SHOTS_SECTION")
 fi
 
-${shouldRunBackendMergeGate(cfg) ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
-# The agent must not be able to skip backend tests on LTS-branch tasks.
+${shouldRunBackendMergeGate(cfg) ? `# Mandatory governed-diff gate: force WITH_TESTS=1 when the diff touches
+# a Blueprint size-governed section. This keeps publication from deferring the
+# database-free size/corpus checks just because --with-tests was omitted.
 _BASE_GATE="${cfg.baseBranch}"
 _CMT_GATE=""
 if git rev-parse --verify "origin/$_BASE_GATE" >/dev/null 2>&1; then
@@ -252,14 +253,15 @@ elif git rev-parse --verify "$_BASE_GATE" >/dev/null 2>&1; then
 fi
 _UNC_GATE=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 _CHG_GATE=$(printf '%s\\n%s\\n' "$_CMT_GATE" "$_UNC_GATE" | sort -u | grep -v '^$' || true)
-if printf '%s\\n' "$_CHG_GATE" | grep -q '^backend/'; then
-  echo "[pr] backend/ touched on LTS branch — forcing WITH_TESTS=1 (mandatory test gate)"
+if printf '%s\\n' "$_CHG_GATE" | grep -Eq '^(backend/|agent/|admin-ui/|scripts/)'; then
+  echo "[pr] governed path touched — forcing WITH_TESTS=1 (mandatory publication gate)"
   WITH_TESTS=1
 fi
 ` : ''}
 # 1. Run ./check as gate (lint always; tests when --with-tests, or forced on
-#    when the backend merge gate applies (self-repo/promotion-target/LTS
-#    branch) and the diff touches backend/ — see the WITH_TESTS=1 block above).
+#    when the governed-diff publication gate applies (self-repo or
+#    promotion-target/LTS branch) and a governed section changed — see the
+#    WITH_TESTS=1 block above).
 # Branch on WITH_TESTS instead of expanding an array. Older bash + set -u
 # aborts on an empty array expansion, so just call ./check directly.
 GATE_TIMEOUT_SECONDS="\${PR_GATE_TIMEOUT_SECONDS:-600}"

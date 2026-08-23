@@ -37,7 +37,11 @@ from app.models import (
     TaskStatus,
     TASK_OUTCOME_TERMINAL_STATUSES,
 )
-from app.alert_policy import create_project_alert_if_allowed
+from app.alert_policy import (
+    ALERT_EVENT_POLICIES,
+    AlertRetirementMode,
+    create_project_alert_if_allowed,
+)
 from app.notification import _send_webhook_notification
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -282,14 +286,24 @@ async def _maybe_create_failure_alert(
     error_snippet: str | None = None,
 ) -> None:
     """Create an ERROR alert for a task failure unless it's a smoketest or retry task.
-    Deduplicates: skips if an undismissed alert already exists for this task."""
+
+    Failure alerts are one episode of the ``task.failed`` family.  The old
+    task-only lookup treated an unrelated open ``task.blocked`` or
+    ``review.escalated`` row as that episode, so a later real failure was
+    silently swallowed.  Restricting the lookup to this event family preserves
+    deduplication within the episode while allowing distinct failure signals.
+    """
     task_type = (task.first_payload).get("type", "")
     if task_type == "smoketest":
         return
     if (task.context or {}).get("is_retry") is True:
         return
     existing = await session.execute(
-        select(Alert).where(Alert.task_id == task.id, Alert.dismissed_at.is_(None))
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.event_type == "task.failed",
+            Alert.dismissed_at.is_(None),
+        )
     )
     if existing.scalars().first() is not None:
         return
@@ -300,6 +314,7 @@ async def _maybe_create_failure_alert(
         message=f"Task type: {task_type}. {error_snippet or 'See task logs for details.'}",
         task_id=task.id,
         event_type="task.failed",
+        dedupe_key=f"task.failed:{task.id}:{int(task.attempt_count or 0)}",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -1809,6 +1824,59 @@ async def sweep_resolve_terminal_task_alerts(
             {"alert_id": str(alert.id), "title": alert.title},
         )
     return len(resolved)
+
+
+async def sweep_resolve_policy_retirement_alerts(
+    session: AsyncSession,
+    *,
+    limit: int = _TERMINAL_TASK_ALERT_SWEEP_LIMIT,
+) -> int:
+    """Run the bounded, policy-owned retirement backstop.
+
+    Condition-specific producers resolve ``SOURCE_CONDITION`` alerts when they
+    observe recovery.  This reaper backstop owns the two generic cases: task
+    terminalization and durable rows left behind by a ``TIMELINE_ONLY`` policy
+    before the policy gate became authoritative.  Manual alerts are never
+    guessed at or auto-dismissed.
+    """
+    budget = max(1, int(limit))
+    resolved = await sweep_resolve_terminal_task_alerts(session, limit=budget)
+    if resolved >= budget:
+        return resolved
+
+    timeline_event_types = [
+        event_type
+        for event_type, policy in ALERT_EVENT_POLICIES.items()
+        if policy.retirement == AlertRetirementMode.TIMELINE_ONLY
+    ]
+    if not timeline_event_types:
+        return resolved
+    legacy_rows = (
+        await session.execute(
+            select(Alert)
+            .where(
+                Alert.dismissed_at.is_(None),
+                Alert.event_type.in_(timeline_event_types),
+            )
+            .order_by(Alert.created_at, Alert.id)
+            .limit(budget - resolved)
+        )
+    ).scalars().all()
+    if not legacy_rows:
+        return resolved
+
+    now = _utcnow()
+    for alert in legacy_rows:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in legacy_rows:
+        await broadcast_to_project(
+            str(alert.project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return resolved + len(legacy_rows)
 
 
 async def _maybe_create_blocked_escalation_alert(

@@ -702,6 +702,7 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_event_type_invariants.py
     testing/test_salvage_bundle_standalone.py
     testing/test_test_durations_freshness.py
+    testing/test_test_estate_ranked_queue.py
     testing/test_shard_balance.py
     testing/test_conversational_workday_protection.py
     testing/test_vitest_durations_freshness.py
@@ -763,7 +764,17 @@ if [ "$USE_DOCKER" = "1" ]; then
     IMAGE_PATH_TAKEN="local-build"
     echo "=== Building backend image ==="
     ensure_image python:3.11-slim
-    docker build -t blueprint-backend-test . -q
+    # --target deps, not the default final `app` stage. CI builds and runs
+    # the tests against `deps`; `app` is the production image and lacks git
+    # and the test Fernet key, so the old default-stage build silently
+    # disagreed with CI -- testing/test_vitest_durations_freshness.py fails
+    # locally on a missing `git` binary while passing in CI, which is
+    # exactly the "identical result" the fallback banner above promises.
+    docker build --target deps -t blueprint-backend-test . -q
+    # `deps` bakes no source, so route this image through the same
+    # bind-mount path the prebuilt images use rather than the legacy
+    # baked-source invocation in _run().
+    DEPS_IMAGE="blueprint-backend-test"
   fi
   echo "=== test-backend image path: ${IMAGE_PATH_TAKEN} ==="
 fi

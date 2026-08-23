@@ -10,6 +10,12 @@ import {
 // live transcript stays well under the backend's 20 msg/s close threshold
 // (routers/projects.py) — the same discipline as replayLogBufferRateLimited.
 const STREAM_FLUSH_MS = 100;
+// A one-shot Chat handler is followed immediately by the role runner's
+// `ws.close()`. Give its ordered queue a short, rate-limited opportunity to
+// finish, then reserve a final lifecycle frame before that close can race it.
+// At most ten queued frames can leave during this window, so the forced final
+// frame remains comfortably below the backend's 20-frame/s socket threshold.
+const TERMINAL_DRAIN_MAX_MS = 900;
 
 /** The `kind` vocabulary the backend `strategic_session` delta accepts
  *  (strategic_events.py `_STRATEGIC_SESSION_KINDS`) — reused from the lib so the
@@ -103,6 +109,57 @@ export class SessionStreamer {
   flush(): void {
     this.queue.seal();
     this.scheduleDrain();
+  }
+
+  /**
+   * Complete a one-shot stream before its owning role closes the WebSocket.
+   *
+   * The normal path preserves every queued frame and the shared <=10/s budget.
+   * A pathological tool burst cannot hold role teardown indefinitely: after the
+   * bounded drain window, discard its stale residual and send the terminal
+   * `done` frame directly. That final frame is what releases the UI's live
+   * preview; it is still rate-safe because the bounded window emits at most ten
+   * frames before the one terminal send.
+   *
+   * Persistent Resident callers deliberately keep using `flush()` plus
+   * `done()` — they own a long-lived socket and must retain their entire queue.
+   */
+  async finish(): Promise<void> {
+    this.done();
+    this.flush();
+
+    // With no socket there is no close race: scheduleDrain's sendLog fallback
+    // preserves the buffered transcript, and waiting would needlessly delay
+    // every non-interactive Strategic task.
+    if (!this.ws) return;
+
+    const fullyDrained = await new Promise<boolean>((resolve) => {
+      const startedAt = Date.now();
+      const check = (): void => {
+        if (this.queue.isEmpty) {
+          resolve(true);
+          return;
+        }
+        const remaining = TERMINAL_DRAIN_MAX_MS - (Date.now() - startedAt);
+        if (remaining <= 0) {
+          resolve(false);
+          return;
+        }
+        setTimeout(check, Math.min(STREAM_FLUSH_MS, remaining));
+      };
+      check();
+    });
+    if (fullyDrained) return;
+
+    // Do not leave a scheduled residual able to send after `done`, especially
+    // once the role runner has closed the socket. seq is assigned at emit time,
+    // so dropping these unsent items cannot create a sequence gap.
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.queue.drain();
+    this.emit('status', '[strategic-session] done', 'done');
   }
 
   status(text: string): void {

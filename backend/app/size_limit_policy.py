@@ -453,18 +453,29 @@ def stale_cap_limit(actual_line_count: int) -> int:
     )
 
 
-def is_breach(count: int | None, cap: int | None) -> bool:
-    """True when ``count`` breaches ``cap`` — the guardrail's fundamental predicate.
+def is_breach(
+    count: int | None,
+    cap: int | None,
+    *,
+    base_count: int | None = None,
+) -> bool:
+    """True when a count is a new or grown breach of a cap.
 
     A record is in breach only when BOTH ``count`` and ``cap`` are present AND
     ``count > cap``. A file absent at the ref (``count is None``) is never a
-    breach — a missing file cannot have grown past its cap. Centralized here in
-    the policy module (the documented single source of truth for the size
-    guardrail) so the standalone checker, the CI-compliance evaluator, and any
-    server-side classification agree on the comparison byte-for-byte instead of
-    re-deriving it inline.
+    breach — a missing file cannot have grown past its cap. When ``base_count``
+    is supplied, an otherwise-breaching record is inherited when its current
+    count is no larger than the baseline; missing baseline evidence is treated
+    as introduced (fail closed). This optional baseline argument keeps the
+    absolute breach and introduced-vs-inherited attribution rules in one
+    dependency-free primitive for every evaluator.
     """
-    return count is not None and cap is not None and count > cap
+    return (
+        count is not None
+        and cap is not None
+        and count > cap
+        and (base_count is None or count > base_count)
+    )
 
 
 def resolve_effective_cap(
@@ -1006,6 +1017,7 @@ def rebuild_cap_bump_history_ledger(
         tuple[str, str, int, int]
         | tuple[str, str, int, int, str, str]
     ] | None = None,
+    repair_targets: set[tuple[str, str]] | None = None,
 ) -> dict:
     """Regenerate the cap-bump-history ledger and write it; return the dict.
 
@@ -1017,6 +1029,8 @@ def rebuild_cap_bump_history_ledger(
     ``check_size_limits.py --fix`` passes the bumps it applies as ``pending``,
     and the rollup size preflight appends its auto-bumps via
     :func:`ledger_with_pending_bumps` before committing both files together.
+    A non-None ``repair_targets`` restricts this write to those ledger keys,
+    preserving all unrelated existing entries during an attributed task repair.
 
     When git is absent or the checkout is truncated (the mainline ancestry
     crosses a ``.git/shallow`` boundary — a shallow task-VM clone, CI's depth-1
@@ -1142,6 +1156,29 @@ def rebuild_cap_bump_history_ledger(
         )
         if phantoms:
             base_history = _prune_phantom_records(base_history, phantoms)
+
+    if repair_targets is not None:
+        # A target-scoped cap repair still needs the canonical ledger mutation
+        # for the cap it bumped, but must not use that necessary write as an
+        # opportunity to regenerate, prune, or attribute other keys. Preserve
+        # non-target entries from the original mirror after all normal policy
+        # calculations, then retain only calculated entries for the targets.
+        restricted_history: dict = {}
+        for section, records in existing_history.items():
+            if not isinstance(records, dict):
+                continue
+            preserved = {
+                key: value
+                for key, value in records.items()
+                if (section, key) not in repair_targets
+            }
+            if preserved:
+                restricted_history[section] = preserved
+        for section, key in repair_targets:
+            records = base_history.get(section, {})
+            if key in records:
+                restricted_history.setdefault(section, {})[key] = records[key]
+        base_history = restricted_history
 
     ledger = {
         "_doc": (

@@ -1,16 +1,4 @@
-"""Review-target drift helpers for the approval fence.
-
-Extracted from ``task_lifecycle`` verbatim. Both functions answer the same
-question from different angles -- what is this PR's *current* immutable review
-target, and does a move in that target actually invalidate an existing
-approval -- and both are defence in depth around the review lifecycle rather
-than part of it, so they read better beside each other than buried in the
-lifecycle module.
-
-Behaviour is unchanged, including the deliberate fail-closed posture: any
-missing provenance, compare failure, or unreachable GitHub keeps the existing
-stale-approval outcome rather than silently accepting a stale review.
-"""
+"""Shared review-target drift checks for approval and change-request fences."""
 
 from __future__ import annotations
 
@@ -21,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Task
 
 logger = logging.getLogger(__name__)
+_GITHUB_PR_FILES_MAX = 3000
 
 
 async def _resolve_live_review_target(
@@ -28,12 +17,7 @@ async def _resolve_live_review_target(
     session: AsyncSession,
     pr_number: int,
 ) -> dict[str, str | int] | None:
-    """Return the PR's current immutable review target, when GitHub is reachable.
-
-    Target-aware review deduplication is defence in depth, so a transient
-    metadata lookup must not block the normal review lifecycle.  Callers pass
-    ``None`` on failure and retain the legacy same-chain guard in that case.
-    """
+    """Return the PR's current immutable review target, when GitHub is reachable."""
     try:
         from app.github import get_pull_request
         from app.routers.agent import get_github_token_for_task
@@ -55,7 +39,7 @@ async def _resolve_live_review_target(
                 "base_sha": base_sha,
                 "head_sha": head_sha,
             }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - target lookup is best-effort
         logger.info(
             "[REVIEW PIPELINE] Could not resolve immutable review target for "
             "PR #%s (task %s): %s — using legacy same-chain dedup",
@@ -70,24 +54,19 @@ async def _base_move_invalidates_approval(
     task: Task,
     session: AsyncSession,
     *,
+    pr_number: int | None = None,
     reviewed_base_sha: str,
     reviewed_head_sha: str,
     live_base_sha: str,
     live_head_sha: str,
 ) -> bool:
-    """Return whether a moved base still makes an approval stale.
+    """Return whether moved-base traffic invalidates the reviewed guidance.
 
-    A base move is material only when the files changed by that move overlap
-    the files in the reviewed ``reviewed_base_sha..reviewed_head_sha`` diff.
-    File-level overlap is deliberately conservative: it may re-review two
-    independent edits in one file, but it cannot prove that line-level edits
-    compose safely.  Missing provenance, a compare failure, malformed output,
-    or GitHub's capped compare response all return ``True`` so an indeterminate
-    result keeps the existing fail-closed stale-approval behavior.
-
-    This is not a replacement for the immutable head/base fence.  It only
-    prevents unrelated base traffic from invalidating an otherwise exact
-    approval; a changed head remains stale at the caller.
+    A base move is material only when its changed files overlap the files in
+    the reviewed PR diff.  The moved-base compare remains fail-closed because
+    GitHub caps its inline compare file collection.  For the reviewed PR,
+    use the paginated files endpoint whenever ``pr_number`` is available so a
+    large rollup is not mistaken for an incomplete comparison.
     """
     if reviewed_base_sha == live_base_sha:
         return False
@@ -101,6 +80,7 @@ async def _base_move_invalidates_approval(
 
     try:
         from app.github_refs import get_changed_files_with_patches_between_refs
+        from app.github import get_pr_files
         from app.routers.agent import get_github_token_for_task
 
         token, owner, repo = await get_github_token_for_task(task.id, session)
@@ -113,24 +93,57 @@ async def _base_move_invalidates_approval(
             live_base_sha,
             project_id=project_id,
         )
-        reviewed_diff = await get_changed_files_with_patches_between_refs(
-            token,
-            owner,
-            repo,
-            reviewed_base_sha,
-            reviewed_head_sha,
-            project_id=project_id,
-        )
-        if base_move is None or reviewed_diff is None:
+        if base_move is None:
             return True
 
-        base_files = {row["filename"] for row in base_move}
-        reviewed_files = {row["filename"] for row in reviewed_diff}
+        if pr_number is not None:
+            reviewed_diff = await get_pr_files(
+                token,
+                owner,
+                repo,
+                int(pr_number),
+                project_id=project_id,
+            )
+        else:
+            reviewed_diff = await get_changed_files_with_patches_between_refs(
+                token,
+                owner,
+                repo,
+                reviewed_base_sha,
+                reviewed_head_sha,
+                project_id=project_id,
+            )
+
+        if (
+            pr_number is not None
+            and isinstance(reviewed_diff, list)
+            and len(reviewed_diff) >= _GITHUB_PR_FILES_MAX
+        ):
+            # get_pr_files is bounded at GitHub's 30-page/3000-file limit and
+            # does not expose whether that bound was reached.
+            return True
+
+        def _validated_filenames(rows: object) -> set[str] | None:
+            if not isinstance(rows, list):
+                return None
+            names: set[str] = set()
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(
+                    row.get("filename"), str
+                ):
+                    return None
+                names.add(row["filename"])
+            return names
+
+        base_files = _validated_filenames(base_move)
+        reviewed_files = _validated_filenames(reviewed_diff)
+        if base_files is None or reviewed_files is None:
+            return True
         return bool(base_files & reviewed_files)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - comparison must fail closed
         logger.warning(
             "[REVIEW PIPELINE] Could not compare moved base against reviewed "
-            "PR diff for task %s — keeping approval stale: %s",
+            "PR diff for task %s — keeping review stale: %s",
             task.id,
             exc,
         )

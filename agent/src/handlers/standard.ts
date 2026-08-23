@@ -634,7 +634,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       try {
         await fs.promises.writeFile(
           `/tmp/test_baseline_${taskId}.json`,
-          JSON.stringify(Array.from(baselineFailures)),
+          JSON.stringify(baselineFailures),
           { mode: 0o644 },
         );
       } catch (e) {

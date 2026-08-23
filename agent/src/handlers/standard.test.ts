@@ -1281,15 +1281,17 @@ describe('test baseline capture', () => {
     expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
   });
 
-  it('writes test_baseline file when captureTestBaseline returns a non-null set', async () => {
+  it('writes test_baseline file when captureTestBaseline returns structured records', async () => {
     const { default: fs } = await import('fs');
-    vi.mocked(captureTestBaseline).mockResolvedValue(new Set(['test A', 'test B']));
+    vi.mocked(captureTestBaseline).mockResolvedValue({
+      records: [{ route: 'test A', testcase: 'test B', kind: 'failure', detail: 'baseline detail' }],
+    });
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const baselineCalls = vi.mocked(fs.promises.writeFile).mock.calls.filter(c => (c[0] as string).includes('test_baseline_'));
     expect(baselineCalls).toHaveLength(1);
     expect(baselineCalls[0][0]).toBe(`/tmp/test_baseline_${TASK_ID}.json`);
-    expect(baselineCalls[0][1] as string).toContain('test A');
+    expect(baselineCalls[0][1] as string).toContain('baseline detail');
   });
 
   it('does not write test_baseline file when captureTestBaseline returns null', async () => {

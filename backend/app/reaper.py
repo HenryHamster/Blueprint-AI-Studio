@@ -447,7 +447,7 @@ async def reaper_service():
     )
     from app.alert_dispatch import (
         _maybe_create_failure_alert,
-        sweep_resolve_terminal_task_alerts,
+        sweep_resolve_policy_retirement_alerts,
     )
     from app.routers.agent_status import record_task_result
     from app.broadcast import broadcast_to_project
@@ -2964,18 +2964,16 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 12-b: Retire "task is stuck" alerts whose task has since
-                # gone terminal. Step 12 above resolves the escalation alert on
-                # the *resume* path; nothing resolved any of them when the task
-                # simply ended, which is where almost all of them end up. This
-                # is condition-derived (it re-reads the task's status) so no
-                # termination path can forget to call it.
+                # Step 12-b: Reconcile policy-owned alert retirements. This
+                # includes terminal task conditions and legacy durable rows
+                # whose current policy is timeline-only; source-condition
+                # alerts are resolved by their producer's recovery path.
                 _mark_reaper_progress()
                 try:
-                    await sweep_resolve_terminal_task_alerts(session)
+                    await sweep_resolve_policy_retirement_alerts(session)
                 except Exception as e:
                     logger.error(
-                        f"[REAPER] Terminal task-alert reconcile error: {e}",
+                        f"[REAPER] Policy alert-retirement reconcile error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

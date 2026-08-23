@@ -817,6 +817,12 @@ def classify_merge_test_verdict(
     absent / old-shape verdict) does NOT block — an older agent that emits no
     ``documentedCommands`` behaves exactly as before.
 
+    Unverifiable baseline attribution (blocks): ``verificationUnverified`` means
+    the verify agent could not establish which failures belong to the PR (base
+    checkout failed / no structured failure report / comparator unavailable), so
+    the diff is UNVERIFIED. It maps to ``"fail"`` — the condition is
+    deterministic, so falling open would merge unverified on every retry.
+
     Newly-disabled tests (VISIBILITY-ONLY, never blocks): the agent may attach a
     ``disabledTests`` block when the PR's own diff NEWLY introduces test-skip /
     disable markers. It is parsed defensively via :func:`disabled_tests_block` and
@@ -862,6 +868,26 @@ def classify_merge_test_verdict(
             or "Partial setup failure: one or more test runners could not run "
             "their suite (environment/setup error); the suite is only partially "
             "verified.",
+        )
+    # UNVERIFIABLE BASELINE ATTRIBUTION (blocks): the verify agent ran (or tried
+    # to run) the suite but could NOT establish which failures are the PR's own
+    # — the base checkout failed, no structured failure report was produced, or
+    # the canonical comparator was unavailable/invalid. Nothing was proven about
+    # this diff, and the condition is DETERMINISTIC (it reproduces on every
+    # re-spawn), so treating it as a crash would burn the bounded verify retries
+    # and then merge UNVERIFIED every single time. Fail closed instead: block the
+    # merge so the unverifiable state is visible and fixable. Checked before the
+    # ``detected is False`` fall-open (the agent posts detected=false on this
+    # path) and before the ``passed`` branch. Older agents that never emit the
+    # flag (falsy) fall through to the existing behavior unchanged.
+    if verdict.get("verificationUnverified"):
+        output = str(verdict.get("output") or "").strip()
+        return (
+            "fail",
+            output
+            or "Test verification could not attribute failures against the base "
+            "branch (missing structured report / unavailable comparator / base "
+            "checkout failure); the diff is UNVERIFIED, so the merge is blocked.",
         )
     # PR-CAUSED SELF-SUPPRESSION (blocks): the PR's OWN diff newly introduced
     # skip/disable markers (a well-formed ``disabledTests`` block) AND the
@@ -975,6 +1001,35 @@ def probe_is_clear_failure(probe: Any) -> bool:
     if probe.get("could_not_run"):
         return False
     return probe.get("passed") is False
+
+
+def verdict_from_failed_verify_artifact(artifact: Any) -> dict[str, Any] | None:
+    """The verdict a FAILED verify task's artifact must still feed, if any.
+
+    A FAILED verify task is normally treated as a CRASH (no usable verdict →
+    bounded re-spawns → UNVERIFIED merge once the retries are exhausted). That is
+    correct for transient infra noise, but two artifact shapes are DETERMINISTIC
+    — they reproduce on every re-spawn — so letting them ride the crash path
+    guarantees an UNVERIFIED merge:
+
+      - the cheap acceptance probe RAN and the changed code CLEARLY failed to
+        compile/build (:func:`probe_is_clear_failure`), and
+      - ``verificationUnverified``: the agent could not attribute failures
+        against the base branch (base checkout failed / no structured failure
+        report / comparator unavailable), so nothing was proven about the diff.
+
+    Both must fail CLOSED. Returning the artifact makes the caller feed it to
+    :func:`classify_merge_test_verdict`, which maps it to a merge BLOCK. Returns
+    ``None`` for every other shape (including a non-dict / missing artifact), so
+    a genuine crash keeps its retry-then-fall-open behavior.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    if probe_is_clear_failure(artifact.get("probe")):
+        return artifact
+    if artifact.get("verificationUnverified"):
+        return artifact
+    return None
 
 
 def declared_build_is_clear_failure(probe: Any) -> bool:

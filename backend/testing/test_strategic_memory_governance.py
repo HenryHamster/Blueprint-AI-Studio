@@ -205,20 +205,39 @@ async def test_native_delete_fails_closed_when_attachment_storage_is_not_erased(
     assert (await db_session.get(ProjectMessage, message.id)).content == "message with attachment"
 
 
-def test_memory_v2_rollout_defaults_off_and_respects_an_explicit_project_allowlist(monkeypatch):
-    monkeypatch.delenv("STRATEGIC_MEMORY_V2_READ_ENABLED", raising=False)
-    monkeypatch.delenv("STRATEGIC_MEMORY_V2_SHADOW_ENABLED", raising=False)
-    monkeypatch.delenv("STRATEGIC_MEMORY_V2_ACTIONS_ENABLED", raising=False)
-    monkeypatch.delenv("STRATEGIC_MEMORY_V2_BACKFILL_ENABLED", raising=False)
-    monkeypatch.delenv("STRATEGIC_MEMORY_V2_PROJECT_IDS", raising=False)
-    assert not memory_v2_rollout().read_enabled
+def test_memory_v2_retrieval_defaults_on_while_mutating_surfaces_stay_closed(monkeypatch):
+    """Read is on by default; every mutating surface still requires opt-in.
+
+    Retrieval shipped dark for its entire life -- ``STRATEGIC_MEMORY_V2_READ_ENABLED``
+    is read by ``memory_v2_rollout`` and set in no config file anywhere in the
+    tree -- so knowledge documents accumulated that nothing ever read. The
+    default is now open. Both escape hatches must keep working, or "default on"
+    would be irreversible during an incident.
+    """
+    for name in (
+        "STRATEGIC_MEMORY_V2_READ_ENABLED",
+        "STRATEGIC_MEMORY_V2_SHADOW_ENABLED",
+        "STRATEGIC_MEMORY_V2_ACTIONS_ENABLED",
+        "STRATEGIC_MEMORY_V2_BACKFILL_ENABLED",
+        "STRATEGIC_MEMORY_V2_PROJECT_IDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert memory_v2_rollout().read_enabled
+    # Shadow is a comparison harness; actions and backfill mutate durable
+    # semantic history. All three stay fail-closed.
     assert not memory_v2_rollout().shadow_enabled
     assert not memory_v2_rollout().actions_enabled
     assert not memory_v2_rollout().backfill_enabled
+
+    # Escape hatch 1: the explicit kill switch must survive the default flip.
+    monkeypatch.setenv("STRATEGIC_MEMORY_V2_READ_ENABLED", "0")
+    assert not memory_v2_rollout().read_enabled
+    monkeypatch.delenv("STRATEGIC_MEMORY_V2_READ_ENABLED", raising=False)
+
+    # Escape hatch 2: an allow-list, when supplied, still fences every surface.
     project_id = uuid.uuid4()
     monkeypatch.setenv("STRATEGIC_MEMORY_V2_BACKFILL_ENABLED", "true")
     assert not memory_v2_rollout(project_id).backfill_enabled
-    monkeypatch.setenv("STRATEGIC_MEMORY_V2_READ_ENABLED", "true")
     monkeypatch.setenv("STRATEGIC_MEMORY_V2_PROJECT_IDS", str(project_id))
     assert memory_v2_rollout(project_id).read_enabled
     assert memory_v2_rollout(project_id).backfill_enabled

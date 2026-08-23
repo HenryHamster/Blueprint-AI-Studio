@@ -532,11 +532,9 @@ export default function App() {
   // of running its own independent timer (eliminating the duplicate assembly).
   const strategicPollEpochRef = useRef(0);
   const [strategicPollEpoch, setStrategicPollEpoch] = useState(0);
-  // The single reconciled Workday status, reported up from MessagesPanel
-  // (which owns the conversation data it is derived from) so the header's
-  // StrategicSessionControl renders the same readout as the utility bar
-  // instead of deriving its own from raw session-lifecycle fields.
-  const [conversationWorkdayStatus, setConversationWorkdayStatus] = useState<ConversationWorkdayStatus | null>(null);
+  // Keep the legacy status-report callback stable for the panel contract; the
+  // visible status itself is owned by MessagesPanel's utility bar.
+  const [, setConversationWorkdayStatus] = useState<ConversationWorkdayStatus | null>(null);
   useEffect(() => {
     if (strategicReadModel.data) {
       strategicPollEpochRef.current += 1;
@@ -1299,7 +1297,6 @@ export default function App() {
                 saving={savingStrategicWorkbench}
                 sessionActive={strategicSessionActive}
                 sessionState={strategicSessionState}
-                workdayStatus={conversationWorkdayStatus}
                 sessionBusy={strategicSessionBusy}
                 sessionRunners={residentStrategicSessionRunners}
                 sessionSelectedRunnerId={strategicSessionSelectedRunnerId}

@@ -20,7 +20,11 @@ from typing import cast
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
-from testing.identity_extraction import count_python_test_ids, extract_python_test_ids
+from testing.identity_extraction import (
+    count_python_test_ids,
+    extract_python_test_ids,
+    extract_typescript_test_ids,
+)
 
 MANIFEST_PATH = Path(__file__).resolve().parent / "conversational_workday_manifest.json"
 
@@ -46,82 +50,12 @@ def _load_manifest() -> dict:
         return cast(dict, json.load(fh))
 
 
-def _extract_ts_it_labels(source: str) -> set[str]:
-    """Extract all it('...') / it("...") / it(`...`) labels from TS source.
-
-    Handles all three JS/TS quote styles.  A single-quote-only regex would
-    silently miss labels written as it("…") or it(`…`), allowing a new test
-    to escape the manifest-completeness check and nullify the anti-deletion
-    guarantee.
-    """
-    import re
-
-    labels: set[str] = set()
-    for m in re.finditer(
-        r"""^\s*it\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)""",
-        source,
-        re.MULTILINE,
-    ):
-        label = m.group(1) or m.group(2) or m.group(3)
-        if label:
-            labels.add(label)
-    return labels
-
-
-def _extract_ts_it_each_labels(source: str) -> set[str]:
-    """Extract it.each(…)(label, …) template strings from TS source.
-
-    Handles all three JS/TS quote styles so that it.each(…)("label") and
-    it.each(…)(`label`) forms are not silently skipped.
-    """
-    import re
-
-    labels: set[str] = set()
-    for m in re.finditer(
-        r"""it\.each\b[\s\S]*?\)\s*\(\s*\n?\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)""",
-        source,
-    ):
-        label = m.group(1) or m.group(2) or m.group(3)
-        if label:
-            labels.add(label)
-    return labels
-
-
-def _extract_ts_test_labels(source: str) -> set[str]:
-    """Extract all test('...') / test("...") / test(`...`) labels from TS source.
-
-    Handles all three JS/TS quote styles so that a test added as test("…") or
-    test(`…`) is not silently missed by a single-quote-only regex.
-    """
-    import re
-
-    labels: set[str] = set()
-    for m in re.finditer(
-        r"""^\s*test\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)""",
-        source,
-        re.MULTILINE,
-    ):
-        label = m.group(1) or m.group(2) or m.group(3)
-        if label:
-            labels.add(label)
-    return labels
-
-
-def _extract_python_test_labels(source: str) -> set[str]:
-    """Return manifest labels derived from canonical Python identities."""
-    return {test_id.rsplit("::", 1)[-1] for test_id in extract_python_test_ids(source)}
-
-
-def _extract_test_labels(path: str, source: str) -> set[str]:
+def _extract_test_ids(path: str, source: str) -> set[str]:
     """Extract all test identities supported by a protected test file."""
     if path.endswith(".py"):
-        return _extract_python_test_labels(source)
+        return extract_python_test_ids(source)
     if path.endswith((".ts", ".tsx")):
-        return (
-            _extract_ts_it_labels(source)
-            | _extract_ts_it_each_labels(source)
-            | _extract_ts_test_labels(source)
-        )
+        return extract_typescript_test_ids(source)
     return set()
 
 
@@ -137,13 +71,13 @@ def _find_completeness_violations(manifest: dict, repo_root: Path) -> list[dict]
         if not full_path.exists():
             continue
 
-        actual_labels = _extract_test_labels(
+        actual_ids = _extract_test_ids(
             target_path,
             full_path.read_text(encoding="utf-8"),
         )
-        listed_labels = set(entry["test_ids"])
-        missing_from_manifest = sorted(actual_labels - listed_labels)
-        extra_in_manifest = sorted(listed_labels - actual_labels)
+        listed_ids = set(entry["test_ids"])
+        missing_from_manifest = sorted(actual_ids - listed_ids)
+        extra_in_manifest = sorted(listed_ids - actual_ids)
         if missing_from_manifest or extra_in_manifest:
             violations.append(
                 {
@@ -155,16 +89,30 @@ def _find_completeness_violations(manifest: dict, repo_root: Path) -> list[dict]
     return violations
 
 
+def _find_existence_violations(manifest: dict, repo_root: Path) -> list[str]:
+    """Return manifest identities no longer present in protected test files."""
+    missing: list[str] = []
+    for entry in manifest["protect"]:
+        full_path = repo_root / entry["path"]
+        if not full_path.exists():
+            continue
+        actual_ids = _extract_test_ids(
+            entry["path"], full_path.read_text(encoding="utf-8")
+        )
+        missing.extend(
+            f"{entry['path']}::{test_id}"
+            for test_id in entry["test_ids"]
+            if test_id not in actual_ids
+        )
+    return missing
+
+
 def _protected_test_count(path: str, source: str) -> int | None:
     """Return the collector-faithful test count for a protected source file."""
     if path.endswith(".py"):
         return count_python_test_ids(source)
     if path.endswith((".ts", ".tsx")):
-        return len(
-            _extract_ts_it_labels(source)
-            | _extract_ts_it_each_labels(source)
-            | _extract_ts_test_labels(source)
-        )
+        return len(extract_typescript_test_ids(source))
     return None
 
 
@@ -321,25 +269,13 @@ def test_no_duplicate_test_ids_in_protect_entry():
 def test_all_protect_test_ids_exist_in_their_files():
     """Every test_id listed in a protect entry must exist in its test file.
 
-    For Python files: scans for a matching def/async-def line (exact function
-    name). For TypeScript/TSX files: scans for the test_id as a quoted literal
-    (the it()/test()/describe() label string). A test can be deleted or renamed
-    with the path guard still green — this check closes that gap.
+    Python test IDs use the canonical ``Class::method`` identity, while
+    TypeScript/TSX test IDs are their it()/test()/describe() label strings.
+    A test can be deleted or renamed with the path guard still green — this
+    check closes that gap.
     """
     manifest = _load_manifest()
-    missing = []
-    for entry in manifest["protect"]:
-        full_path = REPO_ROOT / entry["path"]
-        if not full_path.exists():
-            # test_all_protect_paths_exist already covers this; skip here
-            continue
-        source = full_path.read_text(encoding="utf-8")
-        actual_labels = _extract_test_labels(entry["path"], source)
-        missing.extend(
-            f"{entry['path']}::{test_id}"
-            for test_id in entry["test_ids"]
-            if test_id not in actual_labels
-        )
+    missing = _find_existence_violations(manifest, REPO_ROOT)
 
     assert not missing, (
         "The following PROTECT-listed test_ids no longer exist in their files. "
@@ -348,6 +284,50 @@ def test_all_protect_test_ids_exist_in_their_files():
         + "\n"
         + format_offender_marker(missing)
     )
+
+
+def test_existence_and_completeness_use_the_canonical_class_qualified_identities(
+    tmp_path: Path,
+):
+    """Same-named class methods stay distinct in both manifest protections."""
+    source = (
+        "class FirstTest:\n"
+        "    def test_shared(self): pass\n"
+        "class SecondTest:\n"
+        "    def test_shared(self): pass\n"
+    )
+    path = "testing/test_identity_sample.py"
+    target = tmp_path / path
+    target.parent.mkdir()
+    target.write_text(source, encoding="utf-8")
+    manifest = {
+        "protect": [
+            {
+                "path": path,
+                "test_ids": ["FirstTest::test_shared", "SecondTest::test_shared"],
+                "completeness": "all",
+            }
+        ]
+    }
+
+    assert _find_existence_violations(manifest, tmp_path) == []
+    assert _find_completeness_violations(manifest, tmp_path) == []
+
+    bare_manifest = {
+        "protect": [
+            {**manifest["protect"][0], "test_ids": ["test_shared"]}
+        ]
+    }
+    assert _find_existence_violations(bare_manifest, tmp_path) == [
+        f"{path}::test_shared"
+    ]
+    assert _find_completeness_violations(bare_manifest, tmp_path) == [
+        {
+            "path": path,
+            "missing": ["FirstTest::test_shared", "SecondTest::test_shared"],
+            "extra": ["test_shared"],
+        }
+    ]
 
 
 def test_every_protected_file_meets_declared_test_count():
@@ -839,18 +819,19 @@ def test_completeness_markers_identify_the_existing_full_suites():
     assert "backend/testing/test_reaper.py" not in marked
 
 
-def test_extract_test_labels_dispatches_python_and_typescript():
-    """The generic extractor covers Python, it.each, and test labels."""
-    assert _extract_test_labels(
+def test_extract_test_ids_dispatches_python_and_typescript():
+    """The generic extractor covers Python identities, it.each, and test labels."""
+    assert _extract_test_ids(
         "example.py",
         "def test_python_case():\n    pass\n",
     ) == {"test_python_case"}
-    assert _extract_test_labels(
+    assert _extract_test_ids(
         "example.test.tsx",
         "it('it case', () => {})\n"
         "it.each([['x']])('each %s', () => {})\n"
-        'test("test case", () => {})\n',
-    ) == {"it case", "each %s", "test case"}
+        'test("test case", () => {})\n'
+        "test.each([[1]])(`test each $value`, () => {})\n",
+    ) == {"it case", "each %s", "test case", "test each $value"}
 
 
 def test_completeness_checker_ignores_partial_and_reports_missing_and_extra(tmp_path):
@@ -925,7 +906,7 @@ def test_no_removed_resident_task_type_in_task_capabilities():
 
 
 # ---------------------------------------------------------------------------
-# Unit tests for _extract_ts_it_labels / _extract_ts_it_each_labels helpers
+# Unit tests for the shared TypeScript identity extractor
 #
 # These tests verify that the manifest-completeness guards collect test labels
 # regardless of which JS/TS quote style is used. A single-quote-only regex
@@ -935,48 +916,48 @@ def test_no_removed_resident_task_type_in_task_capabilities():
 
 
 def test_ts_label_extraction_single_quoted():
-    """_extract_ts_it_labels must collect single-quoted it() labels."""
+    """The shared extractor collects single-quoted it() labels."""
     source = "  it('finds single-quoted label', () => { expect(1).toBe(1) })\n"
-    labels = _extract_ts_it_labels(source)
+    labels = extract_typescript_test_ids(source)
     assert labels == {"finds single-quoted label"}, (
         f"Expected {{'finds single-quoted label'}}, got {labels!r}"
     )
 
 
 def test_ts_label_extraction_double_quoted():
-    """_extract_ts_it_labels must collect double-quoted it() labels.
+    """The shared extractor collects double-quoted it() labels.
 
     A regex that only matches single quotes silently misses this form, so a
     test added as it("new test") would escape the manifest-completeness check.
     """
     source = '  it("finds double-quoted label", () => { expect(1).toBe(1) })\n'
-    labels = _extract_ts_it_labels(source)
+    labels = extract_typescript_test_ids(source)
     assert labels == {"finds double-quoted label"}, (
         f"Expected {{'finds double-quoted label'}}, got {labels!r}"
     )
 
 
 def test_ts_label_extraction_backtick_quoted():
-    """_extract_ts_it_labels must collect backtick-quoted it() labels.
+    """The shared extractor collects backtick-quoted it() labels.
 
     A regex that only matches single quotes silently misses this form, so a
     test added as it(`new test`) would escape the manifest-completeness check.
     """
     source = "  it(`finds backtick-quoted label`, () => { expect(1).toBe(1) })\n"
-    labels = _extract_ts_it_labels(source)
+    labels = extract_typescript_test_ids(source)
     assert labels == {"finds backtick-quoted label"}, (
         f"Expected {{'finds backtick-quoted label'}}, got {labels!r}"
     )
 
 
 def test_ts_label_extraction_mixed_quote_styles():
-    """_extract_ts_it_labels collects labels from all three quote styles in one file."""
+    """The shared extractor collects all three quote styles in one file."""
     source = (
         "  it('single-quoted', () => {})\n"
         '  it("double-quoted", () => {})\n'
         "  it(`backtick-quoted`, () => {})\n"
     )
-    labels = _extract_ts_it_labels(source)
+    labels = extract_typescript_test_ids(source)
     assert labels == {"single-quoted", "double-quoted", "backtick-quoted"}, (
         f"Expected all three quote styles captured, got {labels!r}"
     )
@@ -988,7 +969,7 @@ def test_ts_label_extraction_single_quote_only_regex_misses_double_quoted():
     This test documents the negative case: using a single-quote-only pattern
     (the previous implementation) on a source that contains only a
     double-quoted it() call produces an empty set — no guard failure would
-    fire for a manifest that does not list the label.  _extract_ts_it_labels
+    fire for a manifest that does not list the label.  The shared extractor
     fixes this by handling all three quote styles.
     """
     import re
@@ -1009,7 +990,7 @@ def test_ts_label_extraction_single_quote_only_regex_misses_double_quoted():
     )
 
     # The fixed helper correctly finds the label.
-    fixed_result = _extract_ts_it_labels(source)
+    fixed_result = extract_typescript_test_ids(source)
     assert fixed_result == {"unlisted double-quoted test"}, (
         f"Fixed helper should find the double-quoted label, got {fixed_result!r}"
     )
@@ -1033,7 +1014,7 @@ def test_ts_label_extraction_single_quote_only_regex_misses_backtick():
         + format_offender_marker(old_regex_result)
     )
 
-    fixed_result = _extract_ts_it_labels(source)
+    fixed_result = extract_typescript_test_ids(source)
     assert fixed_result == {"unlisted backtick test"}, (
         f"Fixed helper should find the backtick label, got {fixed_result!r}"
     )
@@ -1106,40 +1087,40 @@ def test_reaper_resident_exemption_seam_is_guarded():
 
 
 def test_ts_it_each_label_extraction_double_quoted():
-    """_extract_ts_it_each_labels must collect double-quoted it.each templates."""
+    """The shared extractor collects double-quoted it.each templates."""
     source = (
         "  it.each([\n"
         "    ['a'], ['b'],\n"
         "  ])(\"handles %s in double quotes\", (val) => { expect(val).toBeTruthy() })\n"
     )
-    labels = _extract_ts_it_each_labels(source)
+    labels = extract_typescript_test_ids(source)
     assert labels == {"handles %s in double quotes"}, (
         f"Expected double-quoted it.each template captured, got {labels!r}"
     )
 
 
 def test_ts_it_each_label_extraction_backtick():
-    """_extract_ts_it_each_labels must collect backtick it.each templates."""
+    """The shared extractor collects backtick it.each templates."""
     source = (
         "  it.each([\n"
         "    ['a'], ['b'],\n"
         "  ])(`handles %s in backticks`, (val) => { expect(val).toBeTruthy() })\n"
     )
-    labels = _extract_ts_it_each_labels(source)
+    labels = extract_typescript_test_ids(source)
     assert labels == {"handles %s in backticks"}, (
         f"Expected backtick it.each template captured, got {labels!r}"
     )
 
 
 def test_ts_label_extraction_ignores_non_leading_it_calls():
-    """_extract_ts_it_labels must not collect inline 'it' mentions, only leading it()."""
+    """The shared extractor ignores inline 'it' mentions."""
     source = (
         "  it('valid test label', () => {\n"
         "    // a comment mentioning it('inline') or describe it('as follows')\n"
         "    expect(doIt('something')).toBe(true)\n"
         "  })\n"
     )
-    labels = _extract_ts_it_labels(source)
+    labels = extract_typescript_test_ids(source)
     # Only the first line should be collected; inline mentions must be ignored.
     assert labels == {"valid test label"}, (
         f"Expected only the leading it() to be collected, got {labels!r}"
@@ -1147,6 +1128,5 @@ def test_ts_label_extraction_ignores_non_leading_it_calls():
 
 
 def test_ts_label_extraction_empty_source():
-    """_extract_ts_it_labels returns an empty set for an empty source string."""
-    assert _extract_ts_it_labels("") == set()
-    assert _extract_ts_it_each_labels("") == set()
+    """The shared extractor returns an empty set for an empty source string."""
+    assert extract_typescript_test_ids("") == set()

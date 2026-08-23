@@ -48,6 +48,9 @@ export function ConversationUtilityBar({
   const workdayAge = workdayStatus?.lastActivityMs != null
     ? timeAgo(workdayStatus.lastActivityMs)
     : null;
+  const chatAge = chatChip?.lastActivityMs != null
+    ? timeAgo(chatChip.lastActivityMs)
+    : null;
   return (
     <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4">
       <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-wrap items-center gap-2">
@@ -154,6 +157,17 @@ export function ConversationUtilityBar({
                       </span>
                     </>
                   )}
+                </span>
+              </>
+            )}
+            {chatChip && chatAge && (
+              <>
+                <span aria-hidden="true" className="shrink-0 text-neutral-700">·</span>
+                <span
+                  data-testid="conversation-chat-age"
+                  className="shrink-0 text-neutral-600"
+                >
+                  {chatAge}
                 </span>
               </>
             )}

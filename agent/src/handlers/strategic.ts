@@ -6,7 +6,9 @@ import {
   apiGet, apiPost,
   resolveBaseBranch,
 } from '../index.js';
-import { VmConfigMissingError } from '../providers/runners.js';
+import { VmConfigMissingError, type ProviderRunObserver } from '../providers/runners.js';
+import { describeToolUse } from '../providers/resident-stream.js';
+import { SessionStreamer } from './session-streamer.js';
 import * as indexMod from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import {
@@ -451,6 +453,24 @@ export async function handleStrategic(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
+  // One-shot Strategic is the Chat-mode producer when no persistent Resident is
+  // running.  Its task id is stable for the complete turn; retain an explicitly
+  // supplied session id when a caller has one, otherwise use that task id as the
+  // self-contained session scope.
+  const taskContext = task.context && typeof task.context === 'object' && !Array.isArray(task.context)
+    ? task.context as Record<string, unknown>
+    : {};
+  const sessionId = strVal(taskContext.strategic_session_id) || strVal(payload.strategic_session_id) || taskId;
+  const sessionStreamer = new SessionStreamer(ws, sessionId, taskId);
+  const publicRunObserver: ProviderRunObserver = {
+    onAssistantText: (text) => { sessionStreamer.delta(text); },
+    onToolUse: (name, input) => {
+      const activity = describeToolUse(name, input);
+      if (activity) sessionStreamer.activity(activity.kind, activity.text);
+    },
+  };
+  sessionStreamer.responding();
+  try {
   const baseBranch = resolveBaseBranch(payload, task);
 
   // Clone — strategic still needs a workspace for writing helper scripts
@@ -1627,7 +1647,9 @@ ${proposedCriteriaBlock}
     }
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
-    let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);
+    let { exitCode, allOutput, lastResultText } = await runClaudeCode(
+      executorPrompt, ws, statusRef, model, effort, disallowedTools, undefined, publicRunObserver,
+    );
 
     // Post-check: verify the executor actually called ./strategic
     // set-problem-model AND ./strategic set-running-update. These are
@@ -1681,7 +1703,7 @@ ${proposedCriteriaBlock}
           'Nothing else.',
         ].filter(Boolean).join('\n');
         const retryResult = await runClaudeCode(
-          retryInstructions, ws, statusRef, model, effort, disallowedTools
+          retryInstructions, ws, statusRef, model, effort, disallowedTools, undefined, publicRunObserver,
         );
         exitCode = retryResult.exitCode;
         allOutput = allOutput + '\n' + retryResult.allOutput;
@@ -1727,7 +1749,7 @@ ${proposedCriteriaBlock}
           './strategic create-direction \'{"text": "...", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "..."}}\' \n\n' +
           'success_evidence and retirement_condition are required fields — the backend will reject the call with HTTP 400 if either is missing.\n\n' +
           'Extract the directions from the analysis and call the commands. Nothing else.',
-          ws, statusRef, model, effort, disallowedTools
+          ws, statusRef, model, effort, disallowedTools, undefined, publicRunObserver,
         );
         exitCode = retryResult.exitCode;
         allOutput = allOutput + '\n' + retryResult.allOutput;
@@ -1743,7 +1765,7 @@ ${proposedCriteriaBlock}
           './strategic approve-direction \'{"direction_id": "d-xxx", "rationale": "..."}\'\n' +
           './strategic reject-direction \'{"direction_id": "d-xxx", "rationale": "..."}\'\n\n' +
           'Extract the direction operation from the analysis and call the appropriate command. Nothing else.',
-          ws, statusRef, model, effort, disallowedTools
+          ws, statusRef, model, effort, disallowedTools, undefined, publicRunObserver,
         );
         exitCode = retryResult.exitCode;
         allOutput = allOutput + '\n' + retryResult.allOutput;
@@ -1779,4 +1801,11 @@ ${proposedCriteriaBlock}
       sendLog(ws, `[ERROR] Failed to post strategic completion status: ${String(e)}\n`);
     }
     return;
+  } finally {
+    // Every exit path — failed clone, thinker gate rejection, executor retry,
+    // normal completion, or an exception propagated to the outer classifier —
+    // closes the same ordered, rate-limited stream so Chat cannot remain live.
+    // This must settle before runRoleOnce closes its WebSocket in index.ts.
+    await sessionStreamer.finish();
+  }
 }

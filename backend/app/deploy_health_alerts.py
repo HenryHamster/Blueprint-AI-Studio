@@ -105,14 +105,18 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
     for project_id in project_ids:
         if project_id in already_alerted_pids:
             continue
-        alert = Alert(
+        alert, created, _decision = await create_project_alert_if_allowed(
+            session,
             project_id=project_id,
+            event_type="deployment.auto_pause",
             severity=AlertSeverity.WARNING,
             title=title,
             message=msg,
-            event_type="deployment.auto_pause",
+            source="deploy_health_alerts",
+            dedupe_key=f"deployment.auto_pause:{project_id}",
         )
-        session.add(alert)
+        if alert is None or not created:
+            continue
         await broadcast_to_project(
             str(project_id),
             "alert_created",
@@ -195,14 +199,18 @@ async def _create_forced_resume_alerts(
         warning.dismissed_at = now
         session.add(warning)
     for project_id in project_ids:
-        alert = Alert(
+        alert, created, _decision = await create_project_alert_if_allowed(
+            session,
             project_id=project_id,
+            event_type="deployment.forced_resume",
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
-            event_type="deployment.forced_resume",
+            source="deploy_health_alerts",
+            dedupe_key=f"deployment.forced_resume:{project_id}",
         )
-        session.add(alert)
+        if alert is None or not created:
+            continue
         await broadcast_to_project(
             str(project_id),
             "alert_created",
@@ -304,6 +312,25 @@ async def _create_auto_resume_alerts(
     for warning in all_existing_warnings:
         warning.dismissed_at = now
         session.add(warning)
+    if not flapping:
+        # A healthy resume ends the force-resume condition too. Retire rows
+        # from both the pre-policy emitter and the policy-owned dedupe path.
+        forced_resume_alerts = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id.in_(project_ids),
+                        Alert.event_type == "deployment.forced_resume",
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for forced_resume in forced_resume_alerts:
+            forced_resume.dismissed_at = now
+            session.add(forced_resume)
     # Retire the pre-dedupe backlog of this same family. Rows minted by the old
     # emitter carry no dedupe_key, so the upsert below can neither find nor
     # supersede them and they would stay open forever. Deliberately scoped to

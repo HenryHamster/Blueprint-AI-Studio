@@ -110,11 +110,20 @@ def memory_v2_rollout(project_id: uuid.UUID | None = None) -> MemoryV2Rollout:
     # fail-closed fence for every V2 surface (including envelope assembly).
     selected_here = not selected or (project_id is not None and str(project_id) in selected)
     return MemoryV2Rollout(
-        # V2 can only augment the prompt after an explicit rollout decision.
-        # Leaving this fail-closed preserves the established envelope core when
-        # a deployment has not opted a project/environment into the validated
-        # retrieval path yet.
-        read_enabled=selected_here and _env_bool("STRATEGIC_MEMORY_V2_READ_ENABLED", False),
+        # Retrieval is ON by default. It was previously fail-closed pending a
+        # per-deployment rollout decision, but that decision was never taken in
+        # any environment: the flag is read here and set in no config file, so
+        # 686 accumulated knowledge documents were being written and never read.
+        # A capability that ships dark is a capability that does not exist.
+        #
+        # Defaulting open is safe by construction rather than by optimism: the
+        # sole consumer (``strategic_memory_envelope``) wraps the retrieval call
+        # in a catch-all that logs and degrades back to the established V1
+        # envelope core, because "retrieval has no authority to block a live
+        # conversation". The kill switch survives -- an operator can still set
+        # STRATEGIC_MEMORY_V2_READ_ENABLED=0 to force it closed, or scope it with
+        # STRATEGIC_MEMORY_V2_PROJECT_IDS.
+        read_enabled=selected_here and _env_bool("STRATEGIC_MEMORY_V2_READ_ENABLED", True),
         shadow_enabled=selected_here and _env_bool("STRATEGIC_MEMORY_V2_SHADOW_ENABLED", False),
         actions_enabled=selected_here and _env_bool("STRATEGIC_MEMORY_V2_ACTIONS_ENABLED", False),
         # Historical ingestion is never a global switch: an explicit project

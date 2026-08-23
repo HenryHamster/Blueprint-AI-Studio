@@ -138,10 +138,10 @@
       "path": "backend/testing/test_admin_routers__messages.py",
       "reason": "Covers the operator message-create endpoint (POST /api/admin/projects/{id}/strategic-session/messages) and workbench-state session_started_at decay \u2014 all live conversational-Workday contracts. Split from test_admin_routers.py.",
       "test_ids": [
-        "test_strategic_session_message_idempotency_preserves_response_shape_and_broadcast",
-        "test_strategic_session_message_persists_workbench_snapshot_and_arms",
-        "test_strategic_session_message_allows_attachment_only_content",
-        "test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at"
+        "TestMessages::test_strategic_session_message_idempotency_preserves_response_shape_and_broadcast",
+        "TestMessages::test_strategic_session_message_persists_workbench_snapshot_and_arms",
+        "TestMessages::test_strategic_session_message_allows_attachment_only_content",
+        "TestMessagesWorkbenchState::test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at"
       ],
       "test_count": 140
     },
@@ -158,8 +158,8 @@
       "path": "backend/testing/test_admin_routers.py",
       "reason": "Covers strategic session settings persistence \u2014 live conversational-Workday contracts remaining in the main admin_routers test file.",
       "test_ids": [
-        "test_strategic_session_settings",
-        "test_strategic_session_settings_persist_across_sync"
+        "TestNotificationConfigSettings::test_strategic_session_settings",
+        "TestEvergreenFillSettingsPersist::test_strategic_session_settings_persist_across_sync"
       ],
       "test_count": 443
     },
@@ -232,7 +232,7 @@
         "renders the server-owned Workday request receipt on the Fast acknowledgement",
         "renders the server-owned Fast-only receipt on a reply without a Workday request"
       ],
-      "test_count": 31
+      "test_count": 32
     },
     {
       "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
@@ -280,7 +280,7 @@
         "treats message / reasoning / kind-less as reply, activity kinds as not",
         "builds the bubble from reply-kind deltas only (activity noise excluded)"
       ],
-      "test_count": 37
+      "test_count": 38
     },
     {
       "path": "admin-ui/src/utils/pendingAttachmentStore.test.ts",
@@ -324,9 +324,9 @@
       "path": "scripts/test_runner_isolation.py",
       "reason": "Protects the exact bwrap provider-CLI boundary used by conversational Workday. Host CLI evidence must not admit a runner whose sandbox PATH resolves a shadow Claude without the required Resident identity flags.",
       "test_ids": [
-        "test_host_selected_provider_cli_precedes_legacy_node_directory",
-        "test_agent_plan_probe_uses_exact_bwrap_boundary",
-        "test_agent_plan_probe_reports_sandbox_missing_resident_flag"
+        "TestAgentPlan::test_host_selected_provider_cli_precedes_legacy_node_directory",
+        "TestProbeLlmClis::test_agent_plan_probe_uses_exact_bwrap_boundary",
+        "TestProbeLlmClis::test_agent_plan_probe_reports_sandbox_missing_resident_flag"
       ],
       "test_count": 177
     },
@@ -334,7 +334,7 @@
       "path": "scripts/test_local_runner.py",
       "reason": "Protects heartbeat admission proof through the exact bwrap Agent plan before a conversational Workday session is assigned to a runner.",
       "test_ids": [
-        "test_bwrap_backend_probes_the_exact_agent_plan_when_available"
+        "TestLlmCliBackendProbe::test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ],
       "test_count": 664
     },
@@ -394,9 +394,11 @@
         "test_terminal_reconciler_never_restarts_superseded_or_stopped_worker",
         "test_active_one_shot_records_cycle_reason_then_completion_retries",
         "test_resident_retry_does_not_restore_task_declined_runner",
-        "test_workbench_and_work_session_arming_suppressed_during_resident_session"
+        "test_workbench_and_work_session_arming_suppressed_during_resident_session",
+        "test_operator_message_default_surface_is_the_serviced_lane",
+        "test_operator_message_default_arms_the_active_resident"
       ],
-      "test_count": 23
+      "test_count": 25
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
@@ -702,7 +704,7 @@
       "test_ids": [
         "renders warning work session signals and routes event targets"
       ],
-      "test_count": 55
+      "test_count": 57
     },
     {
       "path": "admin-ui/src/components/StrategicContextWorkspace.test.tsx",
@@ -726,7 +728,7 @@
         "drains only one queued handoff and immediately shows the next after chip removal",
         "test_streaming_preview_renders_math_and_citations_like_the_durable_message"
       ],
-      "test_count": 76
+      "test_count": 77
     },
     {
       "path": "admin-ui/src/hooks/useConversation.test.tsx",
@@ -1144,7 +1146,7 @@
         "an unresolved conflict refuses conversation handoff",
         "a failed flush never creates a conversation reference"
       ],
-      "test_count": 13
+      "test_count": 14
     },
     {
       "path": "admin-ui/src/components/WhiteboardTool.test.tsx",

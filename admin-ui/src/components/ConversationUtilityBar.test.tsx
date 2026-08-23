@@ -651,6 +651,7 @@ describe('ConversationUtilityBar Workday status', () => {
       phase: 'streaming',
       label: 'Replying',
       detail: 'grep release gate',
+      lastActivityMs: Date.now() - 5 * 60 * 1000,
     });
     const line = rendered.querySelector('[data-testid="conversation-workday-status"]');
 
@@ -661,6 +662,7 @@ describe('ConversationUtilityBar Workday status', () => {
     expect(line).not.toHaveAttribute('data-workday-state');
     expect(line).toHaveAttribute('aria-label', 'Strategic reply status');
     expect(line?.className).not.toContain('hidden');
+    expect(rendered.querySelector('[data-testid="conversation-chat-age"]')?.textContent).toBe('5m ago');
   });
 
   test('the Workday readout still owns the slot in continuous mode, even while a chat live state is non-null', () => {
@@ -682,7 +684,7 @@ describe('ConversationUtilityBar Workday status', () => {
     });
     const rendered = renderBar(
       workdayStatus,
-      { phase: 'streaming', label: 'Replying', detail: 'grep release gate' },
+      { phase: 'streaming', label: 'Replying', detail: 'grep release gate', lastActivityMs: fiveMinutesAgo },
       'continuous',
     );
     const line = rendered.querySelector('[data-testid="conversation-workday-status"]');
@@ -695,6 +697,7 @@ describe('ConversationUtilityBar Workday status', () => {
     expect(line).not.toHaveTextContent('Replying');
     expect(line).not.toHaveTextContent('grep release gate');
     expect(rendered.querySelector('[data-testid="conversation-workday-age"]')?.textContent).toBe('5m ago');
+    expect(rendered.querySelector('[data-testid="conversation-chat-age"]')).toBeNull();
   });
 
   test('the chat affordance still owns the slot in chat mode when the mode is passed explicitly', () => {

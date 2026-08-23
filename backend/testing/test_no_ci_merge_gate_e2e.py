@@ -41,6 +41,8 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from app.rollup_size_preflight import SizeCapPreflightResult
 from sqlalchemy import select
 
 from app.build_config_detection import persist_recovered_test_command
@@ -219,9 +221,12 @@ def _patch_github(mocker):
     )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("ok", None)),
+        AsyncMock(side_effect=_bound_ok),
     )
     mocker.patch(
         "app.review_merge_authority._fetch_live_review_target",

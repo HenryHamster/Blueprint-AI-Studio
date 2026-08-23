@@ -696,6 +696,10 @@ async def _persist_stale_review_evidence(
         if isinstance(row, dict) and row.get("review_task_id") != str(task.id)
     ]
     task_history = bound_review_history([*child_history, entry])
+    reviewed_target = review_loop.get("review_target")
+    preserved_reviewed_target = (
+        dict(reviewed_target) if isinstance(reviewed_target, dict) else None
+    )
     task_ledger = build_issue_ledger(
         task_history,
         **(
@@ -713,6 +717,12 @@ async def _persist_stale_review_evidence(
         "authoritative_review_required": True,
         **({"review_target": dict(live_target)} if live_target else {}),
     }
+    if preserved_reviewed_target is not None:
+        # ``review_target`` is the mutable respawn target. Keep the exact
+        # target that produced this late verdict as separate backend evidence
+        # so the cross-episode census cannot mistake the live target for the
+        # discarded generation.
+        gated_loop.setdefault("reviewed_target", preserved_reviewed_target)
     for key in ("review_not_required", "review_policy_reason", "verdict"):
         gated_loop.pop(key, None)
     task.context = {**(task.context or {}), "review_loop": gated_loop}
@@ -774,6 +784,8 @@ async def _persist_stale_review_evidence(
             **({"review_target": dict(live_target)} if live_target else {}),
         }
     )
+    if preserved_reviewed_target is not None:
+        parent_loop.setdefault("reviewed_target", preserved_reviewed_target)
     for key in ("review_not_required", "review_policy_reason", "verdict"):
         parent_loop.pop(key, None)
     orig.context = {**(orig.context or {}), "review_loop": parent_loop}
@@ -4205,6 +4217,7 @@ async def _process_post_commit(
                             await _base_move_invalidates_approval(
                                 task,
                                 session,
+                                pr_number=pr_number,
                                 reviewed_base_sha=reviewed_base_sha,
                                 reviewed_head_sha=reviewed_head_sha,
                                 live_base_sha=str(_live_approve_target["base_sha"]),
@@ -4358,13 +4371,16 @@ async def _process_post_commit(
                                 _pre_rollup_own: str | None = None
                                 _pre_rollup_rep: str | None = None
                                 _pre_rollup_mig_guard: object | None = None
-                                _pre_rollup_size_cap: (
-                                    tuple[str, str | None] | None
-                                ) = None
+                                _pre_rollup_size_cap: object | None = None
                                 if _orig_peek_loop.get("ci_passed"):
                                     _peek_pr_num = _orig_peek_loop.get("pr_number")
                                     _peek_base = _orig_peek_loop.get("base_branch", "")
                                     _peek_branch = _orig_peek_loop.get("branch", "")
+                                    _peek_head = str(
+                                        _orig_peek_loop.get("ci_checked_head_sha")
+                                        or _orig_peek_loop.get("head_sha")
+                                        or ""
+                                    )
                                     try:
                                         (
                                             _pre_rollup_gh,
@@ -4395,16 +4411,16 @@ async def _process_post_commit(
                                                     else None
                                                 ),
                                             )
-                                        # Hoist size-cap preflight before the lock for
-                                        # direct (non-rollup) task PRs, mirroring the
-                                        # migration guard pattern above.  Rollup parents
-                                        # have rollup_pr_number in context — skip there.
+                                        # Hoist the size-cap preflight before the lock for
+                                        # every CI-reviewed PR, including rollup parents,
+                                        # mirroring the migration guard pattern above.
+                                        # _attempt_merge_with_retry_and_escalation reuses
+                                        # this immutable-head result instead of repeating
+                                        # a check or cap bump under the lock.
                                         if (
                                             _peek_pr_num
                                             and _peek_branch
-                                            and not (_orig_peek or {}).get(
-                                                "rollup_pr_number"
-                                            )
+                                            and _peek_head
                                         ):
                                             from app.rollup_size_preflight import (
                                                 preflight_rollup_size_caps as _sc_pre,
@@ -4419,6 +4435,7 @@ async def _process_post_commit(
                                                 project_id=str(task.project_id)
                                                 if task.project_id
                                                 else None,
+                                                expected_head_sha=_peek_head,
                                             )
                                     except Exception as _pre_exc:
                                         logger.debug(

@@ -483,6 +483,24 @@ describe('computeStrategicChatLiveState', () => {
     });
   });
 
+  it('carries the newest valid timestamp from a no-Resident Chat turn', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, status: 'responding', ts: '2026-06-01T11:59:00Z' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: 'pytest tests/chat.py', ts: 'not-a-timestamp' }),
+      delta({ id: 3, seq: 3, kind: 'message', text: 'partial answer', ts: '2026-06-01T12:00:00Z' }),
+    ];
+    const turn = computeStrategicStreamingTurn(transcript, []);
+    const activity = computeStrategicSessionActivity(transcript, []);
+    const state = computeStrategicChatLiveState(turn, activity);
+
+    expect(activity.lastActivityMs).toBe(Date.parse('2026-06-01T12:00:00Z'));
+    expect(state).toMatchObject({
+      phase: 'streaming',
+      detail: 'pytest tests/chat.py',
+      lastActivityMs: Date.parse('2026-06-01T12:00:00Z'),
+    });
+  });
+
   it('reports the working phase when the turn is open but no reply text has streamed', () => {
     const activity = computeStrategicSessionActivity(
       [

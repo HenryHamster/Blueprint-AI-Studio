@@ -88,6 +88,17 @@ def test_merge_with_empty_partial_directory_keeps_baseline(tmp_path: Path) -> No
     assert json.loads(output.read_text(encoding="utf-8")) == baseline
 
 
+def test_merge_drops_entries_from_an_unparseable_test_module(tmp_path: Path) -> None:
+    """Unreadable identities fail closed rather than preserving stale durations."""
+    test_file = tmp_path / "testing" / "test_broken.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("def test_broken(\n", encoding="utf-8")
+
+    assert merge_durations.filter_current_entries(
+        {"testing/test_broken.py::test_broken": 1.0}, tmp_path
+    ) == {}
+
+
 def test_regenerate_write_merged_preserves_baseline_and_filters_outliers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

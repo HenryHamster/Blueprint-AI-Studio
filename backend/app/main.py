@@ -51,6 +51,7 @@ from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
 from app.routers.admin_project_strategic_session import router as admin_project_strategic_session_router
+from app.routers.admin_project_consultations import router as admin_project_consultations_router
 from app.routers.admin_settings import router as admin_settings_router
 from app.routers.admin_migration_exemptions import (
     router as admin_migration_exemptions_router,
@@ -1036,6 +1037,7 @@ app = FastAPI(
 app.include_router(admin_router)
 app.include_router(admin_projects_router)
 app.include_router(admin_project_strategic_session_router)
+app.include_router(admin_project_consultations_router)
 app.include_router(admin_settings_router)
 app.include_router(admin_migration_exemptions_router)
 app.include_router(admin_debug_router)

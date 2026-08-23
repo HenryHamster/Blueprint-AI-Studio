@@ -130,14 +130,19 @@ describe('handleVerifyTests', () => {
     // documented-command probe is a no-op and existing tests are unaffected.
     // The no-op-build tests override this per-case.
     vi.mocked(discoverDocumentedCommands).mockReturnValue([]);
-    vi.mocked(execFileAsync).mockResolvedValue('');
-    vi.mocked(captureTestBaseline).mockResolvedValue(null);
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
+      if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('HEAD')) return Promise.resolve('head-sha');
+      return Promise.resolve('');
+    });
+    vi.mocked(captureTestBaseline).mockResolvedValue({ records: [] });
   });
 
   it('passes the merge gate when every detected failure is present on the base ref', async () => {
-    const inheritedFailure = 'agent/src/handlers/verify-tests.test.ts::inherited failure';
+    const inheritedFailure = {
+      route: 'agent/src/handlers/verify-tests.test.ts', testcase: 'inherited failure', kind: 'failure' as const, detail: 'expected 1 to equal 2',
+    };
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
-    vi.mocked(captureTestBaseline).mockResolvedValue(new Set([inheritedFailure]));
+    vi.mocked(captureTestBaseline).mockResolvedValue({ records: [inheritedFailure] });
     vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
     vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
       if (cmd !== 'git') return Promise.resolve('');
@@ -163,7 +168,7 @@ describe('handleVerifyTests', () => {
       ['checkout', '--force', '--detach', 'origin/main'],
       ['checkout', '--force', '--detach', 'head-sha'],
     ]);
-    expect(vi.mocked(testFixLoop).mock.calls[0][5]).toEqual(new Set([inheritedFailure]));
+    expect(vi.mocked(testFixLoop).mock.calls[0][5]).toEqual({ records: [inheritedFailure] });
     const verdict = parsedVerdict();
     expect(verdict.detected).toBe(true);
     expect(verdict.passed).toBe(true);
@@ -555,8 +560,8 @@ describe('handleVerifyTests', () => {
     });
     vi.mocked(detectAcceptanceProbes).mockReturnValue([PY_PROBE]);
     const err = Object.assign(new Error('SyntaxError: invalid syntax'), { stderr: 'SyntaxError: invalid syntax', status: 1 });
-    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) =>
-      cmd === 'git' ? Promise.resolve('') : Promise.reject(err),
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) =>
+      cmd === 'git' ? Promise.resolve((args as string[])[0] === 'rev-parse' ? 'head-sha' : '') : Promise.reject(err),
     );
 
     await handleVerifyTests('p4', payload, task, 'tok', 'o', 'r', null, { value: '' });
@@ -591,6 +596,7 @@ describe('handleVerifyTests', () => {
     vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
       if (cmd === 'git') {
         const a = args as string[];
+        if (a[0] === 'rev-parse' && a.includes('HEAD')) return Promise.resolve('head-sha');
         if (a[0] === 'status') {
           // snapshotWorkingTree calls: 1st → before, 2nd → after
           gitStatusCalls += 1;
@@ -714,8 +720,8 @@ describe('handleVerifyTests', () => {
     vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
     vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
     // git snapshots resolve; the declared build itself exits non-zero cleanly.
-    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'git') return Promise.resolve('');
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+      if (cmd === 'git') return Promise.resolve((args as string[])[0] === 'rev-parse' ? 'head-sha' : '');
       return Promise.reject(Object.assign(new Error('Command failed: npm run build\nwebpack: build error'), {
         stdout: '', stderr: 'webpack: build error in module foo', status: 1, code: undefined,
       }));
@@ -758,8 +764,8 @@ describe('handleVerifyTests', () => {
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
     vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
     vi.mocked(detectAcceptanceProbes).mockReturnValue([DECLARED_PROBE]);
-    vi.mocked(execFileAsync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'git') return Promise.resolve('');
+    vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
+      if (cmd === 'git') return Promise.resolve((args as string[])[0] === 'rev-parse' ? 'head-sha' : '');
       return Promise.reject(Object.assign(new Error('failed'), {
         stdout: '', stderr: 'bash: npm: command not found', status: 127, code: undefined,
       }));
@@ -870,6 +876,7 @@ describe('handleVerifyTests', () => {
       vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
         if (cmd === 'git') {
           const a = args as string[];
+          if (a[0] === 'rev-parse' && a.includes('HEAD')) return Promise.resolve('head-sha');
           if (a.includes('--name-only')) return Promise.resolve('package.json');
           if (a.includes('status')) {
             statusCalls += 1;
@@ -971,6 +978,7 @@ describe('handleVerifyTests', () => {
       vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
         if (cmd === 'git') {
           const a = args as string[];
+          if (a[0] === 'rev-parse' && a.includes('HEAD')) return Promise.resolve('head-sha');
           if (a.includes('--name-only')) return Promise.resolve(files.join('\n'));
           if (a.includes('--unified=0')) return Promise.resolve(unified);
         }
@@ -1053,6 +1061,7 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
       if (cmd === 'git') {
         const a = args as string[];
+        if (a[0] === 'rev-parse' && a.includes('HEAD')) return Promise.resolve('head-sha');
         if (a.includes('--name-only')) return Promise.resolve(changedFiles.join('\n'));
         return Promise.resolve('');
       }
@@ -1070,8 +1079,8 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
   });
 
   it('declared test that RAN → acceptanceTest.status=ran, ran=true (no block)', async () => {
-    vi.mocked(execFileAsync).mockImplementation((cmd: string) =>
-      Promise.resolve(cmd === 'git' ? '' : 'collected 1 item\n1 passed in 0.10s'),
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) =>
+      Promise.resolve(cmd === 'git' ? (args[0] === 'rev-parse' ? 'head-sha' : '') : 'collected 1 item\n1 passed in 0.10s'),
     );
     await handleVerifyTests('at1', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
     const block = acceptanceBlock();
@@ -1088,8 +1097,8 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
     // The targeted runner exits non-zero (rejects) with a real test-FAILURE
     // signature (not an environment failure), so it classifies as `ran` but the
     // run is RED — passed must be false so a failing declared test cannot mint proven.
-    vi.mocked(execFileAsync).mockImplementation((cmd: string) => {
-      if (cmd === 'git') return Promise.resolve('');
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
+      if (cmd === 'git') return Promise.resolve(args[0] === 'rev-parse' ? 'head-sha' : '');
       const err = Object.assign(new Error('pytest exited 1'), {
         stdout: 'collected 1 item\n\ntest_seam.py::test_x FAILED\n\n1 failed in 0.12s',
         stderr: '',
@@ -1104,8 +1113,8 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
   });
 
   it('declared test SKIPPED → status=skipped, ran=false (backend blocks)', async () => {
-    vi.mocked(execFileAsync).mockImplementation((cmd: string) =>
-      Promise.resolve(cmd === 'git' ? '' : 'collected 1 item\n1 skipped in 0.01s'),
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) =>
+      Promise.resolve(cmd === 'git' ? (args[0] === 'rev-parse' ? 'head-sha' : '') : 'collected 1 item\n1 skipped in 0.01s'),
     );
     await handleVerifyTests('at2', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
     const block = acceptanceBlock();
@@ -1116,8 +1125,8 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
   });
 
   it('declared test ABSENT → status=absent, present=false (backend blocks)', async () => {
-    vi.mocked(execFileAsync).mockImplementation((cmd: string) =>
-      Promise.resolve(cmd === 'git' ? '' : 'no tests ran in 0.01s'),
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) =>
+      Promise.resolve(cmd === 'git' ? (args[0] === 'rev-parse' ? 'head-sha' : '') : 'no tests ran in 0.01s'),
     );
     await handleVerifyTests('at3', payload, declaredTask('testing/test_missing.py::test_y'), 'tok', 'o', 'r', null, { value: '' });
     const block = acceptanceBlock();
@@ -1128,8 +1137,8 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
   });
 
   it('environment failure during targeted run → could_not_run (degrades, never false-absent)', async () => {
-    vi.mocked(execFileAsync).mockImplementation((cmd: string) => {
-      if (cmd === 'git') return Promise.resolve('');
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
+      if (cmd === 'git') return Promise.resolve(args[0] === 'rev-parse' ? 'head-sha' : '');
       const err = Object.assign(new Error('boom'), { stdout: '', stderr: 'error while loading shared libraries: libatk-1.0.so.0' });
       return Promise.reject(err);
     });
@@ -1142,7 +1151,9 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
 
   it('non-pytest / un-targetable selector → could_not_run (no execFile run)', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([{ cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' }]);
-    vi.mocked(execFileAsync).mockResolvedValue('');
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) =>
+      Promise.resolve(cmd === 'git' && args[0] === 'rev-parse' ? 'head-sha' : ''),
+    );
     await handleVerifyTests('at5', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
     const block = acceptanceBlock();
     expect(block?.status).toBe('could_not_run');
@@ -1215,6 +1226,7 @@ describe('handleVerifyTests — diff-aware runner filtering', () => {
     vi.mocked(execFileAsync).mockImplementation((cmd: unknown, args: unknown) => {
       if (cmd === 'git') {
         const a = args as string[];
+        if (a[0] === 'rev-parse' && a.includes('HEAD')) return Promise.resolve('head-sha');
         if (a.includes('--name-only')) return Promise.resolve(changedFiles.join('\n'));
         if (a.includes('--unified=0')) return Promise.resolve('');
       }

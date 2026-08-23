@@ -620,7 +620,19 @@ async def create_operator_project_message(
     compact_context_size: bool = True,
     enforce_raw_content_max: bool = False,
     sync_local_continuation_marker: bool = False,
-    surface: MessageSurface = MessageSurface.ACTIVITY,
+    # Every message created here is operator-authored (``from_type="user"``
+    # is hardcoded below), so the serviced conversation lane is the only
+    # correct default -- it matches the canonical rule ``build_project_message``
+    # already applies for ``from_type in {"user", "strategic"}``.
+    #
+    # The 0608/0638 Postgres compat trigger CANNOT repair a wrong value here.
+    # Its ``should_project`` promotion fires only when the row arrives with
+    # ``surface='conversation'`` already, or with ``sequence IS NULL``; this
+    # function pre-allocates the sequence (see ``next_sequence`` below) before
+    # INSERT, so neither disjunct holds. An ``activity`` default is therefore
+    # durable, and strands the operator's message on the display-only surface,
+    # which has no delivery path and no claim lifecycle.
+    surface: MessageSurface = MessageSurface.CONVERSATION,
     reply_to_message_id: uuid.UUID | None = None,
     include_strategic_session_snapshot: bool = True,
     precommit_validate: Callable[

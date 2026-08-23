@@ -369,6 +369,8 @@ build {
       "# line in this HCL and the strict regex in agent/src/index.ts before the",
       "# image tags. Passes on the baked 'unknown' fallback (dev build).",
       "sudo -u agent -H bash -c 'cd /opt/agent && node --import tsx ./src/agent-source-sha-bake-smoke.ts && echo PACKER_SOURCE_SHA_READBACK_OK'",
+      "# Execute the merge-time structured failure comparator from its packaged /opt/agent path.",
+      "sudo -u agent -H bash -c 'cd /opt/agent && node --import tsx ./src/fixgate-attribution-bake-smoke.ts'",
       "# Exercise the shipped memo handler through the runtime TS entrypoint with a",
       "# deterministic dispatcher memo payload and a localhost fetch stub.",
       "sudo -u agent -H bash -lc 'cd /opt/agent && ORCHESTRATOR_URL=http://127.0.0.1:9 AGENT_TOKEN=packer-smoke node --import tsx ./src/handlers/memo-bake-smoke.ts && echo PACKER_MEMO_SMOKE_OK'",

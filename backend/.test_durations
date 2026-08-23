@@ -2467,7 +2467,6 @@
   "testing/test_ci_completion.py::test_size_cap_defer_returns_false_without_state_mutation": 0.242419721999795,
   "testing/test_ci_completion.py::test_size_cap_hold_gates_off_does_not_set_requires_approval": 0.23042236199853505,
   "testing/test_ci_completion.py::test_size_cap_hold_sets_requires_approval_and_returns_false": 0.23425259099894902,
-  "testing/test_ci_completion.py::test_size_cap_skipped_for_rollup_parent_task": 0.4174461419988802,
   "testing/test_ci_completion.py::test_suppress_warm_handoff_ci_failure": 0.29422629899909225,
   "testing/test_ci_completion.py::test_suppress_warm_handoff_merge_blocked_rebase": 0.31002833799993823,
   "testing/test_ci_completion.py::test_suppress_warm_handoff_merge_conflict": 0.28950666099899536,

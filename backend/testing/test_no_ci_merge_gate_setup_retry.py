@@ -24,6 +24,8 @@ import json
 import uuid
 
 import pytest
+
+from app.rollup_size_preflight import SizeCapPreflightResult
 from sqlalchemy import select
 
 from app.alert_dispatch import _UNVERIFIED_REASON_LABELS
@@ -33,6 +35,7 @@ from app.ci_resolution import (
     classify_merge_test_verdict,
     resolve_no_checks_escalation,
     should_run_no_ci_test_gate,
+    verdict_from_failed_verify_artifact,
 )
 from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
 from app.orchestrator import _VERIFY_TESTS_MAX_RETRIES
@@ -156,9 +159,14 @@ def _read_terminal_verdict(verify_task: Task, artifact: dict | None):
 
     Only a COMPLETED verify task carries a usable verdict; a FAILED one is
     treated as a crash, so ``_verdict`` stays None even when a diagnostic
-    artifact exists.
+    artifact exists — EXCEPT for the DETERMINISTIC artifact shapes that must fail
+    closed, which the real monitor redirects into a blocking verdict via
+    ``ci_resolution.verdict_from_failed_verify_artifact`` (called here, not
+    re-implemented, so this mirror cannot drift from the production rule).
     """
-    return artifact if verify_task.status == TaskStatus.COMPLETED else None
+    if verify_task.status == TaskStatus.COMPLETED:
+        return artifact
+    return verdict_from_failed_verify_artifact(artifact)
 
 
 def _verify_setup_failed(verify_task: Task, artifact: dict | None) -> bool:
@@ -185,9 +193,12 @@ def _patch_github(mocker, project_id):
     )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("ok", None)),
+        AsyncMock(side_effect=_bound_ok),
     )
     mocker.patch(
         "app.review_merge_authority._fetch_live_review_target",
@@ -398,3 +409,76 @@ async def test_escalation_backstop_routes_definitive_no_ci_repo_into_verify_gate
         resolve_no_checks_escalation(project, BASE, gate_enabled=True) == "verify_tests"
     )
     assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True
+
+
+# ---------------------------------------------------------------------------
+# 4. An UNVERIFIABLE BASELINE (FAILED + verificationUnverified) must never reach
+#    the crash-retry-then-merge-UNVERIFIED lane. The condition is DETERMINISTIC
+#    (missing structured report / unavailable comparator / base checkout
+#    failure), so every re-spawn reproduces it: riding the crash path would
+#    exhaust the retries and merge UNVERIFIED every single time. It fails CLOSED
+#    to a blocking verdict instead.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unverified_attribution_blocks_and_never_reaches_unverified_merge(
+    db_session,
+):
+    project = await _make_no_ci_project(db_session)
+    verify_task = Task(
+        project_id=project.id,
+        title="verify",
+        payloads=[{"type": "verify_tests"}],
+        status=TaskStatus.FAILED,
+    )
+    artifact = {
+        "detected": False,
+        "passed": False,
+        "verificationUnverified": True,
+        "tests": [],
+        "output": (
+            "Test runner failed but did not produce a structured failure "
+            "report for baseline attribution."
+        ),
+    }
+
+    # NOT a setup failure (no setupFailed/partialSetupFailed marker) — so the
+    # verify_setup_failed operator label is untouched by this path.
+    assert _verify_setup_failed(verify_task, artifact) is False
+
+    # A FAILED task normally yields no verdict; this shape is redirected into
+    # one so the gate blocks instead of falling open.
+    verdict = _read_terminal_verdict(verify_task, artifact)
+    assert verdict is artifact
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "fail"
+    assert detail
+    # The crash split is what feeds the retry-then-UNVERIFIED-merge lane; a
+    # blocking verdict never enters it, so no retry budget is consumed.
+    assert _is_verify_crash(outcome, verdict) is False
+
+
+@pytest.mark.asyncio
+async def test_plain_setup_failure_still_takes_the_crash_retry_path(db_session):
+    # Guard the adjacent behavior this change must NOT alter: a plain FAILED
+    # setup failure (no unverified marker, no clear probe break) still yields no
+    # verdict → crash → bounded retries → verify_setup_failed label.
+    project = await _make_no_ci_project(db_session)
+    verify_task = Task(
+        project_id=project.id,
+        title="verify",
+        payloads=[{"type": "verify_tests"}],
+        status=TaskStatus.FAILED,
+    )
+    artifact = {
+        "detected": False,
+        "passed": False,
+        "setupFailed": True,
+        "output": "npm ci failed: registry timeout",
+    }
+    assert _verify_setup_failed(verify_task, artifact) is True
+    verdict = _read_terminal_verdict(verify_task, artifact)
+    assert verdict is None
+    outcome, _ = classify_merge_test_verdict(verdict)
+    assert _is_verify_crash(outcome, verdict) is True

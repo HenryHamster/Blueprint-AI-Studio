@@ -24,6 +24,11 @@ from pathlib import Path
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.identity_extraction import (
+    extract_python_test_ids,
+    extract_python_test_ids_from_file,
+    extract_python_test_nodes,
+)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
@@ -74,18 +79,7 @@ def _parse_test_module_roots(harness: Path) -> tuple[Path, ...]:
 
 
 def _test_module_has_executing_tests(path: Path) -> bool:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name.startswith("test_"):
-                return True
-        elif isinstance(node, ast.ClassDef) and any(
-            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and member.name.startswith("test_")
-            for member in node.body
-        ):
-            return True
-    return False
+    return bool(extract_python_test_ids_from_file(path))
 
 
 def _test_module_has_intentional_zero_test_marker(path: Path) -> bool:
@@ -158,31 +152,9 @@ def _script_test_roster_residue(
 def _script_test_has_discoverable_tests(source: str, *, filename: str) -> bool:
     """Return whether pytest or unittest can discover a test in ``source``."""
     try:
-        tree = ast.parse(source, filename=filename)
+        return bool(extract_python_test_ids(source))
     except (SyntaxError, UnicodeError):
         return False
-
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name.startswith("test_"):
-                return True
-            continue
-        if not isinstance(node, ast.ClassDef):
-            continue
-
-        is_pytest_class = node.name.startswith("Test")
-        is_unittest_class = any(
-            (isinstance(base, ast.Name) and base.id == "TestCase")
-            or (isinstance(base, ast.Attribute) and base.attr == "TestCase")
-            for base in node.bases
-        )
-        if (is_pytest_class or is_unittest_class) and any(
-            isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and method.name.startswith("test_")
-            for method in node.body
-        ):
-            return True
-    return False
 
 
 def _script_test_execution_residue(
@@ -6300,6 +6272,8 @@ def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> li
     whose name ends in one of ``suffixes``, is not excluded by ``is_excluded``,
     exceeds ``_COVERAGE_THRESHOLD`` lines, and has no key in ``section``.
     Tree-relative paths use forward slashes to match the JSON key convention."""
+    from app.size_limit_policy import is_breach
+
     offenders = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
@@ -6311,7 +6285,7 @@ def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> li
                 continue
             with open(abs_path) as f:
                 count = len(f.readlines())
-            if count > _COVERAGE_THRESHOLD and rel_path not in section:
+            if is_breach(count, _COVERAGE_THRESHOLD) and rel_path not in section:
                 offenders.append((rel_path, count))
     offenders.sort(key=lambda item: item[1], reverse=True)
     return offenders
@@ -14194,6 +14168,8 @@ def test_script_roster_tripwire_accepts_pytest_async_and_unittest_tests(
     (scripts_root / "test_unittest.py").write_text(
         "import unittest\n\n"
         "class LegacyCase(unittest.TestCase):\n"
+        "    pass\n\n"
+        "class LegacyRegressionTests(LegacyCase):\n"
         "    def test_case(self):\n"
         "        pass\n",
         encoding="utf-8",
@@ -14405,6 +14381,7 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         "test_event_type_invariants.py",
         "test_salvage_bundle_standalone.py",
         "test_test_durations_freshness.py",
+        "test_test_estate_ranked_queue.py",
         "test_shard_balance.py",
         "test_conversational_workday_protection.py",
         "test_vitest_durations_freshness.py",
@@ -14925,12 +14902,7 @@ def test_standalone_corpus_set_guards_emit_offender_identity():
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
         helpers = _module_level_functions(tree)
-        for function in (
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test_")
-        ):
+        for test_id, function in extract_python_test_nodes(tree).items():
             collection_names = _collection_names_in_function(function)
             for failure in ast.walk(function):
                 message = _standalone_failure_message(failure)
@@ -14942,7 +14914,7 @@ def test_standalone_corpus_set_guards_emit_offender_identity():
                 if rendered and not _has_offender_marker(message, helpers):
                     unmarked.append(
                         f"{_canonical_roster_identity(path, harness)}"
-                        f"::{function.name}:"
+                        f"::{test_id}:"
                         f"{failure.lineno}:{','.join(sorted(rendered))}"
                     )
 
@@ -15028,12 +15000,7 @@ def _unmarked_sites_in_source(source: str) -> list[str]:
     tree = ast.parse(source)
     helpers = _module_level_functions(tree)
     sites: list[str] = []
-    for function in (
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.startswith("test_")
-    ):
+    for test_id, function in extract_python_test_nodes(tree).items():
         collection_names = _collection_names_in_function(function)
         for failure in ast.walk(function):
             message = _standalone_failure_message(failure)
@@ -15041,7 +15008,7 @@ def _unmarked_sites_in_source(source: str) -> list[str]:
                 continue
             rendered = _rendered_collection_names(message, collection_names, helpers)
             if rendered and not _has_offender_marker(message, helpers):
-                sites.append(f"{function.name}:{','.join(sorted(rendered))}")
+                sites.append(f"{test_id}:{','.join(sorted(rendered))}")
     return sorted(sites)
 
 
@@ -15149,12 +15116,18 @@ def test_dark_test_detector_requires_a_marker_for_intentional_zero_tests(
     )
     real = tmp_path / "test_real.py"
     real.write_text("def test_real():\n    pass\n", encoding="utf-8")
+    helper = tmp_path / "test_helper_class.py"
+    helper.write_text(
+        "class Helper:\n    def test_not_collected(self):\n        pass\n",
+        encoding="utf-8",
+    )
 
     assert not _test_module_has_executing_tests(dark)
     assert not _test_module_has_intentional_zero_test_marker(dark)
     assert not _test_module_has_executing_tests(nested)
     assert _test_module_has_intentional_zero_test_marker(marked)
     assert _test_module_has_executing_tests(real)
+    assert not _test_module_has_executing_tests(helper)
 
 
 def test_script_roster_selection_uses_capability_not_ci_marker():

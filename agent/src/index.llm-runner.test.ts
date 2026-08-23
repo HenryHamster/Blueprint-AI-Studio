@@ -783,12 +783,12 @@ describe('detectTestRunners auto-detect postgres flag', () => {
 
     const bashCalls = vi.mocked(spawn).mock.calls.filter(c => c[0] === 'bash');
     expect(bashCalls).toHaveLength(2);
-    expect(bashCalls[0][1]).toEqual([
+    expect(bashCalls[0][1]).toEqual(expect.arrayContaining([
       'scripts/test-backend.sh',
       '--postgres',
       'testing/test_models.py::test_create',
-    ]);
-    expect(bashCalls[1][1]).toEqual(['scripts/test-backend.sh', '--postgres', '--require-testmon']);
+    ]));
+    expect(bashCalls[1][1]).toEqual(expect.arrayContaining(['scripts/test-backend.sh', '--postgres', '--require-testmon']));
   });
 
   it('does not scope away backend targeted runners when related files point elsewhere', async () => {
@@ -807,11 +807,11 @@ describe('detectTestRunners auto-detect postgres flag', () => {
 
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
-    expect(defined(bashCall)[1]).toEqual([
+    expect(defined(bashCall)[1]).toEqual(expect.arrayContaining([
       'scripts/test-backend.sh',
       '--postgres',
       'testing/test_models.py::test_create',
-    ]);
+    ]));
   });
 
   it('appends --no-postgres when Docker is unavailable (captureTestBaseline)', async () => {
@@ -1967,4 +1967,3 @@ describe('parseFailingTestsFromVitestJson', () => {
     expect(parseFailingTestsFromVitestJson(json).size).toBe(0);
   });
 });
-

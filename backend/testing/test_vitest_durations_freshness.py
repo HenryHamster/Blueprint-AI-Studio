@@ -18,6 +18,12 @@ import subprocess
 import warnings
 from pathlib import Path
 
+from testing.estate_inventory import (
+    is_vitest_test_path,
+    vitest_test_file_inventory,
+    vitest_test_file_inventory_from_paths,
+)
+
 def _resolve_workspace_root() -> Path:
     candidates = (Path(__file__).resolve().parents[2], Path("/repo"))
     for candidate in candidates:
@@ -36,35 +42,16 @@ ADMINUI_DURATIONS = WORKSPACE_ROOT / "admin-ui" / ".test_durations.json"
 
 def _is_suite_test_path(suite: str, relative: str) -> bool:
     """Return whether a suite-relative posix path belongs to that suite's roster."""
-    if suite == "agent":
-        return relative.startswith("src/") and relative.endswith(".test.ts")
-    if suite == "admin-ui":
-        included = (
-            (relative.startswith("src/") and relative.endswith((".test.ts", ".test.tsx")))
-            or (
-                relative.startswith("eslint-rules/")
-                and relative.endswith((".test.js", ".test.ts"))
-            )
-        )
-        return included and not (
-            relative.startswith("src/") and ".viewport.test." in relative
-        )
-    raise ValueError(f"Unknown Vitest suite: {suite}")
+    return is_vitest_test_path(suite, relative)
 
 
 def _test_file_inventory_from_paths(suite: str, paths) -> set[str]:
-    return {relative for relative in paths if _is_suite_test_path(suite, relative)}
+    return vitest_test_file_inventory_from_paths(suite, paths)
 
 
 def _test_file_inventory(suite: str) -> set[str]:
     """Return the files collected by the suite's committed Vitest config."""
-    suite_root = WORKSPACE_ROOT / suite
-    relatives = (
-        path.relative_to(suite_root).as_posix()
-        for path in suite_root.rglob("*")
-        if path.is_file()
-    )
-    return _test_file_inventory_from_paths(suite, relatives)
+    return vitest_test_file_inventory(WORKSPACE_ROOT, suite)
 
 
 class BaselineUnavailable(RuntimeError):

@@ -159,6 +159,12 @@
           "commit_date": "2026-08-08T02:32:09Z",
           "old_cap": 6200,
           "new_cap": 7750
+        },
+        {
+          "commit_sha": "74921b8a62e536b310a8236d238ec71f081204a1",
+          "commit_date": "2026-08-23T00:05:07Z",
+          "old_cap": 6200,
+          "new_cap": 7150
         }
       ],
       "task_lifecycle_requeue.py": [
@@ -1627,6 +1633,12 @@
           "commit_date": "2026-07-23T09:25:44Z",
           "old_cap": 4000,
           "new_cap": 4750
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-23T03:39:00.107257+00:00",
+          "old_cap": 4750,
+          "new_cap": 5500
         }
       ],
       "reaper_fleet_health_sweeps.py": [
@@ -2321,6 +2333,12 @@
           "commit_date": "2026-08-20T07:54:41Z",
           "old_cap": 3100,
           "new_cap": 3600
+        },
+        {
+          "commit_sha": "74921b8a62e536b310a8236d238ec71f081204a1",
+          "commit_date": "2026-08-23T00:05:07Z",
+          "old_cap": 3100,
+          "new_cap": 3650
         }
       ],
       "routers/admin_debug.py": [
@@ -4635,8 +4653,8 @@
       ],
       "test_generated_shell.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-22T23:27:00.900818+00:00",
+          "commit_sha": "56daa558e8f49b8c4fcf1ecb9f87c7f4b1acb91b",
+          "commit_date": "2026-08-22T16:34:38-07:00",
           "old_cap": 2400,
           "new_cap": 2850
         }
@@ -4655,6 +4673,14 @@
           "commit_date": "2026-08-21T10:38:20-07:00",
           "old_cap": 2400,
           "new_cap": 2850
+        }
+      ],
+      "static_release_guard.py": [
+        {
+          "commit_sha": "74921b8a62e536b310a8236d238ec71f081204a1",
+          "commit_date": "2026-08-23T00:05:07Z",
+          "old_cap": 750,
+          "new_cap": 1000
         }
       ],
       "test_vitest_verification_guard.py": [

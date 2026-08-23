@@ -22,6 +22,7 @@ from sqlalchemy.orm import sessionmaker
 from app.ci_completion import _normalize_merge_error, _review_approved
 from app.migration_reservations import allocate_migration_reservation
 from app.models import Alert, Project, Task, TaskStatus
+from app.rollup_size_preflight import SizeCapPreflightResult
 
 
 @pytest.fixture(autouse=True)
@@ -52,9 +53,12 @@ def _default_size_cap_ok(mocker):
     Tests exercising the size-cap gate re-patch
     ``app.rollup_size_preflight.preflight_rollup_size_caps`` to override this.
     """
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("ok", None)),
+        AsyncMock(side_effect=_bound_ok),
     )
 
 
@@ -6687,7 +6691,11 @@ async def test_size_cap_hold_sets_requires_approval_and_returns_false(db_session
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("hold", "chronic offender: models.py (3 bumps)")),
+        AsyncMock(
+            return_value=SizeCapPreflightResult(
+                "hold", "chronic offender: models.py (3 bumps)"
+            )
+        ),
     )
 
     project = Project(name="Size hold test", user_id="test-user")
@@ -6715,7 +6723,9 @@ async def test_size_cap_bumped_rearms_ci_and_returns_false(db_session, mocker):
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("bumped", "models.py: 500 -> 800")),
+        AsyncMock(
+            return_value=SizeCapPreflightResult("bumped", "models.py: 500 -> 800")
+        ),
     )
 
     project = Project(name="Size bump test", user_id="test-user")
@@ -6750,7 +6760,9 @@ async def test_size_cap_hold_gates_off_does_not_set_requires_approval(db_session
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("hold", "chronic offender: models.py")),
+        AsyncMock(
+            return_value=SizeCapPreflightResult("hold", "chronic offender: models.py")
+        ),
     )
     original_gates = shared_state.runtime_config.get("require_approval_gates", True)
     shared_state.runtime_config["require_approval_gates"] = False
@@ -6784,7 +6796,7 @@ async def test_size_cap_defer_returns_false_without_state_mutation(db_session, m
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("defer", "github rate limit")),
+        AsyncMock(return_value=SizeCapPreflightResult("defer", "github rate limit")),
     )
 
     project = Project(name="Size defer test", user_id="test-user")
@@ -6810,13 +6822,54 @@ async def test_size_cap_defer_returns_false_without_state_mutation(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_size_cap_skipped_for_rollup_parent_task(db_session, mocker):
-    """Size-cap preflight is skipped when rollup_pr_number is set (rollup parent task)."""
+async def test_size_cap_old_precomputed_head_cannot_authorize_direct_merge(
+    db_session, mocker
+):
+    """The pre-lock direct path cannot reuse a verdict from an older head."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+    project = Project(name="Stale size preflight test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="review_approval",
+        precomputed_size_cap=SizeCapPreflightResult("ok", None, "old-pr-head"),
+        checked_head_sha="test-head-42",
+        checked_base_sha="test-base-42",
+    )
+
+    assert result is False
+    merge_mock.assert_not_awaited()
+    assert "verdict head differs" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_size_cap_holds_rollup_parent_at_merge_with_ci_checked_head(
+    db_session, mocker
+):
+    """A rollup parent is held at the merge chokepoint on an un-repaired cap."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
     preflight_mock = mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("hold", "should not be called")),
+        AsyncMock(
+            return_value=SizeCapPreflightResult(
+                "hold", "models.py: 500 -> 750 requires cap repair"
+            )
+        ),
     )
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
@@ -6837,9 +6890,51 @@ async def test_size_cap_skipped_for_rollup_parent_task(db_session, mocker):
         task, "fake-token", "owner", "repo", db_session, source="poll"
     )
 
-    assert result is True, "Rollup parent merge must not be blocked by size-cap preflight"
+    assert result is False, "Rollup parent must not merge without the cap repair"
+    preflight_mock.assert_awaited_once()
+    assert preflight_mock.await_args.kwargs["expected_head_sha"] == "test-head-42"
+    merge_mock.assert_not_awaited()
+    assert task.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_rollup_precomputed_size_clearance_does_not_repeat_or_bump_at_merge(
+    db_session, mocker
+):
+    """The pre-lock rollup result is reused at merge rather than checked twice."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    preflight_mock = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(side_effect=AssertionError("precomputed result must be reused")),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+
+    project = Project(name="Rollup precomputed cap test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    task.context = {**(task.context or {}), "rollup_pr_number": 999}
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        precomputed_size_cap=SizeCapPreflightResult("ok", None, "test-head-42"),
+    )
+
+    assert result is True
     preflight_mock.assert_not_awaited()
-    merge_mock.assert_awaited()
+    merge_mock.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

@@ -1103,7 +1103,13 @@ def review_cap_generation_identity(
     discarded generation collapses on the (base, head) pair the agent
     actually reviewed instead of over- or under-counting duplicate discards
     of one superseded generation. The two populations never overlap, so a
-    caller may safely combine both counts without double-counting a row.
+    caller may safely combine both counts without double-counting a row. A
+    stale review row whose live ``review_target`` was rewritten for its respawn
+    retains the backend-captured ``reviewed_target`` beside it; on the discard
+    paths that never rewrite the target (operator-park, defensive merge-path
+    respawn, and every row predating ``reviewed_target``) the un-rewritten
+    ``review_target`` is itself the reviewed generation, so it is used as the
+    fallback.
     """
 
     payload = task.first_payload or {}
@@ -1143,7 +1149,20 @@ def review_cap_generation_identity(
             )
         return (lane, "legacy-fix", str(task.id))
 
-    target = _exact_review_target_identity(loop.get("review_target"))
+    # A stale discard's live target may have been rewritten to the target used
+    # for its respawn. Where that happened the backend preserved the reviewed
+    # generation under ``reviewed_target``; where it did not (the operator-park
+    # discard and the defensive merge-path respawn both set the stale flags
+    # without rewriting the row's own ``review_target``, as do all rows written
+    # before ``reviewed_target`` existed) the un-rewritten ``review_target`` is
+    # itself the reviewed generation. Fall back to it so those populations are
+    # not silently dropped from the cross-episode census.
+    if count_stale_discards:
+        target = _exact_review_target_identity(
+            loop.get("reviewed_target")
+        ) or _exact_review_target_identity(loop.get("review_target"))
+    else:
+        target = _exact_review_target_identity(loop.get("review_target"))
     signed = _structured_review_verdict(task)
     if signed is not None:
         verdict, reviewed_base, reviewed_head = signed
@@ -1166,7 +1185,10 @@ def review_cap_generation_identity(
             continue
         if str(entry.get("review_task_id") or "") != str(task.id):
             continue
-        if entry.get("target_verified_by_backend") is not True or target is None:
+        if (
+            entry.get("target_verified_by_backend") is not True
+            and not (count_stale_discards and loop.get("reviewed_target") is not None)
+        ) or target is None:
             return None
         entry_base = str(entry.get("reviewed_base_sha") or "").strip()
         entry_head = str(entry.get("reviewed_head_sha") or "").strip()

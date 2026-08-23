@@ -44,6 +44,7 @@ from verification_receipt import (  # noqa: E402
     record_lane as record_verification_lane,
 )
 from testing.impacted_tests import load_surface_manifest
+from app.size_limit_policy import SECTION_PATH_PREFIXES
 
 MANIFEST_PATH = (
     Path(__file__).resolve().parents[1]
@@ -134,6 +135,22 @@ def _is_static_scope(path: str, repo_root: str = _REPO_ROOT) -> bool:
         if regex.match(normalized):
             return True
     return False
+
+
+def _is_size_scope(path: str) -> bool:
+    """Whether ``path`` belongs to one of the five governed size sections.
+
+    Size enforcement must not inherit the static-corpus roster's narrower
+    surface selection.  The canonical section prefixes come from the same
+    policy module used by the checker, so a newly governed section cannot be
+    silently omitted from this publication gate.
+    """
+    normalized = path.replace("\\", "/").strip("/")
+    return any(
+        normalized == prefix.rstrip("/")
+        or normalized.startswith(prefix)
+        for prefix in SECTION_PATH_PREFIXES.values()
+    )
 
 
 _extract_base = extract_base
@@ -373,7 +390,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[static guard] ERROR: {exc}", file=sys.stderr)
         return 2
 
-    scoped = [path for path in changed if _is_static_scope(path)]
+    size_scoped = [path for path in changed if _is_size_scope(path)]
+    corpus_scoped = [path for path in changed if _is_static_scope(path)]
+    if args.size_only:
+        scoped = size_scoped
+    elif args.corpus_only:
+        scoped = corpus_scoped
+    else:
+        scoped = sorted(set(size_scoped) | set(corpus_scoped))
     if not scoped:
         print("[static guard] no static release-guard paths changed; skipping")
         return 0
@@ -397,6 +421,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.corpus_only:
             print("[static guard] module size guard SKIPPED (--corpus-only)")
+        elif not size_scoped:
+            print("[static guard] module size guard SKIPPED (no governed size paths changed)")
         else:
             size_result = _run_size_guard(repo, base_root)
             if size_result.returncode != 0:
@@ -428,6 +454,17 @@ def main(argv: list[str] | None = None) -> int:
             print("[static guard] PASS (size-only)")
             return 0
 
+        if not corpus_scoped:
+            print("[static guard] standalone static corpus SKIPPED (no corpus paths changed)")
+            if failures:
+                print(
+                    f"[static guard] FAIL — {', '.join(failures)}",
+                    file=sys.stderr,
+                )
+                return 1
+            print("[static guard] PASS (size-only)")
+            return 0
+
         # Each tree must run its own harness and static roster. Replacing the
         # extracted base harness with the task's copy would make a weakened
         # candidate harness weaken the baseline too, hiding exactly the class
@@ -437,7 +474,8 @@ def main(argv: list[str] | None = None) -> int:
         if not current_harness.is_file() or not base_harness.is_file():
             print("[static guard] ERROR: scripts/test-backend.sh is unavailable", file=sys.stderr)
             return 2
-        harness_changed = "scripts/test-backend.sh" in scoped
+
+        harness_changed = "scripts/test-backend.sh" in corpus_scoped
         roster_changed = _static_roster_changed(base_harness, current_harness)
         # The route helper is an execution dependency mounted alongside the
         # harness; retain the existing fixture/bootstrap behavior for it. The

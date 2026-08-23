@@ -20,6 +20,7 @@ from app.research_completion import _parse_research_findings, _calibrate_finding
 from app.plan_completion import _validate_plan_dependencies
 from app.failure_classification import classify_failure
 from app.routers.agent_status import record_task_result
+from app.rollup_size_preflight import SizeCapPreflightResult
 from app.deploy_health import should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
 from app.strategic_completion import _handle_strategic_completion
@@ -1955,10 +1956,13 @@ def _patch_common_rollup_mocks(mocker):
     # fetches the caps JSON and changed-file contents at the staging branch.
     # Default to "ok" so the guard is a no-op; tests exercising breach cases
     # override this.
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("ok", None),
+        side_effect=_bound_ok,
     )
 
 

@@ -12,6 +12,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.release_artifacts import summarize_required_artifact_gap
 from app import pause_clock, release_version
+from app.alert_policy import get_alert_event_policy
 from app.models import Alert, AlertSeverity, DeploymentState
 from app.release_gate_latch import (
     _audited_surface_at_ref,
@@ -25,6 +26,86 @@ from app.time_utils import _utcnow
 _MODULE_SIZE_GOVERNANCE_CAP: int = 984
 
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_release_alerts(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    event_types: set[str] | frozenset[str],
+) -> int:
+    """Dismiss open alerts for a version when their lifecycle condition ends."""
+    if not event_types:
+        return 0
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == version.project_id,
+            Alert.task_id.is_(None),
+            Alert.event_type.in_(event_types),
+            Alert.title.like(f"Release v{version.version_number}%"),
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    alerts = result.scalars().all()
+    if not alerts:
+        return 0
+    now = _utcnow()
+    for alert in alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    logger.info(
+        "[RELEASE_QUALIFIER] resolved %d lifecycle alert(s) for v%d: %s",
+        len(alerts),
+        version.version_number,
+        ", ".join(sorted(event_types)),
+    )
+    return len(alerts)
+
+
+async def _create_release_alert(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    *,
+    event_type: str,
+    severity: AlertSeverity,
+    title: str,
+    message: str,
+) -> bool:
+    """Create one policy-stamped release alert.
+
+    Release versions are already scoped to the release lifecycle lane; unlike
+    generic project emitters, this producer must retain its historical behavior
+    for external projects whose domain opt-in predates the central gate. It
+    still stamps the canonical policy domain and event type, while each
+    condition's version marker supplies the dedupe contract.
+    """
+    policy = get_alert_event_policy(event_type)
+    common = {
+        "project_id": version.project_id,
+        "severity": severity,
+        "title": title,
+        "message": message,
+        "domain": policy.domain,
+        "source": "release_stall_alerts",
+    }
+    if event_type == "release.calcifying":
+        session.add(Alert(**common, event_type="release.calcifying"))
+    elif event_type == "release.ci_unresolved":
+        session.add(Alert(**common, event_type="release.ci_unresolved"))
+    elif event_type == "release.build_stalled":
+        session.add(Alert(**common, event_type="release.build_stalled"))
+    elif event_type == "release.stabilize_stalled":
+        session.add(Alert(**common, event_type="release.stabilize_stalled"))
+    elif event_type == "release.promotion_deploy_failed":
+        session.add(
+            Alert(**common, event_type="release.promotion_deploy_failed")
+        )
+    elif event_type == "release.managed_check_wait_stalled":
+        session.add(
+            Alert(**common, event_type="release.managed_check_wait_stalled")
+        )
+    else:
+        raise ValueError(f"unsupported release alert event type: {event_type}")
+    return True
 
 # Minimum consecutive hard-blocker failures before raising a calcification
 # alert. Three failures on the same blocker strongly suggest the issue is not
@@ -80,12 +161,18 @@ async def _check_version_calcification(
 ) -> bool:
     """Post a deduplicated calcification alert when a version is stuck."""
     if version.status != "open" or version.phase != "stabilize":
+        await _resolve_release_alerts(
+            session, version, {"release.calcifying", "release.ci_unresolved"}
+        )
         return False
 
     rq = _release_qualifier_module()
 
     attempts = version.qualification_attempts or 0
     if attempts < rq._MIN_CALCIFICATION_ATTEMPTS:
+        await _resolve_release_alerts(
+            session, version, {"release.calcifying", "release.ci_unresolved"}
+        )
         return False
 
     # Terminal facts come from the DURABLE verdict row, not the mutable blob —
@@ -98,14 +185,22 @@ async def _check_version_calcification(
     blocker = facts.blocker
 
     if qual_status == "dry_run":
+        await _resolve_release_alerts(
+            session, version, {"release.calcifying", "release.ci_unresolved"}
+        )
         return False
     if qual_status != "not_promoted" or not blocker:
+        await _resolve_release_alerts(
+            session, version, {"release.calcifying", "release.ci_unresolved"}
+        )
         return False
 
     if blocker == "ci_unresolved":
+        await _resolve_release_alerts(session, version, {"release.calcifying"})
         return False
     if version.calcification_alerted_blocker == blocker:
         return False
+    await _resolve_release_alerts(session, version, {"release.ci_unresolved"})
 
     # The candidate audited surface once lived ONLY in last_qualification and is
     # erased by the same stub, so re-derive it from the repository tree at the
@@ -156,21 +251,21 @@ async def _check_version_calcification(
     _site_phrase = rq.blocker_execution_site_label(blocker)
     if _site_phrase:
         blocker_label = f"{blocker_label} ({_site_phrase})"
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            event_type="release.calcifying",
-            severity=AlertSeverity.WARNING,
-            title=alert_title,
-            message=(
+    if not await _create_release_alert(
+        session,
+        version,
+        event_type="release.calcifying",
+        severity=AlertSeverity.WARNING,
+        title=alert_title,
+        message=(
                 f"Release v{version.version_number} has been stuck in the "
                 f"stabilize phase for {age_days} day(s) with {attempts} "
                 f"qualification attempt(s), each blocked by: {blocker_label}. "
                 f"The integration trunk may be drifting from the deployed "
                 f"branch. Resolve the blocker to restore promotion."
             ),
-        )
-    )
+    ):
+        return False
     await rq.post_version_calcification_message(
         session,
         version.project_id,
@@ -199,20 +294,24 @@ async def _check_version_ci_unresolved_stall(
 ) -> bool:
     """Post a deduplicated alert when CI state cannot be resolved repeatedly."""
     if version.status != "open" or version.phase != "stabilize":
+        await _resolve_release_alerts(session, version, {"release.ci_unresolved"})
         return False
 
     rq = _release_qualifier_module()
 
     attempts = version.qualification_attempts or 0
     if attempts < rq._MIN_CALCIFICATION_ATTEMPTS:
+        await _resolve_release_alerts(session, version, {"release.ci_unresolved"})
         return False
 
     # Same durable-record sourcing as _check_version_calcification: the pending
     # stub the auto-retrigger writes would otherwise hide this state too.
     facts = await _resolve_terminal_qualification_facts(session, version)
     if facts.status != "not_promoted":
+        await _resolve_release_alerts(session, version, {"release.ci_unresolved"})
         return False
     if facts.blocker != "ci_unresolved":
+        await _resolve_release_alerts(session, version, {"release.ci_unresolved"})
         return False
 
     if version.calcification_alerted_blocker == "ci_unresolved":
@@ -223,13 +322,13 @@ async def _check_version_ci_unresolved_stall(
     if ref_time is not None:
         age_days = max(0, (_utcnow() - ref_time).days)
 
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            event_type="release.ci_unresolved",
-            severity=AlertSeverity.WARNING,
-            title=f"Release v{version.version_number}: CI state unresolvable",
-            message=(
+    if not await _create_release_alert(
+        session,
+        version,
+        event_type="release.ci_unresolved",
+        severity=AlertSeverity.WARNING,
+        title=f"Release v{version.version_number}: CI state unresolvable",
+        message=(
                 f"Release v{version.version_number} has been stuck in the "
                 f"stabilize phase for {age_days} day(s) with {attempts} "
                 f"qualification attempt(s) unable to resolve CI state (checks "
@@ -237,8 +336,8 @@ async def _check_version_ci_unresolved_stall(
                 f"CI infrastructure or configuration problem — investigate CI "
                 f"connectivity and check-run reporting, not the release candidate."
             ),
-        )
-    )
+    ):
+        return False
     await rq.post_version_ci_unresolved_stall_message(
         session,
         version.project_id,
@@ -264,10 +363,12 @@ async def _check_version_build_stall(
 ) -> bool:
     """Post a deduplicated build-stall alert when a version sits too long."""
     if version.status != "open" or version.phase != "build":
+        await _resolve_release_alerts(session, version, {"release.build_stalled"})
         return False
 
     ref_time = version.phase_changed_at or version.opened_at
     if ref_time is None:
+        await _resolve_release_alerts(session, version, {"release.build_stalled"})
         return False
 
     age_days = max(0, (_utcnow() - ref_time).days)
@@ -287,17 +388,18 @@ async def _check_version_build_stall(
     rq = _release_qualifier_module()
 
     if not _is_build_stalled(age_days, merged_count):
+        await _resolve_release_alerts(session, version, {"release.build_stalled"})
         return False
     if version.build_stall_alerted_at == ref_time:
         return False
 
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            event_type="release.build_stalled",
-            severity=AlertSeverity.WARNING,
-            title=f"Release v{version.version_number} stalled in build phase",
-            message=(
+    if not await _create_release_alert(
+        session,
+        version,
+        event_type="release.build_stalled",
+        severity=AlertSeverity.WARNING,
+        title=f"Release v{version.version_number} stalled in build phase",
+        message=(
                 f"Release v{version.version_number} has been in the build phase "
                 f"for {age_days} day(s) with {merged_count} merged task(s) and "
                 f"has not advanced to stabilize. build→stabilize is agent-driven "
@@ -305,8 +407,8 @@ async def _check_version_build_stall(
                 f"emit a version_phase_decision to move it to stabilize so it can "
                 f"progress toward qualification and promotion."
             ),
-        )
-    )
+    ):
+        return False
     try:
         await rq.post_version_build_stalled_message(
             session,
@@ -340,12 +442,14 @@ async def _check_version_stabilize_stall(
 ) -> bool:
     """Post a deduplicated stabilize-stall alert when a version sits too long."""
     if version.status != "open" or version.phase != "stabilize":
+        await _resolve_release_alerts(session, version, {"release.stabilize_stalled"})
         return False
 
     rq = _release_qualifier_module()
     qual = version.last_qualification or {}
     qual_status = qual.get("status")
     if qual_status == "dry_run":
+        await _resolve_release_alerts(session, version, {"release.stabilize_stalled"})
         return False
     external_delivery_blocked = all(
         qual.get(key) == value for key, value in _EXTERNAL_DELIVERY_BLOCKER.items()
@@ -360,6 +464,7 @@ async def _check_version_stabilize_stall(
         # attempts for _check_version_calcification to fire).  Below that
         # threshold the calcification alert is silent, so the age/count gate
         # below serves as the backstop to keep the version operator-visible.
+        await _resolve_release_alerts(session, version, {"release.stabilize_stalled"})
         return False
 
     ref_time = version.phase_changed_at or version.opened_at
@@ -384,6 +489,7 @@ async def _check_version_stabilize_stall(
         age_days >= rq._STABILIZE_STALL_AGE_DAYS
         or merged_count >= rq._STABILIZE_STALL_MERGED_TASKS
     ):
+        await _resolve_release_alerts(session, version, {"release.stabilize_stalled"})
         return False
     if version.stabilize_stall_alerted_at == ref_time:
         return False
@@ -404,15 +510,15 @@ async def _check_version_stabilize_stall(
             f"qualification now or addressing what is preventing readiness."
         )
 
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            event_type="release.stabilize_stalled",
-            severity=AlertSeverity.WARNING,
-            title=f"Release v{version.version_number} stalled in stabilize phase",
-            message=alert_message,
-        )
-    )
+    if not await _create_release_alert(
+        session,
+        version,
+        event_type="release.stabilize_stalled",
+        severity=AlertSeverity.WARNING,
+        title=f"Release v{version.version_number} stalled in stabilize phase",
+        message=alert_message,
+    ):
+        return False
     try:
         await rq.post_version_stabilize_stalled_message(
             session,
@@ -506,21 +612,21 @@ async def _alert_promotion_deploy_failed(
     _artifact_gap = summarize_required_artifact_gap(artifact_evidence)
     _artifact_text = f" Aggregate evidence: {_artifact_gap}." if _artifact_gap else ""
 
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            event_type="release.promotion_deploy_failed",
-            severity=AlertSeverity.ERROR,
-            title=_deploy_failed_alert_title(version.version_number),
-            message=(
+    if not await _create_release_alert(
+        session,
+        version,
+        event_type="release.promotion_deploy_failed",
+        severity=AlertSeverity.ERROR,
+        title=_deploy_failed_alert_title(version.version_number),
+        message=(
                 f"Release v{version.version_number} merged to the promotion "
                 f"target (promoted_sha={(version.promoted_sha or '')[:12] or '?'}) "
                 f"but its deploy is NOT serving: {_reason_text} "
                 f"(reason={reason}). {_outcome_text} {_resolution_text}"
                 f"{_artifact_text}"
             ),
-        )
-    )
+    ):
+        return False
     try:
         from app.release_promotion import _notify_operator
 
@@ -608,10 +714,16 @@ async def _check_version_managed_check_wait_stall(
 ) -> bool:
     """Alert when Blueprint's managed promotion PR has been pending too long."""
     if version.status != "open":
+        await _resolve_release_alerts(
+            session, version, {"release.managed_check_wait_stalled"}
+        )
         return False
 
     qual = version.last_qualification or {}
     if qual.get("status") != "pending":
+        await _resolve_release_alerts(
+            session, version, {"release.managed_check_wait_stalled"}
+        )
         return False
 
     from app.release_promotion_pending import (
@@ -626,9 +738,15 @@ async def _check_version_managed_check_wait_stall(
         version=version,
     )
     if pending is None or pending_kind != _PROMOTION_PENDING_MANAGED:
+        await _resolve_release_alerts(
+            session, version, {"release.managed_check_wait_stalled"}
+        )
         return False
     enabled_at = _parse_promotion_pending_time(pending.get("enabled_at"))
     if enabled_at is None:  # canonicalizer is total; defensive only.
+        await _resolve_release_alerts(
+            session, version, {"release.managed_check_wait_stalled"}
+        )
         return False
     if pending_was_normalized:
         qual = dict(qual)
@@ -643,6 +761,9 @@ async def _check_version_managed_check_wait_stall(
         deploy_state, enabled_at, pending.get("pause_baseline")
     )
     if age_seconds < _MANAGED_CHECK_WAIT_STALL_SECONDS:
+        await _resolve_release_alerts(
+            session, version, {"release.managed_check_wait_stalled"}
+        )
         return False
 
     last_alerted_str = pending.get("mcw_last_alerted_at")
@@ -672,23 +793,23 @@ async def _check_version_managed_check_wait_stall(
         else ""
     )
 
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            event_type="release.managed_check_wait_stalled",
-            severity=severity,
-            title=(
+    if not await _create_release_alert(
+        session,
+        version,
+        event_type="release.managed_check_wait_stalled",
+        severity=severity,
+        title=(
                 f"Release v{version.version_number} promotion check wait stalled"
             ),
-            message=(
+        message=(
                 f"Release v{version.version_number} promotion PR #{pr_number} has "
                 f"waited {age_hours}h for required checks (CI state: {ci_state}). "
                 "Blueprint will revalidate the exact base/head and retry the merge "
                 f"once checks pass. Check for stuck or failing checks: {pr_url}"
                 f"{severity_note}"
             ),
-        )
-    )
+    ):
+        return False
 
     new_qual = dict(qual)
     new_pending = dict(pending)

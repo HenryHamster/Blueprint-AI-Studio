@@ -3791,22 +3791,42 @@ async def _check_and_trigger_rollup(
                     # commit_bump=False and a breach is detected, avoiding the
                     # spurious commit that would otherwise happen before the
                     # budget check in the "bumped" branch below.
-                    from app.rollup_size_preflight import preflight_rollup_size_caps
+                    from app.rollup_size_preflight import (
+                        SizeCapPreflightResult,
+                        preflight_rollup_size_caps,
+                    )
                     _sb_pr_pre = parent_ctx.get("_size_cap_autobump_pr")
                     _sb_count_pre = (
                         int(parent_ctx.get("_size_cap_autobump_count", 0))
                         if _sb_pr_pre == rollup_pr_number
                         else 0
                     )
-                    size_cap_status, size_cap_reason = await preflight_rollup_size_caps(
-                        gh_token,
-                        owner,
-                        repo,
-                        rollup_pr_number,
-                        staging_branch,
-                        project_id=str(project_id_local) if project_id_local else None,
-                        commit_bump=_sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP,
+                    _rollup_candidate_head = str(
+                        (pr_detail.get("head") or {}).get("sha") or ""
                     )
+                    if not _rollup_candidate_head:
+                        size_cap_result = SizeCapPreflightResult(
+                            "defer",
+                            "rollup PR head unavailable for size-cap evaluation",
+                        )
+                    else:
+                        size_cap_result = await preflight_rollup_size_caps(
+                            gh_token,
+                            owner,
+                            repo,
+                            rollup_pr_number,
+                            staging_branch,
+                            project_id=str(project_id_local) if project_id_local else None,
+                            commit_bump=_sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP,
+                            expected_head_sha=_rollup_candidate_head,
+                        )
+                    if not isinstance(size_cap_result, SizeCapPreflightResult):
+                        size_cap_result = SizeCapPreflightResult(
+                            "defer",
+                            "size-cap guard returned unbound evidence",
+                        )
+                    size_cap_status = size_cap_result.status
+                    size_cap_reason = size_cap_result.reason
 
                     # ── K7: post the security-scan report HERE, while the parent
                     # lock is still released (2026-07-12 concurrency audit).
@@ -4415,16 +4435,18 @@ async def _check_and_trigger_rollup(
                         )
                         return
 
-                    _rollup_checked_head = str(
-                        (pr_detail.get("head") or {}).get("sha") or ""
-                    )
+                    _rollup_checked_head = size_cap_result.head_sha
                     _rollup_checked_base = str(
                         (pr_detail.get("base") or {}).get("sha") or ""
                     )
-                    if not _rollup_checked_head or not _rollup_checked_base:
+                    if (
+                        not _rollup_checked_head
+                        or _rollup_checked_head != _rollup_candidate_head
+                        or not _rollup_checked_base
+                    ):
                         parent.latest_status_message = (
                             f"Rollup PR #{rollup_pr_number} merge held — could not "
-                            "bind the attempt to an immutable base/head"
+                            "bind the size-cap verdict to the immutable merge head"
                         )[:500]
                         session.add(parent)
                         await session.commit()
@@ -4979,10 +5001,11 @@ async def _check_and_trigger_rollup(
                                             not _rp_head
                                             or not _rp_base
                                             or _rp_base != _validated_base
+                                            or _rp_head != _rollup_checked_head
                                         ):
                                             _repoll_merge_fail_msg = (
                                                 "live base/head no longer matches the "
-                                                "validated rollup target"
+                                                "size-cap-validated rollup target"
                                             )
                                             break
                                         async def _submit_repoll_merge(
@@ -5300,6 +5323,7 @@ async def _check_and_trigger_rollup(
                                             _esc_head
                                             and _esc_base
                                             and _esc_base == _validated_base
+                                            and _esc_head == _rollup_checked_head
                                         ):
                                             async def _submit_escalation_merge(
                                                 expected_head_sha: str,
@@ -5345,7 +5369,10 @@ async def _check_and_trigger_rollup(
                                         else:
                                             _esc_result = {
                                                 "merged": False,
-                                                "message": "live base/head changed since validation",
+                                                "message": (
+                                                    "live base/head changed since "
+                                                    "size-cap validation"
+                                                ),
                                             }
                                     except Exception as _esc_exc:
                                         logger.warning(

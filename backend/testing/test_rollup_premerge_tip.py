@@ -20,6 +20,8 @@ trigger ``update_branch`` and must NOT spawn a fix task.
 import pytest
 from unittest.mock import AsyncMock, create_autospec
 
+from app.rollup_size_preflight import SizeCapPreflightResult
+
 from app.github import get_branch_sha as _real_get_branch_sha
 from app.models import TaskStatus
 from testing.test_rollup_cleanup import (
@@ -94,10 +96,13 @@ def _mock_clean_premerge_deps(mocker, *, head_sha, base_tip_sha):
             },
         ],
     )
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("ok", None),
+        side_effect=_bound_ok,
     )
     return mock_tip
 

@@ -18,6 +18,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from app.models import Project, Task, TaskStatus
+from app.rollup_size_preflight import SizeCapPreflightResult
 from app.auth import create_agent_token
 from app.review_pipeline import (
     _spawn_pipeline_task,
@@ -44,9 +45,12 @@ def _default_no_migration_pr(mocker):
     from unittest.mock import AsyncMock
 
     mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("ok", None)),
+        AsyncMock(side_effect=_bound_ok),
     )
     # Prevent the status handler from hitting the real GitHub API to verify
     # PR base branches when a task completes with a PULL_REQUEST artifact.

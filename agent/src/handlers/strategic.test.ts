@@ -339,6 +339,7 @@ vi.mock('../index.js', () => ({
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
   sanitize: (s: string) => s,
   sendLog: vi.fn(),
+  sendWsFrame: vi.fn(() => true),
   readHandlerOutput: vi.fn().mockReturnValue(null),
   persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
@@ -630,7 +631,7 @@ import {
   detectThinkerDirectionRecommendations,
 } from './strategic.js';
 import * as mockedIndexModule from '../index.js';
-import { runClaudeCode, apiPost, setCurrentPromptFingerprint, sendHeartbeatSync } from '../index.js';
+import { runClaudeCode, apiPost, setCurrentPromptFingerprint, sendHeartbeatSync, sendWsFrame } from '../index.js';
 import * as mockedWorkspacePrepModule from '../workspacePrep.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { VmConfigMissingError } from '../providers/runners.js';
@@ -2117,6 +2118,111 @@ describe('handleStrategic executor prompt: version-signal sibling passthrough', 
 
     // Each field's absence must mean skip (not fabricate).
     expect(executorPrompt).toContain('do not fabricate');
+  });
+});
+
+describe('one-shot Chat strategic_session stream', () => {
+  beforeEach(() => {
+    vi.mocked(sendWsFrame).mockClear();
+    vi.mocked(runClaudeCode).mockClear();
+  });
+
+  it('test_chat_mode_turn_emits_session_activity', async () => {
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'No direction operation is needed.',
+    });
+    vi.mocked(runClaudeCode).mockImplementation((...args) => {
+      const observer = args[7];
+      observer?.onAssistantText?.('Here is the public answer.');
+      observer?.onToolUse?.('Read', { file_path: '/workspace/agent/README.md' });
+      return Promise.resolve({
+        exitCode: 0,
+        allOutput: [
+          './strategic set-problem-model',
+          './strategic set-running-update',
+          './strategic set-retirement-critiques',
+        ].join('\n'),
+        lastResultText: '',
+      });
+    });
+
+    await handleStrategic(
+      'chat-turn-task',
+      { project_name: 'Blueprint', strategic_session_id: 'chat-turn-task' },
+      {},
+      'tok', 'owner', 'repo', {} as never, { value: '' },
+    );
+
+    await vi.waitFor(() => {
+      const frames = vi.mocked(sendWsFrame).mock.calls
+        .map(([, frame]) => frame as { type: string; payload: Record<string, unknown> })
+        .filter(frame => frame.type === 'strategic_session' && frame.payload.task_id === 'chat-turn-task');
+      expect(frames.at(-1)?.payload.status).toBe('done');
+    }, { timeout: 2_000, interval: 20 });
+
+    const frames = vi.mocked(sendWsFrame).mock.calls
+      .map(([, frame]) => frame as { type: string; payload: Record<string, unknown> })
+      .filter(frame => frame.type === 'strategic_session' && frame.payload.task_id === 'chat-turn-task')
+      .map(frame => frame.payload);
+    expect(frames[0]).toMatchObject({
+      session_id: 'chat-turn-task', task_id: 'chat-turn-task', seq: 0, status: 'responding',
+    });
+    expect(frames.some(frame => frame.kind === 'message' && frame.text === 'Here is the public answer.')).toBe(true);
+    expect(frames.some(frame => frame.kind === 'read' && frame.text === 'read …/agent/README.md')).toBe(true);
+    expect(frames.filter(frame => frame.status === 'done')).toHaveLength(1);
+    expect(frames.map(frame => frame.seq)).toEqual(frames.map((_, index) => index));
+  });
+
+  it('drains the terminal frame before the role runner closes the Chat socket', async () => {
+    vi.useFakeTimers();
+    try {
+      const transport: string[] = [];
+      let socketOpen = true;
+      const ws = {
+        close: () => {
+          socketOpen = false;
+          transport.push('close');
+        },
+      };
+      vi.mocked(sendWsFrame).mockImplementation((_ws, frame) => {
+        if (!socketOpen) return false;
+        const payload = frame.payload as { status?: string };
+        transport.push(payload.status ?? 'delta');
+        return true;
+      });
+      vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+        ok: true,
+        analysisText: 'No direction operation is needed.',
+      });
+      vi.mocked(runClaudeCode).mockImplementation((...args) => {
+        args[7]?.onAssistantText?.('A streamed Chat reply.');
+        // A burst is deliberately larger than the bounded teardown window:
+        // the handler must preserve the rate limit yet still deliver `done`
+        // before the role runner closes the socket.
+        for (let i = 0; i < 25; i++) {
+          args[7]?.onToolUse?.('Read', { file_path: `/workspace/agent/file-${i}.md` });
+        }
+        return Promise.resolve({ exitCode: 0, allOutput: '', lastResultText: '' });
+      });
+
+      const handled = handleStrategic(
+        'chat-close-task',
+        { project_name: 'Blueprint', strategic_session_id: 'chat-close-task' },
+        {}, 'tok', 'owner', 'repo', ws as never, { value: '' },
+      ).then(() => { ws.close(); });
+
+      // This is the role runner boundary in index.ts: it closes immediately
+      // after the handler resolves, without leaving a later timer turn alive.
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await handled;
+
+      expect(transport).toContain('done');
+      expect(transport.indexOf('done')).toBeLessThan(transport.indexOf('close'));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -25,21 +25,18 @@ from durations_quality import (
     in_band_setup_artifacts,
     quality_ok,
 )
-from testing.identity_extraction import extract_python_test_ids
+from testing.identity_extraction import extract_python_test_ids_from_file
 
 
-def _valid_test_ids(path: Path) -> set[str] | None:
-    """Return collectable test IDs, or None when the file cannot be parsed."""
-    try:
-        return extract_python_test_ids(path.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError):
-        return None
+def _valid_test_ids(path: Path) -> set[str]:
+    """Return canonical IDs, treating unreadable source as no valid tests."""
+    return extract_python_test_ids_from_file(path)
 
 
 def filter_current_entries(data: dict, root: str | os.PathLike[str]) -> dict:
     """Drop entries whose test file or statically collectable ID is gone."""
     root_path = Path(root)
-    valid_ids_by_file: dict[Path, set[str] | None] = {}
+    valid_ids_by_file: dict[Path, set[str]] = {}
     current: dict = {}
     for key, value in data.items():
         file_key, separator, raw_node_id = key.partition("::")
@@ -52,7 +49,7 @@ def filter_current_entries(data: dict, root: str | os.PathLike[str]) -> dict:
             valid_ids_by_file[test_path] = _valid_test_ids(test_path)
         valid_ids = valid_ids_by_file[test_path]
         base_node_id = raw_node_id.split("[", 1)[0]
-        if valid_ids is not None and base_node_id not in valid_ids:
+        if base_node_id not in valid_ids:
             continue
         current[key] = value
     return current

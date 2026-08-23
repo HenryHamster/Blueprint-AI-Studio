@@ -20,6 +20,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+from testing.identity_extraction import extract_typescript_test_ids
+
 COMPONENTS_DIR = Path("admin-ui/src/components")
 
 # Anti-pattern regexes
@@ -106,8 +109,7 @@ def scan_file(filepath: Path) -> dict:
     }
 
     # Count test blocks
-    test_pattern = re.compile(r"(?:^|\s)(test|it)\s*\(\s*['\"]")
-    stats["total_tests"] = len(test_pattern.findall(text))
+    stats["total_tests"] = len(extract_typescript_test_ids(text))
 
     # Count assertions
     stats["assertion_count"] = len(ASSERTION_PATTERNS.findall(text))

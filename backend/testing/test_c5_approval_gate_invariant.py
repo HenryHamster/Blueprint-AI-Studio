@@ -16,6 +16,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import shared_state
 from app.models import Project, Task, TaskStatus
+from app.rollup_size_preflight import SizeCapPreflightResult
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +68,12 @@ def _default_size_cap_ok(mocker):
     unmocked call issues a real network request and returns 'defer', causing
     the merge to return False and failing 'assert result is True'.
     """
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
-        AsyncMock(return_value=("ok", None)),
+        AsyncMock(side_effect=_bound_ok),
     )
 
 

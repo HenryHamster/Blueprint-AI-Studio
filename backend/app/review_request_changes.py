@@ -61,6 +61,7 @@ from app.review_pipeline import (
 )
 from app.module_finding_chain import find_and_mark_chain_escalation
 from app.rollup_locking import _OriginalTaskLockTimeout, _lock_original_task
+from app.review_target_drift import _base_move_invalidates_approval
 
 logger = logging.getLogger(__name__)
 
@@ -389,11 +390,30 @@ async def run_request_changes(
         await session.commit()
         return True, {"status": "accepted"}
 
+    _base_move_invalidates: bool | None = None
+    if (
+        reviewed_base_sha
+        and reviewed_base_sha != base_sha
+        and reviewed_head_sha == head_sha
+    ):
+        _base_move_invalidates = await _base_move_invalidates_approval(
+            task,
+            session,
+            pr_number=pr_number,
+            reviewed_base_sha=reviewed_base_sha,
+            reviewed_head_sha=reviewed_head_sha,
+            live_base_sha=base_sha,
+            live_head_sha=head_sha,
+        )
+
     review_target_unproven = (
         not reviewed_head_sha
         or not reviewed_base_sha
         or reviewed_head_sha != head_sha
-        or reviewed_base_sha != base_sha
+        or (
+            reviewed_base_sha != base_sha
+            and _base_move_invalidates is not False
+        )
     )
     if review_target_unproven:
         # A stale finding can waste a fix iteration just as a
@@ -417,7 +437,7 @@ async def run_request_changes(
                     Task, uuid.UUID(original_task_id)
                 )
                 _stale_park_reason = review_loop_parked_for_operator(_chain_root)
-                if _stale_park_reason is not None and review_loop_park_stale_head(
+                if _stale_park_reason is not None and review_loop_park_stale_head(  # noqa: SIM102
                     _chain_root, head_sha
                 ):
                     # The park predates commits it never saw (defect: a fix

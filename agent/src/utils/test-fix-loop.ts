@@ -6,8 +6,10 @@
  * regression failures (caused by the agent's changes) from pre-existing ones.
  */
 
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, sendLog, sendHeartbeatSync, execFileAsync, errorFingerprint, git, apiPost,
@@ -38,7 +40,7 @@ import {
 import {
   type BuildConfig, type TestRunner,
   detectTestRunners, isDockerRunner, describeRunnerDirectory,
-  parseFailingTests, buildTargetedPytestRunners,
+  buildTargetedPytestRunners,
   classifySetupFailure, classifyTestExecution, matchesEnvironmentFailureSignature,
   extractTestCoverage, extractLineCoverage, extractChangedLineCoverage, runnerFromCommand,
 } from './test-runners.js';
@@ -217,24 +219,127 @@ export function matchesSizeBreachSignature(text: string): boolean {
   );
 }
 
+/** The size-limit sections `check_size_limits.py --repair-target` accepts. */
+const SIZE_SECTION = 'backend|agent|frontend|testing|scripts';
+
+/** `[breach] agent/prompt.ts: …` / `[uncapped] agent/prompts/huge.ts: …` */
+const EXPLICIT_SIZE_TARGET_RE = new RegExp(
+  String.raw`\[(?:breach|uncapped)\]\s*((?:${SIZE_SECTION})\/[A-Za-z0-9._/-]+)`,
+  'gi',
+);
+
 /**
- * Run the canonical size-cap bump (`check_size_limits.py --fix`) from the repo
- * root. The checker rewrites ONLY the breached caps in module_size_limits.json
- * using the shared `bump_size_limit` policy — it edits no source or test files,
- * guaranteeing a policy-consistent remediation. Returns true when a cap was
- * bumped, false on a no-op ("No breaches to fix") or failure, so the caller can
- * fall back to the prompt-level guidance path.
+ * The aggregated missing-cap header emitted by
+ * test_invariants._missing_cap_message and agent/src/moduleSize.contract.test.ts:
+ * "N source file(s) exceed 1500 lines with NO cap entry under '<section>' in".
+ * The section is bound in the HEADER — it never reappears after the offenders —
+ * so the header must be parsed before the per-offender lines below it.
  */
-async function runDeterministicSizeCapBump(ws: WebSocket | null): Promise<boolean> {
+const MISSING_CAP_HEADER_RE = new RegExp(
+  String.raw`NO cap entry under\s+['"](${SIZE_SECTION})['"]`,
+  'gi',
+);
+
+/** One offender line of an aggregated block: "  - prompts/huge.ts has 1700 lines (threshold: 1500)" */
+const MISSING_CAP_OFFENDER_RE =
+  /^[ \t]*-[ \t]+([A-Za-z0-9][A-Za-z0-9._/-]*)\s+has\s+\d+\s+lines\s+\(threshold:\s*\d+\)/gm;
+
+/** Single-file invariant form: "<rel> has <N> lines (limit: <M>)" … "under '<section>'". */
+const INVARIANT_SIZE_TARGET_RE = new RegExp(
+  String.raw`(?:^|\s)([A-Za-z0-9][A-Za-z0-9._/-]*)\s+has\s+\d+\s+lines\s+` +
+  String.raw`\((?:limit|threshold):\s*\d+\)[\s\S]*?under\s+['"](${SIZE_SECTION})['"]`,
+  'gi',
+);
+
+/**
+ * Consume every aggregated missing-cap block in `detail`, returning one target
+ * per offender line plus the residual text with those blocks blanked out. The
+ * residual keeps the single-file invariant scan from re-attributing an
+ * aggregated block's offenders to a different section named further down a
+ * concatenated runner detail.
+ */
+function consumeAggregatedMissingCapTargets(
+  detail: string,
+): { targets: string[]; residual: string } {
+  const targets: string[] = [];
+  const headers = Array.from(detail.matchAll(MISSING_CAP_HEADER_RE));
+  if (headers.length === 0) return { targets, residual: detail };
+
+  let residual = '';
+  let cursor = 0;
+  headers.forEach((header, index) => {
+    const start = header.index;
+    const blockStart = start + header[0].length;
+    const blockEnd = headers[index + 1]?.index ?? detail.length;
+    const block = detail.slice(blockStart, blockEnd);
+    for (const offender of block.matchAll(MISSING_CAP_OFFENDER_RE)) {
+      targets.push(`${header[1].toLowerCase()}/${offender[1]}`);
+    }
+    residual += detail.slice(cursor, start);
+    // Blank the consumed block, preserving newlines so the residual's remaining
+    // line-anchored and `(?:^|\s)` matches keep their original boundaries.
+    residual += detail.slice(start, blockEnd).replace(/[^\n]/g, ' ');
+    cursor = blockEnd;
+  });
+  residual += detail.slice(cursor);
+  return { targets, residual };
+}
+
+/**
+ * Return checker repair selectors only for canonically formatted size findings.
+ * A structured comparator has already established that these details are new;
+ * malformed size diagnostics deliberately produce null so automatic mutation
+ * fails closed rather than guessing a file from raw runner output.
+ *
+ * Every offender in a detail is collected, not just the first: the missing-cap
+ * form is aggregated (one test failure listing every uncapped file), so
+ * repairing one file per iteration would exhaust maxFixAttempts on a multi-file
+ * breach.
+ */
+export function extractSizeRepairTargets(details: Iterable<string>): string[] | null {
+  const targets = new Set<string>();
+  for (const detail of details) {
+    if (!matchesSizeBreachSignature(detail)) continue;
+    const found: string[] = [];
+    for (const match of detail.matchAll(EXPLICIT_SIZE_TARGET_RE)) found.push(match[1]);
+    const aggregated = consumeAggregatedMissingCapTargets(detail);
+    found.push(...aggregated.targets);
+    for (const match of aggregated.residual.matchAll(INVARIANT_SIZE_TARGET_RE)) {
+      found.push(`${match[2].toLowerCase()}/${match[1]}`);
+    }
+    // A detail that carries the size signature but yields no canonical target is
+    // malformed — fail the whole batch closed rather than guessing.
+    if (found.length === 0) return null;
+    for (const target of found) {
+      if (target.includes('..') || target.endsWith('/')) return null;
+      targets.add(target);
+    }
+  }
+  return Array.from(targets).sort();
+}
+
+/**
+ * Run the canonical, target-scoped size-cap repair from the repo root. The
+ * checker still owns the bump, governing-source rewrite, ledger, and chronic
+ * refusal policies; this loop merely supplies the comparator-attributed target.
+ */
+async function runDeterministicSizeCapBump(
+  ws: WebSocket | null,
+  repairTargets: readonly string[],
+): Promise<boolean> {
+  if (repairTargets.length === 0) return false;
   sendLog(
     ws,
-    'Size-guardrail breach detected — running deterministic cap bump ' +
-    '(python3 backend/testing/check_size_limits.py --fix) instead of an LLM refactor.\n',
+    'Attributed size-guardrail breach detected — running deterministic cap repair ' +
+    '(python3 backend/testing/check_size_limits.py --fix --repair-target …) instead of an LLM refactor.\n',
   );
   try {
     const out = await execFileAsync(
       'python3',
-      ['backend/testing/check_size_limits.py', '--fix'],
+      [
+        'backend/testing/check_size_limits.py', '--fix',
+        ...repairTargets.flatMap(target => ['--repair-target', target]),
+      ],
       { cwd: WORKSPACE, timeoutMs: TEST_RUNNER_TIMEOUT },
     );
     sendLog(ws, `${out}\n`);
@@ -259,9 +364,25 @@ function withRequiredTestmon(runner: TestRunner): TestRunner {
   };
 }
 
-// Minimal vitest JSON reporter shape — we only need the failed-test names.
+export interface StructuredTestFailure {
+  route: string;
+  testcase: string;
+  kind: 'failure' | 'error';
+  detail: string;
+}
+
+export interface TestFailureBaseline {
+  records: StructuredTestFailure[];
+}
+
+type StructuredAttribution = {
+  blocking: boolean;
+  new_failures: Record<string, string>;
+  suppressed_failures: Record<string, { detail: string; reason: string }>;
+};
+
 // Full schema at https://vitest.dev/guide/reporters.html#json-reporter; these
-// fields are stable across vitest 2.x/3.x.
+// fields are stable across Vitest 2.x/3.x and carry the full comparator key.
 interface VitestJsonReport {
   testResults?: Array<{
     name?: string;
@@ -269,8 +390,42 @@ interface VitestJsonReport {
       fullName?: string;
       title?: string;
       status?: 'passed' | 'failed' | 'skipped' | 'pending' | 'todo';
+      failureMessages?: string[];
     }>;
   }>;
+}
+
+function stableVitestRoute(name: string): string {
+  if (!name) return '<vitest>';
+  const normalized = name.replace(/\\/g, '/');
+  const workspace = WORKSPACE.replace(/\\/g, '/');
+  return normalized.startsWith(`${workspace}/`)
+    ? normalized.slice(workspace.length + 1)
+    : path.isAbsolute(normalized) ? path.basename(normalized) : normalized;
+}
+
+export function parseStructuredVitestFailures(jsonText: string): StructuredTestFailure[] | null {
+  let parsed: VitestJsonReport;
+  try {
+    parsed = JSON.parse(jsonText) as VitestJsonReport;
+  } catch {
+    return null;
+  }
+  const records: StructuredTestFailure[] = [];
+  for (const file of parsed.testResults ?? []) {
+    for (const assertion of file.assertionResults ?? []) {
+      if (assertion.status !== 'failed') continue;
+      const testcase = (assertion.fullName || assertion.title || '').trim();
+      if (!testcase) return null;
+      records.push({
+        route: stableVitestRoute(file.name ?? ''),
+        testcase,
+        kind: 'failure',
+        detail: (assertion.failureMessages ?? []).join('\n').trim(),
+      });
+    }
+  }
+  return records;
 }
 
 /**
@@ -281,21 +436,97 @@ interface VitestJsonReport {
  */
 export function parseFailingTestsFromVitestJson(jsonText: string): Set<string> {
   const failing = new Set<string>();
-  let parsed: VitestJsonReport;
-  try {
-    parsed = JSON.parse(jsonText) as VitestJsonReport;
-  } catch {
-    return failing;
-  }
-  for (const file of parsed.testResults ?? []) {
-    for (const assertion of file.assertionResults ?? []) {
-      if (assertion.status === 'failed') {
-        const id = (assertion.fullName || assertion.title || '').trim();
-        if (id) failing.add(id);
-      }
-    }
-  }
+  parseStructuredVitestFailures(jsonText)?.forEach(record => failing.add(record.testcase));
   return failing;
+}
+
+function isPytestRunner(runner: TestRunner): boolean {
+  return [runner.cmd, ...runner.args].some(arg =>
+    arg.includes('pytest') || arg.includes('scripts/test-backend.sh'),
+  );
+}
+
+function usesVerificationJunitContract(runner: TestRunner): boolean {
+  // scripts/test-backend.sh runs pytest in Docker for the normal backend
+  // verification path. Its BLUEPRINT_VERIFICATION_JUNIT contract mounts the
+  // report directory and translates the host path for the container; a direct
+  // host /tmp --junitxml argument is not visible from that container.
+  return [runner.cmd, ...runner.args].some(arg => arg.includes('scripts/test-backend.sh'));
+}
+
+type StructuredReportInvocation = {
+  reportOutputPath: string | null;
+  runArgs: string[];
+  env?: NodeJS.ProcessEnv;
+  useVitestJson: boolean;
+};
+
+function structuredReportInvocation(runner: TestRunner, phase: 'baseline' | 'current'): StructuredReportInvocation {
+  const useVitestJson = runner.cmd === 'npm' && isVitestRunner(runner.cwd);
+  const usePytestJunit = !useVitestJson && isPytestRunner(runner);
+  const reportOutputPath = useVitestJson
+    ? `/tmp/vitest-${phase}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`
+    : usePytestJunit ? `/tmp/pytest-${phase}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.xml` : null;
+  const harnessAwareJunit = usePytestJunit && usesVerificationJunitContract(runner);
+  const runArgs = useVitestJson && reportOutputPath
+    ? [...runner.args, '--', '--reporter=default', '--reporter=json', `--outputFile=${reportOutputPath}`]
+    : usePytestJunit && reportOutputPath && !harnessAwareJunit
+      ? [...runner.args, `--junitxml=${reportOutputPath}`]
+      : runner.args;
+
+  return {
+    reportOutputPath,
+    runArgs,
+    env: harnessAwareJunit && reportOutputPath
+      ? { ...process.env, BLUEPRINT_VERIFICATION_JUNIT: reportOutputPath }
+      : undefined,
+    useVitestJson,
+  };
+}
+
+function junitRecords(reportPath: string, treeRoot: string): StructuredTestFailure[] | null {
+  try {
+    const output = execFileSync(
+      'python3',
+      [canonicalComparatorPath(), '--junit-records', reportPath, treeRoot],
+      { cwd: WORKSPACE, encoding: 'utf-8', timeout: 30_000 },
+    );
+    const records = JSON.parse(output) as unknown;
+    return Array.isArray(records) ? records as StructuredTestFailure[] : null;
+  } catch {
+    return null;
+  }
+}
+
+export function compareStructuredFailures(
+  current: StructuredTestFailure[], baseline: StructuredTestFailure[],
+): StructuredAttribution | null {
+  try {
+    const output = execFileSync('python3', [canonicalComparatorPath()], {
+      cwd: WORKSPACE,
+      encoding: 'utf-8',
+      input: JSON.stringify({ current, baseline }),
+      timeout: 30_000,
+    });
+    const result = JSON.parse(output) as Partial<StructuredAttribution>;
+    if (typeof result.blocking !== 'boolean' || !result.new_failures || !result.suppressed_failures) return null;
+    return result as StructuredAttribution;
+  } catch {
+    return null;
+  }
+}
+
+export function canonicalComparatorPath(
+  sourceDirectory = path.dirname(fileURLToPath(import.meta.url)),
+): string {
+  // The backend source tree is not present on baked agents: Packer and the
+  // container image copy agent/src to /opt/agent/src. Keep the parity-checked
+  // canonical attributor in that packaged tree, rather than falling back to a
+  // workspace checkout whose contents are the task under verification.
+  return path.resolve(
+    sourceDirectory,
+    '../_agent_scripts/fixgate_attribution.py',
+  );
 }
 
 function isVitestRunner(cwd: string): boolean {
@@ -311,8 +542,8 @@ function isVitestRunner(cwd: string): boolean {
  *
  * - Scope-limited to runners relevant to relatedFiles (avoids running full suite).
  * - Time-bounded by timeoutMs (default 60s) — returns null on timeout/error.
- * - Returns an empty Set if all tests pass (all future failures are new).
- * - Returns null to signal "skip baseline" — fall back to current behavior.
+ * - Returns an empty structured record set if all tests pass.
+ * - Returns null when the baseline cannot be proved from a structured report.
  */
 export async function captureTestBaseline(
   ws: WebSocket | null,
@@ -320,7 +551,7 @@ export async function captureTestBaseline(
   buildConfig?: BuildConfig,
   relatedFiles?: string[],
   timeoutMs = TEST_BASELINE_TIMEOUT,
-): Promise<Set<string> | null> {
+): Promise<TestFailureBaseline | null> {
   let runners = detectTestRunners(buildConfig);
 
   if (runners.length === 0) return null;
@@ -344,7 +575,7 @@ export async function captureTestBaseline(
   sendLog(ws, `Capturing test baseline for: ${runners.map(r => r.label).join(', ')}\n`);
   statusRef.value = 'Capturing test baseline...';
 
-  const baselineFailures = new Set<string>();
+  const baselineRecords: StructuredTestFailure[] = [];
   const taskId = process.env.TASK_ID || '';
   const successfulRunners: TestRunner[] = [];
 
@@ -380,13 +611,7 @@ export async function captureTestBaseline(
     // baseline even when the suite had many. When JSON is available it's
     // the source of truth; stdout is a fallback for runners (pytest) that
     // don't emit a comparable JSON report at this runner-invocation layer.
-    const useVitestJson = runner.cmd === 'npm' && isVitestRunner(runner.cwd);
-    const jsonOutputPath = useVitestJson
-      ? `/tmp/vitest-baseline-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`
-      : null;
-    const runArgs = jsonOutputPath
-      ? [...runner.args, '--', '--reporter=default', '--reporter=json', `--outputFile=${jsonOutputPath}`]
-      : runner.args;
+    const { reportOutputPath, runArgs, env, useVitestJson } = structuredReportInvocation(runner, 'baseline');
 
     try {
       sendHeartbeatSync(taskId, `Baseline test run [${runner.label}]...`);
@@ -394,6 +619,7 @@ export async function captureTestBaseline(
       await execFileAsync(runner.cmd, runArgs, {
         cwd: runner.cwd,
         timeoutMs: runnerTimeout,
+        env,
       });
       // Runner exited cleanly — no failures
       successfulRunners.push(runner);
@@ -412,64 +638,40 @@ export async function captureTestBaseline(
         return null;
       }
       const msg = err instanceof Error ? err.message : String(err);
-      // Prefer JSON reporter output when available — authoritative and
-      // format-stable across vitest 2.x/3.x.
-      let parsedFromJson = false;
-      if (jsonOutputPath && fs.existsSync(jsonOutputPath)) {
+      // Fail closed when a failing supported runner cannot provide the
+      // occurrence records the route/key/detail comparator needs.  Do not
+      // revive the old stdout/name-only baseline as a fallback.
+      let records: StructuredTestFailure[] | null = null;
+      if (reportOutputPath && fs.existsSync(reportOutputPath)) {
         try {
-          const jsonText = fs.readFileSync(jsonOutputPath, 'utf-8');
-          const parsed = parseFailingTestsFromVitestJson(jsonText);
-          if (parsed.size > 0) {
-            parsed.forEach(f => baselineFailures.add(f));
-            parsedFromJson = true;
-          } else if (jsonText.includes('"numFailedTests":0') || jsonText.includes('"success":true')) {
-            // JSON reporter says 0 failures but the process exited non-zero.
-            // That's a non-test issue (setup error, runner crash); fall
-            // through to stdout parser to surface whatever broke.
-            parsedFromJson = false;
-          } else {
-            // JSON loaded but extraction returned empty — fall back to
-            // stdout so we don't silently treat a broken suite as passing.
-            parsedFromJson = false;
-          }
+          records = useVitestJson
+            ? parseStructuredVitestFailures(fs.readFileSync(reportOutputPath, 'utf-8'))
+            : junitRecords(reportOutputPath, runner.cwd);
         } catch {
-          // JSON file unreadable/malformed — fall through to stdout.
+          records = null;
         }
       }
-      if (!parsedFromJson) {
-        const parsed = parseFailingTests(msg);
-        parsed.forEach(f => baselineFailures.add(f));
-        // If BOTH paths came up empty despite the process exiting
-        // non-zero, something's wrong — log loudly so an operator can
-        // investigate rather than silently treating it as a clean baseline.
-        if (baselineFailures.size === 0) {
-          sendLog(
-            ws,
-            `WARNING: Test baseline for [${runner.label}] exited non-zero ` +
-            `but neither JSON reporter nor stdout parser extracted any ` +
-            `failures. Proceeding without baseline — treat any failures ` +
-            `in the fix loop as potentially pre-existing.\n`,
-          );
-          return null;
-        }
+      if (records === null || records.length === 0) {
+        sendLog(ws, `Test baseline for [${runner.label}] exited non-zero but did not produce structured failure records. Baseline is unverified.\n${msg.slice(0, 500)}\n`);
+        return null;
       }
+      baselineRecords.push(...records);
     } finally {
-      // Best-effort cleanup of the baseline JSON file.
-      if (jsonOutputPath) {
-        try { fs.unlinkSync(jsonOutputPath); } catch { /* ignore */ }
+      if (reportOutputPath) {
+        try { fs.unlinkSync(reportOutputPath); } catch { /* ignore */ }
       }
     }
   }
 
   await postBuildDiscoveryReport(ws, buildConfig, successfulRunners);
 
-  if (baselineFailures.size > 0) {
-    sendLog(ws, `Baseline: ${baselineFailures.size} pre-existing failure(s) found — these will be excluded from test fix analysis.\n`);
+  if (baselineRecords.length > 0) {
+    sendLog(ws, `Baseline: ${baselineRecords.length} pre-existing failure occurrence(s) found — these will be excluded from test fix analysis.\n`);
   } else {
     sendLog(ws, 'Baseline captured: all tests passing before changes.\n');
   }
 
-  return baselineFailures;
+  return { records: baselineRecords };
 }
 
 /**
@@ -572,11 +774,11 @@ function describeRunnerSetupCommand(runner: TestRunner): { cmd: string; args: st
 export async function testFixLoop(
   ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, buildConfig?: BuildConfig,
-  baselineFailures?: Set<string>,
+  baselineFailures?: TestFailureBaseline,
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; timedOut?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number }; line_coverage_pct?: number; changed_lines_coverage_pct?: number }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; timedOut?: boolean; verificationUnverified?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number }; line_coverage_pct?: number; changed_lines_coverage_pct?: number }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -657,7 +859,7 @@ export async function testFixLoop(
     // output file. When present, baseline comparison uses it as the source
     // of truth for WHICH tests failed, bypassing stdout pattern matching
     // (which mis-classifies mocked failure output inside passing tests).
-    const failures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = [];
+    const failures: Array<{ label: string; message: string; structuredRecords?: StructuredTestFailure[] | null }> = [];
     // Track setup errors (dep install, spawn timeout) separately from test
     // failures. If NO runner actually gets to execute tests, we can't
     // claim tests passed — the result must propagate as a setup failure
@@ -819,18 +1021,12 @@ export async function testFixLoop(
       // For vitest runners, request the JSON reporter alongside default
       // (human-readable) output — the JSON file is the authoritative source
       // of failed-test IDs, stdout is kept for operator diagnosis.
-      const useVitestJson = runner.cmd === 'npm' && isVitestRunner(runner.cwd);
-      const jsonOutputPath = useVitestJson
-        ? `/tmp/vitest-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`
-        : null;
-      const runArgs = jsonOutputPath
-        ? [...runner.args, '--', '--reporter=default', '--reporter=json', `--outputFile=${jsonOutputPath}`]
-        : runner.args;
+      const { reportOutputPath, runArgs, env, useVitestJson } = structuredReportInvocation(runner, 'current');
 
       try {
         sendHeartbeatSync(taskId, `Running tests [${runner.label}]...`);
         const runnerTimeout = isDockerRunner(runner) ? TEST_RUNNER_DOCKER_TIMEOUT : TEST_RUNNER_TIMEOUT;
-        const passOutput = await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: runnerTimeout });
+        const passOutput = await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: runnerTimeout, env });
         ranAnyRunner = true;
         runnerOutputs.push(passOutput);
         // A clean exit only counts as a real verdict if real tests ran. An
@@ -887,20 +1083,20 @@ export async function testFixLoop(
         const failClass = classifyTestExecution(msg);
         if (failClass === 'ran') anyRealTestExecuted = true;
         else if (failClass === 'all_skipped') sawAllSkipped = true;
-        let structuredIds: Set<string> | undefined;
-        if (jsonOutputPath && fs.existsSync(jsonOutputPath)) {
+        let structuredRecords: StructuredTestFailure[] | null = null;
+        if (reportOutputPath && fs.existsSync(reportOutputPath)) {
           try {
-            const jsonText = fs.readFileSync(jsonOutputPath, 'utf-8');
-            structuredIds = parseFailingTestsFromVitestJson(jsonText);
+            structuredRecords = useVitestJson
+              ? parseStructuredVitestFailures(fs.readFileSync(reportOutputPath, 'utf-8'))
+              : junitRecords(reportOutputPath, runner.cwd);
           } catch {
-            // Fall back to stdout scanning via parseFailingTests downstream.
+            structuredRecords = null;
           }
         }
-        failures.push({ label: runner.label, message: msg, structuredIds });
+        failures.push({ label: runner.label, message: msg, structuredRecords });
       } finally {
-        // Don't leave per-run temp files behind (cheap, but they accumulate).
-        if (jsonOutputPath) {
-          try { fs.unlinkSync(jsonOutputPath); } catch { /* already gone */ }
+        if (reportOutputPath) {
+          try { fs.unlinkSync(reportOutputPath); } catch { /* already gone */ }
         }
       }
     }
@@ -1009,32 +1205,35 @@ export async function testFixLoop(
     // don't have structured IDs (non-vitest runners).
     const renderFailure = (f: { label: string; message: string }) => `[${f.label}]:\n${f.message}`;
 
-    // When baseline is available, separate new failures from pre-existing ones.
-    // A failure block is pre-existing when all parsed test IDs within it appear
-    // in the baseline. Unparseable failures (size=0) are treated as new (safe default).
-    let fixableFailures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = reportableFailures;
+    // When baseline is available, let the canonical Python comparator decide
+    // route + testcase + kind + normalized-detail attribution.  A missing
+    // report/comparator is unverified; never fall back to test names.
+    let actionableFailureDetails: string[] | null = null;
     let preExistingNote = '';
 
     if (baselineFailures) {
-      const newFailures: typeof failures = [];
-      const preExistingFailures: typeof failures = [];
-
-      for (const failure of reportableFailures) {
-        // Structured IDs (from vitest JSON reporter) win over stdout parsing.
-        // Fall back to parseFailingTests only when JSON wasn't available.
-        const failureIds = failure.structuredIds ?? parseFailingTests(failure.message);
-        const isAllPreExisting = failureIds.size > 0 &&
-          Array.from(failureIds).every(id => baselineFailures.has(id));
-        if (isAllPreExisting) {
-          preExistingFailures.push(failure);
-        } else {
-          newFailures.push(failure);
-        }
+      const allRecords = reportableFailures.flatMap(failure => failure.structuredRecords ?? []);
+      if (allRecords.length === 0 || reportableFailures.some(failure => failure.structuredRecords === null)) {
+        return {
+          passed: false,
+          testFailuresDetected: false,
+          verificationUnverified: true,
+          failureSummary: 'Test runner failed but did not produce a structured failure report for baseline attribution.',
+        };
+      }
+      const attribution = compareStructuredFailures(allRecords, baselineFailures.records);
+      if (attribution === null) {
+        return {
+          passed: false,
+          testFailuresDetected: false,
+          verificationUnverified: true,
+          failureSummary: 'Canonical structured baseline comparator was unavailable or returned an invalid result.',
+        };
       }
 
-      if (newFailures.length === 0) {
+      if (!attribution.blocking) {
         // Every detected failure existed before our changes — task is not responsible
-        sendLog(ws, `All ${preExistingFailures.length} test failure(s) are pre-existing and were not caused by this task.\n`);
+        sendLog(ws, `All ${allRecords.length} test failure occurrence(s) are pre-existing and were not caused by this task.\n`);
         // ...but if a sibling runner failed setup, a suite never ran — surface
         // the partial-setup signal instead of an unqualified clean pass.
         if (partialSetupFailed) {
@@ -1044,13 +1243,18 @@ export async function testFixLoop(
         return { passed: true, testFailuresDetected: false };
       }
 
-      fixableFailures = newFailures;
-      if (preExistingFailures.length > 0) {
-        preExistingNote = `\n\nNote: The following test failures existed BEFORE your changes — do not attempt to fix these:\n${preExistingFailures.map(renderFailure).join('\n\n').slice(0, 1500)}`;
+      preExistingNote = `\n\nNote: structured baseline attribution suppressed ${Object.keys(attribution.suppressed_failures).length} inherited failure occurrence(s).`;
+      actionableFailureDetails = Object.values(attribution.new_failures);
+      if (Object.keys(attribution.suppressed_failures).length > 0) {
+        // Keep inherited diagnostics visible to operators, but never feed them
+        // into cap mutation or the LLM's actionable-failure prompt.
+        sendLog(ws, `Reporting ${Object.keys(attribution.suppressed_failures).length} inherited failure occurrence(s); excluding them from task repair decisions.\n`);
       }
     }
 
-    const combinedFailures = fixableFailures.map(renderFailure).join('\n\n');
+    const combinedFailures = actionableFailureDetails
+      ? actionableFailureDetails.join('\n\n')
+      : reportableFailures.map(renderFailure).join('\n\n');
     const fingerprint = errorFingerprint(combinedFailures);
     // Early exit: byte-identical consecutive failure (existing behaviour).
     if (fingerprintHistory.length > 0 && fingerprint === fingerprintHistory[fingerprintHistory.length - 1]) {
@@ -1101,8 +1305,11 @@ export async function testFixLoop(
       // to verify the breach cleared without spending an LLM fix attempt; the
       // prompt-level SIZE_GUARDRAIL_GUIDANCE remains the fallback for the no-op
       // case (e.g. a breach the checker can't resolve).
-      if (matchesSizeBreachSignature(combinedFailures)) {
-        const bumped = await runDeterministicSizeCapBump(ws);
+      const repairTargets = actionableFailureDetails === null
+        ? null
+        : extractSizeRepairTargets(actionableFailureDetails);
+      if (repairTargets && repairTargets.length > 0) {
+        const bumped = await runDeterministicSizeCapBump(ws, repairTargets);
         if (bumped) {
           git(['add', '-A']);
           prevDiff = currDiff;
@@ -1110,6 +1317,8 @@ export async function testFixLoop(
           continue;
         }
         sendLog(ws, 'Deterministic size-cap bump made no change — falling back to the Claude fix path.\n');
+      } else if (actionableFailureDetails !== null && repairTargets === null) {
+        sendLog(ws, 'Attributed size diagnostic had no safe repair target — skipping deterministic cap mutation.\n');
       }
 
       const analysisSections = analysisContext ? condensedAnalysisSections(analysisContext) : '';

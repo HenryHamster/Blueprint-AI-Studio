@@ -53,7 +53,7 @@ vi.mock('../utils/test-runners.js', async (importOriginal) => {
 
 vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/test-fix-loop.js')>();
-  return { ...actual, testFixLoop: vi.fn() };
+  return { ...actual, captureTestBaseline: vi.fn().mockResolvedValue({ records: [] }), testFixLoop: vi.fn() };
 });
 
 // existsSync answers true ONLY for the committed impacted-test resolver, so
@@ -74,7 +74,7 @@ vi.mock('fs', async (importOriginal) => {
 import { handleVerifyTests } from './verify-tests.js';
 import { persistAndPostStatus, execFileAsync } from '../index.js';
 import { detectTestRunners } from '../utils/test-runners.js';
-import { testFixLoop } from '../utils/test-fix-loop.js';
+import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 
 const WS = '/tmp/workspace';
 const NPM_RUNNER = { cmd: 'npm', args: ['test'], cwd: WS, label: 'npm test (root)' };
@@ -96,6 +96,7 @@ function parsedVerdict(): { detected: boolean; passed: boolean; setupFailed?: bo
 // resolver returns `resolverOut`; everything else resolves empty.
 function driveExecFileAsync(resolverOut: string): void {
   vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
+    if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('HEAD')) return Promise.resolve('head-sha');
     if (cmd === 'git' && args.includes('--name-only')) return Promise.resolve('backend/app/ci_resolution.py\n');
     if (cmd === 'python3' && args[0] === 'backend/testing/impacted_tests.py') {
       const mandatoryIndex = args.indexOf('--mandatory-output');
@@ -112,7 +113,10 @@ describe('handleVerifyTests — bounded/fall-open safety net', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(execFileAsync).mockResolvedValue('');
+    vi.mocked(captureTestBaseline).mockResolvedValue({ records: [] });
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) =>
+      Promise.resolve(cmd === 'git' && args[0] === 'rev-parse' && args.includes('HEAD') ? 'head-sha' : ''),
+    );
   });
 
   it('(1) a runaway full-suite run (timedOut) FALLS OPEN — COMPLETED detected=false, NOT retried, NOT FAILED', async () => {
@@ -164,6 +168,7 @@ describe('handleVerifyTests — bounded/fall-open safety net', () => {
     );
     const sentinel = 'backend/testing/test_drift_sentinel.py';
     vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
+      if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('HEAD')) return Promise.resolve('head-sha');
       if (cmd === 'git' && args.includes('--name-only')) return Promise.resolve('backend/app/ci_resolution.py\n');
       if (cmd === 'python3' && args[0] === 'backend/testing/impacted_tests.py') {
         const mandatoryIndex = args.indexOf('--mandatory-output');

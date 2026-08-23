@@ -55,6 +55,7 @@ from pathlib import Path
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.identity_extraction import extract_python_test_nodes
 
 # Canonical registry for the MissingGreenlet fidelity growth ratchet lives in
 # production (backend/app/greenlet_fidelity.py) so the debt is greppable from
@@ -729,10 +730,8 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
         return []
 
     violations: list[str] = []
-    for node in ast.walk(tree):
+    for test_id, node in extract_python_test_nodes(tree).items():
         if not isinstance(node, ast.AsyncFunctionDef):
-            continue
-        if not node.name.startswith("test_"):
             continue
         docstring = ast.get_docstring(node)
         if not docstring or "greenlet" not in docstring.lower():
@@ -780,7 +779,7 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
         if faithful_body:
             continue
 
-        violations.append(f"{path.name}::{node.name}")
+        violations.append(f"{path.name}::{test_id}")
     return violations
 
 
@@ -903,6 +902,17 @@ class TestMissingGreenletTestsFaithful:
             "flagged.  expire_fidelity restores _InstanceState._expire, so "
             "session.expire() genuinely works and the test is faithful."
         )
+
+    def test_greenlet_scanner_ignores_noncollectable_helper_methods(self, tmp_path):
+        """Only canonical, collectable test identities receive fidelity checks."""
+        helper = tmp_path / "test_helper.py"
+        helper.write_text(textwrap.dedent("""\
+            class Helper:
+                async def test_greenlet_helper(self):
+                    \"\"\"MissingGreenlet wording in a helper method.\"\"\"
+                    pass
+        """))
+        assert _unfaithful_greenlet_tests(helper) == []
 
     def test_session_expire_all_alone_is_not_faithful(self, tmp_path):
         """A test that only uses ``session.expire_all()`` WITHOUT the

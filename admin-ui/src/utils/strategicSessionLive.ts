@@ -56,6 +56,8 @@ export interface StrategicLiveActivity {
    *  `responding` = operator turn in flight; `working` = autonomous turn in
    *  flight; `done` = turn ended (strip cleared); `null` = no lifecycle seen. */
   latestLifecycle: 'responding' | 'working' | 'done' | null;
+  /** Epoch ms of the newest valid delta in the current visible turn. */
+  lastActivityMs?: number;
 }
 
 // Activity kinds mirror strategic_events.py `_STRATEGIC_SESSION_KINDS`.
@@ -214,6 +216,14 @@ export function computeStrategicSessionActivity(
   const doneSeq = lastDoneSeq(visible);
 
   const inFlight = latestLifecycle === 'working' || latestLifecycle === 'responding';
+  let lastActivityMs: number | undefined;
+  for (const d of visible) {
+    if ((d.seq ?? d.id) <= doneSeq || !d.ts) continue;
+    const tsMs = parseTimestamp(d.ts).getTime();
+    if (!Number.isNaN(tsMs) && (lastActivityMs === undefined || tsMs > lastActivityMs)) {
+      lastActivityMs = tsMs;
+    }
+  }
   const rawItems: StrategicActivityItem[] = visible
     .filter(d => STRATEGIC_ACTIVITY_KINDS.has(d.kind ?? '') && Boolean(d.text) && (d.seq ?? d.id) > doneSeq)
     .map(d => {
@@ -229,6 +239,7 @@ export function computeStrategicSessionActivity(
   return {
     items: items.length > MAX_ACTIVITY ? items.slice(-MAX_ACTIVITY) : items,
     latestLifecycle,
+    ...(lastActivityMs !== undefined ? { lastActivityMs } : {}),
   };
 }
 
@@ -502,6 +513,8 @@ export interface StrategicChatLiveState {
   label: string;
   /** The newest activity one-liner (or streamed reply excerpt) — optional. */
   detail?: string;
+  /** Epoch ms of the newest valid delta in the in-flight Chat turn. */
+  lastActivityMs?: number;
 }
 
 const CHAT_LIVE_DETAIL_MAX_CHARS = 60;
@@ -535,6 +548,7 @@ export function computeStrategicChatLiveState(
       phase: 'streaming',
       label: 'Replying',
       detail: chatLiveDetail(latestActivityText),
+      ...(activity.lastActivityMs !== undefined ? { lastActivityMs: activity.lastActivityMs } : {}),
     };
   }
   if (activity.latestLifecycle === 'responding' || activity.latestLifecycle === 'working') {
@@ -542,6 +556,7 @@ export function computeStrategicChatLiveState(
       phase: 'working',
       label: 'Working',
       detail: chatLiveDetail(latestActivityText),
+      ...(activity.lastActivityMs !== undefined ? { lastActivityMs: activity.lastActivityMs } : {}),
     };
   }
   return null;

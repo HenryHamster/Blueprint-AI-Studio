@@ -8,6 +8,7 @@ clean; section scoping works; absent-tree sections are skipped not errored.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -277,6 +278,71 @@ def test_fix_bumps_and_adds_in_one_pass(tmp_path):
     assert data["backend"]["big.py"] == bump_size_limit(1720)
     assert data["backend"]["huge.py"] == bump_size_limit(1600)
     assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_scoped_fix_repairs_only_the_selected_current_breach(tmp_path):
+    """Attribution-driven repair must not sweep a sibling offender into a task PR."""
+    repo, jp = _build_repo(
+        tmp_path,
+        backend={"task_change.py": (1720, 1600), "inherited.py": (1900, 1600)},
+    )
+
+    assert _run(
+        jp,
+        repo,
+        "--fix",
+        "--sections",
+        "backend",
+        "--repair-target",
+        "backend/task_change.py",
+    ) == 0
+
+    data = json.loads(_read(jp))
+    assert data["backend"]["task_change.py"] == bump_size_limit(1720)
+    # It remains a visible checker breach, but this task-targeted repair did
+    # not mutate it merely because it was present in the current checkout.
+    assert data["backend"]["inherited.py"] == 1600
+    assert _run(jp, repo, "--sections", "backend") == 1
+
+
+def test_scoped_fix_rejects_a_non_actionable_or_malformed_target(tmp_path, capsys):
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 1600)})
+
+    rc = _run(
+        jp,
+        repo,
+        "--fix",
+        "--sections",
+        "backend",
+        "--repair-target",
+        "backend/not-current.py",
+    )
+
+    assert rc == 1
+    assert "[refused] repair target" in capsys.readouterr().out
+    assert json.loads(_read(jp))["backend"]["big.py"] == 1600
+
+    with pytest.raises(SystemExit):
+        _run(jp, repo, "--fix", "--repair-target", "backend/../escape.py")
+
+
+def test_scoped_fix_limits_the_canonical_ledger_rebuild_to_its_target(tmp_path, mocker):
+    repo, jp = _build_repo(tmp_path, backend={"task_change.py": (1720, 1600)})
+    rebuilt = mocker.patch("app.size_limit_policy.rebuild_cap_bump_history_ledger")
+
+    assert _run(
+        jp,
+        repo,
+        "--fix",
+        "--sections",
+        "backend",
+        "--repair-target",
+        "backend/task_change.py",
+    ) == 0
+
+    assert rebuilt.call_args.kwargs["repair_targets"] == {
+        ("backend", "task_change.py")
+    }
 
 
 def test_fix_prunes_deleted_cap_and_its_ledger_history(tmp_path, mocker):
@@ -1778,6 +1844,22 @@ def test_ungoverned_release_surface_module_fails_with_named_file(tmp_path, capsy
     _write_governed_module(release_module, total_lines=1, governance_cap=1)
     assert csl.find_ungoverned_release_surface_modules(repo) == []
     assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_base_root_preexisting_ungoverned_release_module_warn_passes(tmp_path, capsys):
+    """An ungoverned release module inherited from base is reported, not blocking."""
+    base, _base_jp = _build_repo(tmp_path / "base", backend={"ok.py": (10, 100)})
+    module_name = "release_inherited.py"
+    base_module = os.path.join(base, "backend", "app", module_name)
+    _write_lines(base_module, 1)
+
+    repo, jp = _build_repo(tmp_path / "current", backend={"ok.py": (10, 100)})
+    shutil.copy2(base_module, os.path.join(repo, "backend", "app", module_name))
+
+    assert _run(jp, repo, "--base-root", base, "--sections", "backend") == 0
+    out = capsys.readouterr().out
+    assert "[pre-existing] backend/release_inherited.py" in out
+    assert "inherited from the base branch" in out
 
 
 # Zero-headroom escape hatch: --fix/--force-chronic cannot bump a module
