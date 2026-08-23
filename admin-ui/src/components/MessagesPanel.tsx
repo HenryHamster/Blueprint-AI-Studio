@@ -29,6 +29,7 @@ import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useConversationSend } from '../hooks/useConversationSend';
 import { compareConversationMessages, isCanonicalConversationEnvelope, useConversation } from '../hooks/useConversation';
 import { useStrategistStatus } from '../hooks/useStrategistStatus';
+import { useProjectConsultations } from '../hooks/useProjectConsultations';
 import { StrategistStatusChip } from './StrategistStatusChip';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
@@ -2750,6 +2751,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     textareaRef.current?.focus();
   }, [canOperateProject, captureCurrentDraftRefs, persistComposerEnvelope]);
 
+  // Collapsed progress for Resident-invoked Workday sub-sessions. Chat mode
+  // only: the triage view has no consultation lines to annotate.
+  const { rowsById: consultationRows } = useProjectConsultations(
+    selectedProjectId,
+    conversationMode,
+  );
+
   const bubbleProps = useMemo(() => ({
     actionMode: canOperateProject ? (conversationMode ? 'reply-only' as const : 'full' as const) : 'none' as const,
     deletingIds,
@@ -2770,6 +2778,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     onReply,
     onOpenStrategicContext: conversationMode ? onOpenStrategicContextWorkspace : undefined,
     currentActorUserId: auth.currentUser?.uid ?? null,
+    consultationRows,
   }), [
     canOperateProject,
     conversationMode,
@@ -2790,6 +2799,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     onCancelInvestigate,
     onReply,
     onOpenStrategicContextWorkspace,
+    consultationRows,
   ]);
 
   // Stable callbacks for MessagesPanelHeader and MessagesComposer props —
