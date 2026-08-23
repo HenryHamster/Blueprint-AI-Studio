@@ -228,6 +228,74 @@ async def find_parked_blocked_foundation(
     return None
 
 
+async def _review_loop_original_task(
+    dep: Task, raw_original_id, session: AsyncSession
+) -> Task | None:
+    """Load the review-loop ORIGINAL task that owns *dep*'s PR park marker.
+
+    The park marker is recorded on the loop's original task, NOT on the
+    per-iteration fix task a dependent usually points at, so it has to be
+    followed through ``review_loop.original_task_id``. Returns *dep* when it IS
+    the original (or carries no pointer); ``None`` when the pointer dangles or
+    crosses projects — a marker that cannot be read must never be inferred.
+    """
+    if not raw_original_id or str(raw_original_id) == str(dep.id):
+        return dep
+    try:
+        original = await session.get(Task, uuid.UUID(str(raw_original_id)))
+    except (ValueError, AttributeError, TypeError):
+        return dep
+    if original is None or original.project_id != dep.project_id:
+        return None
+    return original
+
+
+async def find_unlandable_pr_foundation(
+    dependent: Task, dep_tasks: list, session: AsyncSession, verify_pr_merged
+) -> dict | None:
+    """Describe the first COMPLETED dependency whose PR can never merge on its own.
+
+    The same-base gate releases a code-producing dependency only once its PR is
+    MERGED. That wait is normally transient — the review loop keeps driving the
+    PR. It turns PERMANENT once that loop is parked for operator disposition
+    (abandon-candidate / stuck / standoff): automatic fix spawning is
+    deliberately stopped, and the dependency is already terminal (COMPLETED,
+    usually archived), so neither side can ever advance it and the dependent
+    sits QUEUED forever behind a bare "Waiting on N deps" message.
+
+    Returns a plain descriptor dict (``id`` / ``label`` / ``reason`` /
+    ``pr_number``), not the ORM row, so the caller can escalate from its own
+    session. Conservative by construction, mirroring
+    :func:`is_parked_blocked_foundation`: a dependency whose loop is still live
+    (no park recorded), or whose PR has in fact merged, yields ``None``, so an
+    ordinary in-flight merge wait is never escalated.
+    """
+    from app.review_loop_convergence import review_loop_parked_for_operator
+
+    for dt in dep_tasks:
+        if dt.status != TaskStatus.COMPLETED or dt.project_id != dependent.project_id:
+            continue
+        loop = (dt.context or {}).get("review_loop")
+        loop = loop if isinstance(loop, dict) else {}
+        original = await _review_loop_original_task(
+            dt, loop.get("original_task_id"), session
+        )
+        park_reason = review_loop_parked_for_operator(
+            dt
+        ) or review_loop_parked_for_operator(original)
+        # Only a still-unmerged PR strands the dependent — a parked loop whose PR
+        # an operator merged by hand satisfies the gate through the normal path.
+        if not park_reason or await verify_pr_merged(dt, session):
+            continue
+        return {
+            "id": str(dt.id),
+            "label": dt.title or str(dt.id),
+            "reason": str(park_reason),
+            "pr_number": loop.get("pr_number"),
+        }
+    return None
+
+
 async def _classify_stuck_tasks(
     stuck, dep_map, dep_tasks_by_id, stuck_ids, session, verify_pr_merged
 ) -> list:
@@ -246,6 +314,14 @@ async def _classify_stuck_tasks(
                                so the in-flight wait below would strand this dependent
                                forever and the dead-deps breaker (terminal-only) never
                                fires. Surface it so the caller escalates the dependent.
+      - ``'stranded_unlanded'`` — every dependency is terminal, but a COMPLETED
+                               code-producing dependency's PR will never merge: the
+                               review loop that owns it is parked for operator
+                               disposition, so automatic fix spawning has stopped.
+                               The same-base PR-merge gate would hold this dependent
+                               QUEUED forever. Surface it so the caller escalates the
+                               dependent WITH the reason (never cleared-and-dispatched:
+                               its base genuinely lacks the prerequisite's code).
 
     Dependency-death semantics are delegated to :func:`_check_candidate_task_deps`
     so this deadlock-breaker and the main dispatch loop share ONE source of truth:
@@ -337,7 +413,19 @@ async def _classify_stuck_tasks(
             out.append((t.id, "cascade_cancel", failed_prereq))
         elif result == "eligible":
             out.append((t.id, "dead_deps"))
-        # result == "waiting" (e.g. a requeue clone still in flight) → keep waiting.
+        else:
+            # result == "waiting". Normally transient — a requeue clone still in
+            # flight, or a PR the review loop is still driving to merge — so the
+            # default really is to keep waiting. It is PERMANENT in exactly one
+            # shape: the dependency is terminal AND the review loop that owns its
+            # PR has been parked for operator disposition, so nothing will ever
+            # merge that PR and the same-base merge gate holds this dependent
+            # QUEUED forever with no operator-visible reason.
+            unlandable = await find_unlandable_pr_foundation(
+                t, dep_tasks, session, verify_pr_merged
+            )
+            if unlandable is not None:
+                out.append((t.id, "stranded_unlanded", unlandable))
     return out
 
 

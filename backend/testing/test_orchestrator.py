@@ -9306,6 +9306,117 @@ class TestWarmVMSkipProvision:
             )
 
     @pytest.mark.asyncio
+    async def test_deadlock_breaker_escalates_unlanded_dependent_with_reason(
+        self, orch_warm_db, mocker
+    ):
+        """A ``stranded_unlanded`` classification must move the dependent into
+        BLOCKED with an operator-actionable reason naming the unmerged PR and the
+        park — never clear depends_on and dispatch it (its base genuinely lacks
+        the prerequisite's code), and never leave it silently QUEUED."""
+        from sqlmodel import select as _select
+        from app.models import Alert, AlertSeverity
+        from app.orchestrator import _apply_deadlock_classification
+        from app.broadcast import broadcast_to_project
+
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Deadlock Unlanded", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            prereq = make_task(
+                project_id=project.id,
+                title="fix(size): attribute merge cap breaches",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix", "prompt": "prereq"}],
+            )
+            session.add(prereq)
+            await session.commit()
+            await session.refresh(prereq)
+
+            dependent = make_task(
+                project_id=project.id,
+                title="stranded-dependent",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent"}],
+                depends_on=[str(prereq.id)],
+            )
+            session.add(dependent)
+            await session.commit()
+            await session.refresh(dependent)
+            project_id = project.id
+            dependent_id = dependent.id
+            prereq_id = prereq.id
+
+        descriptor = {
+            "id": str(prereq_id),
+            "label": "fix(size): attribute merge cap breaches",
+            "reason": "semantic_nonconvergence",
+            "pr_number": 17707,
+        }
+        eligible_ids: list = []
+        acted = await _apply_deadlock_classification(
+            [(dependent_id, "stranded_unlanded", descriptor)],
+            broadcast_to_project,
+            eligible_ids,
+        )
+
+        assert acted == 1
+        # Never dispatched: the stranded dependent must not join eligible_ids.
+        assert eligible_ids == []
+
+        async with orch_warm_db() as verify:
+            row = await verify.get(Task, dependent_id)
+            assert row.status == TaskStatus.BLOCKED
+            # depends_on stays intact — the prerequisite relationship is real.
+            assert row.depends_on == [str(prereq_id)]
+            assert (row.context or {}).get("_blocked_escalated") is True
+            # The reason must reach BOTH operator surfaces: the task-list line
+            # (which previously read only "Waiting on 1 dep: <prefix>") and the
+            # durable blocker record.
+            message = row.latest_status_message or ""
+            assert "PR #17707" in message
+            assert "semantic_nonconvergence" in message
+            assert str(prereq_id) in message
+            assert "PR #17707" in (row.blocked_reason or "")
+            assert row.blocker_kind == "upstream_dependency"
+            blocker = (row.context or {}).get("blocker") or {}
+            assert blocker.get("escalated") is True
+            assert (blocker.get("need") or {}).get("ref") == str(prereq_id)
+
+            # Recovery contract. The need must stay UNSATISFIED while the PR is
+            # open (no false resume against a base that lacks the code), and must
+            # become satisfied the moment the prerequisite carries a merge-unblock
+            # signal — so an operator merging the PR is by itself enough for the
+            # parked re-evaluation sweep to bring this dependent back, with no
+            # manual requeue.
+            from app.blocked_need_resolution import need_satisfied_by_completed
+
+            need = blocker.get("need")
+            prereq_row = await verify.get(Task, prereq_id)
+            assert need_satisfied_by_completed(row, need, [prereq_row]) is False
+            prereq_row.context = {**(prereq_row.context or {}), "pr_merged": True}
+            assert need_satisfied_by_completed(row, need, [prereq_row]) is True
+
+            alerts = (
+                (
+                    await verify.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts) == 1, (
+                f"Expected exactly one blocked-escalation alert, got {len(alerts)}"
+            )
+            assert alerts[0].severity == AlertSeverity.ERROR
+            assert alerts[0].task_id == dependent_id
+            assert "PR #17707" in (alerts[0].message or "")
+
+    @pytest.mark.asyncio
     async def test_ci_poll_merge_on_promotion_target_withholds_pr_merged(
         self, db_session
     ):
@@ -11449,6 +11560,248 @@ class TestClassifyStuckTasksSharedPolicy:
         # Still-recovering BLOCKED foundation is a normal in-flight wait — the
         # dependent keeps waiting unchanged, not stranded.
         assert out == []
+
+    @pytest.mark.asyncio
+    async def test_unlanded_parked_pr_dependency_strands_dependent(self, db_session):
+        """A COMPLETED same-base code dep whose review loop is parked for operator
+        disposition can never merge its PR, so the same-base merge gate holds the
+        dependent QUEUED forever. That must be surfaced, not left as a bare wait."""
+        from app.orchestrator_health import _classify_stuck_tasks
+        from app.review_loop_convergence import REVIEW_LOOP_ABANDON_CANDIDATE_KEY
+
+        async def _unmerged(_task, _session):
+            return False
+
+        project = make_project(name="StuckUnlanded", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # The park marker lives on the review loop's ORIGINAL task, not on the
+        # per-iteration fix task the dependent actually points at.
+        original = make_task(
+            project_id=project.id,
+            title="original-review-loop-task",
+            payloads=[{"type": "fix", "prompt": "original"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                REVIEW_LOOP_ABANDON_CANDIDATE_KEY: {
+                    "reason": "semantic_nonconvergence",
+                    "attempts": 7,
+                    "cycles": 3,
+                    "pr_number": 17707,
+                }
+            },
+        )
+        db_session.add(original)
+        await db_session.commit()
+        await db_session.refresh(original)
+
+        dep = make_task(
+            project_id=project.id,
+            title="fix(size): attribute merge cap breaches",
+            payloads=[{"type": "fix", "prompt": "dep"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "review_loop": {
+                    "original_task_id": str(original.id),
+                    "pr_number": 17707,
+                }
+            },
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {dep.id}},
+            {dep.id: dep},
+            {stuck.id},
+            db_session,
+            _unmerged,
+        )
+        # Surfaced for escalation WITH the reason — never silently waiting, and
+        # never cleared-and-dispatched (the base genuinely lacks the dep's code).
+        assert len(out) == 1, out
+        assert out[0][0] == stuck.id
+        assert out[0][1] == "stranded_unlanded"
+        descriptor = out[0][2]
+        assert descriptor["id"] == str(dep.id)
+        assert descriptor["reason"] == "semantic_nonconvergence"
+        assert descriptor["pr_number"] == 17707
+        assert descriptor["label"] == dep.title
+
+    @pytest.mark.asyncio
+    async def test_live_review_loop_dependency_keeps_waiting(self, db_session):
+        """An unmerged PR whose review loop is still LIVE (no operator park) is an
+        ordinary in-flight merge wait — it must NOT be escalated as stranded."""
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        async def _unmerged(_task, _session):
+            return False
+
+        project = make_project(name="StuckLiveLoop", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        original = make_task(
+            project_id=project.id,
+            title="original-live-loop",
+            payloads=[{"type": "fix", "prompt": "original"}],
+            status=TaskStatus.COMPLETED,
+            context={"review_loop": {"pr_number": 17707, "iteration": 2}},
+        )
+        db_session.add(original)
+        await db_session.commit()
+        await db_session.refresh(original)
+
+        dep = make_task(
+            project_id=project.id,
+            title="live-fix-iteration",
+            payloads=[{"type": "fix", "prompt": "dep"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "review_loop": {
+                    "original_task_id": str(original.id),
+                    "pr_number": 17707,
+                }
+            },
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {dep.id}},
+            {dep.id: dep},
+            {stuck.id},
+            db_session,
+            _unmerged,
+        )
+        assert out == []
+
+    @pytest.mark.asyncio
+    async def test_unlanded_lookup_ignores_merged_pr_and_foreign_original(
+        self, db_session
+    ):
+        """``find_unlandable_pr_foundation`` is conservative on both fences: a
+        parked loop whose PR actually merged is satisfied through the normal
+        path, and a park marker on a FOREIGN project's task is never inferred."""
+        from app.orchestrator_health import find_unlandable_pr_foundation
+        from app.review_loop_convergence import REVIEW_LOOP_ABANDON_CANDIDATE_KEY
+
+        async def _unmerged(_task, _session):
+            return False
+
+        async def _merged(_task, _session):
+            return True
+
+        own_project = make_project(name="OwnUnlandedFence", user_id="u1")
+        foreign_project = make_project(name="ForeignUnlandedFence", user_id="u2")
+        db_session.add_all([own_project, foreign_project])
+        await db_session.flush()
+
+        parked_marker = {
+            REVIEW_LOOP_ABANDON_CANDIDATE_KEY: {
+                "reason": "semantic_nonconvergence",
+                "pr_number": 17707,
+            }
+        }
+        own_original = make_task(
+            project_id=own_project.id,
+            title="own-original",
+            payloads=[{"type": "fix", "prompt": "own original"}],
+            status=TaskStatus.COMPLETED,
+            context=dict(parked_marker),
+        )
+        foreign_original = make_task(
+            project_id=foreign_project.id,
+            title="foreign-original",
+            payloads=[{"type": "fix", "prompt": "foreign original"}],
+            status=TaskStatus.COMPLETED,
+            context=dict(parked_marker),
+        )
+        db_session.add_all([own_original, foreign_original])
+        await db_session.flush()
+
+        parked_dep = make_task(
+            project_id=own_project.id,
+            title="parked-dep",
+            payloads=[{"type": "fix", "prompt": "parked dep"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "review_loop": {
+                    "original_task_id": str(own_original.id),
+                    "pr_number": 17707,
+                }
+            },
+        )
+        foreign_pointer_dep = make_task(
+            project_id=own_project.id,
+            title="foreign-pointer-dep",
+            payloads=[{"type": "fix", "prompt": "foreign pointer dep"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "review_loop": {
+                    "original_task_id": str(foreign_original.id),
+                    "pr_number": 17707,
+                }
+            },
+        )
+        db_session.add_all([parked_dep, foreign_pointer_dep])
+        await db_session.flush()
+
+        dependent = make_task(
+            project_id=own_project.id,
+            payloads=[{"type": "create", "prompt": "dependent"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(parked_dep.id)],
+        )
+        db_session.add(dependent)
+        await db_session.flush()
+
+        # Control: the parked, still-open PR IS detected.
+        assert (
+            await find_unlandable_pr_foundation(
+                dependent, [parked_dep], db_session, _unmerged
+            )
+        ) is not None
+        # Fence 1: an operator merged the PR by hand -> satisfied normally.
+        assert (
+            await find_unlandable_pr_foundation(
+                dependent, [parked_dep], db_session, _merged
+            )
+        ) is None
+        # Fence 2: the original_task_id points across projects -> marker
+        # unreadable, so it is never inferred.
+        assert (
+            await find_unlandable_pr_foundation(
+                dependent, [foreign_pointer_dep], db_session, _unmerged
+            )
+        ) is None
 
     @pytest.mark.asyncio
     async def test_co_deferred_plus_failed_prereq_identifies_correct_prereq(
