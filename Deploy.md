@@ -102,21 +102,24 @@ Do not hand-cut a branch for this. Name the repair instead:
 
 ```bash
 # preview exactly what would ship
-GET  /api/admin/projects/{project_id}/promote/hotfix/preview?repair_commit_shas=<full-40-hex-sha>
+GET  /api/admin/projects/{project_id}/promote/hotfix/preview?repair_commit_shas=<commit-sha>
 # ship it
 POST /api/admin/projects/{project_id}/promote/hotfix
      {"reason": "...", "scope_modules": [...], "ack_inert_until_deploy": true,
-      "repair_commit_shas": ["<full-40-hex-sha>", ...]}
+      "repair_commit_shas": ["<commit-sha>", ...]}
 ```
 
 Each named commit is diffed against its own first parent, the union of those
 diffs goes through the SAME fail-closed allowlist (a named commit that also
 touches product code, a migration, a workflow, or `EXPECTED_SCHEMA_REVISION` is
 still rejected and nothing is cut), and an eligible repair is materialized as a
-new commit on top of the promotion target carrying only those files. SHAs must
-be full 40-hex and at most ten may be named. CI is resolved against the commit
-the repair was actually built and tested on, and the promotion PR then runs its
-own CI on the narrow branch.
+new commit on top of the promotion target carrying only those files. An
+abbreviated sha (what `git log` prints) is fine: the lane resolves each named
+ref to its canonical full sha before anything is diffed, shipped or audited, and
+a ref GitHub cannot resolve — unknown, or a prefix matching more than one object
+— is still rejected, quoting GitHub's own message. At most ten commits may be
+named. CI is resolved against the commit the repair was actually built and
+tested on, and the promotion PR then runs its own CI on the narrow branch.
 
 ---
 
