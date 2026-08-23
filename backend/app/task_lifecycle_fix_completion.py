@@ -39,7 +39,11 @@ from app.admin_approval_authority import (
     establish_independent_approval_hold,
 )
 from app.models import Alert, AlertSeverity, Project, Task
-from app.review_pipeline import SPAWN_REASON_DEFERRED, SPAWN_REASON_KEY
+from app.review_pipeline import (
+    SPAWN_REASON_DEFERRED,
+    SPAWN_REASON_KEY,
+    stale_respawn_delta_base_sha,
+)
 import app.shared_state as _shared_state
 
 logger = logging.getLogger(__name__)
@@ -140,6 +144,9 @@ async def run_fix_completion(
     # Gating on merged==True only prevents silently dropping the
     # re-review handoff during that brief closed window.
     rereview_target: dict[str, str | int] | None = None
+    # Initialized before the try: if the live-PR lookup below raises, the
+    # spawn sites still run and "" (a full re-review) is the safe default.
+    _rr_delta_base = ""
     try:
         (
             gh_token_check,
@@ -158,6 +165,29 @@ async def run_fix_completion(
                 "base_sha": _rr_base_sha,
                 "head_sha": _rr_head_sha,
             }
+        # Narrowest SAFE delta base for the post-fix re-review. NOT simply the
+        # head we last reviewed: a delta review runs
+        # ``git diff <delta_base_sha>..HEAD`` with the broad review context
+        # suppressed, and that narrowing is sound only when the head moved and
+        # the base did NOT. When a research staging base is refreshed under a
+        # live plan branch, ``reviewed_head..HEAD`` sweeps in the base-merge
+        # commit, and the reviewer reads base-branch content as this PR's own
+        # scope creep — it raises a file-set blocker naming files the PR never
+        # touches, the fix agent "complies" by reverting BASE content, the
+        # revert-of-the-revert shows up in the next incremental range, and the
+        # loop stands off (real: PR #17690 blocked on scripts/local_runner.py
+        # and docs/RUNNER_RUNBOOK.md, both byte-identical to the base; PR
+        # #17720 told to revert a size cap already at that value on its base).
+        # ``stale_respawn_delta_base_sha`` already encodes the safe predicate
+        # and returns "" — a full re-review — for exactly these cases; this
+        # path just never called it.
+        _rr_delta_base = stale_respawn_delta_base_sha(
+            reviewed_head_sha=review_loop.get("reviewed_head_sha")
+            or review_loop.get("head_sha"),
+            reviewed_base_sha=review_loop.get("reviewed_base_sha"),
+            live_head_sha=_rr_head_sha,
+            live_base_sha=_rr_base_sha,
+        )
         if pr_data_check.get("merged"):
             logger.info(
                 f"[REVIEW PIPELINE] PR #{pr_number} already merged — skipping fix re-review for task {task.id}"
@@ -233,11 +263,7 @@ async def run_fix_completion(
             branch,
             base_branch,
             original_task_id=original_task_id,
-            delta_base_sha=str(
-                review_loop.get("reviewed_head_sha")
-                or review_loop.get("head_sha")
-                or ""
-            ),
+            delta_base_sha=_rr_delta_base,
             review_target=rereview_target,
         )
         if review_task:
@@ -290,11 +316,7 @@ async def run_fix_completion(
                     branch,
                     base_branch,
                     original_task_id=original_task_id,
-                    delta_base_sha=str(
-                        review_loop.get("reviewed_head_sha")
-                        or review_loop.get("head_sha")
-                        or ""
-                    ),
+                    delta_base_sha=_rr_delta_base,
                     review_target=rereview_target,
                 )
                 if review_task:

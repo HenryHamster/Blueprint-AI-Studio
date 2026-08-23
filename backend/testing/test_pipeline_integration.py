@@ -931,6 +931,26 @@ async def test_fix_task_spawns_review_on_completion(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
+    # The live PR must be readable for the re-review to be scoped to a delta at
+    # all: the safe delta base is a function of reviewed-vs-live BASE, and an
+    # unreachable PR is missing provenance, which correctly widens to a full
+    # re-review. This test is about the delta, so give it a live pair whose
+    # base matches what was reviewed (base held, head moved).
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": False,
+            "state": "open",
+            "base": {"sha": "base-held"},
+            "head": {"sha": "live-head-after-fix"},
+        },
+    )
 
     project = Project(name="Respawn Review Test", user_id="test-user-123")
     db_session.add(project)
@@ -957,6 +977,7 @@ async def test_fix_task_spawns_review_on_completion(
                 "base_branch": "main",
                 "iteration": 2,
                 "reviewed_head_sha": "reviewed-before-fix",
+                "reviewed_base_sha": "base-held",
             }
         },
         vm_instance_id=vm_id,

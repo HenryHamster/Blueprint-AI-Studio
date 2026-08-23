@@ -7635,6 +7635,12 @@ async def test_fix_completion_all_reasons_spawn_exact_head_delta_rereview(
                 "fix_reason": fix_reason,
                 "iteration": 2,
                 "reviewed_head_sha": "pre-fix-head",
+                # The BASE this fix's review actually ran against. It matches
+                # the live base below, so the base held and only the head
+                # moved — the one shape in which a head-relative delta is
+                # sound. Seeding the head alone (as this test used to) is not
+                # the happy path, it is missing provenance.
+                "reviewed_base_sha": "live-base",
             },
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -7650,6 +7656,111 @@ async def test_fix_completion_all_reasons_spawn_exact_head_delta_rereview(
     assert spawn_args[1] == "review"
     assert spawn_kwargs["delta_base_sha"] == "pre-fix-head"
     assert spawn_kwargs["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 42,
+        "base_sha": "live-base",
+        "head_sha": "live-head",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reviewed_base_sha,expected_delta",
+    [
+        # Base MOVED under the plan branch (a research staging-base refresh).
+        # No head-relative delta can cover content the reviewer never saw
+        # against the new base — and `reviewed_head..HEAD` would sweep in the
+        # base-merge commit, which the reviewer then reads as this PR's own
+        # scope creep. Full re-review.
+        ("stale-base", ""),
+        # Provenance missing: never guess a narrower scope.
+        (None, ""),
+    ],
+)
+async def test_fix_completion_declines_a_delta_when_the_base_moved(
+    tl_db, mocker, reviewed_base_sha, expected_delta
+):
+    """A post-fix re-review must not diff across a base refresh.
+
+    Real incidents: PR #17690 stood off for 6 iterations on a blocker naming
+    ``scripts/local_runner.py`` and ``docs/RUNNER_RUNBOOK.md`` — both
+    byte-identical to the base and absent from the PR's own 8-file diff — and
+    PR #17720 was told to revert a ``task_lifecycle.py`` size cap that its base
+    already carried. In both, the reviewer's reported delta matched
+    ``git diff <reviewed_head>..HEAD`` exactly, and that range spanned a
+    ``Merge remote-tracking branch 'origin/research/...'`` commit. The fix
+    agent complies by reverting BASE content, the revert-of-the-revert lands in
+    the next incremental range, and the loop cannot converge.
+    """
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": False,
+            "state": "open",
+            "base": {"sha": "live-base"},
+            "head": {"sha": "live-head"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    spawned_review = mocker.Mock(id=uuid.uuid4())
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    _loop = {
+        "pr_number": 42,
+        "branch": "blueprint/test-branch",
+        "base_branch": "main",
+        "fix_reason": "code_review",
+        "iteration": 2,
+        "reviewed_head_sha": "pre-fix-head",
+    }
+    if reviewed_base_sha is not None:
+        _loop["reviewed_base_sha"] = reviewed_base_sha
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": _loop},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.args[1] == "review"
+    assert spawn_mock.await_args.kwargs["delta_base_sha"] == expected_delta, (
+        "a base refresh under the plan branch must force a FULL re-review, "
+        "not a head-relative delta that spans the base-merge commit"
+    )
+    # The re-review still targets the LIVE pair — only the diff scope widens.
+    assert spawn_mock.await_args.kwargs["review_target"] == {
         "project_id": str(project.id),
         "pr_number": 42,
         "base_sha": "live-base",

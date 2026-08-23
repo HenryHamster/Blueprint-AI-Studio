@@ -345,36 +345,55 @@ async def test_source_authority_project_lock_contention_has_short_retry_reason(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "origin,fix_reason,source_loop,expected_head",
+    "origin,fix_reason,source_loop,expected_head,expected_base",
     [
         (
             "review_approve_ci_failure",
             "ci_failure",
-            {"head_sha": "approved-head"},
+            {"head_sha": "approved-head", "base_sha": "approved-base"},
             "approved-head",
+            "approved-base",
         ),
         (
             "ci_completion_failure",
             "ci_failure",
-            {"reviewed_head_sha": "reviewed-ci-head", "head_sha": "later-head"},
+            {
+                "reviewed_head_sha": "reviewed-ci-head",
+                "reviewed_base_sha": "reviewed-ci-base",
+                "head_sha": "later-head",
+                "base_sha": "later-base",
+            },
             "reviewed-ci-head",
+            # PAIRED: verdict provenance wins for BOTH, so the later ambient
+            # base must not be spliced onto the reviewed head.
+            "reviewed-ci-base",
         ),
         (
             "ci_completion_merge_conflict",
             "merge_conflict",
             {"head_sha": "conflicted-head"},
             "conflicted-head",
+            # The chosen source has a head and no base. Emitting nothing is
+            # correct: the post-fix re-review then widens to a full review
+            # rather than assuming the base held.
+            None,
         ),
         (
             "migration_guard",
             "migration_guard",
-            {"review_target": {"head_sha": "migration-guard-head"}},
+            {
+                "review_target": {
+                    "head_sha": "migration-guard-head",
+                    "base_sha": "migration-guard-base",
+                }
+            },
             "migration-guard-head",
+            "migration-guard-base",
         ),
     ],
 )
 async def test_fix_origins_inherit_pre_fix_head_for_delta_rereview(
-    db_session, mocker, origin, fix_reason, source_loop, expected_head
+    db_session, mocker, origin, fix_reason, source_loop, expected_head, expected_base
 ):
     """Every post-approval fix origin preserves the cheap delta-review base."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
@@ -411,6 +430,11 @@ async def test_fix_origins_inherit_pre_fix_head_for_delta_rereview(
     assert created is True and fix_task is not None, origin
     fix_loop = (fix_task.context or {}).get("review_loop", {})
     assert fix_loop.get("reviewed_head_sha") == expected_head, origin
+    # The base travels WITH the head. Without it the post-fix re-review has no
+    # way to tell a held base from a refreshed one and has to guess a delta —
+    # which is how a research staging-base merge ends up inside the review
+    # range and gets reported back as this PR's own scope creep.
+    assert fix_loop.get("reviewed_base_sha") == expected_base, origin
 
 
 @pytest.mark.asyncio

@@ -3812,16 +3812,33 @@ async def _spawn_pipeline_task(
         # wins; older source rows fall back through their live head and pinned
         # immutable review target.
         source_review_target = source_loop.get("review_target")
-        reviewed_head_sha = str(
-            source_loop.get("reviewed_head_sha")
-            or source_loop.get("head_sha")
-            or (
-                source_review_target.get("head_sha")
-                if isinstance(source_review_target, dict)
-                else ""
-            )
-            or ""
-        )
+        if not isinstance(source_review_target, dict):
+            source_review_target = {}
+        # Head and base are derived as a PAIR, from the same source, in one
+        # precedence order. They are not independently-best-effort fields: the
+        # only consumer (stale_respawn_delta_base_sha, via the post-fix
+        # re-review) compares reviewed base against LIVE base to decide whether
+        # a head-relative delta is sound at all. A head taken from the ambient
+        # live head next to a base taken from a pinned older target would make
+        # a moved base look held — the exact wrong answer, and worse than no
+        # answer, because "no base" widens safely to a full re-review.
+        for _src_head, _src_base in (
+            (
+                source_loop.get("reviewed_head_sha"),
+                source_loop.get("reviewed_base_sha"),
+            ),
+            (source_loop.get("head_sha"), source_loop.get("base_sha")),
+            (
+                source_review_target.get("head_sha"),
+                source_review_target.get("base_sha"),
+            ),
+        ):
+            if _src_head:
+                reviewed_head_sha = str(_src_head)
+                reviewed_base_sha = str(_src_base or "")
+                break
+        else:
+            reviewed_head_sha = ""
     cached_verdict_json = ""
     cached_review_task_id = ""
     if task_type == "review" and requested_review_target is not None:
@@ -4719,6 +4736,20 @@ async def _spawn_pipeline_task(
         **(
             {"reviewed_head_sha": reviewed_head_sha}
             if task_type == "fix" and reviewed_head_sha
+            else {}
+        ),
+        # The BASE travels with the head. A fix task carrying only
+        # ``reviewed_head_sha`` gives its post-fix re-review half the
+        # provenance, and half is not enough to decide anything:
+        # ``stale_respawn_delta_base_sha`` needs reviewed base vs live base to
+        # tell "the head moved under a held base" (a delta is sound) from "the
+        # base moved too" (it is not). Without the base, the post-fix spawn had
+        # to guess, always guessed delta, and swept base-refresh commits into
+        # the review range. Callers already pass ``reviewed_base_sha``
+        # alongside ``reviewed_head_sha``; this just stops dropping it.
+        **(
+            {"reviewed_base_sha": reviewed_base_sha}
+            if task_type == "fix" and reviewed_base_sha
             else {}
         ),
         **(
