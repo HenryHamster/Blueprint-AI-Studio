@@ -379,10 +379,13 @@ async def _attempt_merge_with_retry_and_escalation(
             session.add(task)
             return False
 
-    # Size-cap preflight for direct (non-rollup) task PRs.  Rollup parents
-    # run this check in rollup_management.py before reaching this path; skip
-    # here to avoid redundant GitHub I/O and a double-bump risk.
-    if ci_pr_number and ci_branch and not (task.context or {}).get("rollup_pr_number"):
+    # Size-cap preflight for every reviewed task PR, including rollup parents.
+    # Small intermediate rollups retain their earlier check in
+    # rollup_management.py as an optimization, but reviewed rollups must reach
+    # this canonical merge chokepoint with a verdict bound to their CI head.
+    # A matching pre-lock result is reused below, so this does not issue a
+    # second check or cap bump for the same immutable head.
+    if ci_pr_number and ci_branch:
         from app.rollup_size_preflight import (
             SizeCapPreflightResult,
             preflight_rollup_size_caps,
@@ -428,7 +431,7 @@ async def _attempt_merge_with_retry_and_escalation(
             return False
         _sc_verdict = _sc_result.status
         _sc_reason = _sc_result.reason
-        if _sc_verdict == "ok" and _sc_result.head_sha != _sc_expected_head:
+        if _sc_verdict == "ok" and not _sc_result.is_bound_to(_sc_expected_head):
             task.latest_status_message = (
                 "Merge held — size-cap verdict head differs from immutable CI head; "
                 "awaiting fresh evaluation"

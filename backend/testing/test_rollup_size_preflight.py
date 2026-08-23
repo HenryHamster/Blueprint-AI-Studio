@@ -134,6 +134,51 @@ async def test_preflight_breach_auto_bumps_and_returns_bumped():
 
 
 @pytest.mark.asyncio
+async def test_large_rollup_growing_capped_file_without_bump_is_held():
+    """A capped file grown by a large rollup cannot merge without its repair.
+
+    The literal 500-line cap pin makes this a ratchet test: when the preflight
+    cannot commit a cap repair (whether its bounded budget is spent or the
+    file is chronic), a 501-line assembled tree must hold rather than silently
+    authorizing the merge.
+    """
+    file_content = "line\n" * 501
+
+    with (
+        patch(
+            "app.rollup_size_preflight.get_file_text_at_ref",
+            new_callable=AsyncMock,
+        ) as mock_fetch,
+        patch(
+            "app.rollup_size_preflight.get_pr_files",
+            new_callable=AsyncMock,
+        ) as mock_pr_files,
+        patch(
+            "app.rollup_size_preflight.commit_file_changes",
+            new_callable=AsyncMock,
+        ) as mock_commit,
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+
+        result = await preflight_rollup_size_caps(
+            "tok",
+            "owner",
+            "repo",
+            987,
+            "staging/large-rollup",
+            commit_bump=False,
+            expected_head_sha=_PINNED_HEAD,
+        )
+
+    assert result.status == "hold"
+    assert result.head_sha == _PINNED_HEAD
+    assert result.is_bound_to(_PINNED_HEAD)
+    assert "models.py" in (result.reason or "")
+    mock_commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_preflight_governed_breach_updates_json_source_and_ledger_together():
     """A governed repair commits all three artifacts at the pinned SHA.
 

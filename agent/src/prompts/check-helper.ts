@@ -243,17 +243,15 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
 # Usage:
 #   ./check         # lint+build only — fast, run before each iteration
 #   ./check test    # also run tests (slow; mainly before ./pr open)
-#   ./check full    # run repo-wide lint (eslint .) + full viewport suite
-#                   # WITHOUT scoping. Skips the SIZE-GUARDRAIL baseline
-#                   # recheck on failure (the result IS the new baseline).
+#   ./check full    # run repo-wide lint (eslint .) + full viewport suite;
+#                   # the size lane still uses the shared archive baseline.
 #                   # The viewport lane stays per-identity attributed in
 #                   # both modes — it just runs the unscoped roster here.
 #                   # Use sparingly — when you're confident your edits
 #                   # affect a shared rule / config / global selector
 #                   # whose effect a scoped check can't surface, OR
-#                   # when a baseline-warned WARN is hiding a real
-#                   # regression you want to confirm. Combine with
-#                   # 'test' (./check full test) to also run tests.
+#                   # when a scoped check cannot surface a shared-rule impact.
+#                   # Combine with 'test' (./check full test) to also run tests.
 # Exits 0 on green or on named, structured failures confirmed inherited on the
 # base branch; those publish through ./pr open with their verification receipt.
 # New or unattributed failures, execution/attribution failures, and explicit

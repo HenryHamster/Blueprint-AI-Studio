@@ -700,6 +700,87 @@ def test_non_backend_task_diff_breaching_size_guard_fails_check(tmp_path: Path) 
     assert "size_probe.py" in output
 
 
+def test_inherited_size_breach_untouched_by_diff_does_not_fail_check(tmp_path: Path) -> None:
+    """The generated task lane uses the shared archive baseline, not a worktree."""
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "backend" / "app").mkdir(parents=True)
+    (repo / "backend" / "testing").mkdir(parents=True)
+    (repo / "backend" / "app" / "__init__.py").write_text("")
+
+    for relative in (
+        "static_release_guard.py",
+        "verification_receipt.py",
+        "backend-test-route.sh",
+    ):
+        source = REPO_ROOT / "scripts" / relative
+        destination = repo / "scripts" / relative
+        shutil.copy2(source, destination)
+    for relative in (
+        "check_size_limits.py",
+        "fixgate_attribution.py",
+        "impacted_tests.py",
+        "module_size_limits.json",
+        "cap_bump_history.json",
+    ):
+        source = REPO_ROOT / "backend" / "testing" / relative
+        shutil.copy2(source, repo / "backend" / "testing" / relative)
+    shutil.copy2(
+        REPO_ROOT / "backend" / "app" / "size_limit_policy.py",
+        repo / "backend" / "app" / "size_limit_policy.py",
+    )
+    (repo / "scripts" / "size_probe.py").write_text("one = 1\ntwo = 2\n")
+    (repo / "scripts" / "changed.py").write_text("value = 1\n")
+    limits_path = repo / "backend" / "testing" / "module_size_limits.json"
+    limits = json.loads(limits_path.read_text())
+    limits["scripts"] = {"size_probe.py": 1}
+    limits_path.write_text(json.dumps(limits) + "\n")
+    fragment = (REPO_ROOT / "agent" / "src" / "prompts" / "check_size_guardrail.sh").read_text()
+    script = tmp_path / "run-size-guard.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        f"BASE=automain\nWORKSPACE={shlex.quote(str(repo))}\n"
+        "FULL_SCOPE=0\nFAILED=()\n"
+        "run() { local label=\"$1\"; shift; echo \"[test] $label\"; \"$@\" || FAILED+=(\"$label\"); }\n"
+        f"{fragment}\n"
+        "if [ ${#FAILED[@]} -eq 0 ]; then exit 0; else exit 1; fi\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    stale_worktree = Path("/tmp/check_size_guardrail_baseline_wt")
+    shutil.rmtree(stale_worktree, ignore_errors=True)
+    stale_worktree.mkdir()
+    (stale_worktree / "stale-marker").write_text("left by an earlier run\n")
+    try:
+        _git(repo, "init", "-b", "automain")
+        _git(repo, "config", "user.email", "test@example.com")
+        _git(repo, "config", "user.name", "Test")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-m", "base with inherited size breach")
+        _git(repo, "switch", "-c", "task")
+        (repo / "scripts" / "changed.py").write_text("value = 2\n")
+        _git(repo, "add", "scripts/changed.py")
+        _git(repo, "commit", "-m", "change unrelated capped file")
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            cwd=repo,
+            env={**os.environ, "TASK_ID": "task-inherited-size-123"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        shutil.rmtree(stale_worktree, ignore_errors=True)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "static size guards (task diff)" in output
+    assert "module size guard OK" in output
+
+
 def _prepare_docker_attribution_repo(
     tmp_path: Path, current_state: str, base_state: str = "preexisting"
 ) -> tuple[Path, Path]:

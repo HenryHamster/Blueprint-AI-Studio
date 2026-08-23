@@ -1006,6 +1006,7 @@ def rebuild_cap_bump_history_ledger(
         tuple[str, str, int, int]
         | tuple[str, str, int, int, str, str]
     ] | None = None,
+    repair_targets: set[tuple[str, str]] | None = None,
 ) -> dict:
     """Regenerate the cap-bump-history ledger and write it; return the dict.
 
@@ -1017,6 +1018,8 @@ def rebuild_cap_bump_history_ledger(
     ``check_size_limits.py --fix`` passes the bumps it applies as ``pending``,
     and the rollup size preflight appends its auto-bumps via
     :func:`ledger_with_pending_bumps` before committing both files together.
+    A non-None ``repair_targets`` restricts this write to those ledger keys,
+    preserving all unrelated existing entries during an attributed task repair.
 
     When git is absent or the checkout is truncated (the mainline ancestry
     crosses a ``.git/shallow`` boundary — a shallow task-VM clone, CI's depth-1
@@ -1142,6 +1145,29 @@ def rebuild_cap_bump_history_ledger(
         )
         if phantoms:
             base_history = _prune_phantom_records(base_history, phantoms)
+
+    if repair_targets is not None:
+        # A target-scoped cap repair still needs the canonical ledger mutation
+        # for the cap it bumped, but must not use that necessary write as an
+        # opportunity to regenerate, prune, or attribute other keys. Preserve
+        # non-target entries from the original mirror after all normal policy
+        # calculations, then retain only calculated entries for the targets.
+        restricted_history: dict = {}
+        for section, records in existing_history.items():
+            if not isinstance(records, dict):
+                continue
+            preserved = {
+                key: value
+                for key, value in records.items()
+                if (section, key) not in repair_targets
+            }
+            if preserved:
+                restricted_history[section] = preserved
+        for section, key in repair_targets:
+            records = base_history.get(section, {})
+            if key in records:
+                restricted_history.setdefault(section, {})[key] = records[key]
+        base_history = restricted_history
 
     ledger = {
         "_doc": (

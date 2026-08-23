@@ -123,6 +123,10 @@ class SizeCapPreflightResult:
         yield self.status
         yield self.reason
 
+    def is_bound_to(self, expected_head_sha: str) -> bool:
+        """Whether this verdict was evaluated against one exact merge candidate."""
+        return bool(expected_head_sha) and self.head_sha == expected_head_sha
+
 
 def _result(
     status: str, reason: str | None = None, *, head_sha: str | None = None

@@ -219,24 +219,127 @@ export function matchesSizeBreachSignature(text: string): boolean {
   );
 }
 
+/** The size-limit sections `check_size_limits.py --repair-target` accepts. */
+const SIZE_SECTION = 'backend|agent|frontend|testing|scripts';
+
+/** `[breach] agent/prompt.ts: …` / `[uncapped] agent/prompts/huge.ts: …` */
+const EXPLICIT_SIZE_TARGET_RE = new RegExp(
+  String.raw`\[(?:breach|uncapped)\]\s*((?:${SIZE_SECTION})\/[A-Za-z0-9._/-]+)`,
+  'gi',
+);
+
 /**
- * Run the canonical size-cap bump (`check_size_limits.py --fix`) from the repo
- * root. The checker rewrites ONLY the breached caps in module_size_limits.json
- * using the shared `bump_size_limit` policy — it edits no source or test files,
- * guaranteeing a policy-consistent remediation. Returns true when a cap was
- * bumped, false on a no-op ("No breaches to fix") or failure, so the caller can
- * fall back to the prompt-level guidance path.
+ * The aggregated missing-cap header emitted by
+ * test_invariants._missing_cap_message and agent/src/moduleSize.contract.test.ts:
+ * "N source file(s) exceed 1500 lines with NO cap entry under '<section>' in".
+ * The section is bound in the HEADER — it never reappears after the offenders —
+ * so the header must be parsed before the per-offender lines below it.
  */
-async function runDeterministicSizeCapBump(ws: WebSocket | null): Promise<boolean> {
+const MISSING_CAP_HEADER_RE = new RegExp(
+  String.raw`NO cap entry under\s+['"](${SIZE_SECTION})['"]`,
+  'gi',
+);
+
+/** One offender line of an aggregated block: "  - prompts/huge.ts has 1700 lines (threshold: 1500)" */
+const MISSING_CAP_OFFENDER_RE =
+  /^[ \t]*-[ \t]+([A-Za-z0-9][A-Za-z0-9._/-]*)\s+has\s+\d+\s+lines\s+\(threshold:\s*\d+\)/gm;
+
+/** Single-file invariant form: "<rel> has <N> lines (limit: <M>)" … "under '<section>'". */
+const INVARIANT_SIZE_TARGET_RE = new RegExp(
+  String.raw`(?:^|\s)([A-Za-z0-9][A-Za-z0-9._/-]*)\s+has\s+\d+\s+lines\s+` +
+  String.raw`\((?:limit|threshold):\s*\d+\)[\s\S]*?under\s+['"](${SIZE_SECTION})['"]`,
+  'gi',
+);
+
+/**
+ * Consume every aggregated missing-cap block in `detail`, returning one target
+ * per offender line plus the residual text with those blocks blanked out. The
+ * residual keeps the single-file invariant scan from re-attributing an
+ * aggregated block's offenders to a different section named further down a
+ * concatenated runner detail.
+ */
+function consumeAggregatedMissingCapTargets(
+  detail: string,
+): { targets: string[]; residual: string } {
+  const targets: string[] = [];
+  const headers = Array.from(detail.matchAll(MISSING_CAP_HEADER_RE));
+  if (headers.length === 0) return { targets, residual: detail };
+
+  let residual = '';
+  let cursor = 0;
+  headers.forEach((header, index) => {
+    const start = header.index;
+    const blockStart = start + header[0].length;
+    const blockEnd = headers[index + 1]?.index ?? detail.length;
+    const block = detail.slice(blockStart, blockEnd);
+    for (const offender of block.matchAll(MISSING_CAP_OFFENDER_RE)) {
+      targets.push(`${header[1].toLowerCase()}/${offender[1]}`);
+    }
+    residual += detail.slice(cursor, start);
+    // Blank the consumed block, preserving newlines so the residual's remaining
+    // line-anchored and `(?:^|\s)` matches keep their original boundaries.
+    residual += detail.slice(start, blockEnd).replace(/[^\n]/g, ' ');
+    cursor = blockEnd;
+  });
+  residual += detail.slice(cursor);
+  return { targets, residual };
+}
+
+/**
+ * Return checker repair selectors only for canonically formatted size findings.
+ * A structured comparator has already established that these details are new;
+ * malformed size diagnostics deliberately produce null so automatic mutation
+ * fails closed rather than guessing a file from raw runner output.
+ *
+ * Every offender in a detail is collected, not just the first: the missing-cap
+ * form is aggregated (one test failure listing every uncapped file), so
+ * repairing one file per iteration would exhaust maxFixAttempts on a multi-file
+ * breach.
+ */
+export function extractSizeRepairTargets(details: Iterable<string>): string[] | null {
+  const targets = new Set<string>();
+  for (const detail of details) {
+    if (!matchesSizeBreachSignature(detail)) continue;
+    const found: string[] = [];
+    for (const match of detail.matchAll(EXPLICIT_SIZE_TARGET_RE)) found.push(match[1]);
+    const aggregated = consumeAggregatedMissingCapTargets(detail);
+    found.push(...aggregated.targets);
+    for (const match of aggregated.residual.matchAll(INVARIANT_SIZE_TARGET_RE)) {
+      found.push(`${match[2].toLowerCase()}/${match[1]}`);
+    }
+    // A detail that carries the size signature but yields no canonical target is
+    // malformed — fail the whole batch closed rather than guessing.
+    if (found.length === 0) return null;
+    for (const target of found) {
+      if (target.includes('..') || target.endsWith('/')) return null;
+      targets.add(target);
+    }
+  }
+  return Array.from(targets).sort();
+}
+
+/**
+ * Run the canonical, target-scoped size-cap repair from the repo root. The
+ * checker still owns the bump, governing-source rewrite, ledger, and chronic
+ * refusal policies; this loop merely supplies the comparator-attributed target.
+ */
+async function runDeterministicSizeCapBump(
+  ws: WebSocket | null,
+  repairTargets: readonly string[],
+): Promise<boolean> {
+  if (repairTargets.length === 0) return false;
   sendLog(
     ws,
-    'Size-guardrail breach detected — running deterministic cap bump ' +
-    '(python3 backend/testing/check_size_limits.py --fix) instead of an LLM refactor.\n',
+    'Attributed size-guardrail breach detected — running deterministic cap repair ' +
+    '(python3 backend/testing/check_size_limits.py --fix --repair-target …) instead of an LLM refactor.\n',
   );
   try {
     const out = await execFileAsync(
       'python3',
-      ['backend/testing/check_size_limits.py', '--fix'],
+      [
+        'backend/testing/check_size_limits.py', '--fix',
+        ...repairTargets.flatMap(target => ['--repair-target', target]),
+      ],
       { cwd: WORKSPACE, timeoutMs: TEST_RUNNER_TIMEOUT },
     );
     sendLog(ws, `${out}\n`);
@@ -1105,7 +1208,7 @@ export async function testFixLoop(
     // When baseline is available, let the canonical Python comparator decide
     // route + testcase + kind + normalized-detail attribution.  A missing
     // report/comparator is unverified; never fall back to test names.
-    const fixableFailures: Array<{ label: string; message: string; structuredRecords?: StructuredTestFailure[] | null }> = reportableFailures;
+    let actionableFailureDetails: string[] | null = null;
     let preExistingNote = '';
 
     if (baselineFailures) {
@@ -1141,9 +1244,17 @@ export async function testFixLoop(
       }
 
       preExistingNote = `\n\nNote: structured baseline attribution suppressed ${Object.keys(attribution.suppressed_failures).length} inherited failure occurrence(s).`;
+      actionableFailureDetails = Object.values(attribution.new_failures);
+      if (Object.keys(attribution.suppressed_failures).length > 0) {
+        // Keep inherited diagnostics visible to operators, but never feed them
+        // into cap mutation or the LLM's actionable-failure prompt.
+        sendLog(ws, `Reporting ${Object.keys(attribution.suppressed_failures).length} inherited failure occurrence(s); excluding them from task repair decisions.\n`);
+      }
     }
 
-    const combinedFailures = fixableFailures.map(renderFailure).join('\n\n');
+    const combinedFailures = actionableFailureDetails
+      ? actionableFailureDetails.join('\n\n')
+      : reportableFailures.map(renderFailure).join('\n\n');
     const fingerprint = errorFingerprint(combinedFailures);
     // Early exit: byte-identical consecutive failure (existing behaviour).
     if (fingerprintHistory.length > 0 && fingerprint === fingerprintHistory[fingerprintHistory.length - 1]) {
@@ -1194,8 +1305,11 @@ export async function testFixLoop(
       // to verify the breach cleared without spending an LLM fix attempt; the
       // prompt-level SIZE_GUARDRAIL_GUIDANCE remains the fallback for the no-op
       // case (e.g. a breach the checker can't resolve).
-      if (matchesSizeBreachSignature(combinedFailures)) {
-        const bumped = await runDeterministicSizeCapBump(ws);
+      const repairTargets = actionableFailureDetails === null
+        ? null
+        : extractSizeRepairTargets(actionableFailureDetails);
+      if (repairTargets && repairTargets.length > 0) {
+        const bumped = await runDeterministicSizeCapBump(ws, repairTargets);
         if (bumped) {
           git(['add', '-A']);
           prevDiff = currDiff;
@@ -1203,6 +1317,8 @@ export async function testFixLoop(
           continue;
         }
         sendLog(ws, 'Deterministic size-cap bump made no change — falling back to the Claude fix path.\n');
+      } else if (actionableFailureDetails !== null && repairTargets === null) {
+        sendLog(ws, 'Attributed size diagnostic had no safe repair target — skipping deterministic cap mutation.\n');
       }
 
       const analysisSections = analysisContext ? condensedAnalysisSections(analysisContext) : '';

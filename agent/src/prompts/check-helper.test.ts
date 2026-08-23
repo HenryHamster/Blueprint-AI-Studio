@@ -197,25 +197,19 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).not.toContain('merge-resolution verify');
     expect(script).toContain('PASS — all checks green');
     // Size guardrail is wired into the self-repo gate: invoked by reference as
-    // the committed checker script, run UNCONDITIONALLY across all sections
-    // (not diff-scoped) — a rebase/merge can grow a file in a stack the diff
-    // never touched, and the check is sub-second, so it's cheap always-on
-    // insurance against burning a CI iteration on a common, trivial breach.
-    expect(script).toContain('python3 backend/testing/check_size_limits.py > "$SIZE_GR_LOG" 2>&1');
-    // Baseline-recheck: on failure, the checker re-runs with --base-root
-    // against a detached worktree of the base branch so a breach INHERITED
-    // from the base (e.g. an upstream merge pushed a chronic offender over
-    // its cap on automain) warn-passes instead of blocking every unrelated
-    // PR — mirroring the viewport/backend-pytest baseline pattern. A NEW or
-    // GROWN breach still fails closed.
-    expect(script).toContain('size guardrail FAILED — checking baseline on origin/$BASE');
-    expect(script).toContain('python3 backend/testing/check_size_limits.py --base-root "$SIZE_GR_WT"');
-    expect(script).toContain('size guardrail WARN — every offender pre-exists on $SIZE_GR_BASE_REF; not blocking this PR');
-    expect(script).toContain('FAILED+=("size guardrail")');
-    // --full skips the baseline recheck (the result IS the new baseline),
-    // matching the viewport gate, so an agent can force a blocking view of a
-    // baseline-warned WARN.
-    expect(script).toContain('size guardrail FAILED (--full, no baseline recheck)');
+    // the committed archive-backed checker script. It evaluates every size
+    // section when a governed path is in the task diff, while inherited
+    // offenders remain visible without blocking unrelated task changes.
+    // The generated task gate and tracked gate share one archive-backed size
+    // attribution entry point. Inherited breaches warn-pass there; new/grown
+    // breaches remain blocking.
+    expect(script).toContain('run "static size guards (task diff)" env TASK_ID="${TASK_ID:-${_VERIFY_TASK_ID:-}}" python3 scripts/static_release_guard.py');
+    expect(script).toContain('--size-only --base "$BASE" --repo-root "$WORKSPACE"');
+    expect(script).not.toContain('python3 backend/testing/check_size_limits.py > "$SIZE_GR_LOG" 2>&1');
+    expect(script).not.toContain('git worktree add --detach "$SIZE_GR_WT"');
+    expect(script).not.toContain('size guardrail FAILED — checking baseline on origin/$BASE');
+    expect(script).not.toContain('size guardrail WARN — every offender pre-exists on $SIZE_GR_BASE_REF; not blocking this PR');
+    expect(script).toContain('FAILED+=("$label")');
     // It must NOT be gated on the touched stacks anymore.
     expect(script).not.toContain('SIZE_SECTIONS');
     expect(script).not.toContain('--sections $SIZE_SECTIONS');
@@ -425,8 +419,8 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).not.toContain('if admin_ui_runtime_touched; then');
     expect(script).not.toContain('run "agent tsc');
     // The self-repo invariant stays armed on the config-driven path.
-    expect(script).toContain('python3 backend/testing/check_size_limits.py > "$SIZE_GR_LOG" 2>&1');
-    expect(script).toContain('size guardrail FAILED — checking baseline on origin/$BASE');
+    expect(script).toContain('run "static size guards (task diff)" env TASK_ID="${TASK_ID:-${_VERIFY_TASK_ID:-}}" python3 scripts/static_release_guard.py');
+    expect(script).toContain('--size-only --base "$BASE" --repo-root "$WORKSPACE"');
   });
 
   it('validateCfgShellSafety rejects unsafe taskId when called via writeCheckHelper', async () => {
@@ -1162,6 +1156,7 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
         realFs.writeFileSync(sandboxPythonPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       }
       realFs.mkdirSync(bin, { recursive: true });
+      realFs.mkdirSync(realPath.join(dir, 'backend', 'app'), { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
       // The generated checker sources this committed helper at runtime. Copy
@@ -1172,35 +1167,20 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       if (scenario.routeHelper === 'syntax-invalid') realFs.writeFileSync(fixtureRouteHelper, 'if then\n');
       else if (scenario.routeHelper !== 'missing') realFs.copyFileSync(routeHelper, fixtureRouteHelper);
       const productionRoot = realPath.resolve(process.cwd(), '..');
-      realFs.copyFileSync(
-        realPath.join(productionRoot, 'scripts', 'backend_verification_guard.py'),
-        realPath.join(dir, 'scripts', 'backend_verification_guard.py'),
-      );
-      // The backend lane merges its block into the shared multi-lane sidecar
-      // through this helper instead of an inline heredoc, so the fixture needs
-      // the real writer to reach a minted receipt.
-      realFs.copyFileSync(
-        realPath.join(productionRoot, 'scripts', 'verification_receipt.py'),
-        realPath.join(dir, 'scripts', 'verification_receipt.py'),
-      );
-      // The guard records its suppressions through this sibling emitter; copy
-      // it so the fixture exercises the same cross-lane receipt path as a real
-      // checkout rather than the guard's missing-emitter fallback.
-      realFs.copyFileSync(
-        realPath.join(productionRoot, 'scripts', 'guard_suppression_receipt.py'),
-        realPath.join(dir, 'scripts', 'guard_suppression_receipt.py'),
-      );
-      realFs.copyFileSync(
-        realPath.join(productionRoot, 'scripts', 'static_release_guard.py'),
-        realPath.join(dir, 'scripts', 'static_release_guard.py'),
-      );
-      realFs.copyFileSync(
-        realPath.join(productionRoot, 'backend', 'testing', 'fixgate_attribution.py'),
-        realPath.join(dir, 'backend', 'testing', 'fixgate_attribution.py'),
-      );
+      // Keep the isolated fixture's shared size-guard imports identical to a
+      // real checkout; the Python shim below only intercepts direct test calls.
+      for (const relative of [
+        'scripts/backend_verification_guard.py', 'scripts/verification_receipt.py',
+        'scripts/guard_suppression_receipt.py', 'scripts/static_release_guard.py',
+        'backend/testing/fixgate_attribution.py', 'backend/testing/impacted_tests.py',
+        'backend/testing/drift_sentinel_surfaces.json', 'backend/testing/check_size_limits.py',
+        'backend/testing/module_size_limits.json', 'backend/testing/cap_bump_history.json',
+        'backend/app/__init__.py', 'backend/app/size_limit_policy.py',
+      ]) {
+        realFs.copyFileSync(realPath.join(productionRoot, relative), realPath.join(dir, relative));
+      }
       realFs.writeFileSync(realPath.join(dir, 'backend', 'x.py'), 'value = 1\n');
       realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'test_x.py'), 'def test_x(): assert True\n');
-      realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'impacted_tests.py'), '# shimmed by python3\n');
       for (const changedPath of changedPaths) {
         if (missingPaths.has(changedPath)) continue;
         const changedFile = realPath.join(dir, changedPath);

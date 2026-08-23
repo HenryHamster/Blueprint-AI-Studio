@@ -448,6 +448,13 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
     expect(SIZE_GUARDRAIL_GUIDANCE).toContain('Bump, Don\'t Refactor');
   });
 
+  it('SIZE_GUARDRAIL_GUIDANCE distinguishes attributable repair from inherited debt and keeps chronic approval outside tasks', () => {
+    expect(SIZE_GUARDRAIL_GUIDANCE).toContain('attributed to this task');
+    expect(SIZE_GUARDRAIL_GUIDANCE).toContain('report it loudly');
+    expect(SIZE_GUARDRAIL_GUIDANCE).toContain('Do not pass `--force-chronic`');
+    expect(SIZE_GUARDRAIL_GUIDANCE).toContain('outside the task');
+  });
+
   it('PRIOR_ATTEMPT_DIVERGENCE contains section header fingerprint', () => {
     expect(PRIOR_ATTEMPT_DIVERGENCE).toContain("If You're Retrying");
   });

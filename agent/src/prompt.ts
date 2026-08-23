@@ -471,15 +471,16 @@ The diagnosis system fingerprints failures as \`ResidualRemediationCase\`. If yo
 export const SIZE_GUARDRAIL_GUIDANCE = `
 ## Size Guardrails Are Advisory — Bump, Don't Refactor
 
-**Core policy: Bump the limit, do NOT refactor.** If a test fails with \`module_size_limits.json\` or \`size guardrail\`, update the JSON cap — not the source. The assertion message walks you through the procedure.
+**Core policy: Bump the limit, do NOT refactor — but only for a breach attributed to this task.** An inherited size breach is debt from the base branch: report it loudly and do not absorb it into this task's cap changes.
 
 **Two guardrail cases:**
 1. Existing cap breach (\`has <N> lines (limit: <M>)\`) — bump the cap.
 2. New uncapped file over 1500 lines — add a cap entry (not a code split).
 
 **Fix procedure:**
-\`python3 backend/testing/check_size_limits.py --fix\`
-This rewrites caps and adds entries using the canonical bump policy (\`max(current+200, current*1.15)\`). Commit both source and regenerated JSON.
+For an attributable breach, run \`python3 backend/testing/check_size_limits.py --fix\` (the task fixer supplies a validated repair target automatically). This rewrites caps and adds entries using the canonical bump policy (\`max(current+200, current*1.15)\`). Commit both source and regenerated JSON.
+
+**Inherited debt and chronic offenders:** report inherited offenders rather than bumping them. Do not pass \`--force-chronic\` or set \`SIZE_CAP_OPERATOR_APPROVAL\`: chronic-offender approval must come from outside the task.
 
 **Why not refactor?** Refactoring during create/fix tasks is out-of-scope, causes import cycles, breaks unrelated tests, and burns retries. Size decisions belong in separate PRs. Exception: if you bundled unrelated code by accident, shrink the diff back to scope.
 `;

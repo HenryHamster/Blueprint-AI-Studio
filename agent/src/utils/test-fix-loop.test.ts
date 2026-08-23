@@ -11,7 +11,9 @@ const { execFileAsync, mockApiPost, mockReaddirSync } = vi.hoisted(() => ({
 }));
 vi.mock('../index.js', () => ({
   normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
-  WORKSPACE: '/tmp/workspace',
+  // Keep comparator subprocesses on a real cwd while runners themselves remain
+  // mocked and may use /tmp/workspace as an opaque fixture path.
+  WORKSPACE: process.cwd(),
   sendLog: vi.fn(),
   sendHeartbeatSync: vi.fn(),
   execFileAsync,
@@ -43,7 +45,8 @@ vi.mock('./diff-detection.js', () => ({
   detectLoopDivergence: vi.fn(() => null),
 }));
 
-vi.mock('child_process', () => ({
+vi.mock('child_process', async importOriginal => ({
+  ...(await importOriginal<typeof import('child_process')>()),
   execSync: vi.fn(() => ''),
 }));
 
@@ -61,10 +64,13 @@ vi.mock('fs', () => ({
 }));
 
 import fs from 'fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   canonicalComparatorPath,
   captureTestBaseline,
   testFixLoop,
+  extractSizeRepairTargets,
   matchesSizeBreachSignature,
   matchesTransientSetupFailure,
 } from './test-fix-loop.js';
@@ -81,6 +87,7 @@ const defaultExistsSync = (p: unknown): boolean =>
   typeof p === 'string' && (p.endsWith('/node_modules') || p.includes('/node_modules/'));
 
 const NPM_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
+const VITEST_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (vitest root)' };
 const PLACEHOLDER_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace/packages/a', label: 'npm test (packages/a)' };
 const REAL_RUNNER: TestRunner = { cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: '/tmp/workspace/packages/b', label: 'pytest (packages/b)' };
 const INSTALL_RUNNER: TestRunner = {
@@ -91,6 +98,27 @@ const INSTALL_RUNNER: TestRunner = {
   installCmd: 'python3 -m pip install -e . && python3 -m pip check',
 };
 const statusRef = { value: '' };
+
+function vitestFailureReport(records: Array<{ testcase: string; detail: string }>): string {
+  return JSON.stringify({
+    testResults: [{
+      name: '/tmp/workspace/agent/src/size-guardrail.test.ts',
+      assertionResults: records.map(record => ({
+        fullName: record.testcase,
+        status: 'failed',
+        failureMessages: [record.detail],
+      })),
+    }],
+  });
+}
+
+function configureStructuredVitestFailure(records: Array<{ testcase: string; detail: string }>): void {
+  vi.mocked(fs.existsSync).mockImplementation((p: unknown) =>
+    defaultExistsSync(p) ||
+    (typeof p === 'string' && (p.endsWith('/vitest.config.ts') || p.includes('/tmp/vitest-current-'))),
+  );
+  vi.mocked(fs.readFileSync).mockReturnValue(vitestFailureReport(records));
+}
 
 describe('canonicalComparatorPath', () => {
   it('resolves the packaged comparator in the deployed /opt/agent layout', () => {
@@ -633,6 +661,29 @@ const SIZE_BREACH_FAILURE =
   '  2. Apply the new_limit returned in the response to\n' +
   "     backend/testing/module_size_limits.json under 'agent'.";
 
+// The BYTE-EXACT aggregated missing-cap failure. Both producers build the same
+// shape:
+//   backend/testing/test_invariants.py:_missing_cap_message
+//   agent/src/moduleSize.contract.test.ts
+// The section name appears ONLY in the header ("under 'agent' in"), never after
+// the offender lines — a parser that expects the section to follow the offender
+// text silently matches nothing and kills the deterministic auto-add path.
+// AGGREGATED_MISSING_CAP_FAILURE is pinned to the producers by the parity test
+// below, so this fixture cannot drift into a synthetic string the system never
+// emits.
+const AGGREGATED_MISSING_CAP_FAILURE =
+  "2 source file(s) exceed 1500 lines with NO cap entry under 'agent' in\n" +
+  'backend/testing/module_size_limits.json:\n' +
+  '\n' +
+  '  - prompts/huge.ts has 1700 lines (threshold: 1500)\n' +
+  '  - utils/big.ts has 1600 lines (threshold: 1500)\n' +
+  '\n' +
+  'A large file with no cap is invisible to the size guardrails and can\n' +
+  'grow without limit. Add an entry for each file above under the\n' +
+  "'agent' section, set to its current line count plus modest\n" +
+  'headroom (e.g. current + 100). This is a reviewed config edit, not a\n' +
+  'refactor — do NOT extract or restructure the source in this PR.';
+
 describe('matchesSizeBreachSignature', () => {
   it('matches the test_invariants size-breach assertion', () => {
     expect(matchesSizeBreachSignature(SIZE_BREACH_FAILURE)).toBe(true);
@@ -691,7 +742,11 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
   });
 
-  it('auto-bumps the cap via check_size_limits.py --fix and re-verifies — no LLM call', async () => {
+  it('auto-bumps only the comparator-attributed cap via a scoped repair target and re-verifies — no LLM call', async () => {
+    const newSizeDetail =
+      '[breach] agent/prompt.ts: 1700 lines (cap: 1650)\n' +
+      '1 size breach(es) in module_size_limits.json.';
+    configureStructuredVitestFailure([{ testcase: 'new size breach', detail: newSizeDetail }]);
     let testRunCalls = 0;
     execFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'python3' && args.includes('--fix')) {
@@ -706,8 +761,8 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
 
     const result = await testFixLoop(
       null, statusRef, undefined, undefined, undefined,
-      undefined, undefined, undefined,
-      { maxFixAttempts: 1, runnersOverride: [NPM_RUNNER] },
+      { records: [{ route: 'agent/src/size-guardrail.test.ts', testcase: 'old failure', kind: 'failure', detail: 'old failure' }] }, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [VITEST_RUNNER] },
     );
 
     expect(result.passed).toBe(true);
@@ -716,17 +771,18 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
       ([cmd, args]) => cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
     );
     expect(bumpCall).toBeDefined();
-    expect(bumpCall?.[1]).toEqual(['backend/testing/check_size_limits.py', '--fix']);
+    expect(bumpCall?.[1]).toEqual([
+      'backend/testing/check_size_limits.py', '--fix', '--repair-target', 'agent/prompt.ts',
+    ]);
     // The breach was resolved deterministically — no refactor/LLM path taken.
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
-  it('auto-adds a missing cap for an uncapped large file — no LLM call', async () => {
+  it('auto-adds an attributed missing cap through its scoped repair target — no LLM call', async () => {
     const COVERAGE_FAILURE =
-      'Command failed: npm test\n' +
-      '1 source file(s) exceed 1500 lines with NO cap entry under \'agent\' in\n' +
-      'backend/testing/module_size_limits.json:\n\n' +
-      '  - prompts/huge.ts has 1700 lines (threshold: 1500)\n';
+      '[uncapped] agent/prompts/huge.ts: 1700 lines (threshold: 1500) — NO cap entry\n' +
+      'module_size_limits.json size guardrail';
+    configureStructuredVitestFailure([{ testcase: 'new uncapped size breach', detail: COVERAGE_FAILURE }]);
     let testRunCalls = 0;
     execFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'python3' && args.includes('--fix')) {
@@ -741,16 +797,52 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
 
     const result = await testFixLoop(
       null, statusRef, undefined, undefined, undefined,
-      undefined, undefined, undefined,
-      { maxFixAttempts: 1, runnersOverride: [NPM_RUNNER] },
+      { records: [] }, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [VITEST_RUNNER] },
     );
 
     expect(result.passed).toBe(true);
     const bumpCall = execFileAsync.mock.calls.find(
       ([cmd, args]) => cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
     );
-    expect(bumpCall?.[1]).toEqual(['backend/testing/check_size_limits.py', '--fix']);
+    expect(bumpCall?.[1]).toEqual([
+      'backend/testing/check_size_limits.py', '--fix', '--repair-target', 'agent/prompts/huge.ts',
+    ]);
     // Remediated deterministically — the refactor-biased LLM path never ran.
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('auto-adds caps for EVERY offender in the byte-exact aggregated missing-cap failure — no LLM call', async () => {
+    // Restores the regression the synthetic '[uncapped] …' fixture could not
+    // catch: this is the message test_invariants._missing_cap_message and
+    // agent/src/moduleSize.contract.test.ts actually emit, and it lists every
+    // offender in ONE failure, so one iteration must repair all of them.
+    configureStructuredVitestFailure([
+      { testcase: 'agent no uncapped large file', detail: AGGREGATED_MISSING_CAP_FAILURE },
+    ]);
+    let testRunCalls = 0;
+    execFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'python3' && args.includes('--fix')) return Promise.resolve('Added 2 cap(s).');
+      testRunCalls += 1;
+      if (testRunCalls === 1) return Promise.reject(new Error(AGGREGATED_MISSING_CAP_FAILURE));
+      return Promise.resolve('Tests  3 passed (3)');
+    });
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      { records: [] }, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [VITEST_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    const bumpCall = execFileAsync.mock.calls.find(
+      ([cmd, args]) => cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
+    );
+    expect(bumpCall?.[1]).toEqual([
+      'backend/testing/check_size_limits.py', '--fix',
+      '--repair-target', 'agent/prompts/huge.ts',
+      '--repair-target', 'agent/utils/big.ts',
+    ]);
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
@@ -771,6 +863,167 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
       ([cmd]) => cmd === 'python3',
     );
     expect(bumpCall).toBeUndefined();
+  });
+
+  it('testFixLoop — deterministic size-breach remediation does not run deterministic cap bump for an inherited-only breach', async () => {
+    const inheritedSizeDetail =
+      '[breach] backend/chronic.py: 1720 lines (cap: 1600)\n' +
+      'module_size_limits.json size guardrail';
+    configureStructuredVitestFailure([{ testcase: 'inherited chronic size breach', detail: inheritedSizeDetail }]);
+    execFileAsync.mockRejectedValue(new Error(`Command failed: npm test\n${inheritedSizeDetail}`));
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      { records: [{ route: 'size-guardrail.test.ts', testcase: 'inherited chronic size breach', kind: 'failure', detail: inheritedSizeDetail }] }, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [VITEST_RUNNER] },
+    );
+
+    expect(result).toMatchObject({ passed: true, testFailuresDetected: false });
+    expect(execFileAsync.mock.calls.some(([cmd, args]) =>
+      cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
+    )).toBe(false);
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('keeps an inherited size breach out of the LLM prompt when a new non-size failure remains', async () => {
+    const inheritedSizeDetail =
+      '[breach] backend/chronic.py: 1720 lines (cap: 1600)\nmodule_size_limits.json size guardrail';
+    const newFailure = 'AssertionError: expected enabled to be true';
+    configureStructuredVitestFailure([
+      { testcase: 'inherited chronic size breach', detail: inheritedSizeDetail },
+      { testcase: 'new behavior', detail: newFailure },
+    ]);
+    execFileAsync.mockRejectedValue(new Error(`Command failed: npm test\n${inheritedSizeDetail}\n${newFailure}`));
+
+    await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      { records: [{ route: 'size-guardrail.test.ts', testcase: 'inherited chronic size breach', kind: 'failure', detail: inheritedSizeDetail }] }, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [VITEST_RUNNER] },
+    );
+
+    expect(execFileAsync.mock.calls.some(([cmd, args]) =>
+      cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
+    )).toBe(false);
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runClaudeCode).mock.calls[0][0]).toContain(newFailure);
+    expect(vi.mocked(runClaudeCode).mock.calls[0][0]).not.toContain('backend/chronic.py');
+  });
+
+  it('repairs a new size target without including a concurrent inherited size offender', async () => {
+    const inheritedSizeDetail =
+      '[breach] backend/chronic.py: 1720 lines (cap: 1600)\nmodule_size_limits.json size guardrail';
+    const newSizeDetail =
+      '[breach] agent/new.ts: 1700 lines (cap: 1650)\nmodule_size_limits.json size guardrail';
+    configureStructuredVitestFailure([
+      { testcase: 'inherited chronic size breach', detail: inheritedSizeDetail },
+      { testcase: 'new size breach', detail: newSizeDetail },
+    ]);
+    let calls = 0;
+    execFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'python3' && args.includes('--fix')) return Promise.resolve('Bumped 1 cap(s).');
+      calls += 1;
+      return calls === 1
+        ? Promise.reject(new Error(`Command failed: npm test\n${inheritedSizeDetail}\n${newSizeDetail}`))
+        : Promise.resolve('Tests  3 passed (3)');
+    });
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      { records: [{ route: 'size-guardrail.test.ts', testcase: 'inherited chronic size breach', kind: 'failure', detail: inheritedSizeDetail }] }, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [VITEST_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    const bumpCall = execFileAsync.mock.calls.find(([cmd, args]) =>
+      cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
+    );
+    expect(bumpCall?.[1]).toEqual([
+      'backend/testing/check_size_limits.py', '--fix', '--repair-target', 'agent/new.ts',
+    ]);
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for an attributable but malformed size target', () => {
+    expect(extractSizeRepairTargets([
+      'size guardrail: mysterious file has 1700 lines (limit: 1600)',
+    ])).toBeNull();
+  });
+});
+
+describe('extractSizeRepairTargets — real producer formats', () => {
+  it('extracts EVERY offender from the aggregated missing-cap failure', () => {
+    // Regression: the aggregated form previously matched neither branch, so the
+    // whole batch returned null and check_size_limits.py --fix never ran.
+    expect(extractSizeRepairTargets([AGGREGATED_MISSING_CAP_FAILURE])).toEqual([
+      'agent/prompts/huge.ts',
+      'agent/utils/big.ts',
+    ]);
+  });
+
+  it('binds each aggregated block to its own header section', () => {
+    const twoSections =
+      AGGREGATED_MISSING_CAP_FAILURE +
+      '\n\n' +
+      "1 source file(s) exceed 1500 lines with NO cap entry under 'backend' in\n" +
+      'backend/testing/module_size_limits.json:\n' +
+      '\n' +
+      '  - app/enormous.py has 1900 lines (threshold: 1500)\n';
+    expect(extractSizeRepairTargets([twoSections])).toEqual([
+      'agent/prompts/huge.ts',
+      'agent/utils/big.ts',
+      'backend/app/enormous.py',
+    ]);
+  });
+
+  it('extracts every [breach]/[uncapped] checker line in one detail, not just the first', () => {
+    const checkerOutput =
+      '[breach] agent/prompt.ts: 1700 lines (cap: 1650)\n' +
+      '[uncapped] backend/app/huge.py: 1800 lines (threshold: 1500) — NO cap entry\n' +
+      '2 size breach(es) in module_size_limits.json.';
+    expect(extractSizeRepairTargets([checkerOutput])).toEqual([
+      'agent/prompt.ts',
+      'backend/app/huge.py',
+    ]);
+  });
+
+  it('still extracts the single-file test_invariants breach assertion', () => {
+    expect(extractSizeRepairTargets([SIZE_BREACH_FAILURE])).toEqual(['agent/prompt.ts']);
+  });
+
+  it('fails the batch closed when any size-signature detail has no canonical target', () => {
+    expect(extractSizeRepairTargets([
+      AGGREGATED_MISSING_CAP_FAILURE,
+      'size guardrail: mysterious file has 1700 lines (limit: 1600)',
+    ])).toBeNull();
+  });
+
+  it('matches the byte-exact templates both producers emit', async () => {
+    // Un-gameable pin: the fixture above is only meaningful if the producers
+    // still emit these exact fragments. Reading the producer sources keeps the
+    // parser certified against real input rather than a synthetic string.
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const invariants = realFs.readFileSync(
+      path.resolve(here, '../../../backend/testing/test_invariants.py'), 'utf-8',
+    );
+    const contract = realFs.readFileSync(
+      path.resolve(here, '../moduleSize.contract.test.ts'), 'utf-8',
+    );
+
+    // Header: section bound before the offender lines.
+    expect(invariants).toContain(
+      'f"with NO cap entry under \'{section}\' in "',
+    );
+    expect(contract).toContain(
+      "with NO cap entry under 'agent' in backend/testing/module_size_limits.json:",
+    );
+    // Offender line shape consumed by the parser.
+    expect(invariants).toContain(
+      'f"  - {rel} has {count} lines (threshold: {_COVERAGE_THRESHOLD})"',
+    );
+    expect(contract).toContain(
+      '`  - ${o.rel} has ${o.count} lines (threshold: ${COVERAGE_THRESHOLD})`',
+    );
   });
 });
 

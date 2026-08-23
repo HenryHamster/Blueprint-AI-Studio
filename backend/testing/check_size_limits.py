@@ -45,6 +45,8 @@ Usage (from the repo root, no install step)::
     python3 backend/testing/check_size_limits.py                 # check all sections
     python3 backend/testing/check_size_limits.py --sections backend
     python3 backend/testing/check_size_limits.py --fix           # bump breached caps
+    python3 backend/testing/check_size_limits.py --fix --repair-target agent/prompt.ts
+                                  # repair only an attributed current offender
     python3 backend/testing/check_size_limits.py --base-root /tmp/base_wt
                                   # baseline-aware: block only NEW/GROWN offenders
 
@@ -895,6 +897,31 @@ def _parse_sections(raw: str) -> list[str]:
     return [s for s in SECTIONS if s in requested]
 
 
+def _parse_repair_target(raw: str) -> str:
+    """Validate a repeatable ``section/repo-relative-path`` repair selector.
+
+    This selector is intentionally narrower than ``--sections``: a caller that
+    has already attributed one task-caused offender must not turn that repair
+    into a sweep over every breach presently visible in the checkout.
+    """
+    if not isinstance(raw, str) or not raw or "\\" in raw:
+        raise argparse.ArgumentTypeError(
+            "repair target must be a forward-slash section/path"
+        )
+    section, separator, rel = raw.partition("/")
+    parts = rel.split("/") if separator else []
+    if (
+        section not in SECTIONS
+        or not rel
+        or any(part in {"", ".", ".."} for part in parts)
+        or os.path.isabs(rel)
+    ):
+        raise argparse.ArgumentTypeError(
+            "repair target must be a known section followed by a safe relative path"
+        )
+    return f"{section}/{rel}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Check (and optionally --fix) module size-limit guardrails."
@@ -909,6 +936,17 @@ def main(argv: list[str] | None = None) -> int:
         "--fix",
         action="store_true",
         help="bump the cap of each breached file to the canonical policy value",
+    )
+    parser.add_argument(
+        "--repair-target",
+        action="append",
+        type=_parse_repair_target,
+        default=[],
+        metavar="SECTION/PATH",
+        help=(
+            "with --fix, repair only this current breached or uncapped file; "
+            "repeatable and intended for baseline-attributed task repair"
+        ),
     )
     parser.add_argument(
         "--force-chronic",
@@ -947,6 +985,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.repair_target and not args.fix:
+        parser.error("--repair-target requires --fix")
+    if len(args.repair_target) != len(set(args.repair_target)):
+        parser.error("--repair-target values must be unique")
     if args.force_chronic and not os.environ.get(_OPERATOR_APPROVAL_ENV, "").strip():
         print(
             f"[refused] --force-chronic requires operator approval: set "
@@ -1045,6 +1087,38 @@ def main(argv: list[str] | None = None) -> int:
     ]
 
     if args.fix:
+        scoped_repair = bool(args.repair_target)
+        if scoped_repair:
+            requested_targets = set(args.repair_target)
+            actionable_targets = {
+                f"{section}/{rec['rel']}" for section, rec in breaches + uncapped
+            }
+            invalid_targets = sorted(requested_targets - actionable_targets)
+            if invalid_targets:
+                print(
+                    "[refused] repair target(s) are not current cap breaches or "
+                    "uncapped oversized files: " + ", ".join(invalid_targets)
+                )
+                return 1
+            # A targeted task repair must not also prune stale caps or heal
+            # unrelated ledger drift. Those unscoped maintenance actions retain
+            # their historic --fix behavior, but are unsafe when this command is
+            # responding to one attributed failure occurrence.
+            breaches = [
+                (section, rec)
+                for section, rec in breaches
+                if f"{section}/{rec['rel']}" in requested_targets
+            ]
+            uncapped = [
+                (section, rec)
+                for section, rec in uncapped
+                if f"{section}/{rec['rel']}" in requested_targets
+            ]
+            stale_caps = []
+            absent_ledger_records = []
+            unattributed_ledger_records = []
+            missing_ledger_records = []
+
         # Ledger-phantom self-heal: even with no cap breach to bump, a
         # cap-bump-history ledger holding records the mainline git history
         # cannot justify must be pruned so the check (and the deployed
@@ -1052,6 +1126,8 @@ def main(argv: list[str] | None = None) -> int:
         phantoms = phantom_ledger_records(
             repo_root=args.repo_root, ledger_path=ledger_path
         )
+        if scoped_repair:
+            phantoms = []
         if (
             not breaches
             and not uncapped
@@ -1176,6 +1252,11 @@ def main(argv: list[str] | None = None) -> int:
                     # the observed provenance. The trailing status field is
                     # advisory for reporting only, so drop it here.
                     + [rec[:6] for rec in missing_ledger_records],
+                    repair_targets=(
+                        {(section, rec["rel"]) for section, rec, _new_cap in bumped}
+                        if scoped_repair
+                        else None
+                    ),
                 )
                 if phantoms:
                     print(
@@ -1238,6 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
     # baseline fails CLOSED: everything is treated as newly introduced.
     base_breached: dict = {}
     base_uncapped: dict = {}
+    base_ungoverned_release_modules: set[str] | None = set()
     if args.base_root:
         base_breached, base_uncapped, baseline_reason = _collect_baseline_offenders(
             args.base_root, args.sections
@@ -1246,6 +1328,17 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"[baseline] unavailable ({baseline_reason}) — treating every "
                 "offender as introduced by this change"
+            )
+
+        try:
+            base_ungoverned_release_modules = set(
+                find_ungoverned_release_surface_modules(args.base_root)
+            )
+        except (OSError, ValueError) as exc:
+            base_ungoverned_release_modules = None
+            print(
+                f"[baseline] ungoverned release findings unavailable "
+                f"({exc}) — treating every finding as introduced by this change"
             )
 
     base_stale_caps: set[tuple] = set()
@@ -1345,6 +1438,18 @@ def main(argv: list[str] | None = None) -> int:
         ungoverned_release_modules = find_ungoverned_release_surface_modules(
             args.repo_root
         )
+        inherited_ungoverned_release_modules = []
+        if base_ungoverned_release_modules is not None:
+            inherited_ungoverned_release_modules = [
+                name
+                for name in ungoverned_release_modules
+                if name in base_ungoverned_release_modules
+            ]
+            ungoverned_release_modules = [
+                name
+                for name in ungoverned_release_modules
+                if name not in base_ungoverned_release_modules
+            ]
         if ungoverned_release_modules:
             for name in ungoverned_release_modules:
                 print(
@@ -1358,6 +1463,14 @@ def main(argv: list[str] | None = None) -> int:
                 "missing a governance cap declaration."
             )
             exit_code = 1
+        if base_ungoverned_release_modules is not None:
+            for name in inherited_ungoverned_release_modules:
+                print(
+                    f"[pre-existing] backend/{name}: ungoverned release-surface "
+                    "module inherited from the base branch"
+                )
+    else:
+        inherited_ungoverned_release_modules = []
 
     preexisting = [
         ("cap breach", section, rec, base_count)
@@ -1366,7 +1479,7 @@ def main(argv: list[str] | None = None) -> int:
         ("uncapped", section, rec, base_count)
         for section, rec, base_count in preexisting_uncapped
     ]
-    preexisting_count = len(preexisting)
+    preexisting_count = len(preexisting) + len(inherited_ungoverned_release_modules)
     for section, rec in preexisting_stale_caps:
         print(
             f"[pre-existing] {section}/{rec['rel']}: stale cap targets a missing "

@@ -4411,17 +4411,16 @@ async def _process_post_commit(
                                                     else None
                                                 ),
                                             )
-                                        # Hoist size-cap preflight before the lock for
-                                        # direct (non-rollup) task PRs, mirroring the
-                                        # migration guard pattern above.  Rollup parents
-                                        # have rollup_pr_number in context — skip there.
+                                        # Hoist the size-cap preflight before the lock for
+                                        # every CI-reviewed PR, including rollup parents,
+                                        # mirroring the migration guard pattern above.
+                                        # _attempt_merge_with_retry_and_escalation reuses
+                                        # this immutable-head result instead of repeating
+                                        # a check or cap bump under the lock.
                                         if (
                                             _peek_pr_num
                                             and _peek_branch
                                             and _peek_head
-                                            and not (_orig_peek or {}).get(
-                                                "rollup_pr_number"
-                                            )
                                         ):
                                             from app.rollup_size_preflight import (
                                                 preflight_rollup_size_caps as _sc_pre,

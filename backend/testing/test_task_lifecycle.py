@@ -5989,6 +5989,66 @@ async def test_rollup_approve_handoff_copies_exact_authoritative_proof(tl_db, mo
 
 
 @pytest.mark.asyncio
+async def test_rollup_approve_handoff_preflights_ci_reviewed_head_before_merge(
+    tl_db, mocker
+):
+    """A reviewed large rollup passes its immutable size verdict to the merge gate."""
+    from app.rollup_migration_validation import PremergeMigrationGuardResult
+    from app.rollup_size_preflight import SizeCapPreflightResult
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    original.context = {
+        "rollup_pr_number": 5151,
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_passed": True,
+            "review_approved": False,
+            "pr_number": 5151,
+            "branch": "feat/x",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+            "ci_checked_head_sha": "abc123",
+            "ci_checked_base_sha": "base123",
+        },
+    }
+    session.add(original)
+    await session.commit()
+
+    _patch_approve_merge_env(mocker)
+    mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new_callable=AsyncMock,
+        return_value=PremergeMigrationGuardResult("ok", None),
+    )
+    size_preflight = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=SizeCapPreflightResult("ok", None, "abc123"),
+    )
+    merge_gate = mocker.patch(
+        "app.ci_completion._attempt_merge_with_retry_and_escalation",
+        new_callable=AsyncMock,
+    )
+
+    result = await _process_post_commit(
+        review_task.id,
+        payload_for(review_task),
+        _session_factory=factory,
+    )
+
+    assert result == {"status": "accepted"}
+    size_preflight.assert_awaited_once()
+    assert size_preflight.await_args.kwargs["expected_head_sha"] == "abc123"
+    merge_gate.assert_awaited_once()
+    assert merge_gate.await_args.kwargs["checked_head_sha"] == "abc123"
+    assert merge_gate.await_args.kwargs["precomputed_size_cap"] == SizeCapPreflightResult(
+        "ok", None, "abc123"
+    )
+
+
+@pytest.mark.asyncio
 async def test_process_post_commit_review_approve_merge_held_on_dual_head(
     tl_db, mocker
 ):
