@@ -3730,6 +3730,82 @@ def test_directions_show_discovery(mock_api, monkeypatch, capsys):
     assert payload["cycles"][0]["binding_decision_allowed"] is False
 
 
+def test_direction_bare_hex_prefix_resolves(mock_api, monkeypatch, capsys):
+    """A bare hex token resolves, because that is what operators actually copy.
+
+    Direction ids are ``d-<hex>``. Roughly half the surfaces that print one
+    (autonomy snapshots, review packets) show the hex alone, so an operator
+    pastes ``abc12345`` and the resolver did a bare ``startswith`` against
+    ``d-abc12345`` and reported "Direction not found" for a direction that
+    exists — while the argparse help promised "id or prefix".
+    """
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+
+    rc = blueprint.main(["directions", "show-discovery", "abc12345"])
+    assert rc == 0
+    gets = [p for m, p, _ in mock_api if m == "GET" and "/discovery-cycles" in p]
+    assert len(gets) == 1
+    assert "/directions/d-abc12345/discovery-cycles" in gets[0]
+
+    # The d- spelling keeps working; this fix widens what resolves, never narrows.
+    mock_api.clear()
+    capsys.readouterr()
+    rc = blueprint.main(["directions", "show-discovery", "d-abc12345"])
+    assert rc == 0
+    gets = [p for m, p, _ in mock_api if m == "GET" and "/discovery-cycles" in p]
+    assert len(gets) == 1
+    assert "/directions/d-abc12345/discovery-cycles" in gets[0]
+
+
+def test_direction_not_found_surfaces_the_reason(mock_api, monkeypatch, capsys):
+    """A miss must say what was searched and how to look wider, not just 'not found'.
+
+    Surface reasons, not states: the bare message left an operator unable to
+    tell a typo from the wrong project from a retired direction.
+    """
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["directions", "show-discovery", "ffffffff"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Direction not found: ffffffff" in err
+    assert "Searched 3 direction(s) in project proj-1" in err
+    assert "directions list --all" in err
+    assert "d-<hex>" in err
+
+
+def test_direction_not_found_names_the_near_miss(mock_api, monkeypatch, capsys):
+    """When the token appears mid-id, print the ids that carry it."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["directions", "show-discovery", "12345"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Ids containing that token:" in err
+    assert "d-abc12345" in err
+    assert "d-staged12345" in err
+
+
+def test_direction_ambiguous_prefix_lists_the_candidates(mock_api, monkeypatch, capsys):
+    """Ambiguity is still refused, but it now names what it was torn between."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["directions", "show-discovery", "d-"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Direction prefix is ambiguous: d-" in err
+    assert "d-abc12345" in err
+    assert "d-def67890" in err
+    assert "d-staged12345" in err
+
+
 def test_system_autonomy_toggle(mock_api, monkeypatch, capsys):
     """system autonomy --enable/--disable PATCHes the project row; bare call stays read-only."""
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})

@@ -2226,6 +2226,24 @@ def _render_directions_list(data: dict) -> None:
               f"  ({len(history)} cycles, {len(notes)} notes)")
 
 
+def _direction_id_candidates(direction_id: str) -> list[str]:
+    """Prefix forms a bare token may legitimately mean.
+
+    Direction ids are ``d-<hex>``. Every surface that prints one (autonomy
+    snapshots, review packets, task context) shows the hex, and roughly half
+    of them show it WITHOUT the ``d-``. An operator who copies the hex out of
+    one of those and pastes it here was, until this fix, told "Direction not
+    found" for an id that exists — the help text says "id or prefix" and the
+    resolver did a bare ``startswith``, so the two disagreed. Accept both
+    spellings; the ambiguity guard below still refuses a token that matches
+    more than one direction.
+    """
+    candidates = [direction_id]
+    if not direction_id.startswith("d-"):
+        candidates.append(f"d-{direction_id}")
+    return candidates
+
+
 def _resolve_direction(
     args: argparse.Namespace,
     direction_id: str,
@@ -2233,7 +2251,17 @@ def _resolve_direction(
     require_staged: bool = False,
 ) -> dict:
     pid = get_project_id(getattr(args, "project_id", None))
+    candidates = _direction_id_candidates(direction_id)
+
+    def _is_exact(did: str) -> bool:
+        return did in candidates
+
+    def _is_prefix(did: str) -> bool:
+        return any(did.startswith(c) for c in candidates)
+
     matches: list[dict] = []
+    scanned = 0
+    contains: list[str] = []
     if _using_scoped_service_credential():
         offset = 0
         while offset < 10_000:
@@ -2243,13 +2271,16 @@ def _resolve_direction(
                 f"&limit=100&offset={offset}",
             )
             directions = resp.get("directions", []) if isinstance(resp, dict) else []
-            exact = [d for d in directions if (d.get("id") or "") == direction_id]
+            scanned += len(directions)
+            contains.extend(
+                d.get("id") or "" for d in directions
+                if direction_id and direction_id in (d.get("id") or "")
+            )
+            exact = [d for d in directions if _is_exact(d.get("id") or "")]
             if exact:
                 matches = exact
                 break
-            matches.extend(
-                d for d in directions if (d.get("id") or "").startswith(direction_id)
-            )
+            matches.extend(d for d in directions if _is_prefix(d.get("id") or ""))
             next_offset = resp.get("next_offset") if isinstance(resp, dict) else None
             if not resp.get("has_more") or not isinstance(next_offset, int):
                 break
@@ -2264,14 +2295,38 @@ def _resolve_direction(
     else:
         resp = api("GET", f"/api/admin/projects/{pid}/directions")
         directions = resp.get("directions", []) if isinstance(resp, dict) else resp
-        matches = [
-            d for d in directions if (d.get("id") or "").startswith(direction_id)
+        scanned = len(directions)
+        contains = [
+            d.get("id") or "" for d in directions
+            if direction_id and direction_id in (d.get("id") or "")
         ]
+        matches = [d for d in directions if _is_prefix(d.get("id") or "")]
     if not matches:
+        # Surface the reason, not just the state: an operator who gets
+        # "not found" for an id they just read off a snapshot has no way to
+        # tell a typo from a wrong project from a retired direction.
         print(f"Direction not found: {direction_id}", file=sys.stderr)
+        print(
+            f"  Searched {scanned} direction(s) in project {pid}.",
+            file=sys.stderr,
+        )
+        near = sorted(set(i for i in contains if i))[:5]
+        if near:
+            print("  Ids containing that token:", file=sys.stderr)
+            for i in near:
+                print(f"    {i}", file=sys.stderr)
+        else:
+            print(
+                "  Direction ids are 'd-<hex>'; both 'd-<hex>' and a bare "
+                "'<hex>' prefix resolve. Run 'directions list --all' to see "
+                "retired and held directions this project still carries.",
+                file=sys.stderr,
+            )
         sys.exit(1)
     if len(matches) > 1:
         print(f"Direction prefix is ambiguous: {direction_id}", file=sys.stderr)
+        for d in sorted(matches, key=lambda x: x.get("id") or "")[:10]:
+            print(f"    {d.get('id', '?')}  {d.get('status', '?')}", file=sys.stderr)
         sys.exit(1)
     direction = matches[0]
     if require_staged and direction.get("status") != "staged":
@@ -6604,7 +6659,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dirs_show = dirs_sub.add_parser("show", parents=[common],
                                       help="Show one direction in detail.")
-    p_dirs_show.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_show.add_argument("direction_id", help="Direction id (d-<hex>); a unique prefix, with or without the d-, also resolves.")
 
     p_dirs_add = dirs_sub.add_parser("add", parents=[common],
                                      help="Add a new direction (confirms before posting).")
@@ -6625,7 +6680,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dirs_update = dirs_sub.add_parser("update", parents=[common],
                                         help="Update a direction (confirms before patching).")
-    p_dirs_update.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_update.add_argument("direction_id", help="Direction id (d-<hex>); a unique prefix, with or without the d-, also resolves.")
     p_dirs_update.add_argument("--text", help="New direction text.")
     p_dirs_update.add_argument("--priority", choices=["high", "medium", "low"],
                                help="New priority.")
@@ -6659,7 +6714,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dirs_unhold = dirs_sub.add_parser("unhold", parents=[common],
                                         help="Clear a direction's hold (confirms before posting).")
-    p_dirs_unhold.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_unhold.add_argument("direction_id", help="Direction id (d-<hex>); a unique prefix, with or without the d-, also resolves.")
     p_dirs_unhold.add_argument("--yes", action="store_true",
                                help="Skip the confirmation prompt.")
 
@@ -6667,7 +6722,7 @@ def build_parser() -> argparse.ArgumentParser:
         "resolve-discovery", parents=[common],
         help="Resolve an ask_operator discovery cycle: continue with a "
              "bounded next bet, park, or close (confirms before posting).")
-    p_dirs_resolve.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_resolve.add_argument("direction_id", help="Direction id (d-<hex>); a unique prefix, with or without the d-, also resolves.")
     p_dirs_resolve.add_argument("--cycle-id", required=True,
                                 help="Discovery cycle UUID (from tasks autonomy-debug).")
     p_dirs_resolve.add_argument("--cycle-revision", type=int, required=True,
@@ -6694,14 +6749,14 @@ def build_parser() -> argparse.ArgumentParser:
         "show-discovery", parents=[common],
         help="Show a direction's most recent discovery cycles: state, "
              "verdict, operator_question, and binding-decision authority.")
-    p_dirs_show_discovery.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_show_discovery.add_argument("direction_id", help="Direction id (d-<hex>); a unique prefix, with or without the d-, also resolves.")
     p_dirs_show_discovery.add_argument("--limit", type=int, default=5,
                                        help="Max cycles to show, newest first "
                                             "(default 5, max 20).")
 
     p_dirs_retarget = dirs_sub.add_parser("retarget", parents=[common],
                                           help="Retarget a staged direction.")
-    p_dirs_retarget.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_retarget.add_argument("direction_id", help="Direction id (d-<hex>); a unique prefix, with or without the d-, also resolves.")
     p_dirs_retarget.add_argument("version", type=int,
                                  help="New version to stage against.")
     p_dirs_retarget.add_argument("--yes", action="store_true",
@@ -6709,13 +6764,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dirs_activate = dirs_sub.add_parser("activate", parents=[common],
                                           help="Activate a staged direction immediately.")
-    p_dirs_activate.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_activate.add_argument("direction_id", help="Direction id (d-<hex>); a unique prefix, with or without the d-, also resolves.")
     p_dirs_activate.add_argument("--yes", action="store_true",
                                   help="Skip the confirmation prompt.")
 
     p_dirs_cancel = dirs_sub.add_parser("cancel", parents=[common],
                                         help="Cancel a staged direction.")
-    p_dirs_cancel.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_cancel.add_argument("direction_id", help="Direction id (d-<hex>); a unique prefix, with or without the d-, also resolves.")
     p_dirs_cancel.add_argument("--yes", action="store_true",
                                 help="Skip the confirmation prompt.")
 
