@@ -9,7 +9,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 622 | 973,067 | 26,036 | 13,674.233s (372 files) | 250 |
+| backend | 622 | 973,120 | 26,037 | 13,674.233s (372 files) | 250 |
 | admin-ui | 253 | 100,660 | 4,418 | 209.620s (253 files) | 0 |
 | agent | 125 | 111,128 | 5,861 | 72.033s (125 files) | 0 |
 
@@ -34,7 +34,7 @@ The queue includes every currently collected backend, admin-ui, and agent test f
 | 13 | P2 | backend | `backend/testing/test_digest.py` | 11,003 | 231 | critical (>5000 LOC) | 86.555s measured | — |
 | 14 | P2 | backend | `backend/testing/test_release_qualifier__ci_unresolved_blocker.py` | 6,463 | 162 | critical (>5000 LOC) | 82.078s measured | — |
 | 15 | P2 | backend | `backend/testing/test_directions.py` | 11,762 | 339 | critical (>5000 LOC) | 79.334s measured | — |
-| 16 | P2 | backend | `backend/testing/test_admin_routers.py` | 17,952 | 443 | critical (>5000 LOC) | 75.000s measured | protected; declared floor 443 |
+| 16 | P2 | backend | `backend/testing/test_admin_routers.py` | 18,005 | 444 | critical (>5000 LOC) | 75.000s measured | protected; declared floor 443 |
 | 17 | P2 | backend | `backend/testing/test_acceptance_criteria.py` | 13,383 | 283 | critical (>5000 LOC) | 74.580s measured | — |
 | 18 | P2 | backend | `backend/testing/test_orchestrator.py` | 17,472 | 347 | critical (>5000 LOC) | 70.488s measured | — |
 | 19 | P2 | backend | `backend/testing/test_metrics_integrity_sweep.py` | 8,110 | 215 | critical (>5000 LOC) | 65.620s measured | — |

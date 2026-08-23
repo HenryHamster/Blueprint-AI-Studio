@@ -3251,6 +3251,59 @@ class TestResetIterationCap:
         assert "review_loop_abandon_candidate" not in parking.context
 
     @pytest.mark.asyncio
+    async def test_reset_releases_the_merge_gate_exact_target_spawn_budget(
+        self, client: AsyncClient, db_session
+    ):
+        """The reset must clear BOTH per-chain counters, not just the iteration.
+
+        The merge gate bounds exact-target review respawn with its own counter
+        keyed on the immutable ``(base_sha, head_sha)`` target, which is a
+        different key from ``iteration``. If the reset clears only the
+        iteration, the operator releases the PR and the very next CI tick
+        re-parks it: same head, same key, still-exhausted count, and the
+        adjudication they just performed is thrown away. The exhausted budget
+        is exactly what escalated to them, so their explicit disposition is
+        what releases it.
+        """
+        from app.review_merge_gate import (
+            _SPAWN_BUDGET_COUNT_KEY,
+            _SPAWN_BUDGET_TARGET_KEY,
+        )
+
+        project = await _make_project(db_session)
+        parking = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "review", "pr_number": 909, "branch": "feat/x"}],
+            context={
+                "review_loop": {
+                    "iteration": 2,
+                    "pr_number": 909,
+                    _SPAWN_BUDGET_TARGET_KEY: "base-sha-909:head-sha-909",
+                    _SPAWN_BUDGET_COUNT_KEY: 5,
+                },
+                "review_loop_abandon_candidate": {
+                    "status": "abandon_candidate",
+                    "reason": "exact_target_review_budget_exhausted",
+                    "cycles": 1,
+                },
+            },
+        )
+        db_session.add(parking)
+        await db_session.commit()
+        await db_session.refresh(parking)
+
+        resp = await client.post(f"/api/admin/tasks/{parking.id}/reset-iteration-cap")
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(parking)
+        loop = parking.context["review_loop"]
+        assert loop["iteration"] == 0
+        assert _SPAWN_BUDGET_COUNT_KEY not in loop
+        assert _SPAWN_BUDGET_TARGET_KEY not in loop
+        assert "review_loop_abandon_candidate" not in parking.context
+
+    @pytest.mark.asyncio
     async def test_no_pr_number_in_context_returns_400(
         self, client: AsyncClient, db_session
     ):

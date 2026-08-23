@@ -4561,6 +4561,20 @@ async def reset_iteration_cap(
     new_review_loop["iteration_reset_by"] = current_user.get(
         "email", current_user["user_id"]
     )
+    # The merge gate's exact-target respawn budget is a SECOND per-chain
+    # counter, and it is keyed on the immutable (base_sha, head_sha) target
+    # rather than on the iteration. Clearing only the iteration would leave it
+    # exhausted, so the very next CI tick would re-park the PR the operator
+    # just released -- with the same head, the same key, and the same count.
+    # An explicit operator reset is precisely the disposition that budget was
+    # escalating for, so it releases the budget too.
+    from app.review_merge_gate import (
+        _SPAWN_BUDGET_COUNT_KEY,
+        _SPAWN_BUDGET_TARGET_KEY,
+    )
+
+    new_review_loop.pop(_SPAWN_BUDGET_COUNT_KEY, None)
+    new_review_loop.pop(_SPAWN_BUDGET_TARGET_KEY, None)
     new_ctx["review_loop"] = new_review_loop
     # An abandon-candidate hold is a recoverable episode stop. Resetting the
     # existing iteration budget explicitly starts a fresh census window; keep
