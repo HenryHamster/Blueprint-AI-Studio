@@ -1,8 +1,75 @@
 #!/bin/bash
 # ./blueprint — operator CLI entrypoint.
-# Forwards all arguments to scripts/blueprint.py via python3.
+# Forwards all arguments to scripts/blueprint.py via a Python 3 interpreter.
 # Usage: ./blueprint [--json] <subcommand> [args...]
 # Examples: ./blueprint status, ./blueprint --help, ./blueprint tasks list
+#
+# Interpreter discovery deliberately mirrors blueprint.ps1's ladder, in the
+# same order, so an operator gets the same CLI from bash and from PowerShell.
+# This used to be a bare `exec python3`, which hard-fails under Git Bash on
+# Windows: the Python there installs as `python`, with no `python3` on PATH, so
+# the documented Unix entrypoint died with "exec: python3: not found" on a host
+# where the interpreter was sitting right there.
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-exec python3 "$REPO_ROOT/scripts/blueprint.py" "$@"
+
+PYTHON=""
+PYTHON_ARGS=()
+
+# A candidate qualifies only if it actually runs and reports major version 3 —
+# a `python` that is still Python 2, or a Windows App Execution Alias stub that
+# exits without an interpreter, must fall through rather than be selected and
+# then fail confusingly several layers deeper.
+_is_python3() {
+  [ -n "$1" ] || return 1
+  "$@" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' \
+    >/dev/null 2>&1
+}
+
+_try() {
+  if [ -z "$PYTHON" ] && _is_python3 "$@"; then
+    PYTHON="$1"
+    shift
+    PYTHON_ARGS=("$@")
+  fi
+}
+
+# 1. Explicit operator override, as a PATH command or an absolute path.
+if [ -n "${BLUEPRINT_PYTHON:-}" ]; then
+  _try "$BLUEPRINT_PYTHON"
+  if [ -z "$PYTHON" ]; then
+    echo "BLUEPRINT_PYTHON does not name a working Python 3 interpreter:" \
+      "$BLUEPRINT_PYTHON" >&2
+    exit 1
+  fi
+fi
+
+# 2. This checkout's backend virtualenv.
+_try "$REPO_ROOT/backend/.venv/bin/python"
+_try "$REPO_ROOT/backend/.venv/Scripts/python.exe"
+
+# 3. Linked worktrees do not duplicate the virtualenv. When this checkout lives
+#    under <repo>/.worktrees/<name> or <repo>/.codex-worktrees/<name>, reuse the
+#    main checkout's interpreter before falling back to PATH.
+WORKTREES_ROOT="$(dirname "$REPO_ROOT")"
+case "$(basename "$WORKTREES_ROOT")" in
+  .worktrees|.codex-worktrees)
+    SHARED_ROOT="$(dirname "$WORKTREES_ROOT")"
+    _try "$SHARED_ROOT/backend/.venv/bin/python"
+    _try "$SHARED_ROOT/backend/.venv/Scripts/python.exe"
+    ;;
+esac
+
+# 4. PATH, then the Windows launcher.
+_try python3
+_try python
+_try py -3
+
+if [ -z "$PYTHON" ]; then
+  echo "Python 3 was not found. Create backend/.venv, install Python, or set" \
+    "BLUEPRINT_PYTHON to the interpreter path." >&2
+  exit 1
+fi
+
+exec "$PYTHON" ${PYTHON_ARGS[@]+"${PYTHON_ARGS[@]}"} \
+  "$REPO_ROOT/scripts/blueprint.py" "$@"
