@@ -4113,6 +4113,11 @@ async def _spawn_pipeline_task(
         # entries carry a head sha AND the shas match. A missing sha proves
         # nothing about whether the code moved, so it must not disable the
         # detector.
+        #
+        # This value gates EVERY escalation derived from comparing the two
+        # entries -- the stuck legs below and the standoff leg after them. Any
+        # new leg added here must consume it; a leg that does not is a park
+        # that can fire with zero fix attempts behind it.
         _prev_reviewed_head = str(prev_entry.get("reviewed_head_sha") or "").strip()
         _curr_reviewed_head = str(curr_entry.get("reviewed_head_sha") or "").strip()
         _head_advanced_between_reviews = not (
@@ -4159,8 +4164,8 @@ async def _spawn_pipeline_task(
             # is expected and says nothing about convergence. The iteration cap
             # remains the honest backstop for real non-convergence.
             logger.info(
-                "[PIPELINE] Skipping stuck detection on %s - both reviews "
-                "examined head %s, no fix attempt intervened",
+                "[PIPELINE] Skipping stuck/standoff detection on %s - both "
+                "reviews examined head %s, no fix attempt intervened",
                 str(source_task.id)[:8],
                 _curr_reviewed_head[:9],
             )
@@ -4213,7 +4218,30 @@ async def _spawn_pipeline_task(
         # agent side; backend trusts what landed but applies the same check).
         is_standoff = False
         standoff_detail = ""
-        if curr_critical_major and prev_critical_major:
+        # The head-advance guard binds HERE TOO, and this leg is the one that
+        # actually fired in production. #17627 added the guard to the stuck
+        # legs above by putting them in an if/elif chain under it -- but this
+        # block is a sibling statement at the same indent, outside that chain,
+        # so it never saw the guard at all.
+        #
+        # A standoff is a strictly stronger claim than a stuck cycle: not
+        # "the fix agent is not converging" but "the fix agent and the reviewer
+        # disagree about this issue". That claim is only meaningful if a fix
+        # attempt actually happened between the two reviews. Two reviews of the
+        # SAME head re-raising the same description is one reviewer agreeing
+        # with another about code neither of them saw change -- and
+        # ``fix_agent_responses`` is carried forward across the whole chain
+        # (accumulated, capped at 30), so a single structured response from any
+        # earlier iteration latches ``standoff_issue_ids`` permanently. Once
+        # that latch is set, every subsequent same-head review pair scores as a
+        # standoff and parks the chain for an operator with no fix ever
+        # spawned. Live instance: PR #17693, where the park suppressed the fix
+        # while the merge gate respawned the review 441 times.
+        if (
+            _head_advanced_between_reviews
+            and curr_critical_major
+            and prev_critical_major
+        ):
             prior_responses = list(source_loop.get("fix_agent_responses") or [])
             # Collect copied stable BP issue ids when present; retain the
             # issue-summary fallback so older structured responses still count.

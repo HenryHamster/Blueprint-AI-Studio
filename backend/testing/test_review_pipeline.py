@@ -19846,6 +19846,7 @@ async def _run_stuck_pair(
     current_issues,
     prior_feedback="needs error handling",
     current_feedback="needs error handling",
+    fix_agent_responses=None,
 ):
     """Drive one review->review pair through the spawn path.
 
@@ -19899,6 +19900,11 @@ async def _run_stuck_pair(
                 "branch": "plan/0507c2b6",
                 "base_branch": "main",
                 "review_history": [prior_entry],
+                **(
+                    {"fix_agent_responses": fix_agent_responses}
+                    if fix_agent_responses
+                    else {}
+                ),
             },
         },
     )
@@ -19960,6 +19966,96 @@ async def test_stuck_cycle_suppressed_when_no_fix_landed_between_reviews(
     )
     assert original_task.requires_approval is not True
     assert "stuck" not in (original_task.latest_status_message or "").lower()
+
+
+# The standoff leg needs a literal repeat, not a rephrase: it counts
+# ``desc in prev_critical_major`` on normalized descriptions. Same wording on
+# both passes is also the honest shape of the production case -- the ledger
+# rewrites ``issues`` from the binding open set every cycle, so consecutive
+# reviews of an unchanged head carry byte-identical text.
+_REPEATED_ISSUE = [_issue("Error handling code missing in payment processor", "MAJOR")]
+
+# One structured fix-agent response is enough to arm the latch, and
+# ``fix_agent_responses`` accumulates across the whole chain (capped at 30) --
+# so once any iteration has disputed anything, this set is never empty again.
+_PRIOR_RATIONALE = [
+    {
+        "issue_id": "BP-0001",
+        "issue_summary": "Error handling code missing in payment processor",
+        "response": "the handler is unreachable when the gateway rejects",
+        "verify_steps_ok": True,
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_standoff_suppressed_when_no_fix_landed_between_reviews(
+    db_session, mocker
+):
+    """The standoff leg needs the head-advance guard too -- it never had it.
+
+    #17627 put the stuck legs into an if/elif chain under
+    ``_head_advanced_between_reviews``. The standoff block is a sibling
+    statement at the same indent, outside that chain, so the guard never
+    reached it. That is not a cosmetic gap: a standoff is the STRONGER claim
+    (the fix agent and the reviewer disagree), and two reviews of an unchanged
+    head cannot evidence a disagreement about a fix that was never attempted.
+
+    ``fix_agent_responses`` is accumulated across the chain, so one structured
+    response from any earlier iteration latches ``standoff_issue_ids`` for
+    good; from then on every same-head review pair parked the chain. Live
+    instance: PR #17693, parked while the merge gate respawned the review 441
+    times over 9.5 hours and no fix was ever spawned.
+    """
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head=_SAME_HEAD,
+        prior_issues=_REPEATED_ISSUE,
+        current_issues=_REPEATED_ISSUE,
+        fix_agent_responses=_PRIOR_RATIONALE,
+    )
+
+    assert result is not None, (
+        "Nothing moved between the two reviews, so there is no disagreement "
+        "to adjudicate -- the fix both reviewers asked for must be allowed to "
+        "spawn"
+    )
+    assert original_task.requires_approval is not True
+    assert (original_task.context or {}).get("review_loop_terminal_outcome") is None
+
+
+@pytest.mark.asyncio
+async def test_standoff_still_fires_when_a_fix_advanced_the_head(db_session, mocker):
+    """Control: a real standoff must still park.
+
+    Identical issues and identical rationale to the suppression test above --
+    only the head differs. A fix landed, the agent had argued the issue, the
+    reviewer re-raised it anyway: that IS the disagreement the leg exists to
+    catch, and it must keep reaching an operator.
+    """
+    result, original_task = await _run_stuck_pair(
+        db_session,
+        mocker,
+        prior_head=_SAME_HEAD,
+        current_head=_ADVANCED_HEAD,
+        prior_issues=_REPEATED_ISSUE,
+        current_issues=_REPEATED_ISSUE,
+        fix_agent_responses=_PRIOR_RATIONALE,
+    )
+
+    assert result is None, (
+        "a fix DID land and the reviewer rejected the agent's rationale -- "
+        "that is a genuine standoff and must not spawn another blind cycle"
+    )
+    assert original_task.requires_approval is True
+    # Pinned as standoff, not the generic stuck park: this asserts the leg
+    # itself still runs, so the suppression above cannot be satisfied by
+    # deleting standoff detection outright.
+    outcome = (original_task.context or {}).get("review_loop_terminal_outcome") or {}
+    assert outcome.get("kind") == "standoff"
+    assert "rationale" in (outcome.get("detail") or "")
 
 
 @pytest.mark.asyncio

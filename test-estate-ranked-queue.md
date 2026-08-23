@@ -9,7 +9,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 622 | 972,971 | 26,034 | 13,674.233s (372 files) | 250 |
+| backend | 622 | 973,067 | 26,036 | 13,674.233s (372 files) | 250 |
 | admin-ui | 253 | 100,660 | 4,418 | 209.620s (253 files) | 0 |
 | agent | 125 | 111,128 | 5,861 | 72.033s (125 files) | 0 |
 
@@ -21,7 +21,7 @@ The queue includes every currently collected backend, admin-ui, and agent test f
 |-----:|:--------:|------|------|----:|------:|------------------|-------------|---------------------|
 | 1 | P2 | backend | `backend/testing/test_strategic_completion.py` | 21,432 | 616 | critical (>5000 LOC) | 1,290.842s measured | — |
 | 2 | P2 | backend | `backend/testing/test_release_qualifier__compute_composite.py` | 5,968 | 264 | critical (>5000 LOC) | 777.408s measured | — |
-| 3 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,080 | 424 | critical (>5000 LOC) | 557.274s measured | — |
+| 3 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,176 | 426 | critical (>5000 LOC) | 557.274s measured | — |
 | 4 | P2 | backend | `backend/testing/test_pipeline.py` | 6,837 | 277 | critical (>5000 LOC) | 524.226s measured | — |
 | 5 | P2 | backend | `backend/testing/test_task_lifecycle.py` | 12,616 | 315 | critical (>5000 LOC) | 413.882s measured | — |
 | 6 | P2 | backend | `backend/testing/test_reaper.py` | 20,812 | 486 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 486 |
