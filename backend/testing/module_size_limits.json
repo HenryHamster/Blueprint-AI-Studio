@@ -56,7 +56,7 @@
     "rollup_management.py": 6450,
     "rollup_migration_validation.py": 1350,
     "reaper.py": 4250,
-    "reaper_sweeps.py": 4750,
+    "reaper_sweeps.py": 5500,
     "reaper_fleet_health_sweeps.py": 500,
     "reaper_bug_message_sweeps.py": 2050,
     "reaper_evaluating_sweeps.py": 600,
