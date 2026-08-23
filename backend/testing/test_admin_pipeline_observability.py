@@ -384,6 +384,55 @@ async def test_outer_loop_chains_reason_filter(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_outer_loop_chains_reads_payload_typed_chain_tasks(client, db_session):
+    """The drill-down survives a chain whose reducer reads ``first_payload``.
+
+    Regression for the raiseload projection class: the chain reducer counts
+    review-typed iterations off ``Task.first_payload``, so a caller that
+    projects its own column set without ``payloads`` raises
+    ``'Task.payloads' is not available due to raiseload=True`` at request time
+    rather than at import time. Seeds a real review-typed payload so the read
+    is exercised, not just tolerated on an empty ``payloads`` list.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    review = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=2),
+        payloads=[{"type": "review", "instructions": "review the PR"}],
+        context={"review_loop": {"iteration": 1, "pr_number": 77}},
+    )
+    fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=now - timedelta(hours=1),
+        payloads=[{"type": "fix", "instructions": "address the findings"}],
+        context={
+            "pr_rejected": True,
+            "review_loop": {"iteration": 2, "pr_number": 77},
+        },
+    )
+    db_session.add_all([review, fix])
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/outer-loop-chains?hours=24&project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    chain = data["chains"][0]
+    assert chain["pr_number"] == 77
+    assert chain["terminal_reason"] == "rejected"
+    assert chain["max_iteration"] == 2
+
+
+@pytest.mark.asyncio
 async def test_warm_reuse_dropout_names_dominant_leader(client, db_session):
     """The drop-out endpoint surfaces the ranked breakdown and names the single
     dominant reason when one clearly dominates the non-converting population."""
