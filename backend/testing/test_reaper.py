@@ -1594,6 +1594,70 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_requeue_status_message_keeps_the_reap_reason(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """The reaper's non-terminal requeue used to print a state and drop its
+    own evidence.
+
+    ``latest_status_message`` was overwritten with the flat literal "Rate
+    limited — requeued with exhausted account blacklisted". The reaper was
+    holding ``reap_reason`` at that exact point — heartbeat age, last
+    heartbeat timestamp, last tool trace — and dropped it, so the operator
+    saw what the engine DID and never how it knew. Same class as the
+    ``f"{failure_class.title()} — requeued"`` overwrite on the agent-status
+    path; both now go through ``compose_requeue_status_message``.
+
+    The expected tail is read back out of the durable REAPED ``TaskHistory``
+    row rather than pattern-matched, so this is an exact-equality pin on "the
+    surfaced message carries the very reason the reaper recorded".
+    """
+    from app.models import TaskHistory
+
+    mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-rl-reason",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        context={
+            "max_plan_account_id": "acct-reason",
+            "last_error": "API Error: rate limit reached",
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    rows = (
+        (
+            await reaper_db.execute(
+                select(TaskHistory).where(
+                    TaskHistory.task_id == t.id, TaskHistory.action == "REAPED"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    recorded_reason = rows[0].details["reap_reason"]
+    assert "No heartbeat for" in recorded_reason, recorded_reason
+    assert t.latest_status_message == (
+        "Rate limited — requeued with exhausted account blacklisted: "
+        f"{recorded_reason}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reaper_account_cooldown_silent_death_free_requeue(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):

@@ -24160,8 +24160,15 @@ async def test_rate_limit_parks_and_retains_vm_when_alternate_account_eligible(
     assert task.status == TaskStatus.QUEUED
     assert task.vm_instance_id == "agent-vm-park-me"
     assert task.attempt_count == 0
+    # The park disposition is one of the five non-terminal branches that used
+    # to overwrite the composed message with a bare state. It still LEADS (an
+    # operator scanning the queue must see "parked, not abandoned" first), but
+    # the agent's own report from THIS request is no longer discarded behind
+    # it. Updated deliberately: the previous exact-equality value encoded the
+    # clobbering defect, not the intended contract.
     assert task.latest_status_message == (
-        "Rate Limited — parked on warm VM for alternate-account retarget"
+        "Rate Limited — parked on warm VM for alternate-account retarget: "
+        "rate_limited — API Error: Rate limit reached"
     )
     assert ctx.get("parked_for_retarget") is True
     assert ctx.get("warm_target_vm_id") == "agent-vm-park-me"
@@ -28695,14 +28702,16 @@ async def test_status_message_leads_with_recorded_failure_category(
 
     Reported here as ``test_failed`` rather than ``rate_limited`` on purpose.
     A report the classifier resolves to RATE_LIMIT is REQUEUED, not terminal,
-    and the requeue path overwrites ``latest_status_message`` a few hundred
-    lines later with its own category-consistent "Rate Limited — requeued"
-    text, so it can never exercise this writer. The live 075854e6 row proves
-    the raw label and the surfaced message can disagree whenever the derived
-    class is not the requeued one — the raw label is stored verbatim while the
-    class is re-derived. The exact ``rate_limited`` + "no work to ship"
-    pairing is pinned directly on the composer in
-    ``test_operator_failure_messages.py``.
+    and the requeue path re-writes ``latest_status_message`` a few hundred
+    lines later with its own disposition clause in front (``"Rate Limit —
+    requeued: <composed message>"`` since the Defect C fix; a bare ``"Rate
+    Limit — requeued"`` before it), so it can never exercise THIS writer's
+    output shape. The live 075854e6 row proves the raw label and the surfaced
+    message can disagree whenever the derived class is not the requeued one —
+    the raw label is stored verbatim while the class is re-derived. The exact
+    ``rate_limited`` + "no work to ship" pairing is pinned directly on the
+    composer in ``test_operator_failure_messages.py``, and its requeue-path
+    twin in ``test_requeue_sanitizes_provider_stream_frames_like_the_terminal_path``.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -28820,4 +28829,155 @@ async def test_status_message_never_persists_a_raw_provider_stream_fragment(
     assert "ERROR precondition: base branch has no commits" in msg, (
         "the real diagnostic above the stream frames must survive, not be "
         f"blanked along with them: {msg!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Defect C — the requeue paths overwrote the composed truth with a state.
+#
+# ``_compose_operator_status_message`` (the Defect A/B fix above) writes a
+# truthful, category-led, sanitized message onto the row early in the handler.
+# Every non-terminal branch below it then overwrote that column with
+# ``f"{failure_class.replace('_', ' ').title()} — requeued"`` and friends, so
+# the ONE line an operator reads on a requeued task said only what state it
+# was in — never why. The agent's explanation had arrived in the same request.
+# ---------------------------------------------------------------------------
+
+
+async def _post_external_api_requeue(client, db_session, mocker, *, name, logs,
+                                     failure_category):
+    """Drive one EXTERNAL_API transient requeue and return the stored message.
+
+    EXTERNAL_API with no ``external_api_subtype`` in context takes the
+    transient-outage branch: ``should_requeue`` stays True, the retry budget is
+    NOT burned, and the task goes back to QUEUED — the exact non-terminal path
+    that used to clobber ``latest_status_message``.
+    """
+    from app.failure_classification import FailureClassification
+
+    mocker.patch(
+        "app.failure_classification.classify_failure_with_confidence",
+        return_value=FailureClassification("EXTERNAL_API", 1.0),
+    )
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name=name, user_id=f"u-{name}")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = f"agent-vm-{name}"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "requeue diagnosis"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    body = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": failure_category,
+    }
+    if logs is not None:
+        body["logs"] = logs
+    resp = await client.post(
+        "/api/agent/status",
+        json=body,
+        headers={"x-agent-token": create_agent_token(str(task.id), vm_id)},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED, (
+        "this fixture must exercise the non-terminal requeue path"
+    )
+    assert task.attempt_count == 0, "the transient branch must not burn a retry"
+    return task
+
+
+@pytest.mark.asyncio
+async def test_requeue_keeps_the_agent_diagnosis_and_says_it_was_requeued(
+    client: AsyncClient, db_session, mocker
+):
+    """The defect: ``latest_status_message`` was overwritten with a bare state.
+
+    ``External Api — requeued`` tells an operator nothing about what actually
+    broke, and the agent's own explanation was in the very same POST — already
+    composed onto the row by ``_compose_operator_status_message`` and then
+    thrown away. It survived only in the banked ``attempt_history`` snapshot
+    (banking runs before the overwrite), i.e. the engine HELD the reason and
+    printed a state.
+
+    Both halves are pinned: the disposition still leads (so the operator can
+    still see at a glance that the work was requeued, not abandoned) and the
+    category-led diagnosis follows it.
+    """
+    task = await _post_external_api_requeue(
+        client,
+        db_session,
+        mocker,
+        name="requeue-keeps-diagnosis",
+        failure_category="test_failed",
+        logs="pytest: 3 failures in tests/test_widget.py::test_alpha",
+    )
+    assert task.latest_status_message == (
+        "External Api — requeued: test_failed — "
+        "pytest: 3 failures in tests/test_widget.py::test_alpha"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requeue_with_no_agent_diagnosis_is_still_legible(
+    client: AsyncClient, db_session, mocker
+):
+    """A report with no free text must degrade to the disposition alone —
+    not to a dangling separator promising a detail that does not exist."""
+    task = await _post_external_api_requeue(
+        client,
+        db_session,
+        mocker,
+        name="requeue-no-diagnosis",
+        failure_category=None,
+        logs=None,
+    )
+    assert task.latest_status_message == "External Api — requeued"
+
+
+@pytest.mark.asyncio
+async def test_requeue_sanitizes_provider_stream_frames_like_the_terminal_path(
+    client: AsyncClient, db_session, mocker
+):
+    """Proves the requeue path reuses the SHARED composer.
+
+    The task ``1745bab4`` NDJSON tail and the task ``075854e6``
+    category-contradiction are both handled here exactly as on the terminal
+    path: frames stripped, the diagnostic that sat above them recovered, and
+    the recorded category leading the free text it disagrees with. If the
+    requeue path had re-derived its own formatting at the call site, one of
+    these would differ.
+    """
+    fragment = (
+        'se_id":null,"uuid":"21ba040c-6d4a-4c1e-9e5f-2b7c0a91d3ef"} '
+        '{"type":"stream_event","event":{"type":"content_block_delta",'
+        '"delta":{"type":"text_delta","text":"…"}}}'
+    )
+    task = await _post_external_api_requeue(
+        client,
+        db_session,
+        mocker,
+        name="requeue-stream-frames",
+        failure_category="rate_limited",
+        logs="No uncommitted changes found — the branch is clean.\n" + fragment,
+    )
+    msg = task.latest_status_message or ""
+    assert "stream_event" not in msg and "content_block_delta" not in msg, msg
+    assert msg == (
+        "External Api — requeued: rate_limited — "
+        "No uncommitted changes found — the branch is clean."
     )

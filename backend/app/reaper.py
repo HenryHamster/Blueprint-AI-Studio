@@ -87,7 +87,10 @@ from app.time_utils import (
     exponential_backoff,
     set_retry_after,
 )
-from app.operator_failure_messages import compose_provision_failure_message
+from app.operator_failure_messages import (
+    compose_provision_failure_message,
+    compose_requeue_status_message,
+)
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 from app.reaper_post_orphan_sweep import run_post_orphan_sweep
 
@@ -1540,9 +1543,22 @@ async def reaper_service():
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
                             task.started_at = None
-                            task.latest_status_message = (
-                                "Dead OAuth session — account hard-disabled; "
-                                "requeued onto different account"
+                            # Same "surface reasons, not states" rule as the
+                            # agent-status requeue paths: the disposition leads,
+                            # but the evidence the reaper is holding right now
+                            # (``reap_reason`` — heartbeat age, last tools, the
+                            # pre-claim death window) is real diagnosis and used
+                            # to be dropped on the floor here. Only reap_reason
+                            # is appended; feeding the PREVIOUS
+                            # latest_status_message back in would compound the
+                            # message on every successive reap.
+                            task.latest_status_message = compose_requeue_status_message(
+                                reap_reason,
+                                disposition=(
+                                    "Dead OAuth session — account "
+                                    "hard-disabled; requeued onto "
+                                    "different account"
+                                ),
                             )
                             da_ctx = dict(task.context or {})
                             if da_acct_id:
@@ -1594,7 +1610,13 @@ async def reaper_service():
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
                             task.started_at = None
-                            task.latest_status_message = "Rate limited — requeued with exhausted account blacklisted"
+                            task.latest_status_message = compose_requeue_status_message(
+                                reap_reason,
+                                disposition=(
+                                    "Rate limited — requeued with "
+                                    "exhausted account blacklisted"
+                                ),
+                            )
                             # Blacklist the exhausted account; let the orchestrator pick another
                             # from the pool on the next cycle. If all accounts are rate-limited,
                             # the orchestrator handles that case by skipping the task and retrying

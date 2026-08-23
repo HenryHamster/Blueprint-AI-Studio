@@ -41,6 +41,17 @@ keeps the free text as supporting detail (a message that says only
 ``rate_limited`` is worse than one that says why), and never persists text
 that parses as a raw provider stream frame.
 
+**Defect C — the non-terminal paths threw the composed truth away again.**
+Fixing Defect B made the terminal write truthful, but every requeue/park
+branch in ``routers/agent_status.py`` then overwrote the column with a bare
+synthesized state (``f"{failure_class.title()} — requeued"``), and the
+reaper's own non-terminal requeues dropped the ``reap_reason`` they were
+holding. ``Code Error — requeued`` names a state and no reason; the agent's
+explanation arrived in the SAME request and was discarded.
+``compose_requeue_status_message`` keeps both halves — the engine's
+disposition clause leads, the shared terminal composer supplies the
+sanitized, category-led diagnosis behind it.
+
 Kept in its own module rather than inline because ``task_lifecycle.py`` and
 ``routers/agent_status.py`` are both chronic size offenders, and because pure
 composition functions are unit-testable without a DB.
@@ -55,9 +66,11 @@ from typing import Any
 
 __all__ = [
     "NO_READABLE_AGENT_OUTPUT",
+    "REQUEUE_DISPOSITION_JOINER",
     "RUNNER_VM_ID_PREFIX",
     "compose_agent_terminal_message",
     "compose_provision_failure_message",
+    "compose_requeue_status_message",
     "is_local_runner_vm_id",
     "local_runner_label",
     "looks_like_provider_stream_fragment",
@@ -291,6 +304,12 @@ def compose_agent_terminal_message(
     if not category:
         return free_text[-max_chars:]
 
+    if not free_text.strip():
+        # Category but no free text at all (a report whose ``logs`` were
+        # empty). ``f"{category} — {free_text}"`` would emit a dangling em
+        # dash promising a detail that does not exist.
+        return category[:max_chars]
+
     if free_text.strip().lower() == category:
         # The agent's free text WAS the category; don't say it twice.
         return category
@@ -298,3 +317,85 @@ def compose_agent_terminal_message(
     prefix = f"{category} — "
     budget = max(0, max_chars - len(prefix))
     return f"{prefix}{free_text[-budget:]}"
+
+
+# Separator between the engine's disposition clause and the agent's own
+# diagnosis. A colon, deliberately, and NOT another em dash: the disposition
+# clauses already contain one ("Rate Limit — requeued"), and a second one
+# reads as a third independent field rather than "…because:".
+REQUEUE_DISPOSITION_JOINER = ": "
+
+
+def _disposition_already_states(disposition: str, diagnosis: str) -> bool:
+    """True iff *diagnosis* adds nothing the disposition clause did not say.
+
+    Guards the degenerate case where the agent's whole report was the bare
+    category (``failure_category='rate_limited'`` with empty logs): appending
+    ``rate_limited`` to ``Rate Limit — requeued`` says the same thing twice.
+    Underscores are normalised because the two halves come from different
+    vocabularies — the agent's raw snake_case label vs. the engine's
+    title-cased failure class.
+    """
+    normalised = diagnosis.replace("_", " ").strip().lower()
+    return bool(normalised) and normalised in disposition.replace("_", " ").lower()
+
+
+def compose_requeue_status_message(
+    logs: str,
+    *,
+    failure_category: str | None = None,
+    disposition: str,
+    max_chars: int = 8000,
+) -> str:
+    """Compose the operator-facing status for a NON-TERMINAL requeue/park.
+
+    **Defect C — the inverse of Defect B.** ``compose_agent_terminal_message``
+    was wired into the terminal write path so a FAILED task finally told the
+    truth, but every non-terminal path in ``routers/agent_status.py``
+    immediately overwrote ``latest_status_message`` with a synthesized state
+    string::
+
+        task.latest_status_message = f"{failure_class.title()} — requeued"
+
+    ``Code Error — requeued`` is a *state*. The agent's explanation of what
+    actually broke arrived in the SAME request (``payload.logs`` +
+    ``payload.failure_category``), was composed into a truthful message a few
+    hundred lines earlier, and was then discarded — so the operator had to ask
+    the engine for something it already held. Only the banked
+    ``attempt_history`` snapshot kept it, and only because banking happens
+    before the overwrite.
+
+    Both halves are real information and both are kept:
+
+    * *disposition* — the engine's own clause, e.g. ``"Rate Limit — requeued"``
+      or ``"Dead auth session — requeued onto different account"``. It LEADS,
+      byte-for-byte as before, so an operator scanning the queue still reads
+      "this was requeued, not abandoned" first and so the substring-keyed
+      classifier fallbacks in ``failure_classification.py`` see exactly the
+      text they saw before this fix.
+    * the agent's diagnosis — composed by the shared
+      ``compose_agent_terminal_message``, so the requeue path inherits the
+      same category-led ordering, the same provider-stream-frame stripping
+      (task ``1745bab4``) and the same "no readable output" note rather than
+      re-deriving any of it at the call site.
+
+    A requeue with no agent free text and no category degrades to the
+    disposition alone — never a dangling ``": "``.
+    """
+    head = (disposition or "").strip()
+    budget = max_chars - len(head) - len(REQUEUE_DISPOSITION_JOINER)
+    if budget <= 0:
+        return head[:max_chars]
+
+    diagnosis = compose_agent_terminal_message(
+        logs,
+        failure_category=failure_category,
+        max_chars=budget,
+    ).strip()
+    if not diagnosis:
+        return head[:max_chars]
+    if not head:
+        return diagnosis[:max_chars]
+    if _disposition_already_states(head, diagnosis):
+        return head[:max_chars]
+    return f"{head}{REQUEUE_DISPOSITION_JOINER}{diagnosis}"[:max_chars]

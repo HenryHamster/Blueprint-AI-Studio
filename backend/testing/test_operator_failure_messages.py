@@ -12,6 +12,10 @@ the system HELD the true reason and printed a different, misleading one:
   the agent's last free-text line verbatim — a raw NDJSON provider-stream
   fragment in one case, a message flatly contradicting the recorded
   ``rate_limited`` category in the other.
+* Defect C (the inverse of B): every non-terminal requeue/park branch threw
+  the composed truth straight back away, overwriting the column with a bare
+  ``f"{failure_class.title()} — requeued"``. The operator got a state and no
+  reason for something the engine had received in the same request.
 
 These are pure-function tests: no DB, no fixtures. The DB-backed halves live
 in ``test_reaper.py`` (reaper terminal-persist path) and ``test_agent.py``
@@ -24,6 +28,7 @@ from app.operator_failure_messages import (
     NO_READABLE_AGENT_OUTPUT,
     compose_agent_terminal_message,
     compose_provision_failure_message,
+    compose_requeue_status_message,
     is_local_runner_vm_id,
     local_runner_label,
     looks_like_provider_stream_fragment,
@@ -278,3 +283,127 @@ def test_terminal_message_respects_the_column_budget():
     )
     assert len(msg) <= 8000, len(msg)
     assert msg.startswith("code_error — ")
+
+
+# ---------------------------------------------------------------------------
+# Defect C — the requeue paths overwrote the composed truth with a state
+# ---------------------------------------------------------------------------
+
+
+def test_requeue_message_keeps_the_agent_diagnosis_and_the_requeue_fact():
+    """The whole defect in one assertion.
+
+    ``routers/agent_status.py`` used to write ``f"{failure_class.title()} —
+    requeued"`` over the composed message. "Code Error — requeued" is a state:
+    it does not say WHAT broke, and the agent's own explanation had arrived in
+    the same request. Both halves are real information and both must survive —
+    the disposition so the operator knows the work was not abandoned, the
+    diagnosis so they know why it had to be retried.
+    """
+    msg = compose_requeue_status_message(
+        "pytest: 3 failures in tests/test_widget.py::test_alpha",
+        failure_category="test_failed",
+        disposition="Code Error — requeued",
+    )
+    assert msg == (
+        "Code Error — requeued: test_failed — "
+        "pytest: 3 failures in tests/test_widget.py::test_alpha"
+    )
+
+
+def test_requeue_message_with_no_agent_text_is_legible():
+    """A requeue whose report carried no free text must degrade to the
+    disposition alone — never a dangling separator promising a detail that
+    does not exist."""
+    msg = compose_requeue_status_message(
+        "", failure_category=None, disposition="Code Error — requeued"
+    )
+    assert msg == "Code Error — requeued"
+    assert not msg.endswith((":", "—", "- ", ": "))
+
+
+def test_requeue_message_with_only_a_category_has_no_dangling_em_dash():
+    """Empty logs but a reported category: the category is the diagnosis, and
+    the terminal composer's ``f"{category} — {free_text}"`` shape would leave a
+    trailing em dash pointing at nothing."""
+    msg = compose_requeue_status_message(
+        "   \n  ",
+        failure_category="test_failed",
+        disposition="Code Error — requeued",
+    )
+    assert msg == "Code Error — requeued: test_failed"
+
+
+def test_terminal_message_with_a_category_and_no_free_text_has_no_dangling_dash():
+    """Same guard one layer down, where the shape is actually produced."""
+    assert compose_agent_terminal_message("", failure_category="rate_limited") == (
+        "rate_limited"
+    )
+
+
+def test_requeue_message_strips_provider_stream_frames_too():
+    """Proves the requeue path goes through the SHARED composer rather than
+    re-deriving sanitization at the call site: the task ``1745bab4`` NDJSON
+    fragment must be replaced by the explicit "no readable output" note here
+    exactly as it is on the terminal path."""
+    msg = compose_requeue_status_message(
+        LIVE_1745BAB4_FRAGMENT,
+        failure_category="blocked_precondition",
+        disposition="Code Error — requeued",
+    )
+    assert not looks_like_provider_stream_fragment(msg), msg
+    assert "stream_event" not in msg and "content_block_delta" not in msg, msg
+    assert msg == (
+        f"Code Error — requeued: blocked_precondition — {NO_READABLE_AGENT_OUTPUT}"
+    )
+
+
+def test_requeue_message_leads_the_diagnosis_with_the_contradicted_category():
+    """The task ``075854e6`` shape, on the requeue path: the free text tells a
+    story the recorded category contradicts, so the category must still lead
+    the diagnosis half — the requeue disposition does not exempt it."""
+    free_text = (
+        "No uncommitted changes found — the branch is clean and matches the "
+        "latest commit. There is no work to ship."
+    )
+    msg = compose_requeue_status_message(
+        free_text,
+        failure_category="rate_limited",
+        disposition="Rate Limit — requeued",
+    )
+    assert msg == f"Rate Limit — requeued: rate_limited — {free_text}"
+
+
+def test_requeue_message_does_not_state_the_same_thing_twice():
+    """A report whose entire content was its own category adds nothing the
+    disposition clause did not already say."""
+    assert compose_requeue_status_message(
+        "rate_limited",
+        failure_category="rate_limited",
+        disposition="Rate limited — requeued with exhausted account blacklisted",
+    ) == "Rate limited — requeued with exhausted account blacklisted"
+
+
+def test_requeue_message_carries_engine_evidence_when_there_is_no_agent():
+    """The reaper's non-terminal requeues have no agent report at all — the
+    diagnosis they hold and used to drop is ``reap_reason``."""
+    assert compose_requeue_status_message(
+        "No heartbeat for 620s (last: 2026-08-21T00:00:00+00:00)",
+        disposition="Rate limited — requeued with exhausted account blacklisted",
+    ) == (
+        "Rate limited — requeued with exhausted account blacklisted: "
+        "No heartbeat for 620s (last: 2026-08-21T00:00:00+00:00)"
+    )
+
+
+def test_requeue_message_respects_the_column_budget():
+    """The disposition is charged against the same budget, so a huge log tail
+    can never push the composed message past the column write size."""
+    msg = compose_requeue_status_message(
+        "x" * 20000,
+        failure_category="code_error",
+        disposition="Code Error — requeued",
+        max_chars=8000,
+    )
+    assert len(msg) <= 8000, len(msg)
+    assert msg.startswith("Code Error — requeued: code_error — ")
