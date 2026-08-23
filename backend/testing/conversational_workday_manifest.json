@@ -210,7 +210,7 @@
         "uses server availability when a Continuous session has no activity snapshot yet",
         "renders one bounded, server-derived status line with full detail in its title"
       ],
-      "test_count": 22
+      "test_count": 23
     },
     {
       "path": "admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx",
@@ -280,7 +280,7 @@
         "treats message / reasoning / kind-less as reply, activity kinds as not",
         "builds the bubble from reply-kind deltas only (activity noise excluded)"
       ],
-      "test_count": 38
+      "test_count": 41
     },
     {
       "path": "admin-ui/src/utils/pendingAttachmentStore.test.ts",

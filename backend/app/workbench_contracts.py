@@ -210,6 +210,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/recovery_evaluating_approval.py",
         "backend/app/recovery_evaluating_ci_backstop.py",
         "backend/app/recovery_evaluating_hard_timeout.py",
+        "backend/app/recovery_evaluating_prless_hold.py",
         "backend/app/recovery_evaluating_pr_check.py",
         "backend/app/recovery_evaluating_reaped_owner.py",
         "backend/app/recovery_evaluating_strand.py",
