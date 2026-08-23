@@ -1635,8 +1635,8 @@
           "new_cap": 4750
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-23T03:39:00.107257+00:00",
+          "commit_sha": "9303af2bab746aa0a18b22ce4a7648f2fae98dd2",
+          "commit_date": "2026-08-22T20:54:33-07:00",
           "old_cap": 4750,
           "new_cap": 5500
         }
@@ -3557,6 +3557,12 @@
           "commit_date": "2026-07-28T00:09:07-07:00",
           "old_cap": 1700,
           "new_cap": 2050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-23T14:42:28.679301+00:00",
+          "old_cap": 2050,
+          "new_cap": 2100
         }
       ],
       "handlers/review-fix-migration.ts": [

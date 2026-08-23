@@ -356,24 +356,54 @@ def load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]
     return _load_surface_manifest(repo_root)
 
 
+def sentinel_file(sentinel: str) -> str:
+    """The on-disk file part of a registered sentinel selector.
+
+    A sentinel may be registered either as a plain test file
+    (``backend/testing/test_x.py``) or as a single pytest node id
+    (``backend/testing/test_x.py::test_one``). The node-id form exists for a
+    file whose OTHER tests need a database: registering the whole file would
+    drag a DB-dependent module into the ``--no-postgres`` standalone lane,
+    where it errors on a missing fixture rather than reporting drift. Every
+    on-disk check below operates on this file part.
+    """
+    return sentinel.split("::", 1)[0]
+
+
 def _sentinel_exists(sentinel: str, repo_root: str) -> bool:
     """Whether a registered sentinel exists on disk (harness-layout aware).
 
-    Checks ``<repo_root>/<sentinel>`` first (dev checkout / CI workspace). For
+    Checks ``<repo_root>/<file part>`` first (dev checkout / CI workspace). For
     the DEFAULT root only, also checks the sentinel as a sibling of this module:
     the Docker test harness copies the backend tree with testing/ next to app/
     and no enclosing backend/ directory. Hermetic fixture roots keep the strict
     repo_root-only check.
+
+    ``sentinel`` may carry a ``::node`` suffix; only its file part is probed,
+    so a node-id registration is subject to the same existence discipline as a
+    whole-file one and a vanished file still never selects.
     """
-    if os.path.isfile(os.path.join(repo_root, sentinel)):
+    rel = sentinel_file(sentinel)
+    if os.path.isfile(os.path.join(repo_root, rel)):
         return True
-    if repo_root == _DEFAULT_REPO_ROOT and sentinel.startswith("backend/testing/"):
+    if repo_root == _DEFAULT_REPO_ROOT and rel.startswith("backend/testing/"):
         sibling = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            sentinel[len("backend/testing/"):],
+            rel[len("backend/testing/"):],
         )
         return os.path.isfile(sibling)
     return False
+
+
+def surface_sentinels(changed_paths, repo_root: str) -> "set[str]":
+    """Public accessor for the drift sentinels a changed set selects.
+
+    Companion to :func:`load_surface_manifest` for the same reason: a
+    production script (``scripts/static_release_guard.py``) must be able to
+    name the sentinels a change activates without re-implementing the
+    glob-match + on-disk-existence discipline that drives the merge gate.
+    """
+    return _surface_sentinels(changed_paths, repo_root)
 
 
 def _surface_sentinels(changed_paths, repo_root: str) -> "set[str]":
@@ -527,6 +557,11 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     for sentinel in _surface_sentinels(changed_list, repo_root):
         if sentinel in emitted:
             continue
+        # A node-id sentinel collapses into a whole-file selection the earlier
+        # passes already made: running the file covers the node, and emitting
+        # both would run the module twice in one gate invocation.
+        if sentinel_file(sentinel) in emitted:
+            continue
         emitted.add(sentinel)
         ranked.append((MAX_HOPS + 1, 0, 0, 0, sentinel))
 
@@ -547,7 +582,15 @@ def resolve_impacted_partition(
     """
     changed_list = list(changed_paths)
     ranked = resolve_impacted(changed_list, repo_root)
-    mandatory_set = _surface_sentinels(changed_list, repo_root)
+    ranked_set = set(ranked)
+    mandatory_set: "set[str]" = set()
+    for sentinel in _surface_sentinels(changed_list, repo_root):
+        # A node-id sentinel that collapsed into its whole-file selection is
+        # still mandatory: carry the form that actually appears in ``ranked``
+        # so the collapse cannot demote a sentinel into the capped budget.
+        mandatory_set.add(
+            sentinel if sentinel in ranked_set else sentinel_file(sentinel)
+        )
     ordinary = [path for path in ranked if path not in mandatory_set]
     mandatory = [path for path in ranked if path in mandatory_set]
     return ordinary, mandatory

@@ -8,6 +8,7 @@ changed/added test file. These tests build a hermetic fixture tree under
 """
 
 import io
+import json
 import os
 
 import pytest
@@ -425,8 +426,13 @@ def test_live_surface_manifest_is_valid_and_registers_websocket_sentinel():
         for sentinel in sentinels:
             all_sentinels.add(sentinel)
             assert sentinel.startswith("backend/testing/"), sentinel
-            sibling = os.path.join(_here, sentinel[len("backend/testing/"):])
-            assert os.path.isfile(os.path.join(repo_root, sentinel)) or os.path.isfile(
+            # A sentinel may be registered as a pytest node id
+            # (``file.py::node``) when the rest of its module needs a database;
+            # the on-disk assertion applies to the FILE part, exactly as
+            # impacted_tests._sentinel_exists does.
+            rel = impacted_tests.sentinel_file(sentinel)
+            sibling = os.path.join(_here, rel[len("backend/testing/"):])
+            assert os.path.isfile(os.path.join(repo_root, rel)) or os.path.isfile(
                 sibling
             ), f"registered sentinel missing on disk: {sentinel}"
     assert "backend/testing/test_websocket_emitter_inventory.py" in all_sentinels, (
@@ -879,3 +885,193 @@ def test_live_redrive_change_ranks_finalize_qualification_test_in_top_cap(tmp_pa
     )
     assert target in ranked
     assert ranked.index(target) < 8
+
+
+def _repo_root_with(relative: str) -> "str | None":
+    """First checkout root that actually holds *relative*, else None.
+
+    Mirrors the resolution the sibling estate guards use: the Docker harness
+    bind-mounts the repo read-only at /repo while the backend tree is mounted
+    separately, so ``_DEFAULT_REPO_ROOT`` alone does not find repo-level files.
+    """
+    here = os.path.dirname(os.path.abspath(impacted_tests.__file__))
+    candidates = [
+        os.environ.get("BLUEPRINT_REPO_ROOT", ""),
+        "/repo",
+        impacted_tests._DEFAULT_REPO_ROOT,
+        os.path.normpath(os.path.join(here, "..", "..")),
+    ]
+    for root in candidates:
+        if root and os.path.isfile(os.path.join(root, relative)):
+            return root
+    return None
+
+
+def _standalone_roster(harness_text: str) -> "set[str]":
+    """Backend selectors in scripts/test-backend.sh's literal STANDALONE_ARGS.
+
+    Parsed from the harness source rather than by invoking
+    ``--standalone-inventory``: this assertion has to hold in the --noconftest,
+    Docker-less standalone lane, which cannot start the harness it is checking.
+    Only the literal ``testing/...`` entries are collected — the scripts/ and
+    infra/ rosters are glob-discovered and hold no drift sentinel.
+    """
+    marker = "STANDALONE_ARGS=("
+    start = harness_text.index(marker) + len(marker)
+    end = harness_text.index("\n    )", start)
+    return {
+        line.strip()
+        for line in harness_text[start:end].splitlines()
+        if line.strip().startswith("testing/")
+    }
+
+
+def _glob_probe(glob: str) -> str:
+    """A concrete path that the surface glob matches, for reachability tests."""
+    return glob.replace("**/", "probe/").replace("**", "probe").replace("*", "probe")
+
+
+def test_every_registered_sentinel_is_reachable_from_its_own_surface():
+    """A sentinel must actually RUN for a change that matches its surface glob.
+
+    Two lanes can run a registered sentinel:
+
+    * the backend-authoring lane, which resolves selectors only when the diff
+      contains a changed ``backend/*.py`` file; and
+    * the always-on attributed standalone corpus, whose roster is the fixed
+      ``STANDALONE_ARGS`` list in scripts/test-backend.sh.
+
+    So a sentinel registered for a surface that CANNOT contain a backend Python
+    file (admin-ui/, agent/, scripts/, a JSON/markdown artifact) is dead
+    registration unless the standalone roster carries it: nothing selects it,
+    and the drift it guards merges green until the promotion matrix — which has
+    no base to attribute against — surfaces every accumulated guard at once.
+    That is what happened on promotion PR #17738.
+    """
+    root = _repo_root_with("scripts/test-backend.sh")
+    if root is None:
+        pytest.skip("scripts/test-backend.sh not available in this layout")
+    with open(os.path.join(root, "scripts", "test-backend.sh"), encoding="utf-8") as fh:
+        roster = _standalone_roster(fh.read())
+    # Literal pin: a roster that parsed to nothing must not silently pass.
+    assert "testing/test_impacted_tests.py" in roster
+    manifest_path = os.path.join(
+        root, "backend", "testing", "drift_sentinel_surfaces.json"
+    )
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)["surfaces"]
+    unreachable: "list[str]" = []
+    for entry in manifest:
+        glob = entry["glob"]
+        probe = _glob_probe(glob)
+        if probe.startswith("backend/") and probe.endswith(".py"):
+            # The backend-authoring lane's resolver can select these.
+            continue
+        for sentinel in entry["sentinels"]:
+            harness_form = sentinel.split("backend/", 1)[-1]
+            if harness_form in roster:
+                continue
+            if impacted_tests.sentinel_file(harness_form) in roster:
+                continue
+            unreachable.append(f"{glob} -> {sentinel}")
+    assert not unreachable, (
+        "drift sentinels registered for a non-backend-Python surface but absent "
+        "from scripts/test-backend.sh STANDALONE_ARGS, so nothing runs them: "
+        + format_offender_marker(sorted(unreachable))
+    )
+
+
+def test_committed_manifest_registers_the_guards_that_failed_promotion_17738():
+    """Literal pin on the four registrations added after PR #17738.
+
+    Each of these guards protects a DERIVED artifact and was previously
+    unregistered, so the stale artifact reached the promotion matrix.
+    """
+    root = _repo_root_with("backend/testing/drift_sentinel_surfaces.json")
+    if root is None:
+        pytest.skip("surface manifest not available in this layout")
+    cases = {
+        "backend/app/recovery_evaluating_prless_hold.py": (
+            "backend/testing/test_operator_workbench_contracts.py"
+            "::test_websocket_emitter_inventory_covers_current_emitters"
+        ),
+        "backend/.test_durations": (
+            "backend/testing/test_test_durations_freshness.py"
+        ),
+        "test-estate-ranked-queue.md": (
+            "backend/testing/test_test_estate_ranked_queue.py"
+        ),
+        "backend/testing/conversational_workday_manifest.json": (
+            "backend/testing/test_conversational_workday_protection.py"
+        ),
+    }
+    for changed, sentinel in cases.items():
+        selected = impacted_tests.surface_sentinels([changed], root)
+        assert sentinel in selected, (
+            f"{changed} no longer selects {sentinel}; "
+            + format_offender_marker(sorted(selected))
+        )
+
+
+def test_node_id_sentinel_selects_and_reports_its_node(tmp_path):
+    """A ``file.py::node`` registration selects that exact node, not the file.
+
+    The node-id form exists for a guard whose sibling tests need a database:
+    registering the whole file would drag DB-dependent tests into the
+    --no-postgres standalone route, where they ERROR on a missing fixture
+    instead of reporting drift.
+    """
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(root, "backend/testing/test_guard.py", "def test_a():\n    pass\n")
+    _write(
+        root,
+        "backend/testing/drift_sentinel_surfaces.json",
+        '{"surfaces": [{"glob": "admin-ui/**", "sentinels": '
+        '["backend/testing/test_guard.py::test_a"]}]}',
+    )
+    ordinary, mandatory = impacted_tests.resolve_impacted_partition(
+        ["admin-ui/src/App.tsx"], root
+    )
+    assert mandatory == ["backend/testing/test_guard.py::test_a"]
+    assert ordinary == []
+
+
+def test_node_id_sentinel_existence_check_uses_the_file_part(tmp_path):
+    """A node id whose FILE is gone must not select — same discipline as a file."""
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(
+        root,
+        "backend/testing/drift_sentinel_surfaces.json",
+        '{"surfaces": [{"glob": "admin-ui/**", "sentinels": '
+        '["backend/testing/test_vanished.py::test_a"]}]}',
+    )
+    assert impacted_tests.surface_sentinels(["admin-ui/src/App.tsx"], root) == set()
+
+
+def test_node_id_sentinel_collapses_into_a_whole_file_selection(tmp_path):
+    """When the file is already selected, the node id must not be emitted too.
+
+    Emitting both would run the module twice in a single gate invocation, and
+    would also let the collapse demote the sentinel out of the mandatory
+    partition into the capped ordinary budget.
+    """
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(
+        root,
+        "backend/testing/test_guard.py",
+        "from app.foo import bar\n\n\ndef test_a():\n    assert bar() == 1\n",
+    )
+    _write(
+        root,
+        "backend/testing/drift_sentinel_surfaces.json",
+        '{"surfaces": [{"glob": "backend/app/**/*.py", "sentinels": '
+        '["backend/testing/test_guard.py::test_a"]}]}',
+    )
+    ordinary, mandatory = impacted_tests.resolve_impacted_partition(
+        ["backend/app/foo.py"], root
+    )
+    assert mandatory == ["backend/testing/test_guard.py"]
+    assert ordinary == []

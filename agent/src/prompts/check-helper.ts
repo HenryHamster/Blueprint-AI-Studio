@@ -71,6 +71,33 @@ function loadSizeGuardrailScript(): string {
   }
 }
 
+const _STATIC_RELEASE_GUARD_PATH = path.join(_CHECK_HELPER_DIR, 'check_static_release_guard.sh');
+// Like the size guardrail (and unlike the OPTIONAL blocks above), the
+// attributed static corpus is an ALWAYS-ON gate: a missing/unreadable fragment
+// must fail ./check closed, not silently emit a gate whose drift sentinels
+// never run.
+function loadStaticReleaseGuardScript(): string {
+  try { return readShellFragment(_STATIC_RELEASE_GUARD_PATH); } catch {
+    return '\necho "[check] static release guard fragment missing from agent build \u2014 failing closed"\nFAILED+=("static release guard")\n';
+  }
+}
+
+/** Emit the always-on attributed standalone-static-corpus lane.
+ *
+ *  Blueprint self-repo only: the corpus is Blueprint's own roster, and the
+ *  guard's path scoping is written against Blueprint's tree. It is emitted
+ *  OUTSIDE the stack blocks for the same reason the size guardrail is — it is a
+ *  repo invariant, not a property of any one stack — and, critically, because
+ *  the drift sentinels it carries guard admin-ui/, agent/ and scripts/ surfaces
+ *  that a `touches backend/` gate can never reach. Resolved build_config
+ *  directories select the config-driven stack blocks, which never contained
+ *  this lane at all, so hoisting also closes that second hole. */
+function buildStaticReleaseGuardBlock(cfg: CodeChangeHelperConfig, isSelfRepo: boolean): string {
+  if (!isSelfRepo) return '';
+  return loadStaticReleaseGuardScript()
+    .replace(/@MERGE_GATE@/g, shouldRunBackendMergeGate(cfg) ? '1' : '0');
+}
+
 /** Emit the ci_failure closed-loop verify block for the generated ./check.
  *
  *  For a ci_failure fix task we know the EXACT pytest node-ids CI reported
@@ -649,23 +676,12 @@ if touches backend/; then
   else
     echo "[check] ruff not installed, skipping backend lint"
   fi
-  if [ "$WITH_TESTS" = "1" ] && [ "${shouldRunBackendMergeGate(cfg) ? '1' : '0'}" = "1" ]; then
-    # --standalone --no-postgres: agent VM is e2-standard-2 (8 GB) and
-    # cannot fit Docker build + Postgres sidecar + full pytest suite +
-    # agent + Claude subprocess in memory. The full suite OOMs (exit
-    # 137) during the mandatory pre-PR gate (53ef061b, b150b4d6, b15b6813
-    # all died this way 2026-05-05). Standalone runs the ~10-file
-    # invariant set (security, pipeline, invariants, audit-finding-class,
-    # admin-auth, metric-manifest + emitter-inventory contracts) which
-    # catches file-size breaches, security regressions, and basic pipeline
-    # and contract assertions — the rest is CI's job.
-    # The shared static guard runs the same corpus on the task and base trees,
-    # then attributes failures by structured route/test/failure-kind identity.
-    # It must remain the single baseline decision point: a non-zero base run
-    # does not waive unrelated failures introduced by this task.
-    run "backend pytest (attributed)" python3 scripts/static_release_guard.py \
-      --corpus-only --base "$BASE" --repo-root "$WORKSPACE"
-  fi
+  # The attributed standalone static corpus used to live here. It is now an
+  # always-on lane emitted outside every stack block (see
+  # buildStaticReleaseGuardBlock / check_static_release_guard.sh): gating it on
+  # "touches backend/" made every drift sentinel registered for an admin-ui/,
+  # agent/ or scripts/ surface dead code in this gate.
+
   # Fast migration-chain guard: no DB, no Docker, sub-second. Runs only
   # when at least one alembic/versions/ file was added or changed.
   if printf '%s\\n' "$CHANGED" | grep -q '^backend/alembic/versions/.*\\.py$'; then
@@ -695,10 +711,12 @@ ${buildCiFailureVerifyBlock(ciFailureSelectors, cfg.taskId)}
   } else {
     stackBlocks = genericNoConfigStackBlock(cfg.owner, cfg.repo);
   }
-  // The size guardrail is a Blueprint self-repo invariant, not a property of
-  // the hardcoded stack blocks. Resolved build_config directories select the
-  // config-driven stack above, so keep this always-on lane outside that branch
-  // or a self-repo task silently loses its cap enforcement.
+  // The attributed static corpus and the size guardrail are Blueprint
+  // self-repo invariants, not properties of the hardcoded stack blocks.
+  // Resolved build_config directories select the config-driven stack above, so
+  // keep these always-on lanes outside that branch or a self-repo task
+  // silently loses its cap enforcement and every drift sentinel it carries.
+  const staticReleaseGuardBlock = buildStaticReleaseGuardBlock(cfg, isSelfRepo);
   const sizeGuardrailBlock = isSelfRepo ? loadSizeGuardrailScript() : '';
   // Success-path visual-acceptance capture+upload. Keyed to capability signal
   // rather than generated-string identity: can this stack actually capture
@@ -738,7 +756,7 @@ else
   exit 1
 fi
 `;
-  const script = header + stackBlocks + buildRequiredBackendVerificationBlock(cfg) + sizeGuardrailBlock + visualCaptureBlock + footer;
+  const script = header + stackBlocks + staticReleaseGuardBlock + buildRequiredBackendVerificationBlock(cfg) + sizeGuardrailBlock + visualCaptureBlock + footer;
   // For Blueprint self-repo, `check` is a committed static entrypoint that
   // delegates to `.check-task` when present. Write the per-task generated
   // script there (gitignored) so the tracked `check` file stays clean and

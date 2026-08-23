@@ -23,6 +23,35 @@ logger = logging.getLogger(__name__)
 # bookkeeping, not the diff, so no commit fixes it and no reviewer refutes it.
 LEDGER_PROOF_INCOMPLETE_ISSUE_ID = "BP-ledger-proof-incomplete"
 
+# How many exact-target reviews this gate may spawn for ONE immutable
+# ``(base_sha, head_sha)`` pair before it stops asking and hands the PR to an
+# operator.
+#
+# Re-reviewing the same target is legitimate once or twice: the binding
+# blocker set is accumulated across review rows, so a later reviewer can
+# refute an earlier reviewer's finding and move it out of ``open``.  What is
+# never legitimate is doing it without end.  With the head pinned, every spawn
+# reads the identical diff; if this many independent adjudications of that
+# diff have not cleared the ledger, the next one will not either, and the only
+# thing still changing is the runner slot it occupies.
+#
+# The measured defect this bounds: PR #17693 took 441 exact-target review
+# spawns over 9.5 hours -- one every ~66 seconds, continuously occupying one
+# of three fleet runners -- and no cap fired.  The per-chain iteration cap
+# counts actioned *generations*, and ``actioned_review_cap_tasks`` collapses
+# every same-target review into a single generation, so ``chain_iterations``
+# stayed at 1 forever.  That collapsing is correct for what the cap measures;
+# it simply means the cap is not, and cannot be, the counter that bounds
+# same-target respawn.  This is.
+_EXACT_TARGET_REVIEW_SPAWN_BUDGET = 5
+
+# Both live on ``review_loop``.  The target key is stored alongside the count
+# so the budget is scoped to one immutable target rather than to the task: a
+# fix commit or a base refresh mints a new key and restores the full budget,
+# which is why a healthy loop can never reach the cap.
+_SPAWN_BUDGET_TARGET_KEY = "authoritative_review_spawn_target"
+_SPAWN_BUDGET_COUNT_KEY = "authoritative_review_spawns"
+
 
 def review_target_matches_merge_identity(
     review_target: dict[str, str | int] | None,
@@ -228,6 +257,75 @@ async def _enforce_authoritative_review_merge_gate(
         )
         return False
 
+    # Bound the exact-target respawn.  Keyed on the immutable target, so the
+    # only thing this can ever stop is a loop in which nothing is moving:
+    # any real forward motion mints a new key and restores the whole budget.
+    spawn_target_key = f"{live_base}:{live_head}"
+    try:
+        prior_spawns = int(gated_loop.get(_SPAWN_BUDGET_COUNT_KEY) or 0)
+    except (TypeError, ValueError):
+        prior_spawns = 0
+    if str(gated_loop.get(_SPAWN_BUDGET_TARGET_KEY) or "") != spawn_target_key:
+        prior_spawns = 0
+    if (
+        target_identity_is_exact
+        and prior_spawns >= _EXACT_TARGET_REVIEW_SPAWN_BUDGET
+    ):
+        gated_loop[_SPAWN_BUDGET_TARGET_KEY] = spawn_target_key
+        gated_loop[_SPAWN_BUDGET_COUNT_KEY] = prior_spawns
+        task.context = {
+            **source_context,
+            "review_loop": gated_loop,
+            REVIEW_LOOP_ABANDON_CANDIDATE_KEY: {
+                "status": "abandon_candidate",
+                "reason": "exact_target_review_budget_exhausted",
+                "scope": "exact-target-review",
+                "pr_number": pr_number,
+                "detail": (
+                    f"The merge gate has already spawned {prior_spawns} "
+                    "exact-target review(s) for the immutable target "
+                    f"{live_base[:8]}..{live_head[:8]} and the binding blocker "
+                    "ledger is still not clear. The head has not moved, so "
+                    "every further review reads the identical diff and can "
+                    "only re-derive the same verdict. An operator must "
+                    "adjudicate the open blockers, or a fix must land a "
+                    "commit -- which mints a new target and restores the "
+                    "budget on its own."
+                ),
+                "open_issue_ids": [
+                    str(blocker.get("issue_id") or "")
+                    for blocker in open_blockers
+                    if isinstance(blocker, dict)
+                ],
+                "review_history_entries": len(history),
+                "spawned_reviews": prior_spawns,
+                "review_target": {
+                    "base_sha": live_base,
+                    "head_sha": live_head,
+                },
+                "recorded_at": _utcnow().isoformat(),
+            },
+        }
+        flag_modified(task, "context")
+        task.latest_status_message = (
+            f"Merge held for PR #{pr_number}: {prior_spawns} exact-target "
+            "reviews of an unchanged head have not cleared "
+            f"{len(open_blockers)} binding blocker(s); no further review can "
+            "read a different diff. Operator adjudication required."
+        )
+        session.add(task)
+        logger.error(
+            "[CI] Merge held for PR #%s: exact-target review budget exhausted "
+            "(%d spawns at %s..%s, %d open blocker(s)); suppressed the "
+            "respawn and escalated to operator adjudication",
+            pr_number,
+            prior_spawns,
+            live_base[:8],
+            live_head[:8],
+            len(open_blockers),
+        )
+        return False
+
     review_task_id = ""
     if target_identity_is_exact:
         review_task, _created = await _spawn_pipeline_task(
@@ -243,6 +341,14 @@ async def _enforce_authoritative_review_merge_gate(
         )
         if review_task is not None:
             review_task_id = str(review_task.id)
+        if _created:
+            # Only a genuinely NEW task spends budget. While one spawned
+            # review is still in flight the gate keeps calling this on every
+            # CI tick and ``_spawn_pipeline_task`` hands back the same active
+            # row; charging those would burn the whole budget in five minutes
+            # against a single review that had not even reported yet.
+            gated_loop[_SPAWN_BUDGET_TARGET_KEY] = spawn_target_key
+            gated_loop[_SPAWN_BUDGET_COUNT_KEY] = prior_spawns + 1
 
     post_spawn_context = task.__dict__.get("context")
     refreshed_task = (

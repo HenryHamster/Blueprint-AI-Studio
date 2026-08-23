@@ -44,9 +44,25 @@ from app.models import Project
 
 logger = logging.getLogger(__name__)
 
-# A named repair commit must be a full 40-hex SHA: an abbreviated or symbolic ref
-# is ambiguous, and this value selects what gets DEPLOYED.
-_REPAIR_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+# A named repair commit is RESOLVED to its canonical full 40-hex sha before it is
+# used (:mod:`app.github_commit_resolution`).  Rejecting an abbreviated sha handed
+# the operator back a lookup the engine can perform itself — it holds the token,
+# the owner and the repo, and a human types what ``git log`` prints.  The
+# fail-closed property is untouched: "ambiguous" was only ever true of a prefix
+# matching more than one object, and such a prefix — like an unknown ref — still
+# fails resolution and is still REJECTED, now carrying GitHub's own words.
+#
+# What is still refused by SHAPE, before any lookup, is a SYMBOLIC ref.
+# ``GET /repos/{owner}/{repo}/commits/{ref}`` happily resolves ``main``, ``HEAD``
+# or a tag, and this value selects what gets DEPLOYED — a moving name resolves to
+# whatever it points at in the instant the request lands, which is not a repair
+# the operator can be said to have named.  A hex prefix names one object; a
+# branch names a position.  Only the former is admitted here.
+#
+# The 7-character floor is git's own default abbreviation length: shorter
+# prefixes collide often enough that resolution succeeding is not evidence the
+# operator meant that commit.
+_REPAIR_REF_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 # The lane ships a SURGICAL repair.  A request naming more commits than this is
 # not a surgical repair; route it through the full gate.
@@ -115,7 +131,22 @@ async def _union_repair_diff(
 
 
 def _validate_repair_commit_shas(repair_commit_shas: list[str]) -> str | None:
-    """Return a rejection reason for a malformed commit list, else ``None``."""
+    """Return a rejection reason for a malformed commit list, else ``None``.
+
+    Pure and network-free — only what can be judged from the operator's RAW
+    list: the count cap, and the hex-prefix shape that keeps a symbolic ref out
+    of a lane that selects what deploys (see :data:`_REPAIR_REF_RE`).  Whether a
+    well-shaped prefix actually names one reachable commit is GitHub's answer,
+    not this function's.  The count cap is deliberately applied HERE, BEFORE
+    resolution, for two
+    reasons.  (1) The cap bounds the work this owner-only lever may ask for, so a
+    500-entry list must be refused without first spending 500 GitHub round-trips.
+    (2) Two different abbreviations can name the SAME commit, so resolution is
+    followed by a dedup that can only SHRINK the list; capping the raw list is
+    therefore the strictly stricter ordering, and a list over the cap only
+    because the operator named one commit twice is still refused rather than
+    admitted on an accident of how it was typed.
+    """
     if not repair_commit_shas:
         return "no repair commits named — nothing to materialize (fail-closed)"
     if len(repair_commit_shas) > MAX_REPAIR_COMMITS:
@@ -124,13 +155,68 @@ def _validate_repair_commit_shas(repair_commit_shas: list[str]) -> str | None:
             f"{MAX_REPAIR_COMMITS}) — that is not a surgical repair; route it "
             "through the full gate"
         )
-    bad = [s for s in repair_commit_shas if not _REPAIR_SHA_RE.match(s or "")]
+    bad = [s for s in repair_commit_shas if not _REPAIR_REF_RE.match(s or "")]
     if bad:
         return (
-            "repair commits must be full 40-hex SHAs (an abbreviated or symbolic "
-            f"ref is ambiguous about what deploys): {bad}"
+            "repair commits must be hex commit shas, 7 to 40 characters (a "
+            "branch, tag or other symbolic ref names a moving position, not a "
+            f"repair): {bad}"
         )
     return None
+
+
+async def _resolve_repair_commit_shas(
+    token: str,
+    owner: str,
+    repo: str,
+    repair_commit_shas: list[str],
+    *,
+    project_id: str | None = None,
+) -> tuple[list[str] | None, str | None, str]:
+    """Resolve every named repair ref to its canonical full 40-hex sha.
+
+    Returns ``(resolved, reason, status)``.  On success ``reason`` is ``None``
+    and ``resolved`` is the DEDUPLICATED canonical list in first-appearance
+    order: two abbreviations of one commit (or an abbreviation plus its own full
+    sha) collapse to a single entry, so the commit message, the audit trail and
+    the content-ref default never name the same repair twice.
+
+    A ref GitHub cannot resolve — unknown, or a prefix matching more than one
+    object — is still REJECTED, and the reason carries the resolver's own
+    ``detail`` (which quotes GitHub's message) instead of a generic string.  That
+    is an operator error, so it stays ``scope_rejected``, the same status the
+    old shape-only refusal used.  Anything else (a transport failure, a
+    malformed GitHub answer) is INDETERMINATE rather than a verdict, so it
+    degrades to ``diff_unavailable`` — an unresolvable lookup must never read as
+    "the operator named a bad commit".
+    """
+    resolved: list[str] = []
+    for ref in repair_commit_shas:
+        try:
+            full = await github.resolve_commit_sha(
+                token, owner, repo, ref, project_id=project_id
+            )
+        except Exception as exc:  # noqa: BLE001 — an unresolvable ref IS operator error
+            detail = getattr(exc, "detail", None)
+            operator_error = getattr(exc, "status_code", None) == 400
+            logger.warning(
+                "[HOTFIX_NARROW] could not resolve repair ref %r on %s/%s: %s",
+                ref,
+                owner,
+                repo,
+                detail or exception_reason(exc),
+            )
+            return (
+                None,
+                (
+                    f"repair commit {ref!r} could not be resolved to a full "
+                    f"commit sha: {detail or exception_reason(exc)}"
+                ),
+                "scope_rejected" if operator_error else "diff_unavailable",
+            )
+        if full not in resolved:
+            resolved.append(full)
+    return resolved, None, "eligible"
 
 
 async def narrow_repair_scope(
@@ -144,8 +230,13 @@ async def narrow_repair_scope(
     """Scope-check the NAMED repair commits' own diffs (no mutation).
 
     Returns ``{"status": "eligible"|"scope_rejected"|"diff_unavailable",
-    "changed_files", "offending_files", "reason", "entries"}``.  ``entries`` is
-    the union compare payload, carried so the caller does not re-fetch it.
+    "changed_files", "offending_files", "reason", "entries",
+    "repair_commit_shas"}``.  ``entries`` is the union compare payload, carried
+    so the caller does not re-fetch it.  ``repair_commit_shas`` is the CANONICAL
+    resolved list — carried out so that the diff, the materialized commit, the
+    audit trail and the operator echo all key off the same verified shas instead
+    of re-deriving from the operator's raw input (a split brain in which the
+    engine verifies one string and records another).
     """
     reason = _validate_repair_commit_shas(repair_commit_shas)
     if reason is not None:
@@ -155,9 +246,24 @@ async def narrow_repair_scope(
             "offending_files": [],
             "reason": reason,
             "entries": [],
+            "repair_commit_shas": [],
+        }
+    # Resolve BEFORE the scope check: what gets diffed, shipped and audited must
+    # be the canonical commit, not whatever prefix the operator happened to type.
+    resolved_shas, reason, status = await _resolve_repair_commit_shas(
+        token, owner, repo, repair_commit_shas, project_id=project_id
+    )
+    if resolved_shas is None:
+        return {
+            "status": status,
+            "changed_files": [],
+            "offending_files": [],
+            "reason": reason,
+            "entries": [],
+            "repair_commit_shas": [],
         }
     entries = await _union_repair_diff(
-        token, owner, repo, repair_commit_shas, project_id=project_id
+        token, owner, repo, resolved_shas, project_id=project_id
     )
     if entries is None:
         return {
@@ -169,6 +275,7 @@ async def narrow_repair_scope(
                 "(GitHub compare failed) — refusing fail-closed"
             ),
             "entries": [],
+            "repair_commit_shas": resolved_shas,
         }
     verdict = _scope_verdict_for_entries(entries)
     return {
@@ -177,6 +284,7 @@ async def narrow_repair_scope(
         "offending_files": verdict.offending_files,
         "reason": verdict.reason,
         "entries": entries,
+        "repair_commit_shas": resolved_shas,
     }
 
 
@@ -258,10 +366,13 @@ async def materialize_narrow_hotfix_candidate(
 ) -> dict[str, Any]:
     """Build a machinery-only candidate commit on top of ``prior_deployed_sha``.
 
-    Steps: union the named commits' own diffs -> run the unmodified fail-closed
-    scope check -> reuse each surviving path's blob at ``content_ref`` (default:
-    the LAST named repair commit) -> create ONE commit parented on
-    ``prior_deployed_sha``.  No ref is created or moved.
+    Steps: resolve each named ref to its canonical full sha -> union those
+    commits' own diffs -> run the unmodified fail-closed scope check -> reuse
+    each surviving path's blob at ``content_ref`` (default: the LAST named repair
+    commit, canonicalized) -> create ONE commit parented on
+    ``prior_deployed_sha``.  No ref is created or moved.  The returned
+    ``repair_commit_shas`` are the CANONICAL ones, so the caller's audit trail
+    records what was verified rather than what was typed.
 
     Returns one of::
 
@@ -282,8 +393,12 @@ async def materialize_narrow_hotfix_candidate(
             "offending_files": scope["offending_files"],
             "changed_files": scope["changed_files"],
             "reason": scope["reason"],
+            "repair_commit_shas": scope["repair_commit_shas"],
         }
-    source_ref = content_ref or repair_commit_shas[-1]
+    # From here on ONLY the canonical shas the scope check actually verified are
+    # used — the content ref, the commit message and the returned provenance.
+    resolved_shas: list[str] = scope["repair_commit_shas"]
+    source_ref = content_ref or resolved_shas[-1]
     paths = scope["changed_files"]
     tree_entries = await _tree_entries_for_paths(
         token,
@@ -316,7 +431,7 @@ async def materialize_narrow_hotfix_candidate(
         }
     message = (
         "hotfix: narrow release-machinery candidate\n\n"
-        f"Materialized from repair commit(s) {', '.join(repair_commit_shas)} "
+        f"Materialized from repair commit(s) {', '.join(resolved_shas)} "
         f"on top of {prior_deployed_sha[:12]}.\n"
         f"Paths: {', '.join(paths)}"
     )
@@ -357,7 +472,7 @@ async def materialize_narrow_hotfix_candidate(
         owner,
         repo,
         prior_deployed_sha[:12],
-        [s[:8] for s in repair_commit_shas],
+        [s[:8] for s in resolved_shas],
         paths,
     )
     return {
@@ -366,7 +481,7 @@ async def materialize_narrow_hotfix_candidate(
         "changed_files": paths,
         "offending_files": [],
         "content_ref": source_ref,
-        "repair_commit_shas": list(repair_commit_shas),
+        "repair_commit_shas": list(resolved_shas),
         "reason": "all named repair commits are allowlisted release machinery",
     }
 
@@ -390,7 +505,9 @@ async def check_hotfix_scope_preview(
       ``reason``         — human-readable verdict string (present on success)
       ``candidate_sha``  — resolved candidate SHA (present on success)
       ``prior_deployed_sha`` — promotion-target HEAD SHA (present on success)
-      ``repair_commit_shas`` — echo of the named repair commits (narrow mode)
+      ``repair_commit_shas`` — the CANONICAL (resolved) repair commits in
+                           narrow mode; the operator's raw input when nothing
+                           could be resolved
 
     With ``repair_commit_shas`` the preview evaluates the NARROW path: the union
     of those commits' own diffs, i.e. exactly what ``POST /promote/hotfix`` would
@@ -434,6 +551,9 @@ async def check_hotfix_scope_preview(
         scope = await narrow_repair_scope(
             token, owner, repo, list(repair_commit_shas), project_id=str(project_id)
         )
+        # Echo the CANONICAL shas so the preview shows what would actually ship;
+        # fall back to the raw input only when resolution never produced any.
+        echo_shas = list(scope["repair_commit_shas"] or repair_commit_shas)
         if scope["status"] == "diff_unavailable":
             return {
                 "status": "diff_unavailable",
@@ -443,7 +563,7 @@ async def check_hotfix_scope_preview(
                 "reason": scope["reason"],
                 "candidate_sha": candidate_sha,
                 "prior_deployed_sha": prior_deployed_sha,
-                "repair_commit_shas": list(repair_commit_shas),
+                "repair_commit_shas": echo_shas,
             }
         eligible = scope["status"] == "eligible"
         return {
@@ -454,7 +574,7 @@ async def check_hotfix_scope_preview(
             "reason": scope["reason"],
             "candidate_sha": candidate_sha,
             "prior_deployed_sha": prior_deployed_sha,
-            "repair_commit_shas": list(repair_commit_shas),
+            "repair_commit_shas": echo_shas,
         }
 
     from app import github_refs

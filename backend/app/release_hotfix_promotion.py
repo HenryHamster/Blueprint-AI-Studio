@@ -419,6 +419,10 @@ async def hotfix_promote_current_version(
         # narrow object; resolve it against that content source.
         ci_ref = narrow["content_ref"]
         candidate_sha = narrow["candidate_sha"]
+        # Adopt the CANONICAL repair shas the narrow lane resolved and verified,
+        # so the persisted qualification, the completion debt and the operator
+        # Alert record what actually shipped — never the abbreviation typed.
+        _repair_shas = list(narrow.get("repair_commit_shas") or _repair_shas)
 
     # Compute the candidate's ACTUAL changed files (a GitHub compare) — the WHOLE
     # safety of the lane.  NEVER trust the operator-declared scope_modules as the

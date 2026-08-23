@@ -252,9 +252,17 @@ async def _handle_approval_gate_timeout(
         # later). A merged rollup is a SUCCESS: reconcile to COMPLETED via the
         # canonical rollup-merge path (never classify_failure/record_task_result/
         # failure alert).
-        _merged_pr_num = ctx.get("rollup_pr_number") or (task.first_payload or {}).get(
-            "pr_number"
-        )
+        # Derived through the WIDE accessor, same as the PR-less predicate
+        # below. These preserve/reconcile paths used to read only
+        # ``rollup_pr_number or first_payload.pr_number``, so a task whose PR
+        # identity lived only at ``context.review_loop.pr_number`` (every
+        # ``arm_ci_wait`` co-stamps it there; see ci_merge_helpers.
+        # effective_pr_number for the identity split-brain this mirrors) was
+        # invisible to all three of them. Worse than "no preserve": the wide
+        # predicate at the PR-less branch DID see that number, so the PR-less
+        # hold declined too, and the row fell through BOTH safety nets to
+        # FAILED with no hold at all. One derivation, so they agree.
+        _merged_pr_num = _approval_hold_pr_number(task, ctx)
         if _merged_pr_num:
             _merged_pr_data = None
             try:
@@ -405,9 +413,7 @@ async def _handle_approval_gate_timeout(
         # the preserve flag so re-entering sweeps are idempotent (no repeat
         # alerts). Broken/conflicted/non-rollup PRs fall through to FAILED.
         if not ctx.get("approval_timeout_preserved_for_handmerge"):
-            _pr_num = ctx.get("rollup_pr_number") or (task.first_payload or {}).get(
-                "pr_number"
-            )
+            _pr_num = _approval_hold_pr_number(task, ctx)
             if _pr_num:
                 from app.review_loop_convergence import (
                     _PreservabilityUnavailable,
@@ -579,9 +585,7 @@ async def _respawn_review_after_churn_halt(task, session) -> bool:
     from app.review_loop_convergence import clear_review_escalation_approval_gate
 
     ctx = dict(task.context or {})
-    pr_number = ctx.get("rollup_pr_number") or (task.first_payload or {}).get(
-        "pr_number"
-    )
+    pr_number = _approval_hold_pr_number(task, ctx)
     if not pr_number:
         logger.info(
             f"[EVAL TIMEOUT approval-gate] Task {str(task.id)[:8]}: no "

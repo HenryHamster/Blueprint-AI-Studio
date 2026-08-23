@@ -1046,6 +1046,143 @@ describe('handleReview — emits changed_files for downstream drift detection', 
   });
 });
 
+// ── handleReview: delta mode must not mistake its evidence range for the PR ──
+describe('handleReview — delta mode reports the PR file set, not the delta range', () => {
+  const priorHead = 'c'.repeat(40);
+
+  // `git diff --name-status <delta>..HEAD` — the review's evidence range.
+  const mockDelta = (files: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return files.map(f => `M\t${f}`).join('\n');
+      }
+      return '';
+    });
+  };
+
+  // GitHub's PR file list — the PR's net base..head change. `null` = the call
+  // failed, which is the fail-closed path.
+  const mockPrFiles = (prFiles: string[] | null) => {
+    global.fetch = vi.fn().mockImplementation((url: unknown) => {
+      if (String(url).includes('/files')) {
+        return Promise.resolve(
+          prFiles === null
+            ? { ok: false, json: () => Promise.resolve([]) }
+            : { ok: true, json: () => Promise.resolve(prFiles.map(filename => ({ filename }))) },
+        );
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ title: 'PR title', body: 'PR body' }) });
+    });
+  };
+
+  const runDeltaReview = (taskId: string, prNumber: number) => handleReview(
+    taskId,
+    { pr_number: prNumber, branch: 'plan/x', base_branch: 'main', delta_base_sha: priorHead },
+    { context: { scope: 'medium', review_loop: { iteration: 5 } } },
+    'gh-token', 'owner', 'repo', null, statusRef(),
+  );
+
+  const lastChangedFiles = () => {
+    const calls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
+    return (calls[calls.length - 1][1] as { changed_files?: string[] }).changed_files;
+  };
+
+  it('sends the PR net file set as changed_files, never the delta-only slice', async () => {
+    mockDelta(['backend/app/alert_dispatch.py']);
+    mockPrFiles([
+      'backend/app/alert_dispatch.py',
+      'backend/app/alert_policy.py',
+      'backend/testing/test_alert_policy.py',
+    ]);
+
+    await runDeltaReview('task-delta-scope', 17690);
+
+    // The backend stamps whatever we send as `_pr_changed_files`, which feeds
+    // `_pr_changed_files_has_test` for the acceptance classifier and
+    // `drift_out` for the next fix prompt. Sending the one-file delta would
+    // assert "this PR ships no tests" and "2 files disappeared" — both false,
+    // and neither clearable by any commit the fix agent can make.
+    expect(lastChangedFiles()).toEqual([
+      'backend/app/alert_dispatch.py',
+      'backend/app/alert_policy.py',
+      'backend/testing/test_alert_policy.py',
+    ]);
+  });
+
+  it('omits changed_files rather than overwrite the PR snapshot when GitHub does not answer', async () => {
+    mockDelta(['backend/app/alert_dispatch.py']);
+    mockPrFiles(null);
+
+    await runDeltaReview('task-delta-scope-nogh', 17691);
+
+    // Fail closed. A stale-but-whole `_pr_changed_files` is recoverable; the
+    // delta range written over it manufactures drift for every file this one
+    // fix happened not to touch.
+    expect(lastChangedFiles()).toBeUndefined();
+  });
+
+  it('names the delta files that are NOT in the PR net diff so a scope-creep removal is not re-flagged', async () => {
+    // PR #17690's livelock: iteration 3 flagged scripts/local_runner.py as
+    // scope creep, the fix reverted it to base state, and the delta-scoped
+    // iteration-5 reviewer saw the file in the delta and re-raised the
+    // identical finding. The file is not in the PR's net diff at all.
+    mockDelta(['scripts/local_runner.py', 'backend/app/alert_dispatch.py']);
+    mockPrFiles(['backend/app/alert_dispatch.py']);
+
+    await runDeltaReview('task-delta-scope-creep', 17692);
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('**Authoritative PR scope.**');
+    expect(prompt).toContain("this PR's net change is these 1 file(s)");
+    expect(prompt).toContain('also touches 1 file(s) that are NOT in that net diff');
+    expect(prompt).toContain('  - scripts/local_runner.py');
+    expect(prompt).toContain('that is the requested fix landing, not a repeat of the offense');
+  });
+
+  it('states plainly when the delta is fully inside the net diff, rather than staying silent', async () => {
+    mockDelta(['backend/app/alert_dispatch.py']);
+    mockPrFiles(['backend/app/alert_dispatch.py', 'backend/app/alert_policy.py']);
+
+    await runDeltaReview('task-delta-scope-clean', 17693);
+
+    expect(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0])
+      .toContain('Every file in the delta range is part of that net diff.');
+  });
+
+  it('refuses to suppress findings from a possibly-truncated GitHub page', async () => {
+    // Exactly one full page back: there may be more. Treating a short list as
+    // complete would mark genuinely in-scope files "not in the net diff" —
+    // the one direction of error that hides real findings.
+    mockDelta(['scripts/local_runner.py']);
+    mockPrFiles(Array.from({ length: 100 }, (_, i) => `src/f${i}.ts`));
+
+    await runDeltaReview('task-delta-scope-truncated', 17694);
+
+    expect(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0])
+      .not.toContain('**Authoritative PR scope.**');
+    // The file list is still a better `_pr_changed_files` than the delta.
+    expect(lastChangedFiles()).toHaveLength(100);
+  });
+
+  it('does not consult the GitHub file list in full-PR mode', async () => {
+    // A full review already diffs origin/<base>...HEAD, which IS the net
+    // change. Spending an API call there would be pure overhead.
+    mockDelta(['backend/app/main.py']);
+    mockPrFiles(['zzz/should-not-be-used.py']);
+
+    await handleReview(
+      'task-full-scope',
+      { pr_number: 700, branch: 'feat/full', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const urls = vi.mocked(global.fetch).mock.calls.map(c => String(c[0]));
+    expect(urls.some(u => u.includes('/files'))).toBe(false);
+    expect(lastChangedFiles()).toEqual(['backend/app/main.py']);
+  });
+});
+
 // ── handleReview: planned-files classifier (four-category parity) ───────────
 describe('handleReview — unplanned-file four-category classifier', () => {
   it('replaces the old "flag as MAJOR unless directly necessary" line with the four-category classifier when planned files are configured and the diff contains an unplanned non-test file', async () => {

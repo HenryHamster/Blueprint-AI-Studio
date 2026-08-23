@@ -43,7 +43,11 @@ from verification_receipt import (  # noqa: E402
     LANE_STATIC_CORPUS,
     record_lane as record_verification_lane,
 )
-from testing.impacted_tests import load_surface_manifest
+from testing.impacted_tests import (  # noqa: E402
+    load_surface_manifest,
+    sentinel_file,
+    surface_sentinels,
+)
 from app.size_limit_policy import SECTION_PATH_PREFIXES
 
 MANIFEST_PATH = (
@@ -135,6 +139,96 @@ def _is_static_scope(path: str, repo_root: str = _REPO_ROOT) -> bool:
         if regex.match(normalized):
             return True
     return False
+
+
+# Repair command for each drift sentinel whose failure means a DERIVED
+# artifact is stale rather than that the code under test is wrong. A stale
+# artifact is the single most common way a drift sentinel goes red, and the
+# failure text alone names the mismatch, not the regenerator — so the operator
+# is left to grep for it. Surfacing the exact command here is the difference
+# between a two-minute fix and the hand-repair PR that #17738 needed.
+SENTINEL_REPAIR_COMMANDS: dict[str, str] = {
+    "backend/testing/test_websocket_emitter_inventory.py": (
+        "python backend/testing/regen_emitter_inventory.py --fix"
+    ),
+    "backend/testing/test_operator_workbench_contracts.py": (
+        "python backend/testing/regen_emitter_inventory.py --fix, then mirror the "
+        "same paths into WEBSOCKET_EMITTER_INVENTORY in "
+        "backend/app/workbench_contracts.py (the two inventories are kept by hand "
+        "and drift independently)"
+    ),
+    "backend/testing/test_test_estate_ranked_queue.py": (
+        "python3 scripts/generate_test_estate_ranked_queue.py --write"
+    ),
+    "backend/testing/test_test_durations_freshness.py": (
+        "regenerate backend/.test_durations from a full timed run "
+        "(scripts/durations_quality.py describes the accepted shape)"
+    ),
+    "backend/testing/test_conversational_workday_protection.py": (
+        "update the per-file test_count entries in "
+        "backend/testing/conversational_workday_manifest.json to the counts the "
+        "failure names"
+    ),
+    "backend/testing/test_vitest_durations_freshness.py": (
+        "regenerate admin-ui/.test_durations.json / agent/.test_durations.json "
+        "from a full timed vitest run"
+    ),
+    "backend/testing/test_event_type_invariants.py": (
+        "update backend/testing/event_type_snapshot.json to the event_type "
+        "literals the failure names"
+    ),
+}
+
+
+def _harness_selector(sentinel: str) -> str:
+    """Translate a manifest sentinel into the harness's checkout-relative form.
+
+    scripts/test-backend.sh runs pytest with cwd=backend, so its roster names
+    backend tests as ``testing/test_x.py`` while the surface manifest names
+    them repo-relative as ``backend/testing/test_x.py``. Both forms may carry a
+    ``::node`` suffix, which is preserved.
+    """
+    normalized = sentinel.replace("\\", "/").strip("/")
+    if normalized.startswith("backend/"):
+        return normalized[len("backend/"):]
+    return normalized
+
+
+def _uncovered_sentinels(sentinels: list[str], inventory: set[str]) -> list[str]:
+    """Matched sentinels the harness-owned standalone corpus does not run.
+
+    ``inventory`` is the harness's own corpus identity as emitted by
+    ``scripts/test-backend.sh --standalone --standalone-inventory``, which
+    canonicalizes every entry to REPO-relative form (``testing/x.py`` ->
+    ``backend/testing/x.py``) so the Docker and direct execution modes compare
+    equal. That is the same namespace the surface manifest uses, so the two are
+    compared directly and ``_harness_selector`` is only used to phrase the
+    repair hint in the form STANDALONE_ARGS actually wants.
+
+    A sentinel is covered when the corpus runs it as a whole file OR runs the
+    exact node id registered. The reverse does NOT hold: a corpus entry for one
+    node does not cover a whole-file registration, because the file's other
+    tests never execute.
+    """
+    uncovered: list[str] = []
+    for sentinel in sentinels:
+        if sentinel in inventory:
+            continue
+        if sentinel_file(sentinel) in inventory:
+            continue
+        uncovered.append(sentinel)
+    return uncovered
+
+
+def _sentinel_repair_hints(new_failures: dict[str, str]) -> list[str]:
+    """Repair lines for every registered sentinel named by a new failure."""
+    blob = " ".join([*new_failures.keys(), *(str(v) for v in new_failures.values())])
+    hints: list[str] = []
+    for sentinel, command in sorted(SENTINEL_REPAIR_COMMANDS.items()):
+        basename = sentinel.rsplit("/", 1)[-1]
+        if basename in blob:
+            hints.append(f"{sentinel} is a DERIVED-ARTIFACT guard — repair: {command}")
+    return hints
 
 
 def _is_size_scope(path: str) -> bool:
@@ -280,10 +374,24 @@ def _run_static_corpus(
 
 
 def _run_size_guard(repo: Path, base_root: Path) -> subprocess.CompletedProcess[str]:
+    # --repo-root is passed EXPLICITLY even though it equals the cwd. It is not
+    # redundant: check_size_limits.py keys its frontend escape hatches off
+    # whether the caller supplied a root (`use_env_overrides = not
+    # repo_root_explicit`). Without the flag the current tree resolves
+    # `frontend` through $ADMIN_UI_SRC and the global /admin-ui/src mount BEFORE
+    # <repo>/admin-ui/src. Those exist inside the backend test container, so a
+    # hermetic fixture repo silently measured the REAL admin-ui tree against the
+    # fixture's own (empty) cap ledger and reported every real component as an
+    # uncapped offender. The base side already resolved hermetically; only the
+    # current side leaked. Real runs are unaffected -- this guard executes on the
+    # host, where the mount is absent and <repo>/admin-ui/src is what the
+    # fallback selected anyway.
     return _run(
         [
             sys.executable,
             "backend/testing/check_size_limits.py",
+            "--repo-root",
+            str(repo),
             "--base-root",
             str(base_root),
         ],
@@ -495,6 +603,47 @@ def main(argv: list[str] | None = None) -> int:
             base_inventory = set()
             current_inventory = set()
         corpus_membership_changed = base_inventory != current_inventory
+
+        # Drift-sentinel reachability. The standalone corpus is a FIXED roster;
+        # the surface manifest is a separate, independently edited list. When a
+        # sentinel is registered for a surface but is not in the roster, the
+        # registration is dead for every change that cannot also reach it
+        # through the backend-authoring lane, and the drift it guards merges
+        # green until the promotion matrix forces every guard on at once
+        # (PR #17738). Check the two lists against each other on every corpus
+        # run and fail CLOSED on a mismatch rather than silently skipping.
+        matched_sentinels = sorted(surface_sentinels(corpus_scoped, str(repo)))
+        if matched_sentinels:
+            print("[static guard] drift sentinels matched by this diff:")
+            for sentinel in matched_sentinels:
+                print(f"  - {sentinel}")
+        # A changed backend Python file makes the required backend-authoring
+        # lane run, and THAT lane resolves every matched sentinel through
+        # impacted_tests.py --mandatory-output. The standalone roster only has
+        # to carry the sentinels for a diff that lane never sees, so the check
+        # below applies exactly to the diffs the hoist exists for. Deletions are
+        # counted as present here: erring toward "reachable" keeps this
+        # secondary check from ever inventing a failure, while
+        # test_impacted_tests.py's manifest/roster invariant stays
+        # unconditional.
+        authoring_lane_runs = any(
+            path.startswith("backend/") and path.endswith(".py") for path in changed
+        )
+        if current_inventory and not authoring_lane_runs:
+            unreachable = _uncovered_sentinels(matched_sentinels, current_inventory)
+            if unreachable:
+                print(
+                    "[static guard] ERROR: drift sentinel(s) registered in "
+                    "backend/testing/drift_sentinel_surfaces.json for this diff are "
+                    "NOT in the scripts/test-backend.sh standalone roster, so nothing "
+                    "in this lane runs them: "
+                    f"{json.dumps(unreachable)}. Add each to STANDALONE_ARGS (harness "
+                    "form: "
+                    f"{json.dumps([_harness_selector(x) for x in unreachable])}) or "
+                    "remove the registration.",
+                    file=sys.stderr,
+                )
+                failures.append("drift sentinel unreachable")
         # File inventory alone cannot see a deleted, renamed, or skipped test
         # node inside a still-selected corpus member.  In that case a scoped
         # baseline of only surviving current failures would omit the baseline
@@ -757,6 +906,8 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print("[static guard] standalone static corpus FAILED for this diff")
                     print(f"[static guard] new failures: {json.dumps(attributed)}")
+                    for hint in _sentinel_repair_hints(new_failures):
+                        print(f"[static guard] {hint}")
                 print(current_result.stdout, end="")
                 print(current_result.stderr, end="", file=sys.stderr)
                 failures.append("standalone static corpus")

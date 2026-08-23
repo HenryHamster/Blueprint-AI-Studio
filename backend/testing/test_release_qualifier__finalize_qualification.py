@@ -4649,14 +4649,37 @@ async def test_hotfix_promote_narrow_lane_rejects_repair_commit_with_product_cod
 
 
 @pytest.mark.asyncio
-async def test_hotfix_promote_narrow_lane_rejects_abbreviated_repair_sha(
+async def test_hotfix_promote_narrow_lane_rejects_unresolvable_repair_ref(
     db_session, mocker
 ):
-    """An abbreviated/symbolic repair ref is ambiguous about what deploys."""
+    """Fail-closed survives the resolve-don't-reject change.
+
+    The lane used to refuse ANY abbreviated repair sha on shape alone, which
+    handed the operator back a lookup the engine could perform.  It now resolves
+    the ref -- but a ref GitHub cannot resolve (unknown, or a prefix matching
+    more than one object) is STILL rejected, before any branch is cut, and the
+    reason carries GitHub's own message instead of a generic string.
+    """
+    from fastapi import HTTPException
+
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     branch_mock, create_pr_mock = _patch_hotfix_promote_github(
         mocker, changed_files=[("backend/app/release_scoring.py", None)]
     )
+    candidate = "facec0de" * 5
+
+    async def _resolve(_token, _owner, _repo, ref, **_kwargs):
+        if ref == candidate:
+            return candidate
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Could not resolve {ref!r} to a full 40-character commit sha "
+                f"(GitHub 422: No commit found for SHA: {ref})."
+            ),
+        )
+
+    mocker.patch("app.github.resolve_commit_sha", new=AsyncMock(side_effect=_resolve))
     dangling_mock = mocker.patch(
         "app.github.create_dangling_commit_from_blob_refs", new=AsyncMock()
     )
@@ -4671,12 +4694,127 @@ async def test_hotfix_promote_narrow_lane_rejects_abbreviated_repair_sha(
     )
 
     assert result["status"] == "scope_rejected"
-    assert "full 40-hex" in result["reason"]
+    assert "No commit found for SHA" in result["reason"], (
+        "GitHub's own words must reach the operator, not a generic refusal"
+    )
+    assert "2a5a9833" in result["reason"], "the ref the operator typed must be named"
     dangling_mock.assert_not_awaited()
     branch_mock.assert_not_called()
     create_pr_mock.assert_not_called()
     await db_session.refresh(version)
     assert version.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_hotfix_promote_narrow_lane_resolves_an_abbreviated_repair_sha(
+    db_session, mocker
+):
+    """An abbreviated repair sha ships, and the AUDIT TRAIL records the full one.
+
+    A human types what ``git log`` prints.  The engine holds the token, the owner
+    and the repo, so it resolves the ref itself instead of handing the lookup
+    back.  The split-brain guard is the second half: every downstream consumer --
+    the compare, the materialized commit, the completion-debt detail and the
+    persisted qualification -- must key off the CANONICAL sha, never the
+    abbreviation.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    integration_head = "facec0de" * 5
+    prior_deployed = "mainnew" * 5 + "00000"
+    repair_sha = "ab" * 20
+    repair_abbrev = repair_sha[:9]
+    narrow_sha = "9f" * 20
+    repair_files = ["backend/app/release_stall_alerts.py"]
+    repair_entries = [{"filename": name, "patch": None} for name in repair_files]
+
+    branch_mock, _create_pr_mock = _patch_hotfix_promote_github(
+        mocker, changed_files=[(name, None) for name in repair_files]
+    )
+
+    async def _resolve(_token, _owner, _repo, ref, **_kwargs):
+        if len(ref) == 40:
+            return ref
+        assert ref == repair_abbrev, f"unexpected ref to resolve: {ref}"
+        return repair_sha
+
+    resolve_mock = mocker.patch(
+        "app.github.resolve_commit_sha", new=AsyncMock(side_effect=_resolve)
+    )
+
+    async def _compare(token, owner, repo, base_ref, head_ref, project_id=None):
+        # The own-diff must be taken against the RESOLVED sha, never the prefix.
+        assert base_ref != repair_abbrev and head_ref != repair_abbrev, (
+            "the abbreviation must never reach the compare"
+        )
+        if (base_ref, head_ref) == (f"{repair_sha}~1", repair_sha):
+            return list(repair_entries)
+        if (base_ref, head_ref) == (prior_deployed, narrow_sha):
+            return list(repair_entries)
+        raise AssertionError(f"unexpected compare {base_ref}...{head_ref}")
+
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=AsyncMock(side_effect=_compare),
+    )
+    mocker.patch(
+        "app.github.get_file_blob_sha_at_ref",
+        new=AsyncMock(return_value=(True, "blob-sha")),
+    )
+    dangling_mock = mocker.patch(
+        "app.github.create_dangling_commit_from_blob_refs",
+        new=AsyncMock(return_value=narrow_sha),
+    )
+    ci_mock = mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "detail": "ci green"})),
+    )
+    mocker.patch(
+        "app.database.AsyncSessionLocal", new=_shared_session_factory(db_session)
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="latched gate repair",
+        repair_commit_shas=[repair_abbrev],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted", result
+    assert resolve_mock.await_count >= 1
+    assert branch_mock.call_args.args[4] == narrow_sha
+    # CI resolves against the CONTENT source -- the canonical integration head.
+    assert ci_mock.await_args.args[2] == integration_head
+    # The materialized commit names the resolved sha, not the abbreviation.
+    message = dangling_mock.await_args.kwargs["message"]
+    assert repair_sha in message
+    assert f"{repair_abbrev} " not in message and f"{repair_abbrev}," not in message
+
+    await db_session.commit()
+    debt = (
+        (
+            await db_session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.project_id == project.id,
+                    CompletionDebtEntry.kind == "hotfix_deploy_pending_backfill",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert debt is not None
+    detail = debt.detail if isinstance(debt.detail, dict) else json.loads(debt.detail)
+    assert detail["repair_commit_shas"] == [repair_sha], (
+        "the audit trail must record what was verified, not what was typed"
+    )
+
+    await db_session.refresh(version)
+    assert version.last_qualification.get("hotfix_promote_repair_commit_shas") == [
+        repair_sha
+    ]
 
 
 def test_evaluate_hotfix_scope_pure_predicate():

@@ -407,3 +407,38 @@ def test_requeue_message_respects_the_column_budget():
     )
     assert len(msg) <= 8000, len(msg)
     assert msg.startswith("Code Error — requeued: code_error — ")
+
+
+def test_terminal_message_emits_nothing_when_the_category_fills_the_budget():
+    """A zero free-text budget must drop the free text, not emit all of it.
+
+    ``free_text[-0:]`` is ``free_text`` — Python's negative-slice identity —
+    so the clamp that computes the remaining budget silently inverted into an
+    unbounded write whenever the category prefix consumed the whole allowance.
+    Pin the boundary directly: the composed message stays inside ``max_chars``
+    and does NOT carry the log.
+    """
+    category = "rate_limited"
+    # Budget smaller than "rate_limited — " (15 chars) drives the tail slice
+    # to zero.
+    msg = compose_agent_terminal_message(
+        "SECRET-LOG-BODY" * 4000,
+        failure_category=category,
+        max_chars=len(category) + 2,
+    )
+    assert len(msg) <= len(category) + 2, len(msg)
+    assert "SECRET-LOG-BODY" not in msg
+    assert msg == category[: len(category) + 2]
+
+
+def test_terminal_message_keeps_the_free_text_at_a_one_char_budget():
+    """One character of budget yields one character of log, not zero and not
+    all of it — the off-by-one either side of the boundary above."""
+    category = "code_error"
+    prefix = f"{category} — "
+    msg = compose_agent_terminal_message(
+        "abcdef",
+        failure_category=category,
+        max_chars=len(prefix) + 1,
+    )
+    assert msg == f"{prefix}f"

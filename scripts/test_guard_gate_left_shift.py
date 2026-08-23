@@ -49,6 +49,120 @@ def test_static_guard_base_unpack_uses_data_filter() -> None:
     assert 'bundle.extractall(destination, filter="data")' in source
 
 
+def test_harness_selector_translates_manifest_form_to_roster_form() -> None:
+    """The manifest is repo-relative; the harness roster is backend-relative."""
+    assert (
+        static_release_guard._harness_selector("backend/testing/test_x.py")
+        == "testing/test_x.py"
+    )
+    assert (
+        static_release_guard._harness_selector("backend/testing/test_x.py::test_a")
+        == "testing/test_x.py::test_a"
+    )
+    # A non-backend sentinel keeps its path; the harness re-prefixes scripts/.
+    assert (
+        static_release_guard._harness_selector("scripts/test_x.py")
+        == "scripts/test_x.py"
+    )
+
+
+def test_uncovered_sentinels_compares_in_the_inventory_namespace() -> None:
+    """The corpus inventory is REPO-relative; comparing harness-form is a bug.
+
+    scripts/test-backend.sh --standalone-inventory canonicalizes every
+    STANDALONE_ARGS entry to repo-relative form (``testing/x.py`` ->
+    ``backend/testing/x.py``) so Docker and direct runs emit one comparable
+    inventory. Stripping ``backend/`` off the sentinel before the lookup would
+    make EVERY sentinel read as uncovered and fail the corpus lane closed on
+    every diff.
+    """
+    inventory = {"backend/testing/test_in.py", "backend/testing/test_node.py::test_a"}
+    covered = ["backend/testing/test_in.py", "backend/testing/test_node.py::test_a"]
+    assert static_release_guard._uncovered_sentinels(covered, inventory) == []
+    # A whole-file registration is NOT covered by a roster entry for one node:
+    # the file's other tests never execute.
+    assert static_release_guard._uncovered_sentinels(
+        ["backend/testing/test_node.py"], inventory
+    ) == ["backend/testing/test_node.py"]
+    assert static_release_guard._uncovered_sentinels(
+        ["backend/testing/test_absent.py"], inventory
+    ) == ["backend/testing/test_absent.py"]
+    # A node-id registration IS covered by a whole-file roster entry.
+    assert static_release_guard._uncovered_sentinels(
+        ["backend/testing/test_in.py::test_only"], inventory
+    ) == []
+
+
+def test_live_manifest_sentinels_are_all_carried_by_the_standalone_roster() -> None:
+    """Every registered sentinel is in scripts/test-backend.sh STANDALONE_ARGS.
+
+    The corpus lane is the only lane that runs on a diff with no backend Python
+    file in it, so a sentinel the roster omits is unreachable from exactly the
+    surfaces (admin-ui/, agent/, scripts/, derived artifacts) this manifest
+    exists to cover. Parsed from the harness source because this assertion has
+    to hold in the Docker-less standalone lane, which cannot start the harness.
+    """
+    harness = (REPO_ROOT / "scripts" / "test-backend.sh").read_text(encoding="utf-8")
+    marker = "STANDALONE_ARGS=("
+    start = harness.index(marker) + len(marker)
+    # Mirror the harness's own --standalone-inventory canonicalization.
+    roster = {
+        "backend/" + line.strip()
+        for line in harness[start : harness.index(chr(10) + "    )", start)].splitlines()
+        if line.strip().startswith("testing/")
+    }
+    assert "backend/testing/test_impacted_tests.py" in roster
+    registered: set[str] = set()
+    for _regex, sentinels in static_release_guard.load_surface_manifest(str(REPO_ROOT)):
+        registered.update(sentinels)
+    # Sentinels reachable through the backend-authoring lane are exempt: that
+    # lane resolves selectors whenever the diff holds a changed backend/*.py.
+    corpus_only = {
+        sentinel
+        for sentinel in registered
+        if sentinel
+        not in {
+            "backend/testing/test_direction_referential_guard.py",
+            "backend/testing/test_size_limits_checker.py",
+            "backend/testing/test_migration_0621_safe_encrypt_backfill.py",
+            "backend/testing/test_migration_0626_safe_encrypt_backfill.py",
+        }
+    }
+    assert static_release_guard._uncovered_sentinels(sorted(corpus_only), roster) == []
+
+
+def test_sentinel_repair_hints_name_the_regeneration_command() -> None:
+    """A stale-artifact failure must print HOW to repair it, not just WHAT broke.
+
+    Surfacing states without reasons is what turned the five #17738 guard
+    failures into a hand-diagnosed repair PR.
+    """
+    hints = static_release_guard._sentinel_repair_hints(
+        {
+            "testing/test_test_estate_ranked_queue.py::test_queue_covers_estate": (
+                "AssertionError: test files exist but are absent"
+            )
+        }
+    )
+    assert len(hints) == 1
+    assert "scripts/generate_test_estate_ranked_queue.py --write" in hints[0]
+    # An unrelated failure gets no hint.
+    assert static_release_guard._sentinel_repair_hints(
+        {"testing/test_security.py::test_x": "boom"}
+    ) == []
+
+
+def test_every_repair_command_targets_a_registered_sentinel() -> None:
+    """The repair table may not name a guard the manifest does not register."""
+    registered: set[str] = set()
+    for _regex, sentinels in static_release_guard.load_surface_manifest(str(REPO_ROOT)):
+        registered.update(
+            static_release_guard.sentinel_file(sentinel) for sentinel in sentinels
+        )
+    orphans = sorted(set(static_release_guard.SENTINEL_REPAIR_COMMANDS) - registered)
+    assert not orphans, format_offender_marker(orphans)
+
+
 def test_static_scope_matches_path_boundaries() -> None:
     assert static_release_guard._is_static_scope("backend/testing/test_guard.py")
     assert static_release_guard._is_static_scope("check")
