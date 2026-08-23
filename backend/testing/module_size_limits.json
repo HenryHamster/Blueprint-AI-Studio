@@ -193,7 +193,7 @@
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 1400,
     "handlers/standard.ts": 1900,
-    "handlers/review-fix.ts": 2050,
+    "handlers/review-fix.ts": 2100,
     "handlers/review-fix-history.ts": 200,
     "handlers/review-fix-migration.ts": 400,
     "prompts/review-prompt.ts": 600,

@@ -829,6 +829,52 @@ export async function handleReview(
     }
   } catch { /* best-effort, continue without PR metadata */ }
 
+  // The status payload's `changed_files` must describe the PR, not this
+  // review's evidence range. In delta mode `reviewDiffRange` is the exact
+  // two-SHA slice of the last fix and the base ref is deliberately never
+  // fetched, so a git-derived list names only the files that one fix touched.
+  // That is not a narrower view of the PR, it is a WRONG one: the backend
+  // stamps whatever we send as `_pr_changed_files` (see
+  // acceptance_gate.stamp_changed_files_signal), which then drives
+  // `_pr_changed_files_has_test` / `_has_prod` for the acceptance classifier
+  // and `drift_out` for the next fix prompt. A three-file delta on a
+  // thirty-file PR therefore reads as "27 files disappeared" and "this PR
+  // ships no tests" — false blockers the fix agent cannot clear. Ask GitHub
+  // for the PR's real file set instead; it is the same source the backend
+  // treats as verified provenance.
+  let prScopeFilePathList: string[] = [];
+  // One page only. At exactly the page size the set may be truncated, and a
+  // truncated set would make in-scope files look out-of-scope -- the one
+  // direction of error that SUPPRESSES real findings. Track it, and refuse to
+  // use the list for suppression when it might be short.
+  let prScopeFileListComplete = false;
+  if (deltaBaseSha) {
+    try {
+      const prFilesController = new AbortController();
+      const prFilesTimeout = setTimeout(() => { prFilesController.abort(); }, 25_000);
+      try {
+        const filesRes = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`,
+          {
+            headers: { Authorization: `token ${ghToken}`, Accept: 'application/vnd.github+json' },
+            signal: prFilesController.signal,
+          },
+        );
+        if (filesRes.ok) {
+          const filesData = await filesRes.json() as Array<{ filename?: string }>;
+          if (Array.isArray(filesData)) {
+            prScopeFilePathList = filesData
+              .map(f => String(f?.filename || ''))
+              .filter(Boolean);
+            prScopeFileListComplete = filesData.length < 100;
+          }
+        }
+      } finally {
+        clearTimeout(prFilesTimeout);
+      }
+    } catch { /* best-effort; handled by the fail-closed branch at report time */ }
+  }
+
   // Download viewport screenshots captured by the implementer for visual review.
   // The payload carries `viewport_shot_entries` (list of {name, storage_uri} dicts)
   // and `viewport_source_task_id` (the create/fix task that uploaded them).
@@ -926,13 +972,46 @@ export async function handleReview(
   const iterationPreamble = buildReviewIterationPreamble(
     iteration, reviewMaxIterations, reviewMidBudget, smallScopeEarly,
   );
+  // A two-dot delta answers "what happened between the two review heads",
+  // which is NOT "what this PR changes". The two diverge in exactly the cases
+  // that matter, and both have been observed parking a chain for an operator:
+  //   - PR #17720: a base-merge commit landed between the reviews, dragging the
+  //     base branch's own edits into the delta. The reviewer blocked on a
+  //     size-cap change that is not in the PR's net diff at all.
+  //   - PR #17690: the commit that REMOVES out-of-scope files must touch those
+  //     files, so the delta-scoped reviewer re-raised the identical scope-creep
+  //     finding against the very fix that cleared it. No commit can escape that
+  //     loop; the chain parked with the complaint already false.
+  // The PR's net base..head file set is the authority on what the PR owns; the
+  // delta only says where to look. Both facts have to reach the reviewer, or it
+  // cannot tell a fix landing from a repeat of the offense.
+  const prScopeSet = new Set(prScopeFilePathList);
+  const deltaOnlyFiles = prScopeFileListComplete
+    ? changedFilePathList.filter(f => !prScopeSet.has(f))
+    : [];
+  const fileBullets = (paths: string[], cap: number) =>
+    paths.slice(0, cap).map(f => `  - ${f}`).join('\n') +
+    (paths.length > cap ? `\n  - ...and ${paths.length - cap} more` : '');
+  const deltaNetScopeNote = !prScopeFileListComplete
+    ? ''
+    : `\n**Authoritative PR scope.** Against its base, this PR's net change is these ` +
+      `${prScopeFilePathList.length} file(s):\n${fileBullets(prScopeFilePathList, 60)}\n` +
+      (deltaOnlyFiles.length > 0
+        ? `\nThe delta range above also touches ${deltaOnlyFiles.length} file(s) that are NOT in that net diff:\n` +
+          `${fileBullets(deltaOnlyFiles, 40)}\n` +
+          `Those are base-branch content merged in between the two reviews, or edits that restore a file to its base state. ` +
+          `This PR does not change them. Do NOT raise a finding about them and do NOT count them toward scope. ` +
+          `Specifically: if an earlier iteration flagged scope creep, the commit that REMOVES the out-of-scope files shows up here — ` +
+          `that is the requested fix landing, not a repeat of the offense.\n`
+        : `\nEvery file in the delta range is part of that net diff.\n`);
   const deltaReviewSection = deltaBaseSha
     ? `## Exact-SHA Delta Review\n` +
       `This follow-up review is scoped to the fix delta from the previously reviewed head to the current head: ` +
       `\`git diff ${deltaBaseSha}..HEAD\`. Treat that exact range as the primary evidence. ` +
       `Verify whether the prior findings were resolved and whether this delta introduced a new blocker. ` +
       `Do not start a full base-branch/PR rescan or re-litigate unrelated pre-existing code. ` +
-      `You retain full repository access: inspect surrounding code when it is needed to understand or verify this delta.\n\n`
+      `You retain full repository access: inspect surrounding code when it is needed to understand or verify this delta.\n` +
+      `${deltaNetScopeNote}\n`
     : '';
   const reviewIterationContext = deltaBaseSha
     ? `This is a focused follow-up after review iteration ${iteration}.\n\n`
@@ -1221,8 +1300,22 @@ ${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewC
   // drift falls back to the original create task's _pr_changed_files (which
   // is stale once a rebase-fix or new commits land), leaving drift_in/drift_out
   // empty for exactly the cases we need them to fire (rebase-induced drift).
-  // Cap at 50 to match AgentStatusPayload.changed_files limit.
-  const reviewChangedFiles = changedFilePathList.slice(0, 50);
+  //
+  // Fail CLOSED in delta mode: if GitHub did not answer, send nothing rather
+  // than the delta-only list. A stale-but-whole `_pr_changed_files` is
+  // recoverable; overwriting it with this review's evidence range manufactures
+  // drift_out for every file the last fix happened not to touch.
+  //
+  // Cap at 100, the AgentStatusPayload.changed_files limit. The backend derives
+  // its has_test / has_prod summary from the whole list BEFORE truncating its
+  // own stored copy to 50, so under-sending here silently degrades that
+  // classification on wide PRs.
+  const reviewChangedFiles = (deltaBaseSha ? prScopeFilePathList : changedFilePathList)
+    .slice(0, 100);
+  if (deltaBaseSha && prScopeFilePathList.length === 0) {
+    sendLog(ws, `WARNING: Could not read the PR file list from GitHub; omitting changed_files so the delta range does not overwrite the PR's snapshot.
+`);
+  }
 
   await persistAndPostStatus(taskId, {
     task_id: taskId,

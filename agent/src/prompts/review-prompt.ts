@@ -86,8 +86,9 @@ export const REVIEW_FIX_RESPONSES_INSTRUCTIONS = (
   `For each disputed/alternative/partial response below:\n` +
   `  1. Run every step in \`verify steps\`. Quote the actual command output in your feedback.\n` +
   `  2. If all verify steps confirm the claim → DROP the original issue (do not re-raise).\n` +
-  `  3. If any verify step fails or is non-actionable ("trust me", "I tested it") → re-raise the original issue with severity major AND quote the specific verify step that failed so the next fix iteration knows what to address.\n` +
-  `  4. If you cannot run a verify step (e.g. it requires data you don't have) → flag as "unverifiable" with severity major; do not silently accept.\n\n` +
+  `  3. If a verify step RAN and its result contradicts the claim, or the step is non-actionable ("trust me", "I tested it") → re-raise the original issue with severity major AND quote the specific verify step that failed so the next fix iteration knows what to address. A step that never executed at all is case 4, not this one.\n` +
+  `  4. If a verify step cannot EXECUTE here — the command, subcommand, flag or tool is missing or too old in this sandbox — that is a fact about the environment, not evidence about the claim, and it is NOT the fix agent failing to converge. Find an equivalent check this environment does support and use its result. Only when no equivalent exists, re-raise at severity major, open the description with "verify step blocked by environment:", and quote the exact command and its exact error, so the block is attributable to tooling instead of being scored against the fix.\n` +
+  `  5. If the CLAIM itself cannot be checked — the step needs data or state that does not exist — → flag as "unverifiable" with severity major; do not silently accept.\n\n` +
   `**Sycophancy guard**: a plausible-sounding claim with no verify steps, or with verify steps that boil down to "the agent says so", MUST be rejected. Real disagreements have concrete checks.\n\n`
 );
 

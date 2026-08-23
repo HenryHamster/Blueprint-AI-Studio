@@ -5,6 +5,7 @@ import {
   buildReviewVerdictInstructions,
   buildReviewPromptFingerprintContent,
   REVIEW_DELTA_FOCUS_NOTE,
+  REVIEW_FIX_RESPONSES_INSTRUCTIONS,
 } from './review-prompt.js';
 
 describe('buildReviewIterationPreamble — delta-focus gating', () => {
@@ -194,6 +195,43 @@ describe('buildTypeCheckInstructions — CI owns build/tests, reviewer owns scop
       directories: [{ path: 'backend', type: 'python', lint_cmd: 'ruff check .' }],
     });
     expect(out).not.toContain('./check');
+  });
+});
+
+
+describe('REVIEW_FIX_RESPONSES_INSTRUCTIONS — a step that cannot run is not a failed step', () => {
+  const out = REVIEW_FIX_RESPONSES_INSTRUCTIONS;
+
+  it('separates an environment block from a verify step that ran and contradicted the claim', () => {
+    // These were one disposition. Conflating them makes a missing tool
+    // ("git worktree --write-tree" on git < 2.38) score exactly like a false
+    // claim: a MAJOR the fix agent cannot clear by changing any code. The
+    // reviewer re-raises, the agent re-argues, and the convergence detectors
+    // read that as nonconvergence and park the chain for an operator.
+    expect(out).toContain('cannot EXECUTE here');
+    expect(out).toContain('NOT the fix agent failing to converge');
+    expect(out).toContain('A step that never executed at all is case 4, not this one.');
+  });
+
+  it('still fails closed on an environment block, but attributes it to tooling', () => {
+    // Degrading gracefully must not mean waving the issue through: the
+    // reviewer re-raises at major either way. What changes is that it first
+    // has to try a check this sandbox supports, and then has to name the
+    // command and the error so the block is legible as tooling.
+    expect(out).toContain('an equivalent check this environment does support');
+    expect(out).toContain('verify step blocked by environment:');
+    expect(out).toContain('quote the exact command and its exact error');
+    expect(out).toMatch(/no equivalent exists, re-raise at severity major/);
+  });
+
+  it('keeps the unsupported-claim disposition as its own case', () => {
+    expect(out).toContain('the CLAIM itself cannot be checked');
+    expect(out).toContain('"unverifiable" with severity major');
+  });
+
+  it('keeps the sycophancy guard', () => {
+    expect(out).toContain('**Sycophancy guard**');
+    expect(out).toContain('MUST be rejected');
   });
 });
 
