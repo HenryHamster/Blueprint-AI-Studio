@@ -2222,10 +2222,15 @@ def test_static_corpus_receipt_merges_beside_another_lane(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stdout + result.stderr
     lanes = json.loads(receipt_path.read_text(encoding="utf-8"))["lanes"]
-    assert set(lanes) == {"vitest:agent", "static-corpus"}
+    # Three writers merge into this receipt, not two: the guard also runs the
+    # module-size check, and that checker attributes its own baseline verdict
+    # under "size-limits" (#17760). Exhaustive on purpose -- a clobbering
+    # writer drops a lane, and this is where that shows up.
+    assert set(lanes) == {"vitest:agent", "static-corpus", "size-limits"}
     assert lanes["vitest:agent"]["suppressed_failures"] == {
         "src/a.test.ts::x::failure": {"detail": "inherited"}
     }
+    assert lanes["size-limits"]["blocking"] is False
 
 
 def test_an_unwritable_receipt_does_not_change_the_static_corpus_verdict(

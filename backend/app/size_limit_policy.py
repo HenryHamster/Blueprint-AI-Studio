@@ -368,6 +368,33 @@ def governance_source_relpath(section: str, module_key: str) -> str | None:
     return "/".join((*source_root_parts, module_key))
 
 
+def describe_effective_cap_breach(
+    section: str,
+    module_key: str,
+    count: int,
+    json_cap: int | None,
+    effective_cap: int | None,
+) -> str:
+    """Name the cap a breach actually crossed, and where that cap is declared.
+
+    A module can be governed by a source-declared ``*_SIZE_GOVERNANCE_CAP``
+    tighter than its ``module_size_limits.json`` entry.  Reporting the JSON cap
+    for such a breach prints an arithmetically false comparison (``1979 >
+    2250``) and sends the reader to the wrong file to repair it.  Gates use
+    this so a blocked reader learns which limit bound and which constant moves.
+    """
+    if effective_cap is None:
+        return f"{module_key} ({count} lines, no cap resolved)"
+    if json_cap is not None and effective_cap < json_cap:
+        source = governance_source_relpath(section, module_key) or "the module itself"
+        return (
+            f"{module_key} ({count} > {effective_cap}, the governance cap "
+            f"declared in {source}; the module_size_limits.json cap of "
+            f"{json_cap} is NOT the binding limit)"
+        )
+    return f"{module_key} ({count} > {effective_cap})"
+
+
 def governing_cap_repair(
     section: str, module_key: str, new_limit: int
 ) -> GoverningCapRepair | None:
