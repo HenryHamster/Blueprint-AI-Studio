@@ -109,6 +109,26 @@ def test_blocking_helper_records_the_printed_verdict_and_all_buckets(
     assert "FAILED state=attribution_unavailable" in capsys.readouterr().out
 
 
+def test_blocking_exit_preserves_recorded_coverage_identities(
+    _isolate_verification_receipt: Path,
+) -> None:
+    outcome = {
+        "state": "coverage_regression",
+        "blocking": True,
+        "current_exit_code": 1,
+        "new_failures": {},
+        "suppressed_failures": {},
+        "disappeared_failures": {},
+        "skipped_failures": {},
+    }
+    guard._record("admin-ui", outcome, coverage_failures={"src/foo.test.ts": "missing"})
+
+    assert guard._blocking("admin-ui", "coverage_regression", outcome=outcome) == 1
+
+    lane = json.loads(_isolate_verification_receipt.read_text(encoding="utf-8"))["lanes"]["vitest:admin-ui"]
+    assert lane["new_failures"] == {"src/foo.test.ts::coverage": {"detail": "missing"}}
+
+
 @pytest.fixture(autouse=True)
 def _seed_suite_configs(tmp_path: Path) -> None:
     """Give every synthetic repo the REAL Vitest config of each suite.

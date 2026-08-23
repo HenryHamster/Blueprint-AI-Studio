@@ -72,6 +72,9 @@ import sys
 _BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
+_SCRIPTS_DIR = os.path.normpath(os.path.join(_BACKEND_DIR, "..", "scripts"))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 # Inserting ``_BACKEND_DIR`` at the front of ``sys.path`` only wins the
 # ``app.size_limit_policy`` import when ``<_BACKEND_DIR>/app`` is a REGULAR
@@ -903,6 +906,102 @@ def _parse_sections(raw: str) -> list[str]:
     return [s for s in SECTIONS if s in requested]
 
 
+_SIZE_LIMITS_LANE = "size-limits"
+
+
+def _record_baseline_attribution(
+    *,
+    base_root: str,
+    baseline_reason: str | None,
+    governance_baseline_reason: str | None,
+    blocking_breaches: list,
+    preexisting_breaches: list,
+    blocking_stale_caps: list,
+    preexisting_stale_caps: list,
+    blocking_uncapped: list,
+    preexisting_uncapped: list,
+    blocking_phantoms: list,
+    preexisting_phantoms: list,
+    blocking_absent: list,
+    preexisting_absent: list,
+) -> None:
+    """Record the baseline size verdict in both existing receipt projections.
+
+    This is advisory evidence only. Both receipt writers are deliberately
+    fail-open, and this wrapper keeps an unavailable emitter or an unexpected
+    writer error from changing the checker verdict.
+    """
+    suppressed: dict[str, str] = {}
+    introduced: dict[str, str] = {}
+
+    def add(target: dict[str, str], kind: str, section: str, rel: str) -> None:
+        origin = "inherited" if target is suppressed else "introduced"
+        target[f"{section}/{rel}::{kind}"] = f"{origin} {kind} finding"
+
+    groups = (
+        (suppressed, "size-cap", ((s, r["rel"]) for s, r, *_ in preexisting_breaches)),
+        (introduced, "size-cap", ((s, r["rel"]) for s, r, *_ in blocking_breaches)),
+        (suppressed, "stale-cap", ((s, r["rel"]) for s, r in preexisting_stale_caps)),
+        (introduced, "stale-cap", ((s, r["rel"]) for s, r in blocking_stale_caps)),
+        (suppressed, "uncapped", ((s, r["rel"]) for s, r, *_ in preexisting_uncapped)),
+        (introduced, "uncapped", ((s, r["rel"]) for s, r, *_ in blocking_uncapped)),
+        (suppressed, "ledger-phantom", ((r[0], r[1]) for r in preexisting_phantoms)),
+        (introduced, "ledger-phantom", ((r[0], r[1]) for r in blocking_phantoms)),
+        (suppressed, "ledger-missing", ((r[0], r[1]) for r in preexisting_absent)),
+        (introduced, "ledger-missing", ((r[0], r[1]) for r in blocking_absent)),
+    )
+    for target, kind, findings in groups:
+        for section, rel in findings:
+            add(target, kind, section, rel)
+
+    reasons = [r for r in (baseline_reason, governance_baseline_reason) if r]
+    if reasons:
+        state = "baseline_unavailable"
+    elif introduced:
+        state = "test_failure"
+    elif suppressed:
+        state = "preexisting_test_failure"
+    else:
+        state = "passed"
+    extra = {"base_root": base_root}
+    if reasons:
+        # The receipt writer bounds failure identities/details, but not free-form
+        # extras. Keep exception text bounded before handing it to that API.
+        extra["baseline_reason"] = "; ".join(reasons)[:1000]
+
+    try:
+        from verification_receipt import record_lane as record_verification_lane
+
+        record_verification_lane(
+            _SIZE_LIMITS_LANE,
+            state=state,
+            blocking=bool(introduced),
+            new_failures=introduced,
+            suppressed_failures=suppressed,
+            extra=extra,
+        )
+    except Exception as exc:  # receipt evidence is fail-open
+        print(
+            f"[verification-receipt] WARN could not record {_SIZE_LIMITS_LANE}: {exc}",
+            file=sys.stderr,
+        )
+
+    try:
+        from guard_suppression_receipt import record_lane as record_suppression_lane
+
+        record_suppression_lane(
+            _SIZE_LIMITS_LANE,
+            state=state,
+            suppressed=suppressed,
+            note=(f"baseline unavailable: {extra['baseline_reason']}" if reasons else None),
+        )
+    except Exception as exc:  # receipt evidence is fail-open
+        print(
+            f"[guard-suppression] WARN could not record {_SIZE_LIMITS_LANE}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _parse_repair_target(raw: str) -> str:
     """Validate a repeatable ``section/repo-relative-path`` repair selector.
 
@@ -1643,6 +1742,23 @@ def main(argv: list[str] | None = None) -> int:
             "not introduced by this change"
         )
     preexisting_count += len(preexisting_absent)
+
+    if args.base_root:
+        _record_baseline_attribution(
+            base_root=args.base_root,
+            baseline_reason=baseline_reason,
+            governance_baseline_reason=governance_baseline_reason,
+            blocking_breaches=blocking_breaches,
+            preexisting_breaches=preexisting_breaches,
+            blocking_stale_caps=blocking_stale_caps,
+            preexisting_stale_caps=preexisting_stale_caps,
+            blocking_uncapped=blocking_uncapped,
+            preexisting_uncapped=preexisting_uncapped,
+            blocking_phantoms=blocking_phantoms,
+            preexisting_phantoms=preexisting_phantoms,
+            blocking_absent=blocking_absent,
+            preexisting_absent=preexisting_absent,
+        )
 
     if exit_code == 0 and not preexisting and preexisting_count == 0:
         print("All scoped files within their size caps.")

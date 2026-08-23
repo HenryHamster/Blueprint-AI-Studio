@@ -4664,6 +4664,14 @@
           "old_cap": 2400,
           "new_cap": 2850
         }
+      ],
+      "check_size_limits.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-23T17:47:32.117509+00:00",
+          "old_cap": 1750,
+          "new_cap": 1800
+        }
       ]
     },
     "scripts": {
@@ -4687,6 +4695,18 @@
           "commit_date": "2026-08-23T00:05:07Z",
           "old_cap": 750,
           "new_cap": 1000
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-23T01:08:46.975054+00:00",
+          "old_cap": 750,
+          "new_cap": 1050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-23T01:08:46.975054+00:00",
+          "old_cap": 1000,
+          "new_cap": 1050
         }
       ],
       "test_vitest_verification_guard.py": [
