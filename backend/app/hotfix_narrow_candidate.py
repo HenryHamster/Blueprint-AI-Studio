@@ -32,6 +32,7 @@ it.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -50,6 +51,18 @@ logger = logging.getLogger(__name__)
 # fail-closed property is untouched: "ambiguous" was only ever true of a prefix
 # matching more than one object, and such a prefix — like an unknown ref — still
 # fails resolution and is still REJECTED, now carrying GitHub's own words.
+#
+# What is still refused by SHAPE, before any lookup, is a SYMBOLIC ref.
+# ``GET /repos/{owner}/{repo}/commits/{ref}`` happily resolves ``main``, ``HEAD``
+# or a tag, and this value selects what gets DEPLOYED — a moving name resolves to
+# whatever it points at in the instant the request lands, which is not a repair
+# the operator can be said to have named.  A hex prefix names one object; a
+# branch names a position.  Only the former is admitted here.
+#
+# The 7-character floor is git's own default abbreviation length: shorter
+# prefixes collide often enough that resolution succeeding is not evidence the
+# operator meant that commit.
+_REPAIR_REF_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 # The lane ships a SURGICAL repair.  A request naming more commits than this is
 # not a surgical repair; route it through the full gate.
@@ -121,7 +134,11 @@ def _validate_repair_commit_shas(repair_commit_shas: list[str]) -> str | None:
     """Return a rejection reason for a malformed commit list, else ``None``.
 
     Pure and network-free — only what can be judged from the operator's RAW
-    list.  The count cap is deliberately applied HERE, BEFORE resolution, for two
+    list: the count cap, and the hex-prefix shape that keeps a symbolic ref out
+    of a lane that selects what deploys (see :data:`_REPAIR_REF_RE`).  Whether a
+    well-shaped prefix actually names one reachable commit is GitHub's answer,
+    not this function's.  The count cap is deliberately applied HERE, BEFORE
+    resolution, for two
     reasons.  (1) The cap bounds the work this owner-only lever may ask for, so a
     500-entry list must be refused without first spending 500 GitHub round-trips.
     (2) Two different abbreviations can name the SAME commit, so resolution is
@@ -137,6 +154,13 @@ def _validate_repair_commit_shas(repair_commit_shas: list[str]) -> str | None:
             f"{len(repair_commit_shas)} repair commits named (max "
             f"{MAX_REPAIR_COMMITS}) — that is not a surgical repair; route it "
             "through the full gate"
+        )
+    bad = [s for s in repair_commit_shas if not _REPAIR_REF_RE.match(s or "")]
+    if bad:
+        return (
+            "repair commits must be hex commit shas, 7 to 40 characters (a "
+            "branch, tag or other symbolic ref names a moving position, not a "
+            f"repair): {bad}"
         )
     return None
 

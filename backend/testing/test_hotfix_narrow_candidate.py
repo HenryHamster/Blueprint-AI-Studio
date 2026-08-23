@@ -154,11 +154,16 @@ async def test_ambiguous_prefix_is_still_rejected(mocker):
     _resolution_mock(
         mocker,
         status_code=422,
-        json_data={"message": "Ambiguous match, found 2 commits for SHA: 2a5a"},
+        json_data={"message": "Ambiguous match, found 2 commits for SHA: 2a5a983"},
     )
     seen = _compare_mock(mocker)
 
-    scope = await hotfix_narrow_candidate.narrow_repair_scope("t", "o", "r", ["2a5a"])
+    # Well-shaped (7 hex, git's own default abbreviation) — so this is the
+    # RESOLVER's verdict, not the shape gate's. A prefix can be perfectly
+    # well-formed and still name two objects; only GitHub can say so.
+    scope = await hotfix_narrow_candidate.narrow_repair_scope(
+        "t", "o", "r", ["2a5a983"]
+    )
 
     assert scope["status"] == "scope_rejected"
     assert "Ambiguous match" in scope["reason"]
@@ -221,6 +226,42 @@ async def test_count_cap_still_fires_and_costs_no_resolution_calls(mocker):
         "literal pin: the surgical-repair bound is policy, not a tunable"
     )
     request_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "main",
+        "HEAD",
+        "automain",
+        "v40",
+        "refs/heads/main",
+        "HEAD~1",
+        "abc123",  # hex, but shorter than git's own default abbreviation
+        "",
+    ],
+)
+async def test_symbolic_ref_is_refused_by_shape_before_any_lookup(mocker, ref):
+    """A branch names a POSITION; this lane names what deploys.
+
+    ``GET /repos/{owner}/{repo}/commits/{ref}`` resolves ``main``, ``HEAD`` and
+    tags perfectly well, so resolution alone is not a gate. Whatever such a name
+    points at in the instant the request lands is not a repair the operator can
+    be said to have named, and the resolved sha would be recorded in the audit
+    trail as though they had. Refused on shape, with no round-trip spent.
+    """
+    request_mock = mocker.patch("app.github._github_request", new=mocker.AsyncMock())
+
+    scope = await hotfix_narrow_candidate.narrow_repair_scope("t", "o", "r", [ref])
+
+    assert scope["status"] == "scope_rejected"
+    assert "symbolic ref" in scope["reason"]
+    assert scope["repair_commit_shas"] == []
+    request_mock.assert_not_called()
+    # Literal pin: the admitted shape is policy for a lane that selects what
+    # gets DEPLOYED, not a tunable. 7 is git's default abbreviation length.
+    assert hotfix_narrow_candidate._REPAIR_REF_RE.pattern == r"^[0-9a-fA-F]{7,40}$"
 
 
 @pytest.mark.asyncio
@@ -327,7 +368,9 @@ async def test_materialization_keys_everything_off_the_canonical_sha(mocker):
 async def test_materialize_creates_nothing_when_the_ref_will_not_resolve(mocker):
     """A rejected resolution must cut no tree, blob or commit."""
     _resolution_mock(
-        mocker, status_code=404, json_data={"message": "No commit found for SHA: zz"}
+        mocker,
+        status_code=404,
+        json_data={"message": "No commit found for SHA: deadbee"},
     )
     _compare_mock(mocker)
     blob_mock = mocker.patch(
@@ -338,7 +381,7 @@ async def test_materialize_creates_nothing_when_the_ref_will_not_resolve(mocker)
     )
 
     result = await hotfix_narrow_candidate.materialize_narrow_hotfix_candidate(
-        "t", "o", "r", prior_deployed_sha="d" * 40, repair_commit_shas=["zz"]
+        "t", "o", "r", prior_deployed_sha="d" * 40, repair_commit_shas=["deadbee"]
     )
 
     assert result["status"] == "scope_rejected"
