@@ -866,14 +866,32 @@ async def test_long_complete_evidence_shrinks_to_total_packet_budget(db_session)
     )
     assert all(len(item["summary"]) <= 500 for item in snapshot["knowledge_outcomes"])
     manifest = review.first_payload["evidence_packet_manifest"]
-    assert manifest["binding_decision_allowed"] is False
-    assert manifest["required_evidence_omitted"] is True
-    with pytest.raises(DiscoveryReviewResultError, match="incomplete packet semantics"):
-        await complete_discovery_review(
-            db_session,
-            task=review,
-            raw_result=_result(cycle, review),
-        )
+    # Until 2026-08-23 this asserted the opposite -- no binding decision, and
+    # complete_discovery_review rejecting anything but ask_operator. That
+    # encoded the defect the fleet-idle incident exposed: the evidence in
+    # this cohort is *complete*, the word in this test's own name, merely
+    # long, and shrinking it to the packet budget is the intended behaviour,
+    # not a loss of authority. Gating authority on the omitted-evidence
+    # digest reproducing every item's prose verbatim is what stranded five
+    # directions at ask_operator, each asking the operator to hand back
+    # evidence the engine already held. The digest now shares its budget out
+    # per item, so every omitted knowledge outcome is still represented above
+    # the readable floor and the binding decision is permitted to land.
+    knowledge_coverage = snapshot["evidence_coverage"]["knowledge_outcomes"]
+    assert knowledge_coverage["semantic_digest_complete"] is False
+    assert knowledge_coverage["semantic_digest_item_coverage_complete"] is True
+    assert manifest["binding_action_blockers"] == []
+    assert manifest["binding_decision_allowed"] is True
+    assert manifest["required_evidence_omitted"] is False
+    completed = await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review),
+    )
+    await db_session.flush()
+    assert completed.id == cycle.id
+    assert cycle.state == "reviewed"
+    assert cycle.verdict == "advance"
 
 
 @pytest.mark.asyncio
