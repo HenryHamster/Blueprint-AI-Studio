@@ -6,6 +6,8 @@ import {
   buildReviewPromptFingerprintContent,
   REVIEW_DELTA_FOCUS_NOTE,
   REVIEW_FIX_RESPONSES_INSTRUCTIONS,
+  buildReviewMergeStateSection,
+  type ReviewMergeState,
 } from './review-prompt.js';
 
 describe('buildReviewIterationPreamble — delta-focus gating', () => {
@@ -282,5 +284,84 @@ describe('buildReviewVerdictInstructions — block on substantiated code defects
     const restrictionsSentence = 'Check that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.';
     const count = (content.match(new RegExp(restrictionsSentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
     expect(count).toBe(1);
+  });
+});
+
+
+// ── Authoritative merge state ────────────────────────────────────────────────
+// See the block comment above buildReviewMergeStateSection: PR #17720 parked a
+// chain on a merge-conflict MAJOR that the reviewer manufactured with a
+// wrong-base `git merge-tree`. Each of the three cases must state the FACT and
+// then the RULE, and the three must not bleed into each other.
+describe('buildReviewMergeStateSection', () => {
+  const clean: ReviewMergeState = {
+    mergeable: true, mergeStateStatus: 'clean',
+    baseRef: 'research/3a85fb87', headSha: 'deadbeefcafe0011223344556677889900aabbcc', fetched: true,
+  };
+
+  it('mergeable: names base and head, forbids the finding AND the self-simulation', () => {
+    const out = buildReviewMergeStateSection(clean, 'main');
+    expect(out).toContain('merges cleanly into `research/3a85fb87`');
+    expect(out).toContain('deadbeefcafe0011223344556677889900aabbcc');
+    expect(out).toContain('mergeable_state: `clean`');
+    expect(out).toContain('do NOT raise a merge-conflict or "unresolved three-way conflict" finding');
+    expect(out).toContain('do NOT simulate the merge yourself');
+    // The exact defect mechanism, plus the method that refutes it.
+    expect(out).toContain('base that is not the true merge base fabricates conflict markers');
+    expect(out).toContain('legacy 3-argument');
+    expect(out).toContain('git merge-base origin/research/3a85fb87 HEAD');
+    expect(out).toContain('git merge-tree --write-tree origin/research/3a85fb87 HEAD');
+    expect(out).toContain('exit status is the answer');
+  });
+
+  it('not mergeable: the conflict finding is legitimate and must name the files', () => {
+    const out = buildReviewMergeStateSection(
+      { mergeable: false, mergeStateStatus: 'dirty', baseRef: 'main', headSha: 'abc123', fetched: true },
+      'main',
+    );
+    expect(out).toContain('does NOT merge cleanly into `main`');
+    expect(out).toContain('A merge-conflict finding is legitimate here');
+    expect(out).toContain('name the specific conflicting files');
+    expect(out).not.toContain('do NOT raise a merge-conflict or "unresolved three-way conflict" finding');
+    expect(out).not.toContain('do NOT simulate the merge yourself');
+  });
+
+  it.each([
+    ['fetch failed', { mergeable: undefined, fetched: false }],
+    ['still null after the re-poll', { mergeable: null, mergeStateStatus: 'unknown', fetched: true }],
+  ])('unknown (%s): says so and refuses to block on an unverified merge state', (_label, state) => {
+    const out = buildReviewMergeStateSection(state, 'main');
+    expect(out).toContain('The merge state of this PR could not be established');
+    expect(out).toContain('not grounds to block');
+    expect(out).toContain('do NOT raise a merge-conflict finding on an unverified merge state');
+    // An unknown state must never assert either FACT.
+    expect(out).not.toContain('merges cleanly into');
+    expect(out).not.toContain('do NOT simulate the merge yourself');
+    expect(out).not.toContain('A merge-conflict finding is legitimate here');
+  });
+
+  it('falls back to the handler-supplied base branch when GitHub returned no base ref', () => {
+    const out = buildReviewMergeStateSection({ mergeable: true, fetched: true }, 'automain');
+    expect(out).toContain('merges cleanly into `automain`');
+    expect(out).toContain('(head sha unavailable)');
+  });
+});
+
+describe('review prompt fingerprint — merge-state fragment', () => {
+  // Review telemetry A/Bs by fingerprint. A prompt fragment absent from the
+  // fingerprint content lets the wording change while the fingerprint claims
+  // the same prompt version, silently mixing prompt generations.
+  it('includes all three merge-state variants so an edit to any of them moves the fingerprint', () => {
+    const content = buildReviewPromptFingerprintContent();
+    expect(content).toContain('do NOT raise a merge-conflict or "unresolved three-way conflict" finding');
+    expect(content).toContain('A merge-conflict finding is legitimate here');
+    expect(content).toContain('The merge state of this PR could not be established');
+  });
+
+  it('binds the REQUEST_CHANGES merge-conflict ground to the authoritative section', () => {
+    const out = buildReviewVerdictInstructions('task-xyz');
+    expect(out).toContain('a merge conflict that the authoritative merge-state section above establishes');
+    expect(out).toContain('never one you inferred from your own merge simulation');
+    expect(out).not.toContain('or a merge conflict in the diff');
   });
 });

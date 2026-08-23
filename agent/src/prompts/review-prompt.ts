@@ -99,6 +99,61 @@ export function buildReviewDiffAccessHint(baseBranch: string): string {
   return `You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.`;
 }
 
+// ── Authoritative merge state (shared with prompt fingerprint) ───────────────
+// Rollup PR #17720 burned 7 review-fix attempts, plateaued at 2 unresolved
+// findings for 4 rounds and parked for a human on a MAJOR finding claiming
+// "unresolved three-way conflicts". There were none: the reviewer hand-ran the
+// legacy 3-argument `git merge-tree` with a base that was NOT the merge base,
+// and that form fabricates conflict markers when misfed. No fix agent can ever
+// close a finding about a conflict that does not exist, so the ledger could not
+// drain. The reviewer improvised because the verdict contract names "a merge
+// conflict in the diff" as a REQUEST_CHANGES ground while handing it neither an
+// authoritative signal nor a method. This section supplies both.
+export type ReviewMergeState = {
+  /** GitHub's `mergeable`: true/false once computed, null while its background
+   *  job is still running, undefined when we never established it. */
+  mergeable: boolean | null | undefined;
+  /** GitHub's `mergeable_state` (clean / dirty / blocked / behind / unknown). */
+  mergeStateStatus?: string;
+  baseRef?: string;
+  headSha?: string;
+  /** False when the fetch itself failed (network, non-200, unparseable JSON). */
+  fetched: boolean;
+};
+
+export function buildReviewMergeStateSection(
+  state: ReviewMergeState,
+  baseBranch: string,
+): string {
+  const base = state.baseRef || baseBranch || 'the base branch';
+  const head = state.headSha || '(head sha unavailable)';
+  const status = state.mergeStateStatus ? ` (mergeable_state: \`${state.mergeStateStatus}\`)` : '';
+  if (state.fetched && state.mergeable === true) {
+    return `## Authoritative merge state\n` +
+      `GitHub reports that this PR merges cleanly into \`${base}\` as of head \`${head}\`${status}. ` +
+      `That is the authoritative answer to whether this branch conflicts — it comes from the same ` +
+      `machinery that performs the merge.\n` +
+      `Therefore: do NOT raise a merge-conflict or "unresolved three-way conflict" finding, and do NOT ` +
+      `simulate the merge yourself. A hand-rolled \`git merge-tree\` given a base that is not the true ` +
+      `merge base fabricates conflict markers for a branch that merges cleanly; the legacy 3-argument ` +
+      `form is especially prone to this and has already parked a PR chain on a conflict that did not exist.\n` +
+      `If you still believe there is a genuine conflict, you must first run \`git merge-base origin/${base} HEAD\` ` +
+      `and \`git merge-tree --write-tree origin/${base} HEAD\` (its exit status is the answer: 0 means it merges ` +
+      `cleanly), and quote both commands and their output in the finding. Without that evidence a conflict ` +
+      `finding is not admissible.\n\n`;
+  }
+  if (state.fetched && state.mergeable === false) {
+    return `## Authoritative merge state\n` +
+      `GitHub reports that this PR does NOT merge cleanly into \`${base}\` as of head \`${head}\`${status}. ` +
+      `A merge-conflict finding is legitimate here — name the specific conflicting files in the finding so ` +
+      `the fix agent knows exactly what to resolve.\n\n`;
+  }
+  return `## Authoritative merge state\n` +
+    `The merge state of this PR could not be established (GitHub returned no computed answer). ` +
+    `Uncertainty rooted in something you could not verify is not grounds to block, so do NOT raise a ` +
+    `merge-conflict finding on an unverified merge state.\n\n`;
+}
+
 // ── Build instruction generator for review prompts ───────────────────────────
 // CI — a separate, authoritative gate — already runs the project's build,
 // type-check, eslint, and the full test suite; merge requires `ci_passed AND
@@ -233,7 +288,7 @@ export function buildReviewVerdictInstructions(taskId: string, opts?: { repairCo
 **APPROVE** — the change is ready to merge as-is. Use this when the code is correct, the tests cover the behavior, and nothing blocks shipping. Optional polish notes belong in \`feedback\` as non-blocking observations; they do NOT disqualify APPROVE.
 {"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here.", "resolutions": [{"issue_id": "BP-...", "disposition": "fixed|refuted|adjudicated", "reason": "Concrete evidence for closing this prior blocker."}]}
 
-**REQUEST_CHANGES** — block only on a concrete, substantiated CODE defect: a logic/correctness bug, a security hole, a missing test for new behavior, a broken invariant, a design flaw, or a merge conflict in the diff. Build/type-check/test pass is CI's job, not yours — do not block on it. Uncertainty rooted in something you could NOT verify in your sandbox (a command you couldn't run, a tool that was missing, an API that 401'd) is NOT grounds to block: judge the code on its merits and trust CI for build/test pass. If your concern is a real, substantiated defect, list it; if it is only a "couldn't confirm", do not REQUEST_CHANGES.
+**REQUEST_CHANGES** — block only on a concrete, substantiated CODE defect: a logic/correctness bug, a security hole, a missing test for new behavior, a broken invariant, a design flaw, or a merge conflict that the authoritative merge-state section above establishes (never one you inferred from your own merge simulation). Build/type-check/test pass is CI's job, not yours — do not block on it. Uncertainty rooted in something you could NOT verify in your sandbox (a command you couldn't run, a tool that was missing, an API that 401'd) is NOT grounds to block: judge the code on its merits and trust CI for build/test pass. If your concern is a real, substantiated defect, list it; if it is only a "couldn't confirm", do not REQUEST_CHANGES.
 {"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"issue_id": "BP-...", "severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}], "resolutions": [{"issue_id": "BP-...", "disposition": "fixed|refuted|adjudicated", "reason": "Concrete evidence for closing this prior blocker."}]}
 
 Every pushed repair receives an exact-SHA delta review, so there is no reviewer-waiver field.
@@ -332,6 +387,11 @@ export function buildReviewPromptFingerprintContent(
     REVIEW_FIX_RESPONSES_INSTRUCTIONS,
     buildReviewMasterPreamble('<PR>', '<BRANCH>', '<BASE>'),
     buildReviewDiffAccessHint('<BASE>'),
+    // All three merge-state variants are forced on: a task only ever renders
+    // one of them, but an edit to ANY of them must move the fingerprint.
+    buildReviewMergeStateSection({ mergeable: true, fetched: true, baseRef: '<BASE>', headSha: '<HEAD>', mergeStateStatus: '<STATE>' }, '<BASE>'),
+    buildReviewMergeStateSection({ mergeable: false, fetched: true, baseRef: '<BASE>', headSha: '<HEAD>', mergeStateStatus: '<STATE>' }, '<BASE>'),
+    buildReviewMergeStateSection({ mergeable: undefined, fetched: false }, '<BASE>'),
     buildReviewCoreGuidance(buildConfig, 'TASK_ID'),
   ];
   const rollupGuidance = buildRollupReviewGuidance(options.branch || '', options.baseBranch || 'main');
