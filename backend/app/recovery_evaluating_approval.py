@@ -28,6 +28,12 @@ is durable on GitHub), which makes FAILing it the one disposition that actually
 destroys something. See ``app.recovery_evaluating_prless_hold`` (split out
 only to respect this module's size cap) — incident: research task ``70c5ec8f``.
 
+The preserve-for-handmerge latch is a BOUNDED park, not a one-way door. See
+``app.recovery_evaluating_handmerge_latch``: after a second configurable window
+the engine re-reads the PR and DECIDES — reconcile an already-merged PR, MERGE
+one that is still provably green-and-clean, or re-arm a bounded number of times
+before falling through to the terminalization below.
+
 ``_handle_approval_gate_timeout`` takes the per-row locals it needs (``task``,
 ``ctx``, ``session``, ``now``) plus the runtime-config-derived spend-window
 values and returns ``True`` when it handled the row (the caller ``continue``s)
@@ -52,6 +58,13 @@ from app.admin_approval_authority import (
 )
 from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
 from app.models import TaskStatus
+from app.recovery_evaluating_handmerge_latch import (
+    HANDMERGE_LATCH_STAMPED_AT_KEY,
+    HANDMERGE_REDECIDE_MAX_REARMS,
+    HANDMERGE_REDECIDE_WINDOW_HOURS,
+    reconcile_merged_approval_hold,
+    redecide_preserved_handmerge_latch,
+)
 from app.spawn_calibration import SPEND_BUDGET_APPROVAL_HOLD_REASON
 from app.recovery_evaluating_prless_hold import (
     _approval_hold_pr_number,
@@ -101,6 +114,7 @@ async def _handle_approval_gate_timeout(
     spend_approval_fail_seconds,
     spend_hours,
     maybe_create_failure_alert,
+    handmerge_redecide_seconds: int = HANDMERGE_REDECIDE_WINDOW_HOURS * 3600,
 ) -> bool:
     """Approval-gate hard timeout for EVALUATING parents.
 
@@ -289,34 +303,13 @@ async def _handle_approval_gate_timeout(
                     exc_info=True,
                 )
             if _merged_pr_data is not None and bool(_merged_pr_data.get("merged")):
-                from app.models import Project
-                from app.rollup_state import _clear_rollup_transient_state
-                from app.recovery_evaluating_helpers import (
-                    _apply_rollup_merge_classification,
-                )
-
-                _merged_proj = await session.get(Project, task.project_id)
-                # Clear the approval hold — the work landed; this is terminal.
-                task.requires_approval = False
-                revoke_review_wait_approval_hold(task)
-                revoke_operator_approval_followup(task)
-                consume_approval_hold_metadata(
+                # Shared with the hand-merge latch's re-decision path so the
+                # two merged-PR reconciles cannot drift apart.
+                await reconcile_merged_approval_hold(
                     task,
-                    expected_episode=approval_hold_provenance(task),
-                )
-                _merged_ctx = _clear_rollup_transient_state(
-                    {**(task.context or {})}
-                )
-                _merged_ctx["rollup_pr_number"] = int(_merged_pr_num)
-                task.context = _merged_ctx
-                await _apply_rollup_merge_classification(
-                    task,
-                    _merged_proj,
                     session,
                     pr_number=int(_merged_pr_num),
-                    merged_base_branch=(
-                        (_merged_pr_data.get("base") or {}).get("ref")
-                    ),
+                    pr_data=_merged_pr_data,
                     source="recovery_evaluating.approval_gate_merged",
                     msg_terminal=(
                         f"✓ rollup PR #{_merged_pr_num} merged; reconciled "
@@ -326,21 +319,10 @@ async def _handle_approval_gate_timeout(
                         f"Approval-gate reconcile: rollup PR #{_merged_pr_num} "
                         f"merged into {{landed}}; awaiting downstream landing"
                     ),
-                    hotfix_lane=None,
-                    merge_commit_sha=_merged_pr_data.get("merge_commit_sha"),
-                )
-                flag_modified(task, "context")
-                session.add(task)
-                await session.commit()
-                logger.info(
-                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} approval-gate "
-                    f"timeout after {hours}h — rollup PR #{_merged_pr_num} "
-                    f"ALREADY MERGED; reconciled to {task.status} (not FAILED)"
-                )
-                await services.broadcast_to_project(
-                    str(task.project_id),
-                    "task_updated",
-                    {"task_id": str(task.id), "status": task.status},
+                    log_detail=(
+                        f"approval-gate timeout after {hours}h — rollup PR "
+                        f"#{_merged_pr_num} ALREADY MERGED"
+                    ),
                 )
                 return True
 
@@ -434,25 +416,26 @@ async def _handle_approval_gate_timeout(
                     # install-token-exhaustion window, which is exactly the incident
                     # the raising code exists to prevent.
                     #
-                    # PRESERVE instead. Be honest about what that means: the preserve
-                    # branch below persists ``approval_timeout_preserved_for_handmerge
-                    # =True``, and BOTH the guard above and the early-return below
-                    # then skip this task forever — so a transient blip LATCHES
-                    # preserve permanently. There is no "a later sweep re-decides once
-                    # GitHub is healthy"; this is a one-way door to human hand-merge.
+                    # PRESERVE instead. The preserve branch below persists
+                    # ``approval_timeout_preserved_for_handmerge=True``, which USED
+                    # TO BE a one-way door to human hand-merge: the early-return
+                    # under it skipped the row forever, so a transient blip latched
+                    # preserve permanently and the engine handed a question back to
+                    # a human that it had already answered.
                     #
-                    # That is deliberate and it is the right trade here: the outcome
-                    # is non-destructive (the PR stays OPEN, nothing is closed, no
-                    # CODE_ERROR) and it is OBSERVABLE (the branch fires a hand-merge
-                    # alert), so a latched preserve surfaces to an operator instead of
-                    # silently destroying a mergeable PR. Latching a PR open for a
-                    # human beats closing it because our quota ran out.
+                    # It is now a BOUNDED park. ``recovery_evaluating_handmerge_latch``
+                    # re-decides the latch after a second window: reconcile if the PR
+                    # merged, MERGE it if it is still provably green-and-clean, or
+                    # re-arm (a bounded number of times) and finally terminalize. The
+                    # outcome here stays non-destructive and observable — the PR is
+                    # left OPEN and an alert fires — but it no longer waits forever
+                    # on a human because our quota ran out for one sweep.
                     logger.warning(
                         f"[EVAL TIMEOUT] Preservability UNAVAILABLE for "
                         f"{str(task.id)[:8]} PR #{_pr_num} ({_unavail}) — PRESERVING "
                         f"for hand-merge rather than abandoning a PR we could not "
-                        f"read. NOTE: this LATCHES (approval_timeout_preserved_for_"
-                        f"handmerge); it will not be re-decided automatically."
+                        f"read. This park is BOUNDED: the latch is re-decided "
+                        f"automatically once its second window elapses."
                     )
                     _is_preservable = True
                 except Exception:
@@ -467,10 +450,15 @@ async def _handle_approval_gate_timeout(
                         f"timeout after {hours}h — PR #{_pr_num} is clean/mergeable, "
                         f"PRESERVING for hand-merge instead of abandoning"
                     )
+                    _redecide_hours = round(handmerge_redecide_seconds / 3600, 1)
                     task.context = {
                         **ctx,
                         "approval_timeout_preserved_for_handmerge": True,
                         "failure_detail": "approval_timeout_preserved_for_handmerge",
+                        # Stamp WHEN the latch was armed so the second window is
+                        # measurable. Without it the re-decision path cannot tell
+                        # a fresh park from a week-old one.
+                        HANDMERGE_LATCH_STAMPED_AT_KEY: now.isoformat(),
                     }
                     flag_modified(task, "context")
                     session.add(task)
@@ -479,7 +467,13 @@ async def _handle_approval_gate_timeout(
                         task,
                         session,
                         f"Approval-gate timeout after {hours}h — PR #{_pr_num} "
-                        f"left open for hand-merge (mergeable work, not abandoned)",
+                        f"is clean/mergeable and PRESERVED (not abandoned). This "
+                        f"park is BOUNDED, not a permanent hand-merge request: in "
+                        f"{_redecide_hours}h the engine re-decides it — merging the "
+                        f"PR if it is still green-and-clean, reconciling if it "
+                        f"already merged, otherwise re-arming up to "
+                        f"{HANDMERGE_REDECIDE_MAX_REARMS} times before "
+                        f"terminalizing.",
                     )
                     await services.broadcast_to_project(
                         str(task.project_id),
@@ -488,9 +482,26 @@ async def _handle_approval_gate_timeout(
                     )
                     return True
 
-        # Idempotent re-entry: already preserved on a prior sweep.
+        # BOUNDED RE-ENTRY: already preserved on a prior sweep. This used to be a
+        # bare ``return True`` — a ONE-WAY DOOR. Nothing ever re-decided, so the
+        # row sat EVALUATING with requires_approval=True forever waiting for a
+        # human to press Merge on a PR the engine had already PROVEN landable
+        # (task 129fb995 / PR #17720, MERGEABLE + CLEAN, 2026-08-23). The latch
+        # now gets a second bounded window and a real disposition; only an
+        # exhausted re-arm budget falls through to the terminalization below.
         if ctx.get("approval_timeout_preserved_for_handmerge"):
-            return True
+            if await redecide_preserved_handmerge_latch(
+                task,
+                ctx,
+                session,
+                now,
+                window_seconds=handmerge_redecide_seconds,
+            ):
+                return True
+            # Budget spent and the PR is provably not landable — cull the dud
+            # through the existing terminalization path. Re-read the context the
+            # re-decision just committed so the branches below see it.
+            ctx = task.context or {}
 
         # PR-LESS APPROVAL HOLD: the same non-destructive latch, for work that
         # has no PR to hand-merge. Everything above this line needs a PR number

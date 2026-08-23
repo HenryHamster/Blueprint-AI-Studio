@@ -40,6 +40,9 @@ from app.recovery_evaluating_strand import (
     _handle_rollup_lost_marker,
 )
 from app.recovery_evaluating_approval import _handle_approval_gate_timeout
+from app.recovery_evaluating_handmerge_latch import (
+    resolve_handmerge_redecide_seconds,
+)
 from app.recovery_evaluating_ci_backstop import _handle_ci_waiting_backstop
 from app.recovery_evaluating_pr_check import _handle_pr_state_check_pending
 from app.recovery_evaluating_reaped_owner import (
@@ -148,6 +151,12 @@ async def _check_evaluating_timeouts(progress_cb=None):
     except (ValueError, TypeError):
         _spend_hours = 24
     SPEND_APPROVAL_FAIL_SECONDS = _spend_hours * 3600
+    # Second bounded window before a preserved hand-merge latch is RE-DECIDED
+    # (reconcile a merged PR / merge a proven-clean one / bounded re-arm /
+    # terminalize). Defaults IN CODE to HANDMERGE_REDECIDE_WINDOW_HOURS — the
+    # runtime-config key only retunes an already-active behaviour, it never
+    # gates it on.
+    HANDMERGE_REDECIDE_SECONDS = resolve_handmerge_redecide_seconds(_runtime_config)
     # BLOCKED and PARKED are treated as terminal-for-now in this EVALUATING-timeout
     # sweep: both are durable non-terminal states that must NOT be cascade-CANCELLED
     # on a timeout. (a) Cancelling them destroys durable child state — a BLOCKED
@@ -404,6 +413,7 @@ async def _check_evaluating_timeouts(progress_cb=None):
                     spend_approval_fail_seconds=SPEND_APPROVAL_FAIL_SECONDS,
                     spend_hours=_spend_hours,
                     maybe_create_failure_alert=_maybe_create_failure_alert,
+                    handmerge_redecide_seconds=HANDMERGE_REDECIDE_SECONDS,
                 ):
                     continue
 
