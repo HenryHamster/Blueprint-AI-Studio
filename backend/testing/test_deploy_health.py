@@ -2178,3 +2178,60 @@ async def test_orchestrator_persist_zone_health_round_trips_consecutive_force_re
     _dh._consecutive_force_resumes = 0
     _dh._restore_health_streaks(snapshot)
     assert _dh._consecutive_force_resumes == 4
+
+
+@pytest.mark.asyncio
+async def test_local_production_boot_updates_sha_when_revision_name_is_unchanged(
+    mocker,
+):
+    """Sequential local-production boots must track each resolved serving SHA."""
+    from app import main as _main
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(SQLModel.metadata.create_all)
+
+    session_factory = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch.object(_main, "AsyncSessionLocal", session_factory)
+    mocker.patch.object(_main, "_current_revision", "local-dev")
+    mocker.patch.object(
+        _main,
+        "resolve_deployed_sha",
+        new=AsyncMock(side_effect=["rollout-a", "rollout-b", None]),
+    )
+    mocker.patch.object(_main, "_current_sha", "unknown")
+
+    try:
+        await _main._init_deployment_state()
+        async with session_factory() as session:
+            first = await session.get(DeploymentState, 1)
+            assert first is not None
+            assert first.current_sha == "rollout-a"
+
+        await _main._init_deployment_state()
+        async with session_factory() as session:
+            second = await session.get(DeploymentState, 1)
+            assert second is not None
+            assert second.current_sha == "rollout-b"
+
+        # An unresolved identity must replace stale evidence rather than let
+        # a prior SHA remain eligible for serving confirmation.
+        await _main._init_deployment_state()
+        async with session_factory() as session:
+            unresolved = await session.get(DeploymentState, 1)
+            assert unresolved is not None
+            assert unresolved.current_sha == "unknown"
+    finally:
+        async with engine.begin() as connection:
+            await connection.run_sync(SQLModel.metadata.drop_all)
+        await engine.dispose()

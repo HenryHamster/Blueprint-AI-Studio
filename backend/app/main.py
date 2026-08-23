@@ -426,12 +426,12 @@ async def _init_deployment_state():
     """Check/initialize deployment state on startup. Detects new deploys and rollbacks."""
     # Resolve the real serving SHA from the running Cloud Run revision before any
     # use of _current_sha (deploy-detection, the singleton row, /api/version all
-    # read it). Best-effort: returns None off Cloud Run or on any failure, in
-    # which case we keep the existing default ("unknown") and never block startup.
+    # read it). Best-effort: returns None off Cloud Run or on any failure. An
+    # unresolved identity is recorded as "unknown" below so stale persisted
+    # evidence can never be reused as serving confirmation.
     global _current_sha
     resolved = await resolve_deployed_sha()
-    if resolved:
-        _current_sha = resolved
+    _current_sha = resolved or "unknown"
 
     async with AsyncSessionLocal() as session:
         state = await session.get(DeploymentState, 1)
@@ -775,10 +775,16 @@ async def _init_deployment_state():
         except Exception:
             logger.debug("[DEPLOY] could not set boot lock_timeout (non-postgres?)")
 
-        if state.current_revision == _current_revision:
-            # Same revision — normal restart (cold start, scale event, etc.)
+        if (
+            state.current_revision == _current_revision
+            and state.current_sha == _current_sha
+        ):
+            # Same deployment identity — normal restart (cold start, scale
+            # event, etc.). A changed resolved SHA is a changed deployment,
+            # even when local-production keeps the revision name constant.
             logger.info(
-                f"[DEPLOY] Normal restart — same revision {_current_revision}, status={state.status}"
+                f"[DEPLOY] Normal restart — same deployment identity "
+                f"(revision={_current_revision}, sha={_current_sha}), status={state.status}"
             )
             return
 
