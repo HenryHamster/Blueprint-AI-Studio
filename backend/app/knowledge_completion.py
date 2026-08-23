@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -385,6 +386,27 @@ _MIN_REQUEST_KEYWORDS = 3
 # A clear miss is essentially-no overlap; require only a small fraction of the
 # request keywords to appear so borderline-but-genuine docs are not failed.
 _MIN_TOPIC_OVERLAP_RATIO = 0.1
+# ...but cap that fraction in absolute terms. A bare ratio punishes a carefully
+# specified request: at 10% a 10-keyword topic needs 1 matching keyword while a
+# 159-keyword topic needs 16, so the more detail an operator wrote into the
+# prompt, the harder the document had to work to be judged on-topic. That is
+# backwards. This probe exists to catch a document about a *different* subject,
+# and a handful of distinctive shared keywords settles that question regardless
+# of how long the request was. ``task_completion._FINDINGS_MAX_REQUIRED_OVERLAP``
+# is the findings lane's copy of this bound; move them together.
+_MAX_REQUIRED_TOPIC_OVERLAP = 4
+
+
+def _required_topic_overlap(request_keyword_count: int) -> int:
+    """Keywords a document must share with the request to read as on-topic.
+
+    ``_MIN_TOPIC_OVERLAP_RATIO`` of the request, rounded up, but never more than
+    ``_MAX_REQUIRED_TOPIC_OVERLAP`` -- and never less than one, so a request that
+    cleared ``_MIN_REQUEST_KEYWORDS`` still cannot be answered by a document that
+    shares nothing at all with it.
+    """
+    scaled = math.ceil(_MIN_TOPIC_OVERLAP_RATIO * request_keyword_count)
+    return max(1, min(scaled, _MAX_REQUIRED_TOPIC_OVERLAP))
 
 
 def _keywords(text: str) -> set[str]:
@@ -648,6 +670,9 @@ def _acceptance_probe_detail(
         "passed": _topic_responsiveness_miss(task, document) is None,
         "overlap": overlap,
         "total": total,
+        # Reported so an operator reading a failed probe can see what the bar
+        # actually was, not just how far short the document fell.
+        "required": _required_topic_overlap(total) if total else 0,
     }
     return detail
 
@@ -685,12 +710,13 @@ def _topic_responsiveness_miss(task: Task, document: dict[str, Any]) -> str | No
         " ".join(str(document.get(k) or "") for k in ("title", "summary", "body"))
     )
     overlap = request_keywords & doc_keywords
-    if len(overlap) / len(request_keywords) >= _MIN_TOPIC_OVERLAP_RATIO:
+    required = _required_topic_overlap(len(request_keywords))
+    if len(overlap) >= required:
         return None
     return (
         "output is not responsive to the requested topic "
         f"(only {len(overlap)}/{len(request_keywords)} topic keyword(s) appear "
-        "in the document title/summary/body)"
+        f"in the document title/summary/body; {required} required)"
     )
 
 

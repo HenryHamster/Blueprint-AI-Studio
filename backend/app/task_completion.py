@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import random
 import re
 import uuid
@@ -1837,6 +1838,32 @@ _FINDINGS_STOPWORDS = frozenset(
 )
 _FINDINGS_MIN_KWS = 3
 _FINDINGS_MIN_OVERLAP = 0.1
+# The overlap requirement is capped in absolute terms instead of scaling with
+# the length of the request. A bare fraction punishes a carefully specified
+# task: at 10% a 10-keyword request needs 1 matching keyword while a
+# 159-keyword request needs 16, so the more detail an operator wrote into the
+# prompt, the harder its findings had to work to be judged on-topic. That is
+# backwards, and on 2026-08-23 it killed a valid perf task at 8/159 matched
+# whose findings were plainly about the requested target.
+#
+# This gate exists to catch findings about a *different* subject, and a handful
+# of distinctive shared keywords settles that question regardless of how long
+# the request was. ``knowledge_completion._MAX_REQUIRED_TOPIC_OVERLAP`` is the
+# same threshold for the knowledge lane's copy of this probe; move them
+# together.
+_FINDINGS_MAX_REQUIRED_OVERLAP = 4
+
+
+def _findings_required_overlap(request_keyword_count: int) -> int:
+    """Keywords a set of findings must share with the request to read as on-topic.
+
+    ``_FINDINGS_MIN_OVERLAP`` of the request, rounded up, but never more than
+    ``_FINDINGS_MAX_REQUIRED_OVERLAP`` -- and never less than one, so a request
+    that cleared ``_FINDINGS_MIN_KWS`` can still not be answered by findings
+    that share nothing at all with it.
+    """
+    scaled = math.ceil(_FINDINGS_MIN_OVERLAP * request_keyword_count)
+    return max(1, min(scaled, _FINDINGS_MAX_REQUIRED_OVERLAP))
 
 
 def _findings_kws(text: str) -> set[str]:
@@ -1862,9 +1889,13 @@ def _findings_responsiveness_miss(task: Task, findings: list) -> str | None:
         )
     )
     overlap = req & doc
-    if len(overlap) / len(req) >= _FINDINGS_MIN_OVERLAP:
+    required = _findings_required_overlap(len(req))
+    if len(overlap) >= required:
         return None
-    return f"findings not responsive to target ({len(overlap)}/{len(req)} keyword(s) matched in titles/descriptions)"
+    return (
+        f"findings not responsive to target ({len(overlap)}/{len(req)} keyword(s) "
+        f"matched in titles/descriptions; {required} required)"
+    )
 
 
 def _findings_grounding_miss(findings: list) -> str | None:
@@ -1892,6 +1923,9 @@ def _findings_probe_detail(task: Task, findings: list) -> dict:
             "passed": _findings_responsiveness_miss(task, findings) is None,
             "overlap": len(req & doc),
             "total": len(req),
+            # Reported so an operator reading a failed probe can see what the
+            # bar actually was, not just how far short the findings fell.
+            "required": _findings_required_overlap(len(req)) if req else 0,
         },
         "grounding": {
             "passed": _findings_grounding_miss(findings) is None,
