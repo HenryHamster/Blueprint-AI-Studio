@@ -350,6 +350,11 @@ async def test_disposition_emits_exactly_one_deduped_operator_note(db_session, m
     assert "abandoned by autonomous disposition" in note.content
     assert "left OPEN" in note.content
     assert (note.context or {}).get("park_shape") == "abandon_candidate"
+    # The operator has to actually RECEIVE this.  An event_type missing from
+    # _EVENT_AUDIENCE_REGISTRY fails closed to strategist-internal, which
+    # writes the note and shows it to nobody -- silent, and green everywhere
+    # else.  Pin the routed audience, not just the prose.
+    assert (note.context or {}).get("audience") == "operator-fyi"
 
 
 async def test_double_sweep_is_idempotent(db_session, mocker):

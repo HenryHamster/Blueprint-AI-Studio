@@ -152,6 +152,13 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "lane_checkpoint_recover": OPERATOR_FYI,
     "lane_budget_near_exhausted": OPERATOR_FYI,
     "pilot_auto_disabled": OPERATOR_FYI,
+    # review_park_disposition._post_disposition_note: the operator-disposition
+    # window expired and the sweep abandoned the park on its own.  This is a
+    # record of a decision already taken, not a request for one -- the whole
+    # point of the sweep is that nobody has to answer it -- and the PR is left
+    # OPEN, so nothing irreversible happened.  Operator-fyi, never
+    # operator-action-needed.
+    "review_park_disposed": OPERATOR_FYI,
     # === Alert event types (from alert_policy.ALERT_EVENT_POLICIES) =======
     # Core portable alerts — operator-facing
     "task.failed": OPERATOR_FYI,
