@@ -706,6 +706,7 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_shard_balance.py
     testing/test_conversational_workday_protection.py
     testing/test_vitest_durations_freshness.py
+    testing/test_test_imports_checker.py
     )
     # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
     # The scripts roster is explicitly maintained above and checked by
