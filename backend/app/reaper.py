@@ -87,6 +87,7 @@ from app.time_utils import (
     exponential_backoff,
     set_retry_after,
 )
+from app.operator_failure_messages import compose_provision_failure_message
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 from app.reaper_post_orphan_sweep import run_post_orphan_sweep
 
@@ -2404,39 +2405,27 @@ async def reaper_service():
                                 task.vm_stopped_at = _utcnow()
                             if is_provision_failure:
                                 ctx = task.context or {}
-                                provision_zone = ctx.get(
-                                    "provision_zone", "unknown zone"
-                                )
-                                blacklisted_accounts = (
-                                    ctx.get("blacklisted_accounts", []) or []
-                                )
-                                sticky_accounts = (
-                                    ctx.get("provision_failed_accounts", []) or []
-                                )
-                                all_blocked = list(
-                                    {*blacklisted_accounts, *sticky_accounts}
-                                )
-                                acct_id = get_task_llm_account_id(ctx) or "no account"
-                                gcp_error = provision_err or "no GCP error captured"
-                                gcp_error_short = gcp_error[:200]
-                                # Distinguish: VM created but agent died vs. GCP API failure.
-                                # vm_provisioned_at is the fact that discriminates — it is set
-                                # exactly when the cloud created the VM. provision_zone is only
-                                # a label: a pre-claim death can leave it unresolved, so it must
-                                # not drive the classification.
-                                if task.vm_provisioned_at:
-                                    label = "Agent startup failed"
-                                    detail = f"VM created in {provision_zone} but agent never claimed task"
-                                    if all_blocked:
-                                        detail += f" (blacklisted {len(all_blocked)} account(s))"
-                                else:
-                                    label = "Provision failed"
-                                    detail = f"GCP error: {gcp_error_short}"
+                                # Substrate FIRST, zone/GCP fields only after.
+                                # Blueprint's fleet is three local bwrap runners;
+                                # a runner death has no zone and no GCP error, so
+                                # the old unconditional wording pointed operators
+                                # at "zone: unknown zone" / "GCP error: no GCP
+                                # error captured" for tasks 82eb352a and 4cd822c3
+                                # that in fact died on hamsterwheel with a real
+                                # agent_failure_category_raw in context.
                                 task.latest_status_message = (
-                                    f"{label} {provision_failures}x — "
-                                    f"zone: {provision_zone}, acct: {acct_id}. "
-                                    f"{detail}. "
-                                    f"Last reap: {reap_reason}"
+                                    compose_provision_failure_message(
+                                        vm_instance_id=task.vm_instance_id,
+                                        context=ctx,
+                                        vm_provisioned_at=task.vm_provisioned_at,
+                                        provision_failures=provision_failures,
+                                        account_id=(
+                                            get_task_llm_account_id(ctx)
+                                            or "no account"
+                                        ),
+                                        provision_error=provision_err,
+                                        reap_reason=reap_reason,
+                                    )
                                 )
                             else:
                                 task.latest_status_message = f"{fail_reason.capitalize()} — last reap: {reap_reason}"

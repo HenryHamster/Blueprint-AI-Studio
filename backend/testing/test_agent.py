@@ -24720,7 +24720,15 @@ async def test_two_failed_retries_bank_distinct_attempt_diagnostics(
     assert first_snapshot["retry_count_at_bank"] == 1
     assert first_snapshot["failure_class"] == "CODE_ERROR"
     assert first_snapshot["agent_failure_category_raw"] == "test_failed"
-    assert first_snapshot["failure_message_tail"] == "first attempt unit tests failed"
+    # The banked tail is the composed operator message, so it now LEADS with
+    # the category the same report carried (see
+    # agent_status._compose_operator_status_message — live tasks 1745bab4 and
+    # 075854e6 proved the verbatim tail could contradict that category). The
+    # agent's own free text is still there behind it, which is what this test
+    # is actually about: attempt 1 and attempt 2 keep distinct diagnostics.
+    assert first_snapshot["failure_message_tail"] == (
+        "test_failed — first attempt unit tests failed"
+    )
     assert first_snapshot["agent_error_report"]["stderr_tail"] == (
         "first structured stderr"
     )
@@ -24771,7 +24779,7 @@ async def test_two_failed_retries_bank_distinct_attempt_diagnostics(
     assert second_snapshot["failure_class"] == "CODE_ERROR"
     assert second_snapshot["agent_failure_category_raw"] == "incomplete"
     assert second_snapshot["failure_message_tail"] == (
-        "second attempt exited before publishing"
+        "incomplete — second attempt exited before publishing"
     )
     assert "agent_error_report" in first_snapshot
     assert "agent_error_report" not in second_snapshot, (
@@ -28665,3 +28673,151 @@ async def test_warm_claim_finalizer_allows_when_gate_off(db_session):
     await db_session.refresh(task)
     # Fence did not mutate the task — still QUEUED, requirement intact.
     assert task.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_status_message_leads_with_recorded_failure_category(
+    client: AsyncClient, db_session, mocker
+):
+    """The operator-facing message must not contradict the category the SAME
+    report carried.
+
+    Regression guard for live task ``075854e6`` (create, claude-sonnet-4-6):
+    ``latest_status_message`` read "No uncommitted changes found — the branch
+    is clean and matches the latest commit. There is no work to ship." while
+    ``context['agent_failure_category_raw']`` said ``rate_limited``. Two
+    mutually exclusive stories, and the writer surfaced the wrong one — it was
+    persisting the agent's last free-text line verbatim rather than the
+    structured category it already held.
+
+    The free text is deliberately still present: a message that says only the
+    category is worse than one that says why.
+
+    Reported here as ``test_failed`` rather than ``rate_limited`` on purpose.
+    A report the classifier resolves to RATE_LIMIT is REQUEUED, not terminal,
+    and the requeue path overwrites ``latest_status_message`` a few hundred
+    lines later with its own category-consistent "Rate Limited — requeued"
+    text, so it can never exercise this writer. The live 075854e6 row proves
+    the raw label and the surfaced message can disagree whenever the derived
+    class is not the requeued one — the raw label is stored verbatim while the
+    class is re-derived. The exact ``rate_limited`` + "no work to ship"
+    pairing is pinned directly on the composer in
+    ``test_operator_failure_messages.py``.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Category Truth", user_id="test-user-cat-truth")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-cat-truth",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    free_text = (
+        "No uncommitted changes found — the branch is clean and matches the "
+        "latest commit. There is no work to ship."
+    )
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "test_failed",
+            "logs": free_text,
+        },
+        headers={"x-agent-token": create_agent_token(str(task.id), "agent-vm-cat-truth")},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    assert msg.startswith("test_failed"), (
+        "the operator message must lead with the recorded failure category, "
+        f"not the agent's contradicting last line: {msg!r}"
+    )
+    assert free_text in msg, (
+        f"informative free text must be kept as supporting detail: {msg!r}"
+    )
+    assert (task.context or {}).get("agent_failure_category_raw") == "test_failed"
+
+
+@pytest.mark.asyncio
+async def test_status_message_never_persists_a_raw_provider_stream_fragment(
+    client: AsyncClient, db_session, mocker
+):
+    """A tail slice through the provider's NDJSON stream is not a message.
+
+    Regression guard for live task ``1745bab4`` (create, deepseek-v4-flash):
+    ``latest_status_message`` was literally
+    ``se_id":null,"uuid":"21ba040c-…"} {"type":"stream_event","event":
+    {"type":"content_block_delta",…}}`` — a fragment starting mid-token,
+    carrying zero operator signal — while the report's own
+    ``failure_category`` said ``blocked_precondition``.
+
+    The real diagnostic usually sits just ABOVE the frames the 8000-char tail
+    landed in, so the writer strips the frames and keeps that line rather than
+    blanking the message.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Stream Fragment", user_id="test-user-stream-frag")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-stream-frag",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fragment = (
+        'se_id":null,"uuid":"21ba040c-6d4a-4c1e-9e5f-2b7c0a91d3ef"} '
+        '{"type":"stream_event","event":{"type":"content_block_delta",'
+        '"delta":{"type":"text_delta","text":"…"}}}'
+    )
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "blocked_precondition",
+            "logs": "ERROR precondition: base branch has no commits\n" + fragment,
+        },
+        headers={
+            "x-agent-token": create_agent_token(str(task.id), "agent-vm-stream-frag")
+        },
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    assert "stream_event" not in msg and "content_block_delta" not in msg, (
+        f"a raw provider stream frame reached the operator message: {msg!r}"
+    )
+    assert not msg.startswith('se_id"'), (
+        f"the message must not begin mid-token: {msg!r}"
+    )
+    assert msg.startswith("blocked_precondition"), (
+        f"the recorded category must lead the message: {msg!r}"
+    )
+    assert "ERROR precondition: base branch has no commits" in msg, (
+        "the real diagnostic above the stream frames must survive, not be "
+        f"blanked along with them: {msg!r}"
+    )

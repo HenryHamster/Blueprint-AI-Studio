@@ -2018,6 +2018,70 @@ async def test_provision_failure_message_gcp_api_failure_when_vm_never_provision
 
 
 @pytest.mark.asyncio
+async def test_provision_failure_message_on_local_runner_has_no_gcp_vocabulary(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A local-runner death must be reported in runner vocabulary, not GCP's.
+
+    Regression guard for live tasks ``82eb352a`` and ``4cd822c3``. Both ran on
+    ``hamsterwheel`` (``vm_instance_id='runner:707de5fb-…'``) and recorded a
+    real ``agent_failure_category_raw='walkthrough_harness_failed'``, yet the
+    terminal message read::
+
+        Provision failed 3x — zone: unknown zone, acct: 406bb865-….
+        GCP error: no GCP error captured. Last reap: Silent pre-claim death …
+
+    Blueprint's fleet is three local bwrap runners; there is no zone and no
+    GCP error to look up, so those two literal defaults sent the operator to
+    inspect infrastructure that was never involved while the actual cause sat
+    unread in ``task.context``. ``started_at`` is set here because the runner
+    had already pulled the pin — that is what takes the task past
+    ``_is_runner_pinned_awaiting_pull`` and into the reap path the live tasks
+    took.
+    """
+    mocker.patch("app.reaper.get_provision_error", return_value="")
+    mocker.patch("app.reaper.get_vm_zone", return_value=None)
+
+    runner_uuid = "707de5fb-1c22-4f60-8a19-9d0be2f4a3c1"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"runner:{runner_uuid}",
+        status=TaskStatus.PROVISIONING,
+        started_at=_utcnow() - timedelta(minutes=30),
+        vm_provisioned_at=_utcnow() - timedelta(minutes=7),
+        last_heartbeat=None,
+        context={
+            "provision_failures": 99,
+            "runner_hostname": "hamsterwheel",
+            "runner_target_id": runner_uuid,
+            "agent_failure_category_raw": "walkthrough_harness_failed",
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach the terminal-persist path"
+    msg = t.latest_status_message or ""
+    assert "GCP" not in msg, (
+        f"GCP vocabulary on a fleet with no GCP: {msg!r}"
+    )
+    assert "zone" not in msg.lower(), (
+        f"a local runner has no zone; 'unknown zone' reads as a finding: {msg!r}"
+    )
+    assert "hamsterwheel" in msg, f"the runner must be named: {msg!r}"
+    assert "707de5fb" in msg, f"the runner id must be named: {msg!r}"
+    assert "walkthrough_harness_failed" in msg, (
+        f"the recorded agent category is the real cause and must surface "
+        f"instead of being buried in context: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reaper_enrichment_block_records_failure_class_from_initial_classification(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):

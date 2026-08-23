@@ -9,7 +9,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 617 | 968,388 | 25,909 | 13,675.964s (372 files) | 245 |
+| backend | 619 | 969,531 | 25,951 | 13,675.964s (372 files) | 247 |
 | admin-ui | 253 | 100,519 | 4,414 | 209.620s (253 files) | 0 |
 | agent | 125 | 111,097 | 5,860 | 72.033s (125 files) | 0 |
 
@@ -24,11 +24,11 @@ The queue includes every currently collected backend, admin-ui, and agent test f
 | 3 | P2 | backend | `backend/testing/test_review_pipeline.py` | 19,975 | 422 | critical (>5000 LOC) | 557.274s measured | — |
 | 4 | P2 | backend | `backend/testing/test_pipeline.py` | 6,837 | 277 | critical (>5000 LOC) | 524.226s measured | — |
 | 5 | P2 | backend | `backend/testing/test_task_lifecycle.py` | 12,505 | 314 | critical (>5000 LOC) | 413.882s measured | — |
-| 6 | P2 | backend | `backend/testing/test_reaper.py` | 20,684 | 484 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 484 |
+| 6 | P2 | backend | `backend/testing/test_reaper.py` | 20,748 | 485 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 485 |
 | 7 | P2 | backend | `backend/testing/test_research_completion.py` | 23,835 | 530 | critical (>5000 LOC) | 137.469s measured | — |
 | 8 | P2 | backend | `backend/testing/test_playbook_sr_metrics.py` | 8,196 | 148 | critical (>5000 LOC) | 133.180s measured | — |
 | 9 | P2 | backend | `backend/testing/test_autonomous_research.py` | 20,226 | 393 | critical (>5000 LOC) | 125.162s measured | — |
-| 10 | P2 | backend | `backend/testing/test_agent.py` | 28,667 | 503 | critical (>5000 LOC) | 122.224s measured | — |
+| 10 | P2 | backend | `backend/testing/test_agent.py` | 28,823 | 505 | critical (>5000 LOC) | 122.224s measured | — |
 | 11 | P2 | backend | `backend/testing/test_invariants.py` | 15,142 | 271 | critical (>5000 LOC) | 120.389s measured | — |
 | 12 | P2 | backend | `backend/testing/test_local_runner.py` | 13,861 | 345 | critical (>5000 LOC) | 111.153s measured | — |
 | 13 | P2 | backend | `backend/testing/test_digest.py` | 11,003 | 231 | critical (>5000 LOC) | 86.555s measured | — |
@@ -47,8 +47,8 @@ The queue includes every currently collected backend, admin-ui, and agent test f
 | 26 | P2 | backend | `backend/testing/test_compute_image_build_local.py` | 8,169 | 228 | critical (>5000 LOC) | 42.722s measured | — |
 | 27 | P2 | backend | `backend/testing/test_efficiency_snapshot.py` | 12,740 | 314 | critical (>5000 LOC) | 39.993s measured | — |
 | 28 | P2 | backend | `backend/testing/test_ci_completion.py` | 8,900 | 146 | critical (>5000 LOC) | 37.248s measured | — |
-| 29 | P2 | backend | `backend/testing/test_evaluating.py` | 6,043 | 92 | critical (>5000 LOC) | 33.386s measured | — |
-| 30 | P2 | backend | `backend/testing/test_direction_outcomes.py` | 10,387 | 191 | critical (>5000 LOC) | 26.802s measured | — |
+| 29 | P2 | backend | `backend/testing/test_evaluating.py` | 6,343 | 96 | critical (>5000 LOC) | 33.386s measured | — |
+| 30 | P2 | backend | `backend/testing/test_direction_outcomes.py` | 10,397 | 191 | critical (>5000 LOC) | 26.802s measured | — |
 | 31 | P2 | backend | `backend/testing/test_warm_pool_maintainer.py` | 5,828 | 122 | critical (>5000 LOC) | 17.404s measured | — |
 | 32 | P2 | backend | `backend/testing/test_github.py` | 5,847 | 185 | critical (>5000 LOC) | 17.135s measured | — |
 | 33 | P2 | backend | `backend/testing/test_salvage_bundle_standalone.py` | 7,737 | 239 | critical (>5000 LOC) | 8.485s measured | — |
@@ -97,7 +97,7 @@ The queue includes every currently collected backend, admin-ui, and agent test f
 | 76 | P3 | backend | `backend/testing/test_blocked_need_resolution.py` | 4,481 | 138 | high (3000–5000 LOC) | 8.477s measured | — |
 | 77 | P3 | backend | `backend/testing/test_pack_under_budget.py` | 3,211 | 66 | high (3000–5000 LOC) | 6.628s measured | — |
 | 78 | P3 | backend | `backend/testing/test_admin_routers__messages.py` | 4,897 | 140 | high (3000–5000 LOC) | 3.650s measured | protected; declared floor 140 |
-| 79 | P3 | backend | `backend/testing/test_alert_dispatch.py` | 3,259 | 78 | high (3000–5000 LOC) | 1.590s measured | — |
+| 79 | P3 | backend | `backend/testing/test_alert_dispatch.py` | 3,298 | 79 | high (3000–5000 LOC) | 1.590s measured | — |
 | 80 | P3 | agent | `agent/src/index.watchdog.test.ts` | 3,507 | 113 | high (3000–5000 LOC) | 0.480s measured | — |
 | 81 | P3 | backend | `backend/testing/test_repo_bootstrap.py` | 3,989 | 81 | high (3000–5000 LOC) | 0.380s measured | — |
 | 82 | P3 | agent | `agent/src/handlers/review-fix.test.ts` | 4,333 | 223 | high (3000–5000 LOC) | 0.081s measured | — |
@@ -124,7 +124,7 @@ The queue includes every currently collected backend, admin-ui, and agent test f
 | 103 | P5 | backend | `backend/testing/test_staged_directions.py` | 1,694 | 40 | moderate (1500–2999 LOC) | 29.493s measured | — |
 | 104 | P5 | backend | `backend/testing/test_warm_pool.py` | 1,591 | 45 | moderate (1500–2999 LOC) | 26.162s measured | — |
 | 105 | P5 | backend | `backend/testing/test_payload_schemas.py` | 2,161 | 148 | moderate (1500–2999 LOC) | 18.922s measured | — |
-| 106 | P5 | backend | `backend/testing/test_deploy_health.py` | 2,180 | 80 | moderate (1500–2999 LOC) | 17.586s measured | — |
+| 106 | P5 | backend | `backend/testing/test_deploy_health.py` | 2,237 | 81 | moderate (1500–2999 LOC) | 17.586s measured | — |
 | 107 | P5 | backend | `backend/testing/test_migration_apply_gate.py` | 2,900 | 86 | moderate (1500–2999 LOC) | 17.539s measured | — |
 | 108 | P5 | backend | `backend/testing/test_ci_compliance_gate.py` | 2,992 | 55 | moderate (1500–2999 LOC) | 16.687s measured | — |
 | 109 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.test.tsx` | 2,791 | 77 | moderate (1500–2999 LOC) | 14.213s measured | protected; declared floor 77 |
@@ -925,92 +925,94 @@ The queue includes every currently collected backend, admin-ui, and agent test f
 | 904 | G | backend | `backend/testing/test_admin_orchestrator_errors.py` | 282 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
 | 905 | G | backend | `backend/testing/test_admin_approval_gate_release_authority.py` | 281 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
 | 906 | G | backend | `backend/testing/test_automatic_task_creation_authority.py` | 280 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 907 | G | backend | `backend/testing/test_strategic_memory_source_schema.py` | 280 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 908 | G | backend | `backend/testing/test_project_outcome_projection.py` | 277 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 909 | G | backend | `backend/testing/test_warm_claim_account_attribution.py` | 274 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 910 | G | backend | `backend/testing/test_discovery_review_sequencing.py` | 271 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 911 | G | backend | `backend/testing/test_migration_0669_backfill_direction_fa_telemetry.py` | 271 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 912 | G | backend | `backend/testing/test_test_estate_ranked_queue.py` | 270 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 913 | G | backend | `backend/testing/test_migration_0696_project_sr_analytics.py` | 269 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 914 | G | backend | `backend/testing/test_rollup_premerge_tip.py` | 260 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 915 | G | backend | `backend/testing/test_scripts_test_lane.py` | 257 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 916 | G | backend | `backend/testing/test_migration_0720_direction_index_repair.py` | 255 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 917 | G | backend | `backend/testing/test_compute_secret_manifest.py` | 252 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 918 | G | backend | `backend/testing/test_strategic_memory_claim_redaction_repair_retry.py` | 252 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 919 | G | backend | `backend/testing/test_strategic_resident_work_state.py` | 248 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 920 | G | backend | `backend/testing/test_admin_bulk_cancellation_fencing.py` | 246 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 921 | G | backend | `backend/testing/test_strategic_memory_governance.py` | 245 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 922 | G | backend | `backend/testing/test_strategic_memory_knowledge.py` | 245 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 923 | G | backend | `backend/testing/test_strategic_workday_handoff_recovery.py` | 242 | 3 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 3 |
-| 924 | G | backend | `backend/testing/test_automatic_task_creation_producers.py` | 233 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 925 | G | backend | `backend/testing/test_migration_0657_0671_resident_session_id.py` | 228 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 926 | G | backend | `backend/testing/test_discovery_runtime_integration.py` | 227 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 927 | G | backend | `backend/testing/test_release_qualifier_candidate_sha_stamp.py` | 225 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 928 | G | backend | `backend/testing/test_terminal_rollup_pr_sweep.py` | 219 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 929 | G | backend | `backend/testing/test_migration_0668_drop_projectcomputeimagebuild.py` | 218 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 930 | G | backend | `backend/testing/test_migration_0698_cochange_state.py` | 217 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 931 | G | backend | `backend/testing/test_migration_0717_strategic_memory_semantic_ledger.py` | 217 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 932 | G | backend | `backend/testing/test_review_wait_monitor_owned_gate.py` | 206 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 933 | G | backend | `backend/testing/test_compute_artifact_iam.py` | 204 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 934 | G | backend | `backend/testing/test_rollup_handoff_ci_gate.py` | 204 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 935 | G | backend | `backend/testing/test_anomaly_persistence.py` | 203 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 936 | G | backend | `backend/testing/test_vm_lifecycle_forensics.py` | 196 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 937 | G | backend | `backend/testing/test_release_ownership.py` | 195 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 938 | G | backend | `backend/testing/test_migration_0656_projectmessage_context_audience_index.py` | 194 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 939 | G | backend | `backend/testing/test_projects.py` | 186 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 940 | G | backend | `backend/testing/test_user_management.py` | 186 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
-| 941 | G | backend | `backend/testing/test_strategic_memory_invariants.py` | 182 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 942 | G | backend | `backend/testing/test_release_operator_commit_gate.py` | 181 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 943 | G | backend | `backend/testing/test_admin_task_requeue_terminal.py` | 180 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 944 | G | backend | `backend/testing/test_strategic_op_contracts.py` | 179 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 945 | G | backend | `backend/testing/test_voice_credentials.py` | 178 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 946 | G | backend | `backend/testing/test_strategic_memory_sources.py` | 174 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 947 | G | backend | `backend/testing/test_research_mem_eval.py` | 172 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 948 | G | backend | `backend/testing/test_task_lifecycle_modularity.py` | 162 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 949 | G | backend | `backend/testing/test_frontend_static.py` | 155 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 950 | G | backend | `backend/testing/test_recovery_sidecar.py` | 155 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 951 | G | backend | `backend/testing/test_release_artifact_freshness.py` | 150 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 952 | G | backend | `backend/testing/test_strategic_correctness_preflight.py` | 150 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 953 | G | backend | `backend/testing/test_sr_analytics_store.py` | 148 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 954 | G | backend | `backend/testing/test_strategic_workday_mutation_rebind.py` | 148 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
-| 955 | G | backend | `backend/testing/test_migration_0722_discovery_controller.py` | 147 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 956 | G | backend | `backend/testing/test_livekit_tokens.py` | 143 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 957 | G | backend | `backend/testing/test_release_activation_after_timeout.py` | 143 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 958 | G | backend | `backend/testing/test_compute_execution_documents.py` | 130 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 959 | G | backend | `backend/testing/test_execution_capability_requirements.py` | 126 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 960 | G | backend | `backend/testing/test_release_qualifier_retained_scoring.py` | 125 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 961 | G | backend | `backend/testing/test_migration_0713_hot_sweep_indexes.py` | 124 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 962 | G | backend | `backend/testing/test_release_promotion_compute_image_refresh.py` | 124 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 963 | G | backend | `backend/testing/test_release_qualifier.py` | 124 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 964 | G | backend | `backend/testing/test_verification_toolchain.py` | 121 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 965 | G | backend | `backend/testing/test_post_commit_recovery_claim.py` | 120 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 966 | G | backend | `backend/testing/test_local_app_release.py` | 118 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 967 | G | backend | `backend/testing/test_admin_promotion_enablement.py` | 114 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 968 | G | backend | `backend/testing/test_migration_0716_strategic_memory_source_control_plane.py` | 112 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 969 | G | backend | `backend/testing/test_release_serving_reason_attribution.py` | 108 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 970 | G | backend | `backend/testing/test_websocket_server_integration.py` | 104 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 971 | G | backend | `backend/testing/test_task_counts_endpoint.py` | 100 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 972 | G | backend | `backend/testing/test_admin_strategic_memory.py` | 99 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 973 | G | backend | `backend/testing/test_release_prepromotion_rehearsal_contracts.py` | 99 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 974 | G | backend | `backend/testing/test_rollup_open_pr_reconciliation.py` | 94 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 975 | G | backend | `backend/testing/test_runbook_drift.py` | 91 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 976 | G | backend | `backend/testing/test_vm_lifecycle_runner_doomed_marker.py` | 89 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 977 | G | backend | `backend/testing/test_agent_task_capabilities.py` | 88 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 978 | G | backend | `backend/testing/test_qualifier_smoketest_retired.py` | 86 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 979 | G | backend | `backend/testing/test_admin_task_mutations_import.py` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 980 | G | backend | `backend/testing/test_strategic_resident_activity.py` | 85 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 981 | G | backend | `backend/testing/test_migration_0718_strategic_memory_timezone_columns.py` | 84 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 982 | G | backend | `backend/testing/test_release_activation.py` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 983 | G | backend | `backend/testing/test_direction_terminal_guard.py` | 80 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 984 | G | backend | `backend/testing/test_blocked_recheck_autonomy.py` | 79 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 985 | G | backend | `backend/testing/test_strategic_stall_visibility.py` | 71 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 986 | G | backend | `backend/testing/test_research_deferred_carry.py` | 62 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 987 | G | backend | `backend/testing/test_migration_0719_validate_task_context_size_constraint.py` | 57 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 988 | G | backend | `backend/testing/test_migration_0715_strategic_context_envelopes.py` | 53 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 989 | G | backend | `backend/testing/test_github_oauth_origins.py` | 52 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 990 | G | backend | `backend/testing/test_task_list_pagination.py` | 51 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 991 | G | backend | `backend/testing/test_agent_task_contract.py` | 50 | 0 | under 1500 LOC | unknown (no committed measurement) | — |
-| 992 | G | backend | `backend/testing/test_agent_memory_consolidation.py` | 43 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 993 | G | backend | `backend/testing/test_compute_outcome_status.py` | 34 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 994 | G | backend | `backend/testing/test_orchestrator_health_authority.py` | 32 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 995 | G | backend | `backend/testing/test_failure_classification_retained.py` | 11 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 907 | G | backend | `backend/testing/test_operator_failure_messages.py` | 280 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 908 | G | backend | `backend/testing/test_strategic_memory_source_schema.py` | 280 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 909 | G | backend | `backend/testing/test_project_outcome_projection.py` | 277 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 910 | G | backend | `backend/testing/test_warm_claim_account_attribution.py` | 274 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 911 | G | backend | `backend/testing/test_discovery_review_sequencing.py` | 271 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 912 | G | backend | `backend/testing/test_migration_0669_backfill_direction_fa_telemetry.py` | 271 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 913 | G | backend | `backend/testing/test_test_estate_ranked_queue.py` | 270 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 914 | G | backend | `backend/testing/test_migration_0696_project_sr_analytics.py` | 269 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 915 | G | backend | `backend/testing/test_rollup_premerge_tip.py` | 260 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 916 | G | backend | `backend/testing/test_scripts_test_lane.py` | 257 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 917 | G | backend | `backend/testing/test_migration_0720_direction_index_repair.py` | 255 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 918 | G | backend | `backend/testing/test_compute_secret_manifest.py` | 252 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 919 | G | backend | `backend/testing/test_strategic_memory_claim_redaction_repair_retry.py` | 252 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 920 | G | backend | `backend/testing/test_strategic_resident_work_state.py` | 248 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 921 | G | backend | `backend/testing/test_admin_bulk_cancellation_fencing.py` | 246 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 922 | G | backend | `backend/testing/test_strategic_memory_governance.py` | 245 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 923 | G | backend | `backend/testing/test_strategic_memory_knowledge.py` | 245 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 924 | G | backend | `backend/testing/test_strategic_workday_handoff_recovery.py` | 242 | 3 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 3 |
+| 925 | G | backend | `backend/testing/test_completion_topic_overlap.py` | 237 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
+| 926 | G | backend | `backend/testing/test_automatic_task_creation_producers.py` | 233 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 927 | G | backend | `backend/testing/test_migration_0657_0671_resident_session_id.py` | 228 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 928 | G | backend | `backend/testing/test_discovery_runtime_integration.py` | 227 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 929 | G | backend | `backend/testing/test_release_qualifier_candidate_sha_stamp.py` | 225 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 930 | G | backend | `backend/testing/test_terminal_rollup_pr_sweep.py` | 219 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 931 | G | backend | `backend/testing/test_migration_0668_drop_projectcomputeimagebuild.py` | 218 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 932 | G | backend | `backend/testing/test_migration_0698_cochange_state.py` | 217 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 933 | G | backend | `backend/testing/test_migration_0717_strategic_memory_semantic_ledger.py` | 217 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 934 | G | backend | `backend/testing/test_review_wait_monitor_owned_gate.py` | 206 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 935 | G | backend | `backend/testing/test_compute_artifact_iam.py` | 204 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 936 | G | backend | `backend/testing/test_rollup_handoff_ci_gate.py` | 204 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 937 | G | backend | `backend/testing/test_anomaly_persistence.py` | 203 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 938 | G | backend | `backend/testing/test_vm_lifecycle_forensics.py` | 196 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 939 | G | backend | `backend/testing/test_release_ownership.py` | 195 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 940 | G | backend | `backend/testing/test_migration_0656_projectmessage_context_audience_index.py` | 194 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 941 | G | backend | `backend/testing/test_projects.py` | 186 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 942 | G | backend | `backend/testing/test_user_management.py` | 186 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
+| 943 | G | backend | `backend/testing/test_strategic_memory_invariants.py` | 182 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 944 | G | backend | `backend/testing/test_release_operator_commit_gate.py` | 181 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 945 | G | backend | `backend/testing/test_admin_task_requeue_terminal.py` | 180 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 946 | G | backend | `backend/testing/test_strategic_op_contracts.py` | 179 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 947 | G | backend | `backend/testing/test_voice_credentials.py` | 178 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 948 | G | backend | `backend/testing/test_strategic_memory_sources.py` | 174 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 949 | G | backend | `backend/testing/test_research_mem_eval.py` | 172 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 950 | G | backend | `backend/testing/test_task_lifecycle_modularity.py` | 162 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 951 | G | backend | `backend/testing/test_frontend_static.py` | 155 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 952 | G | backend | `backend/testing/test_recovery_sidecar.py` | 155 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 953 | G | backend | `backend/testing/test_release_artifact_freshness.py` | 150 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 954 | G | backend | `backend/testing/test_strategic_correctness_preflight.py` | 150 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 955 | G | backend | `backend/testing/test_sr_analytics_store.py` | 148 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 956 | G | backend | `backend/testing/test_strategic_workday_mutation_rebind.py` | 148 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
+| 957 | G | backend | `backend/testing/test_migration_0722_discovery_controller.py` | 147 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 958 | G | backend | `backend/testing/test_livekit_tokens.py` | 143 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 959 | G | backend | `backend/testing/test_release_activation_after_timeout.py` | 143 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 960 | G | backend | `backend/testing/test_compute_execution_documents.py` | 130 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 961 | G | backend | `backend/testing/test_execution_capability_requirements.py` | 126 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 962 | G | backend | `backend/testing/test_release_qualifier_retained_scoring.py` | 125 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 963 | G | backend | `backend/testing/test_migration_0713_hot_sweep_indexes.py` | 124 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 964 | G | backend | `backend/testing/test_release_promotion_compute_image_refresh.py` | 124 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 965 | G | backend | `backend/testing/test_release_qualifier.py` | 124 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 966 | G | backend | `backend/testing/test_verification_toolchain.py` | 121 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 967 | G | backend | `backend/testing/test_post_commit_recovery_claim.py` | 120 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 968 | G | backend | `backend/testing/test_local_app_release.py` | 118 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 969 | G | backend | `backend/testing/test_admin_promotion_enablement.py` | 114 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 970 | G | backend | `backend/testing/test_migration_0716_strategic_memory_source_control_plane.py` | 112 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 971 | G | backend | `backend/testing/test_release_serving_reason_attribution.py` | 108 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 972 | G | backend | `backend/testing/test_websocket_server_integration.py` | 104 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 973 | G | backend | `backend/testing/test_task_counts_endpoint.py` | 100 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 974 | G | backend | `backend/testing/test_admin_strategic_memory.py` | 99 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 975 | G | backend | `backend/testing/test_release_prepromotion_rehearsal_contracts.py` | 99 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 976 | G | backend | `backend/testing/test_rollup_open_pr_reconciliation.py` | 94 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 977 | G | backend | `backend/testing/test_runbook_drift.py` | 91 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 978 | G | backend | `backend/testing/test_vm_lifecycle_runner_doomed_marker.py` | 89 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 979 | G | backend | `backend/testing/test_agent_task_capabilities.py` | 88 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 980 | G | backend | `backend/testing/test_qualifier_smoketest_retired.py` | 86 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 981 | G | backend | `backend/testing/test_admin_task_mutations_import.py` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 982 | G | backend | `backend/testing/test_strategic_resident_activity.py` | 85 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 983 | G | backend | `backend/testing/test_migration_0718_strategic_memory_timezone_columns.py` | 84 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 984 | G | backend | `backend/testing/test_release_activation.py` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 985 | G | backend | `backend/testing/test_direction_terminal_guard.py` | 80 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 986 | G | backend | `backend/testing/test_blocked_recheck_autonomy.py` | 79 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 987 | G | backend | `backend/testing/test_strategic_stall_visibility.py` | 71 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 988 | G | backend | `backend/testing/test_research_deferred_carry.py` | 62 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 989 | G | backend | `backend/testing/test_migration_0719_validate_task_context_size_constraint.py` | 57 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 990 | G | backend | `backend/testing/test_migration_0715_strategic_context_envelopes.py` | 53 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 991 | G | backend | `backend/testing/test_github_oauth_origins.py` | 52 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 992 | G | backend | `backend/testing/test_task_list_pagination.py` | 51 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 993 | G | backend | `backend/testing/test_agent_task_contract.py` | 50 | 0 | under 1500 LOC | unknown (no committed measurement) | — |
+| 994 | G | backend | `backend/testing/test_agent_memory_consolidation.py` | 43 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 995 | G | backend | `backend/testing/test_compute_outcome_status.py` | 34 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 996 | G | backend | `backend/testing/test_orchestrator_health_authority.py` | 32 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 997 | G | backend | `backend/testing/test_failure_classification_retained.py` | 11 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
