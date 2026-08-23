@@ -2692,3 +2692,89 @@ def test_repoll_with_guard_records_exactly_once():
     assert len(block["recent_outcomes"]) == 1
     assert block["recent_outcomes"][0]["at"] == "2026-06-10T00:00:01"
     assert block["unverified_reason_counts"]["undetected_runtime"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Unverifiable baseline attribution must FAIL CLOSED (block), never fall open.
+# The agent posts detected=false + verificationUnverified when it could not tell
+# which failures belong to this PR (base checkout failed / no structured failure
+# report / canonical comparator unavailable). That condition is DETERMINISTIC —
+# every verify re-spawn reproduces it — so an "undetected" fall-open would merge
+# UNVERIFIED every single time once the crash retries are exhausted.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_verdict_verification_unverified_blocks_not_falls_open():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": False,
+            "passed": False,
+            "verificationUnverified": True,
+            "tests": [],
+            "output": "Canonical structured baseline comparator was unavailable.",
+        }
+    )
+    assert outcome == "fail"
+    assert "comparator was unavailable" in detail
+
+
+def test_classify_verdict_verification_unverified_blank_output_gets_fallback():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "passed": False, "verificationUnverified": True}
+    )
+    assert outcome == "fail"
+    assert detail  # non-empty fallback naming the unverified attribution
+
+
+def test_classify_verdict_verification_unverified_wins_over_passed():
+    # A runner that "passed" cannot mask an unattributable baseline.
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {"detected": True, "passed": True, "verificationUnverified": True}
+    )
+    assert outcome == "fail"
+
+
+def test_failed_verify_artifact_forces_verdict_on_unverified_attribution():
+    # The orchestrator only reads a verdict from a COMPLETED verify task; this
+    # helper is what redirects the DETERMINISTIC FAILED shapes out of the
+    # crash-retry-then-merge-UNVERIFIED lane.
+    artifact = {
+        "detected": False,
+        "passed": False,
+        "verificationUnverified": True,
+        "output": "no structured failure report",
+    }
+    assert ci_resolution.verdict_from_failed_verify_artifact(artifact) is artifact
+    outcome, _ = ci_resolution.classify_merge_test_verdict(
+        ci_resolution.verdict_from_failed_verify_artifact(artifact)
+    )
+    assert outcome == "fail"
+
+
+def test_failed_verify_artifact_forces_verdict_on_clear_probe_failure():
+    artifact = {
+        "detected": False,
+        "passed": False,
+        "setupFailed": True,
+        "probe": {"ran": True, "passed": False, "could_not_run": False},
+    }
+    assert ci_resolution.verdict_from_failed_verify_artifact(artifact) is artifact
+
+
+def test_failed_verify_artifact_keeps_plain_setup_failure_on_crash_path():
+    # A plain setup failure (no clear probe break, no unverified marker) is
+    # transient infra noise: it must KEEP the crash-retry behavior, so no verdict
+    # is forced.
+    assert (
+        ci_resolution.verdict_from_failed_verify_artifact(
+            {
+                "detected": False,
+                "passed": False,
+                "setupFailed": True,
+                "probe": {"ran": False, "could_not_run": True},
+            }
+        )
+        is None
+    )
+    assert ci_resolution.verdict_from_failed_verify_artifact(None) is None
+    assert ci_resolution.verdict_from_failed_verify_artifact("not a dict") is None

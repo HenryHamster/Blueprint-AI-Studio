@@ -2669,21 +2669,22 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                 )
                             )
                         )
-                        # The suite could not run, but the cheap
-                        # acceptance probe DID run on the setup-failure
-                        # fall-open and the changed code CLEARLY failed
-                        # to compile/build (not a could-not-run degrade
-                        # from the same environment problem). Feed the
-                        # FAILED artifact as the verdict so it maps to a
-                        # merge BLOCK + fix instead of the
-                        # crash-retry-then-fall-open path — a genuine
-                        # build break must not merge UNVERIFIED.
-                        if isinstance(
-                            _failed_artifact, dict
-                        ) and ci_resolution.probe_is_clear_failure(
-                            _failed_artifact.get("probe")
-                        ):
-                            _verdict = _failed_artifact
+                        # DETERMINISTIC shapes that must fail CLOSED
+                        # rather than ride the crash-retry path: the
+                        # cheap acceptance probe DID run and the changed
+                        # code CLEARLY failed to compile/build, or
+                        # ``verificationUnverified`` (the agent could not
+                        # attribute failures against the base branch, so
+                        # nothing was proven about the diff). Both
+                        # reproduce on every re-spawn, so the crash path
+                        # would exhaust the retries and merge UNVERIFIED
+                        # every time. Feeding the artifact as the verdict
+                        # maps it to a merge BLOCK + fix instead.
+                        _forced = ci_resolution.verdict_from_failed_verify_artifact(
+                            _failed_artifact
+                        )
+                        if _forced is not None:
+                            _verdict = _forced
                     _outcome, _detail = (
                         ci_resolution.classify_merge_test_verdict(_verdict)
                     )

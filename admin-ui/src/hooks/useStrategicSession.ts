@@ -12,7 +12,6 @@ import {
 } from '../strategicStateApi';
 import { parseArmingOutcome, workbenchArmingToastCopy } from '../components/messageArming';
 import { buildOptimisticStrategicWorkbench } from '../utils/strategicWorkbenchSession';
-import { buildStrategicContextDescriptor } from '../utils/strategicContextDescriptor';
 import { parseTimestamp } from '../utils/time';
 import type { useStrategicReadModel } from './useStrategicReadModel';
 
@@ -378,11 +377,6 @@ export function useStrategicSession({
     hasCurrentOperateAccess,
   ]);
 
-  const chatComposerContextDescriptor = useMemo(
-    () => buildStrategicContextDescriptor(selectedStrategicReadModel, strategicWorkbenchState),
-    [selectedStrategicReadModel, strategicWorkbenchState],
-  );
-
   useEffect(() => {
     strategicWorkbenchStateRef.current = strategicWorkbenchState;
   }, [strategicWorkbenchState]);
@@ -576,7 +570,6 @@ export function useStrategicSession({
     savingStrategicWorkbench,
     checkingInStrategicSession,
     strategicSessionBusy,
-    chatComposerContextDescriptor,
     taskContextSessionProps,
     persistStrategicWorkbench,
     updateStrategicSessionRefs,

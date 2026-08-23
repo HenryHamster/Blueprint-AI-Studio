@@ -29,6 +29,7 @@ from testing.fixgate_attribution import (
     _normalize_failure_detail,
     attribute_reports,
     classify_verification,
+    compare_structured,
     format_offender_marker,
     parse_junit_report,
     test_route_coverage_gaps as route_coverage_gaps,
@@ -60,6 +61,23 @@ def _install_developer_check(repo: Path) -> None:
     destination.chmod(destination.stat().st_mode | stat.S_IXUSR)
 
 
+def _install_static_release_guard(repo: Path) -> None:
+    """Install the size-guard helper the gate now requires on every path.
+
+    ``scripts/check-default.sh`` runs ``static_release_guard.py --size-only``
+    on the lint-only path and the full attributed corpus under ``check test``,
+    and fails closed when the helper is absent. The real helper imports the
+    backend package, so these gate fixtures install a zero-exit stand-in: the
+    subject of this module is the changed-file computation, not the size
+    ledger, and the missing-helper branch is exercised separately.
+    """
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "static_release_guard.py").write_text(
+        "raise SystemExit(0)\n", encoding="utf-8"
+    )
+
+
 def _init_repo(repo: Path) -> None:
     """Bootstrap a minimal repo with the tracked developer gate committed."""
     repo.mkdir(parents=True, exist_ok=True)
@@ -74,8 +92,17 @@ def _init_repo(repo: Path) -> None:
     # into the fixture before creating the base ref so it does not manufacture
     # an unrelated untracked diff in tests whose subject is an empty diff.
     _install_developer_check(repo)
+    # Commit the size-guard stand-in for the same reason: an untracked helper
+    # would itself become a changed file in the empty-diff tests.
+    _install_static_release_guard(repo)
     (repo / "file.txt").write_text("hello\n", encoding="utf-8")
-    _git(repo, "add", "file.txt", "scripts/check-default.sh")
+    _git(
+        repo,
+        "add",
+        "file.txt",
+        "scripts/check-default.sh",
+        "scripts/static_release_guard.py",
+    )
     _git(repo, "commit", "-q", "-m", "initial")
 
 
@@ -156,6 +183,46 @@ def test_genuine_noop_diff_still_exits_zero(tmp_path: Path) -> None:
         f"exit {result.returncode} with output:\n{combined}"
     )
     assert "PASS" in combined, f"expected the green PASS marker, got:\n{combined}"
+
+
+def test_missing_static_release_guard_fails_the_lint_only_path(
+    tmp_path: Path,
+) -> None:
+    """An absent size-guard helper must fail the gate, not silently skip it.
+
+    The size guard binds on EVERY path into the gate, including the lint-only
+    invocation. A checkout that has lost ``scripts/static_release_guard.py``
+    cannot prove its module-size ledger, so the gate must refuse rather than
+    report a green PASS with the guard quietly unexecuted.
+    """
+    bash = shutil.which("bash")
+    git = shutil.which("git")
+    if not bash:
+        pytest.skip("bash not available on this host")
+    if not git:
+        pytest.skip("git not available on this host")
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "branch", "automain")
+    # Everything else about this repo is the green no-op case above; the only
+    # difference is the removed helper.
+    _git(repo, "rm", "-q", "scripts/static_release_guard.py")
+    _git(repo, "commit", "-q", "-m", "drop the size guard helper")
+    result = _run_check(repo)
+
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, (
+        "a checkout missing the size-guard helper must fail closed; "
+        f"got exit 0 with output:\n{combined}"
+    )
+    assert "static release guard helper is missing" in combined, (
+        "the diagnostic must name the missing helper; "
+        f"output:\n{combined}"
+    )
+    assert "PASS" not in combined, (
+        f"the gate must not report PASS with the size guard unexecuted:\n{combined}"
+    )
 
 
 def test_required_backend_verification_unavailable_is_a_hard_failure(
@@ -593,6 +660,126 @@ def test_attribute_reports_suppress_task_counter_only_difference() -> None:
 
     assert attribution.new_failures == {}
     assert key in attribution.suppressed_failures
+
+
+def test_duplicate_junit_failures_remain_independently_attributable(
+    tmp_path: Path,
+) -> None:
+    """Repeated nodes keep their occurrence and compare normalized details."""
+
+    baseline_junit = tmp_path / "baseline.xml"
+    baseline_junit.write_text(
+        "<testsuite>"
+        '<testcase classname="testing.test_dupe" name="test_same">'
+        "<failure>Task-17 uuid=3fa85f64-5717-4562-b3fc-2c963f66afa6: inherited</failure>"
+        "</testcase>"
+        '<testcase classname="testing.test_dupe" name="test_same">'
+        "<failure>AssertionError: old detail</failure>"
+        "</testcase>"
+        "</testsuite>",
+        encoding="utf-8",
+    )
+    current_junit = tmp_path / "current.xml"
+    current_junit.write_text(
+        "<testsuite>"
+        '<testcase classname="testing.test_dupe" name="test_same">'
+        "<failure>Task-902 uuid=9c858901-8a57-4791-81fe-4c455b099bc9: inherited</failure>"
+        "</testcase>"
+        '<testcase classname="testing.test_dupe" name="test_same">'
+        "<failure>AssertionError: changed detail</failure>"
+        "</testcase>"
+        "</testsuite>",
+        encoding="utf-8",
+    )
+
+    baseline = parse_junit_report(baseline_junit)
+    current = parse_junit_report(current_junit)
+    first = "testing.test_dupe::test_same::failure"
+    second = f"{first}::occurrence=2"
+
+    assert set(baseline.failures) == {first, second}
+    assert set(current.failures) == {first, second}
+    attribution = classify_verification(
+        runtime_available=True,
+        current_exit_code=1,
+        current_report=current,
+        baseline_report=baseline,
+    )
+    assert attribution["blocking"] is True
+    assert list(attribution["suppressed_failures"]) == [first]
+    assert attribution["new_failures"] == {second: "AssertionError: changed detail"}
+
+
+def test_structured_comparator_normalizes_noise_and_preserves_offender_semantics() -> None:
+    result = compare_structured(
+        {
+            "baseline": [
+                {
+                    "route": "vitest/example.test.ts",
+                    "testcase": "fails",
+                    "kind": "failure",
+                    "detail": "Task-4 uuid=3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "offenders": ["src/example.test.ts"],
+                }
+            ],
+            "current": [
+                {
+                    "route": "vitest/example.test.ts",
+                    "testcase": "fails",
+                    "kind": "failure",
+                    "detail": "Task-902 uuid=9c858901-8a57-4791-81fe-4c455b099bc9",
+                    "offenders": ["src/example.test.ts"],
+                }
+            ],
+        }
+    )
+
+    key = "vitest/example.test.ts::fails::failure"
+    assert result["blocking"] is False
+    assert result["new_failures"] == {}
+    assert result["suppressed_failures"][key]["detail"] == "Task-<n> uuid=<uuid>"
+
+
+def test_structured_comparator_rejects_unbounded_occurrence_arrays() -> None:
+    with pytest.raises(ValueError, match="4096-record limit"):
+        compare_structured(
+            {
+                "current": [
+                    {
+                        "route": "route",
+                        "testcase": "test",
+                        "kind": "failure",
+                        "detail": "detail",
+                    }
+                ]
+                * 4097,
+                "baseline": [],
+            }
+        )
+
+
+def test_structured_comparator_cli_returns_machine_readable_verdict() -> None:
+    payload = {
+        "baseline": [
+            {"route": "r", "testcase": "t", "kind": "failure", "detail": "Task-1"}
+        ],
+        "current": [
+            {"route": "r", "testcase": "t", "kind": "failure", "detail": "Task-2"}
+        ],
+    }
+    result = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "backend/testing/fixgate_attribution.py")],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    verdict = json.loads(result.stdout)
+    assert verdict["blocking"] is False
+    assert verdict["new_failures"] == {}
+    assert verdict["suppressed_failures"]["r::t::failure"]["detail"] == "Task-<n>"
 
 
 def test_repaired_baseline_failure_is_distinguishable_from_a_deleted_route() -> None:

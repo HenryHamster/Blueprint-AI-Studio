@@ -36,7 +36,6 @@ import {
   deleteMessageAttachmentUpload,
   findStrategicMessageByClientIdentity,
   StrategicSessionMessageCreateError,
-  type StrategicContextPackageDescriptor,
   type StrategicMessageTarget,
   type StrategicStateResponse,
   type StrategicWorkbenchState,
@@ -408,8 +407,6 @@ export interface MessagesPanelProps {
    *  When set, the conversation refresh piggybacks on the strategic-state
    *  poll cadence instead of running its own independent timer. */
   strategicPollEpoch?: number;
-  /** Compact Strategic context descriptor, shown only in the minimal chat surface. */
-  contextPackage?: StrategicContextPackageDescriptor | null;
   /** Strategic workbench read model, used by the minimal chat surface. */
   strategicState?: StrategicStateResponse | null;
   /** Optimistic workbench session state from the shell; overrides stale read-model workbench refs. */
@@ -441,10 +438,6 @@ export interface MessagesPanelProps {
   onOpenCommandPalette?: () => void;
   /** Open the project Activity inbox from the calm operation status. */
   onOpenActivityFeed?: () => void;
-  /** Backwards-compatible alias for older call sites. */
-  onOpenStrategicContextCommands?: () => void;
-  /** Legacy refresh callback kept for callers that still wire the old prop name. */
-  onStrategicRefresh?: () => void;
   /** Active alerts surfaced inline at the top of the panel, replacing the separate AlertsPopover. */
   alerts?: Alert[];
   onDismissAlert?: (id: string) => void;
@@ -514,7 +507,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, active = true, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, strategicSessionTranscript, onStrategicInteraction, onWorkdayStatusChange, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, active = true, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, onOpenDirection, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, onAcknowledgeRealtimeMessage, strategicPollEpoch, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, strategicSessionTranscript, onStrategicInteraction, onWorkdayStatusChange, onOpenStrategicContextWorkspace, onOpenCommandPalette, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -529,7 +522,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
   const canOperateProjectRef = useRef(canOperateProject);
   // eslint-disable-next-line react-hooks/refs
   canOperateProjectRef.current = canOperateProject;
-  const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
   const recordStrategicInteraction = useCallback(() => {
     if (!canOperateProjectRef.current || !onStrategicInteraction) return;
     Promise.resolve(onStrategicInteraction()).catch(() => {});
@@ -1517,7 +1509,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         clearSubmittedComposerDraft(currentActorUserId, selectedProjectId, optimisticSend.draft_write_id);
         clearPendingAttachments(optimisticSend.key);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
-        void refreshStrategicState?.();
+        void onStrategicStateRefresh?.();
       })
       .catch(() => {
         settled = !cancelled;
@@ -2143,7 +2135,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         setLastArming(null);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast('Question answered', 'success');
-        void refreshStrategicState?.();
+        void onStrategicStateRefresh?.();
         recordStrategicInteraction();
         await fetchMessages();
         return;
@@ -2233,7 +2225,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
           if (textareaRef.current) textareaRef.current.style.height = 'auto';
           addToast('Message accepted', 'success');
           void fetchMessages().catch(() => undefined);
-          void refreshStrategicState?.();
+          void onStrategicStateRefresh?.();
           recordStrategicInteraction();
           return;
         }
@@ -2414,10 +2406,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
           };
           optimisticStrategicRefreshRef.current = optimisticRefresh;
           setStrategicRefresh(optimisticRefresh);
-          void refreshStrategicState?.();
+          void onStrategicStateRefresh?.();
           didRefreshStrategicState = true;
         } else if (arming === 'duplicate') {
-          void refreshStrategicState?.();
+          void onStrategicStateRefresh?.();
           didRefreshStrategicState = true;
         }
         // The receipt is durable and the old draft has been cleared. Release
@@ -2425,7 +2417,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         // immediately begin the next turn, including selecting attachments.
         releaseSubmittedComposer();
         await fetchMessages().catch(() => undefined);
-        if (!didRefreshStrategicState) void refreshStrategicState?.();
+        if (!didRefreshStrategicState) void onStrategicStateRefresh?.();
         recordStrategicInteraction();
         return;
       }
@@ -2478,14 +2470,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
         };
         optimisticStrategicRefreshRef.current = optimisticRefresh;
         setStrategicRefresh(optimisticRefresh);
-        void refreshStrategicState?.();
+        void onStrategicStateRefresh?.();
         didRefreshStrategicState = true;
       } else if (arming === 'duplicate') {
-        void refreshStrategicState?.();
+        void onStrategicStateRefresh?.();
         didRefreshStrategicState = true;
       }
       await fetchMessages();
-      if (!didRefreshStrategicState) void refreshStrategicState?.();
+      if (!didRefreshStrategicState) void onStrategicStateRefresh?.();
       recordStrategicInteraction();
     } catch {
       // The draft and identity remain intact. The next manual retry first queries
@@ -2534,7 +2526,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       optimisticStrategicRefreshRef.current = null;
       setStrategicRefresh(null);
-      void refreshStrategicState?.();
+      void onStrategicStateRefresh?.();
       addToast('Strategic steer cancelled', 'success');
       await fetchMessages();
     } catch {
@@ -2590,7 +2582,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       directionIdempotencyKeysRef.current.delete(msg.id);
       if (!silent) addToast('Direction created', 'success');
       await fetchMessages();
-      void refreshStrategicState?.();
+      void onStrategicStateRefresh?.();
       return true;
     } catch {
       addToast('Failed to create direction', 'error');
@@ -2647,7 +2639,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       convertForm.resetAddForm();
       addToast('Direction created', 'success');
       await fetchMessages();
-      void refreshStrategicState?.();
+      void onStrategicStateRefresh?.();
     } catch {
       convertForm.markAddAttemptFailed();
       addToast('Failed to create direction', 'error');
@@ -2776,7 +2768,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     onStartInvestigate,
     onCancelInvestigate,
     onReply,
-    onOpenStrategicContext: conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined,
+    onOpenStrategicContext: conversationMode ? onOpenStrategicContextWorkspace : undefined,
     currentActorUserId: auth.currentUser?.uid ?? null,
   }), [
     canOperateProject,
@@ -2798,7 +2790,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     onCancelInvestigate,
     onReply,
     onOpenStrategicContextWorkspace,
-    onOpenStrategicContextCommands,
   ]);
 
   // Stable callbacks for MessagesPanelHeader and MessagesComposer props —
@@ -3132,7 +3123,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
                     await acceptPendingConfirmation(projectId, pendingId);
                     setResolvedConfirmationIds(prev => new Set(prev).add(item.id));
                     setExpandedConfirmationItemId(null);
-                    void refreshStrategicState?.();
+                    void onStrategicStateRefresh?.();
                   } catch {
                     addToast?.('Failed to accept — try again', 'error');
                   }
@@ -3146,7 +3137,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
                     await dismissPendingConfirmation(projectId, pendingId);
                     setResolvedConfirmationIds(prev => new Set(prev).add(item.id));
                     setExpandedConfirmationItemId(null);
-                    void refreshStrategicState?.();
+                    void onStrategicStateRefresh?.();
                   } catch {
                     addToast?.('Failed to dismiss — try again', 'error');
                   }

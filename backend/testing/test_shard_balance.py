@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
-from testing.identity_extraction import extract_python_test_ids
+from testing.identity_extraction import extract_python_test_ids_from_file
 
 try:
     import tomllib
@@ -252,10 +252,7 @@ def _extract_valid_test_ids(filepath: Path) -> set:
     Shared with the duration freshness and merge tools so all duration readers
     model the same static collection universe.
     """
-    try:
-        return extract_python_test_ids(filepath.read_text(encoding="utf-8"))
-    except (SyntaxError, OSError):
-        return set()
+    return extract_python_test_ids_from_file(filepath)
 
 
 def _enumerate_collected_test_ids() -> set:

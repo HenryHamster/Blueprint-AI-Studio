@@ -28,6 +28,7 @@ import {
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
+import { extractPythonTestDeclaration, extractTypeScriptTestDeclarations } from '../utils/test-identities.js';
 import { describeJsonExtractionResult, extractJsonArrayDetailed } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
@@ -836,22 +837,10 @@ export async function handleReleaseAudit(
       maxBuffer: 50 * 1024 * 1024,
     });
 
-    // ASSERTION_RE must NOT include it(/describe( — those are test-function
-    // declarations counted by TEST_FN_RE. Overlapping both regexes would
-    // double-count every JS/TS test declaration.
+    // Test declarations are counted separately from assertions. The shared
+    // extractor keeps direct and parameterized TS declarations aligned with
+    // Workday protection and viewport inventory paths.
     const ASSERTION_RE = /\b(assert[\s(]|expect\(|assertEqual|assertRaises)/;
-    const TEST_FN_RE = /\b(def test_|test\(|it\(|describe\()/;
-    // Captures a stable test-function identifier: python "def test_foo(" or
-    // JS/TS "test('name'" / "it(\"name\"". Used only for relocation matching
-    // (below), not for the assertion/test-count delta.
-    const TEST_IDENTIFIER_RE = /^[+-]\s*(?:(?:async\s+)?def\s+(test_\w+)\s*\(|(?:test|it)\(\s*(['"`])((?:(?!\2).)+)\2)/;
-    const extractIdentifier = (line: string): string | null => {
-      const m = line.match(TEST_IDENTIFIER_RE);
-      if (!m) return null;
-      if (m[1]) return m[1];
-      if (m[3]) return m[3];
-      return null;
-    };
 
     const deletedTestFileSet = new Set(deletedTestFiles);
     // Co-deletion is computable up front from git diff --name-status alone
@@ -879,40 +868,66 @@ export async function handleReleaseAudit(
     let currentFile = '';
     let assertionDelta = 0;
     let testCountDelta = 0;
+    let pendingDiffKind: '+' | '-' | null = null;
+    let pendingDiffLines: string[] = [];
+    const flushTestDeclarations = () => {
+      if (!pendingDiffKind || pendingDiffLines.length === 0) return;
+
+      const declarations = [
+        ...pendingDiffLines.map(extractPythonTestDeclaration).filter(declaration => declaration.isDeclaration),
+        ...extractTypeScriptTestDeclarations(pendingDiffLines.join('\n')),
+      ];
+      for (const declaration of declarations) {
+        if (pendingDiffKind === '+') {
+          testCountDelta++;
+          if (addedFiles.has(currentFile) && declaration.identifier) {
+            addedIdentifiersInNewFiles.add(declaration.identifier);
+          }
+        } else {
+          testCountDelta--;
+          if (deletedTestFileSet.has(currentFile) && declaration.identifier) {
+            let set = removedIdentifiersByFile.get(currentFile);
+            if (!set) {
+              set = new Set();
+              removedIdentifiersByFile.set(currentFile, set);
+            }
+            set.add(declaration.identifier);
+          }
+        }
+      }
+      pendingDiffKind = null;
+      pendingDiffLines = [];
+    };
     for (const line of diffText.split('\n')) {
       // Track which file the current hunk belongs to.
       if (line.startsWith('diff --git ')) {
+        flushTestDeclarations();
         // Format: "diff --git a/<path> b/<path>" — extract the b-side path.
         const m = line.match(/^diff --git a\/.+ b\/(.+)$/);
         currentFile = m ? m[1] : '';
         continue;
       }
 
-      if (coDeletedTestFiles.has(currentFile)) continue;
+      if (coDeletedTestFiles.has(currentFile)) {
+        flushTestDeclarations();
+        continue;
+      }
 
       if (line.startsWith('+') && !line.startsWith('+++')) {
         if (ASSERTION_RE.test(line)) assertionDelta++;
-        if (TEST_FN_RE.test(line)) testCountDelta++;
-        if (addedFiles.has(currentFile)) {
-          const id = extractIdentifier(line);
-          if (id) addedIdentifiersInNewFiles.add(id);
-        }
+        if (pendingDiffKind === '-') flushTestDeclarations();
+        pendingDiffKind = '+';
+        pendingDiffLines.push(line);
       } else if (line.startsWith('-') && !line.startsWith('---')) {
         if (ASSERTION_RE.test(line)) assertionDelta--;
-        if (TEST_FN_RE.test(line)) testCountDelta--;
-        if (deletedTestFileSet.has(currentFile)) {
-          const id = extractIdentifier(line);
-          if (id) {
-            let set = removedIdentifiersByFile.get(currentFile);
-            if (!set) {
-              set = new Set();
-              removedIdentifiersByFile.set(currentFile, set);
-            }
-            set.add(id);
-          }
-        }
+        if (pendingDiffKind === '+') flushTestDeclarations();
+        pendingDiffKind = '-';
+        pendingDiffLines.push(line);
+      } else {
+        flushTestDeclarations();
       }
     }
+    flushTestDeclarations();
 
     // Classify each deleted test file deterministically. Two independent
     // deterministic signals, either of which is sufficient:
@@ -1054,8 +1069,8 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
 
 2. **Assess test erosion.** Identify:
    - Any test files deleted in the diff (files under \`testing/\`, \`tests/\`, \`__tests__/\`, \`*.test.*\`, \`*.spec.*\` that appear as deleted).
-   - Net change in assertion count: search for \`assert \`, \`expect(\`, \`assertEqual\`, \`assertRaises\`, \`it(\`, \`describe(\` in the diff's added/removed lines.
-   - Net change in test function/case count: count added vs removed \`def test_\`, \`test(\`, \`it(\`, \`describe(\` patterns.
+   - Net change in assertion count: search for \`assert \`, \`expect(\`, \`assertEqual\`, and \`assertRaises\` in the diff's added/removed lines.
+   - Net change in test function/case count: count added vs removed Python \`def test_<name>(\` declarations and direct JavaScript/TypeScript \`test(\` or \`it(\` declarations. Do not count suite \`describe(\` calls or member calls such as \`.test(\`.
 
 3. **Review code quality** against \`${baseBranch}\`'s conventions (read CLAUDE.md for standards). Focus on:
    - Correctness and logic errors introduced

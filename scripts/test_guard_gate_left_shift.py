@@ -173,23 +173,40 @@ def test_archive_extractors_drain_stderr_without_a_pipe_or_read_deadlock(
     assert len(popen_calls) == 1
 
 
-def test_check_runs_static_guard_only_for_test_gate() -> None:
-    """The dispatcher reaches the tracked fallback, whose guard stays test-only."""
+def test_check_runs_size_guard_on_plain_gate_and_corpus_only_on_test_gate() -> None:
+    """The tracked fallback never defers size enforcement to the test gate."""
     dispatcher = (REPO_ROOT / "check").read_text()
     assert 'DEFAULT_GATE="$WORKSPACE/scripts/check-default.sh"' in dispatcher
     assert 'if [ ! -x "$DEFAULT_GATE" ]; then' in dispatcher
     assert 'exec "$DEFAULT_GATE" "$@"' in dispatcher
 
     fallback = (REPO_ROOT / "scripts" / "check-default.sh").read_text()
-    release_block_start = fallback.index("# The database-free release guard corpus")
+    release_block_start = fallback.index("# The database-free size guard is part of every publication gate")
     release_block_end = fallback.index("# Idempotent npm install", release_block_start)
     release_block = fallback[release_block_start:release_block_end]
     guard_call = 'run "static release guards (task diff)" python3 scripts/static_release_guard.py'
-    assert 'if [ "$WITH_TESTS" = "1" ]; then' in release_block
     assert guard_call in release_block
-    assert "--size-only" not in release_block
-    assert "static release guard deferred" in release_block
+    assert 'if [ "$WITH_TESTS" = "1" ]; then' in release_block
+    assert (
+        'run "static size guards (task diff)" python3 scripts/static_release_guard.py '
+        '--size-only --base "$BASE" --repo-root "$PWD"'
+        in release_block
+    )
+    assert "static release guard deferred" not in release_block
     assert "refusing to skip the gate" in release_block
+
+
+def test_size_scope_covers_every_governed_section() -> None:
+    """Size scope follows all five canonical checker sections."""
+    for path in (
+        "backend/app/service.py",
+        "agent/src/handlers/service.ts",
+        "admin-ui/src/App.tsx",
+        "backend/testing/test_service.py",
+        "scripts/release_helper.py",
+    ):
+        assert static_release_guard._is_size_scope(path)
+    assert not static_release_guard._is_size_scope("docs/README.md")
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -588,8 +605,8 @@ def test_backend_verification_docker_preserves_configured_junit_path(
     assert payload["failures"] == 0
 
 
-def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
-    """A changed cap that makes a source file over-limit must fail the gate."""
+def test_non_backend_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
+    """A plain check must catch a cap breach in the governed scripts section."""
     (tmp_path / "scripts").mkdir()
     (tmp_path / "backend" / "app").mkdir(parents=True)
     (tmp_path / "backend" / "testing").mkdir(parents=True)
@@ -640,9 +657,15 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     os.chmod(tmp_path / "scripts" / "check-default.sh", 0o755)
     os.chmod(tmp_path / "scripts" / "static_release_guard.py", 0o755)
     os.chmod(tmp_path / "scripts" / "backend-test-route.sh", 0o755)
-    (tmp_path / "backend" / "app" / "size_probe.py").write_text("line_one = 1\nline_two = 2\n")
+    (tmp_path / "scripts" / "size_probe.py").write_text("line_one = 1\nline_two = 2\n")
 
-    limits = {"backend": {"size_probe.py": 2}, "agent": {}, "frontend": {}}
+    limits = {
+        "backend": {},
+        "agent": {},
+        "frontend": {},
+        "testing": {},
+        "scripts": {"size_probe.py": 2},
+    }
     limits_path = tmp_path / "backend" / "testing" / "module_size_limits.json"
     limits_path.write_text(json.dumps(limits) + "\n")
 
@@ -653,13 +676,13 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     _git(tmp_path, "commit", "-m", "base")
     _git(tmp_path, "switch", "-c", "task")
 
-    limits["backend"]["size_probe.py"] = 1
+    limits["scripts"]["size_probe.py"] = 1
     limits_path.write_text(json.dumps(limits) + "\n")
     _git(tmp_path, "add", str(limits_path.relative_to(tmp_path)))
-    _git(tmp_path, "commit", "-m", "breach size cap")
+    _git(tmp_path, "commit", "-m", "breach non-backend size cap")
 
     result = subprocess.run(
-        ["bash", str(tmp_path / "check"), "test"],
+        ["bash", str(tmp_path / "check")],
         cwd=tmp_path,
         env={**os.environ, "WORKSPACE": str(tmp_path), "TASK_ID": ""},
         capture_output=True,
@@ -668,8 +691,8 @@ def test_task_diff_breaching_size_guard_fails_check(tmp_path: Path) -> None:
     )
 
     assert result.returncode != 0, (
-        "the current per-task gate incorrectly passed a changed diff whose "
-        "module_size_limits.json cap makes size_probe.py exceed its limit\n"
+        "the plain per-task gate incorrectly passed a changed non-backend diff "
+        "whose module_size_limits.json cap makes size_probe.py exceed its limit\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     output = result.stdout + result.stderr

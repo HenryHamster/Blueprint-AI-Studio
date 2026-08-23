@@ -483,7 +483,6 @@ _DRIFT_SENTINEL_TERMINAL_DISPATCH_KEY = "_drift_sentinel_terminal_dispatch"
 
 # Auto-qualification debounce seams; the marker key is re-exported for tests.
 from app.release_qualifier_debounce import (  # noqa: E402
-    _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
     compute_automain_head_quiet_seconds,
     find_live_qualifier_audit_task_id,
 )
@@ -1054,8 +1053,11 @@ async def _run_lifecycle_stall_alerts(
                     await _check_version_managed_check_wait_stall(alert_session, v)
                     or alerted
                 )
-                if alerted:
-                    await alert_session.commit()
+                # Resolution is a first-class lifecycle result too. The
+                # source-condition checkers may only dismiss an old alert and
+                # return False, so commit the dedicated session after every
+                # version regardless of whether a new row was raised.
+                await alert_session.commit()
         except Exception:
             logger.exception(
                 "[RELEASE_QUALIFIER] lifecycle-stall check failed for version %s",

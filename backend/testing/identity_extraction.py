@@ -13,6 +13,8 @@ name, so a subclass-only body is not an empty identity set.
 from __future__ import annotations
 
 import ast
+import re
+from pathlib import Path
 
 
 def extract_python_test_ids(source: str) -> set[str]:
@@ -27,26 +29,61 @@ def extract_python_test_ids(source: str) -> set[str]:
     and cross-module inheritance cannot be proven statically and are
     deliberately left to the live collector.
     """
-    tree = ast.parse(source)
+    return set(extract_python_test_nodes(ast.parse(source)))
+
+
+def extract_python_test_ids_from_file(path: Path) -> set[str]:
+    """Return canonical IDs from *path*, treating unreadable source as empty.
+
+    Static duration and invariant guards must fail closed when a test module
+    cannot be read or parsed.  Keeping that policy here prevents individual
+    callers from accidentally preserving stale duration entries or treating a
+    syntactically-invalid module as executable.
+    """
+    try:
+        return extract_python_test_ids(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return set()
+
+
+def extract_python_test_nodes(
+    tree: ast.Module,
+) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Select canonical IDs and the AST node that implements each test.
+
+    Consumers that inspect a test body must select from this collector-faithful
+    mapping first.  In particular, a ``test_*`` method on an arbitrary helper
+    class is not a test, and inherited methods retain the subclass-qualified
+    identity reported by pytest/unittest.
+    """
     top_level_classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
     classes_by_name = {node.name: node for node in top_level_classes}
     unittest_classes = _unittest_subclass_names(top_level_classes)
 
-    test_ids: set[str] = set()
+    test_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name.startswith("test_"):
-                test_ids.add(node.name)
+                test_nodes[node.name] = node
             continue
         if not isinstance(node, ast.ClassDef) or not (
             _has_pytest_class_name(node.name) or node.name in unittest_classes
         ):
             continue
-        test_ids.update(
-            f"{node.name}::{method_name}"
-            for method_name in _inherited_test_method_names(node, classes_by_name)
+        test_nodes.update(
+            {
+                f"{node.name}::{method_name}": method
+                for method_name, method in _inherited_test_methods(
+                    node, classes_by_name
+                ).items()
+            }
         )
-    return test_ids
+    return test_nodes
+
+
+def _extract_python_test_ids_from_tree(tree: ast.Module) -> set[str]:
+    """Extract canonical identities from one already-parsed Python module."""
+    return set(extract_python_test_nodes(tree))
 
 
 def count_python_test_ids(source: str) -> int:
@@ -59,20 +96,45 @@ def count_python_test_ids(source: str) -> int:
     return len(extract_python_test_ids(source))
 
 
+_TS_DIRECT_TEST_RE = re.compile(
+    r'''^\s*(?:it|test)\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)''',
+    re.MULTILINE,
+)
+_TS_PARAMETERIZED_TEST_RE = re.compile(
+    r'''^\s*(?:it|test)\.each\b[\s\S]*?\)\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)''',
+    re.MULTILINE,
+)
+
+
+def extract_typescript_test_ids(source: str) -> set[str]:
+    """Return labels from direct and ``.each`` Vitest/Jest declarations.
+
+    This is intentionally the single Python-side TypeScript identity extractor:
+    manifest protection and viewport auditing must count the same backtick,
+    quoted, and parameterized declarations.
+    """
+    return {
+        label
+        for pattern in (_TS_DIRECT_TEST_RE, _TS_PARAMETERIZED_TEST_RE)
+        for match in pattern.finditer(source)
+        if (label := next((group for group in match.groups() if group), None))
+    }
+
+
 def _has_pytest_class_name(name: str) -> bool:
     """Match Blueprint's configured pytest ``python_classes`` conventions."""
     return name.startswith("Test") or name.endswith("Test")
 
 
-def _inherited_test_method_names(
+def _inherited_test_methods(
     node: ast.ClassDef, classes_by_name: dict[str, ast.ClassDef]
-) -> set[str]:
-    """Return ``test_*`` methods on a class plus those from module-local bases.
+) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Return ``test_*`` methods on a class plus module-local inherited ones.
 
     An override and its base definition collapse to one identity because the
     collector reports one node ID per name on the subclass.
     """
-    method_names: set[str] = set()
+    methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
     visited: set[str] = set()
     pending = [node]
     while pending:
@@ -80,18 +142,21 @@ def _inherited_test_method_names(
         if current.name in visited:
             continue
         visited.add(current.name)
-        method_names.update(
-            member.name
-            for member in current.body
-            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and member.name.startswith("test_")
+        methods.update(
+            {
+                member.name: member
+                for member in current.body
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and member.name.startswith("test_")
+                and member.name not in methods
+            }
         )
         pending.extend(
             classes_by_name[base.id]
             for base in current.bases
             if isinstance(base, ast.Name) and base.id in classes_by_name
         )
-    return method_names
+    return methods
 
 
 def _unittest_subclass_names(classes: list[ast.ClassDef]) -> set[str]:

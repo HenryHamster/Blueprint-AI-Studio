@@ -4358,13 +4358,16 @@ async def _process_post_commit(
                                 _pre_rollup_own: str | None = None
                                 _pre_rollup_rep: str | None = None
                                 _pre_rollup_mig_guard: object | None = None
-                                _pre_rollup_size_cap: (
-                                    tuple[str, str | None] | None
-                                ) = None
+                                _pre_rollup_size_cap: object | None = None
                                 if _orig_peek_loop.get("ci_passed"):
                                     _peek_pr_num = _orig_peek_loop.get("pr_number")
                                     _peek_base = _orig_peek_loop.get("base_branch", "")
                                     _peek_branch = _orig_peek_loop.get("branch", "")
+                                    _peek_head = str(
+                                        _orig_peek_loop.get("ci_checked_head_sha")
+                                        or _orig_peek_loop.get("head_sha")
+                                        or ""
+                                    )
                                     try:
                                         (
                                             _pre_rollup_gh,
@@ -4402,6 +4405,7 @@ async def _process_post_commit(
                                         if (
                                             _peek_pr_num
                                             and _peek_branch
+                                            and _peek_head
                                             and not (_orig_peek or {}).get(
                                                 "rollup_pr_number"
                                             )
@@ -4419,6 +4423,7 @@ async def _process_post_commit(
                                                 project_id=str(task.project_id)
                                                 if task.project_id
                                                 else None,
+                                                expected_head_sha=_peek_head,
                                             )
                                     except Exception as _pre_exc:
                                         logger.debug(

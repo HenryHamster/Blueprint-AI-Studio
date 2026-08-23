@@ -756,7 +756,7 @@ describe('MessagesPanel send arming receipt', () => {
   test('refreshes strategic state after steering message mutation', async () => {
     _setupSendMock({ arming: 'steering' });
     const addToast = vi.fn();
-    const onStrategicRefresh = vi.fn();
+    const onStrategicStateRefresh = vi.fn();
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -769,17 +769,17 @@ describe('MessagesPanel send arming receipt', () => {
           onClose={() => {}}
           addToast={addToast as never}
           onMessageCountChange={() => {}}
-          onStrategicRefresh={onStrategicRefresh}
+          onStrategicStateRefresh={onStrategicStateRefresh}
         />,
       );
     });
     await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
     const el = host as HTMLDivElement;
 
-    expect(onStrategicRefresh).not.toHaveBeenCalled();
+    expect(onStrategicStateRefresh).not.toHaveBeenCalled();
     await typeAndSend(el, 'steer: focus on the migration work');
     await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
-    expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
+    expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
   });
 
   test('attachment upload flow: type=image + signed download URL in context', async () => {
@@ -1014,7 +1014,7 @@ describe('MessagesPanel send arming receipt', () => {
   test('refreshes strategic state once after duplicate steering replay', async () => {
     _setupSendMock({ arming: 'duplicate' });
     const addToast = vi.fn();
-    const onStrategicRefresh = vi.fn();
+    const onStrategicStateRefresh = vi.fn();
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -1027,7 +1027,7 @@ describe('MessagesPanel send arming receipt', () => {
           onClose={() => {}}
           addToast={addToast as never}
           onMessageCountChange={() => {}}
-          onStrategicRefresh={onStrategicRefresh}
+          onStrategicStateRefresh={onStrategicStateRefresh}
         />,
       );
     });
@@ -1039,7 +1039,7 @@ describe('MessagesPanel send arming receipt', () => {
     expect(addToast).toHaveBeenCalledWith(armingToastCopy('duplicate'), 'success');
     // duplicate is steady-state narration: no inline composer hint for it.
     expect(hintText(el)).toBeNull();
-    expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
+    expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
   });
 });
 

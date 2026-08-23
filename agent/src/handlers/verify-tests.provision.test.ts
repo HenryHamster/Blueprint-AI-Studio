@@ -15,6 +15,7 @@ vi.mock('../index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../index.js')>();
   return {
     ...actual,
+    captureTestBaseline: vi.fn().mockResolvedValue({ records: [] }),
     WORKSPACE: '/tmp/workspace',
     sendLog: vi.fn(),
     persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
@@ -47,6 +48,7 @@ vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/test-fix-loop.js')>();
   return {
     ...actual,
+    captureTestBaseline: vi.fn().mockResolvedValue({ records: [] }),
     testFixLoop: vi.fn(() => {
       callLog.push('suite');
       return Promise.resolve({ passed: true, testFailuresDetected: false });
@@ -59,6 +61,7 @@ vi.mock('fs', () => ({ default: { writeFileSync: vi.fn() } }));
 import { handleVerifyTests } from './verify-tests.js';
 import { persistAndPostStatus, execFileAsync } from '../index.js';
 import { detectTestRunners, detectProvisioningSteps, detectAcceptanceProbes } from '../utils/test-runners.js';
+import { captureTestBaseline } from '../utils/test-fix-loop.js';
 
 const RUNNER = { cmd: 'python3', args: ['-m', 'pytest'], cwd: '/tmp/workspace', label: 'pytest (root)' };
 const INSTALL_STEP = { cmd: 'make', args: ['setup'], cwd: '/tmp/workspace', label: 'make setup (root)', declared: true };
@@ -80,13 +83,14 @@ describe('handleVerifyTests — dependency provisioning', () => {
     callLog.length = 0;
     vi.mocked(detectProvisioningSteps).mockReturnValue([INSTALL_STEP]);
     vi.mocked(detectAcceptanceProbes).mockReturnValue([]);
+    vi.mocked(captureTestBaseline).mockResolvedValue({ records: [] });
   });
 
   it('runs the declared install AHEAD of the detected suite', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
-    vi.mocked(execFileAsync).mockImplementation((cmd: string) => {
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
       callLog.push(`exec:${cmd}`);
-      return Promise.resolve('');
+      return Promise.resolve(cmd === 'git' && args[0] === 'rev-parse' ? 'head-sha' : '');
     });
 
     await handleVerifyTests('p1', payload, task, 'tok', 'o', 'r', null, { value: '' });
@@ -106,7 +110,7 @@ describe('handleVerifyTests — dependency provisioning', () => {
     ]);
     vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[]) => {
       callLog.push(`exec:${cmd} ${args.join(' ')}`);
-      return Promise.resolve('');
+      return Promise.resolve(cmd === 'git' && args[0] === 'rev-parse' ? 'head-sha' : '');
     });
 
     await handleVerifyTests('p2', payload, task, 'tok', 'o', 'r', null, { value: '' });
@@ -141,9 +145,9 @@ describe('handleVerifyTests — dependency provisioning', () => {
   it('no provisioning steps → suite runs unchanged (no-op pass-through)', async () => {
     vi.mocked(detectProvisioningSteps).mockReturnValue([]);
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
-    vi.mocked(execFileAsync).mockImplementation((cmd: string) => {
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) => {
       callLog.push(`exec:${cmd}`);
-      return Promise.resolve('');
+      return Promise.resolve(cmd === 'git' && args[0] === 'rev-parse' ? 'head-sha' : '');
     });
 
     await handleVerifyTests('p4', payload, task, 'tok', 'o', 'r', null, { value: '' });

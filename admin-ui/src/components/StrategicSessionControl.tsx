@@ -1,7 +1,6 @@
-import { AlertTriangle, Infinity as InfinityIcon, LoaderCircle, MessageSquare, Play, Server, Square } from 'lucide-react';
+import { Infinity as InfinityIcon, LoaderCircle, MessageSquare, Play, Server, Square } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { StrategicResidentRunnerOption } from '../strategicStateApi';
-import { WORKDAY_STATE_PRESENTATION, type ConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
 
 export type StrategicInteractionMode = 'chat' | 'continuous';
 
@@ -11,11 +10,6 @@ export interface StrategicSessionControlProps {
   saving?: boolean;
   sessionActive?: boolean;
   sessionState?: string | null;
-  // The single reconciled status readout — the same ConversationWorkdayStatus
-  // the utility bar renders. This is the only source for the visible status
-  // label/detail; sessionState/sessionActive above are Start/Stop button
-  // affordance inputs only, not a second display vocabulary.
-  workdayStatus?: ConversationWorkdayStatus | null;
   sessionBusy?: boolean;
   sessionRunners?: StrategicResidentRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
@@ -32,9 +26,6 @@ const MODES: Array<{ value: StrategicInteractionMode; label: string; Icon: Lucid
   { value: 'continuous', label: 'Workday', Icon: InfinityIcon },
 ];
 
-const FALLBACK_PRESENTATION = WORKDAY_STATE_PRESENTATION.ready;
-const STUCK_STATES = new Set(['unavailable', 'needs_restart']);
-
 function runnerLabel(runner: StrategicResidentRunnerOption): string {
   const name = runner.name || runner.hostname || runner.id.slice(0, 8);
   if (!runner.online) return `${name} — offline`;
@@ -49,7 +40,6 @@ export function StrategicSessionControl({
   saving = false,
   sessionActive = false,
   sessionState,
-  workdayStatus,
   sessionBusy = false,
   sessionRunners,
   sessionSelectedRunnerId,
@@ -72,12 +62,6 @@ export function StrategicSessionControl({
   const wedged = normalizedSessionState === 'blocked' || normalizedSessionState === 'error';
   // Keep a live blob stoppable even when its lifecycle label is not Active.
   const canStop = active || sessionActive || normalizedSessionState === 'starting' || normalizedSessionState === 'stopping' || wedged;
-  const presentation = workdayStatus ? WORKDAY_STATE_PRESENTATION[workdayStatus.state] : FALLBACK_PRESENTATION;
-  const statusLabel = workdayStatus?.label ?? 'Ready';
-  const statusDetail = workdayStatus?.detail ?? null;
-  const statusTitle = workdayStatus?.title ?? statusLabel;
-  const spinning = sessionBusy || saving || (workdayStatus ? ['starting', 'stopping', 'waiting', 'retrying'].includes(workdayStatus.state) : false);
-  const stuck = STUCK_STATES.has(workdayStatus?.state ?? '') || wedged;
   const runners = sessionRunners ?? [];
 
   return (
@@ -105,17 +89,6 @@ export function StrategicSessionControl({
 
       {selectedMode === 'continuous' && (
         <>
-          <span
-            className={`hidden min-h-7 min-w-0 max-w-64 items-center gap-1.5 rounded border px-2 text-xs sm:inline-flex ${presentation.tone}`}
-            role="status"
-            aria-label="Workday status"
-            title={statusTitle}
-            data-workday-state={workdayStatus?.state ?? 'ready'}
-          >
-            {spinning ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : stuck ? <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> : <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />}
-            <span className="truncate">{statusDetail ? `${statusLabel} · ${statusDetail}` : statusLabel}</span>
-          </span>
-
           {runners.length > 0 && onSelectRunner && (
             <label className="hidden min-h-7 items-center gap-1 rounded border border-neutral-800 bg-workbench-shell/80 px-1.5 sm:inline-flex" title="Workday device">
               <Server className="h-3.5 w-3.5 text-neutral-500" aria-hidden="true" />

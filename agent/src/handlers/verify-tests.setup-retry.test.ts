@@ -34,7 +34,7 @@ vi.mock('../utils/test-runners.js', async (importOriginal) => {
 
 vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/test-fix-loop.js')>();
-  return { ...actual, testFixLoop: vi.fn() };
+  return { ...actual, captureTestBaseline: vi.fn().mockResolvedValue({ records: [] }), testFixLoop: vi.fn() };
 });
 
 vi.mock('fs', () => ({
@@ -44,9 +44,9 @@ vi.mock('fs', () => ({
 }));
 
 import { handleVerifyTests } from './verify-tests.js';
-import { persistAndPostStatus } from '../index.js';
+import { execFileAsync, persistAndPostStatus } from '../index.js';
 import { detectTestRunners } from '../utils/test-runners.js';
-import { testFixLoop } from '../utils/test-fix-loop.js';
+import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 
 const RUNNER = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
 
@@ -55,9 +55,9 @@ function lastPostedPayload(): Record<string, unknown> {
   return calls[calls.length - 1][1];
 }
 
-function parsedVerdict(): { detected: boolean; passed: boolean; setupFailed?: boolean; tests: unknown[]; output: string } {
+function parsedVerdict(): { detected: boolean; passed: boolean; setupFailed?: boolean; verificationUnverified?: boolean; tests: unknown[]; output: string } {
   return JSON.parse(lastPostedPayload().logs as string) as {
-    detected: boolean; passed: boolean; setupFailed?: boolean; tests: unknown[]; output: string;
+    detected: boolean; passed: boolean; setupFailed?: boolean; verificationUnverified?: boolean; tests: unknown[]; output: string;
   };
 }
 
@@ -67,6 +67,10 @@ describe('handleVerifyTests — transient setup-failure retry', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(captureTestBaseline).mockResolvedValue({ records: [] });
+    vi.mocked(execFileAsync).mockImplementation((cmd: string, args: string[] = []) =>
+      Promise.resolve(cmd === 'git' && args[0] === 'rev-parse' && args.includes('HEAD') ? 'head-sha' : ''),
+    );
   });
 
   it('setup fails once then the suite runs → uses the REAL verdict (detected=true), not detected=false', async () => {
@@ -128,6 +132,32 @@ describe('handleVerifyTests — transient setup-failure retry', () => {
     const verdict = parsedVerdict();
     expect(verdict.detected).toBe(false);
     expect(verdict.setupFailed).toBe(true);
+  });
+
+  it('unverifiable baseline attribution → artifact carries verificationUnverified (backend blocks on it)', async () => {
+    // The structured baseline could not attribute failures (no structured
+    // report / comparator unavailable). This is DETERMINISTIC — every verify
+    // re-spawn reproduces it — so the artifact MUST carry the
+    // verificationUnverified marker that ci_resolution maps to a merge BLOCK.
+    // Without the marker the backend sees a FAILED task with no verdict, treats
+    // it as a crash, and merges UNVERIFIED once the retries are exhausted.
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false, testFailuresDetected: false, verificationUnverified: true,
+      failureSummary: 'Test runner failed but did not produce a structured failure report for baseline attribution.',
+    });
+
+    await handleVerifyTests('s5', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    // Not retried as a setup flake: the condition is deterministic.
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledTimes(1);
+    const post = lastPostedPayload();
+    expect(post.artifact_type).toBe('MERGE_TEST_RESULT');
+    const verdict = parsedVerdict();
+    expect(verdict.verificationUnverified).toBe(true);
+    // Distinct from the setup-failure lane, which owns its own operator label.
+    expect(verdict.setupFailed).toBeUndefined();
+    expect(verdict.output).toContain('structured failure report');
   });
 
   it('genuine no-suite repo still falls open (detected=false, COMPLETED) — forward progress preserved', async () => {

@@ -34,11 +34,70 @@ from app.alert_dispatch import (
     _resolve_runner_degraded_alert,
     _runner_escalation_last_notified,
     _runner_outage_escalated_keys,
+    sweep_resolve_policy_retirement_alerts,
     sweep_resolve_terminal_task_alerts,
 )
 from app.models import Alert, AlertSeverity
 from app.time_utils import _utcnow
 from testing.factories import make_project, make_task
+
+
+def test_every_operator_action_needed_event_type_declares_a_retirement_rule():
+    """Durable operator-action alerts must state how their condition ends."""
+    from app.alert_policy import ALERT_EVENT_POLICIES, AlertRetirementMode
+    from app.message_audience import get_operator_event_types
+
+    operator_alerts = sorted(
+        set(ALERT_EVENT_POLICIES).intersection(get_operator_event_types())
+    )
+    assert operator_alerts, "the contract must exercise the operator alert registry"
+    missing = [
+        event_type
+        for event_type in operator_alerts
+        if ALERT_EVENT_POLICIES[event_type].retirement is None
+    ]
+    assert not missing, (
+        "operator-action-needed alert events without a retirement rule: "
+        + ", ".join(missing)
+    )
+    assert all(
+        isinstance(ALERT_EVENT_POLICIES[event_type].retirement, AlertRetirementMode)
+        for event_type in operator_alerts
+        if event_type
+    )
+    assert any(
+        ALERT_EVENT_POLICIES[event_type].retirement
+        == AlertRetirementMode.MANUAL
+        for event_type in operator_alerts
+        if event_type
+    )
+
+
+@pytest.mark.asyncio
+async def test_policy_retirement_sweep_clears_legacy_timeline_rows(db_session, mocker):
+    """The policy gate's former durable timeline rows are retired in bounded batches."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.INFO,
+        title="Pipeline auto-resumed",
+        message="legacy timeline row",
+        event_type="deployment.auto_resume",
+    )
+    db_session.add(alert)
+    await db_session.commit()
+
+    assert await sweep_resolve_policy_retirement_alerts(db_session, limit=1) == 1
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is not None
+    bcast.assert_awaited_once()
+    assert bcast.await_args.args[1] == "alert_dismissed"
 
 
 def make_warm_pool_project(**kwargs):
@@ -3080,16 +3139,14 @@ async def test_all_three_families_clear_in_one_pass(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_a_stale_alert_of_any_family_swallows_the_next_failure_alert(
+async def test_a_stale_alert_of_any_family_does_not_swallow_the_next_failure_alert(
     db_session, mocker
 ):
     """The widest second-order payoff, and why this is not cosmetic.
 
-    ``_maybe_create_failure_alert`` dedupes on ``task_id`` ALONE — no title, no
-    event_type filter. So one stale open alert of ANY family silently swallows
-    that task's next failure alert outright. Here a corpse ``review.escalated``
-    row from a converged loop mutes a genuine later failure of the same task;
-    clearing it is what makes the failure audible again.
+    ``_maybe_create_failure_alert`` must dedupe only within the ``task.failed``
+    family. A corpse ``review.escalated`` row from a converged loop must not
+    mute a genuine later failure of the same task.
     """
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
@@ -3114,16 +3171,15 @@ async def test_a_stale_alert_of_any_family_swallows_the_next_failure_alert(
 
     await _maybe_create_failure_alert(task, db_session, "boom")
     await db_session.commit()
-    assert await _open_alerts_of(db_session, project.id, "task.failed") == [], (
-        "a stale alert of an unrelated family swallows the failure alert — "
-        "_maybe_create_failure_alert dedupes on task_id with no type filter"
+    assert len(await _open_alerts_of(db_session, project.id, "task.failed")) == 1, (
+        "an unrelated open alert must not suppress the real failure alert"
     )
 
     # Clear the corpse the way the sweep does, then let it fail again.
     task.status = "COMPLETED"
     db_session.add(task)
     await db_session.commit()
-    assert await sweep_resolve_terminal_task_alerts(db_session) == 1
+    assert await sweep_resolve_terminal_task_alerts(db_session) == 2
     await db_session.refresh(stale)
     assert stale.dismissed_at is not None
 

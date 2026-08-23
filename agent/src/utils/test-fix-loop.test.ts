@@ -61,7 +61,13 @@ vi.mock('fs', () => ({
 }));
 
 import fs from 'fs';
-import { captureTestBaseline, testFixLoop, matchesSizeBreachSignature, matchesTransientSetupFailure } from './test-fix-loop.js';
+import {
+  canonicalComparatorPath,
+  captureTestBaseline,
+  testFixLoop,
+  matchesSizeBreachSignature,
+  matchesTransientSetupFailure,
+} from './test-fix-loop.js';
 import { runClaudeCode } from '../providers/runners.js';
 import { apiPost } from '../index.js';
 import { expectCalledWith } from './typed-mock-call.js';
@@ -85,6 +91,13 @@ const INSTALL_RUNNER: TestRunner = {
   installCmd: 'python3 -m pip install -e . && python3 -m pip check',
 };
 const statusRef = { value: '' };
+
+describe('canonicalComparatorPath', () => {
+  it('resolves the packaged comparator in the deployed /opt/agent layout', () => {
+    expect(canonicalComparatorPath('/opt/agent/src/utils'))
+      .toBe('/opt/agent/src/_agent_scripts/fixgate_attribution.py');
+  });
+});
 
 describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () => {
   beforeEach(() => {
@@ -276,7 +289,7 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
     expect(execFileAsync).toHaveBeenNthCalledWith(
       2,
       'python3',
-      ['-m', 'pytest', '-x', '-q'],
+      expect.arrayContaining(['-m', 'pytest', '-x', '-q']),
       expect.objectContaining({ cwd: INSTALL_RUNNER.cwd }),
     );
   });
@@ -497,7 +510,7 @@ describe('captureTestBaseline dependency materialization', () => {
 
     const result = await captureTestBaseline(null, { value: '' }, adminBuildConfig);
 
-    expect(result).toBeInstanceOf(Set);
+    expect(result?.records).toEqual([]);
     expect(execFileAsync).toHaveBeenCalledTimes(2);
     const installCall = execFileAsync.mock.calls[0];
     expect(installCall[0]).toBe('npm');
@@ -550,8 +563,7 @@ describe('captureTestBaseline build-config discovery reporting', () => {
 
     const result = await captureTestBaseline(null, { value: '' });
 
-    expect(result).toBeInstanceOf(Set);
-    expect((result as Set<string>).size).toBe(0);
+    expect(result?.records).toEqual([]);
     expect(vi.mocked(apiPost)).toHaveBeenCalledTimes(1);
     expectCalledWith(apiPost, '/api/agent/build-config-discovery', {
       discovered_directories: [
@@ -957,6 +969,43 @@ describe('matchesTransientSetupFailure', () => {
     expect(matchesTransientSetupFailure('connection refused')).toBe(true);
     expect(matchesTransientSetupFailure('Network is unreachable')).toBe(true);
     expect(matchesTransientSetupFailure('EAI_AGAIN')).toBe(true);
+  });
+});
+
+describe('structured pytest report invocation', () => {
+  const BACKEND_HARNESS_RUNNER: TestRunner = {
+    cmd: 'bash', args: ['scripts/test-backend.sh', '--postgres'], cwd: '/tmp/workspace',
+    label: 'bash scripts/test-backend.sh --postgres (root)',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(apiPost).mockResolvedValue({ persisted: true });
+    vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
+  });
+
+  it('uses the mounted BLUEPRINT_VERIFICATION_JUNIT contract for baseline and current harness runs', async () => {
+    const failedRun = new Error('Command failed: bash scripts/test-backend.sh --postgres\n1 failed in 0.10s');
+    execFileAsync.mockRejectedValue(failedRun);
+
+    await captureTestBaseline(null, { value: '' }, {
+      directories: [{ path: '.', type: 'python', test_cmd: 'bash scripts/test-backend.sh --postgres' }],
+    });
+    await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      { records: [] }, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [BACKEND_HARNESS_RUNNER] },
+    );
+
+    const harnessCalls = execFileAsync.mock.calls.filter(([cmd, args]) =>
+      cmd === 'bash' && args.includes('scripts/test-backend.sh'),
+    );
+    expect(harnessCalls).toHaveLength(2);
+    for (const [, args, options] of harnessCalls) {
+      expect(args.some(arg => arg.startsWith('--junitxml='))).toBe(false);
+      expect((options as { env?: NodeJS.ProcessEnv }).env?.BLUEPRINT_VERIFICATION_JUNIT)
+        .toMatch(/^\/tmp\/pytest-(baseline|current)-.+\.xml$/);
+    }
   });
 });
 

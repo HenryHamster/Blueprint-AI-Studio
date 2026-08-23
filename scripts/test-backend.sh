@@ -702,6 +702,7 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_event_type_invariants.py
     testing/test_salvage_bundle_standalone.py
     testing/test_test_durations_freshness.py
+    testing/test_test_estate_ranked_queue.py
     testing/test_shard_balance.py
     testing/test_conversational_workday_protection.py
     testing/test_vitest_durations_freshness.py

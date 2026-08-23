@@ -2,6 +2,8 @@ import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { waitFor } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { MessagesPanel as MessagesPanelComponent, type MessagesPanelProps } from './MessagesPanel';
 
 type MessagesPanelTestProps = Omit<MessagesPanelProps, 'canOperateProject'> & {
@@ -1149,28 +1151,21 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.textContent).not.toContain('Stale polling message');
   });
 
-  test('minimal chat chrome hides the ready-only Strategic context package strip', async () => {
+  test('test_removed_context_bar_module_and_props_stay_absent', async () => {
     const el = await renderPanel({
       filterChrome: 'minimal',
-      contextPackage: {
-        id: 'strategic-context:proj-1',
-        title: 'Workbench context',
-        status: 'ready',
-        item_count: 18,
-        token_count: null,
-        canvas: {
-          id: 'strategic-canvas:proj-1',
-          title: 'Strategic context map',
-          kind: 'strategic_context',
-          node_count: null,
-        },
-        sources: [{ kind: 'messages', count: 2 }],
-        drilldowns: [],
-      },
     });
 
-    const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
-    expect(strip).toBeNull();
+    expect(el.querySelector('[data-testid="strategic-context-package-strip"]')).toBeNull();
+    expect(el.querySelector('[data-testid="strategic-context-descriptor"]')).toBeNull();
+
+    const panelSource = readFileSync(path.join(process.cwd(), 'src', 'components', 'MessagesPanel.tsx'), 'utf8');
+    expect(panelSource).not.toContain('contextPackage?:');
+    expect(panelSource).not.toContain('onOpenStrategicContextCommands');
+    expect(panelSource).not.toContain('onStrategicRefresh');
+    const sessionHookSource = readFileSync(path.join(process.cwd(), 'src', 'hooks', 'useStrategicSession.ts'), 'utf8');
+    expect(sessionHookSource).not.toContain('chatComposerContextDescriptor');
+    expect(sessionHookSource).not.toContain('buildStrategicContextDescriptor');
   });
 
   test('minimal chat chrome keeps Strategic work-session and attention status out of Chat', async () => {
@@ -1888,11 +1883,6 @@ describe('MessagesPanel chrome modes', () => {
   test('compact/full message chrome keeps the context package out of the legacy surface', async () => {
     const el = await renderPanel({
       filterChrome: 'compact',
-      contextPackage: {
-        id: 'strategic-context:proj-1',
-        title: 'Workbench context',
-        status: 'ready',
-      },
     });
 
     expect(el.querySelector('[data-testid="strategic-context-package-strip"]')).toBeNull();
@@ -2767,7 +2757,7 @@ describe('MessagesPanel live strategist streaming', () => {
     expect(el.textContent).not.toContain('Unattributed delta');
   });
 
-  test('renders live Chat awareness directly, and returns to Workday off when the reply persists', async () => {
+  test('chat_mode_live_turn_shows_activity_and_age_without_resident', async () => {
     const transcript: StrategicSessionDelta[] = [
       delta({ id: 1, seq: 1, status: 'responding', ts: STREAM_AT }),
       delta({ id: 2, seq: 2, kind: 'command', text: 'grep release gate', ts: STREAM_AT }),
@@ -2778,8 +2768,11 @@ describe('MessagesPanel live strategist streaming', () => {
     const liveStatus = el.querySelector('[data-testid="conversation-workday-status"]');
     expect(liveStatus).toHaveTextContent('Replying');
     expect(liveStatus).toHaveTextContent('grep release gate');
+    expect(liveStatus?.querySelector('[data-testid="conversation-chat-age"]')?.textContent).toMatch(/ago$/);
     expect(liveStatus).toHaveAttribute('data-chat-live-phase', 'streaming');
     expect(liveStatus).not.toHaveTextContent('Workday off');
+    expect(el.querySelector('[data-testid="strategic-streaming-reply"]')?.textContent)
+      .toBe('Streaming answer');
 
     _mockMessagesFetch([operatorTurn(), durableReply()]);
     await rerender({

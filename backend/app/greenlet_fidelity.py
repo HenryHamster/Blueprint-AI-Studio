@@ -35,7 +35,8 @@ from __future__ import annotations
 # Tests that mention the MissingGreenlet hazard (``greenlet`` in their docstring)
 # but cannot faithfully reproduce the asyncpg failure mode on SQLite, and are
 # acknowledged technical debt rather than a fidelity regression. Each entry is a
-# ``module::test_name`` selector. Ideally every entry eventually either gets a
+# ``module::canonical_test_identity`` selector. Ideally every entry eventually
+# either gets a
 # ``@pytest.mark.skipif(not USE_POSTGRES, ...)`` decorator, uses the
 # ``expire_fidelity``/``missing_greenlet_proxy`` fixtures, or injects the fault
 # directly — at which point it is removed here and the ceiling is lowered.
@@ -47,11 +48,11 @@ KNOWN_UNFAITHFUL_ALLOWLIST: frozenset[str] = frozenset({
     "test_agent.py::test_agent_status_complete_with_artifacts_creates_artifact_record",
     # Owned by the parallel "expire_all() soundness hole" task — left untouched
     # here to avoid a cross-task merge conflict on test_local_runner.py.
-    "test_local_runner.py::test_heartbeat_survives_declined_continuation_renewal_race",
+    "test_local_runner.py::TestRunnerEndpoints::test_heartbeat_survives_declined_continuation_renewal_race",
     # Verifies hold-branch idempotency across cycles — real SQLite coverage the
     # docstring itself notes is separate from the asyncpg-pool-specific crash, so
     # skipif would drop legitimate coverage.
-    "test_local_runner_holds.py::test_repeated_hold_no_change_does_not_crash",
+    "test_local_runner_holds.py::TestHoldStrategicLocalRunnerTask::test_repeated_hold_no_change_does_not_crash",
     # alembic serialization test: docstring describes greenlet-bridged DDL
     # concurrency but the test exercises no ORM session — uses a fake engine, so
     # a Postgres-only skip would be semantically wrong.

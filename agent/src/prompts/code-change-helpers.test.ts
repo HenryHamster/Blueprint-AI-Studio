@@ -362,7 +362,7 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     // Test gate fires because baseBranch === promotionTarget === 'production'
     expect(checkScript).toContain('"1" = "1"');
     expect(prScript).toContain('LTS branch');
-    expect(prScript).toContain('mandatory test gate');
+    expect(prScript).toContain('mandatory publication gate');
   });
 
   it('self-repo keeps the test gate even when promotionTarget does not match baseBranch', async () => {

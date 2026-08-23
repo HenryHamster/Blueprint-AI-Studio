@@ -138,21 +138,19 @@ run() {
 
 source scripts/backend-test-route.sh
 
-# The database-free release guard corpus is part of the test gate. The helper
-# compares static-test failures with the base tree and uses the existing
-# no-Postgres backend harness; it never invokes --fix or changes the cap ledger.
-# Keep lint/build-only checks fast: only ./check test pays for this release
-# guard. That is the local merge-test path used by ./pr open --with-tests and by
-# the mandatory backend publication gate.
-if [ "$WITH_TESTS" = "1" ]; then
-  if [ -f scripts/static_release_guard.py ]; then
+# The database-free size guard is part of every publication gate. The
+# baseline-aware size-only path covers all five governed sections and never
+# invokes --fix or changes the cap ledger. ./check test additionally runs the
+# attributed static corpus through the same helper.
+if [ -f scripts/static_release_guard.py ]; then
+  if [ "$WITH_TESTS" = "1" ]; then
     run "static release guards (task diff)" python3 scripts/static_release_guard.py --base "$BASE" --repo-root "$PWD"
   else
-    echo "[check] static release guard helper is missing — refusing to skip the gate"
-    FAILED+=("static release guard helper missing")
+    run "static size guards (task diff)" python3 scripts/static_release_guard.py --size-only --base "$BASE" --repo-root "$PWD"
   fi
 else
-  echo "[check] static release guard deferred — run './check test' to execute it"
+  echo "[check] static release guard helper is missing — refusing to skip the gate"
+  FAILED+=("static release guard helper missing")
 fi
 
 # Idempotent npm install guarded by package-lock IDENTITY, not the mere

@@ -2060,7 +2060,7 @@ describe('writePrHelper — generated script content', () => {
     expect(script).toContain('GATE_SECTION=$(printf \'%s\n%s\' "$GATE_SECTION" "$GUARD_SUPPRESSIONS_SECTION")');
   });
 
-  it('emits the mandatory test gate for self-repo automain task PR (baseBranch=automain, promotionTarget=main)', () => {
+  it('emits the mandatory governed-diff test gate for self-repo task PRs', () => {
     writePrHelper({
       taskId: 'task-selfrepo-1',
       workBranch: 'blueprint/task-selfrepo-1',
@@ -2073,9 +2073,26 @@ describe('writePrHelper — generated script content', () => {
     const script = capturedScripts['/tmp/workspace/pr'];
     expect(script).toBeDefined();
     // shouldRunBackendMergeGate returns true for self-repo regardless of branch.
-    expect(script).toContain('# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/');
-    expect(script).toContain('backend/ touched on LTS branch — forcing WITH_TESTS=1 (mandatory test gate)');
+    expect(script).toContain('# Mandatory governed-diff gate: force WITH_TESTS=1 when the diff touches');
+    expect(script).toContain("grep -Eq '^(backend/|agent/|admin-ui/|scripts/)'");
+    expect(script).toContain('governed path touched — forcing WITH_TESTS=1 (mandatory publication gate)');
     expect(script).toContain('WITH_TESTS=1');
+  });
+
+  it('selects the governed test path for non-backend publication diffs', () => {
+    writePrHelper({
+      taskId: 'task-selfrepo-agent-1',
+      workBranch: 'blueprint/task-selfrepo-agent-1',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: false,
+      promotionTarget: 'main',
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    expect(script).toContain("grep -Eq '^(backend/|agent/|admin-ui/|scripts/)'");
+    expect(script).not.toContain("grep -q '^backend/'");
   });
 
   it('does NOT emit the mandatory test gate for a foreign repo off promotion target (baseBranch=automain, promotionTarget=main)', () => {

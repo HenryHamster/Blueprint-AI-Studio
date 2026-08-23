@@ -147,7 +147,7 @@ async def _attempt_merge_with_retry_and_escalation(
     *,
     source: str,
     precomputed_migration_guard: object | None = None,
-    precomputed_size_cap: tuple[str, str | None] | None = None,
+    precomputed_size_cap: object | None = None,
     checked_head_sha: str | None = None,
     checked_base_sha: str | None = None,
 ) -> bool:
@@ -383,20 +383,58 @@ async def _attempt_merge_with_retry_and_escalation(
     # run this check in rollup_management.py before reaching this path; skip
     # here to avoid redundant GitHub I/O and a double-bump risk.
     if ci_pr_number and ci_branch and not (task.context or {}).get("rollup_pr_number"):
-        from app.rollup_size_preflight import preflight_rollup_size_caps
+        from app.rollup_size_preflight import (
+            SizeCapPreflightResult,
+            preflight_rollup_size_caps,
+        )
         from app.task_completion import _reset_review_loop_pr_head_cache
 
+        # CI evidence, the cap verdict, and merge submission must name exactly
+        # one immutable head.  A status/reason tuple has no authority: it may
+        # describe a different branch tip by the time this path submits.
+        _sc_expected_head = str(
+            checked_head_sha
+            or ci_loop.get("ci_checked_head_sha")
+            or ci_loop.get("head_sha")
+            or ""
+        )
+        if not _sc_expected_head:
+            task.latest_status_message = (
+                "Merge held — size-cap guard lacks an immutable CI head; "
+                "awaiting fresh CI"
+            )[:500]
+            session.add(task)
+            return False
         if precomputed_size_cap is not None:
-            _sc_verdict, _sc_reason = precomputed_size_cap
+            _sc_result = precomputed_size_cap
         else:
-            _sc_verdict, _sc_reason = await preflight_rollup_size_caps(
+            _sc_result = await preflight_rollup_size_caps(
                 gh_token,
                 owner,
                 repo,
                 ci_pr_number,
                 ci_branch,
                 project_id=str(task.project_id) if task.project_id else None,
+                expected_head_sha=_sc_expected_head,
             )
+        if not isinstance(_sc_result, SizeCapPreflightResult):
+            # No compatibility path: allowing legacy unkeyed tuples turns the
+            # preflight into an advisory observation again.
+            task.latest_status_message = (
+                "Merge held — size-cap guard returned unbound evidence; "
+                "awaiting fresh evaluation"
+            )[:500]
+            session.add(task)
+            return False
+        _sc_verdict = _sc_result.status
+        _sc_reason = _sc_result.reason
+        if _sc_verdict == "ok" and _sc_result.head_sha != _sc_expected_head:
+            task.latest_status_message = (
+                "Merge held — size-cap verdict head differs from immutable CI head; "
+                "awaiting fresh evaluation"
+            )[:500]
+            session.add(task)
+            return False
         from app.shared_state import runtime_config as _rt_cfg
 
         _gates_on = _rt_cfg.get("require_approval_gates", True)
@@ -434,7 +472,15 @@ async def _attempt_merge_with_retry_and_escalation(
                 _sc_reason,
             )
             return False
-        # "ok" → fall through to merge
+        if _sc_verdict != "ok":
+            task.latest_status_message = (
+                f"Merge held — invalid size-cap verdict: {_sc_verdict!r}"
+            )[:500]
+            session.add(task)
+            return False
+        # The merge authority below must submit the very head the cap guard
+        # evaluated, not merely the prior CI-loop read of it.
+        checked_head_sha = _sc_result.head_sha
 
     # Empty-effective-diff gate for direct (non-rollup) task PRs. A code-fix /
     # create PR can reach this merge chokepoint with a zero-file effective diff

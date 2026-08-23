@@ -38,6 +38,7 @@ from sqlmodel import SQLModel, select
 
 from app.rollup_management import _cleanup_branches, _verify_pr_merged
 from app.rollup_pr_verification import _PR_MERGE_NEGATIVE_TTL_S
+from app.rollup_size_preflight import SizeCapPreflightResult
 from app.models import (
     Alert,
     AlertSeverity,
@@ -2996,10 +2997,13 @@ def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadb
         new_callable=AsyncMock,
         return_value=False,
     )
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("ok", None),
+        side_effect=_bound_ok,
     )
 
 
@@ -4117,10 +4121,13 @@ async def test_merge_conflict_empty_mergeability_repoll_resolves_and_merges(
     )
     # Suppress the asyncio.sleep so the test runs instantly.
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("ok", None),
+        side_effect=_bound_ok,
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -4247,10 +4254,13 @@ async def test_merge_conflict_empty_mergeability_defers_when_repoll_exhausted(
         return_value=(None, None),
     )
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
+        return SizeCapPreflightResult("ok", None, expected_head_sha)
+
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=("ok", None),
+        side_effect=_bound_ok,
     )
 
     from app.rollup_management import _check_and_trigger_rollup

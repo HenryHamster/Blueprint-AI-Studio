@@ -18,7 +18,7 @@ describe('App workbench wiring', () => {
     expect(control).toContain("currentMode={strategicInteractionMode === 'continuous' ? 'continuous' : 'chat'}");
     expect(control).toContain('sessionActive={strategicSessionActive}');
     expect(control).toContain('sessionState={strategicSessionState}');
-    expect(control).toContain('workdayStatus={conversationWorkdayStatus}');
+    expect(control).not.toContain('workdayStatus=');
     expect(control).toContain('sessionRunners={residentStrategicSessionRunners}');
     expect(control).toContain('sessionSelectedRunnerId={strategicSessionSelectedRunnerId}');
     expect(control).toContain('onSelectRunner={handleSelectStrategicRunner}');
@@ -27,9 +27,10 @@ describe('App workbench wiring', () => {
     expect(control).toContain('onModeChange={setStrategicInteractionMode}');
   });
 
-  test('feeds the header status readout from the same computation MessagesPanel reports up, not a second local one', () => {
-    expect(appSource).toContain('const [conversationWorkdayStatus, setConversationWorkdayStatus] = useState<ConversationWorkdayStatus | null>(null);');
+  test('keeps the canonical status in MessagesPanel without wiring a second header readout', () => {
+    expect(appSource).toContain('const [, setConversationWorkdayStatus] = useState<ConversationWorkdayStatus | null>(null);');
     expect(appSource).toMatch(/<MessagesPanel[\s\S]*onWorkdayStatusChange=\{setConversationWorkdayStatus\}/);
+    expect(appSource).not.toMatch(/<StrategicSessionControl[\s\S]*workdayStatus=/);
   });
 
   test('threads the live strategist transcript into the chat-owned awareness bar', () => {

@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 
 import httpx
 
@@ -103,6 +104,32 @@ def _is_transient_commit_error(exc: BaseException) -> bool:
 _SECTION_PREFIXES: dict[str, str] = SECTION_PATH_PREFIXES
 
 
+@dataclass(frozen=True)
+class SizeCapPreflightResult:
+    """A size-cap verdict bound to the immutable head it examined.
+
+    ``head_sha`` is present only when the branch was successfully pinned and
+    remained unchanged through evaluation.  Merge callers must use that exact
+    SHA as their expected head; a status/reason pair by itself is never merge
+    authority.
+    """
+
+    status: str
+    reason: str | None
+    head_sha: str | None = None
+
+    def __iter__(self):
+        """Retain the two-value read-only unpacking used by diagnostic callers."""
+        yield self.status
+        yield self.reason
+
+
+def _result(
+    status: str, reason: str | None = None, *, head_sha: str | None = None
+) -> SizeCapPreflightResult:
+    return SizeCapPreflightResult(status=status, reason=reason, head_sha=head_sha)
+
+
 async def preflight_rollup_size_caps(
     gh_token: str,
     owner: str,
@@ -112,12 +139,13 @@ async def preflight_rollup_size_caps(
     *,
     project_id: str | None = None,
     commit_bump: bool = True,
-) -> tuple[str, str | None]:
+    expected_head_sha: str | None = None,
+) -> SizeCapPreflightResult:
     """Check assembled-tree module sizes against caps; auto-bump on breach.
 
-    Returns ``(verdict, reason)`` where *verdict* is one of the four strings
-    above and *reason* is a human-readable detail string (or ``None`` for
-    ``"ok"``).
+    The returned result carries the exact immutable SHA that was examined.
+    Callers may merge only an ``"ok"`` result whose ``head_sha`` equals both
+    their already-checked PR head and the merge API's expected head.
     """
     # Pin every read to one immutable branch tip. Branch-name content reads are
     # cached for ten minutes and were the direct cause of repeated stale bumps:
@@ -132,7 +160,15 @@ async def preflight_rollup_size_caps(
             live=True,
         )
     except Exception as exc:
-        return ("defer", f"could not resolve live staging head: {exc}")
+        return _result("defer", f"could not resolve live staging head: {exc}")
+
+    if expected_head_sha is not None and observed_head_sha != expected_head_sha:
+        return _result(
+            "defer",
+            "staging branch head differs from the immutable merge candidate "
+            f"({expected_head_sha[:12]} != {observed_head_sha[:12]})",
+            head_sha=observed_head_sha,
+        )
 
     # 1. Fetch caps JSON and changed source at the pinned immutable tip.
     try:
@@ -145,7 +181,7 @@ async def preflight_rollup_size_caps(
             project_id=project_id,
         )
     except Exception as exc:
-        return ("defer", f"could not fetch module_size_limits.json: {exc}")
+        return _result("defer", f"could not fetch module_size_limits.json: {exc}")
 
     if caps_text is None:
         # ``get_file_text_at_ref`` collapses "file genuinely absent (404)" and
@@ -170,10 +206,10 @@ async def preflight_rollup_size_caps(
                 _CAPS_JSON_PATH,
                 staging_branch,
             )
-            return ("ok", None)
+            return _result("ok", head_sha=observed_head_sha)
         # exists is True (present but text unreadable) or None (indeterminate):
         # both are transient — retry next cycle rather than merge unchecked.
-        return (
+        return _result(
             "defer",
             "module_size_limits.json present but unreadable at staging branch tip",
         )
@@ -181,13 +217,13 @@ async def preflight_rollup_size_caps(
     try:
         caps_data: dict = await async_json_loads(caps_text)
     except Exception as exc:
-        return ("defer", f"could not parse module_size_limits.json: {exc}")
+        return _result("defer", f"could not parse module_size_limits.json: {exc}")
 
     # 2. List files changed by the rollup PR.
     try:
         pr_files = await get_pr_files(gh_token, owner, repo, rollup_pr_number, project_id)
     except Exception as exc:
-        return ("defer", f"could not fetch PR #{rollup_pr_number} files: {exc}")
+        return _result("defer", f"could not fetch PR #{rollup_pr_number} files: {exc}")
 
     # Build status map so we can distinguish deleted files from fetch failures.
     pr_file_status: dict[str, str] = {
@@ -246,7 +282,7 @@ async def preflight_rollup_size_caps(
                     staging_branch,
                     exc,
                 )
-                return ("defer", f"could not fetch {full_path} at {staging_branch}: {exc}")
+                return _result("defer", f"could not fetch {full_path} at {staging_branch}: {exc}")
             if content is None:
                 # Fetch returned no content for a non-deleted file — treat as a
                 # transient failure and defer rather than silently skipping.
@@ -256,7 +292,7 @@ async def preflight_rollup_size_caps(
                     full_path,
                     staging_branch,
                 )
-                return ("defer", f"no content returned for {full_path} at {staging_branch}")
+                return _result("defer", f"no content returned for {full_path} at {staging_branch}")
             line_count = len(content.splitlines())
             if line_count > cap:
                 verdict = await asyncio.to_thread(
@@ -297,9 +333,9 @@ async def preflight_rollup_size_caps(
             live=True,
         )
     except Exception as exc:
-        return ("defer", f"could not revalidate live staging head: {exc}")
+        return _result("defer", f"could not revalidate live staging head: {exc}")
     if current_head_sha != observed_head_sha:
-        return (
+        return _result(
             "defer",
             "staging branch advanced during size-cap preflight "
             f"({observed_head_sha[:12]} -> {current_head_sha[:12]})",
@@ -316,10 +352,10 @@ async def preflight_rollup_size_caps(
             rollup_pr_number,
             names,
         )
-        return ("hold", f"chronic offender(s) require decomposition: {names}")
+        return _result("hold", f"chronic offender(s) require decomposition: {names}", head_sha=observed_head_sha)
 
     if not breaches and not removed_caps:
-        return ("ok", None)
+        return _result("ok", head_sha=observed_head_sha)
 
     summary_parts = [
         f"{key}: {old_cap} -> {new_cap}"
@@ -337,7 +373,7 @@ async def preflight_rollup_size_caps(
             rollup_pr_number,
             summary,
         )
-        return ("hold", f"auto-bump budget exhausted; breach: {summary}")
+        return _result("hold", f"auto-bump budget exhausted; breach: {summary}", head_sha=observed_head_sha)
 
     # 4. Write repaired caps into a copy of the parsed JSON and commit.
     updated: dict = dict(caps_data)
@@ -376,15 +412,15 @@ async def preflight_rollup_size_caps(
                 project_id=project_id,
             )
         except Exception as exc:
-            return ("defer", f"could not fetch governing cap source {source_path}: {exc}")
+            return _result("defer", f"could not fetch governing cap source {source_path}: {exc}")
         if source_text is None:
-            return ("defer", f"governing cap source {source_path} was unreadable")
+            return _result("defer", f"governing cap source {source_path} was unreadable")
         try:
             upserts[source_path] = rewrite_governing_cap_constant(
                 section, key, source_text, new_cap
             )
         except ValueError as exc:
-            return ("hold", f"invalid governing cap declaration in {source_path}: {exc}")
+            return _result("hold", f"invalid governing cap declaration in {source_path}: {exc}", head_sha=observed_head_sha)
     try:
         ledger_text = await get_file_text_at_ref(
             _CAP_BUMP_HISTORY_LEDGER_RELPATH,
@@ -395,7 +431,7 @@ async def preflight_rollup_size_caps(
             project_id=project_id,
         )
     except Exception as exc:
-        return (
+        return _result(
             "defer",
             f"could not fetch cap-bump-history ledger before auto-bump commit: {exc}",
         )
@@ -426,7 +462,7 @@ async def preflight_rollup_size_caps(
                 staging_branch,
             )
         else:
-            return (
+            return _result(
                 "defer",
                 "cap-bump-history ledger present but unreadable at staging branch tip",
             )
@@ -434,7 +470,7 @@ async def preflight_rollup_size_caps(
         try:
             ledger_data = json.loads(ledger_text)
         except Exception as exc:
-            return ("defer", f"could not parse cap-bump-history ledger: {exc}")
+            return _result("defer", f"could not parse cap-bump-history ledger: {exc}")
         pending = [
             (section, key, cap, new_cap)
             for section, key, _count, cap, new_cap in breaches
@@ -470,14 +506,14 @@ async def preflight_rollup_size_caps(
                 type(exc).__name__,
                 exc,
             )
-            return ("defer", f"auto-bump commit failed (transient): {exc}")
+            return _result("defer", f"auto-bump commit failed (transient): {exc}")
         logger.warning(
             "[ROLLUP-SIZE] PR #%s: auto-bump commit failed (%s: %s); holding for approval",
             rollup_pr_number,
             type(exc).__name__,
             exc,
         )
-        return ("hold", f"auto-bump commit failed: {exc}")
+        return _result("hold", f"auto-bump commit failed: {exc}", head_sha=observed_head_sha)
 
     if committed_sha == observed_head_sha:
         logger.info(
@@ -486,7 +522,7 @@ async def preflight_rollup_size_caps(
             rollup_pr_number,
             staging_branch,
         )
-        return ("ok", None)
+        return _result("ok", head_sha=observed_head_sha)
 
     logger.info(
         "[ROLLUP-SIZE] PR #%s: committed size-cap bumps on %s: %s",
@@ -494,4 +530,4 @@ async def preflight_rollup_size_caps(
         staging_branch,
         summary,
     )
-    return ("bumped", summary)
+    return _result("bumped", summary, head_sha=observed_head_sha)

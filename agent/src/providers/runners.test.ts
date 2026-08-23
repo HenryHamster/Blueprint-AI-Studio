@@ -355,6 +355,29 @@ describe('drainJsonChunks — assistant event dispatch', () => {
     await runProviderAgent('prompt', null, statusRef);
     expect(statusRef.value).toBe('Using tool: Read');
   });
+
+  it('notifies an optional observer about finalized public text and top-level tool use', async () => {
+    const onAssistantText = vi.fn();
+    const onToolUse = vi.fn();
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [
+          { type: 'text', text: 'A public reply.' },
+          { type: 'tool_use', name: 'Read', input: { file_path: '/repo/README.md' } },
+        ] },
+      }),
+      JSON.stringify({ type: 'result', result: 'done' }),
+    ]);
+
+    await runProviderAgent(
+      'prompt', null, { value: '' }, undefined, undefined, undefined, undefined, undefined,
+      { onAssistantText, onToolUse },
+    );
+
+    expect(onAssistantText).toHaveBeenCalledWith('A public reply.');
+    expect(onToolUse).toHaveBeenCalledWith('Read', { file_path: '/repo/README.md' });
+  });
 });
 
 describe('output byte cap — structured modes survive envelope amplification', () => {

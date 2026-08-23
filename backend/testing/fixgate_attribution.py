@@ -12,9 +12,11 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -46,6 +48,10 @@ class JUnitReport:
     skipped_routes: set[str] = field(default_factory=set)
     selectors: dict[str, str] = field(default_factory=dict)
     offender_sets: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Keep the original occurrence fields as well as the key-indexed maps.
+    # The Node merge verifier must hand records to this module's structured
+    # comparator without reimplementing pytest's JUnit route resolution.
+    structured_records: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -56,6 +62,18 @@ class Attribution:
     suppressed_failures: dict[str, str]
     disappeared_failures: dict[str, str]
     skipped_failures: dict[str, str]
+
+
+# The structured boundary is used by callers that cannot safely duplicate the
+# parser's normalization rules (notably the Node merge-time verifier).  Keep
+# both sides bounded so a malformed or accidentally unbounded reporter cannot
+# turn the comparator into an untrusted memory sink.
+MAX_STRUCTURED_PAYLOAD_BYTES = 2 * 1024 * 1024
+MAX_STRUCTURED_RECORDS = 4096
+MAX_STRUCTURED_DETAIL_LENGTH = 32_768
+MAX_STRUCTURED_FIELD_LENGTH = 1024
+MAX_STRUCTURED_OFFENDERS = 256
+MAX_STRUCTURED_OFFENDER_LENGTH = 512
 
 
 def _relative_source(source: Path, tree_root: Path) -> str:
@@ -146,6 +164,26 @@ def _extract_offender_set(detail: str) -> frozenset[str] | None:
     return frozenset(values)
 
 
+def _append_failure(
+    report: JUnitReport,
+    identity: FailureIdentity,
+    detail: str,
+    *,
+    offenders: frozenset[str] | None = None,
+) -> str:
+    """Add one failure while retaining repeated records as occurrences."""
+
+    occurrence = 1
+    key = identity.key
+    while key in report.failures:
+        occurrence += 1
+        key = f"{identity.key}::occurrence={occurrence}"
+    report.failures[key] = detail
+    if offenders is not None:
+        report.offender_sets[key] = offenders
+    return key
+
+
 def _resolve_route(
     classname: str, name: str, *, tree_root: Path | None
 ) -> tuple[str, str, str | None]:
@@ -224,10 +262,17 @@ def parse_junit_report(
             (detail_node.text or detail_node.attrib.get("message", "")).strip(),
             tree_root=root_path,
         )
-        parsed.failures[identity.key] = detail
-        offender_set = _extract_offender_set(detail)
-        if offender_set is not None:
-            parsed.offender_sets[identity.key] = offender_set
+        _append_failure(parsed, identity, detail, offenders=_extract_offender_set(detail))
+        record: dict[str, object] = {
+            "route": route,
+            "testcase": testcase or "<collection>",
+            "kind": kind,
+            "detail": detail,
+        }
+        offenders = _extract_offender_set(detail)
+        if offenders is not None:
+            record["offenders"] = sorted(offenders)
+        parsed.structured_records.append(record)
         if source is not None:
             suffix = f"::{testcase}" if testcase else ""
             source_path = Path(source)
@@ -314,6 +359,174 @@ def attribute_reports(current: JUnitReport, baseline: JUnitReport) -> Attributio
         disappeared_failures=disappeared,
         skipped_failures=skipped,
     )
+
+
+def _structured_string(value: object, *, field_name: str, max_length: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        raise ValueError(
+            f"structured {field_name} must be a non-empty string of at most {max_length} characters"
+        )
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"structured {field_name} must be a single-line string")
+    return value
+
+
+def _structured_report(records: object, *, label: str) -> JUnitReport:
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes, bytearray)):
+        raise ValueError(f"structured {label} must be an occurrence array")
+    if len(records) > MAX_STRUCTURED_RECORDS:
+        raise ValueError(
+            f"structured {label} exceeds the {MAX_STRUCTURED_RECORDS}-record limit"
+        )
+
+    report = JUnitReport()
+    for index, raw_record in enumerate(records):
+        if not isinstance(raw_record, Mapping):
+            raise ValueError(f"structured {label}[{index}] must be an object")
+        allowed = {"route", "testcase", "kind", "detail", "offenders"}
+        unknown = set(raw_record) - allowed
+        if unknown:
+            raise ValueError(
+                f"structured {label}[{index}] has unsupported fields: {sorted(unknown)}"
+            )
+        route = _structured_string(
+            raw_record.get("route"),
+            field_name=f"{label}[{index}].route",
+            max_length=MAX_STRUCTURED_FIELD_LENGTH,
+        )
+        testcase = _structured_string(
+            raw_record.get("testcase"),
+            field_name=f"{label}[{index}].testcase",
+            max_length=MAX_STRUCTURED_FIELD_LENGTH,
+        )
+        kind = _structured_string(
+            raw_record.get("kind"),
+            field_name=f"{label}[{index}].kind",
+            max_length=16,
+        )
+        if kind not in {"failure", "error"}:
+            raise ValueError(f"structured {label}[{index}].kind must be failure or error")
+        detail = raw_record.get("detail")
+        if not isinstance(detail, str) or len(detail) > MAX_STRUCTURED_DETAIL_LENGTH:
+            raise ValueError(
+                f"structured {label}[{index}].detail must be a string of at most "
+                f"{MAX_STRUCTURED_DETAIL_LENGTH} characters"
+            )
+
+        offenders: frozenset[str] | None = None
+        if "offenders" in raw_record:
+            raw_offenders = raw_record["offenders"]
+            if (
+                not isinstance(raw_offenders, Sequence)
+                or isinstance(raw_offenders, (str, bytes, bytearray))
+                or len(raw_offenders) > MAX_STRUCTURED_OFFENDERS
+            ):
+                raise ValueError(
+                    f"structured {label}[{index}].offenders must contain at most "
+                    f"{MAX_STRUCTURED_OFFENDERS} identities"
+                )
+            values = [
+                _structured_string(
+                    value,
+                    field_name=f"{label}[{index}].offenders[{offender_index}]",
+                    max_length=MAX_STRUCTURED_OFFENDER_LENGTH,
+                )
+                for offender_index, value in enumerate(raw_offenders)
+            ]
+            if len(values) != len(set(values)):
+                raise ValueError(f"structured {label}[{index}].offenders must be unique")
+            offenders = frozenset(values)
+
+        identity = FailureIdentity(route=route, testcase=testcase, kind=kind)
+        normalized = _normalize_failure_detail(detail, tree_root=None)
+        _append_failure(report, identity, normalized, offenders=offenders)
+        report.test_routes.add(identity.test_key)
+    return report
+
+
+def compare_structured(payload: Mapping[str, object]) -> dict[str, object]:
+    """Compare bounded occurrence arrays using the canonical normalization.
+
+    The boundary intentionally accepts only ``current`` and ``baseline``
+    arrays. Each occurrence contains ``route``, ``testcase``, ``kind`` and
+    ``detail``, with an optional offender set. The returned object is JSON-safe
+    and uses the same route/kind/detail/offender semantics as publication
+    attribution. Invalid or oversized input raises ``ValueError`` so a caller
+    can fail closed rather than silently falling back to test-name matching.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("structured attribution payload must be an object")
+    if set(payload) != {"current", "baseline"}:
+        raise ValueError("structured attribution payload must contain only current and baseline")
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"structured attribution payload is not JSON-safe: {exc}") from exc
+    if len(encoded.encode("utf-8")) > MAX_STRUCTURED_PAYLOAD_BYTES:
+        raise ValueError(
+            f"structured attribution payload exceeds the {MAX_STRUCTURED_PAYLOAD_BYTES}-byte limit"
+        )
+
+    current = _structured_report(payload["current"], label="current")
+    baseline = _structured_report(payload["baseline"], label="baseline")
+    attributed = attribute_reports(current, baseline)
+    result: dict[str, object] = {
+        "blocking": bool(attributed.new_failures),
+        "new_failures": attributed.new_failures,
+        "suppressed_failures": {
+            key: {"detail": detail, "reason": "same route/test/failure kind failed on baseline"}
+            for key, detail in attributed.suppressed_failures.items()
+        },
+        "disappeared_failures": attributed.disappeared_failures,
+        "skipped_failures": attributed.skipped_failures,
+    }
+    try:
+        output_size = len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError) as exc:  # pragma: no cover - internal types are JSON-safe
+        raise ValueError(f"structured attribution output is not JSON-safe: {exc}") from exc
+    if output_size > MAX_STRUCTURED_PAYLOAD_BYTES:
+        raise ValueError("structured attribution output exceeds the payload limit")
+    return result
+
+
+def _structured_cli_error(message: str) -> dict[str, object]:
+    return {"blocking": True, "error": {"code": "invalid_input", "message": message}}
+
+
+def _run_structured_cli() -> int:
+    raw = sys.stdin.buffer.read(MAX_STRUCTURED_PAYLOAD_BYTES + 1)
+    if len(raw) > MAX_STRUCTURED_PAYLOAD_BYTES:
+        result = _structured_cli_error(
+            f"structured attribution payload exceeds the {MAX_STRUCTURED_PAYLOAD_BYTES}-byte limit"
+        )
+        print(json.dumps(result, separators=(",", ":")))
+        return 2
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        result = compare_structured(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        print(json.dumps(_structured_cli_error(str(exc)), separators=(",", ":")))
+        return 2
+    print(json.dumps(result, separators=(",", ":")))
+    return 0
+
+
+def _run_junit_records_cli(report_path: str, tree_root: str) -> int:
+    """Emit canonical structured occurrences for a JUnit-producing runner.
+
+    This intentionally reuses ``parse_junit_report``: callers must not copy
+    route resolution or diagnostic normalization into another language merely
+    to reach the structured comparator.
+    """
+
+    try:
+        report = parse_junit_report(report_path, tree_root=tree_root, label="merge test")
+        print(json.dumps(report.structured_records, ensure_ascii=False, separators=(",", ":")))
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(json.dumps({"error": str(exc)}, separators=(",", ":")))
+        return 2
+    return 0
 
 
 def test_route_coverage_gaps(current: JUnitReport, baseline: JUnitReport) -> dict[str, str]:
@@ -453,9 +666,16 @@ __all__ = [
     "JUnitReport",
     "attribute_reports",
     "classify_verification",
+    "compare_structured",
     "extract_base",
     "format_offender_marker",
     "is_attributable_pytest_result",
     "parse_junit_failures",
     "parse_junit_report",
 ]
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--junit-records":
+        raise SystemExit(_run_junit_records_cli(sys.argv[2], sys.argv[3]))
+    raise SystemExit(_run_structured_cli())

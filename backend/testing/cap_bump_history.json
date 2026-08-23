@@ -159,6 +159,12 @@
           "commit_date": "2026-08-08T02:32:09Z",
           "old_cap": 6200,
           "new_cap": 7750
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-22T20:24:43.065104+00:00",
+          "old_cap": 6200,
+          "new_cap": 7150
         }
       ],
       "task_lifecycle_requeue.py": [
@@ -2321,6 +2327,12 @@
           "commit_date": "2026-08-20T07:54:41Z",
           "old_cap": 3100,
           "new_cap": 3600
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-22T20:24:43.065104+00:00",
+          "old_cap": 3100,
+          "new_cap": 3650
         }
       ],
       "routers/admin_debug.py": [
@@ -4655,6 +4667,14 @@
           "commit_date": "2026-08-21T10:38:20-07:00",
           "old_cap": 2400,
           "new_cap": 2850
+        }
+      ],
+      "static_release_guard.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-22T09:11:11.281462+00:00",
+          "old_cap": 750,
+          "new_cap": 1000
         }
       ],
       "test_vitest_verification_guard.py": [

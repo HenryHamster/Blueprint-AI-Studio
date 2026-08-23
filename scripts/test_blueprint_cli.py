@@ -454,7 +454,7 @@ def test_load_config_missing_raises_library_error(monkeypatch, tmp_path, capsys)
 
 
 def test_check_test_delegates_to_attributed_static_release_guard():
-    """The developer fallback runs the attributed static guard for ./check test."""
+    """The developer fallback runs size checks plain and the corpus for ./check test."""
     check_path = os.path.join(REPO_ROOT, "check")
     with open(check_path, encoding="utf-8") as f:
         wrapper = f.read()
@@ -468,6 +468,12 @@ def test_check_test_delegates_to_attributed_static_release_guard():
         'scripts/static_release_guard.py --base "$BASE" --repo-root "$PWD"'
         in default_gate
     )
+    assert (
+        'run "static size guards (task diff)" python3 '
+        'scripts/static_release_guard.py --size-only --base "$BASE" --repo-root "$PWD"'
+        in default_gate
+    )
+    assert "static release guard deferred" not in default_gate
     assert "static release guard helper is missing — refusing to skip the gate" in default_gate
     assert "bash scripts/test-backend.sh --standalone --no-postgres" not in default_gate
 

@@ -748,6 +748,21 @@ export interface ProviderRunner {
   missingCredentials(): string[];
 }
 
+/**
+ * Optional, public-safe observation of a one-shot provider run.
+ *
+ * The runner continues to own its normal log, telemetry, retry, and error
+ * behavior.  A caller may opt into these finalized assistant text and top-level
+ * tool-use notifications to mirror an operator-visible turn elsewhere (for
+ * example, the typed `strategic_session` WebSocket stream).  Deliberately do
+ * not surface partial/thinking events: they can contain private reasoning and
+ * are not a durable public reply contract.
+ */
+export interface ProviderRunObserver {
+  onAssistantText?: (text: string) => void;
+  onToolUse?: (name: string, input: unknown) => void;
+}
+
 /** Narrow execution contract for a receipt-only memory worker.
  *
  * It is deliberately not a general sandbox toggle: callers must supply a
@@ -1143,6 +1158,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
 type RunClaudeCodeOverride = (
   prompt: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean,
+  observer?: ProviderRunObserver,
 ) => Promise<{ exitCode: number; allOutput: string; lastResultText: string }>;
 
 let _runClaudeCodeOverride: RunClaudeCodeOverride | null = null;
@@ -1309,15 +1325,15 @@ export function syncAgentHelpersToPath(
   return helperBin;
 }
 
-export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
+export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, observer?: ProviderRunObserver): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
   stderrTail?: string;
 }> {
   if (_runClaudeCodeOverride) {
-    return _runClaudeCodeOverride(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
+    return _runClaudeCodeOverride(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog, observer);
   }
-  return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
+  return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog, undefined, observer);
 }
 
 /** Append text without exceeding a byte ceiling (JS string length is UTF-16). */
@@ -1347,7 +1363,7 @@ export async function runIsolatedTextOnlyMemory(
   return runProviderAgent(prompt, ws, statusRef, model, effort, undefined, false, options);
 }
 
-export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, isolatedTextOnly?: IsolatedTextOnlyRunOptions): Promise<{
+export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, isolatedTextOnly?: IsolatedTextOnlyRunOptions, observer?: ProviderRunObserver): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
   stderrTail?: string;
@@ -1890,6 +1906,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                   if (block.type === 'text') {
                     sendLog(ws, (block.text ?? '') + '\n');
                     statusRef.value = (block.text ?? '').slice(0, 100);
+                    if (!isNested && block.text) observer?.onAssistantText?.(block.text);
                   } else if (block.type === 'tool_use') {
                     sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
                     statusRef.value = `Using tool: ${strVal(block.name)}`;
@@ -1898,6 +1915,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                     // in-flight workflow tool — it refreshes progress (above) but
                     // does not replace the parent's in-flight tracking.
                     if (!isNested) {
+                      observer?.onToolUse?.(strVal(block.name), block.input);
                       toolInFlight = true;
                       workflowToolInFlight = isWorkflowToolName(strVal(block.name));
                       lastToolUseAt = Date.now();
@@ -2194,6 +2212,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                   sendLog(ws, `[tool: ${toolName}] ${preview.slice(0, 200)}\n`);
                   statusRef.value = `Using tool: ${toolName}`;
                   recordToolUse(toolName, item ?? {});
+                  if (eventType === 'item.started') observer?.onToolUse?.(toolName, item ?? {});
                   toolInFlight = true;
                   workflowToolInFlight = isWorkflowToolName(toolName);
                   lastToolUseAt = Date.now();
@@ -2222,6 +2241,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                   if (preview) statusRef.value = preview.slice(0, 100);
                   if (eventType === 'item.completed') {
                     lastResultText = (item != null && typeof item.text === 'string') ? item.text : preview;
+                    if (preview) observer?.onAssistantText?.(preview);
                   }
                 }
               } else if (itemType === 'reasoning') {
@@ -2297,6 +2317,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
           statusRef.value = trimmed.slice(0, 100);
           modelOutputSeen = true;  // run report: text-mode providers have no event schema
           recordToolUse('model_output', trimmed.slice(0, 200));
+          observer?.onAssistantText?.(text);
         }
       }
     });

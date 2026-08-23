@@ -5,18 +5,17 @@ with the current test collection so CI shard time-balancing can't silently rot.
 Runs under --noconftest (no DB, no conftest fixtures).
 """
 import ast
-import glob
 import json
 import re
 import tempfile
 import warnings
 from pathlib import Path
 from testing.fixgate_attribution import format_offender_marker
-from testing.identity_extraction import extract_python_test_ids
+from testing.estate_inventory import iter_backend_test_files
+from testing.identity_extraction import extract_python_test_ids_from_file
 
 BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
-TEST_FILE_GLOB = str(BACKEND_ROOT / "testing" / "test_*.py")
 # Key format: "testing/<filename>.py::<test_function_or_class>"
 KEY_PATTERN = re.compile(r"^testing/test_[^/]+\.py::.+$")
 # At least 60% of test_*.py files must appear in the durations map.
@@ -129,8 +128,8 @@ def test_durations_coverage_fraction_within_threshold() -> None:
     files_in_durations = {k.split("::")[0] for k in data}
 
     all_test_files = {
-        Path(p).relative_to(BACKEND_ROOT).as_posix()
-        for p in glob.glob(TEST_FILE_GLOB)
+        path.relative_to(BACKEND_ROOT).as_posix()
+        for path in iter_backend_test_files(BACKEND_ROOT.parent)
     }
 
     if not all_test_files:
@@ -340,10 +339,7 @@ def _extract_valid_test_ids(filepath: Path) -> set:
     behaviour.  Does not expand @pytest.mark.parametrize variants — callers
     must strip the "[param]" suffix before lookup.
     """
-    try:
-        return extract_python_test_ids(filepath.read_text(encoding="utf-8"))
-    except (SyntaxError, OSError):
-        return set()
+    return extract_python_test_ids_from_file(filepath)
 
 
 def test_durations_no_stale_entries() -> None:

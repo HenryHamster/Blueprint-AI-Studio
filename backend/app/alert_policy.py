@@ -7,7 +7,8 @@ not leak into every project's alert queue.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any
 import uuid
 
@@ -34,6 +35,25 @@ ROUTE_ALERT = "alert"
 ROUTE_TIMELINE = "timeline"
 ROUTE_HEALTH = "health"
 ROUTE_SUPPRESS = "suppress"
+
+
+class AlertRetirementMode(str, Enum):
+    """How an operator-visible alert leaves the active feed.
+
+    ``SOURCE_CONDITION`` means the producer owns a condition-specific resolver;
+    ``TASK_TERMINAL`` is reconciled by the bounded task sweep. ``MANUAL`` is a
+    genuine operator acknowledgement/dismissal, while ``TIMELINE_ONLY`` means
+    the event must never create a durable alert row (legacy rows are retired by
+    the policy sweep).
+    """
+
+    TASK_TERMINAL = "task_terminal"
+    SOURCE_CONDITION = "source_condition"
+    MANUAL = "manual"
+    TIMELINE_ONLY = "timeline_only"
+    # Friendly compatibility alias for callers describing the route rather
+    # than the storage consequence.
+    TIMELINE = "timeline_only"
 
 
 ALERT_DOMAIN_DEFINITIONS: dict[str, dict[str, str]] = {
@@ -96,6 +116,7 @@ class AlertEventPolicy:
     allow_info: bool = False
     action_required: bool = True
     audience: str | None = None
+    retirement: AlertRetirementMode | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +126,7 @@ class AlertDecision:
     domain: str
     route: str
     reason: str = ""
+    retirement: AlertRetirementMode = AlertRetirementMode.MANUAL
 
 
 ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
@@ -256,6 +278,63 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
 }
 
 
+# Keep retirement ownership explicit and reviewable alongside the policy
+# registry.  The sets are intentionally exhaustive: adding a new durable
+# operator event without deciding how it ends fails at import time instead of
+# creating another immortal row.
+_TASK_TERMINAL_RETIREMENT_EVENTS = frozenset(
+    {"task.failed", "task.blocked", "review.escalated"}
+)
+_TIMELINE_ONLY_RETIREMENT_EVENTS = frozenset(
+    {
+        "deployment.auto_resume",
+        "deployment.halted_recovered",
+        "research.direction_auto_completed",
+        "research.direction_auto_retired",
+    }
+)
+_MANUAL_RETIREMENT_EVENTS = frozenset(
+    {
+        "approval.needed",
+        "cost.ceiling_reached",
+        "capacity.quota_exhausted",
+        "capacity.all_accounts_blocked",
+        "branch.unsafe_config",
+        "branch.missing_config",
+        "branch.promotion_target_landing",
+        "merge.unverified",
+        "review.fail_open",
+        "release.qualification_timeout",
+        "release.qualification_crash_loop",
+        "release.walkthrough_key_unmatched",
+        "rollup.backmerge_blocked",
+        "rollup.pr_blocked",
+        "notification.dead_letter_lost",
+    }
+)
+
+_RETIREMENT_MODE_BY_EVENT: dict[str, AlertRetirementMode] = dict.fromkeys(
+    ALERT_EVENT_POLICIES, AlertRetirementMode.SOURCE_CONDITION
+)
+_RETIREMENT_MODE_BY_EVENT.update(
+    {
+        **dict.fromkeys(
+            _TASK_TERMINAL_RETIREMENT_EVENTS, AlertRetirementMode.TASK_TERMINAL
+        ),
+        **dict.fromkeys(
+            _TIMELINE_ONLY_RETIREMENT_EVENTS, AlertRetirementMode.TIMELINE_ONLY
+        ),
+        **dict.fromkeys(_MANUAL_RETIREMENT_EVENTS, AlertRetirementMode.MANUAL),
+    }
+)
+if set(_RETIREMENT_MODE_BY_EVENT) != set(ALERT_EVENT_POLICIES):
+    raise RuntimeError("every alert policy must declare a retirement mode")
+ALERT_EVENT_POLICIES = {
+    event_type: replace(policy, retirement=_RETIREMENT_MODE_BY_EVENT[event_type])
+    for event_type, policy in ALERT_EVENT_POLICIES.items()
+}
+
+
 def get_alert_event_policy(event_type: str | None) -> AlertEventPolicy:
     """Return a policy, defaulting unknown events to core alert behavior."""
 
@@ -319,6 +398,7 @@ def should_emit_project_alert(
             policy.domain,
             policy.route,
             reason=f"audience:{audience}",
+            retirement=policy.retirement or AlertRetirementMode.MANUAL,
         )
 
     if policy.route != ROUTE_ALERT:
@@ -328,6 +408,7 @@ def should_emit_project_alert(
             policy.domain,
             policy.route,
             reason=f"route:{policy.route}",
+            retirement=policy.retirement or AlertRetirementMode.MANUAL,
         )
     if severity_value == AlertSeverity.INFO.value and not policy.allow_info:
         return AlertDecision(
@@ -336,6 +417,7 @@ def should_emit_project_alert(
             policy.domain,
             policy.route,
             reason="info_severity",
+            retirement=policy.retirement or AlertRetirementMode.MANUAL,
         )
     if not project_alert_domain_enabled(project, policy.domain):
         return AlertDecision(
@@ -344,8 +426,15 @@ def should_emit_project_alert(
             policy.domain,
             policy.route,
             reason=f"domain_disabled:{policy.domain}",
+            retirement=policy.retirement or AlertRetirementMode.MANUAL,
         )
-    return AlertDecision(True, policy.event_type, policy.domain, policy.route)
+    return AlertDecision(
+        True,
+        policy.event_type,
+        policy.domain,
+        policy.route,
+        retirement=policy.retirement or AlertRetirementMode.MANUAL,
+    )
 
 
 async def alert_policy_allows(

@@ -79,6 +79,27 @@ async def test_preflight_no_breach_returns_ok():
 
 
 @pytest.mark.asyncio
+async def test_preflight_rejects_branch_head_mismatch_before_reading_tree():
+    """A branch tip other than the intended merge head has no merge authority."""
+    with patch(
+        "app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock
+    ) as mock_fetch:
+        result = await preflight_rollup_size_caps(
+            "tok",
+            "owner",
+            "repo",
+            42,
+            "staging/branch-1",
+            expected_head_sha="b" * 40,
+        )
+
+    assert result.status == "defer"
+    assert result.head_sha == _PINNED_HEAD
+    assert "differs from the immutable merge candidate" in (result.reason or "")
+    mock_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_preflight_breach_auto_bumps_and_returns_bumped():
     """PR file over its cap → auto-bump committed, verdict bumped."""
     file_content = "line\n" * 600  # 600 lines, cap 500

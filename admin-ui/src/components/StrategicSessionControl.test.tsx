@@ -1,25 +1,14 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, expect, test, vi } from 'vitest';
 import { StrategicSessionControl } from './StrategicSessionControl';
-import type { ConversationWorkdayStatus } from '../utils/conversationWorkdayStatus';
 
-function status(overrides: Partial<ConversationWorkdayStatus> = {}): ConversationWorkdayStatus {
-  return {
-    state: 'working',
-    label: 'Workday working',
-    title: 'Private Continuous Workday Resident is actively working',
-    ...overrides,
-  };
-}
-
-describe('StrategicSessionControl single status readout', () => {
-  test('renders exactly one legible mode control and one Workday status readout', () => {
+describe('StrategicSessionControl keeps status readout in the utility bar', () => {
+  test('renders lifecycle controls without a second Workday status readout', () => {
     render(
       <StrategicSessionControl
         currentMode="continuous"
         sessionActive
         sessionState="active"
-        workdayStatus={status({ state: 'working', label: 'Workday working' })}
         onStartSession={vi.fn()}
         onStopSession={vi.fn()}
       />,
@@ -30,37 +19,25 @@ describe('StrategicSessionControl single status readout', () => {
     expect(screen.getByLabelText('Switch Strategic mode to Chat')).toBeInTheDocument();
     expect(screen.getByLabelText('Switch Strategic mode to Workday')).toBeInTheDocument();
 
-    // Exactly one Workday status readout, sourced from the workdayStatus prop.
-    const statuses = screen.getAllByRole('status');
-    expect(statuses).toHaveLength(1);
-    expect(statuses[0]).toHaveTextContent('Workday working');
-    expect(statuses[0]).toHaveAttribute('data-workday-state', 'working');
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
-  test('reflects the shared ConversationWorkdayStatus label and detail, not a locally-derived one', () => {
+  test('does not derive a status label from session lifecycle inputs', () => {
     render(
       <StrategicSessionControl
         currentMode="continuous"
         sessionActive
         sessionState="active"
-        workdayStatus={status({
-          state: 'consultation_queued',
-          label: 'Workday requested',
-          detail: '2 open requests',
-          title: 'Fast requested a private Continuous Workday consultation',
-        })}
         onStartSession={vi.fn()}
         onStopSession={vi.fn()}
       />,
     );
 
-    const readout = screen.getByRole('status');
-    expect(readout).toHaveTextContent('Workday requested · 2 open requests');
-    expect(readout).toHaveAttribute('title', 'Fast requested a private Continuous Workday consultation');
-    expect(readout).toHaveAttribute('data-workday-state', 'consultation_queued');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByText(/Workday requested|2 open requests/)).toBeNull();
   });
 
-  test('falls back to a neutral Ready readout when no workdayStatus is supplied', () => {
+  test('does not render a Ready fallback readout', () => {
     render(
       <StrategicSessionControl
         currentMode="continuous"
@@ -70,45 +47,34 @@ describe('StrategicSessionControl single status readout', () => {
       />,
     );
 
-    const readout = screen.getByRole('status');
-    expect(readout).toHaveTextContent('Ready');
-    expect(readout).toHaveAttribute('data-workday-state', 'ready');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByText('Ready')).toBeNull();
   });
 
-  test('shows a spinner while the shared status is starting, stopping, waiting, or retrying', () => {
-    for (const state of ['starting', 'stopping', 'waiting', 'retrying'] as const) {
-      const { unmount } = render(
-        <StrategicSessionControl
-          currentMode="continuous"
-          sessionActive
-          sessionState="active"
-          workdayStatus={status({ state, label: state })}
-          onStartSession={vi.fn()}
-          onStopSession={vi.fn()}
-        />,
-      );
+  test('shows a spinner on the lifecycle button while sessionBusy is true', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionBusy
+        onStartSession={vi.fn()}
+      />,
+    );
 
-      expect(screen.getByRole('status').querySelector('.animate-spin')).not.toBeNull();
-      unmount();
-    }
+    expect(screen.getByTitle('Start Workday session').querySelector('.animate-spin')).not.toBeNull();
   });
 
-  test('shows an alert glyph when the shared status is unavailable or needs_restart', () => {
-    for (const state of ['unavailable', 'needs_restart'] as const) {
-      const { unmount } = render(
-        <StrategicSessionControl
-          currentMode="continuous"
-          sessionActive={false}
-          sessionState="ready"
-          workdayStatus={status({ state, label: state })}
-          onStartSession={vi.fn()}
-          onStopSession={vi.fn()}
-        />,
-      );
+  test('does not add a status glyph for an unavailable lifecycle state', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="error"
+        sessionActive
+        onStopSession={vi.fn()}
+      />,
+    );
 
-      expect(screen.getByRole('status').querySelector('svg')).not.toBeNull();
-      unmount();
-    }
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.getByTitle('Stop Workday session before restarting')).toBeInTheDocument();
   });
 
   test('offers stop-then-restart when the session lifecycle is blocked or errored, independent of the status label', () => {
@@ -117,7 +83,6 @@ describe('StrategicSessionControl single status readout', () => {
         currentMode="continuous"
         sessionActive
         sessionState="blocked"
-        workdayStatus={status({ state: 'unavailable', label: 'Workday unavailable' })}
         onStartSession={vi.fn()}
         onStopSession={vi.fn()}
       />,
@@ -450,7 +415,6 @@ describe('StrategicSessionControl chat mode', () => {
     render(
       <StrategicSessionControl
         currentMode="chat"
-        workdayStatus={status({ state: 'off', label: 'Workday off' })}
         onModeChange={vi.fn()}
       />,
     );
