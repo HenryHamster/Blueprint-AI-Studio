@@ -5644,6 +5644,63 @@ def _sweep_metric_value(verdict: dict) -> "float | str | None":
 _ACTIVE_COMPUTE_STATUSES = frozenset({"QUEUED", "STARTING", "RUNNING", "POLLING"})
 
 
+def _fmt_window_minutes(minutes) -> str:
+    """Render a --include-finished window the way an operator said it."""
+    try:
+        m = int(minutes)
+    except (TypeError, ValueError):
+        return "the default window"
+    if m <= 0:
+        return "0m (active jobs only)"
+    if m >= 1440 and m % 1440 == 0:
+        return f"{m // 1440}d"
+    if m >= 60 and m % 60 == 0:
+        return f"{m // 60}h"
+    return f"{m}m"
+
+
+def _compute_criterion_cell(j: dict) -> str:
+    """Render the SCIENTIFIC verdict, which is not the execution status.
+
+    The backend derives ``criterion_status`` (NOT_DECLARED / MET / NOT_MET /
+    UNMEASURED / INVALID) and serves it on every compute-job payload. Prefer it:
+    ``criterion_verdict.met`` is a bool, so it collapses "the threshold was
+    measured and missed" and "the metric was never measured at all" into the
+    same ``met=False`` — and a job in the second case reads as a clean
+    scientific failure when it is actually an unmeasured run.
+
+    Falls back to the raw verdict for a pre-upgrade backend that does not serve
+    the derived field.
+    """
+    cv = j.get("criterion_verdict") if isinstance(j.get("criterion_verdict"), dict) else None
+    metric = cv.get("metric") if cv else None
+    value = cv.get("value") if cv else None
+    measurement = f" ({metric}={value})" if metric and value is not None else ""
+    crit = j.get("criterion_status")
+    if isinstance(crit, str) and crit:
+        if crit == "NOT_DECLARED":
+            return ""
+        return f"  crit={crit}{measurement}"
+    if cv is not None:
+        return f"  met={cv.get('met')}{measurement}"
+    return ""
+
+
+def _compute_watchdog_cell(j: dict) -> str:
+    """Surface an in-flight no-progress cut on the list row.
+
+    ``watchdog_state == 'cutting'`` means the no-progress condition holds right
+    now and the next poll pass terminates the job. An operator scanning the list
+    should not have to open the job to learn that.
+    """
+    if j.get("status") not in _ACTIVE_COMPUTE_STATUSES:
+        return ""
+    if j.get("watchdog_state") != "cutting":
+        return ""
+    reason = j.get("watchdog_cut_reason") or "no_progress"
+    return f"  ⚠ watchdog cutting ({reason})"
+
+
 def _compute_job_burn_rate(j: dict, now: "datetime") -> "float | None":
     """Return $/hr burn rate for an active job; None if data is insufficient (<60s elapsed or no accrued cost)."""
     if j.get("status") not in _ACTIVE_COMPUTE_STATUSES:
@@ -5701,19 +5758,42 @@ def _compute_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
     limit = getattr(args, "limit", 20)
     status_filter = getattr(args, "status_filter", None)
-    if getattr(args, "all_terminal", False):
+    all_terminal = bool(getattr(args, "all_terminal", False))
+    finished = getattr(args, "include_finished", 360)
+    if all_terminal:
         resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
                    f"?all_terminal=true&limit={limit}")
     else:
-        finished = getattr(args, "include_finished", 360)
         resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
                    f"?include_finished_minutes={finished}&limit={limit}")
     jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
     has_more = resp.get("has_more", False) if isinstance(resp, dict) else False
     summary = resp.get("summary") if isinstance(resp, dict) else None
     if status_filter:
-        jobs = [j for j in jobs if j.get("status", "").upper() == status_filter.upper()]
-    _emit(args, {"compute_jobs": jobs, "has_more": has_more, "summary": summary, "status_filter": status_filter}, _render_compute_list)
+        wanted = status_filter.upper()
+        # Match either the execution status or the derived experiment status, so
+        # `--status CRITERION_UNMEASURED` is askable without the caller having to
+        # know that those jobs are all filed under SUCCEEDED.
+        jobs = [
+            j for j in jobs
+            if (j.get("status") or "").upper() == wanted
+            or (j.get("experiment_status") or "").upper() == wanted
+        ]
+    _emit(
+        args,
+        {
+            "compute_jobs": jobs,
+            "has_more": has_more,
+            "summary": summary,
+            "status_filter": status_filter,
+            "window": {
+                "all_terminal": all_terminal,
+                "include_finished_minutes": None if all_terminal else finished,
+                "limit": limit,
+            },
+        },
+        _render_compute_list,
+    )
 
 
 def _render_compute_list(data: dict) -> None:
@@ -5721,6 +5801,19 @@ def _render_compute_list(data: dict) -> None:
     print(f"=== COMPUTE JOBS ({len(jobs)}) ===")
     if not jobs:
         print("  (none)")
+        # An empty list is a claim about a WINDOW, not about the project. Say
+        # which window produced it, or the reader concludes there is no compute.
+        window = data.get("window") or {}
+        if window.get("all_terminal"):
+            print("  (searched every terminal job; none matched)")
+        else:
+            print(
+                "  (window: active jobs plus those finished in the last "
+                f"{_fmt_window_minutes(window.get('include_finished_minutes'))} — "
+                "widen with --include-finished <minutes> or --all-terminal)"
+            )
+        if data.get("status_filter"):
+            print(f"  (filtered to status={data['status_filter']})")
         return
     now = datetime.now(timezone.utc)
     for j in jobs:
@@ -5730,21 +5823,22 @@ def _render_compute_list(data: dict) -> None:
         task_type = j.get("task_type") or "?"
         cost = j.get("final_cost_usd")
         cost_str = f"  ${cost:.2f}" if cost is not None else ""
-        cv = j.get("criterion_verdict") if isinstance(j.get("criterion_verdict"), dict) else None
-        if cv is not None:
-            metric = cv.get("metric")
-            value = cv.get("value")
-            if metric and value is not None:
-                verdict_str = f"  met={cv.get('met')} ({metric}={value})"
-            else:
-                verdict_str = f"  met={cv.get('met')}"
-        else:
-            verdict_str = ""
+        verdict_str = _compute_criterion_cell(j)
         exp = (j.get("experiment") or "")[:20]
         exp_str = f"  exp={exp}" if exp else ""
         burn = _compute_job_burn_rate(j, now)
         burn_str = f"  burn=${burn:.2f}/hr" if burn is not None else ""
-        print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}{burn_str}")
+        watchdog_str = _compute_watchdog_cell(j)
+        terminal_reason = (j.get("terminal_reason") or "").strip()
+        reason_str = (
+            f"  reason={terminal_reason[:60]}"
+            if terminal_reason and status not in _ACTIVE_COMPUTE_STATUSES
+            else ""
+        )
+        print(
+            f"  {jid}  {status:12} [{task_type}]  {title}"
+            f"{cost_str}{verdict_str}{exp_str}{burn_str}{watchdog_str}{reason_str}"
+        )
     status_filter = data.get("status_filter")
     if data.get("has_more") and not status_filter:
         print("  (more jobs available; increase --limit, --include-finished, or use --all-terminal)")
@@ -5806,6 +5900,18 @@ def _render_compute_show(data: dict) -> None:
     print(f"=== COMPUTE JOB: {j.get('id', '?')} ===")
     status = j.get("status", "?")
     print(f"  status    : {status}")
+    # status is EXECUTION truth only. The backend fuses it with the criterion
+    # verdict into experiment_status, which is what actually answers "did this
+    # experiment work?" — a SUCCEEDED job can be CRITERION_UNMEASURED.
+    experiment_status = j.get("experiment_status")
+    if experiment_status and experiment_status != status:
+        print(f"  result    : {experiment_status}")
+    outcome = j.get("outcome")
+    if outcome:
+        print(f"  outcome   : {outcome}")
+    criterion_status = j.get("criterion_status")
+    if criterion_status and criterion_status != "NOT_DECLARED":
+        print(f"  criterion : {criterion_status}")
     print(f"  title     : {j.get('task_title') or j.get('title') or '—'}")
     print(f"  type      : {j.get('task_type', '?')}")
     experiment = j.get("experiment")
@@ -5834,6 +5940,21 @@ def _render_compute_show(data: dict) -> None:
         deadline = j.get("wall_clock_deadline")
         if deadline:
             print(f"  deadline  : {deadline}")
+        wd_state = j.get("watchdog_state")
+        if wd_state:
+            timeout = j.get("no_progress_timeout_seconds")
+            t_str = f" (cut at {timeout}s no-progress)" if timeout else ""
+            if wd_state == "cutting":
+                reason = j.get("watchdog_cut_reason") or "no_progress"
+                print(f"  watchdog  : ⚠ CUTTING NOW — {reason}{t_str}")
+            elif wd_state == "protected":
+                last = j.get("last_progress_at")
+                last_str = f", last progress {last}" if last else ""
+                print(f"  watchdog  : protected{t_str}{last_str}")
+            else:
+                inert = j.get("watchdog_inert_reason")
+                inert_str = f" — {inert}" if inert else ""
+                print(f"  watchdog  : {wd_state}{inert_str}{t_str}")
     else:
         cost = j.get("final_cost_usd")
         if cost is not None:

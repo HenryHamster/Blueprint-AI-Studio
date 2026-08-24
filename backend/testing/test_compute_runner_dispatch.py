@@ -3073,90 +3073,10 @@ def test_serialize_compute_job_response_safe_absent_on_legacy_rows():
     assert data["progress_series"] is None
 
 
-def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status():
-    """serialize_compute_job_response_safe promotes watchdog-protection status
-    fields as first-class fields on the operator-facing payload.
-
-    Three sub-cases:
-    (1) Protected running job: declared metric + enough fresh receipt-time history
-        -> watchdog_active=True and watchdog_state='protected'.
-    (2) No declared metric: watchdog_active=False, watchdog_inert_reason='no_declared_metric'.
-    (3) Metric-name mismatch: samples exist but none match declared metric ->
-        watchdog_inert_reason='metric_name_mismatch'.
-    """
-    from app.schemas import serialize_compute_job_response_safe
-    from app.models import _utcnow
-
-    # --- Case 1: protected job with declared metric and matching samples ---
-    now = _utcnow()
-    progress_series = [
-        {
-            "t": "runner-authored",
-            "received_at": (now - timedelta(seconds=age)).isoformat(),
-            "name": "reward",
-            "value": 1.0,
-        }
-        for age in (3600, 2700, 1800, 900, 0)
-    ]
-    job_protected = ComputeJob(
-        id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        backend="local-subprocess",
-        status=ComputeJobStatus.RUNNING,
-        spend_cap_usd=1.0,
-        started_at=now - timedelta(hours=2),
-        polling_metadata={
-            "declared_metric": "reward",
-            "no_progress_timeout_seconds": 3600,
-            "progress_series": progress_series,
-        },
-    )
-    data = serialize_compute_job_response_safe(job_protected)
-    assert data["watchdog_active"] is True, "watchdog must be active for a protected job"
-    assert data["watchdog_state"] == "protected"
-    assert data["no_progress_timeout_seconds"] == 3600, "per-job timeout must be reported"
-    assert data["last_progress_at"] == now.isoformat(), "must return newest server receipt time"
-    assert data["watchdog_inert_reason"] is None, "no inert reason for an active watchdog"
-
-    # --- Case 2: no declared metric ---
-    job_no_metric = ComputeJob(
-        id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        backend="local-subprocess",
-        status=ComputeJobStatus.RUNNING,
-        spend_cap_usd=1.0,
-        polling_metadata={},
-    )
-    data2 = serialize_compute_job_response_safe(job_no_metric)
-    assert data2["watchdog_active"] is False
-    assert data2["watchdog_inert_reason"] == "no_declared_metric"
-    assert data2["no_progress_timeout_seconds"] is None
-    assert data2["last_progress_at"] is None
-
-    # --- Case 3: declared metric but all samples carry a different metric name ---
-    job_mismatch = ComputeJob(
-        id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        backend="local-subprocess",
-        status=ComputeJobStatus.RUNNING,
-        spend_cap_usd=1.0,
-        polling_metadata={
-            "declared_metric": "reward",
-            "progress_series": [
-                {
-                    "t": "runner-authored",
-                    "received_at": now.isoformat(),
-                    "name": "loss",
-                    "value": 0.5,
-                },
-            ],
-        },
-    )
-    data3 = serialize_compute_job_response_safe(job_mismatch)
-    assert data3["watchdog_active"] is False
-    assert data3["watchdog_state"] == "inert"
-    assert data3["watchdog_inert_reason"] == "metric_name_mismatch"
-    assert data3["last_progress_at"] is None
+# The third member of this serialize group -- the one that pins the
+# watchdog-protection fields promoted onto the same payload -- lives in
+# test_compute_watchdog.py, next to the classifier whose verdict it
+# serializes (test_serialize_compute_job_response_safe_promotes_watchdog_protection_status).
 
 
 def test_runner_bridge_last_progress_at_reflects_written_samples():

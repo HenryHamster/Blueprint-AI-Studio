@@ -681,6 +681,42 @@ describe('ComputeJobsPanel watchdog protection status', () => {
     },
   );
 
+  test.each([
+    ['plateau', 'its declared metric has not moved for 30m'],
+    ['stale_telemetry', 'stopped being reported before the start of the no-progress window'],
+    ['no_telemetry', 'its declared metric has never been reported'],
+    ['malformed_history', 'the ingestion path is producing unusable telemetry'],
+  ] as const)(
+    'watchdog_state:cutting says the job is being terminated, not that it is safe (%s)',
+    async (cutReason, explanation) => {
+      setupMocks();
+      fetchComputeJobs.mockResolvedValue(wrapJobs([
+        makeJob({
+          status: 'RUNNING',
+          watchdog_active: true,
+          watchdog_state: 'cutting',
+          watchdog_cut_reason: cutReason,
+          watchdog_inert_reason: null,
+          no_progress_timeout_seconds: 1800,
+        }),
+      ]));
+      const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+      const el = await findByTestId('compute-watchdog-status');
+      expect(el.querySelector('[data-testid="compute-watchdog-cutting"]')?.textContent).toContain('Cutting now');
+      const warning = el.querySelector('[data-testid="compute-watchdog-cutting-warning"]');
+      expect(warning?.textContent).toContain('The no-progress watchdog is terminating this job');
+      expect(warning?.textContent).toContain(explanation);
+      // The reassuring branches must not fire for a job that is being cut. This
+      // is the whole point: 'stale_telemetry' and 'no_telemetry' used to render
+      // as "Watchdog will not currently cut this job" in the very poll pass that
+      // terminated it.
+      expect(el.querySelector('[data-testid="compute-watchdog-unprotected"]')).toBeNull();
+      expect(el.querySelector('[data-testid="compute-watchdog-inert-warning"]')).toBeNull();
+      expect(el.querySelector('[data-testid="compute-watchdog-protected"]')).toBeNull();
+      expect(el.textContent?.toLowerCase()).not.toContain('will not currently cut');
+    },
+  );
+
   test('new protected state overrides a contradictory legacy boolean', async () => {
     setupMocks();
     fetchComputeJobs.mockResolvedValue(wrapJobs([

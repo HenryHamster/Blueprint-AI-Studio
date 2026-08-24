@@ -5043,6 +5043,8 @@ def test_compute_list_status_filter_case_insensitive(mock_api, capsys):
     assert "GPU benchmark alpha" not in out
 
 
+
+
 def test_compute_kill_read_only_refused(mock_api, monkeypatch):
     """compute kill refuses under a read-only (agent-JWT) config."""
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})

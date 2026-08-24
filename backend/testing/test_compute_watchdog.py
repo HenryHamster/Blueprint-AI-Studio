@@ -11,12 +11,15 @@ Seams exercised:
     window requirement, disabled-when-zero)
   • _build_container_run_prefix / _build_local_wrapper_command: progress env injection
   • _parse_progress_record / _ProgressTail: runner-side JSONL reader
+  • serialize_compute_job_response_safe: promotion of the watchdog verdict
+    onto the operator-facing payload
   • process_compute_jobs_once: end-to-end watchdog kill
     (terminal_kind == NO_PROGRESS_TERMINAL_REASON, distinct from deadline)
 """
 
 import os
 import sys
+import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -51,12 +54,14 @@ from app.database import resolve_async_engine
 from app.models import (
     Alert,
     AlertSeverity,
+    ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
     Project,
     Task,
     TaskStatus,
 )
+from app.schemas import serialize_compute_job_response_safe
 from app.time_utils import _utcnow
 
 
@@ -427,17 +432,45 @@ def test_no_progress_stalled_disabled_when_window_seconds_zero(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("samples", "started_offset", "expected_state", "expected_reason", "expected_stalled"),
+    ("samples", "started_offset", "expected_state", "expected_reason"),
     [
-        ([], 7200, "insufficient_history", "no_telemetry", True),
-        ([(4000, "val/loss", 1.0), (3900, "val/loss", 1.0)], 7200, "stale_telemetry", "stale_telemetry", True),
-        ([(120, "val/loss", 1.0), (60, "val/loss", 1.0), (0, "val/loss", 1.0)], 7200, "insufficient_history", "insufficient_window", False),
-        (_flat_samples("other/loss"), 7200, "inert", "metric_name_mismatch", False),
+        # ── the watchdog IS cutting: the surface must say so ────────────────
+        ([], 7200, "cutting", "no_telemetry"),
+        ([(4000, "val/loss", 1.0), (3900, "val/loss", 1.0)], 7200, "cutting", "stale_telemetry"),
+        (_flat_samples("val/loss"), 7200, "cutting", "plateau"),
+        # Samples carry the declared name but no usable number — the ingestion
+        # path is broken, not the job silent. Cut either way; say which.
+        ([(a, "val/loss", "high") for a in _SPAN_AGES_SECONDS], 7200, "cutting", "malformed_history"),
+        # ── the watchdog is armed but will not cut ──────────────────────────
+        (_advancing_samples("val/loss"), 7200, "protected", None),
+        ([(120, "val/loss", 1.0), (60, "val/loss", 1.0), (0, "val/loss", 1.0)], 7200, "insufficient_history", "insufficient_window"),
+        ([], 60, "warming_up", None),
+        # ── the watchdog cannot fire at all ─────────────────────────────────
+        (_flat_samples("other/loss"), 7200, "inert", "metric_name_mismatch"),
     ],
 )
-def test_watchdog_status_is_honest_for_inert_telemetry(
-    samples, started_offset, expected_state, expected_reason, expected_stalled
+def test_watchdog_status_agrees_with_the_cut_the_poller_will_make(
+    samples, started_offset, expected_state, expected_reason
 ):
+    """The operator surface and the poller answer from ONE verdict.
+
+    REWRITTEN GUARD — please read. This test used to assert the opposite for
+    its first two rows: ``watchdog_active is False`` for a job whose
+    ``_no_progress_stalled`` assertion, in the same test body, was ``True``. It
+    was named "is honest for inert telemetry" and it pinned exactly the
+    dishonesty it named. ``no_telemetry`` and ``stale_telemetry`` are two of the
+    conditions under which ``_no_progress_stalled`` returns True and
+    ``process_compute_jobs_once`` terminates the job with
+    ``terminal_kind=no_progress``; the admin UI rendered both as "Watchdog will
+    not currently cut this job", and ``blueprint compute show`` reported the job
+    unprotected, right up to the moment it was cut.
+
+    No coverage is lost: every original row is still here, still asserting the
+    poller's boolean via the agreement invariant below, and now also asserting
+    the reason the operator is shown. Four rows were added to close the states
+    the original table never reached — plateau (the cut the watchdog was built
+    for), a broken ingestion path, and the two non-cutting armed states.
+    """
     job, now = _make_stub_job(
         metric="val/loss",
         samples=samples,
@@ -449,13 +482,28 @@ def test_watchdog_status_is_honest_for_inert_telemetry(
         now=now,
     )
     assert status["watchdog_state"] == expected_state
-    assert status["watchdog_active"] is False
-    assert status["watchdog_inert_reason"] == expected_reason
-    # Missing or stale declared telemetry is enforceable after grace.
-    assert _no_progress_stalled(job, now=now) is expected_stalled
+
+    stalled = _no_progress_stalled(job, now=now)
+    assert (status["watchdog_state"] == "cutting") is stalled, (
+        "the operator surface and the poller must never disagree about whether "
+        f"this job is being cut: state={status['watchdog_state']!r} "
+        f"_no_progress_stalled={stalled}"
+    )
+    assert status["watchdog_active"] is (expected_state in {"protected", "cutting"}), (
+        "watchdog_active means 'the watchdog is enforcing on this job right "
+        "now', which includes the job it is about to cut"
+    )
+    if expected_state == "cutting":
+        assert status["watchdog_cut_reason"] == expected_reason
+        assert status["watchdog_inert_reason"] is None, (
+            "a job being cut is not inert"
+        )
+    else:
+        assert status["watchdog_cut_reason"] is None
+        assert status["watchdog_inert_reason"] == expected_reason
 
 
-def test_watchdog_status_warming_and_malformed_history_are_not_protected():
+def test_watchdog_status_warming_up_is_not_protected_and_malformed_is_a_cut():
     warming, now = _make_stub_job(
         metric="val/loss",
         samples=[],
@@ -468,6 +516,8 @@ def test_watchdog_status_warming_and_malformed_history_are_not_protected():
     )
     assert warming_status["watchdog_state"] == "warming_up"
     assert warming_status["watchdog_active"] is False
+    assert warming_status["watchdog_cut_reason"] is None
+    assert _no_progress_stalled(warming, now=now) is False
 
     # Both samples have received_at present but malformed (not parseable).
     # Truly malformed telemetry cannot bypass an armed watchdog after grace.
@@ -490,12 +540,57 @@ def test_watchdog_status_warming_and_malformed_history_are_not_protected():
         started_at=malformed.started_at,
         now=now,
     )
-    assert malformed_status["watchdog_state"] == "insufficient_history"
-    assert malformed_status["watchdog_inert_reason"] == "malformed_history"
-    assert malformed_status["watchdog_active"] is False
     # Present-but-bad received_at does not qualify as a legacy pre-upgrade sample
-    # (received_at is server-stamped; bad = ingestion bypass), so still stalled.
+    # (received_at is server-stamped; bad = ingestion bypass), so the job IS
+    # stalled -- and the surface now says so instead of reporting it unprotected.
     assert _no_progress_stalled(malformed, now=now) is True
+    assert malformed_status["watchdog_state"] == "cutting"
+    assert malformed_status["watchdog_active"] is True
+    assert malformed_status["watchdog_cut_reason"] == "malformed_history"
+    assert malformed_status["watchdog_inert_reason"] is None
+    assert malformed_status["last_progress_at"] is None, (
+        "no sample is usable, so there is no enforcement clock to report"
+    )
+
+
+def test_watchdog_status_reads_the_same_enforcement_clock_as_the_cut():
+    """Pre-upgrade samples are what the watchdog enforces on, so they are what
+    the operator surface reports.
+
+    The reporting path used to re-derive its own sample set from ``received_at``
+    alone, ignoring the ``t`` fallback that ``_watched_progress_samples`` applies
+    when ``received_at`` is ABSENT. A healthy in-flight job carried through a
+    rolling deploy therefore read as insufficient_history / malformed_history
+    with no last-progress time at all, while ``_no_progress_stalled`` was
+    watching the very samples the surface claimed did not exist. Both halves of
+    that fork -- the state and the clock -- are asserted here.
+    """
+    now = datetime(2026, 1, 2, 12, 0, 0)
+    pre_upgrade = SimpleNamespace(
+        polling_metadata={
+            "declared_metric": "val/loss",
+            "progress_series": [
+                {
+                    "t": (now - timedelta(seconds=age)).isoformat(),
+                    "name": "val/loss",
+                    "value": round(0.9 - i * 0.01, 3),
+                }
+                for i, age in enumerate(_SPAN_AGES_SECONDS)
+            ],
+        },
+        started_at=now - timedelta(seconds=3000),
+    )
+    assert _no_progress_stalled(pre_upgrade, now=now) is False
+    status = derive_watchdog_protection_status(
+        pre_upgrade.polling_metadata,
+        started_at=pre_upgrade.started_at,
+        now=now,
+    )
+    assert status["watchdog_state"] == "protected"
+    assert status["watchdog_active"] is True
+    assert status["last_progress_at"] == now.isoformat(), (
+        "the reported clock must be the newest sample the cut is computed from"
+    )
 
 
 def test_pre_upgrade_samples_without_received_at_do_not_fire_watchdog():
@@ -1254,3 +1349,142 @@ async def test_sweep_skips_non_running_runner_jobs(db_session):
         assert finalized == 0
         await db_session.refresh(job)
         assert job.status == initial_status
+
+
+def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status():
+    """serialize_compute_job_response_safe promotes watchdog-protection status
+    fields as first-class fields on the operator-facing payload.
+
+    Four sub-cases:
+    (1) Protected running job: declared metric, fresh receipt-time history, and
+        a metric that is still MOVING -> watchdog_active=True, state='protected'.
+    (2) No declared metric: watchdog_active=False, watchdog_inert_reason='no_declared_metric'.
+    (3) Metric-name mismatch: samples exist but none match declared metric ->
+        watchdog_inert_reason='metric_name_mismatch'.
+    (4) The same history with a FLAT metric -> state='cutting', not 'protected'.
+
+    Case 1's fixture was rewritten and case 4 added, so read this. The original
+    case-1 fixture reported ``value: 1.0`` at every one of its five samples
+    across a full 3600s window -- a textbook plateau, and precisely the
+    condition ``_no_progress_stalled`` exists to cut. It asserted
+    ``watchdog_state == 'protected'`` and passed, because the reporting function
+    only ever checked that the history was fresh and never that the metric had
+    moved. That is the defect in its most severe form: the green "Protected"
+    badge on a job the poller was terminating for no progress. The fixture now
+    advances the metric, and the flat history it used to carry is asserted
+    against the honest verdict in case 4.
+    """
+    from app.schemas import serialize_compute_job_response_safe
+    from app.models import _utcnow
+
+    # --- Case 1: protected job with declared metric and matching samples ---
+    now = _utcnow()
+    progress_series = [
+        {
+            "t": "runner-authored",
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
+            "name": "reward",
+            # A protected job is one the watchdog is watching AND that is still
+            # moving. A constant here would be a plateau -- see case 4.
+            "value": 1.0 + i * 0.5,
+        }
+        for i, age in enumerate((3600, 2700, 1800, 900, 0))
+    ]
+    job_protected = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        started_at=now - timedelta(hours=2),
+        polling_metadata={
+            "declared_metric": "reward",
+            "no_progress_timeout_seconds": 3600,
+            "progress_series": progress_series,
+        },
+    )
+    data = serialize_compute_job_response_safe(job_protected)
+    assert data["watchdog_active"] is True, "watchdog must be active for a protected job"
+    assert data["watchdog_state"] == "protected"
+    assert data["no_progress_timeout_seconds"] == 3600, "per-job timeout must be reported"
+    assert data["last_progress_at"] == now.isoformat(), "must return newest server receipt time"
+    assert data["watchdog_inert_reason"] is None, "no inert reason for an active watchdog"
+    assert data["watchdog_cut_reason"] is None, "a moving metric is not being cut"
+    assert _no_progress_stalled(job_protected, now=now) is False, (
+        "the reported state and the poller's verdict come from one classifier"
+    )
+
+    # --- Case 2: no declared metric ---
+    job_no_metric = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={},
+    )
+    data2 = serialize_compute_job_response_safe(job_no_metric)
+    assert data2["watchdog_active"] is False
+    assert data2["watchdog_inert_reason"] == "no_declared_metric"
+    assert data2["no_progress_timeout_seconds"] is None
+    assert data2["last_progress_at"] is None
+
+    # --- Case 3: declared metric but all samples carry a different metric name ---
+    job_mismatch = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "declared_metric": "reward",
+            "progress_series": [
+                {
+                    "t": "runner-authored",
+                    "received_at": now.isoformat(),
+                    "name": "loss",
+                    "value": 0.5,
+                },
+            ],
+        },
+    )
+    data3 = serialize_compute_job_response_safe(job_mismatch)
+    assert data3["watchdog_active"] is False
+    assert data3["watchdog_state"] == "inert"
+    assert data3["watchdog_inert_reason"] == "metric_name_mismatch"
+    assert data3["last_progress_at"] is None
+
+    # --- Case 4: same shape as case 1, but the metric never moves ---
+    flat_series = [
+        {
+            "t": "runner-authored",
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
+            "name": "reward",
+            "value": 1.0,
+        }
+        for age in (3600, 2700, 1800, 900, 0)
+    ]
+    job_flat = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        started_at=now - timedelta(hours=2),
+        polling_metadata={
+            "declared_metric": "reward",
+            "no_progress_timeout_seconds": 3600,
+            "progress_series": flat_series,
+        },
+    )
+    assert _no_progress_stalled(job_flat, now=now) is True, (
+        "fixture check: a flat metric over a full window is the no-progress cut"
+    )
+    data4 = serialize_compute_job_response_safe(job_flat)
+    assert data4["watchdog_state"] == "cutting", (
+        "the operator payload must not report a job the poller is terminating "
+        f"as anything else; got {data4['watchdog_state']!r}"
+    )
+    assert data4["watchdog_active"] is True
+    assert data4["watchdog_cut_reason"] == "plateau"
+    assert data4["watchdog_inert_reason"] is None
