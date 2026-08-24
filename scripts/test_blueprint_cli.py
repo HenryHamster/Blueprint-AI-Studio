@@ -285,7 +285,10 @@ def test_prefix_resolution_is_one_server_filtered_request(monkeypatch):
 
     blueprint_api.resolve_task_id_by_prefix("30d5ff95", _PREFIX_PROJECT)
 
-    assert len(requests) == 1, requests
+    assert len(requests) == 1, (
+        "prefix resolution must cost exactly one server-filtered request; got: "
+        + format_offender_marker(f"{m} {p}" for m, p in requests)
+    )
     method, path = requests[0]
     assert method == "GET"
     assert "id_prefix=30d5ff95" in path

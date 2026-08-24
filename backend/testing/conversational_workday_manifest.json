@@ -161,7 +161,7 @@
         "TestNotificationConfigSettings::test_strategic_session_settings",
         "TestEvergreenFillSettingsPersist::test_strategic_session_settings_persist_across_sync"
       ],
-      "test_count": 445
+      "test_count": 455
     },
     {
       "path": "backend/testing/test_agent_strategic_fetch.py",
