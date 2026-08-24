@@ -9,7 +9,10 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.closed_pr_reconciliation import reset_pr_attempt_state
+from app.closed_pr_reconciliation import (
+    append_superseded_pr_number,
+    reset_pr_attempt_state,
+)
 from app.models import Project, Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -65,8 +68,14 @@ async def _bind_fresh_pr_attempt(
     context: dict,
     review_loop: dict,
     pr_data: dict,
+    superseded_pr_number: object | None = None,
 ) -> dict:
-    """Bind ``context`` to one PR with fresh attempt-scoped latches/clocks."""
+    """Bind ``context`` to one PR with fresh attempt-scoped latches/clocks.
+
+    ``superseded_pr_number`` names the PR this rebind is leaving behind when the
+    rebind crosses a real PR boundary (a closed PR adopting its replacement).
+    Re-arming the same PR identity is not a boundary and must not stamp it.
+    """
 
     from app import pause_clock
     from app.ci_merge_helpers import arm_ci_wait
@@ -77,7 +86,25 @@ async def _bind_fresh_pr_attempt(
     base = pr_data.get("base") or {}
     head_branch = head.get("ref") or review_loop.get("branch") or ""
     base_branch = base.get("ref") or review_loop.get("base_branch") or ""
+    # A rebind onto a *different* PR is a PR boundary: record the PR being left
+    # behind before the attempt reset so chain-level convergence reporting can
+    # still classify this chain as supersede-affected once the superseded PR's
+    # iteration tasks age out of the reporting window.
+    crosses_pr_boundary = (
+        superseded_pr_number is not None
+        and str(superseded_pr_number).strip()
+        and str(superseded_pr_number).strip() != str(pr_number).strip()
+    )
+    superseded_pr_numbers = (
+        append_superseded_pr_number(review_loop, superseded_pr_number)
+        if crosses_pr_boundary
+        else []
+    )
+    # ``reset_pr_attempt_state`` already retains any existing lineage; only the
+    # boundary case has a new entry to add.
     fresh_loop = reset_pr_attempt_state(review_loop)
+    if superseded_pr_numbers:
+        fresh_loop["superseded_pr_numbers"] = superseded_pr_numbers
     fresh_loop.update(
         {
             "pr_number": pr_number,
@@ -232,11 +259,18 @@ async def reconcile_terminal_rollup_requeue(
             context=context,
             review_loop=old_loop,
             pr_data=replacement,
+            superseded_pr_number=pr_number,
         )
         await _store_context(task, session, rebound)
         return "replacement_pr_rearmed"
 
+    # Releasing a closed rollup PR is also a PR boundary: rollup_management
+    # creates a fresh PR for the same chain, so the closed number must be kept
+    # in the lineage rather than dropped with the volatile identity.
+    superseded_pr_numbers = append_superseded_pr_number(old_loop, pr_number)
     cleaned = reset_pr_attempt_state(old_loop)
+    if superseded_pr_numbers:
+        cleaned["superseded_pr_numbers"] = superseded_pr_numbers
     released = {
         key: value
         for key, value in context.items()

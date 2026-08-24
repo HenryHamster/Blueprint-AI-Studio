@@ -173,6 +173,9 @@ def compute_lane_waste_diagnostics(
     stale_head_discard_count = 0
     retarget_review_scope_counts = {"delta": 0, "full": 0}
     converged_review_counts: List[int] = []
+    supersede_affected_chain_count = 0
+    supersede_affected_merged_review_counts: List[int] = []
+    cap_exhausted_direction_ids: set[str] = set()
     chain_rows: List[Dict[str, Any]] = []
 
     alert_reasons_by_chain = {}
@@ -218,8 +221,16 @@ def compute_lane_waste_diagnostics(
         cap_exhausted = outcome == "cap_exhausted"
         if cap_exhausted:
             cap_exhausted_chain_count += 1
+            if obs["direction_id"]:
+                cap_exhausted_direction_ids.add(obs["direction_id"])
         if obs["reviews_to_converge"] is not None:
             converged_review_counts.append(obs["reviews_to_converge"])
+        if obs["supersede_affected"]:
+            supersede_affected_chain_count += 1
+            if outcome == "merged" and obs["reviews_to_converge"] is not None:
+                supersede_affected_merged_review_counts.append(
+                    obs["reviews_to_converge"]
+                )
 
         # Newest-first drilldown rows within the chain.
         task_rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
@@ -228,6 +239,8 @@ def compute_lane_waste_diagnostics(
                 "chain_key": key,
                 "original_task_id": obs["original_task_id"],
                 "pr_number": obs["pr_number"],
+                "review_loop_pr_numbers": obs["review_loop_pr_numbers"],
+                "supersede_affected": obs["supersede_affected"],
                 "project_id": obs["project_id"],
                 "direction_id": obs["direction_id"],
                 "terminal_outcome": outcome,
@@ -260,6 +273,14 @@ def compute_lane_waste_diagnostics(
         "cap_excluded_task_count": waste_task_count - cap_counted_total,
         "chain_count": len(chains),
         "cap_exhausted_chain_count": cap_exhausted_chain_count,
+        "cap_exhausted_direction_count": len(cap_exhausted_direction_ids),
+        "supersede_affected_chain_count": supersede_affected_chain_count,
+        "supersede_affected_reviews_to_converge": {
+            "count": len(supersede_affected_merged_review_counts),
+            "sample_count": len(supersede_affected_merged_review_counts),
+            "median": _outer_loop_pct(supersede_affected_merged_review_counts, 50),
+            "p95": _outer_loop_pct(supersede_affected_merged_review_counts, 95),
+        },
         "stale_head_discard_count": stale_head_discard_count,
         "retarget_review_scope_counts": retarget_review_scope_counts,
         "converged_review_counts": sorted(converged_review_counts),
@@ -308,9 +329,10 @@ def compute_lane_baseline_trend(
         threshold_rel: float | None = None,
         threshold_abs: float | None = None,
         lower_is_better: bool = True,
+        classify: bool = True,
     ) -> Dict[str, Any]:
         delta = (curr - prev) if (curr is not None and prev is not None) else None
-        if delta is None:
+        if delta is None or not classify:
             classification: str | None = None
         elif threshold_rel is not None:
             if prev == 0:
@@ -447,6 +469,77 @@ def compute_lane_baseline_trend(
             threshold_abs=0.5,
             lower_is_better=True,
         ),
+        "cap_exhausted_direction_count": _block(
+            convergence_curr.get("cap_exhausted_direction_count"),
+            convergence_prev.get("cap_exhausted_direction_count"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "supersede_affected_reviews_to_converge_median": _block(
+            convergence_curr.get("supersede_affected_reviews_to_converge_median"),
+            convergence_prev.get("supersede_affected_reviews_to_converge_median"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "supersede_affected_reviews_to_converge_p95": _block(
+            convergence_curr.get("supersede_affected_reviews_to_converge_p95"),
+            convergence_prev.get("supersede_affected_reviews_to_converge_p95"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+    }
+
+    lane_waste_curr = latest.get("lane_waste") or {}
+    lane_waste_prev = prior.get("lane_waste") or {}
+    reviews_curr = lane_waste_curr.get("reviews_to_converge") or {}
+    reviews_prev = lane_waste_prev.get("reviews_to_converge") or {}
+    scopes_curr = lane_waste_curr.get("retarget_review_scope_counts") or {}
+    scopes_prev = lane_waste_prev.get("retarget_review_scope_counts") or {}
+    retarget_convergence_trend = {
+        "reviews_to_converge": {
+            # Sample size, not cost: this is how many chains CONVERGED
+            # (merged) in the window. Fewer converged chains is a throughput
+            # drop, not an improvement, and more is not a regression, so this
+            # row carries the delta without a direction verdict.
+            "count": _block(
+                reviews_curr.get("count"),
+                reviews_prev.get("count"),
+                threshold_abs=0.5,
+                classify=False,
+            ),
+            "median": _block(
+                reviews_curr.get("median"),
+                reviews_prev.get("median"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+            "p95": _block(
+                reviews_curr.get("p95"),
+                reviews_prev.get("p95"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+        },
+        "retarget_review_scope_counts": {
+            "delta": _block(
+                scopes_curr.get("delta"),
+                scopes_prev.get("delta"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+            "full": _block(
+                scopes_curr.get("full"),
+                scopes_prev.get("full"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+        },
+        "stale_head_discard_count": _block(
+            lane_waste_curr.get("stale_head_discard_count"),
+            lane_waste_prev.get("stale_head_discard_count"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
     }
 
     return {
@@ -457,4 +550,5 @@ def compute_lane_baseline_trend(
         "waste_taxonomy_shares": waste_trend,
         "checkpoint_recovery_waste_total": crw_trend,
         "outer_loop_convergence": convergence_trend,
+        "retarget_convergence": retarget_convergence_trend,
     }

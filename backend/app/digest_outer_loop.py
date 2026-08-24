@@ -228,11 +228,31 @@ def _outer_loop_chain_observation(
     pr_number = rl0.get("pr_number")
     direction_id = None
     review_count = 0
+    review_loop_pr_numbers: set[str] = set()
+    superseded_pr_numbers: set[str] = set()
     for t in chain_tasks:
         context = t.context or {}
         if direction_id is None and context.get("direction_id"):
             direction_id = str(context["direction_id"])
         rl = (t.context or {}).get("review_loop") or {}
+        pr = rl.get("pr_number")
+        if pr is not None and str(pr).strip():
+            review_loop_pr_numbers.add(str(pr).strip())
+        prior_prs = rl.get("superseded_pr_numbers")
+        if isinstance(prior_prs, list):
+            superseded_pr_numbers.update(
+                str(prior_pr).strip()
+                for prior_pr in prior_prs
+                if prior_pr is not None and str(prior_pr).strip()
+            )
+        # Legacy retarget receipts predate the durable lineage field.  Reading
+        # them keeps a currently-retargeted task correctly classified while
+        # successor tasks use ``superseded_pr_numbers`` above.
+        legacy_retarget = rl.get("head_drift_retargeted_from")
+        if isinstance(legacy_retarget, dict):
+            prior_pr = legacy_retarget.get("pr_number")
+            if prior_pr is not None and str(prior_pr).strip():
+                superseded_pr_numbers.add(str(prior_pr).strip())
         if pr_number is None and rl.get("pr_number") is not None:
             pr_number = rl.get("pr_number")
         it = rl.get("iteration")
@@ -257,6 +277,8 @@ def _outer_loop_chain_observation(
                 break
 
     outcome = _resolve_chain_outcome(outcome_tasks, chain_reasons)
+    chain_pr_numbers = review_loop_pr_numbers | superseded_pr_numbers
+    supersede_affected = len(chain_pr_numbers) > 1
 
     project_id = None
     for t in outcome_tasks:
@@ -273,6 +295,11 @@ def _outer_loop_chain_observation(
         "direction_id": direction_id,
         "review_count": review_count,
         "reviews_to_converge": review_count if outcome == "merged" else None,
+        # A recreated PR remains one chain because the original-task identity
+        # is stable. Retained prior PRs make supersession observable after the
+        # original iteration tasks have aged out of the reporting window.
+        "review_loop_pr_numbers": sorted(chain_pr_numbers),
+        "supersede_affected": supersede_affected,
         "original_task_id": str(oid) if oid else None,
         "pr_number": pr_number,
         "task_ids": [str(t.id) for t in chain_tasks],

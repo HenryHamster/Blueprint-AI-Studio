@@ -1345,6 +1345,83 @@ async def test_review_wait_owned_gate_revalidates_after_unlocked_token_io(
 
 
 @pytest.mark.asyncio
+async def test_replacement_rebind_stamps_superseded_pr_lineage(eval_db, mocker):
+    """Rebinding onto a replacement PR records the closed PR in the lineage.
+
+    ``reconcile_closed_pr_replacement`` is a PR boundary: it moves the review
+    loop off the closed PR and onto its replacement.  If the closed PR number
+    is not appended to ``superseded_pr_numbers`` here, the chain is never
+    classifiable as supersede-affected once the old PR's iteration tasks fall
+    outside the reporting window.
+    """
+    from app.closed_pr_reconciliation import reconcile_closed_pr_replacement
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    replacement_lookup = {
+        "status": "ok",
+        "replacement_pr": {
+            "number": 91,
+            "state": "open",
+            "head": {"sha": "newsha", "ref": "feat/replaced"},
+            "base": {"ref": "automain"},
+        },
+    }
+
+    project = Project(name="Replacement Lineage", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "branch": "feat/replaced"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/replaced",
+                "base_branch": "automain",
+                # An earlier boundary already recorded PR 12 on this chain.
+                "superseded_pr_numbers": ["12"],
+            },
+        },
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    await reconcile_closed_pr_replacement(
+        task=task,
+        session=eval_db,
+        review_loop=dict((task.context or {})["review_loop"]),
+        pr_number=77,
+        pr_data={
+            "number": 77,
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "oldsha", "ref": "feat/replaced"},
+            "base": {"ref": "automain"},
+        },
+        replacement_lookup=replacement_lookup,
+    )
+    await eval_db.refresh(task)
+
+    rebound = (task.context or {})["review_loop"]
+    assert rebound["pr_number"] == 91
+    # Prior lineage is retained across the attempt reset AND the closed PR is
+    # appended, stringified and de-duplicated in first-seen order.
+    assert rebound["superseded_pr_numbers"] == ["12", "77"]
+
+
+@pytest.mark.asyncio
 async def test_replacement_ci_backstop_uses_new_attempt_clock(eval_db, mocker):
     """A replacement gets a full backstop window, then expires from that clock."""
     from app.closed_pr_reconciliation import reconcile_closed_pr_replacement

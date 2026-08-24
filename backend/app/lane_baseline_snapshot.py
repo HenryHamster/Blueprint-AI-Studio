@@ -47,7 +47,7 @@ from app.routers.admin_pipeline_observability import (
 logger = logging.getLogger(__name__)
 
 DESIGN_DOC_KEY = "lane_baselines"
-BASELINE_DEF_VERSION = "v2"
+BASELINE_DEF_VERSION = "v3"
 _SNAPSHOT_PR_BREAKDOWN_LIMIT = 100
 _MAX_TASKS_PER_SNAPSHOT = 5000
 _MAX_BASELINES_STORED = 20
@@ -281,24 +281,25 @@ async def persist_version_lane_baseline(
     original_tasks = await _load_outer_loop_original_tasks(
         session, all_terminal_tasks, project_id=project_id
     )
+    all_tasks_with_originals = [
+        *all_terminal_tasks,
+        *[
+            task
+            for oid, task in original_tasks.items()
+            if oid not in {str(t.id) for t in all_terminal_tasks}
+        ],
+    ]
     alerts = await _load_escalation_alerts(
         session, cutoff=t_opened, project_id=project_id
     )
     diag["lane_waste"] = compute_lane_waste_diagnostics(
-        [
-            *all_terminal_tasks,
-            *[
-                task
-                for oid, task in original_tasks.items()
-                if oid not in {str(t.id) for t in all_terminal_tasks}
-            ],
-        ],
+        all_tasks_with_originals,
         t_opened,
         chain_limit=_SNAPSHOT_PR_BREAKDOWN_LIMIT,
         escalation_alerts=alerts,
     )
     convergence = compute_outer_loop_convergence(
-        all_tasks=all_terminal_tasks,
+        all_tasks=all_tasks_with_originals,
         escalation_alerts=alerts,
         window_start=t_opened,
     )
@@ -313,6 +314,27 @@ async def persist_version_lane_baseline(
         "cap_exhausted_chain_count": (
             (convergence.get("outcomes") or {}).get("cap_exhausted", 0)
         ),
+        "cap_exhausted_direction_count": convergence.get(
+            "cap_exhausted_direction_count", 0
+        ),
+        "supersede_affected_chain_count": convergence.get(
+            "supersede_affected_chain_count", 0
+        ),
+        "supersede_affected_merged_chain_count": convergence.get(
+            "supersede_affected_merged_chain_count", 0
+        ),
+        "supersede_affected_reviews_to_converge_count": (
+            convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("count", 0),
+        "supersede_affected_reviews_to_converge_sample_count": (
+            convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("sample_count", 0),
+        "supersede_affected_reviews_to_converge_median": (
+            convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("median"),
+        "supersede_affected_reviews_to_converge_p95": (
+            convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("p95"),
         "terminal_outcome_counts": convergence.get("terminal_outcome_histogram") or {},
     }
     diag["relay_medians"] = _compute_relay_medians(diag["per_pr_phase_breakdown"])

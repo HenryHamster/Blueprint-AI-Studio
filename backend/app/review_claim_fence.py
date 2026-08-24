@@ -19,6 +19,7 @@ from app.ci_merge_helpers import (
     _pr_number_match,
     revoke_review_authority_for_active_fix,
 )
+from app.closed_pr_reconciliation import append_superseded_pr_number
 from app.github import get_open_pull_request_for_head_branch, get_pull_request
 from app.github_token_resolver import get_github_token_for_task
 from app.models import Task, TaskStatus, _utcnow
@@ -168,6 +169,12 @@ async def _retarget_closed_rollup_fix(
     task.payloads = payloads
     flag_modified(task, "payloads")
 
+    # Keep a compact, semantic lineage of prior PRs.  The exact-head receipt
+    # below protects this *current* task, but the next review/fix task rebuilds
+    # ``review_loop`` and must retain the fact that this chain crossed PRs for
+    # durable convergence reporting.
+    superseded_pr_numbers = append_superseded_pr_number(review_loop, pr_number)
+
     replacement_loop = dict(review_loop)
     replacement_loop.update(
         {
@@ -189,6 +196,7 @@ async def _retarget_closed_rollup_fix(
                 "pr_number": pr_number,
                 "head_sha": str((closed_pr.get("head") or {}).get("sha") or ""),
             },
+            "superseded_pr_numbers": superseded_pr_numbers,
         }
     )
     replacement_context = {**(task.context or {}), "review_loop": replacement_loop}

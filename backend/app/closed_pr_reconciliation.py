@@ -150,8 +150,35 @@ _PR_CHAIN_STATE_KEYS = frozenset(
         "original_task_id",
         "reviewer_model",
         "scope_overflow_warned",
+        # Compact PR lineage for the chain. This must survive every PR
+        # boundary (including a replacement rebind) so a later version
+        # baseline can classify a converged chain as supersede-affected even
+        # when the superseded PR's iteration tasks fall outside its window.
+        "superseded_pr_numbers",
     }
 )
+
+
+def append_superseded_pr_number(
+    review_loop: dict | None, pr_number: object
+) -> list[str]:
+    """Return the chain's PR lineage with ``pr_number`` appended.
+
+    Values are stringified and de-duplicated in first-seen order; blank/None
+    entries are dropped. Callers assign the result back onto the review loop
+    they own.
+    """
+
+    prior = (review_loop or {}).get("superseded_pr_numbers")
+    if not isinstance(prior, list):
+        prior = []
+    return list(
+        dict.fromkeys(
+            str(candidate).strip()
+            for candidate in [*prior, pr_number]
+            if candidate is not None and str(candidate).strip()
+        )
+    )
 
 
 def reset_pr_attempt_state(review_loop: dict | None) -> dict:
@@ -363,9 +390,16 @@ async def reconcile_closed_pr_replacement(
         pr_number=pr_number,
         pr_data=pr_data,
     )
+    # ``reconcile_closed_pr_replacement`` is itself a PR boundary: the loop is
+    # rebound from the closed PR onto its replacement. Record the closed PR in
+    # the chain lineage before the rebind so convergence reporting can still
+    # classify this chain as supersede-affected.
+    superseded_pr_numbers = append_superseded_pr_number(review_loop, pr_number)
     chain_loop = reset_pr_attempt_state(review_loop)
     review_loop.clear()
     review_loop.update(chain_loop)
+    if superseded_pr_numbers:
+        review_loop["superseded_pr_numbers"] = superseded_pr_numbers
     review_loop["branch"] = (
         (replacement_pr.get("head") or {}).get("ref") or ""
     ) or closed_head

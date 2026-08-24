@@ -4814,6 +4814,16 @@ async def _spawn_pipeline_task(
             if task_type == "review" and delta_base_sha
             else {}
         ),
+        # A rollup fix can be retargeted from a closed PR to its replacement.
+        # Unlike the exact-head receipt (which is only for the active task),
+        # this compact PR lineage must survive every successor so a later
+        # version baseline can classify the converged chain as superseded even
+        # when the original PR's iteration tasks are outside its window.
+        **(
+            {"superseded_pr_numbers": list(source_loop["superseded_pr_numbers"])}
+            if isinstance(source_loop.get("superseded_pr_numbers"), list)
+            else {}
+        ),
         **({"retarget_scope": retarget_scope} if retarget_scope else {}),
         **(
             {"review_target": requested_review_target}

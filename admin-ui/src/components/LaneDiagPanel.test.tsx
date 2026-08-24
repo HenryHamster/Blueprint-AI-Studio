@@ -59,9 +59,17 @@ const mockLaneDiagResponse = {
     cap_counted_task_count: 7,
     cap_excluded_task_count: 0,
     chain_count: 4,
-    cap_exhausted_chain_count: 0,
+    cap_exhausted_chain_count: 2,
+    cap_exhausted_direction_count: 1,
+    supersede_affected_chain_count: 3,
+    reviews_to_converge: { count: 3, median: 2, p95: 5 },
+    supersede_affected_reviews_to_converge: { count: 2, sample_count: 2, median: 6, p95: 9 },
+    converged_review_counts: [1, 2, 3],
+    retarget_review_scope_counts: { delta: 1, full: 2 },
+    stale_head_discard_count: 0,
     chain_limit: 50,
     chains_truncated: false,
+    chains: [],
   },
   checkpoint_recovery_waste: {
     by_reason: { stale_context: 4, branch_reset: 2 },
@@ -116,6 +124,26 @@ const mockBaselinesResponse: LaneBaselinesResponse = {
       iteration_p95: { latest: 3, prior: 5, delta: -2, classification: 'improving' },
       convergence_rate: { latest: 1, prior: 0.5, delta: 0.5, classification: 'improving' },
       cap_exhausted_chain_count: { latest: 0, prior: 1, delta: -1, classification: 'improving' },
+      cap_exhausted_direction_count: { latest: 1, prior: 3, delta: -2, classification: 'improving' },
+      supersede_affected_reviews_to_converge_median: {
+        latest: 6, prior: 4, delta: 2, classification: 'declining',
+      },
+      supersede_affected_reviews_to_converge_p95: {
+        latest: 9, prior: 7, delta: 2, classification: 'declining',
+      },
+    },
+    retarget_convergence: {
+      reviews_to_converge: {
+        // Sample size, not cost: the backend leaves this row unclassified.
+        count: { latest: 3, prior: 4, delta: -1, classification: null },
+        median: { latest: 2, prior: 4, delta: -2, classification: 'improving' },
+        p95: { latest: 5, prior: 7, delta: -2, classification: 'improving' },
+      },
+      retarget_review_scope_counts: {
+        delta: { latest: 1, prior: 3, delta: -2, classification: 'improving' },
+        full: { latest: 2, prior: 1, delta: 1, classification: 'declining' },
+      },
+      stale_head_discard_count: { latest: 0, prior: 2, delta: -2, classification: 'improving' },
     },
   },
 };
@@ -215,6 +243,10 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('Outer-Loop Convergence')).toBeInTheDocument();
     expect(screen.getByText('Median cycles')).toBeInTheDocument();
     expect(screen.getByText('Cap-exhausted chains')).toBeInTheDocument();
+    expect(screen.getAllByText('Retarget Convergence')).not.toHaveLength(0);
+    expect(screen.getByText('Reviews to converge (median)')).toBeInTheDocument();
+    expect(screen.getAllByText('Delta-scope retargets')).not.toHaveLength(0);
+    expect(screen.getAllByText('Stale-head discards')).not.toHaveLength(0);
     // classification labels
     expect(screen.getAllByText('↓ improving').length).toBeGreaterThan(0);
   });
@@ -243,6 +275,45 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('LANE_CI')).toBeInTheDocument();
     expect(screen.getByText('LANE_CONFLICT')).toBeInTheDocument();
     expect(screen.getByText('LANE_REVIEW_CONVERGENCE')).toBeInTheDocument();
+  });
+
+  it('renders live retarget convergence counters', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getAllByText('Reviews to converge')).not.toHaveLength(0);
+    expect(screen.getAllByText('Delta-scope retargets')).not.toHaveLength(0);
+    expect(screen.getAllByText('Full-scope retargets')).not.toHaveLength(0);
+    expect(screen.getAllByText('Stale-head discards')).not.toHaveLength(0);
+  });
+
+  it('surfaces the superseded-rollup median and the directions lost to the cap', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    // The two numbers the lane-waste measurement exists to answer must be
+    // readable, not just computed and persisted.
+    expect(screen.getByText('Superseded-rollup reviews to converge')).toBeInTheDocument();
+    expect(
+      screen.getAllByText(/median of 2 merged of 3 superseded chains, P95 9/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText('Directions lost to the review cap')).toBeInTheDocument();
+    expect(screen.getAllByText(/\(2 chains\)/).length).toBeGreaterThan(0);
+  });
+
+  it('renders the new convergence trend rows and leaves sample size unclassified', async () => {
+    render(<LaneDiagPanel projectId="project-1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Directions lost to cap')).toBeInTheDocument();
+    expect(
+      screen.getByText('Superseded reviews to converge (median)'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Superseded reviews to converge (P95)')).toBeInTheDocument();
+    // Converging fewer chains is a throughput drop, never an "improving" verdict.
+    const sampleRow = screen.getByText('Converged chains (sample size)').closest('tr');
+    if (!sampleRow) throw new Error('sample-size trend row was not rendered');
+    expect(sampleRow.textContent).not.toContain('improving');
   });
 
   it('renders per-PR phase breakdown sorted by total_seconds desc', async () => {

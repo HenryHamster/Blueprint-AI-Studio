@@ -64,6 +64,66 @@ function WasteTaxonomyTable({ taxonomy }: { taxonomy: LaneWasteTaxonomy }) {
   );
 }
 
+function RetargetConvergenceTable({
+  laneWaste,
+}: {
+  laneWaste: LaneDiagResponse['lane_waste'];
+}) {
+  return (
+    <table className="w-full text-xs">
+      <thead>
+        <tr className="text-neutral-500 border-b border-neutral-800">
+          <th className="text-left py-1 font-normal">Metric</th>
+          <th className="text-right py-1 font-normal">Count</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Reviews to converge</td>
+          <td className="py-1 text-right text-neutral-200">
+            {laneWaste.reviews_to_converge?.count ?? 0}{' '}
+            <span className="text-neutral-500">
+              (median {laneWaste.reviews_to_converge?.median ?? '—'}, P95 {laneWaste.reviews_to_converge?.p95 ?? '—'})
+            </span>
+          </td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Superseded-rollup reviews to converge</td>
+          <td className="py-1 text-right text-neutral-200">
+            {laneWaste.supersede_affected_reviews_to_converge?.median ?? '—'}{' '}
+            <span className="text-neutral-500">
+              (median of {laneWaste.supersede_affected_reviews_to_converge?.count ?? 0} merged of{' '}
+              {laneWaste.supersede_affected_chain_count ?? 0} superseded chains, P95{' '}
+              {laneWaste.supersede_affected_reviews_to_converge?.p95 ?? '—'})
+            </span>
+          </td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Directions lost to the review cap</td>
+          <td className="py-1 text-right text-neutral-200">
+            {laneWaste.cap_exhausted_direction_count ?? 0}{' '}
+            <span className="text-neutral-500">
+              ({laneWaste.cap_exhausted_chain_count ?? 0} chains)
+            </span>
+          </td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Delta-scope retargets</td>
+          <td className="py-1 text-right text-neutral-200">{laneWaste.retarget_review_scope_counts?.delta ?? 0}</td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Full-scope retargets</td>
+          <td className="py-1 text-right text-neutral-200">{laneWaste.retarget_review_scope_counts?.full ?? 0}</td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Stale-head discards</td>
+          <td className="py-1 text-right text-neutral-200">{laneWaste.stale_head_discard_count ?? 0}</td>
+        </tr>
+      </tbody>
+    </table>
+  );
+}
+
 function CheckpointRecoveryWasteTable({
   crw,
 }: {
@@ -323,6 +383,60 @@ function CrossVersionTrendPanel({ trend }: { trend: LaneBaselineTrend }) {
               label="Cap-exhausted chains"
               block={trend.outer_loop_convergence?.cap_exhausted_chain_count}
             />
+            <TrendRow
+              label="Directions lost to cap"
+              block={trend.outer_loop_convergence?.cap_exhausted_direction_count}
+            />
+            <TrendRow
+              label="Superseded reviews to converge (median)"
+              block={trend.outer_loop_convergence?.supersede_affected_reviews_to_converge_median}
+            />
+            <TrendRow
+              label="Superseded reviews to converge (P95)"
+              block={trend.outer_loop_convergence?.supersede_affected_reviews_to_converge_p95}
+            />
+          </tbody>
+        </table>
+      </div>
+
+      <div>
+        <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+          Retarget Convergence
+        </p>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-neutral-500 border-b border-neutral-800">
+              <th className="text-left py-1 font-normal">Metric</th>
+              <th className="text-right py-1 font-normal">Prior</th>
+              <th className="text-right py-1 font-normal">Latest</th>
+              <th className="text-right py-1 font-normal">Trend</th>
+            </tr>
+          </thead>
+          <tbody>
+            <TrendRow
+              label="Converged chains (sample size)"
+              block={trend.retarget_convergence?.reviews_to_converge.count}
+            />
+            <TrendRow
+              label="Reviews to converge (median)"
+              block={trend.retarget_convergence?.reviews_to_converge.median}
+            />
+            <TrendRow
+              label="Reviews to converge (P95)"
+              block={trend.retarget_convergence?.reviews_to_converge.p95}
+            />
+            <TrendRow
+              label="Delta-scope retargets"
+              block={trend.retarget_convergence?.retarget_review_scope_counts.delta}
+            />
+            <TrendRow
+              label="Full-scope retargets"
+              block={trend.retarget_convergence?.retarget_review_scope_counts.full}
+            />
+            <TrendRow
+              label="Stale-head discards"
+              block={trend.retarget_convergence?.stale_head_discard_count}
+            />
           </tbody>
         </table>
       </div>
@@ -401,6 +515,13 @@ export function LaneDiagPanel({ projectId }: LaneDiagPanelProps) {
           Waste Taxonomy
         </h4>
         <WasteTaxonomyTable taxonomy={data.lane_waste.waste_taxonomy} />
+      </div>
+
+      <div>
+        <h4 className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+          Retarget Convergence
+        </h4>
+        <RetargetConvergenceTable laneWaste={data.lane_waste} />
       </div>
 
       <div>

@@ -211,6 +211,49 @@ async def test_source_spawn_authority_is_acquired_before_source_derivation(
 
 
 @pytest.mark.asyncio
+async def test_successor_review_preserves_rollup_supersede_lineage(db_session, mocker):
+    """A retarget receipt survives the fix-to-review successor handoff."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    original = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "branch": "rollup/replacement"}],
+        context={},
+    )
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "fix", "pr_number": 711}],
+        context={
+            "review_loop": {
+                "original_task_id": str(original.id),
+                "iteration": 4,
+                "pr_number": 711,
+                "branch": "rollup/replacement",
+                "base_branch": "automain",
+                "superseded_pr_numbers": ["710"],
+            }
+        },
+    )
+    await _persist(db_session, original, source)
+
+    spawned, created = await _spawn_pipeline_task(
+        source,
+        "review",
+        db_session,
+        711,
+        "rollup/replacement",
+        "automain",
+        original_task_id=str(original.id),
+        review_target=_review_target(project.id, 711, "base", "head"),
+    )
+
+    assert created is True and spawned is not None
+    assert (spawned.context or {})["review_loop"]["superseded_pr_numbers"] == ["710"]
+
+
+@pytest.mark.asyncio
 async def test_source_authority_pause_defers_then_resume_creates(
     db_session, mocker
 ):
