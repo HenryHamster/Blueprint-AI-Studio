@@ -161,7 +161,7 @@
         "TestNotificationConfigSettings::test_strategic_session_settings",
         "TestEvergreenFillSettingsPersist::test_strategic_session_settings_persist_across_sync"
       ],
-      "test_count": 444
+      "test_count": 445
     },
     {
       "path": "backend/testing/test_agent_strategic_fetch.py",
@@ -696,7 +696,7 @@
       "test_ids": [
         "keeps chat Workday lifecycle wired to live session state and runner controls"
       ],
-      "test_count": 13
+      "test_count": 14
     },
     {
       "path": "admin-ui/src/components/StrategicContextRail.test.tsx",

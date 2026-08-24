@@ -1352,7 +1352,7 @@ export default function App() {
                 showCloseButton={false}
                 addToast={s.addToast}
                 onMessageCountChange={handleMessageCountChange}
-                onOpenTask={handleViewTask}
+                onOpenTask={handleViewTaskById}
                 notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
                 onWorkdayStatusChange={setConversationWorkdayStatus}
                 strategicSessionTranscript={s.strategicSessionTranscript}

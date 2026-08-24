@@ -114,6 +114,7 @@ from app.admin_helpers import (  # noqa: F401
     _get_user_project_with_role,
     _get_user_task,
     _get_user_task_with_role,
+    _resolve_task_id,
 )
 from app.admin_task_mutations import (
     CANCEL_CASCADE_CHILD_STATUSES,
@@ -2122,10 +2123,7 @@ async def get_task(
 ):
     from app.findings_index import resolve_research_findings_for_surface
 
-    try:
-        tid = uuid.UUID(task_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Task not found")
+    tid = await _resolve_task_id(task_id, session)
 
     task = await _get_user_task_with_role(
         tid, current_user["user_id"], session, "viewer"

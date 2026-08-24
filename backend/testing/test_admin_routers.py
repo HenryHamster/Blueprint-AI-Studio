@@ -3333,6 +3333,26 @@ class TestResetIterationCap:
 
 class TestGetTaskWakeRegistration:
     @pytest.mark.asyncio
+    async def test_get_task_resolves_short_task_id_citation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        short_task_id = str(task.id).replace("-", "")[:8]
+        resp = await client.get(f"/api/admin/tasks/{short_task_id}")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["id"] == str(task.id)
+
+    @pytest.mark.asyncio
     async def test_task_detail_returns_null_then_latest_wake_registration(
         self, client: AsyncClient, db_session
     ):

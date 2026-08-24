@@ -75,6 +75,16 @@ describe('MarkdownContentInner — citation links', () => {
     expect(onOpenTask).toHaveBeenCalledWith(id);
   });
 
+  test('a short task id navigates via onOpenTask when clicked', () => {
+    const onOpenTask = vi.fn();
+    const id = 'c0f26a99';
+    const { getByText } = render(
+      <MarkdownContentInner content={`blocked on task ${id} review`} onOpenTask={onOpenTask} />
+    );
+    fireEvent.click(getByText(`task ${id}`));
+    expect(onOpenTask).toHaveBeenCalledWith(id);
+  });
+
   test('a PR reference links out to GitHub when githubRepo is provided', () => {
     const { getByText } = render(
       <MarkdownContentInner content="landed in #17493 yesterday" githubRepo="HenryHamster/BlueprintAIStudio" />
