@@ -9439,20 +9439,12 @@ def main() -> None:
         agent_image = None
 
     # Activate previously verified Blueprint-owned host CLIs before any host
-    # preflight/probe. Maintain them asynchronously so npm/registry trouble can
-    # never take healthy Claude, Gemini, compute, or heartbeat capacity offline.
-    # A genuinely Docker-only runner is image-managed and does not mutate host
-    # dependencies. Hybrid Docker+bwrap runners still maintain the host CLIs
-    # needed by their write/heavy bwrap task slice.
+    # preflight/probe. A genuinely Docker-only runner is image-managed and does
+    # not mutate host dependencies. Hybrid Docker+bwrap runners still maintain
+    # the host CLIs needed by their write/heavy bwrap task slice.
     host_agent_backend = _host_cli_maintenance_allowed(caps, agent_image)
     if host_agent_backend:
         _activate_managed_cli_paths()
-        if not check_mode:
-            threading.Thread(
-                target=_host_cli_maintenance_loop,
-                name="blueprint-cli-maintenance",
-                daemon=True,
-            ).start()
 
     # Resolve after managed PATH activation so bwrap binds the verified release.
     agent_binary = _locate_agent_binary()
@@ -9559,6 +9551,17 @@ def main() -> None:
     elif not result["token_valid"]:
         print("ERROR: initial heartbeat rejected the runner token.", file=sys.stderr)
         sys.exit(1)
+
+    # Start maintenance only after startup preflight succeeds. Besides avoiding
+    # unnecessary npm work for a runner that is already shutting down, this
+    # keeps an immediate preflight shutdown from racing the cleanup join while
+    # the maintenance loop is inside an install/probe subprocess.
+    if host_agent_backend and not _shutdown_event.is_set():
+        threading.Thread(
+            target=_host_cli_maintenance_loop,
+            name="blueprint-cli-maintenance",
+            daemon=True,
+        ).start()
 
     # NOTE: the env-var BLUEPRINT_RUNNER_MAX_CONCURRENT is only the INITIAL
     # default. The heartbeat RESPONSE carries a server-authoritative live-safe
