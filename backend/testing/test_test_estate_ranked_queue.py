@@ -268,3 +268,99 @@ def test_measured_frontend_cost_is_directional_signal(tmp_path: Path) -> None:
     assert output.index("0.125s measured") < output.index(
         "backend/testing/test_example.py"
     )
+
+
+def _each_row_ids(source: str, path: Path) -> set[str]:
+    from testing.identity_extraction import extract_typescript_test_ids
+
+    return extract_typescript_test_ids(source, path)
+
+
+def test_typescript_import_graph_caches_are_invalidated_by_content(
+    tmp_path: Path,
+) -> None:
+    """The import-graph memo must never outlive the file it summarizes.
+
+    Resolving one test file's transitive relative imports is a pure function of
+    the files' contents, so ``identity_extraction`` memoizes the read, the
+    resolution and the per-module parse -- without which a single
+    ``collect_test_files`` pass over the estate re-parses ~100k modules and
+    blows the 60s suite timeout that
+    ``test_checked_in_queue_ranks_every_collected_test_file`` runs under.
+
+    A content-keyed cache is only safe if it actually notices content changing.
+    This pins all three invalidation paths in one process, because that is the
+    shape a stale hit would take: the fixture is rewritten and re-read without
+    the interpreter restarting.
+    """
+    table = tmp_path / "table.ts"
+    table.write_text(
+        "export const CASES = [['a'], ['b']];\n", encoding="utf-8"
+    )
+    spec = tmp_path / "suite.test.ts"
+    source = (
+        "import { CASES } from './table';\n"
+        "describe('suite', () => {\n"
+        "  it.each(CASES)('case %s', () => {});\n"
+        "});\n"
+    )
+    spec.write_text(source, encoding="utf-8")
+
+    assert len(_each_row_ids(source, spec)) == 2, (
+        "fixture check: a two-row imported table expands to two identities"
+    )
+
+    # 1. The imported module grows. Its row count must grow with it.
+    table.write_text(
+        "export const CASES = [['a'], ['b'], ['c'], ['d']];\n", encoding="utf-8"
+    )
+    os.utime(table, (0, 0))  # defeat a coarse mtime clock, not the cache
+    assert len(_each_row_ids(source, spec)) == 4, (
+        "a rewritten imported table was served from a stale source/parse cache"
+    )
+
+    # 2. The module disappears. The resolver must stop returning it, falling
+    #    back to the conservative single row rather than the remembered four.
+    table.unlink()
+    assert len(_each_row_ids(source, spec)) == 1, (
+        "a deleted module was still resolved from the module-resolution cache"
+    )
+
+    # 3. It comes back with different contents.
+    table.write_text(
+        "export const CASES = [['a'], ['b'], ['c']];\n", encoding="utf-8"
+    )
+    assert len(_each_row_ids(source, spec)) == 3, (
+        "a recreated module was resolved to a stale remembered answer"
+    )
+
+
+def test_typescript_import_cycles_still_terminate(tmp_path: Path) -> None:
+    """Memoizing the parse must not turn a cyclic import graph into a hang.
+
+    Two modules importing each other is legal TypeScript and appears in the
+    estate. The walk breaks the cycle on the visited set; the caches sit
+    underneath that and must not resurrect the edge it dropped.
+    """
+    left = tmp_path / "left.ts"
+    right = tmp_path / "right.ts"
+    left.write_text(
+        "import { RIGHT } from './right';\n"
+        "export const LEFT = [[1], [2]];\n",
+        encoding="utf-8",
+    )
+    right.write_text(
+        "import { LEFT } from './left';\n"
+        "export const RIGHT = [[1], [2], [3]];\n",
+        encoding="utf-8",
+    )
+    source = (
+        "import { LEFT } from './left';\n"
+        "describe('cyclic', () => {\n"
+        "  it.each(LEFT)('row %s', () => {});\n"
+        "});\n"
+    )
+    spec = tmp_path / "cyclic.test.ts"
+    spec.write_text(source, encoding="utf-8")
+
+    assert len(_each_row_ids(source, spec)) == 2

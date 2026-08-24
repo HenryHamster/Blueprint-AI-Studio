@@ -4675,16 +4675,16 @@
       ],
       "test_migration_chain.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-23T22:57:52.007549+00:00",
+          "commit_sha": "9d3afeceefdead315e8f0c184483b73dd9dd76a4",
+          "commit_date": "2026-08-23T23:24:41Z",
           "old_cap": 1650,
           "new_cap": 1950
         }
       ],
       "test_research_completion.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-24T18:20:19.858836+00:00",
+          "commit_sha": "722f2bd184ac695af061d78e64f7310e55fde596",
+          "commit_date": "2026-08-24T18:41:21Z",
           "old_cap": 23850,
           "new_cap": 27550
         }

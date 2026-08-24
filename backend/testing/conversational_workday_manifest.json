@@ -339,7 +339,7 @@
       "test_ids": [
         "TestLlmCliBackendProbe::test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ],
-      "test_count": 676
+      "test_count": 679
     },
     {
       "path": "agent/src/index.provider-runner.test.ts",

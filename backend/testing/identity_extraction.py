@@ -416,6 +416,115 @@ def _typescript_each_row_count(
     return rows
 
 
+_TYPESCRIPT_DECLARATION_RE = re.compile(
+    r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)"
+    r"(?:\s*:\s*[\s\S]*?)?\s*=",
+    re.DOTALL,
+)
+_TYPESCRIPT_IMPORT_RE = re.compile(
+    r"\bimport\s*\{([^}]*)\}\s*from\s*['\"]([^'\"]+)['\"]"
+)
+_TYPESCRIPT_IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
+
+# One inventory pass over the estate walks ~1170 test files whose transitive
+# relative-import graphs overlap heavily, and every module in every graph used
+# to be re-resolved, re-read and re-parsed once per importer: ~100k parses and
+# ~132k path.resolve() syscalls, 61s wall. The suite-wide pytest timeout is 60s
+# (pyproject.toml), so test_checked_in_queue_ranks_every_collected_test_file
+# died on the clock rather than on an assertion.
+#
+# The caches below memoize only work that is a pure function of a file's
+# CONTENT, and each is keyed on identity that changes when the file does -- a
+# (mtime_ns, size) stamp for the read, the source text itself for the parse. A
+# test that rewrites a fixture between calls therefore still sees its new
+# content. Import *resolution* is revalidated with a single is_file() stat
+# rather than trusted outright, so a fixture that creates or deletes a module
+# mid-run is not served a stale answer either. Which modules get visited, in
+# what order, and with what cycle handling is unchanged.
+_TYPESCRIPT_SOURCE_CACHE: dict[Path, tuple[tuple[int, int], str]] = {}
+_TYPESCRIPT_RESOLVED_PATH_CACHE: dict[Path, Path] = {}
+_TYPESCRIPT_MODULE_CACHE: dict[tuple[Path, str], Path | None] = {}
+_TYPESCRIPT_BINDINGS_CACHE: dict[
+    tuple[Path | None, str],
+    tuple[dict[str, int | str], dict[str, tuple[Path, str]]],
+] = {}
+
+
+def _resolved_typescript_path(path: Path) -> Path:
+    """``Path.resolve()`` memoized -- it is a filesystem syscall, not string work."""
+    cached = _TYPESCRIPT_RESOLVED_PATH_CACHE.get(path)
+    if cached is None:
+        cached = path.resolve()
+        _TYPESCRIPT_RESOLVED_PATH_CACHE[path] = cached
+    return cached
+
+
+def _read_typescript_module_source(path: Path) -> str | None:
+    """Read an imported module once per (path, mtime_ns, size)."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    cached = _TYPESCRIPT_SOURCE_CACHE.get(path)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    _TYPESCRIPT_SOURCE_CACHE[path] = (stamp, source)
+    return source
+
+
+def _typescript_module_bindings(
+    source: str, path: Path | None
+) -> tuple[dict[str, int | str], dict[str, tuple[Path, str]]]:
+    """Parse one module's own array/alias declarations and named imports.
+
+    Deliberately context-free: the result depends on the module's text and its
+    own directory, never on who imported it. That is what makes it cacheable.
+    """
+    cache_key = (path, source)
+    cached = _TYPESCRIPT_BINDINGS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    bindings: dict[str, int | str] = {}
+    for match in _TYPESCRIPT_DECLARATION_RE.finditer(source):
+        name = match.group(1)
+        value_start = _skip_typescript_trivia(source, match.end())
+        if value_start < len(source) and source[value_start] == "[":
+            value_end = _matching_typescript_delimiter(source, value_start)
+            if value_end is not None:
+                bindings[name] = _typescript_each_row_count(
+                    source[value_start : value_end + 1]
+                )
+        else:
+            alias = _TYPESCRIPT_IDENTIFIER_RE.match(source, value_start)
+            if alias:
+                bindings[name] = alias.group(0)
+
+    imported_bindings: dict[str, tuple[Path, str]] = {}
+    for match in _TYPESCRIPT_IMPORT_RE.finditer(source):
+        if path is None or not match.group(2).startswith("."):
+            continue
+        module_path = _resolve_typescript_module(path.parent, match.group(2))
+        if module_path is None:
+            continue
+        for specifier in match.group(1).split(","):
+            parts = re.split(r"\s+as\s+", specifier.strip())
+            imported = parts[0].strip()
+            local = parts[-1].strip()
+            if _TYPESCRIPT_IDENTIFIER_RE.fullmatch(
+                imported
+            ) and _TYPESCRIPT_IDENTIFIER_RE.fullmatch(local):
+                imported_bindings[local] = (module_path, imported)
+
+    _TYPESCRIPT_BINDINGS_CACHE[cache_key] = (bindings, imported_bindings)
+    return bindings, imported_bindings
+
+
 def _typescript_static_array_row_counts(
     source: str,
     path: Path | None,
@@ -429,57 +538,19 @@ def _typescript_static_array_row_counts(
     ``ALL_AGENT_TASK_TYPES`` without executing TypeScript.
     """
     seen = set() if seen is None else seen
-    normalized_path = path.resolve() if path is not None else None
+    normalized_path = _resolved_typescript_path(path) if path is not None else None
     if normalized_path is not None:
         if normalized_path in seen:
             return {}
         seen.add(normalized_path)
 
-    bindings: dict[str, int | str] = {}
-    declaration_re = re.compile(
-        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)"
-        r"(?:\s*:\s*[\s\S]*?)?\s*=",
-        re.DOTALL,
-    )
-    for match in declaration_re.finditer(source):
-        name = match.group(1)
-        value_start = _skip_typescript_trivia(source, match.end())
-        if value_start < len(source) and source[value_start] == "[":
-            value_end = _matching_typescript_delimiter(source, value_start)
-            if value_end is not None:
-                bindings[name] = _typescript_each_row_count(
-                    source[value_start : value_end + 1]
-                )
-        else:
-            alias = re.match(r"([A-Za-z_$][\w$]*)", source[value_start:])
-            if alias:
-                bindings[name] = alias.group(1)
-
-    imported_bindings: dict[str, tuple[Path, str]] = {}
-    import_re = re.compile(
-        r"\bimport\s*\{([^}]*)\}\s*from\s*['\"]([^'\"]+)['\"]"
-    )
-    for match in import_re.finditer(source):
-        if path is None or not match.group(2).startswith("."):
-            continue
-        module_path = _resolve_typescript_module(path.parent, match.group(2))
-        if module_path is None:
-            continue
-        for specifier in match.group(1).split(","):
-            parts = re.split(r"\s+as\s+", specifier.strip())
-            imported = parts[0].strip()
-            local = parts[-1].strip()
-            if re.fullmatch(r"[A-Za-z_$][\w$]*", imported) and re.fullmatch(
-                r"[A-Za-z_$][\w$]*", local
-            ):
-                imported_bindings[local] = (module_path, imported)
+    bindings, imported_bindings = _typescript_module_bindings(source, path)
 
     resolved: dict[str, int] = {}
     pending = dict(bindings)
     for local, (module_path, imported) in imported_bindings.items():
-        try:
-            imported_source = module_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+        imported_source = _read_typescript_module_source(module_path)
+        if imported_source is None:
             continue
         imported_counts = _typescript_static_array_row_counts(
             imported_source, module_path, seen
@@ -505,12 +576,21 @@ def _typescript_static_array_row_counts(
 
 def _resolve_typescript_module(directory: Path, specifier: str) -> Path | None:
     """Resolve a relative TypeScript import without leaving the workspace tree."""
-    candidate = (directory / specifier).resolve()
+    cache_key = (directory, specifier)
+    cached = _TYPESCRIPT_MODULE_CACHE.get(cache_key, False)
+    # Revalidate with one stat instead of trusting the memo outright: a fixture
+    # may have created or deleted the module since the last lookup.
+    if cached is not False and (cached is None or cached.is_file()):
+        return cached
+
+    candidate = _resolved_typescript_path(directory / specifier)
     candidates = [candidate]
     if candidate.suffix == ".js" or not candidate.suffix:
         candidates.extend(candidate.with_suffix(ext) for ext in (".ts", ".tsx", ".js"))
     candidates.extend(candidate / f"index{ext}" for ext in (".ts", ".tsx", ".js"))
-    return next((item for item in candidates if item.is_file()), None)
+    resolved = next((item for item in candidates if item.is_file()), None)
+    _TYPESCRIPT_MODULE_CACHE[cache_key] = resolved
+    return resolved
 
 
 def _has_pytest_class_name(name: str) -> bool:
