@@ -1,0 +1,216 @@
+name: Guard data
+
+# Close the one structural hole in the merge gate: automain PRs carry ZERO
+# check-runs by design.
+#
+# ci.yml's `pull_request` trigger is `branches: [main]` (automain was removed
+# 2026-06-20 with build_config.requires_ci_checks=false, because the full
+# 8-shard suite was re-running on every task PR and rollup into the integration
+# branch). The deterministic gate is therefore the automain->main promotion PR.
+#
+# That is the right call for the *suite*. It is the wrong call for one narrow
+# class: DERIVED ARTIFACTS. A PR that renames, adds or removes a test without
+# regenerating backend/.test_durations, admin-ui/.test_durations.json,
+# agent/.test_durations.json, test-estate-ranked-queue.md or a manifest JSON
+# merges unchecked and only reds the promotion PR — weeks and dozens of commits
+# later, blamed on whoever happened to cut it. Worse, the class is
+# SELF-CONCEALING: test_test_durations_freshness.py and its vitest twin compare
+# against origin/automain and downgrade *inherited* drift to a UserWarning, so
+# after one bad merge every later branch sees only a warning. It reappears only
+# where no baseline exists — the container, and the promotion PR.
+#
+# This workflow runs ONLY the guard-data subset, ONLY on automain-targeting
+# PRs. It is deliberately not the standalone lane and deliberately not a second
+# copy of ci.yml: main-targeting PRs already collect every one of these tests in
+# the 8-shard suite, so running here too would double the work and compete with
+# the promotion run for the self-hosted pool.
+#
+# DO NOT add this check to branch protection as *required*. A required-but-
+# pending check flips mergeable_state to `blocked`, which
+# orchestrator_ci_monitor.py handles by silently deferring BEFORE CI resolution
+# and only alerting at deferral 10. It gates correctly as an ordinary check:
+# proceed_on_no_checks (ci_resolution.py:88) only relaxes the *absence* of
+# checks; a present, red check resolves as a genuine failure and blocks.
+on:
+  pull_request:
+    # automain only. See above — main is already covered by ci.yml, and
+    # doubling up would contend for the same 4-slot self-hosted pool.
+    branches: [automain]
+    # 'edited' deliberately omitted, matching ci.yml: the autonomous pipeline
+    # PATCHes PR bodies on every fix iteration, and CI is SHA-keyed.
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# Own group. ci.yml's group embeds github.workflow, and so does this one, so the
+# two never queue behind each other.
+#
+# cancel-in-progress is safe here: a cancelled run belongs to the superseded
+# SHA, and CI resolution is SHA-keyed (resolve_ci_status), so the stale
+# conclusion is never queried. _details_have_genuine_failure() also counts only
+# `failure`/`action_required`, never `cancelled`.
+concurrency:
+  group: guard-data-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # Job name is a plain leaf with NO parenthetical sibling. github_checks.py's
+  # _details_have_genuine_failure() treats a check named `X` alongside `X (…)`
+  # as a matrix aggregate and discounts its failure as laundered — emitting that
+  # shape here would make a genuine guard-data failure invisible.
+  derived:
+    name: Derived artifacts
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
+    # Steady state is ~2 min, measured on this runner: 41s checkout, 1s deps,
+    # 268 passed / 1 skipped in 75.58s. The budget is sized for the rare cold
+    # case instead -- a PR that changes requirements.txt/Dockerfile has to build
+    # the deps layer (ci.yml gives that same build 15 min) before it can run a
+    # single test.
+    #
+    # It still has to stay well under the 60-minute
+    # ci_backstop_timeout_minutes (recovery_evaluating.py:125) that hard-FAILs
+    # the parent task and cascade-cancels its children. That backstop is why
+    # this number cannot simply be made generous: automain PRs previously
+    # resolved via `no_checks` in a single poll and never accumulated CI-wait at
+    # all, so this workflow re-arms a kill switch dormant for them.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The freshness guards compare against origin/automain to tell drift
+          # this PR INTRODUCED from drift it merely inherited. Without the full
+          # fetch there is no baseline, and inherited drift hard-asserts —
+          # reddening every PR for someone else's rot.
+          fetch-depth: 0
+
+      # Resolve the deps layer BEFORE the test step, and leave it under the name
+      # tier 1 of resolve_deps_image (scripts/test-backend.sh:367) looks for --
+      # a zero-network `docker image inspect`. Two reasons this is a step and
+      # not left to the harness:
+      #
+      #  1. Correctness. The GHCR copy is pushed only by ci.yml's `backend-deps`
+      #     job, and ci.yml is `branches: [main]`. So an automain PR that
+      #     changes requirements.txt or Dockerfile misses tier 1 (never baked)
+      #     AND tier 2 (nobody pushed that reqhash yet) and silently falls to a
+      #     ~15-minute local build inside the test step's budget. That would red
+      #     an innocent PR for a dependency bump -- the precise class of
+      #     platform defect this gate exists to remove.
+      #  2. Speed. Once tagged locally, every later run on this runner takes
+      #     tier 1 and does no login, no pull, no network at all.
+      #
+      # Best-effort throughout, exactly like ci.yml's deps job: every failure
+      # path exits 0 and lets the harness fall back to its own local build, so
+      # this step can never be the thing that fails the check.
+      - name: Ensure deps image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -u
+          # Must match scripts/test-backend.sh:353 and ci.yml's backend-deps.
+          REQHASH=$(cat backend/requirements.txt backend/Dockerfile | sha256sum | cut -c1-16)
+          LOCAL="blueprint-backend-test-deps:$REQHASH"
+          echo "deps tag: $REQHASH"
+
+          if docker image inspect "$LOCAL" >/dev/null 2>&1; then
+            echo "$LOCAL already present — tier 1 hit, nothing to do"
+            exit 0
+          fi
+
+          REMOTE="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/backend-test-deps:$REQHASH"
+          if echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null 2>&1              && timeout 300 docker pull "$REMOTE" >/dev/null 2>&1; then
+            docker tag "$REMOTE" "$LOCAL"
+            echo "pulled $REMOTE and tagged it $LOCAL"
+            exit 0
+          fi
+
+          echo "::warning::deps image $REQHASH not cached anywhere — building it locally (one time, ~15 min). This is expected on a PR that changes backend/requirements.txt or backend/Dockerfile, because ci.yml (main-only) has not published that tag yet."
+          docker build --target deps -t "$LOCAL" ./backend             || echo "::warning::deps build failed — the harness will rebuild and surface the real error"
+          exit 0
+
+      - name: Run guard-data corpus
+        env:
+          # Wholesale override of the --standalone roster
+          # (scripts/test-backend.sh:665). Newline-separated selectors, base64.
+          # Narrower than --standalone on purpose: that roster is ~1800 tests
+          # and defaults Postgres ON. These are the derived-artifact and
+          # manifest guards only, and none of them needs a database.
+          BLUEPRINT_STATIC_GUARD_SELECTORS: |
+            dGVzdGluZy90ZXN0X3Rlc3RfZHVyYXRpb25zX2ZyZXNobmVzcy5weQp0ZXN0aW5nL3Rlc3Rfdml0
+            ZXN0X2R1cmF0aW9uc19mcmVzaG5lc3MucHkKdGVzdGluZy90ZXN0X3Rlc3RfZXN0YXRlX3Jhbmtl
+            ZF9xdWV1ZS5weQp0ZXN0aW5nL3Rlc3Rfc2hhcmRfYmFsYW5jZS5weQp0ZXN0aW5nL3Rlc3RfaW1w
+            YWN0ZWRfdGVzdHMucHkKdGVzdGluZy90ZXN0X3dlYnNvY2tldF9lbWl0dGVyX2ludmVudG9yeS5w
+            eQp0ZXN0aW5nL3Rlc3Rfb3BlcmF0b3Jfd29ya2JlbmNoX2NvbnRyYWN0cy5weTo6dGVzdF93ZWJz
+            b2NrZXRfZW1pdHRlcl9pbnZlbnRvcnlfY292ZXJzX2N1cnJlbnRfZW1pdHRlcnMKdGVzdGluZy90
+            ZXN0X2V2ZW50X3R5cGVfaW52YXJpYW50cy5weQp0ZXN0aW5nL3Rlc3RfbWlncmF0aW9uX2NoYWlu
+            LnB5CnRlc3RpbmcvdGVzdF9yZWxlYXNlX3Byb21vdGlvbl9tZXRyaWNfbWFuaWZlc3QucHkKdGVz
+            dGluZy90ZXN0X2NvbnZlcnNhdGlvbmFsX3dvcmtkYXlfcHJvdGVjdGlvbi5weQo=
+          # Fallback only: the step above normally leaves the image under the
+          # tier-1 local tag, so the harness never reaches tier 2. Keep the
+          # credentials anyway so that if the prep step failed for some reason,
+          # the GHCR pull (scripts/test-backend.sh:374) is still available
+          # rather than dropping straight to a ~15-minute local build.
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          # The env value above is soft-wrapped across lines for readability;
+          # the harness base64-decodes it and base64 ignores whitespace, but
+          # strip it anyway so the value is exactly what a local reproduction
+          # would export.
+          BLUEPRINT_STATIC_GUARD_SELECTORS="$(printf '%s' "$BLUEPRINT_STATIC_GUARD_SELECTORS" | tr -d '[:space:]')"
+          export BLUEPRINT_STATIC_GUARD_SELECTORS
+          bash scripts/test-backend.sh --standalone --no-postgres
+
+      - name: Explain a failure
+        if: failure()
+        run: |
+          # A red guard-data check spawns a real fix task
+          # (ci_completion.py, fix_reason="ci_failure"), which costs a VM. Give
+          # that agent — and a human — the exact command, so it converges in one
+          # pass instead of rediscovering the regeneration path.
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Guard data is stale
+
+          A derived artifact no longer matches the test estate. This is almost
+          always a test that was **added, renamed, or deleted** without
+          regenerating the file that indexes it.
+
+          Each guard names the offending entries in its own assertion — read the
+          failure above first; it is more specific than anything here.
+
+          Regenerate whichever artifact the failure names:
+
+          | Artifact | Command |
+          |---|---|
+          | `backend/.test_durations` | `scripts/store-backend-durations.sh` (~15-20 min, needs Docker + Postgres) |
+          | `admin-ui/.test_durations.json`, `agent/.test_durations.json` | `scripts/batch-store-durations.sh` |
+          | either of the above, from existing data | `scripts/regenerate-durations.py` |
+          | `test-estate-ranked-queue.md` | `python scripts/generate_test_estate_ranked_queue.py` |
+          | viewport manifest | `python scripts/viewport_manifest.py` |
+          | frontend release manifest | `python scripts/frontend_release_manifest.py` |
+
+          Reproduce this exact lane locally:
+
+          ```bash
+          export BLUEPRINT_STATIC_GUARD_SELECTORS="$(printf '%s\n' \
+            testing/test_test_durations_freshness.py \
+            testing/test_vitest_durations_freshness.py \
+            testing/test_test_estate_ranked_queue.py \
+            testing/test_shard_balance.py \
+            testing/test_impacted_tests.py \
+            testing/test_websocket_emitter_inventory.py \
+            'testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters' \
+            testing/test_event_type_invariants.py \
+            testing/test_migration_chain.py \
+            testing/test_release_promotion_metric_manifest.py \
+            testing/test_conversational_workday_protection.py | base64 -w0)"
+          bash scripts/test-backend.sh --standalone --no-postgres
+          ```
+
+          **Do not "fix" this by deleting the guard or the stale entry's test.**
+          If a test really was removed, regenerating the artifact drops its row
+          for you.
+          EOF
