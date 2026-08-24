@@ -4680,6 +4680,14 @@
           "old_cap": 1650,
           "new_cap": 1950
         }
+      ],
+      "test_research_completion.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-24T18:20:19.858836+00:00",
+          "old_cap": 23850,
+          "new_cap": 27550
+        }
       ]
     },
     "scripts": {

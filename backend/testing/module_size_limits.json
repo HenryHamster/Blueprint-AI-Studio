@@ -281,7 +281,7 @@
     "test_admin_routers.py": 22725,
     "test_agent.py": 31550,
     "test_compute.py": 9400,
-    "test_research_completion.py": 23850,
+    "test_research_completion.py": 27550,
     "test_strategic_completion.py": 22750,
     "test_reaper.py": 21750,
     "test_review_pipeline.py": 21650,
