@@ -202,9 +202,6 @@ async def open_version(
     # testing/test_release_version.py::test_open_version_deploy_artifacts_readable_without_lazy_load.
     version.deploy_artifacts = []
     session.add(version)
-    from app.acceptance_criteria import ensure_operator_authorship_criterion
-
-    await ensure_operator_authorship_criterion(session, project_id, version.id)
     logger.info(
         "[RELEASE_VERSION] opened version=%d project=%s sha=%s phase=%s",
         version_number,
@@ -524,7 +521,7 @@ async def compute_version_acceptance_aggregate(
         and (until is None or _task_completed_at(task) <= until)
     ]
 
-    aggregate: dict[str, int] = {bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS}
+    aggregate: dict[str, int] = dict.fromkeys(ACCEPTANCE_AGGREGATE_BUCKETS, 0)
     for task in rows:
         bucket = classify_merged_acceptance_context(
             task.context if isinstance(task.context, dict) else {}

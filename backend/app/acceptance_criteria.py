@@ -50,63 +50,6 @@ _acceptance_window_recompute_state: dict[
 ] = {}
 
 CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
-OPERATOR_AUTHORSHIP_CRITERION_KEY = "c-operator-authorship"
-OPERATOR_AUTHORSHIP_CRITERION_TEXT = (
-    "The candidate contains no operator-authored commits across its complete release range."
-)
-
-
-async def ensure_operator_authorship_criterion(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    release_version_id: uuid.UUID,
-) -> VersionAcceptanceCriterion:
-    """Ensure every newly opened version has an explicit authorship budget.
-
-    The stable key makes retries idempotent. Existing owner-authored contracts
-    remain authoritative; this helper only supplies the product default when a
-    version has no authorship criterion yet.
-    """
-    from app.release_commit_authorship import (
-        AUTHORSHIP_EVIDENCE_CONTRACT_TYPE,
-        default_authorship_evidence_contract,
-    )
-
-    result = await session.execute(
-        select(VersionAcceptanceCriterion).where(
-            VersionAcceptanceCriterion.project_id == project_id,
-            VersionAcceptanceCriterion.release_version_id == release_version_id,
-            VersionAcceptanceCriterion.criterion_key == OPERATOR_AUTHORSHIP_CRITERION_KEY,
-        )
-    )
-    existing = result.scalar_one_or_none()
-    if existing is not None:
-        return existing
-
-    existing_result = await session.execute(
-        select(VersionAcceptanceCriterion).where(
-            VersionAcceptanceCriterion.project_id == project_id,
-            VersionAcceptanceCriterion.release_version_id == release_version_id,
-            VersionAcceptanceCriterion.status == "active",
-        )
-    )
-    for criterion in existing_result.scalars().all():
-        contract = normalize_evidence_contract(criterion.evidence_contract)
-        if contract is not None and contract.get("type") == AUTHORSHIP_EVIDENCE_CONTRACT_TYPE:
-            return criterion
-
-    criterion = VersionAcceptanceCriterion(
-        project_id=project_id,
-        release_version_id=release_version_id,
-        criterion_key=OPERATOR_AUTHORSHIP_CRITERION_KEY,
-        text=OPERATOR_AUTHORSHIP_CRITERION_TEXT,
-        evidence_contract=default_authorship_evidence_contract(),
-        evidence_contract_updated_at=_utcnow(),
-        evidence_contract_updated_by="system:release_default",
-        created_by="system",
-    )
-    session.add(criterion)
-    return criterion
 
 
 def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:

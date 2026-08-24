@@ -438,6 +438,8 @@ async def test_release_audit_payload_carries_candidate_range_authorship_evidence
     budget when the payload actually carries the measured receipt and the
     contract."""
     from app import shared_state
+    from app import acceptance_criteria as ac
+    from app.release_commit_authorship import default_authorship_evidence_contract
 
     shared_state.runtime_config["smoketest_enabled"] = False
 
@@ -446,6 +448,14 @@ async def test_release_audit_payload_carries_candidate_range_authorship_evidence
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "The candidate stays within the declared authorship budget.",
+        created_by="owner",
+        evidence_contract=default_authorship_evidence_contract(),
+    )
 
     candidate = "cccc3333" * 5  # 40-char placeholder SHA
     mocker.patch(
@@ -490,10 +500,9 @@ async def test_release_audit_payload_carries_candidate_range_authorship_evidence
     assert authorship_evidence.get("state") == "resolved"
     assert authorship_evidence.get("count") == 0
 
-    # The default operator-authorship criterion (opened on every new version
-    # by ensure_operator_authorship_criterion) declares max_count=0 -- its
-    # evidence_contract must survive the categories projection into the
-    # audit payload instead of being stripped to {category_key, text} only.
+    # An explicitly declared operator-authorship criterion's evidence_contract
+    # must survive the categories projection into the audit payload instead of
+    # being stripped to {category_key, text} only.
     contracts = release_evidence.get("contracts") or []
     assert {
         "type": "operator_authored_commits",
@@ -502,7 +511,7 @@ async def test_release_audit_payload_carries_candidate_range_authorship_evidence
 
     categories = payload.get("categories") or []
     authorship_category = next(
-        (c for c in categories if c.get("category_key") == "c-operator-authorship"),
+        (c for c in categories if c.get("category_key") == criterion.criterion_key),
         None,
     )
     assert authorship_category is not None

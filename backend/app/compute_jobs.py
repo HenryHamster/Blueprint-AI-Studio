@@ -1813,6 +1813,16 @@ _NO_USABLE_GPU_TERMINAL_REASON = (
 _NO_DATA_TERMINAL_REASON = (
     "compute job exited 0 but never measured its declared result — no usable result"
 )
+# Bookkeeping the arm aggregator attaches to EVERY arm entry. They are numeric,
+# so counting them as measurements would let an arms sweep in which every arm
+# crashed look like it reported data -- the exact silent-success the no-data
+# guard exists to catch.
+_ARM_BOOKKEEPING_KEYS = frozenset({"exit_code", "elapsed_seconds"})
+# Bound the rendered per-arm explanation: a terminal reason is read in a CLI
+# line and stored on the durable record.
+_ARMS_SUMMARY_MAX_ARMS = 4
+_ARMS_SUMMARY_STDERR_CHARS = 400
+
 _NO_CRITERION_EXPERIMENT_REASON = (
     "compute_experiment declared no metric and produced no measurements — "
     "a metric or success_criterion is required for experiments"
@@ -1931,6 +1941,8 @@ def _resolved_metric_names(
         for arm in arms.values():
             if isinstance(arm, dict):
                 for key, value in arm.items():
+                    if key in _ARM_BOOKKEEPING_KEYS:
+                        continue
                     if _coerce_metric_number(value) is not None:
                         names.add(str(key))
     # stdout fallback fires ONLY when result-file metrics are absent/empty — the
@@ -1998,17 +2010,72 @@ def _arms_have_reported_data(job: ComputeJob, status: ComputeStatusResult) -> bo
     arms = result_metrics.get("arms") if isinstance(result_metrics, dict) else None
     return isinstance(arms, dict) and any(
         isinstance(arm, dict)
-        and any(_coerce_metric_number(value) is not None for value in arm.values())
+        and any(
+            _coerce_metric_number(value) is not None
+            for key, value in arm.items()
+            if key not in _ARM_BOOKKEEPING_KEYS
+        )
         for arm in arms.values()
     )
 
 
-def _no_data_terminal_reason(artifact_reference: Any | None) -> str:
+def _arms_failure_summary(job: ComputeJob, status: ComputeStatusResult) -> str | None:
+    """Render WHY each arm produced nothing, from the arms block itself.
+
+    ``compute_arm_aggregator.py`` already distinguishes crash / timeout /
+    unmeasured-criterion per arm and attaches a bounded ``stderr_excerpt``. That
+    diagnosis was being computed and then thrown away: the terminal reason said
+    only "no usable result", so an operator -- and the agent authoring the next
+    revision of the experiment -- had nothing to act on and could only guess.
+    """
+    result_metrics = (
+        status.metrics
+        if isinstance(status.metrics, dict) and status.metrics
+        else (job.polling_metadata or {}).get("result_metrics")
+    )
+    arms = result_metrics.get("arms") if isinstance(result_metrics, dict) else None
+    if not isinstance(arms, dict):
+        return None
+    parts: list[str] = []
+    for name in sorted(arms):
+        if len(parts) >= _ARMS_SUMMARY_MAX_ARMS:
+            parts.append(f"(+{len(arms) - len(parts)} more arms)")
+            break
+        arm = arms[name]
+        if not isinstance(arm, dict):
+            continue
+        error = arm.get("error")
+        if not isinstance(error, str) or not error:
+            continue
+        detail = error
+        excerpt = arm.get("stderr_excerpt")
+        if isinstance(excerpt, str) and excerpt.strip():
+            # The TAIL of stderr is where the traceback's final line lives.
+            tail = " ".join(excerpt.split())[-_ARMS_SUMMARY_STDERR_CHARS:]
+            detail = f"{detail} [stderr: {tail}]"
+        parts.append(f"{name}: {detail}")
+    return "; ".join(parts) or None
+
+
+def _no_data_terminal_reason(
+    artifact_reference: Any | None,
+    *,
+    arms_summary: str | None = None,
+    unmeasured_metric: str | None = None,
+) -> str:
     """Explain an unfulfilled result contract without discarding artifacts."""
+    reason = _NO_DATA_TERMINAL_REASON
+    if unmeasured_metric:
+        # Name the metric. "never measured its declared result" tells an operator
+        # nothing they can act on; the metric name says WHICH contract went
+        # unfulfilled, and is the first thing to grep the run for.
+        reason = f"{reason} — declared metric '{unmeasured_metric}' was never measured"
+    if arms_summary:
+        reason = f"{reason} — {arms_summary}"
     if artifact_reference is None:
-        return _NO_DATA_TERMINAL_REASON
+        return reason
     return (
-        f"{_NO_DATA_TERMINAL_REASON}; durable artifacts preserved "
+        f"{reason}; durable artifacts preserved "
         f"(uri={artifact_reference.uri}, file_count={artifact_reference.file_count})"
     )
 
@@ -3449,6 +3516,18 @@ async def _process_single_compute_job(
         # record a clean SUCCESS — a metric is definitionally mandatory for experiments.
         declared_metric = _declared_progress_metric(job)
         _criterion_free_experiment = _is_criterion_free_experiment(job, task)
+        # Hoisted out of the ``no_data`` expression so the terminal reason can name
+        # the unfulfilled metric instead of collapsing every cause into one
+        # sentence. Every predicate here is a pure read, so evaluating it up front
+        # is behaviour-identical to the short-circuited form it replaces.
+        _metric_unmeasured = (
+            not timeout_like
+            and not no_usable_gpu
+            and status.status == ComputeJobStatus.SUCCEEDED
+            and declared_metric is not None
+            and _job_expects_data(job, task)
+            and _declared_metric_unmeasured(job, status)
+        )
         no_data = (
             not timeout_like
             and not no_usable_gpu
@@ -3458,7 +3537,7 @@ async def _process_single_compute_job(
                 or (
                     _job_expects_data(job, task)
                     and (
-                        (declared_metric is not None and _declared_metric_unmeasured(job, status))
+                        _metric_unmeasured
                         or (_task_declares_arms(task) and not _arms_have_reported_data(job, status))
                     )
                 )
@@ -3500,7 +3579,13 @@ async def _process_single_compute_job(
                         _NO_CRITERION_EXPERIMENT_REASON
                         if _criterion_free_experiment
                         else (
-                            _no_data_terminal_reason(terminal_artifact_reference)
+                            _no_data_terminal_reason(
+                                terminal_artifact_reference,
+                                arms_summary=_arms_failure_summary(job, status),
+                                unmeasured_metric=(
+                                    declared_metric if _metric_unmeasured else None
+                                ),
+                            )
                             if no_data
                             else _resolve_terminal_reason(
                                 status_message=status.message, outcome=outcome

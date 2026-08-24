@@ -81,6 +81,9 @@ from blueprint_api import (
     list_projects,
     load_config,
     resolve_project_id_by_name,
+    resolve_task_id_by_prefix,
+    task_id_needs_prefix_resolution,
+    validate_project_id,
 )
 
 # Keep the retry policy shared with the backend's activation contract.  The
@@ -1383,9 +1386,37 @@ def _render_task_detail(t: dict) -> None:
     if msg:
         print(f"  Message:  {msg[:200]}")
     ctx = t.get("context") or {}
-    fc = ctx.get("failure_category") or ctx.get("failure_class")
+    fc = (ctx.get("failure_category") or ctx.get("failure_class")
+          or t.get("failure_class"))
     if fc and t.get("status") in ("FAILED", "CANCELLED"):
         print(f"  FailClass: {fc}")
+    # Why a task is not moving is the first thing an operator asks, and it was
+    # the one thing this view never answered -- the fields were in the JSON and
+    # absent from the human render, so `tasks show` reported the state and
+    # withheld the reason.
+    blocked_reason = t.get("blocked_reason")
+    if blocked_reason:
+        kind = t.get("blocker_kind")
+        blocked_at = (t.get("blocked_at") or "")[:19]
+        suffix = " ".join(
+            part for part in (f"[{kind}]" if kind else "",
+                              f"since {blocked_at}" if blocked_at else "")
+            if part
+        )
+        print(f"  Blocked:  {blocked_reason}"[:300]
+              + (f"  {suffix}" if suffix else ""))
+        if t.get("blocker_escalated"):
+            print("    (escalated to a human)")
+    park_reason = t.get("park_reason")
+    if park_reason:
+        parked_at = (t.get("parked_at") or "")[:19]
+        print(f"  Parked:   {park_reason}"[:300]
+              + (f"  since {parked_at}" if parked_at else ""))
+    if t.get("requires_approval"):
+        print("  Approval: REQUIRED (waiting on a human decision)")
+    depends_on = t.get("depends_on") or []
+    if depends_on:
+        print(f"  Depends:  {', '.join(str(d)[:8] for d in depends_on)}")
     diag = ctx.get("compute_terminal_diagnostics")
     if diag:
         reason = diag.get("terminal_reason", "")
@@ -9166,10 +9197,14 @@ _DISPATCH = {
 def main(argv: list | None = None) -> int:
     # Windows consoles default to cp1252; force UTF-8 so non-ASCII glyphs never
     # crash output (mirrors scripts/ops.py).
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
+    # stderr carries every ERROR/note line, including project and task names
+    # that may be non-ASCII; leaving it on cp1252 turns a clear diagnostic into
+    # a UnicodeEncodeError traceback.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -9189,6 +9224,19 @@ def main(argv: list | None = None) -> int:
         proj_name = getattr(args, "project_name", None)
         if proj_name and not getattr(args, "project_id", None):
             args.project_id = resolve_project_id_by_name(proj_name)
+        elif getattr(args, "project_id", None):
+            # An explicit --project-id that names nothing used to produce an
+            # empty listing, which reads as "no tasks" rather than "no project".
+            validate_project_id(args.project_id)
+        # Every id this CLI prints is truncated to 8 chars, so resolve a prefix
+        # back to its full uuid here -- one choke point ahead of the handlers,
+        # the same place --project is resolved -- instead of at each of the
+        # subcommands that take a task id.
+        raw_task_id = getattr(args, "task_id", None)
+        if task_id_needs_prefix_resolution(raw_task_id):
+            args.task_id = resolve_task_id_by_prefix(
+                raw_task_id, get_project_id(getattr(args, "project_id", None))
+            )
         result = handler(args)
         if isinstance(result, int):
             return result

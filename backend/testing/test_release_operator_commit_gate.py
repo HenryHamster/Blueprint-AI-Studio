@@ -75,8 +75,8 @@ _ZERO_BUDGET_CATEGORY = {
 }
 
 
-def test_undeclared_authorship_budget_is_surfaced_to_the_operator():
-    """The product default is a real contract, so the gate no longer stays inert."""
+def test_explicit_authorship_budget_is_surfaced_to_the_operator():
+    """An explicitly declared budget is enforced by the candidate gate."""
     category = {
         "category_key": "c-operator-authorship",
         "evidence_contract": default_authorship_evidence_contract(),

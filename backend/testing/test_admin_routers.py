@@ -3333,6 +3333,26 @@ class TestResetIterationCap:
 
 class TestGetTaskWakeRegistration:
     @pytest.mark.asyncio
+    async def test_get_task_resolves_short_task_id_citation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        short_task_id = str(task.id).replace("-", "")[:8]
+        resp = await client.get(f"/api/admin/tasks/{short_task_id}")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["id"] == str(task.id)
+
+    @pytest.mark.asyncio
     async def test_task_detail_returns_null_then_latest_wake_registration(
         self, client: AsyncClient, db_session
     ):
@@ -14635,6 +14655,208 @@ class TestPostCommitPendingField:
         assert resp.status_code == 200, resp.text
 
         assert resp.json()["sideboard_context"]["strategic"]["cycle"] is None
+
+
+class TestIdPrefixFilter:
+    """GET /api/admin/tasks resolves a truncated task id server-side.
+
+    Every surface truncates task ids to 8 hex chars on display, so pasting
+    those 8 chars back is the natural next request. Before this filter the only
+    way to answer it was to page the entire listing client-side -- ~48s per
+    500-row page, because each row carries description, payloads and history.
+    """
+
+    @staticmethod
+    async def _task_with_id(db_session, project, raw_id: str) -> Task:
+        task = Task(
+            id=uuid.UUID(raw_id),
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        return task
+
+    @pytest.mark.asyncio
+    async def test_id_prefix_returns_only_the_matching_task(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        wanted = await self._task_with_id(
+            db_session, project, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+        other = await self._task_with_id(
+            db_session, project, "9b17c2ea-0000-4000-8000-00000000abcd"
+        )
+
+        resp = await client.get("/api/admin/tasks?id_prefix=30d5ff95")
+
+        assert resp.status_code == 200, resp.text
+        assert [t["id"] for t in resp.json()["tasks"]] == [str(wanted.id)]
+        assert str(other.id) not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_id_prefix_matches_past_the_first_dash(
+        self, client: AsyncClient, db_session
+    ):
+        """A prefix longer than 8 chars spans a dash in the uuid text form.
+
+        Dashes are stripped from the column as well as the input, so two tasks
+        that share their first 8 chars can still be told apart.
+        """
+        project = await _make_project(db_session)
+        wanted = await self._task_with_id(
+            db_session, project, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+        twin = await self._task_with_id(
+            db_session, project, "30d5ff95-aaaa-4000-8000-00000000abcd"
+        )
+
+        resp = await client.get("/api/admin/tasks?id_prefix=30d5ff955cd5")
+
+        assert resp.status_code == 200, resp.text
+        assert [t["id"] for t in resp.json()["tasks"]] == [str(wanted.id)]
+        assert str(twin.id) not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_id_prefix_accepts_the_dashed_form(
+        self, client: AsyncClient, db_session
+    ):
+        """Operators copy ids with the dashes in; both spellings must resolve."""
+        project = await _make_project(db_session)
+        wanted = await self._task_with_id(
+            db_session, project, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+
+        resp = await client.get("/api/admin/tasks?id_prefix=30d5ff95-5cd5")
+
+        assert resp.status_code == 200, resp.text
+        assert [t["id"] for t in resp.json()["tasks"]] == [str(wanted.id)]
+
+    @pytest.mark.asyncio
+    async def test_full_uuid_id_prefix_resolves_to_that_task(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        wanted = await self._task_with_id(
+            db_session, project, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+
+        resp = await client.get(f"/api/admin/tasks?id_prefix={wanted.id}")
+
+        assert resp.status_code == 200, resp.text
+        assert [t["id"] for t in resp.json()["tasks"]] == [str(wanted.id)]
+
+    @pytest.mark.asyncio
+    async def test_unmatched_id_prefix_is_an_empty_page_not_an_error(
+        self, client: AsyncClient, db_session
+    ):
+        """No match is a legitimate answer; the caller needs it to say so."""
+        project = await _make_project(db_session)
+        await self._task_with_id(
+            db_session, project, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+
+        resp = await client.get("/api/admin/tasks?id_prefix=ffffffff")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tasks"] == []
+
+    @pytest.mark.asyncio
+    async def test_id_prefix_cannot_smuggle_a_like_wildcard(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-hex prefix is refused, not escaped.
+
+        This is why the filter needs no escape handling: if ``%`` or ``_``
+        reached the LIKE pattern, ``id_prefix=%`` would quietly match every
+        task in scope and read as an exact-id hit.
+        """
+        project = await _make_project(db_session)
+        await self._task_with_id(
+            db_session, project, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+
+        for hostile in ("%", "%%%%%%", "______", "3_d5ff95", "30d5ff9%"):
+            resp = await client.get(f"/api/admin/tasks?id_prefix={hostile}")
+            assert resp.status_code == 400, (hostile, resp.text)
+            assert "hexadecimal" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_short_id_prefix_is_refused_with_the_floor_named(
+        self, client: AsyncClient, db_session
+    ):
+        """Below the floor a "prefix" is a scan. The floor is pinned literally.
+
+        6 is already shorter than the 8 chars every surface prints, so nothing
+        an operator can have copied is rejected by it.
+        """
+        from app.admin import ADMIN_TASKS_MIN_ID_PREFIX
+
+        assert ADMIN_TASKS_MIN_ID_PREFIX == 6
+
+        await _make_project(db_session)
+
+        resp = await client.get("/api/admin/tasks?id_prefix=30d5f")
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["error"]["message"]
+        assert "at least 6" in detail
+        assert "got 5" in detail
+
+    @pytest.mark.asyncio
+    async def test_empty_id_prefix_is_refused_rather_than_ignored(
+        self, client: AsyncClient, db_session
+    ):
+        """``?id_prefix=`` must not silently degrade into "list everything"."""
+        project = await _make_project(db_session)
+        await self._task_with_id(
+            db_session, project, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+
+        resp = await client.get("/api/admin/tasks?id_prefix=")
+
+        assert resp.status_code == 400, resp.text
+
+    @pytest.mark.asyncio
+    async def test_id_prefix_does_not_reach_outside_the_callers_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """Prefix lookup must not become a cross-project id oracle.
+
+        The project-scope filter is built first and this one is appended to it,
+        so an exact-id prefix for a foreign task still returns nothing.
+        """
+        foreign = await _make_project(
+            db_session, owner_id="someone-else", name="Not Mine"
+        )
+        hidden = await self._task_with_id(
+            db_session, foreign, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+
+        resp = await client.get(f"/api/admin/tasks?id_prefix={hidden.id}")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tasks"] == []
+
+    @pytest.mark.asyncio
+    async def test_id_prefix_composes_with_the_other_filters(
+        self, client: AsyncClient, db_session
+    ):
+        """It narrows an existing query rather than replacing it."""
+        project = await _make_project(db_session)
+        queued = await self._task_with_id(
+            db_session, project, "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+        )
+
+        resp = await client.get("/api/admin/tasks?id_prefix=30d5ff95&status=QUEUED")
+        assert resp.status_code == 200, resp.text
+        assert [t["id"] for t in resp.json()["tasks"]] == [str(queued.id)]
+
+        resp = await client.get("/api/admin/tasks?id_prefix=30d5ff95&status=FAILED")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tasks"] == []
 
 
 class TestApprovalNeededFilter:

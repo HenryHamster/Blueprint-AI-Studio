@@ -45,6 +45,13 @@ describe('App workbench wiring', () => {
     expect(appSource).toMatch(/<MessagesPanel[\s\S]*onAcknowledgeRealtimeMessage=\{s\.acknowledgeMessageDelivery\}/);
   });
 
+  test('routes chat citations through the canonical task lookup and error toast path', () => {
+    expect(appSource).toMatch(/<MessagesPanel[\s\S]*onOpenTask=\{handleViewTaskById\}/);
+    expect(appSource).toMatch(
+      /const handleViewTaskById = useCallback\(\(taskId: string\) => \{[\s\S]*Could not load task — it may have been deleted/
+    );
+  });
+
   test('routes command-palette Strategic targets through overlay-safe wrappers', () => {
     expect(appSource).toMatch(/const openStrategicContextWorkspaceTarget = useCallback\([\s\S]*setStrategicContextWorkspaceOpen\(false\);[\s\S]*openStrategicContextTarget\(target\);/);
     expect(appSource).toMatch(/const openStrategicMessageTargetFromCommandPalette = useCallback\([\s\S]*setStrategicContextWorkspaceOpen\(false\);[\s\S]*strategicMessageTarget\.open\(target\);[\s\S]*\[strategicMessageTarget\.open\]/);

@@ -1037,6 +1037,187 @@ async def test_compute_completion_deadline_kill_is_honest_terminal(
     assert task.plan_output["compute_result"]["outcome"] == "TIMED_OUT"
 
 
+# ── Terminal-outcome gate: a failed job must not complete clean ─────────────
+#
+# The forward gate proves a terminal outcome and a cost are PRESENT. It never
+# asked what the outcome said, so a job the substrate itself finalized as
+# FAILURE reached TaskStatus.COMPLETED and the research loop read a finished
+# experiment. Live shape, CL-MuJoCo project 012da4e0 on 2026-08-23: four of five
+# terminal jobs carried outcome=FAILURE and all four tasks read COMPLETED.
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_job_failure_outcome_does_not_complete_clean(
+    db_session, _quiet_compute_io
+):
+    """outcome=FAILURE is the substrate's verdict that the run failed."""
+    task = await _make_compute_task(db_session)
+
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(
+            outcome="FAILURE", status="FAILED", intentional_terminal=False
+        ),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    gate = task.context["evaluation_gate"]
+    assert gate["passed"] is False
+    assert gate["strategy"] == "compute-job-outcome"
+    assert "FAILURE" in gate["reason"]
+    # The measurement is still durable — this fails the task, it does not
+    # discard the record the follow-on and the operator read.
+    assert task.plan_output["compute_result"]["outcome"] == "FAILURE"
+
+
+@pytest.mark.asyncio
+async def test_failed_outcome_reason_carries_the_job_terminal_reason(
+    db_session, _quiet_compute_io
+):
+    """State without reason is what this gate exists to stop reporting.
+
+    ``terminal_reason`` is the only sentence that says WHY the run failed. A
+    reason of just ``outcome=FAILURE`` hands the operator the enum back.
+    """
+    task = await _make_compute_task(db_session)
+
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(
+            outcome="FAILURE",
+            status="FAILED",
+            intentional_terminal=False,
+            terminal_reason="arm cpu crashed (exit 1): result file not written",
+        ),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert (
+        "arm cpu crashed (exit 1): result file not written"
+        in task.context["evaluation_gate"]["reason"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_compute_outcome_routes_to_code_error(
+    db_session, _quiet_compute_io
+):
+    """A failed command is a work defect: it burns the retry budget and drives
+    diagnosis, rather than being resurrected as a transient infra blip."""
+    from app.failure_classification import (
+        CODE_ERROR,
+        COMPUTE_JOB_FAILED,
+        INFRA_CLASSES,
+        classify_failure,
+    )
+
+    task = await _make_compute_task(db_session)
+
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(
+            outcome="FAILURE", status="FAILED", intentional_terminal=False
+        ),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.context["failure_category"] == COMPUTE_JOB_FAILED
+    assert COMPUTE_JOB_FAILED not in INFRA_CLASSES
+    assert classify_failure(task) == CODE_ERROR
+
+
+@pytest.mark.asyncio
+async def test_unclassified_terminal_outcome_fails_closed(
+    db_session, _quiet_compute_io
+):
+    """The gate is an ALLOW-list, so a new outcome cannot complete clean by default.
+
+    A deny-list would reintroduce the original defect the moment a
+    ``ComputeJobOutcome`` member is added without touching the completion path —
+    the new state would simply not match the list and complete.
+    """
+    task = await _make_compute_task(db_session)
+
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(
+            outcome="PREEMPTED_BY_HOST", status="FAILED", intentional_terminal=False
+        ),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "PREEMPTED_BY_HOST" in task.context["evaluation_gate"]["reason"]
+
+
+def test_every_compute_job_outcome_is_classified():
+    """Adding a ComputeJobOutcome member must force a decision in this gate.
+
+    Two disjoint sets decide whether a terminal job completes its task clean.
+    Pinning them against the enum means a new outcome cannot be added and then
+    silently inherit either behaviour.
+    """
+    from app.models import ComputeJobOutcome
+    from app.task_completion import (
+        _COMPUTE_CLEAN_TERMINAL_OUTCOMES,
+        _COMPUTE_INTENTIONAL_KILL_OUTCOMES,
+    )
+
+    # LITERAL pins, deliberately not the constants: asserting the partition
+    # against the very sets under test would hold no matter which member moved
+    # sides, which is the self-certifying shape.
+    assert _COMPUTE_CLEAN_TERMINAL_OUTCOMES == {
+        "SUCCESS",
+        "SPEND_CAP_EXCEEDED",
+        "TIMED_OUT",
+        "CANCELLED",
+    }
+    assert _COMPUTE_INTENTIONAL_KILL_OUTCOMES == {
+        "SPEND_CAP_EXCEEDED",
+        "TIMED_OUT",
+        "CANCELLED",
+    }
+    # SMOKE_FAILED never reaches this gate — it is intercepted on its own fast
+    # path earlier in the handler — so FAILURE is the only member the gate
+    # itself has to fail.
+    failing = {o.value for o in ComputeJobOutcome} - _COMPUTE_CLEAN_TERMINAL_OUTCOMES
+    assert failing == {"FAILURE", "SMOKE_FAILED"}
+
+
+@pytest.mark.asyncio
+async def test_prerequisite_mode_failed_outcome_does_not_unblock_dependents(
+    db_session, _quiet_compute_io
+):
+    """Advisory prerequisite mode consumes a MEASURED NEGATIVE, not a failed run.
+
+    A dependent unblocked on a job the substrate judged failed is the same false
+    progress in a further-reaching place: the failure propagates as evidence.
+    """
+    task = await _make_compute_task(db_session)
+    task.context = _prerequisite_context()
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(
+            outcome="FAILURE", status="FAILED", intentional_terminal=False
+        ),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["evaluation_gate"]["strategy"] == "compute-job-outcome"
+
+
+
 @pytest.mark.asyncio
 async def test_compute_completion_no_terminal_outcome_fails_gate(
     db_session, _quiet_compute_io

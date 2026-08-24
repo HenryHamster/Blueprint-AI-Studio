@@ -523,8 +523,20 @@ async def deliver_wake(
         job = None
         if registration.wake_source_ref:
             with contextlib.suppress(ValueError, TypeError):
+                # ``populate_existing`` is load-bearing, not defensive noise. This
+                # read decides the task's terminal status: the completion gate
+                # classifies the job's ``outcome``, and an outcome that is not a
+                # clean terminal one now FAILS the task. The job was finalized by
+                # the monitor in a DIFFERENT session and committed; if this
+                # session already holds a pre-terminal snapshot of the same row
+                # (identity map, ``expire_on_commit=False``), a plain ``get``
+                # returns that snapshot and the gate judges a SUCCEEDED run on a
+                # stale ``QUEUED``/``RUNNING`` outcome. Always read the committed
+                # terminal state.
                 job = await session.get(
-                    ComputeJob, uuid.UUID(registration.wake_source_ref)
+                    ComputeJob,
+                    uuid.UUID(registration.wake_source_ref),
+                    populate_existing=True,
                 )
         registration.delivery_state = WakeDeliveryState.DELIVERED
         registration.delivered_at = now

@@ -15,6 +15,7 @@ Usage as CLI:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -442,6 +443,155 @@ def resolve_project_id_by_name(name: str) -> str:
               "Narrow the name or use --project-id.", file=sys.stderr)
         sys.exit(1)
     return matches[0]["id"]
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+# Mirrors ADMIN_TASKS_MIN_ID_PREFIX server-side. Checked here too so an id the
+# server would reject costs no round trip, and so the message can name the CLI's
+# own advice ("paste the 8-char id") rather than the API's.
+TASK_PREFIX_MIN_CHARS = 6
+# Enough to prove ambiguity and name the candidates. The server has already
+# narrowed to the prefix, so a legitimate lookup comes back with one row.
+TASK_PREFIX_MATCH_LIMIT = 25
+
+
+def validate_project_id(project_id: str) -> None:
+    """Exit 1 when an explicitly selected project id is not in the catalog.
+
+    Without this an id that does not exist -- a typo, or a uuid assembled from a
+    printed 8-char prefix -- returned an empty task list and read as "this
+    project has no tasks". The state, not the reason. The check runs only when
+    --project-id was passed explicitly, and fails OPEN if the catalog itself
+    cannot be fetched, so a credential that cannot enumerate projects is not
+    blocked from operating on one it can reach.
+    """
+    try:
+        projects = list_projects()
+    except (APIError, OSError):
+        return
+    if not projects:
+        return
+    if any(str(candidate.get("id")) == str(project_id) for candidate in projects):
+        return
+    catalog = "\n".join(
+        f"    {candidate.get('id')}  {candidate.get('name') or '?'}"
+        for candidate in projects
+    )
+    print(
+        f"ERROR: --project-id {project_id!r} is not a project this credential "
+        f"can see, so every listing would come back empty rather than wrong.\n"
+        f"  Authorized projects:\n{catalog}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def task_id_needs_prefix_resolution(task_id: str | None) -> bool:
+    """True only when ``task_id`` is a hex string short enough to be truncated.
+
+    Gates the resolver so a full uuid -- the overwhelmingly common case -- never
+    triggers project resolution. Without this the CLI paid a project-catalog
+    round trip on every ``tasks show``, including the ones that already knew
+    exactly which task they meant.
+    """
+    candidate = str(task_id or "").strip().lower()
+    if not candidate or _UUID_RE.match(candidate):
+        return False
+    return bool(re.fullmatch(r"[0-9a-f]{1,31}", candidate))
+
+
+def resolve_task_id_by_prefix(task_id: str, project_id: str) -> str:
+    """Resolve a task-id prefix to the single full uuid it matches.
+
+    A full uuid is returned untouched and costs no API call. A hex string short
+    enough to be a truncated uuid is resolved through the listing endpoint's
+    ``id_prefix`` filter -- one bounded request, matched in SQL. Zero or several
+    matches exit with a message naming the candidates, rather than the bare
+    ``404 Task not found`` the raw prefix used to produce. Every other shape is
+    passed through unchanged, so this can only add a resolution that previously
+    failed -- it can never refuse an id the server would have accepted.
+
+    This exists because every id the CLI prints is truncated to 8 chars, so the
+    natural next command is to paste those 8 chars back in -- and the only way
+    to make that work before was to hand-assemble a uuid, which invites
+    fabricating one that does not exist.
+    """
+    candidate = str(task_id or "").strip().lower()
+    if _UUID_RE.match(candidate):
+        return candidate
+    # Strictly additive: anything that is not a plausible truncated uuid goes to
+    # the API untouched, exactly as before. The server is the authority on what
+    # a valid id is, and a CLI-side shape rule would refuse ids it would accept.
+    if not re.fullmatch(r"[0-9a-f]{1,31}", candidate):
+        return str(task_id)
+    if len(candidate) < TASK_PREFIX_MIN_CHARS:
+        print(
+            f"ERROR: task-id prefix {task_id!r} is shorter than "
+            f"{TASK_PREFIX_MIN_CHARS} characters; too short to identify one "
+            "task. Paste the 8-char id the CLI prints.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    scoped = str(load_config().get("api_key") or "").startswith("bpsc_")
+    route = (
+        "/api/agent-access/v1/tasks" if scoped else "/api/admin/tasks"
+    )
+    # The server owns the prefix match (`id_prefix`), so this is one small
+    # response instead of a walk over the whole listing. The client-side scan
+    # this replaced cost ~48s per 500-row page -- roughly five minutes for a
+    # single lookup -- because each row carries description, payloads, history
+    # and error_logs that a prefix match never needed.
+    response = api(
+        "GET",
+        f"{route}?project_id={project_id}"
+        f"&id_prefix={candidate}&limit={TASK_PREFIX_MATCH_LIMIT}",
+    )
+    matches = response.get("tasks", []) if isinstance(response, dict) else response
+    matches = [
+        task for task in (matches or [])
+        if str(task.get("id") or "").lower().replace("-", "").startswith(candidate)
+    ]
+
+    if not matches:
+        print(
+            f"ERROR: no task in project {project_id} starts with {candidate!r}. "
+            "Widen the prefix, check --project-id, or pass the full uuid.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if len(matches) > 1:
+        listing = "\n".join(
+            f"    {task.get('id')}  [{task.get('status', '?')}] "
+            f"{str(task.get('title') or '')[:60]}"
+            for task in matches[:10]
+        )
+        more = (
+            ""
+            if len(matches) <= 10
+            else f"\n    ... and {len(matches) - 10} more"
+            + (
+                " (list truncated)"
+                if len(matches) >= TASK_PREFIX_MATCH_LIMIT
+                else ""
+            )
+        )
+        print(
+            f"ERROR: task-id prefix {candidate!r} is ambiguous; "
+            f"{len(matches)} tasks match:\n{listing}{more}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    resolved = str(matches[0]["id"])
+    print(
+        f"note: resolved task {candidate} -> {resolved} "
+        f"({matches[0].get('status', '?')} {str(matches[0].get('title') or '')[:50]})",
+        file=sys.stderr,
+    )
+    return resolved
 
 
 def get_version_summary(version_id: str) -> dict:

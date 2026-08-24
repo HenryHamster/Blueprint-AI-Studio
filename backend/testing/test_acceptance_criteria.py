@@ -151,25 +151,15 @@ async def test_create_and_fetch_criterion(db_session):
 
 
 @pytest.mark.asyncio
-async def test_open_version_seeds_idempotent_operator_authorship_budget(db_session):
-    """Every production-opened version arms the candidate-range gate once."""
+async def test_open_version_does_not_seed_operator_authorship_budget(db_session):
+    """Opening a version leaves the optional authorship gate unarmed."""
     from app import release_version as rv
 
     project = await _make_project(db_session, "AC-Authorship-Default")
     version = await rv.open_version(db_session, project.id, version_number=1)
     await db_session.commit()
 
-    seeded = await ac.get_criteria_for_version(db_session, version.id)
-    assert len(seeded) == 1
-    assert seeded[0].criterion_key == ac.OPERATOR_AUTHORSHIP_CRITERION_KEY
-    assert seeded[0].evidence_contract == {
-        "type": "operator_authored_commits",
-        "predicate": {"max_count": 0},
-    }
-
-    await ac.ensure_operator_authorship_criterion(db_session, project.id, version.id)
-    await db_session.commit()
-    assert len(await ac.get_criteria_for_version(db_session, version.id)) == 1
+    assert await ac.get_criteria_for_version(db_session, version.id) == []
 
 
 @pytest.mark.asyncio
@@ -354,8 +344,7 @@ async def test_apply_new_acceptance_criteria_enforces_cap(db_session):
     await _apply_new_acceptance_criteria(criteria_texts, task, project, db_session, path="test")
 
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    # The release-policy authorship criterion is additive to the user-criteria cap.
-    assert len(fetched) == ac.MAX_CRITERIA_PER_VERSION + 1
+    assert len(fetched) == ac.MAX_CRITERIA_PER_VERSION
     new_texts = {c.text for c in fetched if c.text.startswith("New criterion")}
     assert len(new_texts) == headroom
 
@@ -396,7 +385,7 @@ async def test_apply_new_acceptance_criteria_already_at_cap_is_noop(db_session):
     await _apply_new_acceptance_criteria(["Should not appear"], task, project, db_session, path="test")
 
     count = await ac.count_criteria_for_version(db_session, version.id)
-    assert count == ac.MAX_CRITERIA_PER_VERSION + 1
+    assert count == ac.MAX_CRITERIA_PER_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -486,13 +475,13 @@ def _make_evidence(
     detail: dict | None = None,
     recorded_at: object = _UNSET,
 ) -> CriterionEvidence:
-    kwargs: dict = dict(
-        id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        criterion_id=uuid.uuid4(),
-        source_kind=source_kind,
-        detail=detail,
-    )
+    kwargs: dict = {
+        "id": uuid.uuid4(),
+        "project_id": uuid.uuid4(),
+        "criterion_id": uuid.uuid4(),
+        "source_kind": source_kind,
+        "detail": detail,
+    }
     # Only override recorded_at when the caller supplies one, so the model's
     # default_factory (fresh _utcnow()) still applies for the common case.
     if recorded_at is not _UNSET:
@@ -2212,15 +2201,12 @@ async def test_strategist_criterion_authoring(db_session):
     await _apply_new_acceptance_criteria(criteria_texts, task, project, db_session, path="test")
 
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    assert len(fetched) == 4  # three strategist criteria plus the policy criterion
+    assert len(fetched) == 3  # three strategist criteria
     fetched_texts = {c.text for c in fetched}
     assert "All unit tests pass" in fetched_texts
     assert "No P0 bugs open" in fetched_texts
     assert "Deploy to staging succeeds" in fetched_texts
-    for c in fetched:
-        if ac.is_operator_authorship_criterion(c):
-            continue
-        assert c.created_by == "strategist"
+    assert all(c.created_by == "strategist" for c in fetched)
 
 
 @pytest.mark.asyncio
@@ -2264,7 +2250,7 @@ async def test_strategist_criterion_authoring_skips_duplicates(db_session):
     )
 
     fetched = await ac.get_criteria_for_version(db_session, version.id)
-    assert len(fetched) == 3  # one new criterion plus the policy criterion
+    assert len(fetched) == 2  # one existing and one new criterion
     fetched_texts = {c.text for c in fetched}
     assert "Existing criterion" in fetched_texts
     assert "Brand new criterion" in fetched_texts
@@ -2843,7 +2829,7 @@ async def test_refresh_after_merge_scopes_to_open_version_and_is_idempotent(
     ev_b_again = await ac.get_evidence_for_criterion(db_session, open_criterion_b.id)
     assert len(ev_a_again) == 2
     assert len(ev_b_again) == 2
-    assert first == 4  # 2 criteria × 2 rows each (task_merge + reachability)
+    assert first == 4  # 2 criteria x 2 rows each (task_merge + reachability)
     assert second == 0
 
     summary = await ac.get_version_coverage_summary(db_session, reopened_version.id)
@@ -3936,7 +3922,7 @@ async def test_apply_new_acceptance_criteria_active_only_headroom(db_session):
         f"expected exactly 1 new active criterion (retracted rows must not consume cap), "
         f"got {len(new_active)}"
     )
-    assert len(active_criteria) == ac.MAX_CRITERIA_PER_VERSION + 1
+    assert len(active_criteria) == ac.MAX_CRITERIA_PER_VERSION
 
 
 @pytest.mark.asyncio

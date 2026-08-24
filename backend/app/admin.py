@@ -20,7 +20,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func, update, case, delete, and_, or_
+from sqlalchemy import String, cast, func, update, case, delete, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
@@ -114,6 +114,7 @@ from app.admin_helpers import (  # noqa: F401
     _get_user_project_with_role,
     _get_user_task,
     _get_user_task_with_role,
+    _resolve_task_id,
 )
 from app.admin_task_mutations import (
     CANCEL_CASCADE_CHILD_STATUSES,
@@ -261,6 +262,12 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 # x large-tail payload stays safely under Cloud Run's 32 MB response limit.
 ADMIN_TASKS_MAX_LIMIT = 500
 
+# Shortest ``id_prefix`` /admin/tasks will resolve. Every surface that prints a
+# task id truncates it to 8 hex chars, so 6 is already shorter than anything an
+# operator can have copied; below that a "prefix" is a scan, not a lookup.
+ADMIN_TASKS_MIN_ID_PREFIX = 6
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
 
 def _fresh_attempt_boundary(task: Task) -> datetime | None:
     """Return the UTC-naive boundary after which current-attempt logs count."""
@@ -326,6 +333,7 @@ async def get_all_tasks(
     terminal_only: bool = Query(False),
     archived: bool | None = Query(None),
     search: str | None = Query(None, max_length=200),
+    id_prefix: str | None = Query(None, max_length=36),
     created_after: datetime | None = Query(None),
     direction_id: str | None = Query(None),
     task_type: str | None = Query(None),
@@ -370,6 +378,45 @@ async def get_all_tasks(
             (Task.title.ilike(search_pattern, escape="\\"))
             | (Task.description.ilike(search_pattern, escape="\\"))
             | (Task.latest_status_message.ilike(search_pattern, escape="\\"))
+        )
+    if id_prefix is not None:
+        # Resolve a truncated task id server-side. Every id this API hands back
+        # is displayed truncated to 8 chars, so pasting those 8 chars into the
+        # next request is the natural follow-up -- and without this filter the
+        # only way to answer it was to page the whole listing client-side, at
+        # ~48s per 500-row page, because each row carries description, payloads,
+        # history and error_logs.
+        #
+        # Rejected rather than sanitized: a value that is not plain hex cannot
+        # be a truncated uuid, so accepting one would only widen the LIKE
+        # surface. Once that holds there is no %, _ or backslash left to escape.
+        normalized_prefix = id_prefix.strip().lower().replace("-", "")
+        if not normalized_prefix or not _HEX_DIGITS.issuperset(normalized_prefix):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "id_prefix must be a hexadecimal task-id prefix (dashes "
+                    f"optional); got {id_prefix!r}"
+                ),
+            )
+        if len(normalized_prefix) < ADMIN_TASKS_MIN_ID_PREFIX:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "id_prefix must be at least "
+                    f"{ADMIN_TASKS_MIN_ID_PREFIX} hex characters to identify a "
+                    f"task; got {len(normalized_prefix)}"
+                ),
+            )
+        # Task.id is a uuid column, so compare against its text form for a
+        # prefix to mean anything. Dashes are stripped from the column too, not
+        # just the input: that way a prefix longer than 8 chars still matches
+        # across the first group boundary, and it costs nothing on a dialect
+        # that renders uuids undashed.
+        filters.append(
+            func.lower(func.replace(cast(Task.id, String), "-", "")).like(
+                f"{normalized_prefix}%"
+            )
         )
     if created_after:
         # Task.created_at is TIMESTAMPTZ (alembic 0061) but the
@@ -2122,10 +2169,7 @@ async def get_task(
 ):
     from app.findings_index import resolve_research_findings_for_surface
 
-    try:
-        tid = uuid.UUID(task_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Task not found")
+    tid = await _resolve_task_id(task_id, session)
 
     task = await _get_user_task_with_role(
         tid, current_user["user_id"], session, "viewer"

@@ -8,9 +8,11 @@ enforce a minimum ``viewer``/``member``/``owner`` level. Re-exports
 """
 
 import logging
+import re
 import uuid
 
 from fastapi import HTTPException
+from sqlalchemy import String, cast, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -29,6 +31,7 @@ PROJECT_WRITE_ROLES = ("member", "owner")
 PROJECT_NON_OWNER_ROLES = ("viewer", "member")
 _ROLE_LEVEL = {role: level for level, role in enumerate(PROJECT_VIEW_ROLES)}
 PENDING_PROJECT_MEMBER_PREFIX = "allowed-user:"
+_SHORT_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 
 
 class AllowedUserBoundToDifferentUID(RuntimeError):
@@ -319,6 +322,32 @@ async def _get_user_task(
             raise HTTPException(status_code=404, detail="Task not found") from None
         raise
     return task
+
+
+async def _resolve_task_id(task_id: str, session: AsyncSession) -> uuid.UUID:
+    """Resolve a full UUID or one unique eight-hex task-ID prefix.
+
+    Citation links intentionally use short IDs for readability. Resolve the
+    prefix before the caller performs its normal project-membership check, and
+    fail closed when the input is malformed or matches zero/multiple tasks.
+    """
+
+    try:
+        return uuid.UUID(task_id)
+    except ValueError:
+        if not _SHORT_TASK_ID_RE.fullmatch(task_id):
+            raise HTTPException(status_code=404, detail="Task not found") from None
+
+    matching_ids = (
+        await session.execute(
+            select(Task.id).where(
+                func.substr(cast(Task.id, String), 1, 8) == task_id.lower()
+            )
+        )
+    ).scalars().all()
+    if len(matching_ids) != 1:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return matching_ids[0]
 
 
 async def _get_user_task_with_role(

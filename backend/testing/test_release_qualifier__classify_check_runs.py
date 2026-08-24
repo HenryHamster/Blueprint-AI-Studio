@@ -15,11 +15,10 @@ def _authorized_qualification_has_a_delivery_target(monkeypatch):
 async def _with_current_contract(db_session, project, version, record):
     """Stamp a synthetic conclusive verdict with today's reusable contract.
 
-    ``open_version`` seeds a default operator-authorship criterion, so a
-    version's live rubric is never empty.  Default the stamped snapshot to the
-    version's CURRENT active rubric — a hardcoded empty snapshot makes the
-    reuse/finalize paths correctly treat the fixture as mid-flight rubric
-    drift before the behavior under test is reached.
+    Default the stamped snapshot to the version's CURRENT active rubric — a
+    hardcoded snapshot makes the reuse/finalize paths correctly treat the
+    fixture as mid-flight rubric drift before the behavior under test is
+    reached.
     """
     rubric_snapshot = record.get("rubric_snapshot")
     if not rubric_snapshot:
@@ -1168,20 +1167,7 @@ async def test_run_qualification_spawns_one_holistic_audit_when_goal_set(
     )
     assert payload["candidate_sha"] == candidate
     assert payload["version_goal"] == "deliver user analytics dashboard"
-    # open_version seeds the default operator-authorship policy criterion, so
-    # every live rubric carries it alongside the product criteria.
     assert lq["rubric_snapshot"] == [
-        {
-            "criterion_key": "c-operator-authorship",
-            "text": (
-                "The candidate contains no operator-authored commits across "
-                "its complete release range."
-            ),
-            "evidence_contract": {
-                "type": "operator_authored_commits",
-                "predicate": {"max_count": 0},
-            },
-        },
         {
             "criterion_key": "c-analytics-ui",
             "text": "Render analytics for the operator",
@@ -1191,17 +1177,6 @@ async def test_run_qualification_spawns_one_holistic_audit_when_goal_set(
     # audit payload so the auditor grades against the same predicate the
     # promotion gate enforces; text-only criteria stay text-only.
     assert payload["categories"] == [
-        {
-            "category_key": "c-operator-authorship",
-            "text": (
-                "The candidate contains no operator-authored commits across "
-                "its complete release range."
-            ),
-            "evidence_contract": {
-                "type": "operator_authored_commits",
-                "predicate": {"max_count": 0},
-            },
-        },
         {
             "category_key": "c-analytics-ui",
             "text": "Render analytics for the operator",
@@ -4864,9 +4839,7 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
 
     shared_state.runtime_config["promotion_enabled"] = True
     project, version = await _make_project_and_version(db_session)
-    # This test asserts behavior orthogonal to the product-default
-    # authorship policy criterion open_version seeds; retract it so the
-    # live rubric is exactly the criteria this test declares.
+    # Keep this fixture's live rubric exactly to the criteria this test declares.
     await _retract_default_authorship_criterion(db_session, version)
     prior = ReleaseVersion(
         project_id=project.id,
@@ -5014,9 +4987,7 @@ async def test_ci_build_smoke_contract_finalizes_without_grader_category(
 
     shared_state.runtime_config["promotion_enabled"] = True
     project, version = await _make_project_and_version(db_session)
-    # This test asserts behavior orthogonal to the product-default
-    # authorship policy criterion open_version seeds; retract it so the
-    # live rubric is exactly the criteria this test declares.
+    # Keep this fixture's live rubric exactly to the criteria this test declares.
     await _retract_default_authorship_criterion(db_session, version)
     criterion_key = "generated-ci-build-smoke-key"
     db_session.add(
@@ -6723,9 +6694,7 @@ async def test_reused_blocked_legacy_smoketest_fact_is_ignored(
     )
 
     project, version = await _make_project_and_version(db_session)
-    # This test asserts behavior orthogonal to the product-default
-    # authorship policy criterion open_version seeds; retract it so the
-    # live rubric is exactly the criteria this test declares.
+    # Keep this fixture's live rubric exactly to the criteria this test declares.
     await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
@@ -6782,9 +6751,7 @@ async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
     shared_state.runtime_config["promotion_enabled"] = True
 
     _project, version = await _make_project_and_version(db_session)
-    # This test asserts behavior orthogonal to the product-default
-    # authorship policy criterion open_version seeds; retract it so the
-    # live rubric is exactly the criteria this test declares.
+    # Keep this fixture's live rubric exactly to the criteria this test declares.
     await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
@@ -6839,9 +6806,7 @@ async def test_archival_passed_smoketest_fact_is_ignored(
     )
 
     project, version = await _make_project_and_version(db_session)
-    # This test asserts behavior orthogonal to the product-default
-    # authorship policy criterion open_version seeds; retract it so the
-    # live rubric is exactly the criteria this test declares.
+    # Keep this fixture's live rubric exactly to the criteria this test declares.
     await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
@@ -7001,9 +6966,7 @@ async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
     shared_state.runtime_config["promotion_enabled"] = True
 
     project, version = await _make_project_and_version(db_session)
-    # This test asserts behavior orthogonal to the product-default
-    # authorship policy criterion open_version seeds; retract it so the
-    # live rubric is exactly the criteria this test declares.
+    # Keep this fixture's live rubric exactly to the criteria this test declares.
     await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     # An active criterion that was never graded into the category-verdict ledger.
@@ -7181,9 +7144,7 @@ async def test_ungraded_acceptance_contract_fails_closed(
     shared_state.runtime_config["promotion_enabled"] = False
 
     project, version = await _make_project_and_version(db_session)
-    # This test asserts behavior orthogonal to the product-default
-    # authorship policy criterion open_version seeds; retract it so the
-    # live rubric is exactly the criteria this test declares.
+    # Keep this fixture's live rubric exactly to the criteria this test declares.
     await _retract_default_authorship_criterion(db_session, version)
     await _seed_qualification_children(
         db_session,

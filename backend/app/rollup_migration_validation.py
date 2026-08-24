@@ -42,14 +42,29 @@ class PremergeMigrationGuardResult:
     distinguish deterministic ``block`` from transient ``defer``.
     """
 
-    __slots__ = ("ok", "reason", "verdict")
+    __slots__ = ("ok", "reason", "target_branch", "verdict")
 
-    def __init__(self, verdict: str, reason: str | None):
+    def __init__(
+        self,
+        verdict: str,
+        reason: str | None,
+        target_branch: str | None = None,
+    ):
         if verdict not in {"ok", "block", "defer"}:
             raise ValueError(f"unknown migration guard verdict: {verdict!r}")
         self.verdict = verdict
         self.ok = verdict == "ok"
         self.reason = None if self.ok else reason
+        # The merge target this verdict was actually evaluated against. A
+        # verdict computed against a different base says nothing about the
+        # merge a chokepoint is about to submit, so consumers that adopt a
+        # pre-computed result MUST check this against their own resolved base
+        # (see ``is_bound_to_target``).
+        self.target_branch = str(target_branch) if target_branch else None
+
+    def is_bound_to_target(self, target_branch: str | None) -> bool:
+        """True when this verdict was evaluated against ``target_branch``."""
+        return bool(target_branch) and self.target_branch == str(target_branch)
 
     def __iter__(self):
         yield self.ok
@@ -73,7 +88,8 @@ class PremergeMigrationGuardResult:
     def __repr__(self) -> str:
         return (
             "PremergeMigrationGuardResult("
-            f"ok={self.ok!r}, reason={self.reason!r}, verdict={self.verdict!r})"
+            f"ok={self.ok!r}, reason={self.reason!r}, verdict={self.verdict!r}, "
+            f"target_branch={self.target_branch!r})"
         )
 
 
@@ -636,7 +652,7 @@ async def enforce_premerge_migration_guard(
         target_branch=target_branch,
         promotion_target=promotion_target,
     )
-    return PremergeMigrationGuardResult(verdict, reason)
+    return PremergeMigrationGuardResult(verdict, reason, target_branch=target_branch)
 
 
 def _divergence_record_is_authorized(
