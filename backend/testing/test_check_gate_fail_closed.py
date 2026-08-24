@@ -214,6 +214,7 @@ def test_genuine_noop_diff_still_exits_zero(tmp_path: Path) -> None:
         ("changed_files", "setup_failure"),
         ("base_extract", "base_extraction_failure"),
         ("size", "size_failure"),
+        ("size_no_corpus", "size_failure"),
         ("harness", "harness_unavailable"),
         ("inventory", "corpus_inventory_failure"),
         ("execution", "execution_failure"),
@@ -270,7 +271,9 @@ def test_static_release_guard_records_every_blocking_exit(
     monkeypatch.setattr(
         static_release_guard,
         "_run_size_guard",
-        lambda *_args: subprocess.CompletedProcess([], 7 if case == "size" else 0, "size output", "size error"),
+        lambda *_args: subprocess.CompletedProcess(
+            [], 7 if case in {"size", "size_no_corpus"} else 0, "size output", "size error"
+        ),
     )
     corpus_calls = 0
 
@@ -307,6 +310,8 @@ def test_static_release_guard_records_every_blocking_exit(
     assert lane["guard_exit_code"] != 0
     if case == "introduced_failure":
         assert lane["new_failures"] == {failure_key: {"detail": "introduced failure"}}
+    if case == "size_no_corpus":
+        assert lane["guard_exit_code"] == 1
 
 
 def test_missing_static_release_guard_fails_the_lint_only_path(

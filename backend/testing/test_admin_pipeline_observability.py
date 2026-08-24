@@ -296,9 +296,14 @@ async def test_outer_loop_summary_includes_dominant_blocker(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_outer_loop_chains_drilldown_lists_nonmerged(client, db_session):
-    """The drill-down lists the actual non-merged PR-chains with enough context
-    to investigate; merged chains are excluded when no reason filter is given."""
+async def test_outer_loop_chains_projects_direction_id_and_reviews_to_converge(
+    client, db_session
+):
+    """The drill-down preserves reducer identity and convergence fields.
+
+    The default view includes resolved merged chains because they are the only
+    chains with a ``reviews_to_converge`` value.
+    """
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -314,13 +319,40 @@ async def test_outer_loop_chains_drilldown_lists_nonmerged(client, db_session):
             "review_loop": {"iteration": 3, "pr_number": 42, "churn_detections": 2},
         },
     )
-    merged = make_task(
+    merged_original = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=3),
+        context={"pr_merged": True, "direction_id": "direction-merged"},
+    )
+    merged_review = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         created_at=now - timedelta(hours=2),
-        context={"pr_merged": True, "review_loop": {"iteration": 1, "pr_number": 43}},
+        payloads=[{"type": "review", "pr_number": 43}],
+        context={
+            "direction_id": "direction-merged",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(merged_original.id),
+                "pr_number": 43,
+            },
+        },
     )
-    db_session.add_all([rejected, merged])
+    merged_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(minutes=30),
+        payloads=[{"type": "fix", "pr_number": 43}],
+        context={
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(merged_original.id),
+                "pr_number": 43,
+            }
+        },
+    )
+    db_session.add_all([rejected, merged_original, merged_review, merged_fix])
     await db_session.commit()
 
     resp = await client.get(f"/api/admin/outer-loop-chains?hours=24&project_id={project.id}")
@@ -328,15 +360,30 @@ async def test_outer_loop_chains_drilldown_lists_nonmerged(client, db_session):
     data = resp.json()
     assert data["window_hours"] == 24
     assert data["reason_filter"] is None
-    # Only the non-merged (rejected) chain is listed by default.
-    assert data["total"] == 1
-    row = data["chains"][0]
-    assert row["pr_number"] == 42
-    assert row["terminal_reason"] == "rejected"
-    assert row["max_iteration"] == 3
-    assert row["churn_count"] == 2
-    assert str(rejected.id) in row["task_ids"]
-    assert row["project_id"] == str(project.id)
+    assert data["total"] == 2
+    rows = {row["pr_number"]: row for row in data["chains"]}
+
+    rejected_row = rows[42]
+    assert rejected_row["terminal_reason"] == "rejected"
+    assert rejected_row["max_iteration"] == 3
+    assert rejected_row["churn_count"] == 2
+    assert rejected_row["direction_id"] is None
+    assert rejected_row["review_count"] == 0
+    assert rejected_row["reviews_to_converge"] is None
+    assert rejected_row["chain_key"] == "pr:42"
+    assert str(rejected.id) in rejected_row["task_ids"]
+    assert rejected_row["original_task_id"] is None
+    assert rejected_row["project_id"] == str(project.id)
+
+    merged_row = rows[43]
+    assert merged_row["terminal_reason"] == "merged"
+    assert merged_row["direction_id"] == "direction-merged"
+    assert merged_row["review_count"] == 1
+    assert merged_row["reviews_to_converge"] == 1
+    assert merged_row["chain_key"] == f"orig:{merged_original.id}"
+    assert merged_row["original_task_id"] == str(merged_original.id)
+    assert merged_row["max_iteration"] == 2
+    assert merged_row["project_id"] == str(project.id)
 
 
 @pytest.mark.asyncio

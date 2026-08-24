@@ -4,6 +4,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import type { StrategicStateTaskFocus, StrategicStateTaskFocusItem } from '../strategicStateApi';
 import type { ResidentActivityState, StrategicChatLiveState } from '../utils/strategicSessionLive';
 import type { ProjectMessage } from '../types/messages';
+import type { Alert } from '../types/alert';
 import {
   buildConversationWorkdayStatus,
   type ConversationWorkdayStatus,
@@ -607,6 +608,135 @@ describe('ConversationUtilityBar detail toggle', () => {
     expect(toggle?.getAttribute('aria-pressed')).toBe('false');
     act(() => { toggle?.click(); });
     expect(calls).toEqual([true]);
+  });
+});
+
+describe('ConversationUtilityBar operator alerts', () => {
+  test('surfaces_an_open_operator_alert_without_revealing_chat_detail', () => {
+    const alert: Alert = {
+      id: 'alert-1',
+      project_id: 'project-1',
+      severity: 'ERROR',
+      title: 'Strategic cycle halted',
+      message: 'No runner is attached to the active cycle.',
+      task_id: 'task-1',
+      created_at: '2026-08-15T00:00:00Z',
+      dismissed_at: null,
+      acknowledged_at: null,
+    };
+    const dismissed: string[] = [];
+    const openedTasks: string[] = [];
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => {
+      root?.render(
+        <ConversationUtilityBar
+          expanded={false}
+          onExpand={() => {}}
+          onCollapse={() => {}}
+          searchQuery=""
+          onSearchChange={() => {}}
+          detailRevealed={false}
+          alerts={[alert]}
+          onDismissAlert={id => dismissed.push(id)}
+          onViewAlertTask={id => openedTasks.push(id)}
+          projectId="project-1"
+          canOperateProject
+        />,
+      );
+    });
+
+    const signal = host.querySelector('[data-testid="conversation-utility-alert"]');
+    expect(signal).toHaveTextContent('Strategic cycle halted');
+    expect(signal).toHaveTextContent('No runner is attached to the active cycle.');
+    const viewTask = signal?.querySelector('button[title="View task"]') as HTMLButtonElement | null;
+    const dismiss = signal?.querySelector('button[title="Dismiss"]') as HTMLButtonElement | null;
+    expect(viewTask).not.toBeNull();
+    expect(dismiss).not.toBeNull();
+    act(() => { viewTask?.click(); dismiss?.click(); });
+    expect(openedTasks).toEqual(['task-1']);
+    expect(dismissed).toEqual(['alert-1']);
+
+    act(() => {
+      root?.render(
+        <ConversationUtilityBar
+          expanded={false}
+          onExpand={() => {}}
+          onCollapse={() => {}}
+          searchQuery=""
+          onSearchChange={() => {}}
+          detailRevealed
+          alerts={[alert]}
+        />,
+      );
+    });
+    expect(host.querySelector('[data-testid="conversation-utility-alert"]')).toBeNull();
+  });
+
+  test('prioritizes the strategic liveness alert over earlier concurrent alerts', () => {
+    const zoneAlert: Alert = {
+      id: 'zone-cooldown',
+      project_id: '',
+      severity: 'WARNING',
+      title: 'Zone Cooldown Active',
+      message: 'New tasks may be delayed.',
+      task_id: null,
+      created_at: '2026-08-16T00:00:00Z',
+      dismissed_at: null,
+      acknowledged_at: null,
+    };
+    const livenessAlert: Alert = {
+      id: 'strategic-liveness',
+      project_id: 'project-1',
+      severity: 'WARNING',
+      title: 'Strategic engine halted: no completed cycle in window',
+      message: 'The strategic loop may be halted.',
+      event_type: 'research.strategic_cycle_liveness',
+      task_id: null,
+      created_at: '2026-08-15T00:00:00Z',
+      dismissed_at: null,
+      acknowledged_at: null,
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => {
+      root?.render(
+        <ConversationUtilityBar
+          expanded={false}
+          onExpand={() => {}}
+          onCollapse={() => {}}
+          searchQuery=""
+          onSearchChange={() => {}}
+          detailRevealed={false}
+          alerts={[zoneAlert, livenessAlert]}
+        />,
+      );
+    });
+
+    const signal = host.querySelector('[data-testid="conversation-utility-alert"]');
+    expect(signal).toHaveTextContent('Strategic engine halted: no completed cycle in window');
+    expect(signal).not.toHaveTextContent('Zone Cooldown Active');
+  });
+
+  test('adds no alert chrome when no open alerts are supplied', () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => {
+      root?.render(
+        <ConversationUtilityBar
+          expanded={false}
+          onExpand={() => {}}
+          onCollapse={() => {}}
+          searchQuery=""
+          onSearchChange={() => {}}
+          alerts={[]}
+        />,
+      );
+    });
+    expect(host.querySelector('[data-testid="conversation-utility-alert"]')).toBeNull();
   });
 });
 

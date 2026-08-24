@@ -55,7 +55,7 @@ def _extract_test_ids(path: str, source: str) -> set[str]:
     if path.endswith(".py"):
         return extract_python_test_ids(source)
     if path.endswith((".ts", ".tsx")):
-        return extract_typescript_test_ids(source)
+        return extract_typescript_test_ids(source, REPO_ROOT / path)
     return set()
 
 
@@ -112,7 +112,7 @@ def _protected_test_count(path: str, source: str) -> int | None:
     if path.endswith(".py"):
         return count_python_test_ids(source)
     if path.endswith((".ts", ".tsx")):
-        return len(extract_typescript_test_ids(source))
+        return len(extract_typescript_test_ids(source, REPO_ROOT / path))
     return None
 
 
@@ -861,6 +861,40 @@ describe("outer suite", () => {
         "outer suite > inner 'suite' > row %s [case 1]",
         "outer suite > inner 'suite' > row %s [case 2]",
     }
+
+
+def test_typescript_identity_resolves_local_referenced_each_arrays():
+    """A statically declared table expands to the rows Vitest collects."""
+    source = """
+const CASES = [['first'], ['second'], ['third']];
+describe('suite', () => {
+  it.each(CASES)('case %s', () => {});
+});
+"""
+
+    assert extract_typescript_test_ids(source) == {
+        "suite > case %s [case 1]",
+        "suite > case %s [case 2]",
+        "suite > case %s [case 3]",
+    }
+
+
+def test_typescript_identity_counts_match_the_runtime_vitest_inventory():
+    """Protected TS counts agree with the committed Vitest runtime inventory."""
+    artifact = json.loads(
+        (REPO_ROOT / "agent" / ".test_durations.json").read_text(encoding="utf-8")
+    )
+    runtime_counts = {
+        entry["file"]: entry["tests"]
+        for entry in artifact["files"]
+        if entry["file"] in {
+            "src/handlers/index.test.ts",
+            "src/handlers/strategic-helpers.test.ts",
+        }
+    }
+    for relative, runtime_count in runtime_counts.items():
+        path = REPO_ROOT / "agent" / relative
+        assert len(extract_typescript_test_ids(path.read_text(encoding="utf-8"), path)) == runtime_count
 
 
 def test_completeness_checker_ignores_partial_and_reports_missing_and_extra(tmp_path):

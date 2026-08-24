@@ -193,7 +193,7 @@
     },
     {
       "path": "admin-ui/src/components/ConversationUtilityBar.test.tsx",
-      "reason": "Protects the compact, server-derived private Continuous Workday status line, its non-global wording, and operator-task priority order.",
+      "reason": "Protects the compact, server-derived private Continuous Workday status line, its non-global wording, operator-task priority order, and the visible clean-Chat operator alert signal.",
       "test_ids": [
         "buildConversationWorkdayStatus > shows Chat as Workday off without claiming other project autonomy stopped",
         "buildConversationWorkdayStatus > maps a live executing Resident to working and prioritizes friction over active work",
@@ -208,21 +208,24 @@
         "buildConversationWorkdayStatus > prioritizes operator judgment over friction and active work",
         "buildConversationWorkdayStatus > maps durable retry and dead states without inventing activity",
         "buildConversationWorkdayStatus > uses server availability when a Continuous session has no activity snapshot yet",
-        "ConversationUtilityBar Workday status > renders one bounded, server-derived status line with full detail in its title"
+        "ConversationUtilityBar Workday status > renders one bounded, server-derived status line with full detail in its title",
+        "ConversationUtilityBar operator alerts > surfaces_an_open_operator_alert_without_revealing_chat_detail",
+        "ConversationUtilityBar operator alerts > prioritizes the strategic liveness alert over earlier concurrent alerts"
       ],
-      "test_count": 24
+      "test_count": 27
     },
     {
       "path": "admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx",
-      "reason": "Protects the unobtrusive Workday status and bounded task detail at the supported narrow conversation viewport.",
+      "reason": "Protects the unobtrusive Workday status and bounded task detail, including the compact operator alert, at the supported narrow conversation viewport.",
       "test_ids": [
         "ConversationUtilityBar \u2014 viewport regression > collapsed search control does not overflow at 375px",
         "ConversationUtilityBar \u2014 viewport regression > expanded search input does not overflow at 375px",
         "ConversationUtilityBar \u2014 viewport regression > Workday status and bounded task detail do not overflow at 375px",
         "ConversationUtilityBar \u2014 viewport regression > expanded search plus Workday status does not overflow at 375px",
-        "ConversationUtilityBar \u2014 viewport regression > requested and paused Workday remains truthful without hover at 375px"
+        "ConversationUtilityBar \u2014 viewport regression > requested and paused Workday remains truthful without hover at 375px",
+        "ConversationUtilityBar \u2014 viewport regression > an actionable long operator alert remains contained at 375px"
       ],
-      "test_count": 7
+      "test_count": 8
     },
     {
       "path": "admin-ui/src/components/MessagesListView.viewport.test.tsx",
@@ -307,7 +310,7 @@
         "strategic dispatch smoke > routes context._resident_session=true to handleStrategicResident",
         "strategic dispatch smoke > routes plain strategic_review (no flags) to handleStrategic, not handleStrategicResident"
       ],
-      "test_count": 37
+      "test_count": 102
     },
     {
       "path": "agent/src/providers/resident-session.test.ts",
@@ -542,7 +545,7 @@
       "test_ids": [
         "writeStrategicHelpers > injects stable typed-consultation provenance across transport retries"
       ],
-      "test_count": 86
+      "test_count": 115
     },
     {
       "path": "agent/src/handlers/strategic-resident.test.ts",
@@ -702,9 +705,9 @@
       "path": "admin-ui/src/App.wiring.test.ts",
       "reason": "Protects the App-level chat Workday seam so the lifecycle control remains connected to the live session state, pinned runner selection, and start/stop handlers.",
       "test_ids": [
-        "keeps chat Workday lifecycle wired to live session state and runner controls"
+        "App workbench wiring > keeps chat Workday lifecycle wired to live session state and runner controls"
       ],
-      "test_count": 8
+      "test_count": 14
     },
     {
       "path": "admin-ui/src/components/StrategicContextRail.test.tsx",

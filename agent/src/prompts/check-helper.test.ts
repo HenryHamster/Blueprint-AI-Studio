@@ -192,7 +192,7 @@ describe('writeCheckHelper — direct invocation', () => {
     // ...and it is emitted at shell TOP LEVEL (column 0), not indented inside
     // `if touches backend/`. Its drift sentinels guard admin-ui/, agent/ and
     // scripts/ surfaces a backend-gated lane can never see (promotion #17738).
-    expect(script).toMatch(/^if \[ "\$WITH_TESTS" = "1" \] && \[ "1" = "1" \]; then\n  run "backend pytest \(attributed\)"/m);
+    expect(script).toMatch(/^if \[ "\$WITH_TESTS" = "1" \] && \[ "1" = "1" \]; then\n\s{2}run "backend pytest \(attributed\)"/m);
     expect(script).not.toContain('BPYTEST_BASELINE_FAILED');
     expect(script).not.toContain('backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR');
     // Conflict-resolution verification shares this one attributed backend lane;
@@ -921,7 +921,7 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     // Every reference to the Blueprint-local writer is behind the readability
     // guard, and the fallback that runs without it writes the same receipt.
     const guardAt = script.indexOf('if [ -r scripts/verification_receipt.py ]; then');
-    const fallbackAt = script.indexOf('elif python3 -c ');
+    const fallbackAt = script.lastIndexOf('elif python3 -c ');
     const verdictAt = script.indexOf('if [ "$_verification_receipt_written" = "1" ]; then');
     expect(guardAt).toBeGreaterThan(-1);
     expect(fallbackAt).toBeGreaterThan(guardAt);
@@ -930,9 +930,9 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     // the readability guard, so its absence takes the `elif` fallback rather
     // than exiting non-zero.
     for (
-      let at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest');
+      let at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest --receipt');
       at !== -1;
-      at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest', at + 1)
+      at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest --receipt', at + 1)
     ) {
       expect(at).toBeGreaterThan(guardAt);
       expect(at).toBeLessThan(fallbackAt);
@@ -1390,7 +1390,9 @@ exit ${scenario.harnessExit}
     expect(result.log).toContain('ruff -m ruff check');
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
-    expect(result.receipt).toBeUndefined();
+    expect(result.receipt).toMatchObject({
+      lanes: { 'backend-pytest': { state: 'runtime_unavailable', blocking: true } },
+    });
     expect(result.capabilityReceipt).toBe(
       `backend_verification:runtime_unavailable:v1:${result.taskId}\n`,
     );
@@ -1419,7 +1421,9 @@ exit ${scenario.harnessExit}
     expect(result.log).toContain('ruff -m ruff check');
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
-    expect(result.receipt).toBeUndefined();
+    expect(result.receipt).toMatchObject({
+      lanes: { 'backend-pytest': { state: 'runtime_unavailable', blocking: true } },
+    });
     expect(result.capabilityReceipt).toBe(
       `backend_verification:runtime_unavailable:v1:${result.taskId}\n`,
     );
@@ -1434,10 +1438,10 @@ exit ${scenario.harnessExit}
     expect(result.status, result.stdout).not.toBe(0);
     if (result.receipt !== undefined) {
       const receipt = result.receipt as {
-        pytest: { exit_code: number };
-        lanes?: Record<string, { blocking?: boolean }>;
+        pytest?: { exit_code?: number };
+        lanes?: Record<string, { blocking?: boolean; state?: string }>;
       };
-      expect(receipt.pytest.exit_code).not.toBe(0);
+      if (receipt.pytest) expect(receipt.pytest.exit_code).not.toBe(0);
       expect(receipt.lanes?.['backend-pytest']?.blocking).toBe(true);
     }
     expect(result.stdout).toContain('FAIL');
@@ -1476,7 +1480,9 @@ exit ${scenario.harnessExit}
       expect(result.status, result.stdout).not.toBe(0);
       expect(result.stdout).toContain('route helper unavailable or invalid');
       expect(result.stdout).not.toContain('PostgreSQL runtime unavailable');
-      expect(result.receipt).toBeUndefined();
+      expect(result.receipt).toMatchObject({
+        lanes: { 'backend-pytest': { state: 'route_helper_unavailable', blocking: true } },
+      });
       expect(result.capabilityReceipt).toBeUndefined();
       expect(result.log).not.toContain('harness USE_TEST_POSTGRES=true');
     },
@@ -1538,7 +1544,9 @@ exit ${scenario.harnessExit}
     });
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
-    expect(result.receipt).toBeUndefined();
+    expect(result.receipt).toMatchObject({
+      lanes: { 'backend-pytest': { state: 'runtime_unavailable', blocking: true } },
+    });
   });
 });
 

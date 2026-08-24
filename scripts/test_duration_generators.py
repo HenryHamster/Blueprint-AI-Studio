@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,153 @@ def _write_test_file(root: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _write_store_duration_harness(root: Path) -> tuple[Path, Path]:
+    """Create a tiny backend runner that records the script's argv contract."""
+    runner = root / "mock-test-backend.sh"
+    runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "printf '%s\\n' \"$@\" >> \"$DURATION_ARGS_LOG\"\n"
+        "cd \"$DURATION_BACKEND_DIR\"\n"
+        "path=.test_durations\n"
+        "while [ \"$#\" -gt 0 ]; do\n"
+        "  if [ \"$1\" = --durations-path ]; then path=\"$2\"; shift 2; continue; fi\n"
+        "  shift\n"
+        "done\n"
+        "sleep \"${DURATION_RUNNER_DELAY:-0}\"\n"
+        "mkdir -p \"$(dirname \"$path\")\"\n"
+        "printf '{\\\"%s\\\": %s}\\n' \"${DURATION_RESULT_KEY:-testing/test_live.py::test_remeasured}\" \"${DURATION_RESULT_VALUE:-2.5}\" > \"$path\"\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o755)
+    log = root / "duration-runner-args.txt"
+    return runner, log
+
+
+def _run_store_duration_script(
+    root: Path, runner: Path, log: Path, *targets: str, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "DURATION_BACKEND_DIR": str(root),
+            "DURATION_TEST_BACKEND_SCRIPT": str(runner),
+            "DURATION_ARGS_LOG": str(log),
+        }
+    )
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", str(Path(__file__).with_name("store-backend-durations.sh")), *targets],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_store_backend_durations_targeted_refresh_forwards_targets_and_merges(
+    tmp_path: Path,
+) -> None:
+    """Explicit selectors write a partial file and merge into the old artifact."""
+    _write_test_file(tmp_path)
+    output = tmp_path / ".test_durations"
+    _write_json(output, {"testing/test_live.py::test_untouched": 1.25})
+    runner, log = _write_store_duration_harness(tmp_path)
+
+    result = _run_store_duration_script(
+        tmp_path, runner, log, "testing/test_live.py::test_remeasured"
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    args = log.read_text(encoding="utf-8").splitlines()
+    assert args[:3] == [
+        "testing/test_live.py::test_remeasured",
+        "--store-durations",
+        "--durations-path",
+    ]
+    assert len(args) == 4
+    assert re.fullmatch(r"\.duration_refresh\.[A-Za-z0-9]+/target/durations\.json", args[3])
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "testing/test_live.py::test_remeasured": 2.5,
+        "testing/test_live.py::test_untouched": 1.25,
+    }
+    assert not list(tmp_path.glob(".duration_refresh.??????"))
+
+
+def test_store_backend_durations_targeted_refreshes_are_isolated_and_serialized(
+    tmp_path: Path,
+) -> None:
+    """Concurrent targeted runs preserve both results and a pre-existing directory."""
+    _write_test_file(tmp_path)
+    output = tmp_path / ".test_durations"
+    _write_json(output, {"testing/test_live.py::test_untouched": 1.25})
+    preserved = tmp_path / ".duration_refresh"
+    preserved.mkdir()
+    marker = preserved / "keep"
+    marker.write_text("do not remove", encoding="utf-8")
+    runner, log = _write_store_duration_harness(tmp_path)
+
+    command = [
+        "bash",
+        str(Path(__file__).with_name("store-backend-durations.sh")),
+        "testing/test_live.py",
+    ]
+    base_env = os.environ.copy()
+    base_env.update(
+        {
+            "DURATION_BACKEND_DIR": str(tmp_path),
+            "DURATION_TEST_BACKEND_SCRIPT": str(runner),
+            "DURATION_ARGS_LOG": str(log),
+            "DURATION_RUNNER_DELAY": "0.2",
+        }
+    )
+    first_env = base_env | {"DURATION_RESULT_KEY": "testing/test_live.py::test_new"}
+    second_env = base_env | {"DURATION_RESULT_KEY": "testing/test_live.py::test_post_gap"}
+    first = subprocess.Popen(command, cwd=tmp_path, env=first_env, text=True)
+    time.sleep(0.05)
+    second = subprocess.Popen(command, cwd=tmp_path, env=second_env, text=True)
+
+    assert first.wait(timeout=20) == 0
+    assert second.wait(timeout=20) == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "testing/test_live.py::test_new": 2.5,
+        "testing/test_live.py::test_post_gap": 2.5,
+        "testing/test_live.py::test_untouched": 1.25,
+    }
+    assert marker.read_text(encoding="utf-8") == "do not remove"
+    paths = [
+        value
+        for value in log.read_text(encoding="utf-8").splitlines()
+        if value.startswith(".duration_refresh.")
+    ]
+    assert len(paths) == 2
+    assert len(set(paths)) == 2
+    assert not list(tmp_path.glob(".duration_refresh.??????"))
+
+
+def test_store_backend_durations_zero_arguments_preserve_full_refresh(
+    tmp_path: Path,
+) -> None:
+    """No selectors retain the full testing/ invocation and direct artifact write."""
+    _write_test_file(tmp_path)
+    output = tmp_path / ".test_durations"
+    _write_json(output, {"testing/test_live.py::test_untouched": 1.25})
+    runner, log = _write_store_duration_harness(tmp_path)
+
+    result = _run_store_duration_script(tmp_path, runner, log)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "testing/",
+        "--store-durations",
+    ]
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "testing/test_live.py::test_remeasured": 2.5,
+    }
 
 
 def _load_regenerate_module():

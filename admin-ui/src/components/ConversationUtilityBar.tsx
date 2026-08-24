@@ -5,10 +5,15 @@ import {
 } from '../utils/conversationWorkdayStatus';
 import type { StrategicChatLiveState } from '../utils/strategicSessionLive';
 import { timeAgo } from '../utils/time';
+import { AlertsBanner } from './AlertsBanner';
+import type { Alert } from '../types/alert';
+
+const STRATEGIC_CYCLE_LIVENESS_EVENT_TYPE = 'research.strategic_cycle_liveness';
 
 /**
  * Compact, collapsible search bar shown above the strategist conversation.
- * Attention and operational alerts intentionally stay out of the Chat surface.
+ * Search, awareness, and a bounded operator alert signal shown above the
+ * strategist conversation.
  */
 export function ConversationUtilityBar({
   expanded,
@@ -21,6 +26,11 @@ export function ConversationUtilityBar({
   interactionMode,
   detailRevealed,
   onToggleDetail,
+  alerts,
+  onDismissAlert,
+  onViewAlertTask,
+  projectId,
+  canOperateProject = false,
 }: {
   expanded: boolean;
   onExpand: () => void;
@@ -34,6 +44,12 @@ export function ConversationUtilityBar({
   interactionMode?: string | null;
   detailRevealed?: boolean;
   onToggleDetail?: (value: boolean) => void;
+  /** Existing open alerts; Chat prioritizes the liveness signal until Details is opened. */
+  alerts?: Alert[];
+  onDismissAlert?: (id: string) => void;
+  onViewAlertTask?: (taskId: string) => void;
+  projectId?: string;
+  canOperateProject?: boolean;
 }) {
   // The chat reply chip and the Workday readout share one slot. In Workday
   // mode `computeStrategicChatLiveState` is non-null for exactly the lifecycles
@@ -53,6 +69,14 @@ export function ConversationUtilityBar({
     : null;
   const chatIsActive = chatChip?.phase === 'streaming' || chatChip?.phase === 'working';
   const chatNeedsAttention = chatChip?.phase === 'stuck' || chatChip?.phase === 'stale';
+  // Details owns the full multi-alert triage banner. The clean Chat surface
+  // keeps one actionable signal visible, without a second alert lifecycle.
+  // The liveness alert is the engine-halt signal this surface exists to expose,
+  // so zone-health and newer persisted alerts must not mask it.
+  const compactAlert = detailRevealed ? null : (
+    alerts?.find(alert => alert.event_type === STRATEGIC_CYCLE_LIVENESS_EVENT_TYPE)
+    ?? alerts?.[0]
+  );
   return (
     <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4">
       <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-wrap items-center gap-2">
@@ -201,6 +225,21 @@ export function ConversationUtilityBar({
           </div>
         )}
       </div>
+      {compactAlert && (
+        <div
+          className="mx-auto mt-1.5 w-full max-w-[940px] min-w-0"
+          data-testid="conversation-utility-alert"
+        >
+          <AlertsBanner
+            alerts={[compactAlert]}
+            onDismiss={onDismissAlert ?? (() => {})}
+            onViewTask={onViewAlertTask}
+            projectId={projectId}
+            canMutate={canOperateProject}
+            compact
+          />
+        </div>
+      )}
     </div>
   );
 }

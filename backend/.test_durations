@@ -17298,7 +17298,6 @@
   "testing/test_vitest_durations_freshness.py::test_adminui_artifact_nonempty_files": 0.027247883030213416,
   "testing/test_vitest_durations_freshness.py::test_adminui_artifact_real_durations": 0.0007718490669503808,
   "testing/test_vitest_durations_freshness.py::test_adminui_artifact_sorted_descending": 0.0007639899849891663,
-  "testing/test_vitest_durations_freshness.py::test_adminui_inventory_excludes_viewport_files": 0.02441817498765886,
   "testing/test_vitest_durations_freshness.py::test_agent_artifact_exists": 0.0006696089403703809,
   "testing/test_vitest_durations_freshness.py::test_agent_artifact_file_schema": 0.0007600490935146809,
   "testing/test_vitest_durations_freshness.py::test_agent_artifact_is_valid_json": 0.0007166999857872725,

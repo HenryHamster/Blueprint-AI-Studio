@@ -5,14 +5,22 @@ with the current test collection so CI shard time-balancing can't silently rot.
 Runs under --noconftest (no DB, no conftest fixtures).
 """
 import ast
+import atexit
 import json
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from testing.fixgate_attribution import format_offender_marker
 from testing.estate_inventory import iter_backend_test_files
-from testing.identity_extraction import extract_python_test_ids_from_file
+from testing.identity_extraction import (
+    extract_python_test_ids,
+    extract_python_test_ids_from_file,
+)
 
 BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
@@ -23,6 +31,257 @@ KEY_PATTERN = re.compile(r"^testing/test_[^/]+\.py::.+$")
 # which is unavailable on agent VMs. The structural and quality checks below
 # remain blocking.
 MIN_COVERAGE_FRACTION = 0.60
+_BASELINE_UNLOADED = object()
+_baseline_cache: object = _BASELINE_UNLOADED
+_baseline_clone_roots: set[Path] = set()
+
+
+def _cleanup_baseline_clones() -> None:
+    for clone_root in _baseline_clone_roots:
+        shutil.rmtree(clone_root, ignore_errors=True)
+
+
+atexit.register(_cleanup_baseline_clones)
+
+
+@dataclass(frozen=True)
+class _DurationBaseline:
+    """The immutable roster and artifact needed for candidate attribution."""
+
+    ref: str
+    test_files: frozenset[str]
+    durations: dict[str, float]
+    stale_entries: frozenset[str]
+    repo_root: Path | None = None
+    git_ref: str | None = None
+
+
+def _workspace_root() -> Path | None:
+    """Find the checkout root for both a normal and a Docker-only layout."""
+    candidates = (BACKEND_ROOT.parent, Path("/repo"))
+    for candidate in candidates:
+        if (candidate / "backend" / "testing").is_dir():
+            return candidate
+    return None
+
+
+def _current_test_files() -> dict[str, Path]:
+    """Return the current collector roster keyed by suite-relative path."""
+    local_testing = BACKEND_ROOT / "testing"
+    if local_testing.is_dir():
+        paths = tuple(sorted(local_testing.glob("test_*.py")))
+    else:
+        workspace_root = _workspace_root()
+        # A backend-only image has /app/testing but no /app/backend.  This
+        # fallback keeps the guard useful even when /repo is not mounted.
+        paths = (
+            iter_backend_test_files(workspace_root)
+            if workspace_root is not None
+            else ()
+        )
+    return {
+        path.relative_to(BACKEND_ROOT).as_posix(): path
+        for path in paths
+    }
+
+
+def _git_output(repo_root: Path, *args: str) -> str | None:
+    """Read one immutable git-tree object without allowing git errors through."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _resolve_baseline_ref(repo_root: Path) -> str | None:
+    """Prefer the fetched automain ref, then a local automain branch."""
+    for ref in ("origin/automain", "automain"):
+        if _git_output(repo_root, "rev-parse", "--verify", f"{ref}^{{commit}}"):
+            return ref
+    return None
+
+
+def _clone_origin_config(repo_root: Path) -> list[str]:
+    """Preserve checkout-local HTTP auth when cloning into a writable tempdir."""
+    output = _git_output(repo_root, "config", "--get-regexp", r"^http\..*\.extraheader$")
+    if output is None:
+        return []
+    args: list[str] = []
+    for line in output.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator and key and value:
+            args.extend(("-c", f"{key}={value}"))
+    return args
+
+
+def _clone_baseline(repo_root: Path) -> tuple[Path, str] | None:
+    """Fetch automain into a private writable clone when checkout is shallow.
+
+    GitHub Actions' default PR checkout has only the candidate merge object and
+    is mounted read-only at /repo inside the backend test container.  Clone the
+    immutable automain tip into /tmp rather than depending on an incidental
+    remote-tracking ref or attempting to mutate that checkout.
+    """
+    origin = _git_output(repo_root, "remote", "get-url", "origin")
+    if origin is None or not origin.strip():
+        return None
+    clone_root = Path(tempfile.mkdtemp(prefix="duration-baseline-"))
+    try:
+        result = subprocess.run(
+            [
+                "git", *_clone_origin_config(repo_root), "clone", "--quiet",
+                "--no-checkout", "--depth=1", "--filter=blob:none",
+                "--branch=automain", origin.strip(), str(clone_root),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        result = None
+    ref = (
+        _git_output(clone_root, "rev-parse", "--verify", "HEAD^{commit}")
+        if result is not None and result.returncode == 0
+        else None
+    )
+    if ref is None or not ref.strip():
+        shutil.rmtree(clone_root, ignore_errors=True)
+        return None
+    _baseline_clone_roots.add(clone_root)
+    return clone_root, ref.strip()
+
+
+def _git_test_files(repo_root: Path, ref: str) -> set[str] | None:
+    listing = _git_output(repo_root, "ls-tree", "-r", "--name-only", ref, "backend/testing")
+    if listing is None:
+        return None
+    return {
+        path.removeprefix("backend/")
+        for path in listing.splitlines()
+        if re.fullmatch(r"backend/testing/test_[^/]+\.py", path)
+    }
+
+
+def _git_json(repo_root: Path, ref: str, path: str) -> dict | None:
+    raw = _git_output(repo_root, "show", f"{ref}:{path}")
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _git_test_ids(
+    repo_root: Path, ref: str, paths: set[str]
+) -> dict[str, set[str]] | None:
+    """Read only candidate-stale modules from the immutable git tree."""
+    ids_by_file: dict[str, set[str]] = {}
+    for file_key in paths:
+        source = _git_output(repo_root, "show", f"{ref}:backend/{file_key}")
+        if source is None:
+            return None
+        try:
+            ids_by_file[file_key] = extract_python_test_ids(source)
+        except (SyntaxError, ValueError):
+            return None
+    return ids_by_file
+
+
+def _stale_entries(
+    durations: dict, test_files: set[str], ids_by_file: dict[str, set[str]]
+) -> set[str]:
+    stale = set()
+    for key in durations:
+        file_key, separator, raw_node_id = key.partition("::")
+        if not separator or file_key not in test_files:
+            continue
+        if raw_node_id.split("[", 1)[0] not in ids_by_file.get(file_key, set()):
+            stale.add(key)
+    return stale
+
+
+def _load_duration_baseline() -> _DurationBaseline | None:
+    """Load an immutable automain snapshot, or None for fail-closed fallback."""
+    global _baseline_cache
+    if _baseline_cache is not _BASELINE_UNLOADED:
+        return _baseline_cache  # type: ignore[return-value]
+
+    repo_root = _workspace_root()
+    if repo_root is None:
+        baseline = None
+    else:
+        ref = _resolve_baseline_ref(repo_root)
+        baseline_root = repo_root
+        baseline_label = ref
+        if ref is None:
+            cloned = _clone_baseline(repo_root)
+            if cloned is None:
+                baseline = None
+            else:
+                baseline_root, sha = cloned
+                ref = sha
+                baseline_label = f"automain@{sha}"
+        if ref is not None:
+            test_files = _git_test_files(baseline_root, ref)
+            durations = _git_json(baseline_root, ref, "backend/.test_durations")
+            if test_files is None or durations is None:
+                baseline = None
+            else:
+                baseline = _DurationBaseline(
+                    ref=baseline_label or ref,
+                    test_files=frozenset(test_files),
+                    durations=durations,
+                    # Loaded lazily only if the candidate has stale entries;
+                    # coverage checks should not parse a 37MB test tree.
+                    stale_entries=frozenset(),
+                    repo_root=baseline_root,
+                    git_ref=ref,
+                )
+    _baseline_cache = baseline
+    return baseline
+
+
+def _warn_inherited(kind: str, entries: set[str], ref: str) -> None:
+    if entries:
+        warnings.warn(
+            f"backend/.test_durations has {len(entries)} inherited {kind} "
+            f"entry(ies) from {ref}; they are not attributed to this candidate. "
+            f"First entries: {sorted(entries)[:10]}",
+            stacklevel=2,
+        )
+
+
+def _baseline_stale_entries(
+    baseline: _DurationBaseline, candidate_stale: set[str]
+) -> set[str]:
+    """Resolve only baseline files relevant to candidate stale entries."""
+    if baseline.stale_entries:
+        return set(baseline.stale_entries)
+    file_keys = {
+        key.split("::", 1)[0]
+        for key in candidate_stale
+        if key.split("::", 1)[0] in baseline.test_files
+    }
+    if not file_keys:
+        return set()
+    repo_root = baseline.repo_root or _workspace_root()
+    if repo_root is None:
+        return set()
+    ids_by_file = _git_test_ids(repo_root, baseline.git_ref or baseline.ref, file_keys)
+    if ids_by_file is None:
+        return set()
+    return _stale_entries(baseline.durations, file_keys, ids_by_file)
 
 
 def _load_durations() -> dict:
@@ -120,30 +379,49 @@ def test_durations_values_have_variance() -> None:
 
 def test_durations_coverage_fraction_within_threshold() -> None:
     """
-    At least MIN_COVERAGE_FRACTION of current test_*.py files must appear in the
-    durations map. Failing here means the baseline was generated against a stale
-    collection (missing whole test modules) and CI shards will silently fall back
-    to count-based splitting.
+    Attribute missing modules to this candidate when an automain tree is usable.
+
+    The committed artifact currently has inherited gaps from automain. Those
+    gaps are reported loudly, but only a newly uncovered current module blocks.
+    Without an immutable baseline, retain the absolute fail-closed threshold.
     """
     data = _load_durations()
     files_in_durations = {k.split("::")[0] for k in data}
 
-    all_test_files = {
-        path.relative_to(BACKEND_ROOT).as_posix()
-        for path in iter_backend_test_files(BACKEND_ROOT.parent)
-    }
+    current_files = _current_test_files()
+    all_test_files = set(current_files)
 
     if not all_test_files:
         return  # Nothing to check (shouldn't happen in a real repo)
 
     covered = files_in_durations & all_test_files
-    fraction = len(covered) / len(all_test_files)
-
     uncovered = sorted(all_test_files - files_in_durations)
+    baseline = _load_duration_baseline()
+    if baseline is not None:
+        baseline_covered = {
+            key.split("::")[0] for key in baseline.durations
+        } & baseline.test_files
+        inherited_missing = (
+            set(uncovered)
+            & (set(baseline.test_files) - baseline_covered)
+        )
+        new_missing = set(uncovered) - (set(baseline.test_files) - baseline_covered)
+        _warn_inherited("missing coverage", inherited_missing, baseline.ref)
+        assert not new_missing, (
+            f"backend/.test_durations introduced {len(new_missing)} uncovered "
+            f"test file(s) relative to {baseline.ref}. "
+            f"Newly uncovered files: {sorted(new_missing)[:10]}"
+            + "\n"
+            + format_offender_marker(sorted(new_missing))
+        )
+        return
+
+    fraction = len(covered) / len(all_test_files)
     assert fraction >= MIN_COVERAGE_FRACTION, (
         f"backend/.test_durations covers only {fraction:.1%} of test files "
         f"({len(covered)}/{len(all_test_files)}), below the {MIN_COVERAGE_FRACTION:.0%} threshold. "
-        f"Regenerate via scripts/store-backend-durations.sh. "
+        f"No usable origin/automain or automain baseline was available; this "
+        f"absolute check is fail-closed. Regenerate via scripts/store-backend-durations.sh. "
         f"Uncovered files ({len(uncovered)}): {uncovered[:10]}"
         + "\n"
         + format_offender_marker(uncovered)
@@ -365,29 +643,33 @@ def test_durations_no_stale_entries() -> None:
     """
     data = _load_durations()
 
-    # Cache file → set of valid test IDs (parsed once per file)
-    _valid_cache: dict = {}
+    current_files = _current_test_files()
+    duration_files = {
+        key.split("::", 1)[0] for key in data if "::" in key
+    }
+    ids_by_file = {
+        file_key: _extract_valid_test_ids(path)
+        for file_key, path in current_files.items()
+        if file_key in duration_files
+    }
+    stale = _stale_entries(data, set(current_files), ids_by_file)
 
-    stale: list = []
-    for key in data:
-        parts = key.split("::", 1)
-        if len(parts) != 2:
-            continue
-        file_key, raw_node_id = parts
-
-        abs_path = BACKEND_ROOT / file_key
-        if not abs_path.exists():
-            # Coverage-fraction test handles missing files; skip here.
-            continue
-
-        if file_key not in _valid_cache:
-            _valid_cache[file_key] = _extract_valid_test_ids(abs_path)
-
-        # Strip parametrize suffix before lookup
-        base_node_id = raw_node_id.split("[")[0]
-
-        if base_node_id not in _valid_cache[file_key]:
-            stale.append(key)
+    baseline = _load_duration_baseline()
+    if baseline is not None:
+        baseline_stale = _baseline_stale_entries(baseline, stale)
+        inherited_stale = stale & baseline_stale
+        new_stale = stale - baseline_stale
+        _warn_inherited("stale artifact", inherited_stale, baseline.ref)
+        assert not new_stale, (
+            f"backend/.test_durations introduced {len(new_stale)} stale "
+            f"entry(ies) relative to {baseline.ref}. These phantom entries "
+            f"inflate CI shard-balancing estimates.\n"
+            f"New stale entries: {sorted(new_stale)[:10]}\n"
+            f"Fix: remove them or regenerate via scripts/store-backend-durations.sh."
+            + "\n"
+            + format_offender_marker(sorted(new_stale))
+        )
+        return
 
     assert not stale, (
         f"backend/.test_durations contains {len(stale)} stale entry(ies) for "
@@ -395,7 +677,7 @@ def test_durations_no_stale_entries() -> None:
         f"inflate CI shard-balancing estimates for tests that were moved or "
         f"removed.\n"
         f"Stale entries ({min(len(stale), 10)} of {len(stale)} shown): "
-        f"{stale[:10]}\n"
+        f"{sorted(stale)[:10]}\n"
         f"Fix: remove these entries from backend/.test_durations, or regenerate "
         f"via scripts/store-backend-durations.sh." + "\n" + format_offender_marker(str(offender) for offender in stale)
     )
@@ -404,6 +686,210 @@ def test_durations_no_stale_entries() -> None:
 # ---------------------------------------------------------------------------
 # Unit tests for _extract_valid_test_ids
 # ---------------------------------------------------------------------------
+
+
+def test_duration_baseline_reads_real_git_tree() -> None:
+    """The preferred automain ref supplies an immutable roster and artifact."""
+    baseline = _load_duration_baseline()
+    if baseline is None:
+        import pytest
+
+        pytest.skip("origin/automain or local automain baseline is unavailable")
+    assert baseline.ref == "origin/automain"
+    assert "testing/test_test_durations_freshness.py" in baseline.test_files
+    assert baseline.durations
+
+
+def _run_git(repo_root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def test_duration_baseline_fetches_automain_from_depth_one_checkout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A shallow candidate checkout still attributes against automain's SHA."""
+    source = tmp_path / "source"
+    origin = tmp_path / "origin.git"
+    shallow = tmp_path / "shallow"
+    source.mkdir()
+    _run_git(source, "init", "-q", "-b", "automain")
+    _run_git(source, "config", "user.email", "duration-test@example.test")
+    _run_git(source, "config", "user.name", "Duration Test")
+    base_test = source / "backend" / "testing" / "test_base.py"
+    base_test.parent.mkdir(parents=True)
+    base_test.write_text("def test_base(): pass\n", encoding="utf-8")
+    (source / "backend" / ".test_durations").write_text(
+        '{"testing/test_base.py::test_base": 1.0, '
+        '"testing/test_base.py::test_removed": 1.1}\n',
+        encoding="utf-8",
+    )
+    _run_git(source, "add", ".")
+    _run_git(source, "commit", "-qm", "base durations")
+    automain_sha = _run_git(source, "rev-parse", "HEAD")
+    _run_git(source, "checkout", "-qb", "candidate")
+    (source / "backend" / "testing" / "test_candidate.py").write_text(
+        "def test_candidate(): pass\n", encoding="utf-8"
+    )
+    _run_git(source, "add", ".")
+    _run_git(source, "commit", "-qm", "candidate")
+    _run_git(tmp_path, "init", "--bare", "-q", str(origin))
+    _run_git(source, "remote", "add", "origin", str(origin))
+    _run_git(source, "push", "-q", "origin", "automain", "candidate")
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--depth=1",
+            "--branch=candidate",
+            f"file://{origin}",
+            str(shallow),
+        ],
+        check=True,
+    )
+
+    module = sys.modules[__name__]
+    assert _resolve_baseline_ref(shallow) is None
+    monkeypatch.setattr(module, "_workspace_root", lambda: shallow)
+    monkeypatch.setattr(module, "_baseline_cache", _BASELINE_UNLOADED)
+
+    baseline = _load_duration_baseline()
+
+    assert baseline is not None
+    assert baseline.ref == f"automain@{automain_sha}"
+    assert baseline.test_files == frozenset({"testing/test_base.py"})
+    assert baseline.durations == {
+        "testing/test_base.py::test_base": 1.0,
+        "testing/test_base.py::test_removed": 1.1,
+    }
+    assert baseline.repo_root is not None
+    assert _baseline_stale_entries(
+        baseline, {"testing/test_base.py::test_removed"}
+    ) == {"testing/test_base.py::test_removed"}
+    shutil.rmtree(baseline.repo_root, ignore_errors=True)
+    _baseline_clone_roots.discard(baseline.repo_root)
+
+
+def test_coverage_guard_rejects_new_backend_inventory_entry(monkeypatch) -> None:
+    """A candidate-added unmeasured module is not hidden by inherited debt."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(
+        module,
+        "_current_test_files",
+        lambda: {
+            "testing/test_existing.py": Path("/tmp/test_existing.py"),
+            "testing/test_new.py": Path("/tmp/test_new.py"),
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_durations",
+        lambda: {"testing/test_existing.py::test_old": 1.0},
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_duration_baseline",
+        lambda: _DurationBaseline(
+            ref="origin/automain",
+            test_files=frozenset({"testing/test_existing.py"}),
+            durations={"testing/test_existing.py::test_old": 1.0},
+            stale_entries=frozenset(),
+        ),
+    )
+
+    import pytest
+
+    with pytest.raises(AssertionError, match="introduced 1 uncovered"):
+        test_durations_coverage_fraction_within_threshold()
+
+
+def test_coverage_guard_suppresses_inherited_missing_module(monkeypatch) -> None:
+    """A missing module already absent on automain warns but does not fail."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(
+        module,
+        "_current_test_files",
+        lambda: {"testing/test_inherited.py": Path("/tmp/test_inherited.py")},
+    )
+    monkeypatch.setattr(module, "_load_durations", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "_load_duration_baseline",
+        lambda: _DurationBaseline(
+            ref="origin/automain",
+            test_files=frozenset({"testing/test_inherited.py"}),
+            durations={},
+            stale_entries=frozenset(),
+        ),
+    )
+
+    import pytest
+
+    with pytest.warns(UserWarning, match="inherited missing coverage"):
+        test_durations_coverage_fraction_within_threshold()
+
+
+def test_stale_guard_rejects_new_stale_entry(tmp_path: Path, monkeypatch) -> None:
+    """A stale node newly introduced by the candidate remains blocking."""
+    module = sys.modules[__name__]
+    path = tmp_path / "test_current.py"
+    path.write_text("def test_current(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "_current_test_files",
+        lambda: {"testing/test_current.py": path},
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_durations",
+        lambda: {"testing/test_current.py::test_removed": 1.0},
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_duration_baseline",
+        lambda: _DurationBaseline(
+            ref="origin/automain",
+            test_files=frozenset({"testing/test_current.py"}),
+            durations={},
+            stale_entries=frozenset(),
+        ),
+    )
+
+    import pytest
+
+    with pytest.raises(AssertionError, match="introduced 1 stale"):
+        test_durations_no_stale_entries()
+
+
+def test_coverage_guard_falls_back_when_baseline_is_unavailable(monkeypatch) -> None:
+    """No baseline means the old absolute coverage check remains fail-closed."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(
+        module,
+        "_current_test_files",
+        lambda: {
+            f"testing/test_{index}.py": Path(f"/tmp/test_{index}.py")
+            for index in range(10)
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_durations",
+        lambda: {"testing/test_0.py::test_one": 1.0},
+    )
+    monkeypatch.setattr(module, "_load_duration_baseline", lambda: None)
+
+    import pytest
+
+    with pytest.raises(AssertionError, match="No usable .* baseline"):
+        test_durations_coverage_fraction_within_threshold()
 
 
 def _write_tmp_py(content: str) -> Path:

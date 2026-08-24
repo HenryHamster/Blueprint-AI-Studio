@@ -657,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"[static guard] FAIL — {', '.join(failures)}",
                     file=sys.stderr,
                 )
-                return 1
+                return finish()
             print("[static guard] PASS (size-only)")
             return 0
 

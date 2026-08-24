@@ -3032,6 +3032,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
           chatLiveState={strategicChatLiveState}
           interactionMode={strategicInteractionMode}
           detailRevealed={chatDetailRevealed} onToggleDetail={persistChatDetailRevealed}
+          alerts={alerts}
+          onDismissAlert={onDismissAlert}
+          onViewAlertTask={onViewAlertTask}
+          projectId={selectedProjectId ?? undefined}
+          canOperateProject={canOperateProject}
         />
       )}
 

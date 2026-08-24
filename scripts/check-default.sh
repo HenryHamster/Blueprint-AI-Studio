@@ -337,6 +337,28 @@ if touches "backend/"; then
   fi
   if [ -n "$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do case "$f" in backend/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]; then
     # required backend-authoring verification. No skip can mint this receipt.
+    _VERIFICATION_DIR='backend'
+    _VERIFICATION_HARNESS='scripts/test-backend.sh'
+    _record_backend_abort() {
+      local state="$1" reason="$2"
+      if [ -r scripts/verification_receipt.py ]; then
+        python3 scripts/verification_receipt.py backend-pytest-diagnosis \
+          --receipt "$_VERIFY_RECEIPT" --task-id "$_VERIFY_TASK_ID" \
+          --directory "$_VERIFICATION_DIR" --state "$state" --reason "$reason" \
+          --current-exit-code 1 >/dev/null 2>&1 || true
+      elif python3 -c 'import json,sys; out,task,directory,state,reason,code=sys.argv[1:];
+try:
+    payload=json.load(open(out,encoding="utf-8"))
+except (OSError,ValueError):
+    payload={}
+lanes=payload.get("lanes") if isinstance(payload.get("lanes"),dict) else {}
+lanes["backend-pytest"]={"lane":"backend-pytest","state":state,"blocking":True,"current_exit_code":int(code),"error":reason,"new_failures":{},"suppressed_failures":{},"disappeared_failures":{},"skipped_failures":{}}
+payload["version"]=1; payload["lanes"]=lanes
+open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\\n")' \
+          "$_VERIFY_RECEIPT" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$state" "$reason" 1; then
+        :
+      fi
+    }
     _VERIFICATION_ROUTE_HELPER_OK=0
     unset -f select_backend_test_route 2>/dev/null || true
     if [ -r scripts/backend-test-route.sh ] \
@@ -346,10 +368,9 @@ if touches "backend/"; then
       _VERIFICATION_ROUTE_HELPER_OK=1
     else
       echo "[check] required backend verification FAILED — route helper unavailable or invalid"
+      _record_backend_abort route_helper_unavailable "route helper unavailable or invalid"
       FAILED+=("backend verification route helper")
     fi
-    _VERIFICATION_DIR='backend'
-    _VERIFICATION_HARNESS='scripts/test-backend.sh'
     _VERIFICATION_CHANGED=$(mktemp /tmp/check_verification_changed.XXXXXX)
     : >"$_VERIFICATION_CHANGED"
     printf '%s\n' "$CHANGED" | grep -E '^backend/.*\.py$' | while IFS= read -r f; do
@@ -358,6 +379,7 @@ if touches "backend/"; then
     _VERIFICATION_RUFF_OK=0
     if [ ! -s "$_VERIFICATION_CHANGED" ]; then
       echo "[check] required backend verification FAILED — no changed Python file in $_VERIFICATION_DIR"
+      _record_backend_abort target_unavailable "no changed Python file in $_VERIFICATION_DIR"
       FAILED+=("$_VERIFICATION_DIR verification: no Python target")
     else
       echo "[check] $_VERIFICATION_DIR required ruff..."
@@ -366,6 +388,7 @@ if touches "backend/"; then
         _VERIFICATION_RUFF_OK=1
       else
         echo "[check] $_VERIFICATION_DIR required ruff FAILED"
+        _record_backend_abort lint_failure "required ruff failed"
         FAILED+=("$_VERIFICATION_DIR required ruff")
       fi
     fi
@@ -405,6 +428,7 @@ if touches "backend/"; then
       if [ "$_verification_resolver_rc" -ne 0 ]; then
         echo "[check] required backend verification resolver FAILED (exit $_verification_resolver_rc)" >&2
         cat "$_verification_stderr" >&2
+        _record_backend_abort resolver_failure "backend verification resolver failed (exit $_verification_resolver_rc)"
         FAILED+=("$_VERIFICATION_DIR verification resolver")
       fi
       _VERIFICATION_ORDINARY_SELECTORS=$(
@@ -432,12 +456,14 @@ if touches "backend/"; then
     fi
     if [ "$_VERIFICATION_RUFF_OK" = "1" ] && [ -z "$_VERIFICATION_SELECTORS" ]; then
       echo "[check] required backend verification FAILED — no impacted pytest file/node was resolved"
+      _record_backend_abort selector_unavailable "no impacted pytest file/node was resolved"
       FAILED+=("$_VERIFICATION_DIR verification: no impacted pytest")
     elif [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
       _verification_ordinary_count=$(printf '%s\n' "$_VERIFICATION_ORDINARY_SELECTORS" | grep -c . || true)
       _verification_mandatory_count=$(printf '%s\n' "$_VERIFICATION_MANDATORY_SELECTORS" | grep -c . || true)
       if [ "$_verification_ordinary_count" -gt 8 ]; then
         echo "[check] required backend verification FAILED — resolver exceeded ordinary selector cap: $_verification_ordinary_count"
+        _record_backend_abort selector_cap_exceeded "resolver exceeded ordinary selector cap: $_verification_ordinary_count"
         FAILED+=("$_VERIFICATION_DIR verification: ordinary selector cap")
       fi
       if [ "$_verification_mandatory_count" -gt 0 ]; then
@@ -453,12 +479,14 @@ if touches "backend/"; then
       _verification_postgres_flag=""
       if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
         echo "[check] required backend verification FAILED — sanctioned harness missing: $_VERIFICATION_HARNESS"
+        _record_backend_abort harness_unavailable "sanctioned harness missing: $_VERIFICATION_HARNESS"
         FAILED+=("$_VERIFICATION_DIR verification: harness missing")
       elif [ "$_VERIFICATION_ROUTE_HELPER_OK" = "1" ]; then
         if _verification_postgres_flag="$(select_backend_test_route)"; then
           :
         else
           echo "[check] required backend verification state=runtime_unavailable — PostgreSQL runtime unavailable"
+          _record_backend_abort runtime_unavailable "PostgreSQL runtime unavailable"
           _verification_capability_tmp="${_VERIFY_CAPABILITY_RECEIPT}.$$"
           if ( umask 077; printf 'backend_verification:runtime_unavailable:v1:%s\n' \
             "$_VERIFY_TASK_ID" >"$_verification_capability_tmp" ) \
@@ -467,6 +495,7 @@ if touches "backend/"; then
           else
             echo "[check] unable to record backend verification capability receipt" >&2
             rm -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"
+            _record_backend_abort capability_receipt_failure "unable to record backend verification capability receipt"
             FAILED+=("$_VERIFICATION_DIR verification: capability receipt")
           fi
           FAILED+=("$_VERIFICATION_DIR verification: runtime_unavailable")

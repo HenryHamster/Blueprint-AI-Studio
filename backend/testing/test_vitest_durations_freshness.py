@@ -609,10 +609,14 @@ def test_adminui_artifact_nonempty_files() -> None:
     _assert_all_entries_measured("admin-ui", data)
 
 
-def test_adminui_inventory_excludes_viewport_files() -> None:
-    inventory = _test_file_inventory("admin-ui")
-    assert inventory
-    assert all(".viewport.test." not in path for path in inventory)
+def test_adminui_unit_and_viewport_inventories_are_disjoint() -> None:
+    unit_inventory = _test_file_inventory("admin-ui")
+    viewport_inventory = _test_file_inventory("admin-ui-viewport")
+    assert unit_inventory
+    assert viewport_inventory
+    assert unit_inventory.isdisjoint(viewport_inventory)
+    assert all(".viewport.test." not in path for path in unit_inventory)
+    assert all(".viewport.test." in path for path in viewport_inventory)
 
 
 def test_adminui_artifact_file_schema() -> None:

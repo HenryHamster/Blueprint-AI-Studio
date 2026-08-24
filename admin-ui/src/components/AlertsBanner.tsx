@@ -49,9 +49,11 @@ interface AlertsBannerProps {
   onViewTask?: (taskId: string) => void;
   projectId?: string;
   canMutate: boolean;
+  /** Keeps a single alert legible when it is embedded in Chat's utility area. */
+  compact?: boolean;
 }
 
-export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, projectId, canMutate = false }: AlertsBannerProps) {
+export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, projectId, canMutate = false, compact = false }: AlertsBannerProps) {
   const [expanded, setExpanded] = useState(false);
   const [acknowledgingAlertId, setAcknowledgingAlertId] = useState<string | null>(null);
   const [acknowledgedAlertIds, setAcknowledgedAlertIds] = useState<Set<string>>(new Set());
@@ -84,7 +86,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
   const hiddenCount = alerts.length - visibleAlerts.length;
 
   return (
-    <div className="mb-4 flex flex-col gap-2 shrink-0">
+    <div className={`${compact ? 'mb-0' : 'mb-4'} flex flex-col gap-2 shrink-0`}>
       {alerts.length > 1 && (onDismissAll || shouldCollapse) && (
         <div className="flex justify-end gap-3">
           {shouldCollapse && (
@@ -109,7 +111,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
       )}
       {visibleAlerts.map(alert => (
         <div key={alert.id} className="flex flex-col gap-1">
-          <div className={`${severityStyles[alert.severity]} border rounded-lg px-4 py-3 text-sm flex items-center gap-3`}>
+          <div className={`${severityStyles[alert.severity]} border rounded-lg ${compact ? 'px-3 py-2 text-xs' : 'px-4 py-3 text-sm'} flex items-center gap-3`}>
             <AlertTriangle className={`w-4 h-4 shrink-0 ${iconColors[alert.severity]}`} />
             <div className="flex-1 min-w-0">
               <span className="font-medium">{alert.title}</span>

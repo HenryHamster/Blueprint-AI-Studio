@@ -694,6 +694,7 @@ describe('MessagesPanel chrome modes', () => {
     }, [message]);
 
     await waitFor(() => expect(el.textContent).toContain('Viewer-readable update'));
+    expect(el.querySelector('[data-testid="conversation-utility-alert"]')?.textContent).toContain('Capacity warning');
     expect(el.querySelector('textarea')).toBeNull();
     expect(el.querySelector('button[aria-label="Acknowledge alert"]')).toBeNull();
     expect(el.querySelector('button[title="Dismiss"]')).toBeNull();
@@ -1945,8 +1946,12 @@ describe('MessagesPanel chrome modes', () => {
       },
     });
 
-    // Clean by default: chat hides the operational banners.
+    // Clean by default: Chat keeps verbose triage hidden, but exposes the
+    // actionable alert signal without making the operator open Details.
     expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+    const utilityAlert = el.querySelector('[data-testid="conversation-utility-alert"]');
+    expect(utilityAlert).not.toBeNull();
+    expect(utilityAlert?.textContent).toContain('Zone Capacity Exhausted');
     expect(el.textContent).not.toContain('Cycle complete');
 
     const detailToggle = el.querySelector('[data-testid="conversation-detail-toggle"]') as HTMLButtonElement | null;
@@ -1959,6 +1964,7 @@ describe('MessagesPanel chrome modes', () => {
     const banner = el.querySelector('[data-testid="alerts-inline-banner"]');
     expect(banner).not.toBeNull();
     expect(banner?.textContent).toContain('Zone Capacity Exhausted');
+    expect(el.querySelector('[data-testid="conversation-utility-alert"]')).toBeNull();
     expect(el.textContent).toContain('Cycle complete');
     expect(el.textContent).toContain('+2 directions');
 
@@ -1966,6 +1972,7 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(detailToggle.getAttribute('aria-pressed')).toBe('false');
     expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+    expect(el.querySelector('[data-testid="conversation-utility-alert"]')).not.toBeNull();
     expect(el.textContent).not.toContain('Cycle complete');
   });
 

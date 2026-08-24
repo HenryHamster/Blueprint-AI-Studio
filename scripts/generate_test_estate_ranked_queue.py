@@ -124,7 +124,7 @@ def _record(
     if area == "backend":
         test_count = len(extract_python_test_ids_from_file(path))
     else:
-        test_count = len(extract_typescript_test_ids(source))
+        test_count = len(extract_typescript_test_ids(source, path))
     threshold, priority = _threshold(len(source.splitlines()))
     return TestFile(
         area=area,
@@ -153,8 +153,8 @@ def collect_test_files(root: Path) -> tuple[TestFile, ...]:
                 backend_costs,
             )
         )
-    for suite in ("admin-ui", "agent"):
-        costs = _vitest_costs(root, suite)
+    for suite in ("admin-ui", "admin-ui-viewport", "agent"):
+        costs = _vitest_costs(root, suite) if suite in VITEST_DURATION_PATHS else {}
         for path in iter_vitest_test_files(root, suite):
             records.append(
                 _record(
@@ -184,7 +184,7 @@ def _summary(records: tuple[TestFile, ...]) -> str:
         "| Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |",
         "|------|------:|---------:|----------------:|--------------:|-------------------:|",
     ]
-    for area in ("backend", "admin-ui", "agent"):
+    for area in ("backend", "admin-ui", "admin-ui-viewport", "agent"):
         group = [record for record in records if record.area == area]
         measured = [record.cost_seconds for record in group if record.cost_seconds is not None]
         lines.append(
@@ -230,7 +230,7 @@ def render_queue(root: Path) -> str:
         "## Estate summary\n\n"
         + _summary(records)
         + "\n\n"
-        "The queue includes every currently collected backend, admin-ui, and agent test file. "
+        "The queue includes every currently collected backend, admin-ui unit, admin-ui viewport, and agent test file. "
         "Backend duration coverage is partial: an `unknown` cost is intentionally not treated "
         "as zero or ranked as cheap. Admin-ui and agent costs are complete directional signals "
         "from their committed artifacts. Protected Workday counts are copied verbatim from the "

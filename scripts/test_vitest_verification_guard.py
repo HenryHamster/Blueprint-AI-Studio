@@ -902,7 +902,10 @@ def test_guard_accepts_valid_failing_current_and_clean_baseline_pairs(
 
 
 def test_guard_blocks_mixed_inherited_failure_and_current_execution_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    _isolate_verification_receipt: Path,
 ) -> None:
     """A v2 runner error cannot inherit an otherwise identical JUnit failure."""
 
@@ -942,6 +945,17 @@ def test_guard_blocks_mixed_inherited_failure_and_current_execution_error(
     output = capsys.readouterr().out
     assert "WARN suppressed baseline failure: src/example.test.ts::keeps failing::failure" in output
     assert "FAILED state=execution_failure" in output
+    lane = json.loads(_isolate_verification_receipt.read_text(encoding="utf-8"))["lanes"][
+        "vitest:agent"
+    ]
+    assert lane["suppressed_failures"][
+        "src/example.test.ts::keeps failing::failure"
+    ]["detail"] == "inherited"
+    assert lane["new_failures"] == {}
+    assert all(
+        key in lane
+        for key in ("new_failures", "suppressed_failures", "disappeared_failures", "skipped_failures")
+    )
 
 
 def test_guard_blocks_baseline_execution_report_error(

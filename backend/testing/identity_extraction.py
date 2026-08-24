@@ -13,6 +13,7 @@ name, so a subclass-only body is not an empty identity set.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,7 +109,9 @@ class _TypeScriptCall:
     body_end: int | None = None
 
 
-def extract_typescript_test_ids(source: str) -> set[str]:
+def extract_typescript_test_ids(
+    source: str, path: Path | None = None
+) -> set[str]:
     """Return collector-shaped identities from Vitest/Jest test source.
 
     Vitest's real identity is the describe ancestry plus the test title.  A
@@ -122,7 +125,8 @@ def extract_typescript_test_ids(source: str) -> set[str]:
     receive a stable ``[case N]`` suffix because the source title may be the
     same for every row and the manifest needs one identity per collected test.
     """
-    calls = _scan_typescript_calls(source)
+    row_counts = _typescript_static_array_row_counts(source, path)
+    calls = _scan_typescript_calls(source, row_counts)
     describes = [call for call in calls if call.kind == "describe"]
     test_ids: set[str] = set()
     for call in calls:
@@ -149,7 +153,9 @@ def extract_typescript_test_ids(source: str) -> set[str]:
     return test_ids
 
 
-def _scan_typescript_calls(source: str) -> list[_TypeScriptCall]:
+def _scan_typescript_calls(
+    source: str, row_counts: dict[str, int] | None = None
+) -> list[_TypeScriptCall]:
     """Scan declaration calls without treating comments or strings as code."""
     calls: list[_TypeScriptCall] = []
     index = 0
@@ -159,6 +165,9 @@ def _scan_typescript_calls(source: str) -> list[_TypeScriptCall]:
             break
         if source[index] in "'\"`":
             index = _typescript_string_end(source, index)
+            continue
+        if source[index] == "/" and _looks_like_typescript_regex(source, index):
+            index = _typescript_regex_end(source, index)
             continue
         if not (source[index].isalpha() or source[index] in "_$"):
             index += 1
@@ -210,7 +219,9 @@ def _scan_typescript_calls(source: str) -> list[_TypeScriptCall]:
                 continue
             label_end = _matching_typescript_delimiter(source, label_start) or label_start
             label = _typescript_call_label(source, label_start + 1)
-            row_count = _typescript_each_row_count(source[cursor + 1 : data_end])
+            row_count = _typescript_each_row_count(
+                source[cursor + 1 : data_end], row_counts
+            )
         else:
             label = _typescript_call_label(source, label_start)
             label_end = data_end
@@ -270,6 +281,9 @@ def _matching_typescript_delimiter(source: str, opening: int) -> int | None:
         if char in "'\"`":
             index = _typescript_string_end(source, index)
             continue
+        if char == "/" and _looks_like_typescript_regex(source, index):
+            index = _typescript_regex_end(source, index)
+            continue
         if source.startswith("//", index):
             index = _skip_typescript_trivia(source, index)
             continue
@@ -297,6 +311,38 @@ def _typescript_string_end(source: str, opening: int) -> int:
             return index + 1
         else:
             index += 1
+    return len(source)
+
+
+def _looks_like_typescript_regex(source: str, index: int) -> bool:
+    """Recognize regex literals well enough to keep the declaration scanner aligned."""
+    if index + 1 >= len(source) or source[index + 1] in "/*":
+        return False
+    previous = index - 1
+    while previous >= 0 and source[previous].isspace():
+        previous -= 1
+    return previous < 0 or source[previous] in "([{=,:;!?&|"
+
+
+def _typescript_regex_end(source: str, opening: int) -> int:
+    """Return the first position after a regex literal and its flags."""
+    index = opening + 1
+    in_class = False
+    while index < len(source):
+        char = source[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        elif char == "/" and not in_class:
+            index += 1
+            while index < len(source) and (source[index].isalpha() or source[index] in "_$"):
+                index += 1
+            return index
+        index += 1
     return len(source)
 
 
@@ -333,10 +379,15 @@ def _find_callback_body(source: str, label_start: int, call_end: int) -> int | N
     return None
 
 
-def _typescript_each_row_count(data: str) -> int:
+def _typescript_each_row_count(
+    data: str, row_counts: dict[str, int] | None = None
+) -> int:
     """Count top-level rows in a static array passed to ``.each``."""
     start = _skip_typescript_trivia(data, 0)
     if start >= len(data) or data[start] != "[":
+        reference = data[start:].strip()
+        if row_counts is not None and re.fullmatch(r"[A-Za-z_$][\w$]*", reference):
+            return row_counts.get(reference, 1)
         return 1
     end = _matching_typescript_delimiter(data, start)
     if end is None:
@@ -363,6 +414,103 @@ def _typescript_each_row_count(data: str) -> int:
     if data[item_start:end].strip():
         rows += 1
     return rows
+
+
+def _typescript_static_array_row_counts(
+    source: str,
+    path: Path | None,
+    seen: set[Path] | None = None,
+) -> dict[str, int]:
+    """Resolve local and relative-imported static arrays used by ``*.each``.
+
+    This intentionally handles only literal arrays and aliases. Dynamic
+    expressions remain conservative at one row, while a supplied source path
+    lets inventory callers follow a relative import such as
+    ``ALL_AGENT_TASK_TYPES`` without executing TypeScript.
+    """
+    seen = set() if seen is None else seen
+    normalized_path = path.resolve() if path is not None else None
+    if normalized_path is not None:
+        if normalized_path in seen:
+            return {}
+        seen.add(normalized_path)
+
+    bindings: dict[str, int | str] = {}
+    declaration_re = re.compile(
+        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)"
+        r"(?:\s*:\s*[\s\S]*?)?\s*=",
+        re.DOTALL,
+    )
+    for match in declaration_re.finditer(source):
+        name = match.group(1)
+        value_start = _skip_typescript_trivia(source, match.end())
+        if value_start < len(source) and source[value_start] == "[":
+            value_end = _matching_typescript_delimiter(source, value_start)
+            if value_end is not None:
+                bindings[name] = _typescript_each_row_count(
+                    source[value_start : value_end + 1]
+                )
+        else:
+            alias = re.match(r"([A-Za-z_$][\w$]*)", source[value_start:])
+            if alias:
+                bindings[name] = alias.group(1)
+
+    imported_bindings: dict[str, tuple[Path, str]] = {}
+    import_re = re.compile(
+        r"\bimport\s*\{([^}]*)\}\s*from\s*['\"]([^'\"]+)['\"]"
+    )
+    for match in import_re.finditer(source):
+        if path is None or not match.group(2).startswith("."):
+            continue
+        module_path = _resolve_typescript_module(path.parent, match.group(2))
+        if module_path is None:
+            continue
+        for specifier in match.group(1).split(","):
+            parts = re.split(r"\s+as\s+", specifier.strip())
+            imported = parts[0].strip()
+            local = parts[-1].strip()
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", imported) and re.fullmatch(
+                r"[A-Za-z_$][\w$]*", local
+            ):
+                imported_bindings[local] = (module_path, imported)
+
+    resolved: dict[str, int] = {}
+    pending = dict(bindings)
+    for local, (module_path, imported) in imported_bindings.items():
+        try:
+            imported_source = module_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        imported_counts = _typescript_static_array_row_counts(
+            imported_source, module_path, seen
+        )
+        if imported in imported_counts:
+            pending[local] = imported_counts[imported]
+
+    while pending:
+        progress = False
+        for name, value in list(pending.items()):
+            if isinstance(value, int):
+                resolved[name] = value
+                del pending[name]
+                progress = True
+            elif value in resolved:
+                resolved[name] = resolved[value]
+                del pending[name]
+                progress = True
+        if not progress:
+            break
+    return resolved
+
+
+def _resolve_typescript_module(directory: Path, specifier: str) -> Path | None:
+    """Resolve a relative TypeScript import without leaving the workspace tree."""
+    candidate = (directory / specifier).resolve()
+    candidates = [candidate]
+    if candidate.suffix == ".js" or not candidate.suffix:
+        candidates.extend(candidate.with_suffix(ext) for ext in (".ts", ".tsx", ".js"))
+    candidates.extend(candidate / f"index{ext}" for ext in (".ts", ".tsx", ".js"))
+    return next((item for item in candidates if item.is_file()), None)
 
 
 def _has_pytest_class_name(name: str) -> bool:

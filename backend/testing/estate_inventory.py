@@ -11,6 +11,15 @@ from pathlib import Path
 from typing import Iterable
 
 
+def _suite_root(workspace_root: Path, suite: str) -> Path:
+    """Return the filesystem root for a logical Vitest suite."""
+    if suite == "admin-ui-viewport":
+        return workspace_root / "admin-ui"
+    if suite in {"agent", "admin-ui"}:
+        return workspace_root / suite
+    raise ValueError(f"Unknown Vitest suite: {suite}")
+
+
 def iter_backend_test_files(workspace_root: Path) -> tuple[Path, ...]:
     """Return the backend test modules included by the pytest inventory."""
     return tuple(sorted((workspace_root / "backend" / "testing").glob("test_*.py")))
@@ -34,12 +43,16 @@ def is_vitest_test_path(suite: str, relative: str) -> bool:
         return included and not (
             relative.startswith("src/") and ".viewport.test." in relative
         )
+    if suite == "admin-ui-viewport":
+        return relative.startswith("src/") and relative.endswith(
+            (".viewport.test.ts", ".viewport.test.tsx")
+        )
     raise ValueError(f"Unknown Vitest suite: {suite}")
 
 
 def iter_vitest_test_files(workspace_root: Path, suite: str) -> tuple[Path, ...]:
     """Return absolute paths in the files collected by *suite*'s config."""
-    suite_root = workspace_root / suite
+    suite_root = _suite_root(workspace_root, suite)
     paths = (
         path
         for path in suite_root.rglob("*")
@@ -53,7 +66,7 @@ def vitest_test_file_inventory(
     workspace_root: Path, suite: str, paths: Iterable[Path] | None = None
 ) -> set[str]:
     """Return suite-relative POSIX paths in the Vitest inventory."""
-    suite_root = workspace_root / suite
+    suite_root = _suite_root(workspace_root, suite)
     candidates = paths if paths is not None else iter_vitest_test_files(workspace_root, suite)
     return {
         path.relative_to(suite_root).as_posix()

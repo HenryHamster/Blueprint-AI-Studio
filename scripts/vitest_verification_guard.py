@@ -814,7 +814,10 @@ def main(argv: list[str] | None = None) -> int:
         # receipt cannot affect the state/exit decision made below.
         if current_execution_error:
             return _blocking(
-                args.suite, "execution_failure", current_exit_code=current.returncode
+                args.suite,
+                "execution_failure",
+                outcome=outcome,
+                current_exit_code=current.returncode,
             )
         if coverage_failures:
             return _blocking(

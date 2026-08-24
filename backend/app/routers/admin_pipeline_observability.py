@@ -1142,7 +1142,7 @@ async def get_outer_loop_chains(
         description=(
             "Filter chains by terminal outcome / escalation reason: rejected, "
             "cap_exhausted, stuck, standoff, repeat_fingerprint_halt, or merged. "
-            "When omitted, all non-merged chains are returned."
+            "When omitted, all resolved chains are returned."
         ),
     ),
     limit: int = Query(50, ge=1, le=50),
@@ -1156,8 +1156,8 @@ async def get_outer_loop_chains(
     single count, this lists the actual PR-chains so an operator can open and
     investigate them. Read-only; reuses the SAME ``require_admin`` dependency,
     row caps, original-task hydration, and chain grouping as the other
-    outer-loop endpoints. When ``reason`` is omitted, all non-merged chains are
-    returned (the actionable set); otherwise only chains matching that outcome.
+    outer-loop endpoints. When ``reason`` is omitted, all resolved chains are
+    returned; otherwise only chains matching that outcome.
     """
     from app.digest_metrics import _resolve_outer_loop_chains  # noqa: PLC0415
 
@@ -1217,15 +1217,18 @@ async def get_outer_loop_chains(
     if reason is not None:
         selected = [c for c in chains if c["outcome"] == reason]
     else:
-        selected = [
-            c for c in chains if c["outcome"] is not None and c["outcome"] != "merged"
-        ]
+        selected = [c for c in chains if c["outcome"] is not None]
 
     rows = [
         {
+            "chain_key": c["chain_key"],
+            "original_task_id": c["original_task_id"],
             "pr_number": c["pr_number"],
+            "direction_id": c["direction_id"],
             "task_ids": c["task_ids"],
             "max_iteration": c["max_iteration"],
+            "review_count": c["review_count"],
+            "reviews_to_converge": c["reviews_to_converge"],
             "churn_count": c["churn_count"],
             "terminal_reason": c["outcome"],
             "project_id": c["project_id"],
