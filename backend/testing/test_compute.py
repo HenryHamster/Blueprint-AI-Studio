@@ -3603,14 +3603,22 @@ async def _run_no_data_guard_job(
     task_payload,
     status_metrics=None,
     artifact_reference=None,
+    status_status=ComputeJobStatus.SUCCEEDED,
+    status_exit_code=0,
+    status_message="completed",
 ):
-    """Drive a SUCCEEDED metric-less compute job through the monitor.
+    """Drive a terminal metric-less compute job through the monitor.
 
     Shared harness for the no-data-guard tests: creates a job whose backend
-    reports SUCCEEDED/exit 0 with the given ``status_metrics``, stubs
-    durable-artifact detection to return ``artifact_reference``, runs two
-    monitor ticks, and returns the refreshed job so the caller can assert the
-    resulting outcome/terminal_reason.
+    reports ``status_status``/``status_exit_code`` with the given
+    ``status_metrics``, stubs durable-artifact detection to return
+    ``artifact_reference``, runs two monitor ticks, and returns the refreshed job
+    so the caller can assert the resulting outcome/terminal_reason.
+
+    The terminal status defaults to SUCCEEDED/exit 0 because the result-contract
+    guards are about a run that finished CLEAN yet produced nothing. It is
+    overridable so a test can also pin what a job that genuinely FAILED reports —
+    the two must not be handed the same reason.
     """
     project = Project(name="No Data Guard", user_id="test-user")
     db_session.add(project)
@@ -3666,10 +3674,10 @@ async def _run_no_data_guard_job(
 
         async def poll_status(self, persisted_job):
             return ComputeStatusResult(
-                status=ComputeJobStatus.SUCCEEDED,
-                exit_code=0,
+                status=status_status,
+                exit_code=status_exit_code,
                 finished_at=_utcnow(),
-                message="completed",
+                message=status_message,
                 metrics=status_metrics,
             )
 
@@ -4020,6 +4028,135 @@ async def test_no_data_guard_skips_side_effect_job(db_session, monkeypatch):
         artifact_reference=None,
     )
     assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
+# ── Criterion-free experiments: durable output IS a result ──────────────────
+#
+# A compute_experiment that declares no metric and no success_criterion still
+# has to produce something, but a scalar is not the only thing that counts. A
+# training loop that runs for hours and writes checkpoints did exactly the work
+# asked of it. The guard draws its line at "produced nothing at all".
+
+
+@pytest.mark.asyncio
+async def test_criterion_free_experiment_is_satisfied_by_durable_artifacts(
+    db_session, monkeypatch
+):
+    """No metric declared + no metric reported + durable output → SUCCESS.
+
+    Requiring a scalar here is the contract being wrong about the work rather
+    than the work being wrong, and the corpus shows what it costs: with a number
+    mandatory, the single commonest declared metric across production jobs is
+    "did my artifacts come back" — authors minting a stand-in number to route
+    around this gate. Ask for the durable output directly instead.
+    """
+    reference = TerminalArtifactReference(
+        uri="file:///tmp/checkpoints",
+        backend="local",
+        file_count=7,
+        total_size_bytes=4096,
+    )
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "compute_experiment"},
+        status_metrics=None,
+        artifact_reference=reference,
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # The reason must say WHICH way the contract resolved. "declared no metric"
+    # on its own is the failure sentence, and reading it on a run that succeeded
+    # is how an operator concludes the pipeline is lying to them.
+    reason = job.terminal_reason or ""
+    assert "durable artifacts satisfy the result contract" in reason
+    assert "uri=file:///tmp/checkpoints" in reason
+    assert "file_count=7" in reason
+
+
+@pytest.mark.asyncio
+async def test_criterion_free_experiment_with_no_output_at_all_still_fails(
+    db_session, monkeypatch
+):
+    """No metric, no artifacts, exit 0 → FAILURE. This is the case the guard is for.
+
+    The relaxation above must not decay into "criterion-free always passes": a
+    run that produced neither a number nor a byte of durable output produced
+    nothing, and recording that as a clean SUCCESS is the silent-failure incident
+    the guard was built to catch.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "compute_experiment"},
+        status_metrics=None,
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "declared no metric and produced no measurements" in (
+        job.terminal_reason or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_criterion_free_experiment_that_failed_reports_the_real_reason(
+    db_session, monkeypatch
+):
+    """A criterion-free run that EXITED NON-ZERO must name its own failure.
+
+    Being criterion-free is a property of the job, not a cause of death. The
+    reason branch used to key on ``_criterion_free_experiment`` alone, so every
+    such job — including one that died on a missing import — was recorded as
+    "declared no metric and produced no measurements", burying the actual error
+    behind a contract complaint. Surface reasons, not states.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "compute_experiment"},
+        status_metrics=None,
+        artifact_reference=None,
+        status_status=ComputeJobStatus.FAILED,
+        status_exit_code=1,
+        status_message="ModuleNotFoundError: No module named mujoco",
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    reason = job.terminal_reason or ""
+    assert "mujoco" in reason, reason
+    assert "declared no metric" not in reason, reason
+
+
+@pytest.mark.asyncio
+async def test_declared_metric_experiment_is_not_excused_by_artifacts(
+    db_session, monkeypatch
+):
+    """The relaxation is scoped to criterion-free runs and must not leak.
+
+    A job that DECLARED a metric and never measured it made a promise it did not
+    keep — a different thing from never having made one. Artifacts do not excuse
+    it, or the metric contract becomes unenforceable for exactly the jobs that
+    opted into it. Same task type as the test above, so only the declaration
+    differs.
+    """
+    reference = TerminalArtifactReference(
+        uri="file:///tmp/checkpoints",
+        backend="local",
+        file_count=7,
+        total_size_bytes=4096,
+    )
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={
+            "type": "compute_experiment",
+            "declared_metric": "env_steps_per_sec",
+        },
+        status_metrics=None,
+        artifact_reference=reference,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    reason = job.terminal_reason or ""
+    assert "env_steps_per_sec" in reason
+    assert "durable artifacts preserved" in reason
 
 
 @pytest.mark.asyncio

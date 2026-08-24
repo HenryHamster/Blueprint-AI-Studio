@@ -7181,32 +7181,44 @@ def _run_compute_job(
             effective_command = "{\n" + setup_step + "\n} && {\n" + command + "\n}"
 
         container_name = f"bp-{str(job_id)[:12]}"
-        plan = iso.plan_compute_execution(
-            caps=caps,
-            command=effective_command,
-            image=container_image,
-            registry_auth=container_registry_auth or None,
-            workspace_host=tmpdir,
-            result_file_host=result_file,
-            artifact_dir_host=artifact_dir,
-            progress_file_host=progress_file,
-            clone_dir_host=clone_dir,
-            cwd_host=cwd,
-            job_env=env_override,
-            gpu_indices=assigned_gpus,
-            container_name=container_name,
-            source_env=dict(os.environ),
-            # ldconfig is only consulted for the bwrap backend (to bind driver
-            # libs living outside /usr); container backends provide their own.
-            ldconfig_output=(
-                _read_ldconfig()
-                if (assigned_gpus and backend_pre == iso.BACKEND_BWRAP)
-                else ""
-            ),
-            cpu_limit=cpu_limit,
-            mem_limit=mem_limit,
-            allow_host_fallback=allow_host_fallback,
-        )
+
+        def _build_plan(gpu_indices: list[int]):
+            """Plan the sandbox for a given GPU assignment.
+
+            Parameterized on the GPU set because the arch probe below may have to
+            rebuild the plan WITHOUT GPUs: a job that declared no accelerator has
+            no business dying because the host's GPU and the image's CUDA runtime
+            disagree. Every other input is fixed for the job, so a rebuild differs
+            only in the device set.
+            """
+            return iso.plan_compute_execution(
+                caps=caps,
+                command=effective_command,
+                image=container_image,
+                registry_auth=container_registry_auth or None,
+                workspace_host=tmpdir,
+                result_file_host=result_file,
+                artifact_dir_host=artifact_dir,
+                progress_file_host=progress_file,
+                clone_dir_host=clone_dir,
+                cwd_host=cwd,
+                job_env=env_override,
+                gpu_indices=gpu_indices,
+                container_name=container_name,
+                source_env=dict(os.environ),
+                # ldconfig is only consulted for the bwrap backend (to bind driver
+                # libs living outside /usr); container backends provide their own.
+                ldconfig_output=(
+                    _read_ldconfig()
+                    if (gpu_indices and backend_pre == iso.BACKEND_BWRAP)
+                    else ""
+                ),
+                cpu_limit=cpu_limit,
+                mem_limit=mem_limit,
+                allow_host_fallback=allow_host_fallback,
+            )
+
+        plan = _build_plan(assigned_gpus)
         # NOTE: BLUEPRINT_PROGRESS_FILE is NOT set here. plan_compute_execution
         # already injects it into plan.env with the correct IN-SANDBOX path
         # (translated from progress_file_host to the per-backend mount, e.g.
@@ -7265,34 +7277,78 @@ def _run_compute_job(
 
             probe_ok, probe_detail = iso.probe_gpu_in_sandbox(plan)
             if not probe_ok:
-                # An arch mismatch is CONCLUSIVE: the container itself reported it
-                # cannot use this GPU, so the run can only end in "no metric".
-                # Fatal no matter what the job declared.
+                # Two axes decide what a failed probe means, and they are
+                # independent:
                 #
-                # Every OTHER probe failure (timeout, no nvidia-smi, empty device
-                # list) is INCONCLUSIVE — it says the PROBE could not run, not
-                # that the JOB cannot. Killing on those would be a false failure,
-                # and the blast radius is wide: `assigned_gpus` is populated from
-                # caps.has_gpu ALONE, so on a GPU host it covers every
-                # containerized job, CPU-only ones included. Keep the old contract
-                # — only a job that DECLARED an accelerator dies on an
-                # inconclusive probe; an image-only job warns and proceeds.
+                #   CONCLUSIVE (arch mismatch) vs INCONCLUSIVE (timeout, no
+                #   nvidia-smi, empty device list). Only the first is evidence the
+                #   GPU is unusable; the rest say the PROBE could not run.
+                #
+                #   DECLARED an accelerator vs did not. `assigned_gpus` is
+                #   populated from caps.has_gpu ALONE, so on a GPU host every
+                #   containerized job is handed a device — CPU-only ones included.
+                #   A device the job never asked for cannot be a reason to fail it.
+                #
+                # Declared + conclusive, and declared + inconclusive, are both
+                # fatal: the job asked for an accelerator and there is not a
+                # working one. Undeclared + conclusive drops the device and
+                # re-plans CPU-only. Undeclared + inconclusive proceeds unchanged.
                 arch_mismatch = iso.no_usable_gpu_marker(probe_detail) is not None
-                if not arch_mismatch and not accelerator_type:
-                    print(
-                        f"[compute] job {job_id}: GPU probe inconclusive "
-                        f"({probe_detail}) — no accelerator was declared, so the "
-                        "job proceeds rather than fail on a probe it never needed",
-                        flush=True,
-                    )
+                if not accelerator_type:
+                    # The job never asked for a GPU. `assigned_gpus` is populated
+                    # from caps.has_gpu ALONE, so on a GPU host EVERY containerized
+                    # job is handed a device, CPU-only ones included. Killing such a
+                    # job because the image's CUDA runtime cannot drive this host's
+                    # arch fails work that would have run fine on the CPU.
+                    #
+                    # An arch mismatch here is conclusive about the DEVICE, not
+                    # about the job: drop the GPU and run CPU-only. An inconclusive
+                    # probe keeps the device and proceeds, exactly as before —
+                    # "the probe could not run" is not evidence the GPU is unusable.
+                    if arch_mismatch:
+                        print(
+                            f"[compute] job {job_id}: GPU unusable in sandbox "
+                            f"({probe_detail}) and no accelerator was declared — "
+                            "releasing the device and running CPU-only rather than "
+                            "failing a job that never asked for a GPU",
+                            flush=True,
+                        )
+                        _release_gpus(gpu_state, assigned_gpus)
+                        assigned_gpus = []
+                        plan = _build_plan(assigned_gpus)
+                        if plan.declined:
+                            print(
+                                f"[compute] DECLINED job {job_id} (fail-closed) on "
+                                f"CPU-only replan: {plan.decline_reason}",
+                                flush=True,
+                            )
+                            outcome = "failure"
+                            _report_terminal(
+                                exec_status="failed", exit_code=1,
+                                command_log={
+                                    "text": (
+                                        "Runner declined job (fail-closed isolation) "
+                                        "after dropping an unusable GPU: "
+                                        f"{plan.decline_reason}"
+                                    ),
+                                    "truncated": False,
+                                },
+                                resume_hydration=resume_hydration,
+                            )
+                            return
+                    else:
+                        print(
+                            f"[compute] job {job_id}: GPU probe inconclusive "
+                            f"({probe_detail}) — no accelerator was declared, so the "
+                            "job proceeds rather than fail on a probe it never needed",
+                            flush=True,
+                        )
                 else:
-                    declared = (
-                        f"accelerator={accelerator_type}"
-                        if accelerator_type
-                        else f"image={container_image}"
-                    )
+                    # Reached only when the job DECLARED an accelerator -- the
+                    # image-only case is handled above -- so the reason names the
+                    # declaration that makes this fatal.
                     terminal_reason = (
-                        f"GPU assigned ({declared}) but unusable "
+                        f"GPU assigned (accelerator={accelerator_type}) but unusable "
                         f"in sandbox: {probe_detail}"
                     )
                     print(f"[compute] ABORT job {job_id}: {terminal_reason}", flush=True)

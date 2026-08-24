@@ -495,6 +495,23 @@ async def _maybe_alert_saturated_compute_cap_defer(
         )
 
 
+def _image_provenance(container_image: str, payload_declared: bool) -> str:
+    """Describe the held job's image AND where it came from.
+
+    A job can now reach the container-capable-runner gate without having asked
+    for a container: when the payload declares no image, dispatch supplies the
+    project's declared one. Saying "job declares container_image=..." over the
+    top of that sends an operator to read a payload that mentions no image at
+    all, so the two cases have to read differently.
+    """
+    if payload_declared:
+        return f"job declares container_image={container_image!r}"
+    return (
+        f"the project environment contract supplies container_image="
+        f"{container_image!r} (the payload declared none)"
+    )
+
+
 async def _dispatch_compute_experiment_directly(
     session: AsyncSession,
     task: Task,
@@ -601,14 +618,28 @@ async def _dispatch_compute_experiment_directly(
     # below. An explicit payload container_image is left untouched; projects with
     # no manifest compute image keep today's image-less behavior.
     #
-    # Gated on `accelerator`: a task declaring neither accelerator nor
-    # container_image must dispatch bare. Attaching a default image to such a
-    # task arms the runner's fatal GPU-arch pre-flight (it fires whenever
-    # assigned_gpus and (accelerator_type or container_image)) even though the
-    # task never asked for a GPU, aborting CPU-only work on GPU-host runners
-    # whose default image doesn't match the host arch.
+    # NOT gated on `accelerator`. It used to be, and that gate was the reason the
+    # environment contract did not exist in practice: the large majority of
+    # compute_experiment jobs declare no accelerator, so they skipped image
+    # resolution entirely and ran as a bare `bash -lc` against whatever toolchain
+    # the claiming host happened to have. That is what produced the commonest
+    # terminal log in the corpus -- `no working pip found (tried "-m pip" and
+    # PATH) - cannot provision the runtime` -- along with the exit-127
+    # (command not found) and exit-126 (not executable) failures. A project that
+    # declares an image means it for all of its work, not only its GPU work.
+    #
+    # The gate existed to dodge a downstream defect, not to express a policy:
+    # attaching an image armed the runner's GPU-arch pre-flight (which fires on
+    # `assigned_gpus and (accelerator_type or container_image)`, and
+    # `assigned_gpus` comes from the HOST having GPUs, not from the job wanting
+    # them), so CPU-only work landing on a GPU host died on an arch mismatch it
+    # had no stake in. That is fixed at the root in `local_runner.py`: a job that
+    # declared no accelerator now RELEASES the unusable device and re-plans
+    # CPU-only instead of aborting. With the kill gone the workaround is not
+    # needed, and the contract can apply to every job as intended.
     resolved_default_container_image: str | None = None
-    if not container_image and accelerator:
+    payload_declared_image = bool(container_image)
+    if not container_image:
         from app.compute_backends import resolve_project_baked_image_strict
 
         project = await session.get(Project, task.project_id)
@@ -616,12 +647,34 @@ async def _dispatch_compute_experiment_directly(
             await resolve_project_baked_image_strict(session, project)
         )
         if image_error is not None:
-            return await _fail_compute_experiment_task(
-                session,
-                task,
-                "baked_image_unresolvable",
+            # Fail CLOSED only for a payload that actually asked for an
+            # accelerator. Those jobs need the declared image to mean anything,
+            # and running them on the host toolchain is a reproducibility
+            # failure the operator must see.
+            #
+            # A BARE payload degrades to image-less instead. The commonest
+            # reason a declared image does not resolve is that it has not been
+            # built YET, and that window is transient project state -- letting
+            # it terminal-fail every CPU-only job in the project would turn a
+            # pending build into an outage for work that never asked for an
+            # image. Applying the contract where it resolves and degrading
+            # where it does not is what makes it safe to apply the contract to
+            # every job at all.
+            if accelerator:
+                return await _fail_compute_experiment_task(
+                    session,
+                    task,
+                    "baked_image_unresolvable",
+                    image_error,
+                )
+            logger.warning(
+                "[RUNNERS] compute_experiment %s: project image unresolvable "
+                "(%s) — the payload declared no accelerator, so it launches "
+                "image-less rather than failing on a contract it never invoked",
+                task.id,
                 image_error,
             )
+            resolved_default_container_image = None
         if resolved_default_container_image:
             container_image = resolved_default_container_image
     # vram_gb (flat or nested) gates runner eligibility on free GPU memory. It is
@@ -925,8 +978,9 @@ async def _dispatch_compute_experiment_directly(
         )
         if disk_blocked:
             hold_msg = (
-                "Waiting for a runner with enough capacity: job declares "
-                f"container_image={container_image!r} (a multi-GB image pull) but "
+                "Waiting for a runner with enough capacity: "
+                f"{_image_provenance(container_image, payload_declared_image)} "
+                "(a multi-GB image pull) but "
                 "every container-capable runner reports workspace or container "
                 "image-store capacity below its reserve "
                 f"(workspace={workspace_floor} bytes, "
@@ -1035,7 +1089,7 @@ async def _dispatch_compute_experiment_directly(
             gpu_req = "an accelerator" if accelerator else f"vram_gb={vram_gb!r}"
             hold_msg = (
                 "Waiting for a runner that can expose a GPU inside the container: "
-                f"job declares both container_image={container_image!r} and "
+                f"job runs under container_image={container_image!r} with "
                 f"{gpu_req}, but no selected runtime has functional passthrough "
                 f"proof ({'; '.join(blockers[:3])})."
             )
@@ -1100,16 +1154,16 @@ async def _dispatch_compute_experiment_directly(
         if project_runners:
             if any(_runner_has_container_capability(r) for r in project_runners):
                 hold_msg = (
-                    "Waiting for an eligible container-capable runner: job declares "
-                    f"container_image={container_image!r}; a container runtime is "
-                    "present, but every such runner is at capacity or fails another "
-                    "job requirement."
+                    "Waiting for an eligible container-capable runner: "
+                    f"{_image_provenance(container_image, payload_declared_image)}; "
+                    "a container runtime is present, but every such runner is at "
+                    "capacity or fails another job requirement."
                 )
             else:
                 hold_msg = (
-                    "Waiting for a container-capable runner: job declares "
-                    f"container_image={container_image!r} but no live runner "
-                    "has docker_usable capability."
+                    "Waiting for a container-capable runner: "
+                    f"{_image_provenance(container_image, payload_declared_image)} "
+                    "but no live runner has docker_usable capability."
                 )
             ctx = dict(task.context or {})
             changed = ctx.pop("runner_target_id", None) is not None

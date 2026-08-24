@@ -16159,6 +16159,206 @@ async def test_forced_runner_gpu_in_container_hold_names_probe_blocker(
     assert "verified GPU passthrough probe" in message
 
 
+# ── The environment contract applies to ALL of a project's compute ──────────
+#
+# A project that declares a compute image means it for every job, not only its
+# GPU jobs. Image resolution used to be gated on `accelerator`, and since the
+# large majority of compute_experiment jobs declare none, most of them skipped
+# the contract entirely and ran as a bare `bash -lc` against whatever toolchain
+# the claiming host happened to have — the source of the "no working pip found"
+# / exit-127 / exit-126 failures in the production corpus.
+
+
+async def _dispatched_container_image(
+    db_session, mocker, *, payload, pinned_image, image_error=None
+):
+    """Dispatch one compute_experiment and return the ComputeJob's container_image.
+
+    Stubs the strict project-image resolver so the test pins the DISPATCH
+    decision (does the contract apply to this job?) rather than re-testing the
+    resolver, which owns its own fail-closed proofs in
+    test_compute_experiment_spawn.py.
+    """
+    from app import compute_backends
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+    from app.models import ComputeJob
+    from sqlalchemy import select
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="EnvContractProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    async def _resolved(*_args, **_kwargs):
+        return pinned_image, image_error
+
+    mocker.patch.object(
+        compute_backends, "resolve_project_baked_image_strict", _resolved
+    )
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[payload],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    jobs = (
+        (await db_session.execute(select(ComputeJob).where(ComputeJob.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    # The launch image is a durable launch input on polling_metadata, not a
+    # column — this is the same key the runner-dispatch body and the resume
+    # rehydration read (`meta["container_image"]`).
+    images = [(j.polling_metadata or {}).get("container_image") for j in jobs]
+    return task, jobs, images
+
+
+@pytest.mark.asyncio
+async def test_cpu_only_experiment_gets_the_project_image(db_session, mocker):
+    """No accelerator, no payload image → still resolves the project's image.
+
+    This is the whole environment contract. Gating it on `accelerator` meant a
+    CPU-only training run got no image and no reproducible toolchain, which is
+    exactly the class of job the contract exists for.
+    """
+    pinned = "registry.example.com/proj@sha256:" + "a" * 64
+    _task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image=pinned,
+    )
+    assert len(jobs) == 1, f"expected one ComputeJob, got {len(jobs)}"
+    assert images[0] == pinned, (
+        "a compute_experiment that declared no accelerator must still run inside "
+        f"the project's declared image, got {images[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_payload_image_is_not_overridden(db_session, mocker):
+    """An explicit container_image in the payload wins over the project default.
+
+    Ungating the resolver must not turn the project image into an override: a
+    task that names its own image is making a deliberate choice.
+    """
+    explicit = "nvcr.io/nvidia/pytorch:25.01-py3"
+    _task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+            "container_image": explicit,
+        },
+        pinned_image="registry.example.com/proj@sha256:" + "b" * 64,
+    )
+    assert len(jobs) == 1
+    assert images[0] == explicit
+
+
+@pytest.mark.asyncio
+async def test_project_with_no_image_still_dispatches_image_less(db_session, mocker):
+    """A project that declares no image keeps today's image-less behaviour.
+
+    Ungating the resolver means it now runs for CPU-only jobs, which is a code
+    path it never ran on. `resolve_project_baked_image_strict` returns
+    ``(None, None)`` for a project with no declared image, and that must stay a
+    normal dispatch — not a new failure mode for every project that has not
+    adopted a compute image.
+    """
+    _task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image=None,
+    )
+    assert len(jobs) == 1, "a project with no declared image must still dispatch"
+    assert images[0] is None, (
+        f"expected no image, got {images[0]!r} — a project that declared nothing "
+        "must not acquire an image at dispatch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cpu_only_experiment_degrades_when_the_image_is_unresolvable(
+    db_session, mocker
+):
+    """A payload that asked for NO accelerator launches image-less when the
+    project's declared image does not resolve. It is not terminal-failed.
+
+    Applying the environment contract to every job means the resolver now runs
+    for jobs that never asked for an image, so its FAILURE direction decides how
+    much blast radius the ungate has. The commonest reason a declared image does
+    not resolve is that it has not been built yet -- transient project state.
+    Failing closed there would convert a pending build into an outage for every
+    CPU-only job in the project: a new kill class, traded for a contract those
+    jobs never invoked.
+
+    A payload that DID declare an accelerator still fails closed, because it
+    cannot run meaningfully without the image it asked for -- see
+    test_dispatch_fails_closed_when_baked_image_declared_but_no_build_record.
+    """
+    task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image=None,
+        image_error="declared build recipe has no digest-pinned build record",
+    )
+    assert len(jobs) == 1, (
+        "a bare payload must still launch when the project image is "
+        f"unresolvable; got {len(jobs)} job(s) and task status {task.status}"
+    )
+    assert task.status != TaskStatus.FAILED, (
+        "an unresolvable project image must not terminal-fail a job that never "
+        f"asked for an image; got {task.status}"
+    )
+    assert images[0] is None, (
+        "an unresolvable image must degrade to image-less, not attach a "
+        f"half-resolved reference; got {images[0]!r}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_gpu_in_container_hold_fires_for_vram_only_no_accelerator(
     db_session, mocker
@@ -16512,12 +16712,10 @@ async def test_dispatch_defaults_project_baked_image_when_payload_has_none(
     Closes the images-first USE-default gap on the dispatch path: experiments
     that never went through the plan/research completion authors (operator
     experiments, planned prerequisites, retries) previously ran image-less on the
-    host toolchain, unreproducibly. This default only applies when the payload
+    host toolchain, unreproducibly. The default applies whether or not the payload
     declares an accelerator — see
-    test_dispatch_bare_payload_stays_image_less_even_with_baked_record for the
-    no-accelerator case, which must NOT inherit a default image (that would arm
-    the runner's fatal GPU-arch pre-flight for a task that never asked for a
-    GPU).
+    test_dispatch_bare_payload_inherits_the_project_baked_image for the
+    no-accelerator case.
     """
     from types import SimpleNamespace
     from app.orchestrator_runner_dispatch import (
@@ -16627,19 +16825,33 @@ async def test_dispatch_defaults_project_baked_image_when_payload_has_none(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_bare_payload_stays_image_less_even_with_baked_record(
+async def test_dispatch_bare_payload_inherits_the_project_baked_image(
     db_session, mocker
 ):
-    """A compute_experiment dispatched with NEITHER accelerator NOR
-    container_image must run bare: no default image attached, even though the
-    project has a resolvable digest-pinned baked image record.
+    """A bare payload (no accelerator, no container_image) DOES inherit the
+    project's digest-pinned baked image.
 
-    Root-fix regression test for the NeurIPS-fleet outage (task 52684be0 and 11
-    others): attaching a default image to an accelerator-less task arms the
-    runner's fatal GPU-arch pre-flight (``assigned_gpus and (accelerator_type or
-    container_image)``) on GPU hosts, aborting CPU-only jobs whose incidentally
-    attached image doesn't support the host's GPU arch. The strict resolver must
-    not even be consulted for a bare payload.
+    This test previously asserted the opposite, as the regression guard for the
+    NeurIPS-fleet outage (task 52684be0 and 11 others): attaching a default
+    image to an accelerator-less task armed the runner's then-fatal GPU-arch
+    pre-flight (``assigned_gpus and (accelerator_type or container_image)``) on
+    GPU hosts, aborting CPU-only jobs whose incidentally attached image did not
+    support the host's arch.
+
+    Withholding the image was a workaround at the wrong layer. It bought outage
+    safety by denying the environment contract to the large majority of
+    compute_experiment jobs -- the ones that declare no accelerator -- which is
+    why those jobs ran as a bare ``bash -lc`` against the host toolchain and
+    produced the corpus's ``no working pip found`` / exit-127 / exit-126
+    failures.
+
+    The kill is now fixed where it lives. A job that declared no accelerator
+    and hits a conclusive arch mismatch RELEASES the device and re-plans
+    CPU-only instead of aborting, so an incidentally attached image can no
+    longer end it. The outage itself is still guarded, by a test that
+    reproduces the actual mechanism rather than avoiding it:
+    ``scripts/test_local_runner.py::TestRunComputeJob::
+    test_cpu_only_job_drops_an_unusable_gpu_and_runs``.
     """
     from types import SimpleNamespace
     from app.orchestrator_runner_dispatch import (
@@ -16712,7 +16924,117 @@ async def test_dispatch_bare_payload_stays_image_less_even_with_baked_record(
     await db_session.commit()
     await db_session.refresh(task)
 
-    # No isolation_backends capability needed — the job must not require one.
+    # The runner IS container-capable. That is now a REQUIREMENT rather than a
+    # detail: an inherited image gates runner eligibility exactly as a declared
+    # one does, so this job no longer routes to a runner with no isolation
+    # backend. See test_inherited_image_gates_on_container_capability for the
+    # other side of that.
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "launched", f"expected 'launched', got {result!r}"
+    assert (
+        captured.get("container_image")
+        == "reg.example.com/org/repo/compute-proj@sha256:deadbeefcafe"
+    ), (
+        "a bare payload must inherit the project's digest-pinned baked image — "
+        "the environment contract is not conditional on asking for a GPU; got "
+        f"{captured.get('container_image')!r}"
+    )
+    manifest_spy.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_inherited_image_gates_on_container_capability(db_session, mocker):
+    """A job that inherits the project image is held when no runner can run a
+    container — and the hold says the image was INHERITED, not declared.
+
+    This is the routing consequence of applying the environment contract to
+    every job, and it is disclosed rather than hidden: a payload that names no
+    image now needs a container-capable runner. Holding is the honest outcome.
+    Degrading to a bare ``bash -lc`` because the fleet is short a runtime would
+    silently reinstate the unreproducible host-toolchain execution this change
+    exists to end, and it would do so in exactly the situation an operator most
+    needs to see.
+
+    The reason string carries the provenance because the operator reading it
+    would otherwise go looking for a ``container_image`` in a payload that does
+    not contain one.
+    """
+    from types import SimpleNamespace
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+    from app.models import ProjectComputeImage
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="InheritedImageHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-inherit",
+            tag="latest",
+            pinned_ref="reg.example.com/org/repo/compute-proj@sha256:deadbeefcafe",
+            digest="sha256:deadbeefcafe",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {
+                    "name": "reg.example.com/org/repo/compute-proj:latest",
+                    "build": {"dockerfile": "Dockerfile"},
+                }
+            }
+        },
+    )
+    mocker.patch(
+        "app.compute_jobs.create_compute_job",
+        new=AsyncMock(
+            side_effect=AssertionError("must not launch without a container runtime")
+        ),
+    )
+    mocker.patch("app.task_lifecycle.park_task", new_callable=AsyncMock)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python analyze.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
     runner = RunnerDispatchSnapshot(
         id=uuid.uuid4(),
         project_id=project.id,
@@ -16723,12 +17045,16 @@ async def test_dispatch_bare_payload_stays_image_less_even_with_baked_record(
         db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
     )
 
-    assert result == "launched", f"expected 'launched', got {result!r}"
-    assert "container_image" not in captured, (
-        "a bare payload (no accelerator, no container_image) must never inherit "
-        f"the project default image; got {captured.get('container_image')!r}"
+    assert result == "held", f"expected 'held', got {result!r}"
+    msg = task.latest_status_message or ""
+    assert "the payload declared none" in msg, (
+        "the hold must say the image was inherited from the project contract, "
+        f"not that the job declared it; got {msg!r}"
     )
-    manifest_spy.assert_not_called()
+    assert "job declares container_image" not in msg, (
+        "a payload that names no image must not be described as declaring one; "
+        f"got {msg!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -17003,14 +17329,23 @@ async def test_dispatch_fails_closed_when_baked_image_declared_but_no_build_reco
 async def test_dispatch_bare_payload_does_not_fail_closed_on_unresolvable_baked_image(
     db_session, mocker
 ):
-    """A bare payload (no accelerator, no container_image) must NOT be
-    terminal-failed by the strict baked-image resolver, even when the project
-    declares an unresolvable build recipe. The resolver must not be consulted
-    at all for a task that never asked for an image — it must launch bare.
+    """A bare payload is never terminal-failed by the strict baked-image
+    resolver, even when the project declares an unresolvable build recipe. It
+    launches image-less.
 
-    This is the direct fix for the class of outage this defect caused: a
-    CPU-only compute_experiment (no accelerator declared) must never be blocked
-    or mis-armed by the project's GPU/image manifest state.
+    The resolver IS now consulted for a bare payload — that is the environment
+    contract, and when the image resolves the job gets it (see
+    test_dispatch_bare_payload_inherits_the_project_baked_image). What must not
+    change is the FAILURE direction. The commonest reason a declared image does
+    not resolve is that it has not been built yet, as this test's
+    ``not-built-yet`` fixture says out loud, and that window is transient
+    project state. Terminal-failing every CPU-only job in the project because a
+    build is pending would turn ordinary project state into an outage for work
+    that never asked for an image.
+
+    Fail-closed still applies to a payload that DID declare an accelerator —
+    see test_dispatch_fails_closed_when_baked_image_declared_but_no_build_record
+    — because that job cannot run meaningfully without the image it asked for.
     """
     from app.orchestrator_runner_dispatch import (
         _dispatch_compute_experiment_directly,
@@ -17081,8 +17416,11 @@ async def test_dispatch_bare_payload_does_not_fail_closed_on_unresolvable_baked_
         "a bare payload must launch image-less, never terminal-fail on an "
         f"unresolvable project default; got {result!r}"
     )
-    assert "container_image" not in captured
-    manifest_spy.assert_not_called()
+    assert "container_image" not in captured, (
+        "an unresolvable image must degrade to image-less, not attach a "
+        f"half-resolved reference; got {captured.get('container_image')!r}"
+    )
+    manifest_spy.assert_called()
 
 
 @pytest.mark.asyncio

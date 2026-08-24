@@ -4459,6 +4459,210 @@ class TestRunComputeJob(unittest.TestCase):
             "the image pull must precede the run",
         )
 
+    # ── An unusable GPU is not a reason to fail a CPU-only job ──────────────
+    #
+    # `assigned_gpus` is populated from `caps.has_gpu` ALONE — it means "this
+    # host has GPUs", never "this job wants one". So on a GPU host every
+    # containerized job is handed a device, and an image whose CUDA runtime
+    # cannot drive that device used to kill work that had no stake in it. The
+    # blast radius grew with the environment contract: once a project's image is
+    # attached to ALL of its jobs (not only its GPU jobs), the arch pre-flight
+    # arms on every one of them.
+
+    def _fake_proc(self, popen_calls):
+        class FakeProc:
+            pid = 1
+            stdout = MagicMock()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+        proc = FakeProc()
+        proc.stdout.read.return_value = b""
+
+        def fake_popen(args, **kwargs):
+            popen_calls.append(list(args))
+            return proc
+
+        return fake_popen
+
+    _ARCH_MISMATCH = (
+        "docker: Error response from daemon: could not select device driver: "
+        "no supported gpu(s) detected to run this container."
+    )
+
+    def test_cpu_only_job_drops_an_unusable_gpu_and_runs(self):
+        """Conclusive arch mismatch + no declared accelerator → run CPU-only.
+
+        The job never asked for an accelerator. An arch mismatch is conclusive
+        about the DEVICE, not about the job, so the right answer is to hand the
+        device back and re-plan without it — not to fail work that would have
+        run fine on the CPU.
+        """
+        popen_calls = []
+        reports = []
+        released = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, **_kw):
+            reports.append(exec_status)
+            return False
+
+        real_release = local_runner._release_gpus
+
+        def spy_release(gpu_state, indices):
+            released.append(list(indices))
+            return real_release(gpu_state, indices)
+
+        job = self._make_job(
+            command="python3 train.py",
+            container_image="nvcr.io/nvidia/pytorch:latest",
+        )
+        gpu_state = _gpu_state([0])
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_release_gpus", spy_release), \
+             patch.object(
+                 iso, "pull_container_image",
+                 lambda plan, image, timeout=1800: (True, "pulled"),
+             ), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox",
+                 lambda plan, timeout=30: (False, self._ARCH_MISMATCH),
+             ), \
+             patch("subprocess.Popen", side_effect=self._fake_proc(popen_calls)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                {"test-job-001"}, threading.Lock(),
+                capabilities=_docker_caps(gpu_indices=(0,)),
+                gpu_state=gpu_state,
+            )
+
+        # It RAN. Before the fix this returned after reporting failed, so there
+        # was no container run at all.
+        docker_args = _docker_run_argv(self, popen_calls)
+        self.assertNotIn(
+            "--gpus", docker_args,
+            "the re-plan must drop the device, not merely survive the probe",
+        )
+        self.assertNotIn(
+            "failed", reports,
+            f"a CPU-only job must not be failed by a GPU it never asked for: {reports}",
+        )
+
+        # Released EXACTLY once. The finally-block release still runs, so
+        # `assigned_gpus` has to be cleared at the drop — otherwise a device
+        # another job claimed in between would be freed out from under it.
+        non_empty = [r for r in released if r]
+        self.assertEqual(
+            non_empty, [[0]],
+            f"expected one release of device 0, got {released!r}",
+        )
+        self.assertEqual(gpu_state["in_use"], set())
+
+    def test_declared_accelerator_still_dies_on_an_unusable_gpu(self):
+        """The job asked for a GPU and there is not a working one → fatal.
+
+        The relaxation above is scoped to jobs that declared no accelerator.
+        Silently demoting a declared-GPU job to CPU would turn a fast, honest
+        failure into a run that burns its full deadline and reports a number
+        measured on the wrong hardware.
+        """
+        popen_calls = []
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, command_log=None, **_kw):
+            reports.append((exec_status, (command_log or {}).get("text", "")))
+            return False
+
+        job = self._make_job(
+            command="python3 train.py",
+            container_image="nvcr.io/nvidia/pytorch:latest",
+            accelerator_type="nvidia-tesla-v100",
+        )
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(
+                 iso, "pull_container_image",
+                 lambda plan, image, timeout=1800: (True, "pulled"),
+             ), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox",
+                 lambda plan, timeout=30: (False, self._ARCH_MISMATCH),
+             ), \
+             patch("subprocess.Popen", side_effect=self._fake_proc(popen_calls)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                {"test-job-001"}, threading.Lock(),
+                capabilities=_docker_caps(gpu_indices=(0,)),
+                gpu_state=_gpu_state([0]),
+            )
+
+        self.assertFalse(
+            [c for c in popen_calls if _is_container_run(c)],
+            "a declared-GPU job must not run after a conclusive arch mismatch",
+        )
+        self.assertTrue(reports, "the abort must be reported")
+        status, text = reports[-1]
+        self.assertEqual(status, "failed")
+        self.assertIn("unusable", text)
+        self.assertIn("accelerator=nvidia-tesla-v100", text)
+
+    def test_inconclusive_probe_keeps_the_gpu_for_a_cpu_only_job(self):
+        """An inconclusive probe is not evidence the device is unusable.
+
+        "The probe could not run" (timeout, no nvidia-smi, empty device list)
+        says nothing about the GPU. Dropping the device on that would silently
+        demote every job on a host whose probe is merely flaky, so the
+        pre-existing behaviour — keep the device, proceed — must be untouched.
+        """
+        popen_calls = []
+        released = []
+
+        real_release = local_runner._release_gpus
+
+        def spy_release(gpu_state, indices):
+            released.append(list(indices))
+            return real_release(gpu_state, indices)
+
+        job = self._make_job(
+            command="python3 train.py",
+            container_image="nvcr.io/nvidia/pytorch:latest",
+        )
+
+        with patch.object(
+                 local_runner, "_report_compute_job",
+                 lambda *a, **kw: False,
+             ), \
+             patch.object(local_runner, "_release_gpus", spy_release), \
+             patch.object(
+                 iso, "pull_container_image",
+                 lambda plan, image, timeout=1800: (True, "pulled"),
+             ), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox",
+                 lambda plan, timeout=30: (False, "probe timed out after 30s"),
+             ), \
+             patch("subprocess.Popen", side_effect=self._fake_proc(popen_calls)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                {"test-job-001"}, threading.Lock(),
+                capabilities=_docker_caps(gpu_indices=(0,)),
+                gpu_state=_gpu_state([0]),
+            )
+
+        docker_args = _docker_run_argv(self, popen_calls)
+        self.assertIn(
+            "--gpus", docker_args,
+            "an inconclusive probe must not cost the job its device",
+        )
+        self.assertEqual(
+            [r for r in released if r], [[0]],
+            "the device is released once, by the normal teardown",
+        )
+
     def test_cancel_requested_on_claim_skips_execution(self):
         """When cancel_requested is True on the job body, no subprocess is started."""
         reports = []

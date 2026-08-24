@@ -2080,6 +2080,24 @@ def _no_data_terminal_reason(
     )
 
 
+def _criterion_free_terminal_reason(artifact_reference: Any | None) -> str:
+    """Say which way a criterion-free experiment's result contract resolved.
+
+    Two outcomes share this branch and they are opposites, so the reason has to
+    distinguish them: durable output satisfies the contract, nothing at all does
+    not. Callers must only reach here for a run that finished CLEAN -- a
+    criterion-free job that exited non-zero failed for its own reason, and
+    reporting "declared no metric" over the top of that hides the real cause.
+    """
+    if artifact_reference is None:
+        return _NO_CRITERION_EXPERIMENT_REASON
+    return (
+        "compute_experiment declared no metric; durable artifacts satisfy the "
+        f"result contract (uri={artifact_reference.uri}, "
+        f"file_count={artifact_reference.file_count})"
+    )
+
+
 def _job_expects_data(job: ComputeJob, task: Task | None) -> bool:
     """True when the job declared it should produce a metric or arms output.
 
@@ -2110,12 +2128,20 @@ def _job_expects_data(job: ComputeJob, task: Task | None) -> bool:
 def _is_criterion_free_experiment(job: "ComputeJob", task: Task | None) -> bool:
     """True for compute_experiment tasks that declared no metric and no criterion.
 
-    A compute_experiment is a measurement task by definition — finishing with no
-    declared metric, no arms, and no success_criterion is never a clean SUCCESS.
-    The run produced nothing evaluable, so it must be reclassified as FAILURE rather
-    than silently benefiting from the _job_expects_data carve-out that was designed
-    for pure side-effect commands. Non-experiment task types (research, plan, …) are
-    unaffected: they are legitimate side-effect jobs and the carve-out stays intact.
+    Such a run still has to produce SOMETHING, but the caller decides what counts:
+    a criterion-free experiment finishing with neither a number nor a durable
+    artifact is reclassified as FAILURE, while one that wrote durable output is a
+    clean SUCCESS. (The artifact half of that rule lives at the ``no_data``
+    computation in ``_process_single_compute_job``, which is where the artifact
+    reference is available.) Without the carve-out these jobs would silently
+    inherit the ``_job_expects_data`` exemption designed for pure side-effect
+    commands and complete clean having produced nothing at all.
+
+    Not every run worth doing emits a scalar — a training loop that writes
+    checkpoints has done its job — which is why durable output satisfies the
+    contract instead of an invented stand-in metric. Non-experiment task types
+    (research, plan, …) are unaffected: they are legitimate side-effect jobs and
+    the carve-out stays intact.
 
     Checks both the task payload AND the job's polling_metadata for a stamped
     declared_metric so a job created with an explicit declared_metric kwarg (which
@@ -3528,7 +3554,7 @@ async def _process_single_compute_job(
             and _job_expects_data(job, task)
             and _declared_metric_unmeasured(job, status)
         )
-        no_data = (
+        _measurement_missing = (
             not timeout_like
             and not no_usable_gpu
             and status.status == ComputeJobStatus.SUCCEEDED
@@ -3544,8 +3570,37 @@ async def _process_single_compute_job(
             )
         )
         terminal_artifact_reference = (
-            await collect_terminal_artifact_reference(job) if no_data else None
+            await collect_terminal_artifact_reference(job) if _measurement_missing else None
         )
+        # A criterion-free experiment is satisfied by DURABLE OUTPUT.
+        #
+        # Not every run worth doing emits a scalar. A training loop that runs for
+        # three hours and writes checkpoints has produced exactly what was asked
+        # of it, and failing it for lacking an accuracy number is the contract
+        # being wrong about the work, not the work being wrong. The corpus shows
+        # what that costs: with a scalar mandatory, 127 of 197 declared metrics
+        # are delivery plumbing rather than science -- the single commonest is
+        # "did my artifacts come back", declared 58 times. That metric is the
+        # author routing around this gate, so make the gate ask for the thing
+        # directly instead of accepting a number that restates it.
+        #
+        # Scope is deliberately narrow. Only the criterion-free branch is
+        # relaxed, and it is disjoint from the `_job_expects_data` branch by
+        # construction (criterion-free requires no declared_metric and no arms;
+        # _job_expects_data requires one of them). A job that DECLARED a metric
+        # and failed to report it is still `no_data` -- an unfulfilled promise is
+        # a different thing from never having made one, and artifacts do not
+        # excuse it.
+        #
+        # An empty artifact location still fails: a run that produced no number
+        # AND no output produced nothing, which is the case this gate was
+        # actually built for. `collect_terminal_artifact_reference` is fail-soft
+        # (any detection error degrades to None), so the failure direction on a
+        # detection fault is unchanged from today.
+        _criterion_free_satisfied_by_artifacts = bool(
+            _criterion_free_experiment and terminal_artifact_reference
+        )
+        no_data = _measurement_missing and not _criterion_free_satisfied_by_artifacts
         if timeout_like or no_progress_like:
             outcome = ComputeJobOutcome.TIMED_OUT
         elif no_usable_gpu or no_data:
@@ -3576,8 +3631,17 @@ async def _process_single_compute_job(
                     _NO_USABLE_GPU_TERMINAL_REASON
                     if no_usable_gpu
                     else (
-                        _NO_CRITERION_EXPERIMENT_REASON
-                        if _criterion_free_experiment
+                        # Gated on `_measurement_missing`, not on
+                        # `_criterion_free_experiment` alone. Being criterion-free is
+                        # a property of the JOB, not a cause of death: a
+                        # criterion-free run that exited non-zero must report the
+                        # failure it actually hit, not "declared no metric" over the
+                        # top of it. `_measurement_missing` is true here exactly when
+                        # the run finished clean and the result contract is what is
+                        # being judged -- which is both the no-artifact failure and
+                        # the artifact-satisfied success.
+                        _criterion_free_terminal_reason(terminal_artifact_reference)
+                        if _criterion_free_experiment and _measurement_missing
                         else (
                             _no_data_terminal_reason(
                                 terminal_artifact_reference,
