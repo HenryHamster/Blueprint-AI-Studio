@@ -320,6 +320,16 @@ COMPUTE_UNMEASURED_CRITERION = "compute_unmeasured_criterion"
 # substrate), so it routes to CODE_ERROR and burns the retry budget.
 COMPUTE_PREFLIGHT_SMOKE_FAILED = "compute_preflight_smoke_failed"
 
+# The compute job reached a terminal outcome that is neither SUCCESS nor an
+# intentional budget/deadline/operator kill -- i.e. the substrate's own verdict
+# on the run is FAILURE. Before this class existed the completion gate asked
+# only whether SOME terminal outcome and SOME cost were present, so a job the
+# platform itself had judged failed still recorded the task COMPLETED and the
+# research loop read it as a finished experiment. Routes to CODE_ERROR: the
+# command failed and must be fixed, so it should burn the retry budget and
+# drive diagnosis rather than be treated as a transient infra blip.
+COMPUTE_JOB_FAILED = "compute_job_failed"
+
 # A QUEUED task whose registry-declared execution site no dispatch path can
 # place (e.g. the qualifier's live-local-runner ``walkthrough_e2e`` site once
 # the task has been requeued and its site-pinned runner is gone). This is a

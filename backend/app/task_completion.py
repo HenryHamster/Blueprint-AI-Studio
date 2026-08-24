@@ -2996,6 +2996,23 @@ _COMPUTE_INTENTIONAL_KILL_OUTCOMES: frozenset[str] = frozenset(
     {"SPEND_CAP_EXCEEDED", "TIMED_OUT", "CANCELLED"}
 )
 
+# The terminal outcomes a compute_experiment may COMPLETE on. SUCCESS is the
+# measured case; the intentional kills above are honest, deliberate stops. Every
+# other terminal outcome -- today only FAILURE, since SMOKE_FAILED is intercepted
+# on its own fast path -- is the substrate saying the run failed, and must
+# terminate the task FAILED.
+#
+# Written as an ALLOW-list on purpose. The gate it feeds previously asked only
+# whether a terminal outcome and a cost EXISTED, never what the outcome said, so
+# FAILURE completed clean; a deny-list would reintroduce that shape the moment a
+# new ComputeJobOutcome member is added without touching this file. With an
+# allow-list an unclassified outcome fails closed and is loud.
+# ``test_every_compute_job_outcome_is_classified`` pins the partition against
+# the enum so adding a member forces a deliberate decision here.
+_COMPUTE_CLEAN_TERMINAL_OUTCOMES: frozenset[str] = frozenset(
+    {"SUCCESS"}
+) | _COMPUTE_INTENTIONAL_KILL_OUTCOMES
+
 
 def _compute_followup_is_opted_in(task: Task) -> bool:
     """Whether this experiment explicitly requests a disposition child.
@@ -3085,6 +3102,48 @@ def _record_unmeasured_compute_criterion_failure(
         EvaluationVerdict(False, miss_reason, "compute-unmeasured-criterion"),
     )
     persist_failure_category(task, COMPUTE_UNMEASURED_CRITERION)
+    return miss_reason
+
+
+def _record_failed_compute_outcome(
+    task: Task,
+    *,
+    outcome: str,
+    logs: str,
+) -> str | None:
+    """Fail loudly when the job's own terminal verdict says the run failed.
+
+    ``_extract_compute_measurement`` proves a terminal outcome and a cost are
+    PRESENT; it says nothing about what the outcome is. A job the substrate
+    finalized as FAILURE therefore reached ``final_status = COMPLETED`` and the
+    research loop read a finished experiment where there was a failed one. The
+    honest-terminal exemption belongs to SUCCESS and the intentional kills only.
+
+    Returns the recorded reason, or ``None`` when the outcome may complete clean.
+    """
+    if outcome in _COMPUTE_CLEAN_TERMINAL_OUTCOMES:
+        return None
+
+    from app.failure_classification import (
+        COMPUTE_JOB_FAILED,
+        persist_failure_category,
+    )
+
+    # Carry the job's own terminal_reason. Without it the operator gets the
+    # outcome enum and nothing else -- the state, not the reason.
+    terminal_reason = _compute_terminal_reason_of(None, logs)
+    miss_reason = (
+        f"compute_job_failed: the compute job reached terminal outcome="
+        f"{outcome} — the substrate judged the run failed, so the experiment "
+        f"must not record a clean completion"
+    )
+    if terminal_reason:
+        miss_reason = f"{miss_reason}; {terminal_reason}"
+    record_failed_gate(
+        task,
+        EvaluationVerdict(False, miss_reason, "compute-job-outcome"),
+    )
+    persist_failure_category(task, COMPUTE_JOB_FAILED)
     return miss_reason
 
 
@@ -4614,6 +4673,12 @@ async def _handle_compute_experiment_completion(
         outcome OR no measured cost must NOT complete clean. Mark it FAILED
         (terminal) — a compute_experiment spawns no children and opens no PR,
         so EVALUATING would hang forever and pin its parent.
+      * Terminal-outcome gate: the forward gate proves an outcome is PRESENT,
+        not that it is good. Only SUCCESS and the intentional budget/deadline/
+        operator kills may complete clean; every other terminal outcome (today
+        FAILURE — SMOKE_FAILED has its own fast path above) is the substrate
+        judging the run failed, and terminates the task FAILED with the job's
+        ``terminal_reason`` attached.
       * On pass: store the result on ``task.plan_output`` and mark COMPLETED.
         Budget/deadline kills carry an honest terminal outcome and a cost, so
         they pass the gate and surface through the task as COMPLETED with the
@@ -4844,6 +4909,29 @@ async def _handle_compute_experiment_completion(
                 owns_commit=owns_commit,
             )
             return
+        # A failed job is not consumable evidence either. Advisory prerequisite
+        # mode makes a MEASURED NEGATIVE useful to the dependent; a run the
+        # substrate finalized as FAILURE measured nothing, and unblocking a
+        # dependent on it is the same false-progress this gate exists to stop.
+        failed_outcome_reason = _record_failed_compute_outcome(
+            task, outcome=outcome, logs=logs
+        )
+        if failed_outcome_reason is not None:
+            logger.info(
+                "[COMPUTE] Prerequisite-mode task %s failed loud "
+                "(job outcome): %s",
+                task.id,
+                failed_outcome_reason,
+            )
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
+            )
+            return
         task.latest_status_message = (
             f"Compute prerequisite measured: outcome={outcome}, final_cost=${cost}"
             f", artifact_delivery={delivery['durability']}"
@@ -5018,6 +5106,54 @@ async def _handle_compute_experiment_completion(
             )
             # The failed criterion and partial result are durable. A follow-on
             # is exceptional and must be explicitly requested by the author.
+            if _compute_followup_is_opted_in(task):
+                if sweep_id:
+                    await _maybe_spawn_sweep_aggregate_followon(
+                        session,
+                        task,
+                        sweep_id,
+                        compute_result,
+                        logs,
+                        failure_mode=True,
+                        automatic_admission=_automatic_spawn_admission,
+                        locked_project=project,
+                        defer_unavailable=_defer_unavailable_spawn,
+                    )
+                else:
+                    await _spawn_act_on_verdict_followon(
+                        session,
+                        task,
+                        compute_result,
+                        logs,
+                        failure_mode=True,
+                        automatic_admission=_automatic_spawn_admission,
+                        locked_project=project,
+                        defer_unavailable=_defer_unavailable_spawn,
+                    )
+            await _finalize_compute_experiment(
+                session,
+                task,
+                TaskStatus.FAILED,
+                logs,
+                criterion,
+                owns_commit=owns_commit,
+            )
+            return
+        # The job's own terminal verdict is the last gate. Reached only after
+        # the criterion checks, so a declared-but-unmeasured metric keeps its
+        # more specific diagnosis; this catches the far commoner case of a run
+        # that declared no criterion at all and simply failed.
+        failed_outcome_reason = _record_failed_compute_outcome(
+            task, outcome=outcome, logs=logs
+        )
+        if failed_outcome_reason is not None:
+            logger.info(
+                "[COMPUTE] Task %s failed loud (job outcome): %s",
+                task.id,
+                failed_outcome_reason,
+            )
+            # Same disposition rule as every other failure branch: the durable
+            # record is always kept, a child is spawned only on explicit opt-in.
             if _compute_followup_is_opted_in(task):
                 if sweep_id:
                     await _maybe_spawn_sweep_aggregate_followon(
