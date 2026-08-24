@@ -11964,6 +11964,136 @@ class TestParseResultMetrics(unittest.TestCase):
         self.assertAlmostEqual(result["val"], -3.14)
         self.assertEqual(result["zero"], 0.0)
 
+    def test_arms_block_survives(self):
+        """The per-arm block is the one nested value the result contract carries.
+
+        It used to be dropped with every other non-scalar, which silently broke
+        EVERY multi-arm sweep -- the aggregator's per-arm numbers never left the
+        runner, so a fully successful sweep was reported as "never measured its
+        declared result".
+        """
+        path = self._write(
+            "result.json",
+            '{"arms": {"cpu": {"env_steps_per_sec": 812.5, "exit_code": 0},'
+            ' "gpu": {"env_steps_per_sec": 903.1, "exit_code": 0}}}',
+        )
+        result = local_runner._parse_result_metrics(path)
+        self.assertEqual(
+            result,
+            {
+                "arms": {
+                    "cpu": {"env_steps_per_sec": 812.5, "exit_code": 0},
+                    "gpu": {"env_steps_per_sec": 903.1, "exit_code": 0},
+                }
+            },
+        )
+
+    def test_failed_arm_diagnosis_survives(self):
+        """A failed arm's reason and stderr excerpt are the whole diagnostic."""
+        path = self._write(
+            "result.json",
+            '{"arms": {"cpu": {"error": "arm crashed (exit 1): result file not'
+            ' written", "exit_code": 1, "elapsed_seconds": 12.0,'
+            ' "stderr_excerpt": "ModuleNotFoundError: No module named mujoco"}}}',
+        )
+        result = local_runner._parse_result_metrics(path)
+        arm = result["arms"]["cpu"]
+        self.assertEqual(arm["exit_code"], 1)
+        self.assertEqual(arm["elapsed_seconds"], 12.0)
+        self.assertIn("result file not written", arm["error"])
+        self.assertIn("No module named mujoco", arm["stderr_excerpt"])
+
+    def test_arms_coexist_with_top_level_scalars(self):
+        path = self._write(
+            "result.json", '{"arms": {"a": {"v": 1}}, "note": "hi", "n": 2}'
+        )
+        self.assertEqual(
+            local_runner._parse_result_metrics(path),
+            {"arms": {"a": {"v": 1}}, "note": "hi", "n": 2},
+        )
+
+    def test_arm_reporting_nothing_is_kept_as_an_empty_arm(self):
+        """A silent arm must stay distinguishable from an undeclared one."""
+        path = self._write("result.json", '{"arms": {"cpu": {}}}')
+        self.assertEqual(
+            local_runner._parse_result_metrics(path), {"arms": {"cpu": {}}}
+        )
+
+    def test_non_arms_nested_values_are_still_dropped(self):
+        """result.json is job-authored: the scalar rule is what bounds it."""
+        path = self._write(
+            "result.json", '{"nested": {"a": 1}, "list": [1, 2], "ok": 1}'
+        )
+        self.assertEqual(local_runner._parse_result_metrics(path), {"ok": 1})
+
+    def test_arms_leaf_values_obey_the_scalar_rule(self):
+        path = self._write(
+            "result.json",
+            '{"arms": {"cpu": {"deep": {"x": 1}, "list": [1], "null": null,'
+            ' "good": 3}}}',
+        )
+        self.assertEqual(
+            local_runner._parse_result_metrics(path), {"arms": {"cpu": {"good": 3}}}
+        )
+
+    def test_arms_leaf_strings_are_byte_bounded(self):
+        path = self._write(
+            "result.json",
+            '{"arms": {"cpu": {"stderr_excerpt": "' + ("x" * 9000) + '"}}}',
+        )
+        result = local_runner._parse_result_metrics(path)
+        excerpt = result["arms"]["cpu"]["stderr_excerpt"]
+        self.assertLessEqual(len(excerpt.encode("utf-8")), 4096)
+
+    def test_arms_count_is_bounded(self):
+        arms = {f"a{i}": {"v": i} for i in range(200)}
+        path = self._write("result.json", json.dumps({"arms": arms}))
+        result = local_runner._parse_result_metrics(path)
+        self.assertEqual(len(result["arms"]), local_runner._ARMS_MAX_ARMS)
+
+    def test_keys_per_arm_are_bounded(self):
+        arm = {f"k{i}": i for i in range(200)}
+        path = self._write("result.json", json.dumps({"arms": {"cpu": arm}}))
+        result = local_runner._parse_result_metrics(path)
+        self.assertEqual(
+            len(result["arms"]["cpu"]), local_runner._ARMS_MAX_KEYS_PER_ARM
+        )
+
+    def test_non_dict_arms_value_is_dropped_not_crashed(self):
+        path = self._write("result.json", '{"arms": "nope", "ok": 1}')
+        self.assertEqual(local_runner._parse_result_metrics(path), {"ok": 1})
+
+    def test_arms_block_total_size_is_bounded(self):
+        """The backend stores the arms block verbatim, so the runner is the only
+        thing standing between a job-authored result.json and the JSON column."""
+        big = "x" * 4096
+        payload = {
+            "arms": {
+                f"arm{i}": {f"k{j}": big for j in range(64)} for i in range(64)
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "result.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            out = local_runner._parse_result_metrics(path)
+        assert out is not None
+        # LITERAL pin, deliberately not the constant: asserting against
+        # ``_ARMS_MAX_TOTAL_CHARS`` would pass no matter how far the cap was
+        # raised, which is the self-certifying-diff shape. 262144 is the bound
+        # this test is actually defending.
+        assert local_runner._ARMS_MAX_TOTAL_CHARS == 262144
+        assert len(json.dumps(out["arms"])) <= 262144
+        # It truncates rather than returning nothing: a partial arms block still
+        # names which arms ran.
+        assert out["arms"]
+
+    def test_non_dict_arm_body_is_skipped(self):
+        path = self._write("result.json", '{"arms": {"cpu": 5, "gpu": {"v": 1}}}')
+        self.assertEqual(
+            local_runner._parse_result_metrics(path), {"arms": {"gpu": {"v": 1}}}
+        )
+
 
 class TestClassifyViewable(_LocalRunnerTestCase):
     """_classify_viewable: extension → (content_type, kind) or None."""

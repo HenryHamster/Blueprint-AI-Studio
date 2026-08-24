@@ -3898,6 +3898,117 @@ async def test_no_data_guard_reclassifies_arms_with_incidental_artifact(
 
 
 @pytest.mark.asyncio
+async def test_failed_arms_terminal_reason_names_each_arm_failure(
+    db_session, monkeypatch
+):
+    """The aggregator already diagnoses each arm; the terminal reason must say it.
+
+    A three-arm sweep whose arms all died reported only "no usable result". The
+    per-arm reason and stderr tail existed on the record the whole time, so the
+    operator -- and the agent authoring the next revision -- had to guess. Three
+    consecutive live runs of the same experiment were burned that way.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={
+            "type": "research",
+            "declared_metric": "env_steps_per_sec",
+            "arms": {"cpu": {}, "gpu": {}},
+        },
+        status_metrics={
+            "arms": {
+                "cpu": {
+                    "error": "arm crashed (exit 1): result file not written",
+                    "exit_code": 1,
+                    "elapsed_seconds": 12.0,
+                    "stderr_excerpt": "ModuleNotFoundError: No module named 'mujoco'",
+                },
+                "gpu": {"error": "arm timed out (exit 124)", "exit_code": 124},
+            }
+        },
+        artifact_reference=None,
+    )
+    reason = job.terminal_reason or ""
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "never measured its declared result" in reason
+    assert "cpu: arm crashed (exit 1): result file not written" in reason
+    assert "No module named 'mujoco'" in reason
+    assert "gpu: arm timed out (exit 124)" in reason
+
+
+@pytest.mark.asyncio
+async def test_arms_bookkeeping_alone_is_not_reported_data(db_session, monkeypatch):
+    """exit_code and elapsed_seconds are numeric, but they measure nothing.
+
+    Every arm entry carries them, so counting them as data would let a sweep in
+    which EVERY arm crashed record a clean SUCCESS -- the exact silent success
+    the no-data guard exists to catch.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "arms": {"cpu": {"metric": "tflops"}}},
+        status_metrics={
+            "arms": {
+                "cpu": {
+                    "error": "arm result file not written (arm may have failed)",
+                    "exit_code": 1,
+                    "elapsed_seconds": 3.0,
+                }
+            }
+        },
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "cpu: arm result file not written" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_measured_arm_still_counts_as_reported_data(db_session, monkeypatch):
+    """The bookkeeping exclusion must not swallow a real per-arm measurement."""
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "arms": {"cpu": {"metric": "tflops"}}},
+        status_metrics={
+            "arms": {"cpu": {"tflops": 41.2, "exit_code": 0, "elapsed_seconds": 9.0}}
+        },
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_arm_bookkeeping_never_satisfies_a_declared_metric(
+    db_session, monkeypatch
+):
+    """Bookkeeping is not a measurement, even when the arm did measure something.
+
+    ``exit_code`` and ``elapsed_seconds`` are attached to EVERY arm by the
+    aggregator. If they resolved as metric names, a sweep that declared either
+    one would be recorded as having measured its hypothesis off a number the
+    platform wrote itself. The arm here reports a genuine metric too, so the
+    no-data guard is satisfied and this pins the metric-name resolver alone.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={
+            "type": "research",
+            "declared_metric": "exit_code",
+            "arms": {"cpu": {"metric": "exit_code"}},
+        },
+        status_metrics={
+            "arms": {"cpu": {"tflops": 41.2, "exit_code": 0, "elapsed_seconds": 9.0}}
+        },
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "exit_code" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
 async def test_no_data_guard_skips_side_effect_job(db_session, monkeypatch):
     """A pure side-effect job (no declared metric, no arms) that exits 0 with no
     metrics and no artifacts stays SUCCESS — the guard must not false-reject it."""

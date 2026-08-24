@@ -6755,8 +6755,86 @@ def _rehydrate_input_artifact(
     )
 
 
+# The per-arm result block is the ONE nested value in the result contract. It is
+# written by the platform's own aggregator (``compute_arm_aggregator.py``), and
+# the orchestrator reads it by exactly this key -- both to resolve a metric out
+# of an arm and to explain a failed arm. Every other nested value stays dropped:
+# ``result.json`` is job-authored, so the scalar-only rule is what bounds it.
+_ARMS_RESULT_KEY = "arms"
+_ARMS_MAX_ARMS = 64
+_ARMS_MAX_KEYS_PER_ARM = 64
+# The backend preserves the arms block VERBATIM (routers/runner.py
+# ``_filter_result_metrics``) -- it trusts the runner to have bounded it. The
+# per-arm and per-key caps alone still admit ~16MB, so the block also carries a
+# total byte budget: this is the only bound between a job-authored result.json
+# and a JSON column write.
+_ARMS_MAX_TOTAL_CHARS = 262144
+# Quotes, colon and comma around each rendered key/value pair.
+_ARMS_ENTRY_OVERHEAD_CHARS = 6
+
+
+def _bounded_scalar(value: object) -> object | None:
+    """Coerce one result value to a bounded scalar, or None if unusable."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")[:4096].decode("utf-8", errors="ignore")
+    return None
+
+
+def _parse_arms_block(value: object) -> dict | None:
+    """Bound the per-arm block to arm -> {scalar}, or None if unusable."""
+    if not isinstance(value, dict):
+        return None
+    arms: dict = {}
+    budget = _ARMS_MAX_TOTAL_CHARS
+    for arm_name, arm_body in value.items():
+        if len(arms) >= _ARMS_MAX_ARMS or budget <= 0:
+            break
+        if not isinstance(arm_name, str) or not isinstance(arm_body, dict):
+            continue
+        overhead = len(arm_name) + _ARMS_ENTRY_OVERHEAD_CHARS
+        if overhead > budget:
+            break
+        budget -= overhead
+        entry: dict = {}
+        for key, raw in arm_body.items():
+            if len(entry) >= _ARMS_MAX_KEYS_PER_ARM or not isinstance(key, str):
+                continue
+            scalar = _bounded_scalar(raw)
+            if scalar is None:
+                continue
+            cost = len(key) + len(str(scalar)) + _ARMS_ENTRY_OVERHEAD_CHARS
+            if cost > budget:
+                # Truncate the arm rather than abandoning the block: a partial
+                # arm still names which arm ran, and an over-budget FIRST arm
+                # must not collapse the whole result back to the silence this
+                # function exists to end.
+                budget = 0
+                break
+            budget -= cost
+            entry[key] = scalar
+        # Keep an EMPTY arm: "this arm reported nothing" is itself the finding,
+        # and dropping it would make a silent arm indistinguishable from one the
+        # sweep never declared.
+        arms[arm_name] = entry
+    return arms or None
+
+
 def _parse_result_metrics(result_file: str) -> dict | None:
-    """Read bounded scalar diagnostics from result.json (best-effort, tolerant)."""
+    """Read bounded diagnostics from result.json (best-effort, tolerant).
+
+    Scalars at the top level, plus the bounded per-arm block. The arms block
+    used to be dropped here along with every other non-scalar value, which
+    silently broke EVERY multi-arm sweep: the aggregator wrote
+    ``{"arms": {...}}`` -- each arm's measured metric on success, and its
+    ``error``/``exit_code``/``stderr_excerpt`` on failure -- this returned
+    ``None``, and the orchestrator then reported "exited 0 but never measured
+    its declared result" with no reason attached. The diagnostic existed on
+    disk the whole time and never left the runner.
+    """
     try:
         with open(result_file, encoding="utf-8") as fh:
             parsed = json.loads(fh.read())
@@ -6768,14 +6846,14 @@ def _parse_result_metrics(result_file: str) -> dict | None:
     for key, value in parsed.items():
         if len(filtered) >= 256 or not isinstance(key, str):
             continue
-        if isinstance(value, bool):
-            filtered[key] = value
-        elif isinstance(value, (int, float)) and math.isfinite(float(value)):
-            filtered[key] = value
-        elif isinstance(value, str):
-            filtered[key] = value.encode("utf-8")[:4096].decode(
-                "utf-8", errors="ignore"
-            )
+        if key == _ARMS_RESULT_KEY:
+            arms = _parse_arms_block(value)
+            if arms is not None:
+                filtered[key] = arms
+            continue
+        scalar = _bounded_scalar(value)
+        if scalar is not None:
+            filtered[key] = scalar
     return filtered or None
 
 
