@@ -3289,8 +3289,8 @@ class TestDigestMetricsModuleSeams:
 # ── Lane-waste convergence evidence ────────────────────────────────────────
 
 
-def test_lane_waste_reports_retarget_rereview_scope_and_converged_review_counts():
-    """Lane waste distinguishes stale re-review scope and counts only merged chains."""
+def test_lane_waste_reports_retarget_scope_and_exact_convergence_stats():
+    """Lane waste keeps exact merged-chain stats without serializing raw samples."""
     window_start = _utcnow() - timedelta(days=1)
     direction_id = "direction-retargeted"
 
@@ -3365,7 +3365,7 @@ def test_lane_waste_reports_retarget_rereview_scope_and_converged_review_counts(
 
     assert result["stale_head_discard_count"] == 1
     assert result["retarget_review_scope_counts"] == {"delta": 1, "full": 2}
-    assert result["converged_review_counts"] == [2]
+    assert "converged_review_counts" not in result
     assert result["reviews_to_converge"] == {"count": 1, "median": 2, "p95": 2}
 
     merged_chain = next(
@@ -3381,12 +3381,14 @@ def test_lane_waste_splits_reviews_to_converge_by_supersede_and_counts_cap_lost_
     """Supersedes stay one chain, while cap loss counts each attributed direction once."""
     window_start = _utcnow() - timedelta(days=1)
 
-    def _chain(*, pr_numbers, outcome, direction_id=None):
-        original_context = {}
+    def _chain(*, pr_numbers, outcome, direction_id=None, direction_text=None, rollup=False):
+        original_context = {"_is_rollup_review": True} if rollup else {}
         if outcome == "merged":
             original_context["pr_merged"] = True
         if direction_id is not None:
             original_context["direction_id"] = direction_id
+        if direction_text is not None:
+            original_context["direction_text"] = direction_text
         original = make_task(status=TaskStatus.COMPLETED, context=original_context)
         tasks = [original]
         for index, pr_number in enumerate(pr_numbers, start=1):
@@ -3398,10 +3400,14 @@ def test_lane_waste_splits_reviews_to_converge_by_supersede_and_counts_cap_lost_
                     "iteration": index,
                 }
             }
+            if rollup:
+                context["rollup_pr_number"] = pr_number
             if is_terminal_cap:
                 context["failure_detail"] = "review_cap_exhausted"
             if direction_id is not None:
                 context["direction_id"] = direction_id
+            if direction_text is not None:
+                context["direction_text"] = direction_text
             tasks.append(
                 make_task(
                     status=TaskStatus.FAILED if is_terminal_cap else TaskStatus.COMPLETED,
@@ -3411,17 +3417,28 @@ def test_lane_waste_splits_reviews_to_converge_by_supersede_and_counts_cap_lost_
             )
         return tasks
 
-    superseded = _chain(pr_numbers=["901", "902"], outcome="merged")
+    superseded = _chain(pr_numbers=["901", "902"], outcome="merged", rollup=True)
     same_pr = _chain(pr_numbers=["903", "903"], outcome="merged")
     same_pr[2].context["review_loop"]["head_drift_retargeted_from"] = {
         "pr_number": 700,
         "head_sha": "a" * 40,
     }
-    cap_one = _chain(pr_numbers=["904"], outcome="cap_exhausted", direction_id="d-shared")
-    cap_two = _chain(pr_numbers=["905"], outcome="cap_exhausted", direction_id="d-shared")
+    cap_one = _chain(
+        pr_numbers=["904"],
+        outcome="cap_exhausted",
+        direction_id="d-shared",
+        direction_text="Shared cap direction",
+    )
+    cap_two = _chain(
+        pr_numbers=["905"],
+        outcome="cap_exhausted",
+        direction_id="d-shared",
+        direction_text="Shared cap direction",
+    )
     cap_missing = _chain(pr_numbers=["906"], outcome="cap_exhausted")
+    control = _chain(pr_numbers=["907"], outcome="merged", rollup=True)
 
-    all_tasks = superseded + same_pr + cap_one + cap_two + cap_missing
+    all_tasks = superseded + same_pr + cap_one + cap_two + cap_missing + control
     result = compute_lane_waste_diagnostics(all_tasks, window_start)
 
     assert result["supersede_affected_chain_count"] == 2
@@ -3433,6 +3450,24 @@ def test_lane_waste_splits_reviews_to_converge_by_supersede_and_counts_cap_lost_
     }
     assert result["cap_exhausted_chain_count"] == 3
     assert result["cap_exhausted_direction_count"] == 1
+    assert result["cap_exhausted_directions"] == [
+        {"direction_id": "d-shared", "direction_text": "Shared cap direction"}
+    ]
+    assert result["rollup_chain_count"] == 2
+    assert result["rollup_supersede_affected_chain_count"] == 1
+    assert result["rollup_supersede_unaffected_chain_count"] == 1
+    assert result["rollup_supersede_affected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 2,
+        "p95": 2,
+    }
+    assert result["rollup_supersede_unaffected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 1,
+        "p95": 1,
+    }
     cap_summary = compute_review_cap_exhaustion_summary(
         [task for task in all_tasks if task.status == TaskStatus.FAILED],
         window_start=window_start,

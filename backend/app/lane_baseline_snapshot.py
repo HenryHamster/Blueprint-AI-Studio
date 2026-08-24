@@ -82,6 +82,9 @@ def _slim_baseline(baseline: Dict[str, Any]) -> Dict[str, Any]:
     if "lane_waste" in entry and isinstance(entry["lane_waste"], dict):
         lw = dict(entry["lane_waste"])
         lw.pop("chains", None)
+        # ``converged_review_counts`` was an unused unbounded legacy sample.
+        # Remove it before overflow shedding so it cannot evict durable metrics.
+        lw.pop("converged_review_counts", None)
         entry["lane_waste"] = lw
 
     for field in _SLIM_OVERFLOW_DROPPABLE:
@@ -317,6 +320,9 @@ async def persist_version_lane_baseline(
         "cap_exhausted_direction_count": convergence.get(
             "cap_exhausted_direction_count", 0
         ),
+        "cap_exhausted_directions": convergence.get(
+            "cap_exhausted_directions", []
+        ),
         "supersede_affected_chain_count": convergence.get(
             "supersede_affected_chain_count", 0
         ),
@@ -334,6 +340,37 @@ async def persist_version_lane_baseline(
         ).get("median"),
         "supersede_affected_reviews_to_converge_p95": (
             convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("p95"),
+        "rollup_chain_count": convergence.get("rollup_chain_count", 0),
+        "rollup_supersede_affected_chain_count": convergence.get(
+            "rollup_supersede_affected_chain_count", 0
+        ),
+        "rollup_supersede_unaffected_chain_count": convergence.get(
+            "rollup_supersede_unaffected_chain_count", 0
+        ),
+        "rollup_supersede_affected_reviews_to_converge_count": (
+            convergence.get("rollup_supersede_affected_reviews_to_converge") or {}
+        ).get("count", 0),
+        "rollup_supersede_affected_reviews_to_converge_sample_count": (
+            convergence.get("rollup_supersede_affected_reviews_to_converge") or {}
+        ).get("sample_count", 0),
+        "rollup_supersede_affected_reviews_to_converge_median": (
+            convergence.get("rollup_supersede_affected_reviews_to_converge") or {}
+        ).get("median"),
+        "rollup_supersede_affected_reviews_to_converge_p95": (
+            convergence.get("rollup_supersede_affected_reviews_to_converge") or {}
+        ).get("p95"),
+        "rollup_supersede_unaffected_reviews_to_converge_count": (
+            convergence.get("rollup_supersede_unaffected_reviews_to_converge") or {}
+        ).get("count", 0),
+        "rollup_supersede_unaffected_reviews_to_converge_sample_count": (
+            convergence.get("rollup_supersede_unaffected_reviews_to_converge") or {}
+        ).get("sample_count", 0),
+        "rollup_supersede_unaffected_reviews_to_converge_median": (
+            convergence.get("rollup_supersede_unaffected_reviews_to_converge") or {}
+        ).get("median"),
+        "rollup_supersede_unaffected_reviews_to_converge_p95": (
+            convergence.get("rollup_supersede_unaffected_reviews_to_converge") or {}
         ).get("p95"),
         "terminal_outcome_counts": convergence.get("terminal_outcome_histogram") or {},
     }

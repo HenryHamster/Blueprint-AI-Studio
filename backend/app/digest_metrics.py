@@ -94,6 +94,8 @@ from app.digest_outer_loop import (  # noqa: F401
     _TERMINAL_OUTCOME_KEYS,
     _ESCALATION_OUTCOME_KEYS,
     _outer_loop_pct,
+    _outer_loop_review_stats,
+    _bounded_direction_records,
     _outer_loop_chain_key,
     _outer_loop_terminal_outcome,
     _group_outer_loop_chains,
@@ -1125,8 +1127,14 @@ def compute_outer_loop_convergence(
     repeat_fingerprint_pr_count = 0
     overall_escalation_pr_count = 0
     cap_exhausted_direction_ids: set[str] = set()
+    cap_exhausted_direction_records: Dict[str, Optional[str]] = {}
     supersede_affected_chain_count = 0
     supersede_affected_merged_review_counts: List[int] = []
+    rollup_chain_count = 0
+    rollup_supersede_affected_chain_count = 0
+    rollup_supersede_unaffected_chain_count = 0
+    rollup_supersede_affected_review_counts: List[int] = []
+    rollup_supersede_unaffected_review_counts: List[int] = []
 
     # Parse escalation Alerts into per-chain reason sets + the deduped histogram.
     (
@@ -1182,6 +1190,9 @@ def compute_outer_loop_convergence(
             rejected_chains.add(key)
             if obs["direction_id"]:
                 cap_exhausted_direction_ids.add(obs["direction_id"])
+                cap_exhausted_direction_records.setdefault(
+                    obs["direction_id"], obs.get("direction_text")
+                )
         elif outcome == "repeat_fingerprint_halt":
             repeat_fingerprint_halt += 1
         if outcome == "stuck":
@@ -1199,6 +1210,20 @@ def compute_outer_loop_convergence(
                 supersede_affected_merged_review_counts.append(
                     obs["reviews_to_converge"]
                 )
+        if obs["is_rollup"]:
+            rollup_chain_count += 1
+            if obs["supersede_affected"]:
+                rollup_supersede_affected_chain_count += 1
+                if outcome == "merged" and obs["reviews_to_converge"] is not None:
+                    rollup_supersede_affected_review_counts.append(
+                        obs["reviews_to_converge"]
+                    )
+            else:
+                rollup_supersede_unaffected_chain_count += 1
+                if outcome == "merged" and obs["reviews_to_converge"] is not None:
+                    rollup_supersede_unaffected_review_counts.append(
+                        obs["reviews_to_converge"]
+                    )
 
         # Tally candidate non-convergence causes for the dominant-blocker ranking.
         # A chain is non-converged when it did NOT merge; it contributes to every
@@ -1283,6 +1308,9 @@ def compute_outer_loop_convergence(
         "escalation_by_reason": escalation_by_reason,
         "convergence_rate": convergence_rate,
         "cap_exhausted_direction_count": len(cap_exhausted_direction_ids),
+        "cap_exhausted_directions": _bounded_direction_records(
+            cap_exhausted_direction_records
+        ),
         "supersede_affected_chain_count": supersede_affected_chain_count,
         "supersede_affected_merged_chain_count": len(
             supersede_affected_merged_review_counts
@@ -1293,6 +1321,15 @@ def compute_outer_loop_convergence(
             "median": _outer_loop_pct(supersede_affected_merged_review_counts, 50),
             "p95": _outer_loop_pct(supersede_affected_merged_review_counts, 95),
         },
+        "rollup_chain_count": rollup_chain_count,
+        "rollup_supersede_affected_chain_count": rollup_supersede_affected_chain_count,
+        "rollup_supersede_unaffected_chain_count": rollup_supersede_unaffected_chain_count,
+        "rollup_supersede_affected_reviews_to_converge": _outer_loop_review_stats(
+            rollup_supersede_affected_review_counts
+        ),
+        "rollup_supersede_unaffected_reviews_to_converge": _outer_loop_review_stats(
+            rollup_supersede_unaffected_review_counts
+        ),
         "non_converged_total": non_converged_total,
         "dominant_blocker": dominant_blocker,
         # Non-code outcomes — ADDITIVE. Tasks without a review_loop context

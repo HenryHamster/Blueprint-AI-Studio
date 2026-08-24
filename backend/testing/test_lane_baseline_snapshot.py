@@ -161,10 +161,48 @@ class TestReadVersionLaneBaseline:
 
         lane_waste = result["lane_waste"]
         assert lane_waste["reviews_to_converge"]["median"] == 2
-        assert lane_waste["converged_review_counts"] == [1, 2, 3]
+        assert "converged_review_counts" not in lane_waste
         assert lane_waste["retarget_review_scope_counts"] == {"delta": 1, "full": 2}
         assert lane_waste["stale_head_discard_count"] == 4
         assert "chains" not in lane_waste
+
+    def test_slim_retains_lane_waste_at_snapshot_chain_ceiling(self):
+        """A 5,000-sample legacy payload cannot evict durable lane-waste data."""
+        baseline = {
+            "version_number": 12,
+            "lane_waste": {
+                "reviews_to_converge": {
+                    "count": 5_000,
+                    "median": 2_500.5,
+                    "p95": 4_750,
+                },
+                "converged_review_counts": list(range(1, 5_001)),
+                "retarget_review_scope_counts": {"delta": 1_234, "full": 567},
+                "stale_head_discard_count": 89,
+                "chains": [{"task_count": 99}] * 100,
+            },
+            "outer_loop_convergence": {
+                "iteration_median": 3,
+                "convergence_rate": 0.75,
+            },
+        }
+
+        result = _slim_baseline(baseline)
+
+        assert len(json.dumps(result).encode()) <= _MAX_BASELINE_ENTRY_BYTES
+        lane_waste = result["lane_waste"]
+        assert "converged_review_counts" not in lane_waste
+        assert "chains" not in lane_waste
+        assert lane_waste["reviews_to_converge"] == {
+            "count": 5_000,
+            "median": 2_500.5,
+            "p95": 4_750,
+        }
+        assert lane_waste["retarget_review_scope_counts"] == {
+            "delta": 1_234,
+            "full": 567,
+        }
+        assert lane_waste["stale_head_discard_count"] == 89
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +212,10 @@ class TestReadVersionLaneBaseline:
 
 class TestPersistVersionLaneBaseline:
     @pytest.mark.asyncio
-    async def test_persist_convergence_hydrates_original_outside_window(
+    async def test_persisted_convergence_reports_both_supersede_arms(
         self, db_session
     ):
-        """Convergence keeps merge and supersede metrics across version windows."""
+        """Persisted convergence separates rollup supersede and control arms."""
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -199,6 +237,7 @@ class TestPersistVersionLaneBaseline:
                 status=TaskStatus.COMPLETED,
                 payloads=[{"type": "review", "pr_number": 902}],
                 context={
+                    "rollup_pr_number": 902,
                     "review_loop": {
                         "original_task_id": str(original.id),
                         "pr_number": 902,
@@ -207,6 +246,30 @@ class TestPersistVersionLaneBaseline:
                     }
                 },
                 created_at=opened + timedelta(hours=1),
+            )
+        )
+        unaffected_original = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True, "_is_rollup_review": True},
+            created_at=opened - timedelta(days=1),
+        )
+        db_session.add(unaffected_original)
+        await db_session.flush()
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "review", "pr_number": 903}],
+                context={
+                    "rollup_pr_number": 903,
+                    "review_loop": {
+                        "original_task_id": str(unaffected_original.id),
+                        "pr_number": 903,
+                        "iteration": 1,
+                    }
+                },
+                created_at=opened + timedelta(hours=2),
             )
         )
         await db_session.commit()
@@ -226,6 +289,13 @@ class TestPersistVersionLaneBaseline:
         assert convergence["supersede_affected_chain_count"] == 1
         assert convergence["supersede_affected_reviews_to_converge_count"] == 1
         assert convergence["supersede_affected_reviews_to_converge_median"] == 1
+        assert convergence["rollup_chain_count"] == 2
+        assert convergence["rollup_supersede_affected_chain_count"] == 1
+        assert convergence["rollup_supersede_unaffected_chain_count"] == 1
+        assert convergence["rollup_supersede_affected_reviews_to_converge_count"] == 1
+        assert convergence["rollup_supersede_unaffected_reviews_to_converge_count"] == 1
+        assert convergence["rollup_supersede_affected_reviews_to_converge_median"] == 1
+        assert convergence["rollup_supersede_unaffected_reviews_to_converge_median"] == 1
 
     @pytest.mark.asyncio
     async def test_persist_keeps_supersede_percentiles_above_one_thousand_chains(

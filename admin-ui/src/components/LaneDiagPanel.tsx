@@ -69,6 +69,10 @@ function RetargetConvergenceTable({
 }: {
   laneWaste: LaneDiagResponse['lane_waste'];
 }) {
+  const affected = laneWaste.rollup_supersede_affected_reviews_to_converge
+    ?? laneWaste.supersede_affected_reviews_to_converge;
+  const unaffected = laneWaste.rollup_supersede_unaffected_reviews_to_converge;
+  const capDirections = laneWaste.cap_exhausted_directions ?? [];
   return (
     <table className="w-full text-xs">
       <thead>
@@ -90,11 +94,23 @@ function RetargetConvergenceTable({
         <tr className="border-b border-neutral-800/50">
           <td className="py-1 text-neutral-300">Superseded-rollup reviews to converge</td>
           <td className="py-1 text-right text-neutral-200">
-            {laneWaste.supersede_affected_reviews_to_converge?.median ?? '—'}{' '}
+            {affected?.median ?? '—'}{' '}
             <span className="text-neutral-500">
-              (median of {laneWaste.supersede_affected_reviews_to_converge?.count ?? 0} merged of{' '}
-              {laneWaste.supersede_affected_chain_count ?? 0} superseded chains, P95{' '}
-              {laneWaste.supersede_affected_reviews_to_converge?.p95 ?? '—'})
+              (median of {affected?.count ?? 0} merged of{' '}
+              {laneWaste.rollup_supersede_affected_chain_count
+                ?? laneWaste.supersede_affected_chain_count
+                ?? 0} superseded rollup chains, P95 {affected?.p95 ?? '—'})
+            </span>
+          </td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Rollup control reviews to converge</td>
+          <td className="py-1 text-right text-neutral-200">
+            {unaffected?.median ?? '—'}{' '}
+            <span className="text-neutral-500">
+              (median of {unaffected?.count ?? 0} merged of{' '}
+              {laneWaste.rollup_supersede_unaffected_chain_count ?? 0} unaffected rollup chains, P95{' '}
+              {unaffected?.p95 ?? '—'})
             </span>
           </td>
         </tr>
@@ -107,6 +123,14 @@ function RetargetConvergenceTable({
             </span>
           </td>
         </tr>
+        {capDirections.length > 0 && (
+          <tr className="border-b border-neutral-800/50">
+            <td className="py-1 text-neutral-300">Cap-loss directions</td>
+            <td className="py-1 text-right text-neutral-500">
+              {capDirections.map((direction) => direction.direction_text || direction.direction_id).join(', ')}
+            </td>
+          </tr>
+        )}
         <tr className="border-b border-neutral-800/50">
           <td className="py-1 text-neutral-300">Delta-scope retargets</td>
           <td className="py-1 text-right text-neutral-200">{laneWaste.retarget_review_scope_counts?.delta ?? 0}</td>
@@ -394,6 +418,14 @@ function CrossVersionTrendPanel({ trend }: { trend: LaneBaselineTrend }) {
             <TrendRow
               label="Superseded reviews to converge (P95)"
               block={trend.outer_loop_convergence?.supersede_affected_reviews_to_converge_p95}
+            />
+            <TrendRow
+              label="Rollup affected reviews (median)"
+              block={trend.outer_loop_convergence?.rollup_supersede_affected_reviews_to_converge_median}
+            />
+            <TrendRow
+              label="Rollup control reviews (median)"
+              block={trend.outer_loop_convergence?.rollup_supersede_unaffected_reviews_to_converge_median}
             />
           </tbody>
         </table>

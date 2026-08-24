@@ -996,7 +996,6 @@ def _make_baseline(
                 "median": reviews_to_converge_median,
                 "p95": reviews_to_converge_p95,
             },
-            "converged_review_counts": [],
             "retarget_review_scope_counts": {
                 "delta": retarget_delta_count,
                 "full": retarget_full_count,

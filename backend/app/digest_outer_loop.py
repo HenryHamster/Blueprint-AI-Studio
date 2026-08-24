@@ -41,6 +41,7 @@ _TERMINAL_OUTCOME_KEYS = frozenset(
     }
 )
 _ESCALATION_OUTCOME_KEYS = frozenset({"stuck", "standoff", "repeat_fingerprint_halt"})
+_CAP_EXHAUSTED_DIRECTION_LIMIT = 20
 
 
 def _outer_loop_pct(values: List[int], p: int) -> Optional[int]:
@@ -199,6 +200,60 @@ def _resolve_chain_outcome(
     return None
 
 
+def _outer_loop_is_rollup_chain(
+    chain_tasks: List[Task], outcome_tasks: List[Task]
+) -> bool:
+    """Return whether a chain carries the canonical rollup lineage marker."""
+    # Keep the predicate in review_pipeline authoritative.  The local import
+    # avoids making this pure digest helper part of review-pipeline imports.
+    from app.review_pipeline import _is_rollup_chain_source
+
+    return any(
+        _is_rollup_chain_source(task)
+        for task in [*chain_tasks, *outcome_tasks]
+    )
+
+
+def _outer_loop_direction_text(
+    direction_id: Optional[str], chain_tasks: List[Task], outcome_tasks: List[Task]
+) -> Optional[str]:
+    """Find the bounded human-readable label attached to a direction."""
+    if not direction_id:
+        return None
+    for task in [*chain_tasks, *outcome_tasks]:
+        context = task.context or {}
+        payload = task.first_payload or {}
+        candidate = (
+            context.get("direction_text")
+            or context.get("direction_name")
+            or payload.get("direction_text")
+            or payload.get("direction_name")
+        )
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()[:200]
+    return None
+
+
+def _bounded_direction_records(
+    direction_records: Dict[str, Optional[str]], limit: int = _CAP_EXHAUSTED_DIRECTION_LIMIT
+) -> List[Dict[str, Optional[str]]]:
+    """Return deterministic, bounded cap-loss direction records."""
+    return [
+        {"direction_id": direction_id, "direction_text": direction_text}
+        for direction_id, direction_text in sorted(direction_records.items())[:limit]
+    ]
+
+
+def _outer_loop_review_stats(values: List[int]) -> Dict[str, Any]:
+    """Summarize a reviews-to-converge population without truncating it."""
+    return {
+        "count": len(values),
+        "sample_count": len(values),
+        "median": _outer_loop_pct(values, 50),
+        "p95": _outer_loop_pct(values, 95),
+    }
+
+
 def _outer_loop_chain_observation(
     key: str,
     chain_tasks: List[Task],
@@ -279,6 +334,10 @@ def _outer_loop_chain_observation(
     outcome = _resolve_chain_outcome(outcome_tasks, chain_reasons)
     chain_pr_numbers = review_loop_pr_numbers | superseded_pr_numbers
     supersede_affected = len(chain_pr_numbers) > 1
+    is_rollup = _outer_loop_is_rollup_chain(chain_tasks, outcome_tasks)
+    direction_text = _outer_loop_direction_text(
+        direction_id, chain_tasks, outcome_tasks
+    )
 
     project_id = None
     for t in outcome_tasks:
@@ -293,6 +352,8 @@ def _outer_loop_chain_observation(
         "churn_count": chain_churn,
         "has_drift": chain_has_drift,
         "direction_id": direction_id,
+        "direction_text": direction_text,
+        "is_rollup": is_rollup,
         "review_count": review_count,
         "reviews_to_converge": review_count if outcome == "merged" else None,
         # A recreated PR remains one chain because the original-task identity

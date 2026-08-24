@@ -833,6 +833,10 @@ export interface LaneWasteDiagnostics {
   cap_exhausted_chain_count: number;
   /** Distinct directions that lost at least one chain to the review cap. */
   cap_exhausted_direction_count: number;
+  cap_exhausted_directions?: {
+    direction_id: string;
+    direction_text: string | null;
+  }[];
   /** Chains whose review loop crossed at least one PR boundary. */
   supersede_affected_chain_count: number;
   reviews_to_converge: {
@@ -847,7 +851,22 @@ export interface LaneWasteDiagnostics {
     median: number | null;
     p95: number | null;
   };
-  converged_review_counts: number[];
+  /** Rollup-only supersede-affected and unaffected control populations. */
+  rollup_chain_count?: number;
+  rollup_supersede_affected_chain_count?: number;
+  rollup_supersede_unaffected_chain_count?: number;
+  rollup_supersede_affected_reviews_to_converge?: {
+    count: number;
+    sample_count: number;
+    median: number | null;
+    p95: number | null;
+  };
+  rollup_supersede_unaffected_reviews_to_converge?: {
+    count: number;
+    sample_count: number;
+    median: number | null;
+    p95: number | null;
+  };
   retarget_review_scope_counts: {
     delta: number;
     full: number;
@@ -936,6 +955,10 @@ export interface LaneBaselineTrend {
     cap_exhausted_direction_count: LaneBaselineTrendBlock;
     supersede_affected_reviews_to_converge_median: LaneBaselineTrendBlock;
     supersede_affected_reviews_to_converge_p95: LaneBaselineTrendBlock;
+    rollup_supersede_affected_reviews_to_converge_median?: LaneBaselineTrendBlock;
+    rollup_supersede_affected_reviews_to_converge_p95?: LaneBaselineTrendBlock;
+    rollup_supersede_unaffected_reviews_to_converge_median?: LaneBaselineTrendBlock;
+    rollup_supersede_unaffected_reviews_to_converge_p95?: LaneBaselineTrendBlock;
   };
   retarget_convergence: {
     reviews_to_converge: {
@@ -958,6 +981,10 @@ export interface LaneBaselineConvergence {
   cap_exhausted_chain_count: number;
   /** Distinct directions that lost at least one chain to the review cap. */
   cap_exhausted_direction_count?: number;
+  cap_exhausted_directions?: {
+    direction_id: string;
+    direction_text: string | null;
+  }[];
   /** Chains that crossed at least one PR boundary (superseded rollups). */
   supersede_affected_chain_count?: number;
   supersede_affected_merged_chain_count?: number;
@@ -965,6 +992,17 @@ export interface LaneBaselineConvergence {
   supersede_affected_reviews_to_converge_sample_count?: number;
   supersede_affected_reviews_to_converge_median?: number | null;
   supersede_affected_reviews_to_converge_p95?: number | null;
+  rollup_chain_count?: number;
+  rollup_supersede_affected_chain_count?: number;
+  rollup_supersede_unaffected_chain_count?: number;
+  rollup_supersede_affected_reviews_to_converge_count?: number;
+  rollup_supersede_affected_reviews_to_converge_sample_count?: number;
+  rollup_supersede_affected_reviews_to_converge_median?: number | null;
+  rollup_supersede_affected_reviews_to_converge_p95?: number | null;
+  rollup_supersede_unaffected_reviews_to_converge_count?: number;
+  rollup_supersede_unaffected_reviews_to_converge_sample_count?: number;
+  rollup_supersede_unaffected_reviews_to_converge_median?: number | null;
+  rollup_supersede_unaffected_reviews_to_converge_p95?: number | null;
   terminal_outcome_counts: Record<string, number>;
 }
 

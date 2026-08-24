@@ -61,10 +61,15 @@ const mockLaneDiagResponse = {
     chain_count: 4,
     cap_exhausted_chain_count: 2,
     cap_exhausted_direction_count: 1,
+    cap_exhausted_directions: [{ direction_id: 'd-cap', direction_text: 'Cap direction' }],
     supersede_affected_chain_count: 3,
     reviews_to_converge: { count: 3, median: 2, p95: 5 },
     supersede_affected_reviews_to_converge: { count: 2, sample_count: 2, median: 6, p95: 9 },
-    converged_review_counts: [1, 2, 3],
+    rollup_chain_count: 3,
+    rollup_supersede_affected_chain_count: 2,
+    rollup_supersede_unaffected_chain_count: 1,
+    rollup_supersede_affected_reviews_to_converge: { count: 2, sample_count: 2, median: 6, p95: 9 },
+    rollup_supersede_unaffected_reviews_to_converge: { count: 1, sample_count: 1, median: 2, p95: 3 },
     retarget_review_scope_counts: { delta: 1, full: 2 },
     stale_head_discard_count: 0,
     chain_limit: 50,
@@ -131,6 +136,18 @@ const mockBaselinesResponse: LaneBaselinesResponse = {
       supersede_affected_reviews_to_converge_p95: {
         latest: 9, prior: 7, delta: 2, classification: 'declining',
       },
+      rollup_supersede_affected_reviews_to_converge_median: {
+        latest: 6, prior: 4, delta: 2, classification: 'declining',
+      },
+      rollup_supersede_affected_reviews_to_converge_p95: {
+        latest: 9, prior: 7, delta: 2, classification: 'declining',
+      },
+      rollup_supersede_unaffected_reviews_to_converge_median: {
+        latest: 2, prior: 3, delta: -1, classification: 'improving',
+      },
+      rollup_supersede_unaffected_reviews_to_converge_p95: {
+        latest: 3, prior: 4, delta: -1, classification: 'improving',
+      },
     },
     retarget_convergence: {
       reviews_to_converge: {
@@ -186,6 +203,8 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('Lost Reasoning')).toBeInTheDocument();
     // total waste tasks footer
     expect(screen.getByText(/Total waste tasks: 7/)).toBeInTheDocument();
+    expect(screen.getByText('Cap direction')).toBeInTheDocument();
+    expect(screen.getByText('Rollup control reviews to converge')).toBeInTheDocument();
   });
 
   it('renders checkpoint recovery waste section with by_reason breakdown', async () => {
@@ -294,9 +313,8 @@ describe('LaneDiagPanel', () => {
     // The two numbers the lane-waste measurement exists to answer must be
     // readable, not just computed and persisted.
     expect(screen.getByText('Superseded-rollup reviews to converge')).toBeInTheDocument();
-    expect(
-      screen.getAllByText(/median of 2 merged of 3 superseded chains, P95 9/).length,
-    ).toBeGreaterThan(0);
+    const affectedRow = screen.getByText('Superseded-rollup reviews to converge').closest('tr');
+    expect(affectedRow?.textContent).toContain('median of 2 merged of 2 superseded rollup chains, P95 9');
     expect(screen.getByText('Directions lost to the review cap')).toBeInTheDocument();
     expect(screen.getAllByText(/\(2 chains\)/).length).toBeGreaterThan(0);
   });
