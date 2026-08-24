@@ -4336,22 +4336,18 @@ async def _process_post_commit(
                             # to peek at ci_waiting first, and only acquire
                             # FOR UPDATE when we're committing to the rollup-
                             # handoff branch.
-                            _orig_peek = (
-                                (
-                                    await session.execute(
-                                        select(Task.context).where(
-                                            Task.id == uuid.UUID(original_task_id)
-                                        )
-                                    )
-                                )
-                                .scalars()
-                                .first()
+                            # Select `payloads` too: the merge chokepoint resolves
+                            # its base through the payload tier, and a context-only
+                            # peek cannot mirror that (see _peek_base below).
+                            _peek_stmt = select(Task.context, Task.payloads).where(
+                                Task.id == uuid.UUID(original_task_id)
                             )
+                            _peek_row = (await session.execute(_peek_stmt)).first()
+                            _peek_pl = ((_peek_row[1] if _peek_row else None) or [{}])[0]
+                            _peek_pl = _peek_pl if isinstance(_peek_pl, dict) else {}
                             _orig_peek_loop = (
-                                (_orig_peek or {}).get("review_loop", {})
-                                if _orig_peek
-                                else {}
-                            )
+                                (_peek_row[0] if _peek_row else None) or {}
+                            ).get("review_loop", {}) or {}
                             if _orig_peek_loop.get("ci_waiting"):
                                 # ── SITE A lock-window fix ──
                                 # When ci_waiting AND ci_passed are both set the
@@ -4374,7 +4370,6 @@ async def _process_post_commit(
                                 _pre_rollup_size_cap: object | None = None
                                 if _orig_peek_loop.get("ci_passed"):
                                     _peek_pr_num = _orig_peek_loop.get("pr_number")
-                                    _peek_base = _orig_peek_loop.get("base_branch", "")
                                     _peek_branch = _orig_peek_loop.get("branch", "")
                                     _peek_head = str(
                                         _orig_peek_loop.get("ci_checked_head_sha")
@@ -4389,14 +4384,21 @@ async def _process_post_commit(
                                         ) = await get_github_token_for_task(
                                             uuid.UUID(original_task_id), session
                                         )
+                                        _pre_rollup_proj = await session.get(Project, task.project_id)
+                                        # Mirror ci_completion's `ci_base` order
+                                        # exactly: any other order evaluates the
+                                        # guards against a branch this PR does
+                                        # not merge into.
+                                        _peek_base = (
+                                            _orig_peek_loop.get("base_branch", "")
+                                            or _peek_pl.get("base_branch", "")
+                                            or _shared_state.get_project_integration_branch(_pre_rollup_proj)
+                                        )
                                         if _peek_pr_num and _peek_base:
                                             from app.rollup_migration_validation import (
                                                 enforce_premerge_migration_guard as _emg_pre,
                                             )
 
-                                            _pre_rollup_proj = await session.get(
-                                                Project, task.project_id
-                                            )
                                             _pre_rollup_mig_guard = await _emg_pre(
                                                 _pre_rollup_gh,
                                                 _pre_rollup_own,
@@ -4411,11 +4413,8 @@ async def _process_post_commit(
                                                     else None
                                                 ),
                                             )
-                                        # Preflight every CI-reviewed PR before the lock and
-                                        # reuse its immutable head result in the locked path.
-                                        if (
-                                            _peek_pr_num and _peek_branch and _peek_head
-                                        ):
+                                        # Preflight and reuse each CI-reviewed PR before the lock.
+                                        if all((_peek_pr_num, _peek_branch, _peek_base, _peek_head)):
                                             from app.rollup_size_preflight import (
                                                 preflight_rollup_size_caps as _sc_pre,
                                             )
@@ -4430,6 +4429,7 @@ async def _process_post_commit(
                                                 if task.project_id
                                                 else None,
                                                 expected_head_sha=_peek_head,
+                                                target_branch=_peek_base,
                                             )
                                     except Exception as _pre_exc:
                                         logger.debug(

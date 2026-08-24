@@ -28,6 +28,7 @@ from sqlalchemy.exc import (
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
@@ -49,6 +50,8 @@ from app.models import (
     WakeDeliveryState,
     MigrationReservationStatus,
 )
+from app.rollup_migration_validation import PremergeMigrationGuardResult
+from app.rollup_size_preflight import SizeCapPreflightResult
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
     _has_active_strategic_task,
@@ -5807,6 +5810,151 @@ async def test_approve_same_head_unrelated_base_move_merges_without_respawn(
     merge_mock.assert_awaited_once()
     await session.refresh(review_task)
     assert (review_task.context or {}).get("_review_stale_target") is not True
+
+
+# ── Pre-lock rollup-handoff base resolution order ───────────────────────────
+#
+# The pre-lock site hoists the Alembic dual-head guard out of the parent's
+# FOR UPDATE window and hands the verdict to the merge chokepoint.  That
+# chokepoint resolves its merge target as
+# ``review_loop.base_branch -> first_payload.base_branch -> project integration
+# branch``; the pre-lock site MUST resolve the same target or its verdict
+# describes a different merge than the one submitted.
+
+
+async def _park_parent_in_ci_wait(
+    session, original, *, base_branch: str | None, pr_number: int = 5151
+):
+    """Park the rollup parent in ci_waiting+ci_passed with a chosen base tier."""
+    loop = {
+        "pr_number": pr_number,
+        "branch": "feat/x",
+        "ci_waiting": True,
+        "ci_passed": True,
+        "head_sha": "abc123",
+        "ci_checked_head_sha": "abc123",
+    }
+    if base_branch is not None:
+        loop["base_branch"] = base_branch
+    original.context = {**(original.context or {}), "review_loop": loop}
+    flag_modified(original, "context")
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+
+def _patch_pre_lock_handoff(mocker, *, payload_base: str):
+    """Patch the pre-lock guard/preflight/merge trio and return the mocks."""
+    guard_mock = mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new=AsyncMock(
+            return_value=PremergeMigrationGuardResult(
+                "ok", None, target_branch=payload_base
+            )
+        ),
+    )
+    preflight_mock = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new=AsyncMock(
+            return_value=SizeCapPreflightResult(
+                "ok", None, "abc123", payload_base
+            )
+        ),
+    )
+    merge_mock = mocker.patch(
+        "app.ci_completion._attempt_merge_with_retry_and_escalation",
+        new=AsyncMock(return_value=True),
+    )
+    return guard_mock, preflight_mock, merge_mock
+
+
+@pytest.mark.asyncio
+async def test_pre_lock_guard_uses_parent_payload_base_when_loop_lacks_one(
+    tl_db, mocker
+):
+    """review_loop has no base_branch → the parent's PAYLOAD base is used.
+
+    Regression: the pre-lock site read only ``Task.context``, so the payload
+    tier was structurally unavailable and an empty loop base jumped straight to
+    the project integration branch — evaluating the guard (and the size-cap
+    preflight) against a branch the merge chokepoint does not target.
+    """
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    original.payloads = [
+        {"type": "create", "prompt": "X", "base_branch": "release-v99"}
+    ]
+    flag_modified(original, "payloads")
+    await _park_parent_in_ci_wait(session, original, base_branch=None)
+    _patch_approve_merge_env(mocker)
+    guard_mock, preflight_mock, merge_mock = _patch_pre_lock_handoff(
+        mocker, payload_base="release-v99"
+    )
+
+    await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    guard_mock.assert_awaited_once()
+    assert guard_mock.await_args.args[4] == "release-v99", (
+        "pre-lock guard must resolve the payload base tier, not the project "
+        f"integration branch. Got: {guard_mock.await_args.args[4]!r}"
+    )
+    preflight_mock.assert_awaited_once()
+    assert preflight_mock.await_args.kwargs["target_branch"] == "release-v99"
+    merge_mock.assert_awaited_once()
+    assert (
+        merge_mock.await_args.kwargs["precomputed_migration_guard"].target_branch
+        == "release-v99"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_lock_guard_prefers_loop_base_over_payload_base(tl_db, mocker):
+    """review_loop.base_branch wins over the payload tier (chokepoint order)."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    original.payloads = [
+        {"type": "create", "prompt": "X", "base_branch": "release-v99"}
+    ]
+    flag_modified(original, "payloads")
+    await _park_parent_in_ci_wait(session, original, base_branch="automain")
+    _patch_approve_merge_env(mocker)
+    guard_mock, preflight_mock, _ = _patch_pre_lock_handoff(
+        mocker, payload_base="automain"
+    )
+
+    await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    guard_mock.assert_awaited_once()
+    assert guard_mock.await_args.args[4] == "automain"
+    assert preflight_mock.await_args.kwargs["target_branch"] == "automain"
+
+
+@pytest.mark.asyncio
+async def test_pre_lock_guard_falls_back_to_integration_branch(tl_db, mocker):
+    """With neither tier populated, the project integration branch is used."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    original.payloads = [{"type": "create", "prompt": "X", "base_branch": ""}]
+    flag_modified(original, "payloads")
+    await _park_parent_in_ci_wait(session, original, base_branch=None)
+    _patch_approve_merge_env(mocker)
+    guard_mock, _, _ = _patch_pre_lock_handoff(mocker, payload_base="automain")
+
+    await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    from app.shared_state import get_project_integration_branch
+
+    guard_mock.assert_awaited_once()
+    assert guard_mock.await_args.args[4] == get_project_integration_branch(project)
 
 
 @pytest.mark.asyncio

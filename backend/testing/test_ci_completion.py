@@ -22,6 +22,7 @@ from sqlalchemy.orm import sessionmaker
 from app.ci_completion import _normalize_merge_error, _review_approved
 from app.migration_reservations import allocate_migration_reservation
 from app.models import Alert, Project, Task, TaskStatus
+from app.rollup_migration_validation import PremergeMigrationGuardResult
 from app.rollup_size_preflight import SizeCapPreflightResult
 
 
@@ -53,8 +54,12 @@ def _default_size_cap_ok(mocker):
     Tests exercising the size-cap gate re-patch
     ``app.rollup_size_preflight.preflight_rollup_size_caps`` to override this.
     """
-    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
-        return SizeCapPreflightResult("ok", None, expected_head_sha)
+    async def _bound_ok(
+        *_args, expected_head_sha=None, target_branch=None, **_kwargs
+    ):
+        return SizeCapPreflightResult(
+            "ok", None, expected_head_sha, target_branch
+        )
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
@@ -4836,7 +4841,163 @@ async def test_precomputed_migration_guard_skips_inline_enforce_call(
         ),
     )
 
-    # Pass a pre-computed guard result — guard must NOT be called inline.
+    # Pass a pre-computed guard result bound to the same merge target the
+    # chokepoint resolves ("automain") — guard must NOT be called inline.
+    await _attempt_merge_with_retry_and_escalation(
+        task,
+        "gh-token",
+        "owner",
+        "repo",
+        db_session,
+        source="review_approval",
+        precomputed_migration_guard=PremergeMigrationGuardResult(
+            "ok", None, target_branch="automain"
+        ),
+    )
+
+    guard_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_precomputed_migration_guard_for_other_target_is_not_adopted(
+    db_session, mocker
+):
+    """A guard verdict evaluated against a different base must be recomputed.
+
+    The pre-lock site resolves the merge target from a narrower view of the
+    parent task than this chokepoint does. Adopting its verdict unconditionally
+    would let a verdict about branch X authorize a merge into branch Y.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    project = Project(
+        name="Guard mismatched-target test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        github_installation_id="inst-guard-3",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = _make_ci_waiting_task(db_session, project, pr_number=5502)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(project)
+
+    guard_mock = mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new=AsyncMock(
+            return_value=PremergeMigrationGuardResult(
+                "ok", None, target_branch="automain"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "sha": "abc123" * 6}),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "state": "open",
+                "mergeable_state": "clean",
+                "head": {"sha": "abc123" * 6, "ref": "blueprint/t-5502"},
+                "base": {"ref": "automain"},
+                "number": 5502,
+                "html_url": "http://pr/5502",
+            }
+        ),
+    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "success",
+                "details": [],
+                "failed_logs": "",
+            }
+        ),
+    )
+
+    await _attempt_merge_with_retry_and_escalation(
+        task,
+        "gh-token",
+        "owner",
+        "repo",
+        db_session,
+        source="review_approval",
+        # Verdict about a DIFFERENT branch than the resolved "automain" base.
+        precomputed_migration_guard=PremergeMigrationGuardResult(
+            "ok", None, target_branch="release-v99"
+        ),
+    )
+
+    guard_mock.assert_called_once()
+    assert guard_mock.call_args.args[4] == "automain"
+
+
+@pytest.mark.asyncio
+async def test_legacy_tuple_migration_guard_is_not_adopted(db_session, mocker):
+    """An unbound legacy tuple names no target, so it cannot skip the guard."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    project = Project(
+        name="Guard legacy-tuple test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        github_installation_id="inst-guard-4",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = _make_ci_waiting_task(db_session, project, pr_number=5503)
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(project)
+
+    guard_mock = mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new=AsyncMock(
+            return_value=PremergeMigrationGuardResult(
+                "ok", None, target_branch="automain"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "sha": "abc123" * 6}),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "state": "open",
+                "mergeable_state": "clean",
+                "head": {"sha": "abc123" * 6, "ref": "blueprint/t-5503"},
+                "base": {"ref": "automain"},
+                "number": 5503,
+                "html_url": "http://pr/5503",
+            }
+        ),
+    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "success",
+                "details": [],
+                "failed_logs": "",
+            }
+        ),
+    )
+
     await _attempt_merge_with_retry_and_escalation(
         task,
         "gh-token",
@@ -4847,7 +5008,7 @@ async def test_precomputed_migration_guard_skips_inline_enforce_call(
         precomputed_migration_guard=(True, None),
     )
 
-    guard_mock.assert_not_called()
+    guard_mock.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -6822,14 +6983,22 @@ async def test_size_cap_defer_returns_false_without_state_mutation(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_size_cap_old_precomputed_head_cannot_authorize_direct_merge(
+async def test_size_cap_old_precomputed_head_is_rechecked_before_direct_merge(
     db_session, mocker
 ):
-    """The pre-lock direct path cannot reuse a verdict from an older head."""
+    """A verdict from an older head is re-evaluated at the merge chokepoint."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
     merge_mock = mocker.patch(
         "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+    preflight_mock = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(
+            return_value=SizeCapPreflightResult(
+                "ok", None, "test-head-42", "main"
+            )
+        ),
     )
     project = Project(name="Stale size preflight test", user_id="test-user")
     db_session.add(project)
@@ -6851,9 +7020,110 @@ async def test_size_cap_old_precomputed_head_cannot_authorize_direct_merge(
         checked_base_sha="test-base-42",
     )
 
-    assert result is False
-    merge_mock.assert_not_awaited()
-    assert "verdict head differs" in (task.latest_status_message or "")
+    assert result is True
+    preflight_mock.assert_awaited_once()
+    assert preflight_mock.await_args.kwargs["target_branch"] == "main"
+    merge_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_precomputed_size_cap_without_merge_target_is_not_adopted(
+    db_session, mocker
+):
+    """A targetless pre-lock verdict is rechecked against the project trunk."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    project = Project(
+        name="Targetless size preflight test",
+        user_id="test-user",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    task.payloads = [{**task.payloads[0], "base_branch": ""}]
+    task.context = {
+        **(task.context or {}),
+        "review_loop": {
+            **(task.context or {}).get("review_loop", {}),
+            "base_branch": "",
+        },
+    }
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    preflight_mock = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(
+            return_value=SizeCapPreflightResult(
+                "ok", None, "test-head-42", "automain"
+            )
+        ),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="review_approval",
+        precomputed_size_cap=SizeCapPreflightResult(
+            "defer", "targetless pre-lock evaluation", "test-head-42"
+        ),
+        checked_head_sha="test-head-42",
+        checked_base_sha="test-base-42",
+    )
+
+    assert result is True
+    preflight_mock.assert_awaited_once()
+    assert preflight_mock.await_args.kwargs["target_branch"] == "automain"
+    merge_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_size_cap_matching_precomputed_target_is_reused(db_session, mocker):
+    """A pre-lock verdict with matching target and head skips recomputation."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    preflight_mock = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(side_effect=AssertionError("matching result must be reused")),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+
+    project = Project(name="Matching size target test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="review_approval",
+        precomputed_size_cap=SizeCapPreflightResult(
+            "ok", None, "test-head-42", "main"
+        ),
+        checked_head_sha="test-head-42",
+        checked_base_sha="test-base-42",
+    )
+
+    assert result is True
+    preflight_mock.assert_not_awaited()
+    merge_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -6929,7 +7199,9 @@ async def test_rollup_precomputed_size_clearance_does_not_repeat_or_bump_at_merg
         "repo",
         db_session,
         source="poll",
-        precomputed_size_cap=SizeCapPreflightResult("ok", None, "test-head-42"),
+        precomputed_size_cap=SizeCapPreflightResult(
+            "ok", None, "test-head-42", "main"
+        ),
     )
 
     assert result is True

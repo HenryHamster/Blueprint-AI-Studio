@@ -107,17 +107,19 @@ _SECTION_PREFIXES: dict[str, str] = SECTION_PATH_PREFIXES
 
 @dataclass(frozen=True)
 class SizeCapPreflightResult:
-    """A size-cap verdict bound to the immutable head it examined.
+    """A size-cap verdict bound to the target and immutable head it examined.
 
     ``head_sha`` is present only when the branch was successfully pinned and
     remained unchanged through evaluation.  Merge callers must use that exact
-    SHA as their expected head; a status/reason pair by itself is never merge
-    authority.
+    SHA as their expected head.  ``target_branch`` identifies the merge target
+    whose assembled tree was checked; a status/reason pair by itself is never
+    merge authority.
     """
 
     status: str
     reason: str | None
     head_sha: str | None = None
+    target_branch: str | None = None
 
     def __iter__(self):
         """Retain the two-value read-only unpacking used by diagnostic callers."""
@@ -145,13 +147,26 @@ async def preflight_rollup_size_caps(
     project_id: str | None = None,
     commit_bump: bool = True,
     expected_head_sha: str | None = None,
+    target_branch: str | None = None,
 ) -> SizeCapPreflightResult:
     """Check assembled-tree module sizes against caps; auto-bump on breach.
 
-    The returned result carries the exact immutable SHA that was examined.
+    The returned result carries the merge target and exact immutable SHA that
+    were examined.
     Callers may merge only an ``"ok"`` result whose ``head_sha`` equals both
-    their already-checked PR head and the merge API's expected head.
+    their already-checked PR head and the merge API's expected head, and whose
+    ``target_branch`` equals the merge target.
     """
+    def _result(
+        status: str, reason: str | None = None, *, head_sha: str | None = None
+    ) -> SizeCapPreflightResult:
+        return SizeCapPreflightResult(
+            status=status,
+            reason=reason,
+            head_sha=head_sha,
+            target_branch=target_branch,
+        )
+
     # Pin every read to one immutable branch tip. Branch-name content reads are
     # cached for ten minutes and were the direct cause of repeated stale bumps:
     # after the first commit, each poll kept re-reading the old caps document.

@@ -254,6 +254,7 @@ async def _attempt_merge_with_retry_and_escalation(
         from app.migration_reservations import get_migration_reservation_for_task
         from app.rollup_management import attempt_pr_migration_finalization
         from app.rollup_migration_validation import (
+            PremergeMigrationGuardResult,
             enforce_premerge_migration_guard,
         )
 
@@ -269,7 +270,18 @@ async def _attempt_merge_with_retry_and_escalation(
             spawn_migration_guard_fix_task,
         )
 
-        if precomputed_migration_guard is not None:
+        # A pre-computed verdict is reusable only when it proves the merge
+        # target this chokepoint actually resolved.  The pre-lock site resolves
+        # its base from a narrower view of the parent task, so an unbound or
+        # differently-targeted verdict says nothing about the merge submitted
+        # here — recompute inline rather than adopting it (parity with the
+        # size-cap reuse check below).
+        _reuse_precomputed_guard = (
+            isinstance(precomputed_migration_guard, PremergeMigrationGuardResult)
+            and bool(ci_base)
+            and precomputed_migration_guard.is_bound_to_target(ci_base)
+        )
+        if _reuse_precomputed_guard:
             _guard_result = precomputed_migration_guard
         else:
             _guard_result = await enforce_premerge_migration_guard(
@@ -408,7 +420,17 @@ async def _attempt_merge_with_retry_and_escalation(
             )[:500]
             session.add(task)
             return False
-        if precomputed_size_cap is not None:
+        # A pre-lock verdict is reusable only when it proves both sides of the
+        # merge identity: the immutable candidate head and the resolved merge
+        # target.  In particular, a targetless defer must not suppress this
+        # chokepoint's integration-branch evaluation.
+        _reuse_precomputed_size_cap = (
+            isinstance(precomputed_size_cap, SizeCapPreflightResult)
+            and bool(ci_base)
+            and precomputed_size_cap.target_branch == ci_base
+            and precomputed_size_cap.is_bound_to(_sc_expected_head)
+        )
+        if _reuse_precomputed_size_cap:
             _sc_result = precomputed_size_cap
         else:
             _sc_result = await preflight_rollup_size_caps(
@@ -419,6 +441,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 ci_branch,
                 project_id=str(task.project_id) if task.project_id else None,
                 expected_head_sha=_sc_expected_head,
+                target_branch=ci_base,
             )
         if not isinstance(_sc_result, SizeCapPreflightResult):
             # No compatibility path: allowing legacy unkeyed tuples turns the
