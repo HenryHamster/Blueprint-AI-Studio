@@ -18,6 +18,8 @@ from app.digest_outer_loop import (
     _outer_loop_chain_observation,
     _outer_loop_pct,
     _outer_loop_review_stats,
+    _new_rollup_convergence_fold,
+    _fold_rollup_convergence_arm,
     _bounded_direction_records,
     _outer_loop_terminal_outcome,
     _scan_escalation_alerts,
@@ -179,11 +181,7 @@ def compute_lane_waste_diagnostics(
     supersede_affected_merged_review_counts: List[int] = []
     cap_exhausted_direction_ids: set[str] = set()
     cap_exhausted_direction_records: Dict[str, Optional[str]] = {}
-    rollup_chain_count = 0
-    rollup_supersede_affected_chain_count = 0
-    rollup_supersede_unaffected_chain_count = 0
-    rollup_supersede_affected_review_counts: List[int] = []
-    rollup_supersede_unaffected_review_counts: List[int] = []
+    rollup_convergence = _new_rollup_convergence_fold()
     chain_rows: List[Dict[str, Any]] = []
 
     alert_reasons_by_chain = {}
@@ -242,20 +240,7 @@ def compute_lane_waste_diagnostics(
                 supersede_affected_merged_review_counts.append(
                     obs["reviews_to_converge"]
                 )
-        if obs["is_rollup"]:
-            rollup_chain_count += 1
-            if obs["supersede_affected"]:
-                rollup_supersede_affected_chain_count += 1
-                if outcome == "merged" and obs["reviews_to_converge"] is not None:
-                    rollup_supersede_affected_review_counts.append(
-                        obs["reviews_to_converge"]
-                    )
-            else:
-                rollup_supersede_unaffected_chain_count += 1
-                if outcome == "merged" and obs["reviews_to_converge"] is not None:
-                    rollup_supersede_unaffected_review_counts.append(
-                        obs["reviews_to_converge"]
-                    )
+        _fold_rollup_convergence_arm(rollup_convergence, obs)
 
         # Newest-first drilldown rows within the chain.
         task_rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
@@ -309,14 +294,18 @@ def compute_lane_waste_diagnostics(
             "median": _outer_loop_pct(supersede_affected_merged_review_counts, 50),
             "p95": _outer_loop_pct(supersede_affected_merged_review_counts, 95),
         },
-        "rollup_chain_count": rollup_chain_count,
-        "rollup_supersede_affected_chain_count": rollup_supersede_affected_chain_count,
-        "rollup_supersede_unaffected_chain_count": rollup_supersede_unaffected_chain_count,
+        "rollup_chain_count": rollup_convergence["chain_count"],
+        "rollup_supersede_affected_chain_count": rollup_convergence[
+            "supersede_affected_chain_count"
+        ],
+        "rollup_supersede_unaffected_chain_count": rollup_convergence[
+            "supersede_unaffected_chain_count"
+        ],
         "rollup_supersede_affected_reviews_to_converge": _outer_loop_review_stats(
-            rollup_supersede_affected_review_counts
+            rollup_convergence["supersede_affected_review_counts"]
         ),
         "rollup_supersede_unaffected_reviews_to_converge": _outer_loop_review_stats(
-            rollup_supersede_unaffected_review_counts
+            rollup_convergence["supersede_unaffected_review_counts"]
         ),
         "stale_head_discard_count": stale_head_discard_count,
         "retarget_review_scope_counts": retarget_review_scope_counts,

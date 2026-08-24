@@ -254,6 +254,39 @@ def _outer_loop_review_stats(values: List[int]) -> Dict[str, Any]:
     }
 
 
+def _new_rollup_convergence_fold() -> Dict[str, Any]:
+    """Create the shared rollup convergence-arm accumulator.
+
+    The outer-loop convergence and lane-waste reducers expose the same rollup
+    population. Keeping the population fold here prevents their denominators
+    and merged-only review samples from drifting apart.
+    """
+    return {
+        "chain_count": 0,
+        "supersede_affected_chain_count": 0,
+        "supersede_unaffected_chain_count": 0,
+        "supersede_affected_review_counts": [],
+        "supersede_unaffected_review_counts": [],
+    }
+
+
+def _fold_rollup_convergence_arm(
+    fold: Dict[str, Any], observation: Dict[str, Any]
+) -> None:
+    """Add one chain observation to the shared rollup convergence arms."""
+    if not observation["is_rollup"]:
+        return
+
+    fold["chain_count"] += 1
+    arm = "supersede_affected" if observation["supersede_affected"] else "supersede_unaffected"
+    fold[f"{arm}_chain_count"] += 1
+    if (
+        observation["outcome"] == "merged"
+        and observation["reviews_to_converge"] is not None
+    ):
+        fold[f"{arm}_review_counts"].append(observation["reviews_to_converge"])
+
+
 def _outer_loop_chain_observation(
     key: str,
     chain_tasks: List[Task],

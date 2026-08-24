@@ -3589,6 +3589,70 @@ def test_outer_loop_supersede_percentiles_include_all_affected_chains():
     }
 
 
+def test_convergence_fold_emits_identical_arms_for_both_consumers():
+    """Both reducers use one fold for merged-only rollup convergence arms."""
+    window_start = _utcnow() - timedelta(days=1)
+
+    def _rollup_chain(pr_numbers, *, merged):
+        original_context = {"_is_rollup_review": True}
+        if merged:
+            original_context["pr_merged"] = True
+        original = make_task(status=TaskStatus.COMPLETED, context=original_context)
+        tasks = [original]
+        for iteration, pr_number in enumerate(pr_numbers, start=1):
+            tasks.append(
+                make_task(
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "review", "pr_number": pr_number}],
+                    context={
+                        "rollup_pr_number": pr_number,
+                        "review_loop": {
+                            "original_task_id": str(original.id),
+                            "pr_number": pr_number,
+                            "iteration": iteration,
+                        },
+                    },
+                )
+            )
+        return tasks
+
+    tasks = (
+        _rollup_chain([901, 902], merged=True)
+        + _rollup_chain([903], merged=True)
+        + _rollup_chain([904, 905], merged=False)
+    )
+    convergence = compute_outer_loop_convergence(
+        all_tasks=tasks, escalation_alerts=[], window_start=window_start
+    )
+    lane_waste = compute_lane_waste_diagnostics(tasks, window_start)
+    arm_keys = (
+        "rollup_chain_count",
+        "rollup_supersede_affected_chain_count",
+        "rollup_supersede_unaffected_chain_count",
+        "rollup_supersede_affected_reviews_to_converge",
+        "rollup_supersede_unaffected_reviews_to_converge",
+    )
+
+    assert {key: convergence[key] for key in arm_keys} == {
+        key: lane_waste[key] for key in arm_keys
+    }
+    assert convergence["rollup_chain_count"] == 3
+    assert convergence["rollup_supersede_affected_chain_count"] == 2
+    assert convergence["rollup_supersede_unaffected_chain_count"] == 1
+    assert convergence["rollup_supersede_affected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 2,
+        "p95": 2,
+    }
+    assert convergence["rollup_supersede_unaffected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 1,
+        "p95": 1,
+    }
+
+
 # ── Auto-pause epidemic summary ────────────────────────────────────────────
 
 
