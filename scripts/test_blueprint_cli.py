@@ -68,42 +68,6 @@ def _hermetic_blueprint_config(monkeypatch, tmp_path):
     monkeypatch.setattr(blueprint_api, "_config_cache", None)
 
 
-@pytest.fixture(autouse=True)
-def _hermetic_blueprint_config(monkeypatch, tmp_path):
-    """Guarantee blueprint_api.load_config() resolves without touching the host.
-
-    Most tests here mock blueprint_api.api directly, but several blueprint.py
-    helpers call the *real* load_config() unconditionally on the way to that
-    mocked api() (e.g. _using_scoped_service_credential(), which many CLI
-    flows consult before ever making a request). On a dev host that has an
-    ambient ~/.blueprint-config.json or repo-root .blueprint-config.json,
-    that real call silently succeeds — but the CI lane runs this file with
-    --noconftest in a container with no config anywhere in the search order
-    (see blueprint_api._config_search_paths), so the same call raises
-    APIError there. Point BLUEPRINT_CONFIG at a throwaway file with the
-    minimal shape load_config()/api() actually read (api_url, api_key) so
-    every test gets the same deterministic, host-independent resolution
-    regardless of what config files exist on the machine running pytest.
-    BLUEPRINT_CONFIG is checked first in load_config(), ahead of the
-    BLUEPRINT_API_URL/KEY pair, the repo-root/home search paths, and the
-    gcloud/agent-token fallbacks, so this fully short-circuits config
-    discovery. Also reset the process-global _config_cache so no test can
-    leak a resolved config into the next one.
-
-    Tests that exercise load_config()'s own search/precedence/error behavior
-    (test_load_config_*) or that replace load_config() outright override this
-    fixture via their own monkeypatch calls, which run after this fixture's
-    setup and are undone independently at teardown.
-    """
-    dummy_config = tmp_path / "hermetic-blueprint-config.json"
-    dummy_config.write_text(
-        json.dumps({"api_url": "https://blueprint-cli-test.invalid", "api_key": "test-key"}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("BLUEPRINT_CONFIG", str(dummy_config))
-    monkeypatch.setattr(blueprint_api, "_config_cache", None)
-
-
 def test_get_project_id_matches_configured_default_repo(monkeypatch):
     """Unscoped commands target the configured repo, not API list position."""
     monkeypatch.delenv("BLUEPRINT_PROJECT_ID", raising=False)
@@ -155,6 +119,375 @@ def test_get_project_id_refuses_ambiguous_unconfigured_fallback(
         blueprint_api.get_project_id()
 
     assert "multiple projects" in capsys.readouterr().err.lower()
+
+
+# ── operator ergonomics: id prefixes and a project that does not exist ───────
+#
+# Every id this CLI prints is truncated to 8 chars, and an explicit --project-id
+# that names nothing used to return an empty listing. Both turned a wrong
+# selection into output that reads like a correct one.
+
+_PREFIX_PROJECT = "37d445e1-0775-4403-bacf-1cd7ed129336"
+
+
+def test_full_uuid_task_id_is_returned_without_an_api_call(monkeypatch):
+    """The common case must stay free -- no listing walk to confirm a uuid."""
+    calls = []
+
+    def _fake_api(*args, **kwargs):
+        calls.append(args)
+        return {"tasks": []}
+
+    monkeypatch.setattr(blueprint_api, "api", _fake_api)
+    full = "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+
+    assert blueprint_api.resolve_task_id_by_prefix(full, _PREFIX_PROJECT) == full
+    assert calls == []
+
+
+def test_a_full_uuid_never_triggers_project_resolution(monkeypatch):
+    """`tasks show <uuid>` must not pay a project-catalog round trip.
+
+    The gate exists because resolution needs a project id, and resolving one
+    costs an API call. Asking for it unconditionally made every id-addressed
+    command slower than it was before prefixes were supported.
+    """
+    def _never(*args, **kwargs):
+        raise AssertionError("resolution must not be attempted for a full uuid")
+
+    monkeypatch.setattr(blueprint_api, "list_projects", _never)
+    monkeypatch.setattr(blueprint_api, "api", _never)
+
+    assert not blueprint_api.task_id_needs_prefix_resolution(
+        "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+    )
+    assert not blueprint_api.task_id_needs_prefix_resolution("task-123")
+    assert not blueprint_api.task_id_needs_prefix_resolution(None)
+    assert blueprint_api.task_id_needs_prefix_resolution("30d5ff95")
+
+
+def test_task_id_prefix_resolves_to_the_single_match(monkeypatch, capsys):
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_key": "admin-key"}
+    )
+    monkeypatch.setattr(
+        blueprint_api,
+        "api",
+        lambda method, path, body=None, timeout=30: {
+            "tasks": [
+                {
+                    "id": "30d5ff95-5cd5-4413-8772-1f0e15067b47",
+                    "status": "EVALUATING",
+                    "title": "the intended task",
+                },
+                {
+                    "id": "aabbccdd-0000-0000-0000-000000000000",
+                    "status": "COMPLETED",
+                    "title": "something else",
+                },
+            ]
+        },
+    )
+
+    resolved = blueprint_api.resolve_task_id_by_prefix("30d5ff95", _PREFIX_PROJECT)
+
+    assert resolved == "30d5ff95-5cd5-4413-8772-1f0e15067b47"
+    # The resolution is announced on stderr: an operator must be able to see
+    # which task a prefix actually hit, not just that it hit one.
+    err = capsys.readouterr().err
+    assert "30d5ff95-5cd5-4413-8772-1f0e15067b47" in err
+    assert "the intended task" in err
+
+
+def test_ambiguous_task_id_prefix_lists_every_candidate(monkeypatch, capsys):
+    """Two matches must never silently resolve to whichever sorted first."""
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_key": "admin-key"}
+    )
+    monkeypatch.setattr(
+        blueprint_api,
+        "api",
+        lambda method, path, body=None, timeout=30: {
+            "tasks": [
+                {
+                    "id": "abc12300-0000-0000-0000-000000000001",
+                    "status": "FAILED",
+                    "title": "first",
+                },
+                {
+                    "id": "abc12300-0000-0000-0000-000000000002",
+                    "status": "QUEUED",
+                    "title": "second",
+                },
+            ]
+        },
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint_api.resolve_task_id_by_prefix("abc123", _PREFIX_PROJECT)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "ambiguous" in err
+    assert "abc12300-0000-0000-0000-000000000001" in err
+    assert "abc12300-0000-0000-0000-000000000002" in err
+
+
+def test_unmatched_task_id_prefix_names_the_project_it_searched(monkeypatch, capsys):
+    """A miss must say which project came up empty, not just 404."""
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_key": "admin-key"}
+    )
+    monkeypatch.setattr(
+        blueprint_api,
+        "api",
+        lambda method, path, body=None, timeout=30: {"tasks": []},
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint_api.resolve_task_id_by_prefix("deadbeef", _PREFIX_PROJECT)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "no task in project" in err
+    assert _PREFIX_PROJECT in err
+    assert "deadbeef" in err
+
+
+def test_prefix_resolution_is_one_server_filtered_request(monkeypatch):
+    """The match happens in SQL, not by paging the listing client-side.
+
+    This is a cost pin, not a style preference. The scan this replaced asked
+    for up to six 500-row pages of /api/admin/tasks, and a single page measured
+    ~48s against the live control plane because every row carries description,
+    payloads, history and error_logs -- about five minutes to answer "which
+    task is 30d5ff95". Any regression to client-side paging shows up here as a
+    second request or a missing id_prefix.
+    """
+    requests = []
+
+    def _fake_api(method, path, body=None, timeout=30):
+        requests.append((method, path))
+        return {
+            "tasks": [
+                {
+                    "id": "30d5ff95-5cd5-4413-8772-1f0e15067b47",
+                    "status": "EVALUATING",
+                    "title": "the intended task",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_key": "admin-key"}
+    )
+    monkeypatch.setattr(blueprint_api, "api", _fake_api)
+
+    blueprint_api.resolve_task_id_by_prefix("30d5ff95", _PREFIX_PROJECT)
+
+    assert len(requests) == 1, requests
+    method, path = requests[0]
+    assert method == "GET"
+    assert "id_prefix=30d5ff95" in path
+    assert f"project_id={_PREFIX_PROJECT}" in path
+    assert "offset=" not in path
+
+
+def test_prefix_resolution_uses_the_scoped_route_for_a_scoped_key(monkeypatch):
+    """A bpsc_ credential has no admin listing; it must use agent-access."""
+    requests = []
+
+    def _fake_api(method, path, body=None, timeout=30):
+        requests.append(path)
+        return {
+            "tasks": [
+                {"id": "30d5ff95-5cd5-4413-8772-1f0e15067b47", "status": "QUEUED"}
+            ]
+        }
+
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_key": "bpsc_scoped"}
+    )
+    monkeypatch.setattr(blueprint_api, "api", _fake_api)
+
+    blueprint_api.resolve_task_id_by_prefix("30d5ff95", _PREFIX_PROJECT)
+
+    assert requests[0].startswith("/api/agent-access/v1/tasks?")
+    assert "id_prefix=30d5ff95" in requests[0]
+
+
+def test_server_returned_non_matches_are_still_filtered_out(monkeypatch):
+    """Trust the filter, but do not let a wider server match resolve silently.
+
+    An older control plane that does not know ``id_prefix`` ignores unknown
+    query params and answers with the ordinary first page. Without this guard
+    that page's first row would be announced as the resolved task.
+    """
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_key": "admin-key"}
+    )
+    monkeypatch.setattr(
+        blueprint_api,
+        "api",
+        lambda method, path, body=None, timeout=30: {
+            "tasks": [
+                {"id": "11111111-0000-0000-0000-000000000000", "status": "QUEUED"},
+                {"id": "22222222-0000-0000-0000-000000000000", "status": "QUEUED"},
+            ]
+        },
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint_api.resolve_task_id_by_prefix("30d5ff95", _PREFIX_PROJECT)
+
+    assert exc.value.code == 1
+
+
+def test_short_task_id_prefix_is_refused_before_any_lookup(monkeypatch, capsys):
+    """Below the floor a prefix cannot mean one task, so do not guess."""
+    calls = []
+
+    def _fake_api(*args, **kwargs):
+        calls.append(args)
+        return {"tasks": []}
+
+    monkeypatch.setattr(blueprint_api, "api", _fake_api)
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint_api.resolve_task_id_by_prefix("30d", _PREFIX_PROJECT)
+
+    assert exc.value.code == 1
+    # Pinned literally: lowering the floor is a real behaviour change and must
+    # not be certified by the constant it changed.
+    assert blueprint_api.TASK_PREFIX_MIN_CHARS == 6
+    assert "shorter than 6 characters" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_non_prefix_shaped_id_is_passed_through_untouched(monkeypatch):
+    """Resolution may only ADD a success; it must never refuse a working id.
+
+    The server owns what a valid task id is. A CLI-side shape rule that rejects
+    anything unfamiliar would break callers whose ids the API accepts, so a
+    value that cannot be a truncated uuid goes through with no lookup at all.
+    """
+    calls = []
+
+    def _fake_api(*args, **kwargs):
+        calls.append(args)
+        return {"tasks": []}
+
+    monkeypatch.setattr(blueprint_api, "api", _fake_api)
+
+    for opaque in ("task-123", "not-an-id", "ZZZZZZZZ"):
+        assert (
+            blueprint_api.resolve_task_id_by_prefix(opaque, _PREFIX_PROJECT)
+            == opaque
+        )
+    assert calls == []
+
+
+def test_unknown_project_id_errors_instead_of_listing_nothing(monkeypatch, capsys):
+    """An id nothing matches must not read as a project with no tasks."""
+    monkeypatch.setattr(
+        blueprint_api,
+        "list_projects",
+        lambda: [
+            {"id": "37d445e1-0775-4403-bacf-1cd7ed129336", "name": "Blueprint"},
+            {"id": "d0955450-6efb-49f3-bec7-08f73db5ca31", "name": "NeurIPS"},
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint_api.validate_project_id("00000000-0000-0000-0000-000000000000")
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "is not a project this credential can see" in err
+    # The catalog is printed so the operator can fix the flag from the error
+    # itself rather than running a second command.
+    assert "Blueprint" in err and "NeurIPS" in err
+
+
+def test_known_project_id_passes_validation(monkeypatch):
+    monkeypatch.setattr(
+        blueprint_api, "list_projects", lambda: [{"id": "known-id", "name": "Blueprint"}]
+    )
+
+    blueprint_api.validate_project_id("known-id")
+
+
+def test_project_validation_fails_open_when_the_catalog_is_unreachable(monkeypatch):
+    """A credential that cannot enumerate projects must still be able to act."""
+
+    def _boom():
+        raise blueprint_api.APIError("catalog unavailable")
+
+    monkeypatch.setattr(blueprint_api, "list_projects", _boom)
+
+    blueprint_api.validate_project_id("some-id")
+
+
+def test_task_detail_renders_the_blocker_reason(capsys):
+    """`tasks show` reported the state and withheld the reason."""
+    blueprint._render_task_detail(
+        {
+            "id": "30d5ff95-5cd5-4413-8772-1f0e15067b47",
+            "title": "a blocked task",
+            "task_type": "create",
+            "status": "BLOCKED",
+            "created_at": "2026-08-23T10:00:50.870874",
+            "blocked_reason": "dependency 7c851b3f has not landed on automain",
+            "blocker_kind": "require_deps_landed_on",
+            "blocked_at": "2026-08-23T11:00:00.000000",
+            "blocker_escalated": True,
+            "depends_on": ["7c851b3f-0000-0000-0000-000000000000"],
+        }
+    )
+
+    out = capsys.readouterr().out
+    assert "dependency 7c851b3f has not landed on automain" in out
+    assert "require_deps_landed_on" in out
+    assert "2026-08-23T11:00:00" in out
+    assert "escalated to a human" in out
+    assert "7c851b3f" in out
+
+
+def test_task_detail_renders_the_park_reason_and_approval_hold(capsys):
+    blueprint._render_task_detail(
+        {
+            "id": "aabbccdd-0000-0000-0000-000000000000",
+            "title": "a parked task",
+            "task_type": "fix",
+            "status": "PARKED",
+            "created_at": "2026-08-23T10:00:50.870874",
+            "park_reason": "review loop parked: no head advance",
+            "parked_at": "2026-08-23T12:00:00.000000",
+            "requires_approval": True,
+        }
+    )
+
+    out = capsys.readouterr().out
+    assert "review loop parked: no head advance" in out
+    assert "2026-08-23T12:00:00" in out
+    assert "Approval: REQUIRED" in out
+
+
+def test_task_detail_stays_quiet_when_nothing_is_blocking(capsys):
+    """The new lines must not appear on a healthy task."""
+    blueprint._render_task_detail(
+        {
+            "id": "aabbccdd-0000-0000-0000-000000000000",
+            "title": "a healthy task",
+            "task_type": "create",
+            "status": "IN_PROGRESS",
+            "created_at": "2026-08-23T10:00:50.870874",
+        }
+    )
+
+    out = capsys.readouterr().out
+    for label in ("Blocked:", "Parked:", "Approval:", "Depends:"):
+        assert label not in out
 
 
 def test_list_projects_follows_all_pages(monkeypatch):

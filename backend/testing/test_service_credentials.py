@@ -728,6 +728,7 @@ def test_coding_agent_task_list_caps_escaped_control_text_and_redacts_secrets():
         statuses=[TaskStatus.FAILED],
         task_type="fix",
         search=None,
+        id_prefix=None,
         direction_id="direction-test",
         approval_needed=False,
     )
