@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal, resolve_dialect_name
+from app.closed_pr_reconciliation import reset_pr_attempt_state
 from app.rollup_locking import (  # noqa: F401 — re-exported for callers/tests
     _ParentMutatedDuringPRCreation,
     _capture_rollup_parent_snapshot,
@@ -3417,6 +3418,14 @@ async def _check_and_trigger_rollup(
                                     for k, v in parent_ctx.items()
                                     if k not in ("rollup_pr_number", "rollup_pr_url")
                                 }
+                                # A replacement PR is a new review attempt. Keep
+                                # only audited chain metadata so approvals, CI,
+                                # verifier, and retry latches from the dead PR
+                                # cannot make its successor appear reviewed.
+                                parent.context["review_loop"] = reset_pr_attempt_state(
+                                    parent_ctx.get("review_loop")
+                                )
+                                parent.context.pop("blueprint_review_verdict", None)
                                 # Durable ownership survives the volatile marker
                                 # clear: a requeue-clone on a foreign-named branch
                                 # whose rollup_pr_number is being dropped here to

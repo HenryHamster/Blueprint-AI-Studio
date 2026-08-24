@@ -37,8 +37,6 @@ _BOT_AUTHOR_EMAILS = frozenset(
         f"{BLUEPRINT_GITHUB_BOT_ID}+blueprintagentorchestrator[bot]@users.noreply.github.com",
     }
 )
-_GITHUB_MERGE_COMMITTERS = frozenset({"github", "web-flow"})
-_GITHUB_NOREPLY_EMAIL = "noreply@github.com"
 MAX_REPORTED_OFFENDERS = 10
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _OFFENDER_SHA = re.compile(r"^[0-9a-f]{12}$")
@@ -49,7 +47,6 @@ _AUTHORSHIP_MEASUREMENT_TIMEOUT_SECONDS = 30
 AUTHORSHIP_RECEIPT_SOURCE = "github_compare"
 AUTHORSHIP_RECEIPT_SCHEMA_VERSION = 2
 _LEGACY_AUTHORSHIP_RECEIPT_SCHEMA_VERSION = 1
-GITHUB_WEB_FLOW_ID = 19864447
 MAX_RECONCILIATION_VERSIONS = 100
 _RECONCILIATION_MAX_CALLS = 25
 _RECONCILIATION_MAX_SECONDS = 20
@@ -237,7 +234,7 @@ def _same_sha(left: Any, right: Any) -> bool:
 
 
 def _trusted_blueprint_bot_commit(commit: Any) -> bool:
-    """Accept either an immutable bot-author identity or a GitHub PR-merge commit.
+    """Accept a verified commit whose immutable author is the Blueprint bot.
 
     A commit's display author is user-controlled, so the direct-bot shape
     requires the GitHub ``author`` object, numeric account id, raw author
@@ -245,34 +242,22 @@ def _trusted_blueprint_bot_commit(commit: Any) -> bool:
     cannot make a bot-looking commit pass by changing only the visible
     name/login/type fields.
 
-    Separately, a commit whose immutable GitHub *committer* identity is
-    web-flow (GitHub's PR-merge committer) is trusted regardless of who
-    authored it: it proves the commit reached history through a GitHub PR
-    merge, not that a human reviewed or approved it — a write-access holder
-    can merge their own PR unreviewed. That is a materially different, and
-    weaker, claim than "reviewed", and this function must never be read as
-    asserting the stronger one. Still, GitHub-merge commits stay counted as
-    the population this gate exists for: raw pushes that bypassed a PR
-    entirely (see hotfix_policy.py's "sanctioned replacement for the ad-hoc
-    operator hand-merge"). Verification must still be present and valid on
-    this branch too, since that field is not self-reported.
+    The committer fields are deliberately not part of the predicate. GitHub
+    sets them to ``web-flow``/``GitHub`` for PR merges, so using them would
+    classify the push path instead of the person or bot that authored the
+    commit. Verification must still be present and valid because that field is
+    independent evidence about the commit.
     """
     if not isinstance(commit, dict):
         return False
     identity = commit.get("author")
     commit_payload = commit.get("commit")
     raw_author = commit_payload.get("author") if isinstance(commit_payload, dict) else None
-    raw_committer = (
-        commit_payload.get("committer") if isinstance(commit_payload, dict) else None
-    )
-    github_committer = commit.get("committer")
     verification = (
         commit_payload.get("verification") if isinstance(commit_payload, dict) else None
     )
     if not (
-        isinstance(raw_committer, dict)
-        and isinstance(github_committer, dict)
-        and isinstance(verification, dict)
+        isinstance(verification, dict)
         and verification.get("verified") is True
         and verification.get("reason") == "valid"
     ):
@@ -285,21 +270,8 @@ def _trusted_blueprint_bot_commit(commit: Any) -> bool:
         and isinstance(raw_author, dict)
         and raw_author.get("name") == BOT_COMMIT_AUTHOR
         and raw_author.get("email") in _BOT_AUTHOR_EMAILS
-        and raw_committer.get("name") == BOT_COMMIT_AUTHOR
-        and raw_committer.get("email") in _BOT_AUTHOR_EMAILS
-        and github_committer.get("login") == BOT_COMMIT_AUTHOR
-        and github_committer.get("id") == BLUEPRINT_GITHUB_BOT_ID
-        and github_committer.get("type") == "Bot"
     )
-    github_pr_merge = (
-        isinstance(raw_committer.get("name"), str)
-        and raw_committer["name"].casefold() in _GITHUB_MERGE_COMMITTERS
-        and raw_committer.get("email") == _GITHUB_NOREPLY_EMAIL
-        and github_committer.get("login") == "web-flow"
-        and github_committer.get("id") == GITHUB_WEB_FLOW_ID
-        and github_committer.get("type") == "User"
-    )
-    return direct_bot or github_pr_merge
+    return direct_bot
 
 
 def _receipt_identity(receipt: Any) -> str | None:

@@ -56,7 +56,8 @@ export interface StrategicLiveActivity {
    *  `responding` = operator turn in flight; `working` = autonomous turn in
    *  flight; `done` = turn ended (strip cleared); `null` = no lifecycle seen. */
   latestLifecycle: 'responding' | 'working' | 'done' | null;
-  /** Epoch ms of the newest valid delta in the current visible turn. */
+  /** Epoch ms of the newest valid delta in the latest session, including its
+   *  completed lifecycle frame for the at-rest Chat age stamp. */
   lastActivityMs?: number;
 }
 
@@ -196,8 +197,10 @@ export function computeStrategicStreamingTurn(
  * for the in-flight resident turn. Shares the streaming bubble's watermark so it
  * only ever shows activity NOT yet superseded by a durable strategic reply, and
  * drops everything up to and including the last `done` frame (that belongs to a
- * completed turn). Returns at most the most recent handful so the strip stays
- * compact. NEVER persisted — purely a live view of the transcript deltas.
+ * completed turn) from the rendered items. The timestamp high-water mark is
+ * retained across that boundary for the at-rest Chat readout. Returns at most
+ * the most recent handful so the strip stays compact. NEVER persisted — purely
+ * a live view of the transcript deltas.
  */
 export function computeStrategicSessionActivity(
   transcript: StrategicSessionDelta[] | undefined,
@@ -209,16 +212,24 @@ export function computeStrategicSessionActivity(
   const watermark = strategicReplyWatermark(conversationMessages);
   const visible = visibleSessionDeltas(deltas, latestSessionId, watermark);
 
+  // Keep lifecycle and timestamp history for the latest session even after the
+  // durable-reply watermark retires the ephemeral rendering. The Chat header
+  // still uses `visible` for activity text, but its at-rest readout needs the
+  // final `done` frame to say when the engine last acted.
+  const latestSessionDeltas = latestSessionId
+    ? deltas.filter(d => d.session_id === latestSessionId)
+    : deltas;
+
   let latestLifecycle: 'responding' | 'working' | 'done' | null = null;
-  for (const d of visible) {
+  for (const d of latestSessionDeltas) {
     if (d.status === 'responding' || d.status === 'working' || d.status === 'done') latestLifecycle = d.status;
   }
   const doneSeq = lastDoneSeq(visible);
 
   const inFlight = latestLifecycle === 'working' || latestLifecycle === 'responding';
   let lastActivityMs: number | undefined;
-  for (const d of visible) {
-    if ((d.seq ?? d.id) <= doneSeq || !d.ts) continue;
+  for (const d of latestSessionDeltas) {
+    if (!d.ts) continue;
     const tsMs = parseTimestamp(d.ts).getTime();
     if (!Number.isNaN(tsMs) && (lastActivityMs === undefined || tsMs > lastActivityMs)) {
       lastActivityMs = tsMs;
@@ -505,7 +516,7 @@ export function scopeStrategicTranscript(
  *  a `ConversationWorkdayState` — Workday's vocabulary describes the Continuous
  *  Resident's autonomy lifecycle, which is `off` in Chat mode and says nothing
  *  about a chat turn being in flight. */
-export type StrategicChatLivePhase = 'streaming' | 'working' | 'stuck';
+export type StrategicChatLivePhase = 'streaming' | 'working' | 'stuck' | 'idle' | 'stale';
 
 export interface StrategicChatLiveState {
   phase: StrategicChatLivePhase;
@@ -513,11 +524,14 @@ export interface StrategicChatLiveState {
   label: string;
   /** The newest activity one-liner (or streamed reply excerpt) — optional. */
   detail?: string;
-  /** Epoch ms of the newest valid delta in the in-flight Chat turn. */
+  /** Epoch ms of the newest valid delta in the latest Chat turn. */
   lastActivityMs?: number;
 }
 
 const CHAT_LIVE_DETAIL_MAX_CHARS = 60;
+
+/** An open Chat turn with no fresh delta after this threshold needs attention. */
+export const CHAT_LIVE_STALE_MS = 120_000;
 
 function chatLiveDetail(value: string | undefined): string | undefined {
   const compact = value?.trim().replace(/\s+/g, ' ');
@@ -574,33 +588,71 @@ function durableStrategicDetail(
  * `streaming` — reply/reasoning text is actively arriving (the preview bubble is
  * on screen). `working` — the turn is open (a `responding`/`working` lifecycle
  * frame with no `done` yet), or the durable cycle still has a live task.
- * `stuck` — the durable cycle is active but has no live task. `null` — no live
- * or durable Chat work needs an awareness readout.
+ * `stuck` — the durable cycle is active but has no live task. `idle` — a Chat
+ * turn has completed. `stale` — an open turn has not emitted a fresh delta
+ * within `CHAT_LIVE_STALE_MS`. `null` — no live or durable Chat work needs an
+ * awareness readout.
  */
 export function computeStrategicChatLiveState(
   turn: StrategicStreamingTurn | null,
   activity: StrategicLiveActivity,
+  clockMs?: number,
   strategic?: StrategicStateResponse['strategic'] | null,
+): StrategicChatLiveState | null;
+/** Backward-compatible overload for callers that only provide durable state. */
+export function computeStrategicChatLiveState(
+  turn: StrategicStreamingTurn | null,
+  activity: StrategicLiveActivity,
+  strategic?: StrategicStateResponse['strategic'] | null,
+): StrategicChatLiveState | null;
+export function computeStrategicChatLiveState(
+  turn: StrategicStreamingTurn | null,
+  activity: StrategicLiveActivity,
+  clockMsOrStrategic?: number | StrategicStateResponse['strategic'] | null,
+  strategicOverride?: StrategicStateResponse['strategic'] | null,
 ): StrategicChatLiveState | null {
+  const clock = typeof clockMsOrStrategic === 'number' ? clockMsOrStrategic : Date.now();
+  const strategic = typeof clockMsOrStrategic === 'number'
+    ? strategicOverride
+    : (clockMsOrStrategic ?? strategicOverride);
   const latestActivityText = activity.items[activity.items.length - 1]?.text;
   const durableActivityMs = strategic ? durableStrategicActivityMs(strategic) : undefined;
   const durableDetail = strategic ? durableStrategicDetail(strategic) : undefined;
+  const open = activity.latestLifecycle === 'responding' || activity.latestLifecycle === 'working';
+  const lastActivityMs = activity.lastActivityMs ?? durableActivityMs;
+  const stale = open
+    && lastActivityMs !== undefined
+    && clock - lastActivityMs >= CHAT_LIVE_STALE_MS;
+
+  if (stale) {
+    return {
+      phase: 'stale',
+      label: 'Chat stalled',
+      detail: chatLiveDetail(latestActivityText) ?? durableDetail,
+      lastActivityMs,
+    };
+  }
   if (turn && turn.segments.length > 0) {
     return {
       phase: 'streaming',
       label: 'Replying',
       detail: chatLiveDetail(latestActivityText) ?? durableDetail,
-      ...((activity.lastActivityMs ?? durableActivityMs) !== undefined
-        ? { lastActivityMs: activity.lastActivityMs ?? durableActivityMs } : {}),
+      ...(lastActivityMs !== undefined ? { lastActivityMs } : {}),
     };
   }
-  if (activity.latestLifecycle === 'responding' || activity.latestLifecycle === 'working') {
+  if (open) {
     return {
       phase: 'working',
       label: 'Working',
       detail: chatLiveDetail(latestActivityText) ?? durableDetail,
-      ...((activity.lastActivityMs ?? durableActivityMs) !== undefined
-        ? { lastActivityMs: activity.lastActivityMs ?? durableActivityMs } : {}),
+      ...(lastActivityMs !== undefined ? { lastActivityMs } : {}),
+    };
+  }
+  if (activity.latestLifecycle === 'done') {
+    return {
+      phase: 'idle',
+      label: 'Chat ready',
+      ...(lastActivityMs !== undefined ? { lastActivityMs } : {}),
     };
   }
   if (strategic?.active_cycle?.stale) {

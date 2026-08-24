@@ -665,6 +665,39 @@ describe('ConversationUtilityBar Workday status', () => {
     expect(rendered.querySelector('[data-testid="conversation-chat-age"]')?.textContent).toBe('5m ago');
   });
 
+  test('renders idle and stale Chat states distinctly with the last-acted age', () => {
+    const workdayStatus = buildConversationWorkdayStatus({ interactionMode: 'chat', residentActivity: null });
+    const lastActivityMs = Date.now() - 5 * 60 * 1000;
+
+    const idle = renderBar(workdayStatus, {
+      phase: 'idle',
+      label: 'Chat ready',
+      lastActivityMs,
+    }, 'chat');
+    const idleLine = idle.querySelector('[data-testid="conversation-workday-status"]');
+    expect(idleLine).toHaveAttribute('data-chat-live-phase', 'idle');
+    expect(idleLine).toHaveTextContent('Chat ready');
+    expect(idleLine).not.toHaveTextContent('Workday off');
+    expect(idle.querySelector('[data-testid="conversation-chat-age"]')?.textContent).toBe('5m ago');
+
+    act(() => root?.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+
+    const stale = renderBar(workdayStatus, {
+      phase: 'stale',
+      label: 'Chat stalled',
+      detail: 'waiting for provider',
+      lastActivityMs,
+    }, 'chat');
+    const staleLine = stale.querySelector('[data-testid="conversation-workday-status"]');
+    expect(staleLine).toHaveAttribute('data-chat-live-phase', 'stale');
+    expect(staleLine).toHaveTextContent('Chat stalled');
+    expect(staleLine).toHaveTextContent('waiting for provider');
+    expect(staleLine?.querySelector('.text-amber-300')).toBeTruthy();
+  });
+
   test('the Workday readout still owns the slot in continuous mode, even while a chat live state is non-null', () => {
     // `computeStrategicChatLiveState` is non-null for exactly the lifecycles
     // the Workday Resident runs under ('working'/'responding'), and App renders

@@ -834,6 +834,35 @@ def test_extract_test_ids_dispatches_python_and_typescript():
     ) == {"it case", "each %s", "test case", "test each $value"}
 
 
+def test_extractor_uses_describe_paths_and_expands_parameter_rows():
+    """Canonical IDs retain suite ancestry, escapes, duplicates, and each rows."""
+    source = r'''
+describe("outer suite", () => {
+  describe(
+    'inner \'suite\'',
+    () => {
+      it("same label", () => {});
+      it("same label", () => {});
+      it.each([
+        ["first", { nested: true }],
+        ["second", { nested: false }],
+      ])(
+        'row %s',
+        (name) => {}
+      );
+    },
+  );
+});
+'''
+
+    assert extract_typescript_test_ids(source) == {
+        "outer suite > inner 'suite' > same label",
+        "outer suite > inner 'suite' > same label [duplicate 2]",
+        "outer suite > inner 'suite' > row %s [case 1]",
+        "outer suite > inner 'suite' > row %s [case 2]",
+    }
+
+
 def test_completeness_checker_ignores_partial_and_reports_missing_and_extra(tmp_path):
     """Partial entries stay partial while complete entries fail both directions."""
     complete = tmp_path / "complete.py"
@@ -1094,7 +1123,10 @@ def test_ts_it_each_label_extraction_double_quoted():
         "  ])(\"handles %s in double quotes\", (val) => { expect(val).toBeTruthy() })\n"
     )
     labels = extract_typescript_test_ids(source)
-    assert labels == {"handles %s in double quotes"}, (
+    assert labels == {
+        "handles %s in double quotes [case 1]",
+        "handles %s in double quotes [case 2]",
+    }, (
         f"Expected double-quoted it.each template captured, got {labels!r}"
     )
 
@@ -1107,7 +1139,10 @@ def test_ts_it_each_label_extraction_backtick():
         "  ])(`handles %s in backticks`, (val) => { expect(val).toBeTruthy() })\n"
     )
     labels = extract_typescript_test_ids(source)
-    assert labels == {"handles %s in backticks"}, (
+    assert labels == {
+        "handles %s in backticks [case 1]",
+        "handles %s in backticks [case 2]",
+    }, (
         f"Expected backtick it.each template captured, got {labels!r}"
     )
 

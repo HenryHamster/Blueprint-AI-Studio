@@ -8,6 +8,7 @@ import {
   isStrategicReplyDelta,
   scopeStrategicTranscript,
   computeStrategicChatLiveState,
+  CHAT_LIVE_STALE_MS,
 } from './strategicSessionLive';
 import type { StrategicLiveActivity } from './strategicSessionLive';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
@@ -542,7 +543,7 @@ describe('computeStrategicChatLiveState', () => {
     ];
     const turn = computeStrategicStreamingTurn(transcript, []);
     const activity = computeStrategicSessionActivity(transcript, []);
-    const state = computeStrategicChatLiveState(turn, activity);
+    const state = computeStrategicChatLiveState(turn, activity, Date.parse('2026-06-01T12:00:01Z'));
 
     expect(activity.lastActivityMs).toBe(Date.parse('2026-06-01T12:00:00Z'));
     expect(state).toMatchObject({
@@ -619,7 +620,57 @@ describe('computeStrategicChatLiveState', () => {
     const turn = computeStrategicStreamingTurn(transcript, []);
     const activity = computeStrategicSessionActivity(transcript, []);
     expect(turn).toBeNull();
-    expect(computeStrategicChatLiveState(turn, activity)).toBeNull();
+    expect(computeStrategicChatLiveState(turn, activity)).toEqual({
+      phase: 'idle',
+      label: 'Chat ready',
+    });
+  });
+
+  it('preserves the completed lifecycle timestamp for the idle age stamp', () => {
+    const completedAt = '2026-06-01T12:00:00Z';
+    const transcript = [
+      delta({ id: 1, seq: 1, status: 'responding', ts: '2026-06-01T11:59:00Z' }),
+      delta({ id: 2, seq: 2, status: 'done', ts: completedAt }),
+    ];
+    const activity = computeStrategicSessionActivity(transcript, []);
+
+    expect(activity.lastActivityMs).toBe(Date.parse(completedAt));
+    expect(computeStrategicChatLiveState(null, activity, Date.parse('2026-06-01T12:00:30Z'))).toEqual({
+      phase: 'idle',
+      label: 'Chat ready',
+      lastActivityMs: Date.parse(completedAt),
+    });
+  });
+
+  it('computeStrategicChatLiveState reports stale once the injected clock passes the chat staleness threshold', () => {
+    const lastActivityMs = Date.parse('2026-06-01T12:00:00Z');
+    const transcript = [
+      delta({ id: 1, seq: 1, status: 'responding', ts: new Date(lastActivityMs).toISOString() }),
+      delta({ id: 2, seq: 2, kind: 'command', text: 'waiting for provider', ts: new Date(lastActivityMs).toISOString() }),
+    ];
+    const activity = computeStrategicSessionActivity(transcript, []);
+
+    expect(computeStrategicChatLiveState(
+      null,
+      activity,
+      lastActivityMs + CHAT_LIVE_STALE_MS + 1,
+    )).toMatchObject({
+      phase: 'stale',
+      label: 'Chat stalled',
+      lastActivityMs,
+    });
+  });
+
+  it('does not invent an age or stale state for an untimestamped completed turn', () => {
+    const activity = computeStrategicSessionActivity([
+      delta({ id: 1, seq: 1, status: 'responding', ts: 'not-a-timestamp' }),
+      delta({ id: 2, seq: 2, status: 'done', ts: 'also-not-a-timestamp' }),
+    ], []);
+
+    expect(computeStrategicChatLiveState(null, activity, Date.now())).toEqual({
+      phase: 'idle',
+      label: 'Chat ready',
+    });
   });
 
   it('elides an over-long activity detail instead of blowing out the header', () => {

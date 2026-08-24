@@ -1506,13 +1506,10 @@ async def test_rollup_resume_closed_pending_reopen_preserves_marker_no_duplicate
 
 
 @pytest.mark.asyncio
-async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
+async def test_superseded_rollup_successor_starts_default_denied(
     cleanup_db, mocker
 ):
-    """C4 4th-site counterpart: a closed-not-merged rollup PR with NO pending_reopen
-    marker is a genuine abandonment — the resume path clears the markers (will
-    retry by creating a fresh PR), preserving the pre-fix behavior for real
-    closures."""
+    """A successor PR cannot inherit approval or verification from its dead PR."""
     _mock_rollup_resume_closed_pr(mocker, merged=False)
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -1521,7 +1518,24 @@ async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
     parent = await _make_rollup_parent_with_pr(
         cleanup_db,
         project.id,
-        extra_context={"review_loop": {"pr_number": 4242, "ci_waiting": True}},
+        extra_context={
+            "blueprint_review_verdict": "APPROVE",
+            "review_loop": {
+                "pr_number": 4242,
+                "branch": "research/old-rollup",
+                "base_branch": "automain",
+                "iteration": 3,
+                "max_iterations": 16,
+                "issue_ledger": {"old": "finding"},
+                "review_approved": True,
+                "review_verdict": "APPROVE",
+                "ci_passed": True,
+                "ci_waiting": True,
+                "ci_checked_head_sha": "dead-pr-head",
+                "verifier_status": "passed",
+                "merge_attempted": True,
+            },
+        },
     )
     child = await _make_merged_child(cleanup_db, project.id, parent.id)
 
@@ -1534,6 +1548,21 @@ async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
         "so the rollup is retried."
     )
     assert "rollup_pr_url" not in ctx
+    assert "blueprint_review_verdict" not in ctx
+
+    successor_loop = ctx.get("review_loop") or {}
+    assert successor_loop.get("review_approved") is None
+    assert successor_loop.get("review_verdict") is None
+    assert successor_loop.get("ci_passed") is None
+    assert successor_loop.get("ci_waiting") is None
+    assert successor_loop.get("ci_checked_head_sha") is None
+    assert successor_loop.get("verifier_status") is None
+    assert successor_loop.get("merge_attempted") is None
+    assert successor_loop["branch"] == "research/old-rollup"
+    assert successor_loop["base_branch"] == "automain"
+    assert successor_loop["iteration"] == 3
+    assert successor_loop["max_iterations"] == 16
+    assert successor_loop["issue_ledger"] == {"old": "finding"}
 
 
 # ── Duplicate-create guard (rollup_pr_creating_at claim) ──────────────────────

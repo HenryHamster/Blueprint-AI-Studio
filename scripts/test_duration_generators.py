@@ -29,7 +29,11 @@ def _write_test_file(root: Path) -> None:
     test_file.write_text(
         "def test_untouched():\n    pass\n\n"
         "def test_remeasured():\n    pass\n\n"
-        "def test_new():\n    pass\n",
+        "def test_new():\n    pass\n\n"
+        "def test_post_gap():\n    pass\n\n"
+        + "\n".join(
+            f"def test_{index}():\n    pass\n" for index in range(100)
+        ),
         encoding="utf-8",
     )
 
@@ -86,6 +90,41 @@ def test_merge_with_empty_partial_directory_keeps_baseline(tmp_path: Path) -> No
 
     assert merge_durations.merge(str(tmp_path / "no-partials"), str(output)) == 1
     assert json.loads(output.read_text(encoding="utf-8")) == baseline
+
+
+def test_merge_drops_observed_setup_plateau_but_keeps_first_post_gap_sample(
+    tmp_path: Path,
+) -> None:
+    _write_test_file(tmp_path)
+    output = tmp_path / ".test_durations"
+    plateau = {
+        f"testing/test_live.py::test_{index}": 12.0 + index / 1000
+        for index in range(100)
+    }
+    plateau["testing/test_live.py::test_post_gap"] = 27.43031809399872
+    _write_json(output, plateau)
+
+    assert merge_durations.merge(str(tmp_path / "no-partials"), str(output)) == 1
+    merged = json.loads(output.read_text(encoding="utf-8"))
+    assert merged == {
+        "testing/test_live.py::test_post_gap": 27.43031809399872,
+    }
+
+
+def test_merge_keeps_plateau_when_an_observation_is_inside_diagnostic_gap(
+    tmp_path: Path,
+) -> None:
+    _write_test_file(tmp_path)
+    output = tmp_path / ".test_durations"
+    plateau = {
+        f"testing/test_live.py::test_{index}": 12.0 + index / 1000
+        for index in range(100)
+    }
+    plateau["testing/test_live.py::test_post_gap"] = 20.0
+    _write_json(output, plateau)
+
+    assert merge_durations.merge(str(tmp_path / "no-partials"), str(output)) == 101
+    assert json.loads(output.read_text(encoding="utf-8")) == plateau
 
 
 def test_merge_drops_entries_from_an_unparseable_test_module(tmp_path: Path) -> None:

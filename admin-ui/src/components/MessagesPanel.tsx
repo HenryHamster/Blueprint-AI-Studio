@@ -636,6 +636,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
   // `done` lifecycle frame arrives, or a safety timeout. Drives the live activity
   // strip so there is zero dead time between send and visible progress.
   const [workingSince, setWorkingSince] = useState<number | null>(null);
+  // Re-render the awareness chip so an open turn becomes stale and an idle
+  // turn's last-acted age advances without another network event.
+  const [chatLiveClockMs, setChatLiveClockMs] = useState(() => Date.now());
   const strategicReplyBaselineRef = useRef<number>(0);
   // Real arming outcome the server reported for the last send (null before any
   // send, or after the operator changes the message type so the composer reverts
@@ -1296,10 +1299,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
     () => computeStrategicChatLiveState(
       strategicStreamingTurn,
       strategicLiveActivity,
+      chatLiveClockMs,
       currentStrategicState?.strategic,
     ),
-    [currentStrategicState?.strategic, strategicStreamingTurn, strategicLiveActivity],
+    [chatLiveClockMs, currentStrategicState?.strategic, strategicStreamingTurn, strategicLiveActivity],
   );
+  const chatLiveClockEnabled = conversationMode && strategicChatLiveState !== null;
+  useEffect(() => {
+    if (!chatLiveClockEnabled) return;
+    const timer = window.setInterval(() => setChatLiveClockMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [chatLiveClockEnabled]);
   // Hoisted out of the Workday-status memo: the utility bar needs the same
   // single mode value to decide which readout owns the shared status slot.
   // A plain string — memoizing it would buy no referential stability.

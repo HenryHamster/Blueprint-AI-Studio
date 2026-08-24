@@ -2480,8 +2480,8 @@ describe('MessagesPanel live strategist streaming', () => {
     return { project_id: 'proj-1', session_id: 'sess-1', text: '', ...over };
   }
 
-  const DURABLE_REPLY_AT = '2026-06-01T10:00:10.000Z';
-  const STREAM_AT = '2026-06-01T10:00:05.000Z';
+  const DURABLE_REPLY_AT = new Date(Date.now() - 10_000).toISOString();
+  const STREAM_AT = new Date(Date.now() - 15_000).toISOString();
   // The durable reply the poll eventually delivers. Its `created_at` is NEWER
   // than every streamed delta's `ts`, which is what retires the preview.
   const durableReply = () => makeMsg({
@@ -2804,7 +2804,8 @@ describe('MessagesPanel live strategist streaming', () => {
 
     await waitFor(() => expect(el.textContent).toContain('The durable strategist reply.'));
     const settledStatus = el.querySelector('[data-testid="conversation-workday-status"]');
-    expect(settledStatus).toHaveTextContent('Workday off');
-    expect(settledStatus).not.toHaveAttribute('data-chat-live-phase');
+    expect(settledStatus).toHaveTextContent('Chat ready');
+    expect(settledStatus).toHaveAttribute('data-chat-live-phase', 'idle');
+    expect(settledStatus).not.toHaveTextContent('Workday off');
   });
 });

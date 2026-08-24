@@ -17,7 +17,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from durations_quality import (
+    IN_BAND_SETUP_GAP_MAX,
     IN_BAND_SETUP_MAX,
+    IN_BAND_SETUP_MIN,
     MIN_CV,
     MIN_ENTRIES,
     MIN_UNIQUE,
@@ -98,7 +100,8 @@ def merge(src_dir: str, output_path: str) -> int:
     if band_artifacts:
         print(
             f"  Dropped {len(band_artifacts)} in-band setup artifacts "
-            f"({IN_BAND_SETUP_MAX:g}s plateau with no following observations)"
+            f"({IN_BAND_SETUP_MIN:g}-{IN_BAND_SETUP_MAX:g}s plateau; "
+            f"no observations through {IN_BAND_SETUP_GAP_MAX:g}s)"
         )
 
     if outlier_count:

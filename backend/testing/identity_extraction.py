@@ -13,7 +13,7 @@ name, so a subclass-only body is not an empty identity set.
 from __future__ import annotations
 
 import ast
-import re
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -96,29 +96,273 @@ def count_python_test_ids(source: str) -> int:
     return len(extract_python_test_ids(source))
 
 
-_TS_DIRECT_TEST_RE = re.compile(
-    r'''^\s*(?:it|test)\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)''',
-    re.MULTILINE,
-)
-_TS_PARAMETERIZED_TEST_RE = re.compile(
-    r'''^\s*(?:it|test)\.each\b[\s\S]*?\)\s*\(\s*(?:'([^']+)'|"([^"]+)"|`([^`]+)`)''',
-    re.MULTILINE,
-)
+@dataclass(frozen=True)
+class _TypeScriptCall:
+    """One statically recognizable Vitest declaration."""
+
+    kind: str
+    start: int
+    label: str | None
+    row_count: int
+    body_start: int | None = None
+    body_end: int | None = None
 
 
 def extract_typescript_test_ids(source: str) -> set[str]:
-    """Return labels from direct and ``.each`` Vitest/Jest declarations.
+    """Return collector-shaped identities from Vitest/Jest test source.
 
-    This is intentionally the single Python-side TypeScript identity extractor:
-    manifest protection and viewport auditing must count the same backtick,
-    quoted, and parameterized declarations.
+    Vitest's real identity is the describe ancestry plus the test title.  A
+    bare-label set loses same-named tests in different suites and treats an
+    ``it.each`` table as one test.  This bounded scanner deliberately parses
+    only declaration syntax: it skips comments and strings, balances nested
+    delimiters, preserves escaped label delimiters, qualifies nested
+    ``describe`` scopes, and expands statically representable array rows.
+
+    IDs use Vitest's human-readable ``describe > test`` shape. Parameter rows
+    receive a stable ``[case N]`` suffix because the source title may be the
+    same for every row and the manifest needs one identity per collected test.
     """
-    return {
-        label
-        for pattern in (_TS_DIRECT_TEST_RE, _TS_PARAMETERIZED_TEST_RE)
-        for match in pattern.finditer(source)
-        if (label := next((group for group in match.groups() if group), None))
-    }
+    calls = _scan_typescript_calls(source)
+    describes = [call for call in calls if call.kind == "describe"]
+    test_ids: set[str] = set()
+    for call in calls:
+        if call.kind != "test" or call.label is None:
+            continue
+        ancestors = [
+            describe
+            for describe in describes
+            if describe.body_start is not None
+            and describe.body_end is not None
+            and describe.body_start <= call.start < describe.body_end
+        ]
+        ancestors.sort(key=lambda describe: describe.start)
+        prefix = [describe.label for describe in ancestors if describe.label]
+        title = " > ".join([*prefix, call.label])
+        for row in range(1, call.row_count + 1):
+            candidate = title if call.row_count == 1 else f"{title} [case {row}]"
+            if candidate in test_ids:
+                duplicate = 2
+                while f"{candidate} [duplicate {duplicate}]" in test_ids:
+                    duplicate += 1
+                candidate = f"{candidate} [duplicate {duplicate}]"
+            test_ids.add(candidate)
+    return test_ids
+
+
+def _scan_typescript_calls(source: str) -> list[_TypeScriptCall]:
+    """Scan declaration calls without treating comments or strings as code."""
+    calls: list[_TypeScriptCall] = []
+    index = 0
+    while index < len(source):
+        index = _skip_typescript_trivia(source, index)
+        if index >= len(source):
+            break
+        if source[index] in "'\"`":
+            index = _typescript_string_end(source, index)
+            continue
+        if not (source[index].isalpha() or source[index] in "_$"):
+            index += 1
+            continue
+
+        identifier_start = index
+        index += 1
+        while index < len(source) and (source[index].isalnum() or source[index] in "_$"):
+            index += 1
+        identifier = source[identifier_start:index]
+        if identifier not in {"describe", "it", "test"}:
+            continue
+        if identifier_start > 0 and source[identifier_start - 1] in ".$_":
+            continue
+
+        cursor = _skip_typescript_trivia(source, index)
+        is_each = False
+        if source.startswith(".each", cursor):
+            after_each = cursor + len(".each")
+            if after_each == len(source) or not (source[after_each].isalnum() or source[after_each] in "_$"):
+                is_each = True
+                cursor = _skip_typescript_trivia(source, after_each)
+        while True:
+            modifier = next(
+                (
+                    name
+                    for name in ("skip", "only", "fails", "concurrent")
+                    if source.startswith(f".{name}", cursor)
+                    and (
+                        cursor + len(name) + 1 == len(source)
+                        or not (source[cursor + len(name) + 1].isalnum() or source[cursor + len(name) + 1] in "_$")
+                    )
+                ),
+                None,
+            )
+            if modifier is None:
+                break
+            cursor = _skip_typescript_trivia(source, cursor + len(modifier) + 1)
+        if cursor >= len(source) or source[cursor] != "(":
+            continue
+
+        data_end = _matching_typescript_delimiter(source, cursor)
+        if data_end is None:
+            continue
+        label_start = _skip_typescript_trivia(source, data_end + 1) if is_each else cursor + 1
+        label_end = label_start
+        if is_each:
+            if label_start >= len(source) or source[label_start] != "(":
+                continue
+            label_end = _matching_typescript_delimiter(source, label_start) or label_start
+            label = _typescript_call_label(source, label_start + 1)
+            row_count = _typescript_each_row_count(source[cursor + 1 : data_end])
+        else:
+            label = _typescript_call_label(source, label_start)
+            label_end = data_end
+            row_count = 1
+        if label is None:
+            continue
+
+        body_start = body_end = None
+        if identifier == "describe":
+            callback_start = _find_callback_body(source, label_start, label_end)
+            if callback_start is not None:
+                body_start = callback_start + 1
+                body_end = _matching_typescript_delimiter(source, callback_start)
+        calls.append(
+            _TypeScriptCall(
+                kind="describe" if identifier == "describe" else "test",
+                start=identifier_start,
+                label=label,
+                row_count=row_count,
+                body_start=body_start,
+                body_end=body_end,
+            )
+        )
+        # Continue through a describe callback so nested declarations are
+        # discovered; the lexical scanner already skips the declaration's
+        # label and callback strings as it walks.
+        index = identifier_start + len(identifier)
+    return calls
+
+
+def _skip_typescript_trivia(source: str, index: int) -> int:
+    """Skip whitespace and JS comments while scanning declaration syntax."""
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+        elif source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline == -1 else newline + 1
+        elif source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            index = len(source) if end == -1 else end + 2
+        else:
+            break
+    return index
+
+
+def _matching_typescript_delimiter(source: str, opening: int) -> int | None:
+    """Find a matching bracket while ignoring strings and comments."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    closing = pairs.get(source[opening])
+    if closing is None:
+        return None
+    stack = [closing]
+    index = opening + 1
+    while index < len(source):
+        char = source[index]
+        if char in "'\"`":
+            index = _typescript_string_end(source, index)
+            continue
+        if source.startswith("//", index):
+            index = _skip_typescript_trivia(source, index)
+            continue
+        if source.startswith("/*", index):
+            index = _skip_typescript_trivia(source, index)
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char == stack[-1]:
+            stack.pop()
+            if not stack:
+                return index
+        index += 1
+    return None
+
+
+def _typescript_string_end(source: str, opening: int) -> int:
+    """Return the first position after a JS string, honoring escaped quotes."""
+    delimiter = source[opening]
+    index = opening + 1
+    while index < len(source):
+        if source[index] == "\\":
+            index += 2
+        elif source[index] == delimiter:
+            return index + 1
+        else:
+            index += 1
+    return len(source)
+
+
+def _typescript_call_label(source: str, argument_start: int) -> str | None:
+    """Read a static first string argument and decode ordinary JS escapes."""
+    index = _skip_typescript_trivia(source, argument_start)
+    if index >= len(source) or source[index] not in "'\"`":
+        return None
+    end = _typescript_string_end(source, index)
+    raw = source[index + 1 : max(index + 1, end - 1)]
+    try:
+        return ast.literal_eval(source[index:end]) if source[index] != "`" else _decode_typescript_template(raw)
+    except (SyntaxError, ValueError):
+        return raw.replace("\\" + source[index], source[index]).replace("\\\\", "\\")
+
+
+def _decode_typescript_template(raw: str) -> str:
+    """Decode only template escapes; interpolation remains a stable source label."""
+    return raw.replace("\\`", "`").replace("\\\\", "\\").replace("\\n", "\n")
+
+
+def _find_callback_body(source: str, label_start: int, call_end: int) -> int | None:
+    """Locate the callback block following a describe label."""
+    index = _skip_typescript_trivia(source, label_start)
+    if index < len(source) and source[index] in "'\"`":
+        index = _typescript_string_end(source, index)
+    while index < len(source) and index < call_end:
+        if source[index] == "{":
+            return index
+        if source[index] in "'\"`":
+            index = _typescript_string_end(source, index)
+        else:
+            index += 1
+    return None
+
+
+def _typescript_each_row_count(data: str) -> int:
+    """Count top-level rows in a static array passed to ``.each``."""
+    start = _skip_typescript_trivia(data, 0)
+    if start >= len(data) or data[start] != "[":
+        return 1
+    end = _matching_typescript_delimiter(data, start)
+    if end is None:
+        return 1
+    rows = 0
+    item_start = start + 1
+    index = item_start
+    stack: list[str] = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    while index < end:
+        char = data[index]
+        if char in "'\"`":
+            index = _typescript_string_end(data, index)
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+        elif char == "," and not stack:
+            if data[item_start:index].strip():
+                rows += 1
+            item_start = index + 1
+        index += 1
+    if data[item_start:end].strip():
+        rows += 1
+    return rows
 
 
 def _has_pytest_class_name(name: str) -> bool:
