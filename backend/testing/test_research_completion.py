@@ -610,6 +610,29 @@ class TestResearchFindingTypeContract:
                 {"runner_target": {"runner_id": "not-a-uuid"}},
                 "runner_target is invalid",
             ),
+            # The artifact_produced relaxation below must not become a hole: a
+            # criterion that says it is a metric still has to carry one, and an
+            # unrecognized kind is not a second way to skip the check.
+            (
+                {
+                    "success_criterion": {
+                        "kind": "metric",
+                        "operator": ">=",
+                        "threshold": 10,
+                    }
+                },
+                "finite numeric threshold",
+            ),
+            (
+                {
+                    "success_criterion": {
+                        "kind": "vibes",
+                        "operator": ">=",
+                        "threshold": 10,
+                    }
+                },
+                "finite numeric threshold",
+            ),
         ],
     )
     def test_compute_contract_rejects_coercible_or_malformed_v2_shapes(
@@ -667,6 +690,62 @@ class TestResearchFindingTypeContract:
                     "error_excerpt": "",
                 },
             },
+        }
+
+        assert _research_finding_contract_errors(finding) == []
+
+    @_pytest.mark.parametrize(
+        "launch_override",
+        [
+            {"success_criterion": {"kind": "artifact_produced", "min_file_count": 2}},
+            {"success_criterion": {"kind": "artifact_produced"}},
+            {"success_criteria": [{"kind": "artifact_produced", "min_file_count": 1}]},
+            {},
+        ],
+        ids=[
+            "singular-with-file-count",
+            "singular-default-file-count",
+            "plural",
+            "no-criterion",
+        ],
+    )
+    def test_compute_contract_accepts_an_experiment_whose_result_is_its_output(
+        self, launch_override
+    ):
+        """A run whose deliverable is what it leaves behind is authorable.
+
+        ``kind="artifact_produced"`` has always been evaluated at runtime --
+        task_evaluators._normalize_success_criterion rewrites it to
+        ``durable_file_count >= min_file_count`` -- and the plural
+        ``success_criteria`` branch has always accepted it, as has the Pydantic
+        model both fields share (payload_schemas.ComputeSuccessCriterion). Only
+        the singular branch demanded a metric, and singular is the form every
+        authoring prompt teaches, so the artifact goal was unreachable through
+        the only door authors are shown. That is a direct reason the corpus
+        reaches for metrics that merely restate delivery (``artifacts_returned
+        >= 2``, declared 58 times) instead of asking for the artifacts.
+        """
+        launch = {
+            "command": "python3 -m testing.train_baseline",
+            "spend_cap_usd": 2,
+            "deadline_seconds": 300,
+            "smoke_sample": {
+                "exit_code": 0,
+                "startup_ok": True,
+                "metric_captured": True,
+                "timed_out": False,
+                "error_excerpt": "",
+            },
+            **launch_override,
+        }
+        finding = {
+            "type": "compute_experiment",
+            "title": "Train the baseline policy",
+            "prompt": "Run the bounded training loop and keep the checkpoints.",
+            "actionability_grade": "HIGH",
+            "work_class": "confirmatory",
+            "stop_or_pivot_condition": "Stop when the checkpoints are written.",
+            "compute_experiment": launch,
         }
 
         assert _research_finding_contract_errors(finding) == []

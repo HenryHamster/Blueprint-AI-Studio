@@ -158,6 +158,12 @@ const INPUTS = {
       'runner_target', 'accelerator', 'vram_gb', 'min_compute_capability',
       'cwd', 'env', 'container_image', 'allow_host_fallback', 'depends_on',
       'require_deps_landed_on', 'release_base_branch',
+      // Compute fields the launch payload has always accepted but this schema
+      // never listed, so an agent reading `./strategic schema spawn-task` could
+      // not discover them. `arms`/`declared_metric` are the multi-arm form the
+      // thinker prompt already instructs the strategist to send.
+      'arms', 'declared_metric', 'setup_step', 'require_durable_artifact',
+      'input_artifact_job_id', 'no_progress_timeout_seconds',
     ],
     example: {
       type: 'create',
@@ -178,6 +184,8 @@ const INPUTS = {
       'For compute_experiment, set preview_only=true to validate and inspect the normalized launch without dispatching.',
       'Omit accelerator for a CPU-only job. Preview reports the selected resource and estimated billable cost.',
       'Use success_criteria for simple all-required (AND) measurement contracts; success_criterion remains supported.',
+      'A compute_experiment states its result contract one of two ways. A MEASURED goal declares success_criterion {metric, operator, threshold} and its command must emit that metric, or the run fails compute_unmeasured_criterion. A PRODUCTION run — one whose value IS its output — declares NO metric and NO criterion: exit 0 with durable artifacts in $BLUEPRINT_ARTIFACT_DIR is the result and an empty delivery fails. Tighten the second with success_criterion {kind: "artifact_produced", min_file_count: N} or require_durable_artifact. Never declare a metric that restates delivery (artifacts_returned >= 2) — it is met whenever the job merely ran.',
+      'input_artifact_job_id rehydrates the durable bundle of a TERMINAL compute job into $BLUEPRINT_ARTIFACT_DIR before the command runs, for train-then-evaluate, resuming a deadline-capped run, or sharing one preprocessing step. It requires declared_metric and no_progress_timeout_seconds — the metric is the progress signal the watchdog reads, not necessarily a success goal — and the launch is refused without that pair.',
     ],
   },
   request_qualification: {

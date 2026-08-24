@@ -325,22 +325,35 @@ def _strict_compute_launch_error(contract: dict[str, Any]) -> str | None:
     if success_criterion is not None:
         if not isinstance(success_criterion, dict):
             return "success_criterion must be an object"
-        metric = success_criterion.get("metric")
-        operator = success_criterion.get("operator")
-        threshold = success_criterion.get("threshold")
-        if (
-            not isinstance(metric, str)
-            or not metric.strip()
-            or not isinstance(operator, str)
-            or operator not in _COMPUTE_OPERATORS
-            or isinstance(threshold, bool)
-            or not isinstance(threshold, (int, float))
-            or not math.isfinite(threshold)
-        ):
-            return (
-                "success_criterion requires a metric, supported operator, "
-                "and finite numeric threshold"
-            )
+        # ``kind="artifact_produced"`` declares that the experiment's RESULT is
+        # its durable output rather than a scalar, so metric/operator/threshold
+        # do not apply -- the evaluator rewrites it to ``durable_file_count >=
+        # min_file_count`` (task_evaluators._normalize_success_criterion).
+        #
+        # The plural ``success_criteria`` branch below has always skipped this
+        # kind, and so has the Pydantic model both fields share
+        # (payload_schemas.ComputeSuccessCriterion). Only this singular branch
+        # demanded a metric, which made the artifact goal unreachable through
+        # the one form every authoring surface teaches -- and is a direct reason
+        # authors reached for a metric that merely restates delivery
+        # (``artifacts_returned >= 2``) instead.
+        if str(success_criterion.get("kind") or "metric") != "artifact_produced":
+            metric = success_criterion.get("metric")
+            operator = success_criterion.get("operator")
+            threshold = success_criterion.get("threshold")
+            if (
+                not isinstance(metric, str)
+                or not metric.strip()
+                or not isinstance(operator, str)
+                or operator not in _COMPUTE_OPERATORS
+                or isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not math.isfinite(threshold)
+            ):
+                return (
+                    "success_criterion requires a metric, supported operator, "
+                    "and finite numeric threshold"
+                )
 
     success_criteria = contract.get("success_criteria")
     if success_criteria is not None:
