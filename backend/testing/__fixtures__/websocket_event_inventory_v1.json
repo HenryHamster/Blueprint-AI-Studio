@@ -660,6 +660,22 @@
     {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
+      "classification": "legacy_review_required",
+      "event": "alert_dismissed",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 2665,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "dict:alert_id,title",
+      "scope": "_resolve_strategic_cycle_liveness_alerts",
+      "source_path": "backend/app/alert_dispatch.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
+      "callee": "broadcast_to_project",
+      "canonical_callee": "broadcast_to_project",
       "classification": "legacy_project_event",
       "event": "alert_created",
       "event_expression": null,
@@ -5606,7 +5622,7 @@
   "summary": {
     "legacy_global_event": 16,
     "legacy_project_event": 225,
-    "legacy_review_required": 29,
+    "legacy_review_required": 30,
     "message_v1_payload": 29,
     "raw_websocket_control": 3,
     "strategic_v1_emitter": 5,

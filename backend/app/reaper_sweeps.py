@@ -2368,6 +2368,47 @@ def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime 
     return newest
 
 
+async def _retire_quiet_project_liveness_alerts(session, project_ids: list) -> int:
+    """Dismiss open halt alerts for projects that became deliberately quiet.
+
+    These projects are excluded from the liveness candidate set, so they never
+    reach the per-candidate resolution loop.  The alert event is registered
+    with ``AlertRetirementMode.SOURCE_CONDITION``, meaning the generic policy
+    retirement sweep will not retire it either — without this pass an operator
+    who quiets an already-alerted project keeps a permanent stale banner.
+    One batched query narrows the work to the (normally empty) set of
+    projects that actually hold an open WARNING.
+    """
+    from app.models import Alert, AlertSeverity
+
+    alerted_ids = set(
+        (
+            await session.execute(
+                select(Alert.project_id)
+                .where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not alerted_ids:
+        return 0
+
+    from app.alert_dispatch import _resolve_strategic_cycle_liveness_alerts
+
+    retired = 0
+    for project_id in alerted_ids:
+        retired += await _resolve_strategic_cycle_liveness_alerts(session, project_id)
+    return retired
+
+
 async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     """Detect a halted strategic loop and route one operator-visible alert.
 
@@ -2377,21 +2418,36 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     active/incomplete cycle, or phase-1-only completion, is deliberately not
     evidence of full-cycle liveness.
     """
-    from app.models import Alert, AlertSeverity, Project, StrategicCycle
+    from app.models import (
+        Alert,
+        AlertSeverity,
+        MessagesNoisePrefs,
+        Project,
+        StrategicCycle,
+    )
     from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
     from app.shared_state import runtime_config as _runtime_config
     from app.strategic_cycle import OUTCOME_COMPLETED
     from app.strategic_resident_session import (
         read_resident_session,
+        resident_session_is_active,
         resident_worker_is_healthy,
     )
+    from app.workbench_state import workbench_state_from_prefs
 
-    starvation_hours = int(
+    configured_starvation_hours = int(
         _runtime_config.get(
             "strategic_cycle_starvation_hours",
             _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS,
         )
         or _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS
+    )
+    cadence_backstop_minutes = int(
+        _runtime_config.get("strategic_max_interval_minutes", 1_440) or 0
+    )
+    starvation_hours = max(
+        configured_starvation_hours,
+        (max(0, cadence_backstop_minutes) + 60 + 59) // 60,
     )
     cutoff = now - timedelta(hours=starvation_hours)
 
@@ -2415,6 +2471,8 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     candidate_ids: list = []
     candidate_visions: dict = {}
     automatic_cycles_allowed: dict = {}
+    resident_blobs: dict[Any, dict[str, Any]] = {}
+    project_candidates: list[tuple[Any, Any, bool, dict[str, Any] | None]] = []
     for (
         project_id,
         project_created_at,
@@ -2427,11 +2485,69 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
                 pc = pc.replace(tzinfo=None)
             if pc > cutoff:
                 continue
-        candidate_ids.append(project_id)
-        candidate_visions[project_id] = project_vision
-        automatic_cycles_allowed[project_id] = automatic_strategic_cycles_enabled(
+        automatic_allowed = automatic_strategic_cycles_enabled(
             SimpleNamespace(build_config=project_build_config)
         )
+        resident_blob = read_resident_session(project_vision)
+        if resident_blob is not None:
+            resident_blobs[project_id] = resident_blob
+        project_candidates.append(
+            (
+                project_id,
+                project_vision,
+                automatic_allowed,
+                resident_blob,
+            )
+        )
+
+    quiet_project_ids: list = []
+    continuous_projects: set[Any] = set()
+    disabled_project_ids = [
+        candidate[0] for candidate in project_candidates if not candidate[2]
+    ]
+    if disabled_project_ids:
+        preference_rows = (
+            await session.execute(
+                select(MessagesNoisePrefs.project_id, MessagesNoisePrefs.prefs).where(
+                    MessagesNoisePrefs.project_id.in_(disabled_project_ids)
+                )
+            )
+        ).all()
+        continuous_projects = {
+            project_id
+            for project_id, prefs in preference_rows
+            if workbench_state_from_prefs(prefs).get("interaction_mode")
+            == "continuous"
+        }
+
+    for (
+        project_id,
+        project_vision,
+        automatic_allowed,
+        resident_blob,
+    ) in project_candidates:
+        # A disabled automatic Strategic lane is a deliberately quiet
+        # portfolio unless the Resident is still owned or Workday can recover
+        # it. Without one of those paths, no strategic-cycle receipt can ever
+        # be expected and the project is not a liveness candidate.
+        if not automatic_allowed and not (
+            resident_session_is_active(resident_blob)
+            or project_id in continuous_projects
+        ):
+            # A project that halted while automatic cycles were on, and was
+            # then deliberately quieted, keeps its open WARNING forever
+            # otherwise: it never reaches the resolution loop below, and the
+            # event's SOURCE_CONDITION retirement mode means no policy sweep
+            # will retire it either. Retire it here instead of leaving a
+            # stale halt banner on a portfolio this sweep calls healthy.
+            quiet_project_ids.append(project_id)
+            continue
+        candidate_ids.append(project_id)
+        candidate_visions[project_id] = project_vision
+        automatic_cycles_allowed[project_id] = automatic_allowed
+
+    if quiet_project_ids:
+        await _retire_quiet_project_liveness_alerts(session, quiet_project_ids)
 
     if not candidate_ids:
         return 0
@@ -2465,9 +2581,8 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     # receipt. Batch-load the exact task named by each session projection and
     # suppress only for a canonical, identity-matched, bounded-fresh worker.
     resident_task_ids: list[uuid.UUID] = []
-    resident_blobs: dict[Any, dict[str, Any]] = {}
     for project_id in candidate_ids:
-        blob = read_resident_session(candidate_visions.get(project_id))
+        blob = resident_blobs.get(project_id)
         if not isinstance(blob, dict):
             continue
         task_id = blob.get("task_id")
@@ -2495,15 +2610,17 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             .scalars()
             .all()
         }
-    healthy_resident_projects = {
-        project_id
-        for project_id, blob in resident_blobs.items()
-        if resident_worker_is_healthy(
-            blob,
-            resident_tasks.get(uuid.UUID(str(blob["task_id"]))),
-            now,
-        )
-    }
+    healthy_resident_projects = set()
+    for project_id, blob in resident_blobs.items():
+        task_id = blob.get("task_id")
+        if not task_id:
+            continue
+        try:
+            task_uuid = uuid.UUID(str(task_id))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if resident_worker_is_healthy(blob, resident_tasks.get(task_uuid), now):
+            healthy_resident_projects.add(project_id)
 
     # Batched lookup: which candidate projects already have an open WARNING
     # dedup alert. Replaces the per-project dedup SELECT.
@@ -2526,7 +2643,10 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     )
 
     created = 0
-    from app.alert_dispatch import _maybe_create_strategic_cycle_liveness_alert
+    from app.alert_dispatch import (
+        _maybe_create_strategic_cycle_liveness_alert,
+        _resolve_strategic_cycle_liveness_alerts,
+    )
     from app.strategic_trigger import (
         ORIGIN_QUALIFICATION,
         request_strategic_refresh,
@@ -2534,10 +2654,13 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
 
     for project_id in candidate_ids:
         if project_id in recent_completions:
+            await _resolve_strategic_cycle_liveness_alerts(session, project_id)
             continue
         if _recent_no_delta_skip_at(candidate_visions.get(project_id), cutoff) is not None:
+            await _resolve_strategic_cycle_liveness_alerts(session, project_id)
             continue
         if project_id in healthy_resident_projects:
+            await _resolve_strategic_cycle_liveness_alerts(session, project_id)
             continue
         if automatic_cycles_allowed[project_id]:
             # An alert is only the operator-facing symptom. Arm the durable
@@ -2559,7 +2682,10 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             # Workday auto-start arm on its own fresh session. This runs before
             # alert deduplication so an open alert cannot suppress recovery.
             await session.commit()
-            await _maybe_retry_resident_workday_auto_start(project_id)
+            recovered = await _maybe_retry_resident_workday_auto_start(project_id)
+            if recovered:
+                await _resolve_strategic_cycle_liveness_alerts(session, project_id)
+                continue
             logger.info(
                 "[STRATEGIC] Liveness alert for project %s; autonomous refresh "
                 "not armed because automatic Strategic cycles are disabled",
@@ -2578,12 +2704,13 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     return created
 
 
-async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
+async def _maybe_retry_resident_workday_auto_start(project_id) -> bool:
     """Retry the existing Workday auto-start arm after a resident halt.
 
     The liveness sweep owns its session, so the state check and the arm both
     use fresh sessions.  The Workday preference is the durable operator
     authority; a project with no continuous operator remains alert-only.
+    Return whether a healthy worker was already present or a new one started.
     """
     from app.models import MessagesNoisePrefs, Project
     from app.strategic_resident_session import (
@@ -2598,7 +2725,7 @@ async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
         async with AsyncSessionLocal() as fresh:
             project = await fresh.get(Project, project_id)
             if project is None:
-                return
+                return False
             resident_blob = read_resident_session(project.vision)
             resident_task = None
             resident_task_id = (resident_blob or {}).get("task_id")
@@ -2610,7 +2737,7 @@ async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
                 except (TypeError, ValueError, AttributeError):
                     resident_task = None
             if resident_worker_is_healthy(resident_blob, resident_task, _utcnow()):
-                return
+                return True
             operator_rows = (
                 await fresh.execute(
                     select(MessagesNoisePrefs.user_id)
@@ -2631,28 +2758,32 @@ async def _maybe_retry_resident_workday_auto_start(project_id) -> None:
             project_id,
             exc_info=True,
         )
-        return
+        return False
 
     if operator_user_id is None:
-        return
+        return False
 
     try:
-        await _auto_start_on_workday_entry(
+        snapshot = await _auto_start_on_workday_entry(
             project_id,
             operator_user_id=operator_user_id,
             session_factory=AsyncSessionLocal,
         )
+        if snapshot is None:
+            return False
         logger.info(
             "[STRATEGIC] resident liveness recovery attempted Workday auto-start "
             "for project %s",
             project_id,
         )
+        return True
     except Exception:
         logger.warning(
             "[STRATEGIC] resident liveness recovery auto-start failed for project %s",
             project_id,
             exc_info=True,
         )
+        return False
 
 
 # ── Step 20: Orphaned cross-base children that can never land ─────────────────

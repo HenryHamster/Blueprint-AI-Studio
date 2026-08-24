@@ -245,6 +245,12 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "research.strategic_issue": AlertEventPolicy(
         "research.strategic_issue", domain=DOMAIN_RESEARCH_DIRECTIONS
     ),
+    # Strategic-cycle liveness applies to every autonomous project, while its
+    # producer owns retirement when a completion or healthy-idle receipt arrives.
+    "research.strategic_cycle_liveness": AlertEventPolicy(
+        "research.strategic_cycle_liveness",
+        retirement=AlertRetirementMode.SOURCE_CONDITION,
+    ),
     "rollup.backmerge_blocked": AlertEventPolicy(
         "rollup.backmerge_blocked", domain=DOMAIN_ROLLUP_LTS
     ),

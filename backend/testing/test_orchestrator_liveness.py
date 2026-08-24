@@ -190,7 +190,7 @@ class TestStrategicLoopLiveness:
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
-        last_completed = now - timedelta(hours=25)
+        last_completed = now - timedelta(hours=26)
         db_session.add(
             StrategicCycle(
                 id=f"sc-{uuid.uuid4().hex[:8]}",
@@ -205,7 +205,7 @@ class TestStrategicLoopLiveness:
             StrategicCycle(
                 id=f"sc-{uuid.uuid4().hex[:8]}",
                 project_id=project.id,
-                phase1_started_at=now - timedelta(hours=25),
+                phase1_started_at=now - timedelta(hours=26),
                 outcome="phase1_running",
             )
         )
@@ -315,10 +315,98 @@ class TestStrategicLoopLiveness:
             == 1
         )
 
-    async def test_resident_owned_starvation_does_not_persist_autonomous_refresh(
+    async def test_second_halt_after_recovery_raises_a_fresh_signal(
+        self, db_session, monkeypatch
+    ):
+        """A recovered liveness alert retires before a later halt re-alerts."""
+        from app.alert_policy import AlertRetirementMode, get_alert_event_policy
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        assert (
+            get_alert_event_policy("research.strategic_cycle_liveness").retirement
+            == AlertRetirementMode.SOURCE_CONDITION
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        routed = []
+
+        async def record_broadcast(project_id, event, payload):
+            routed.append((project_id, event, payload))
+
+        monkeypatch.setattr("app.alert_dispatch.broadcast_to_project", record_broadcast)
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        first_alert = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert first_alert.dismissed_at is None
+        assert first_alert.domain == "core"
+        assert first_alert.event_type == "research.strategic_cycle_liveness"
+        assert first_alert.dedupe_key == (
+            f"research.strategic_cycle_liveness:{project.id}"
+        )
+
+        completed_at = now
+        db_session.add(
+            StrategicCycle(
+                id=f"sc-{uuid.uuid4().hex[:8]}",
+                project_id=project.id,
+                phase2_completed_at=completed_at,
+                outcome="completed",
+            )
+        )
+        await db_session.commit()
+
+        # The completion is a healthy receipt and must retire the first alert.
+        assert await _sweep_strategic_cycle_starvation(
+            db_session, now + timedelta(hours=1)
+        ) == 0
+        await db_session.refresh(first_alert)
+        assert first_alert.dismissed_at is not None
+
+        # Once that receipt ages out, a distinct halt must create a new row.
+        assert await _sweep_strategic_cycle_starvation(
+            db_session, now + timedelta(hours=26)
+        ) == 1
+        alerts = (
+            await db_session.execute(
+                select(Alert)
+                .where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+                .order_by(Alert.created_at, Alert.id)
+            )
+        ).scalars().all()
+        assert len(alerts) == 2
+        assert alerts[0].id != alerts[1].id
+        assert alerts[0].dismissed_at is not None
+        assert alerts[1].dismissed_at is None
+        assert [event for _, event, _ in routed] == [
+            "alert_created",
+            "alert_dismissed",
+            "alert_created",
+        ]
+
+    async def test_quiet_resident_owned_portfolio_does_not_raise_signal(
         self, db_session
     ):
-        """A Resident-owned halt is alerted without arming an unreadable marker."""
+        """A disabled, idle Resident portfolio is not a strategic halt."""
         from app.reaper_sweeps import (
             _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
             _sweep_strategic_cycle_starvation,
@@ -333,32 +421,28 @@ class TestStrategicLoopLiveness:
         db_session.add(project)
         await db_session.commit()
 
-        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
-        await db_session.refresh(project)
-        assert (project.vision or {}).get("_strategic_refresh") is None
-
-        # A repeated reaper pass must remain marker-free, even while the alert
-        # is deduped. There is no autonomous consumer for this project's marker.
         assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
         await db_session.refresh(project)
         assert (project.vision or {}).get("_strategic_refresh") is None
-        assert len(
-            (
-                await db_session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project.id,
-                        Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
-                    )
+
+        # A repeated reaper pass remains quiet because no Resident ownership or
+        # Workday recovery path makes this project a liveness candidate.
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+        await db_session.refresh(project)
+        assert (project.vision or {}).get("_strategic_refresh") is None
+        assert not (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
                 )
             )
-            .scalars()
-            .all()
-        ) == 1
+        ).scalars().first()
 
-    async def test_resident_halt_retries_workday_auto_start_even_when_alert_is_deduped(
+    async def test_successful_resident_recovery_suppresses_alert(
         self, db_session, monkeypatch
     ):
-        """A continuous operator makes every halted pass eligible to retry."""
+        """A successful Workday restart suppresses the same-pass halt alert."""
         from app.reaper_sweeps import (
             _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
             _sweep_strategic_cycle_starvation,
@@ -381,26 +465,26 @@ class TestStrategicLoopLiveness:
         )
         await db_session.commit()
 
-        attempts = AsyncMock()
+        attempts = AsyncMock(return_value={"session_id": "recovered"})
         monkeypatch.setattr(
             "app.strategic_resident_session._auto_start_on_workday_entry",
             attempts,
         )
 
-        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
         assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
         assert attempts.await_count == 2
         assert attempts.await_args.kwargs["operator_user_id"] == "workday-operator"
-        assert "24h" in (
+        assert not (
             await db_session.execute(
                 select(Alert).where(
                     Alert.project_id == project.id,
                     Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
                 )
             )
-        ).scalars().one().message
+        ).scalars().first()
 
-    async def test_resident_halt_without_continuous_operator_is_alert_only(
+    async def test_resident_halt_without_continuous_operator_is_not_a_candidate(
         self, db_session, monkeypatch
     ):
         """Chat-mode prefs must not arm Resident recovery."""
@@ -429,8 +513,86 @@ class TestStrategicLoopLiveness:
             attempts,
         )
 
-        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
         assert attempts.await_count == 0
+
+    async def test_failed_resident_recovery_still_raises_signal(
+        self, db_session, monkeypatch
+    ):
+        """A Workday path that cannot restart the Resident remains actionable."""
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={"automatic_strategic_cycles_enabled": False},
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+        db_session.add(
+            MessagesNoisePrefs(
+                user_id="workday-operator",
+                project_id=project.id,
+                prefs={WORKBENCH_STATE_KEY: {"interaction_mode": "continuous"}},
+            )
+        )
+        await db_session.commit()
+
+        attempts = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "app.strategic_resident_session._auto_start_on_workday_entry",
+            attempts,
+        )
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        alert = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert "loop=strategic" in alert.message
+
+    async def test_starvation_window_is_floored_by_strategic_backstop(
+        self, db_session, mocker
+    ):
+        """The halt window cannot pre-empt the cadence backstop plus grace."""
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        mocker.patch.dict(
+            _ss.runtime_config,
+            {
+                "strategic_cycle_starvation_hours": 1,
+                "strategic_max_interval_minutes": 180,
+            },
+        )
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            created_at=now - timedelta(hours=5),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        alert = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert "last 4h" in alert.message
 
     async def test_resident_recovery_is_bounded_for_runner_and_session_states(
         self, db_session, monkeypatch
@@ -710,6 +872,71 @@ class TestStrategicLoopLiveness:
                 select(Alert).where(
                     Alert.project_id == project.id,
                     Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().first()
+
+    async def test_quieting_an_alerted_project_retires_its_open_halt_alert(
+        self, db_session, monkeypatch
+    ):
+        """Alerted-then-quieted must not leave a permanent stale halt banner.
+
+        A quiet project is filtered out of the candidate set before the
+        per-candidate resolution loop, and the event's SOURCE_CONDITION
+        retirement mode means no policy sweep retires it either — so the
+        starvation sweep itself has to dismiss the row it created.
+        """
+        from app.reaper_sweeps import (
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={"automatic_strategic_cycles_enabled": True},
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        # The automatic lane halts and the operator gets the WARNING.
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        alert = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert alert.dismissed_at is None
+
+        # The operator then deliberately quiets the project: automatic cycles
+        # off, chat mode, no Resident ownership.
+        project.build_config = {"automatic_strategic_cycles_enabled": False}
+        db_session.add(project)
+        await db_session.commit()
+
+        restart = AsyncMock()
+        monkeypatch.setattr(
+            "app.strategic_resident_session._auto_start_on_workday_entry",
+            restart,
+        )
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+        assert restart.await_count == 0
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None
+
+        # Idempotent: a second quiet pass has nothing left to retire.
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+        assert not (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                    Alert.dismissed_at.is_(None),
                 )
             )
         ).scalars().first()
