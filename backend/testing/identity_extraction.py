@@ -13,7 +13,9 @@ name, so a subclass-only body is not an empty identity set.
 from __future__ import annotations
 
 import ast
+import contextlib
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -450,6 +452,46 @@ _TYPESCRIPT_BINDINGS_CACHE: dict[
 ] = {}
 
 
+_TYPESCRIPT_TREE_FROZEN = False
+
+
+@contextlib.contextmanager
+def frozen_typescript_tree() -> Iterator[None]:
+    """Treat the TypeScript source tree as immutable for the duration.
+
+    Outside this context every cache hit still pays a ``stat`` to prove the
+    file has not changed underneath it. That is the right default -- test
+    fixtures rewrite and delete modules in-process, and
+    ``test_typescript_import_graph_caches_are_invalidated_by_content`` pins
+    that they are never served a stale answer.
+
+    But a bulk sweep of a checkout is not that. ``collect_test_files``
+    resolves the same imported modules from hundreds of entry points, and
+    measured over the real estate it spends **103,550 stat calls to perform
+    2,231 reads** -- roughly 46 revalidation stats for every file it actually
+    opens. Nothing writes to the tree during that sweep, so every one of those
+    stats is answering a question whose answer cannot have changed. On a native
+    filesystem that is 18s of waste; over the Docker-on-Windows bind mount the
+    standalone lane runs on, where stat is ~100x slower, it is what pushes
+    ``test_checked_in_queue_ranks_every_collected_test_file`` past its 30s
+    timeout.
+
+    Inside the context a cached module is returned without the stat, so the
+    sweep costs one stat per distinct module instead of one per reference.
+    Nesting is safe -- the previous value is restored on exit, not cleared.
+    It is deliberately NOT the default: being wrong here means silently
+    reporting a stale test estate, which is what the estate guards exist to
+    catch.
+    """
+    global _TYPESCRIPT_TREE_FROZEN
+    previous = _TYPESCRIPT_TREE_FROZEN
+    _TYPESCRIPT_TREE_FROZEN = True
+    try:
+        yield
+    finally:
+        _TYPESCRIPT_TREE_FROZEN = previous
+
+
 def _resolved_typescript_path(path: Path) -> Path:
     """``Path.resolve()`` memoized -- it is a filesystem syscall, not string work."""
     cached = _TYPESCRIPT_RESOLVED_PATH_CACHE.get(path)
@@ -461,12 +503,14 @@ def _resolved_typescript_path(path: Path) -> Path:
 
 def _read_typescript_module_source(path: Path) -> str | None:
     """Read an imported module once per (path, mtime_ns, size)."""
+    cached = _TYPESCRIPT_SOURCE_CACHE.get(path)
+    if cached is not None and _TYPESCRIPT_TREE_FROZEN:
+        return cached[1]
     try:
         stat = path.stat()
     except OSError:
         return None
     stamp = (stat.st_mtime_ns, stat.st_size)
-    cached = _TYPESCRIPT_SOURCE_CACHE.get(path)
     if cached is not None and cached[0] == stamp:
         return cached[1]
     try:
@@ -579,8 +623,12 @@ def _resolve_typescript_module(directory: Path, specifier: str) -> Path | None:
     cache_key = (directory, specifier)
     cached = _TYPESCRIPT_MODULE_CACHE.get(cache_key, False)
     # Revalidate with one stat instead of trusting the memo outright: a fixture
-    # may have created or deleted the module since the last lookup.
-    if cached is not False and (cached is None or cached.is_file()):
+    # may have created or deleted the module since the last lookup. Under
+    # frozen_typescript_tree() the tree is known not to be changing, so the
+    # memo is authoritative and the stat is skipped.
+    if cached is not False and (
+        cached is None or _TYPESCRIPT_TREE_FROZEN or cached.is_file()
+    ):
         return cached
 
     candidate = _resolved_typescript_path(directory / specifier)

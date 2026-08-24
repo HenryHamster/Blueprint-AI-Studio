@@ -26,6 +26,7 @@ from backend.testing.estate_inventory import (  # noqa: E402
 from backend.testing.identity_extraction import (  # noqa: E402
     extract_python_test_ids_from_file,
     extract_typescript_test_ids,
+    frozen_typescript_tree,
 )
 
 QUEUE_PATH = "test-estate-ranked-queue.md"
@@ -139,32 +140,42 @@ def _record(
 
 
 def collect_test_files(root: Path) -> tuple[TestFile, ...]:
-    """Collect all three current test inventories with canonical test counts."""
+    """Collect all three current test inventories with canonical test counts.
+
+    The sweep is read-only, so it runs under ``frozen_typescript_tree()``:
+    resolving one Vitest file's transitive imports is the same work for
+    hundreds of entry points, and revalidating each cached module with a stat
+    every time costs ~46 stats per file actually read. See that context
+    manager for the measurement.
+    """
     protected = _load_protected_counts(root)
     records: list[TestFile] = []
     backend_costs = _backend_costs(root)
-    for path in iter_backend_test_files(root):
-        records.append(
-            _record(
-                "backend",
-                path,
-                path.relative_to(root).as_posix(),
-                protected,
-                backend_costs,
-            )
-        )
-    for suite in ("admin-ui", "admin-ui-viewport", "agent"):
-        costs = _vitest_costs(root, suite) if suite in VITEST_DURATION_PATHS else {}
-        for path in iter_vitest_test_files(root, suite):
+    with frozen_typescript_tree():
+        for path in iter_backend_test_files(root):
             records.append(
                 _record(
-                    suite,
+                    "backend",
                     path,
                     path.relative_to(root).as_posix(),
                     protected,
-                    costs,
+                    backend_costs,
                 )
             )
+        for suite in ("admin-ui", "admin-ui-viewport", "agent"):
+            costs = (
+                _vitest_costs(root, suite) if suite in VITEST_DURATION_PATHS else {}
+            )
+            for path in iter_vitest_test_files(root, suite):
+                records.append(
+                    _record(
+                        suite,
+                        path,
+                        path.relative_to(root).as_posix(),
+                        protected,
+                        costs,
+                    )
+                )
     return tuple(records)
 
 

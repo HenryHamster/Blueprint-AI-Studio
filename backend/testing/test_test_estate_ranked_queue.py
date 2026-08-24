@@ -160,6 +160,21 @@ def test_repository_root_resolution_never_raises_on_a_missing_checkout(
 _RANKED_ROW = re.compile(r"^\| \d+ \| \S+ \| \S+ \| `([^`]+)` \|", re.MULTILINE)
 
 
+# Measured cost of the one full sweep this guard runs: 15.8s on a native
+# filesystem, 37.1s inside the standalone lane's container (Docker-on-Windows
+# bind mount, ~2.3x slower at both I/O and CPU). The work is irreducible --
+# 1,170 test files plus 1,061 transitively imported modules, 47 MB, read and
+# parsed to derive canonical test counts. Two upstream fixes already cut the
+# container cost from >120s to 37.1s (the node_modules walk and the
+# per-reference revalidation stat); what is left is reading and parsing the
+# tree, which the guard exists to do.
+#
+# So the 30s the standalone lane passes on the command line is not a budget
+# this test can meet -- it left zero headroom over a 15.8s native cost and the
+# guard died on a timeout, not an assertion, which reads as a red gate with no
+# diagnosis. The explicit marker overrides it. Keep the number well clear of
+# the measurement: a shared CI runner competing for four slots is slower again.
+@pytest.mark.timeout(180)
 def test_checked_in_queue_ranks_every_collected_test_file() -> None:
     """Every current test file is ranked, and no vanished file still is.
 
@@ -364,3 +379,160 @@ def test_typescript_import_cycles_still_terminate(tmp_path: Path) -> None:
     spec.write_text(source, encoding="utf-8")
 
     assert len(_each_row_ids(source, spec)) == 2
+
+
+def _table_fixture(tmp_path: Path, rows: int) -> tuple[str, Path]:
+    """A spec whose it.each table lives in a separate imported module."""
+    table = tmp_path / "table.ts"
+    cases = ", ".join(f"['r{i}']" for i in range(rows))
+    table.write_text(f"export const CASES = [{cases}];" + NL, encoding="utf-8")
+    spec = tmp_path / "suite.test.ts"
+    source = (
+        "import { CASES } from './table';" + NL
+        + "describe('suite', () => {" + NL
+        + "  it.each(CASES)('case %s', () => {});" + NL
+        + "});" + NL
+    )
+    spec.write_text(source, encoding="utf-8")
+    return source, spec
+
+
+def test_frozen_typescript_tree_is_opt_in_and_does_not_leak(tmp_path: Path) -> None:
+    """The bulk-sweep fast path must be explicit, and must end when it ends.
+
+    ``frozen_typescript_tree`` buys its speed by declaring the tree immutable
+    and skipping the revalidation stat on every cache hit. That is only sound
+    for a read-only sweep, so it is deliberately not the default -- being wrong
+    here means silently reporting a stale test estate, which is exactly the
+    class of bug the estate guards exist to catch.
+
+    Two halves, and the second is the one that matters: inside the context a
+    rewritten module is intentionally served from cache, and on exit
+    revalidation must resume. A leaked flag would make every later caller in
+    the same process blind to edits, including the fixtures in
+    ``test_typescript_import_graph_caches_are_invalidated_by_content``.
+    """
+    from testing.identity_extraction import frozen_typescript_tree
+
+    source, spec = _table_fixture(tmp_path, 2)
+    table = tmp_path / "table.ts"
+
+    assert len(_each_row_ids(source, spec)) == 2, "fixture check"
+
+    with frozen_typescript_tree():
+        table.write_text(
+            "export const CASES = [['a'], ['b'], ['c'], ['d']];" + NL,
+            encoding="utf-8",
+        )
+        assert len(_each_row_ids(source, spec)) == 2, (
+            "inside the frozen context the cached parse is authoritative -- "
+            "that is the entire point of the context, and the reason it is "
+            "opt-in rather than the default"
+        )
+
+    assert len(_each_row_ids(source, spec)) == 4, (
+        "frozen_typescript_tree leaked: revalidation must resume on exit"
+    )
+
+
+def test_frozen_typescript_tree_stops_paying_a_stat_per_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated resolution of one module must cost one stat, not one each.
+
+    This is the measurement the context exists for. Over the real estate the
+    unfrozen sweep spends 103,550 stat calls to perform 2,231 reads -- ~46
+    revalidation stats per file actually opened -- because the same imported
+    modules are reached from hundreds of entry points. On a native filesystem
+    that is ~18s of waste. Over the Docker-on-Windows bind mount the standalone
+    lane runs on, where stat is ~100x slower, it is what pushed
+    ``test_checked_in_queue_ranks_every_collected_test_file`` past its timeout.
+
+    Asserting "zero further stats" rather than "fewer stats" so that quietly
+    reintroducing per-reference revalidation fails here instead of only showing
+    up as a timeout in the container, which is where it is most expensive to
+    diagnose.
+    """
+    from testing.identity_extraction import frozen_typescript_tree
+
+    source, spec = _table_fixture(tmp_path, 3)
+
+    calls: list[Path] = []
+    real_stat = Path.stat
+
+    def counting_stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        calls.append(self)
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counting_stat)
+
+    with frozen_typescript_tree():
+        assert len(_each_row_ids(source, spec)) == 3
+        warm = len(calls)
+        for _ in range(20):
+            assert len(_each_row_ids(source, spec)) == 3
+        extra = [str(path) for path in calls[warm:]]
+        assert not extra, (
+            f"20 repeat resolutions inside the frozen context made {len(extra)} "
+            "extra stat call(s); the memo is supposed to be authoritative there"
+            + NL
+            + format_offender_marker(sorted(set(extra)))
+        )
+
+    before = len(calls)
+    _each_row_ids(source, spec)
+    assert len(calls) > before, (
+        "outside the context every hit must still revalidate -- otherwise the "
+        "default is unsafe, not just the fast path"
+    )
+
+
+def test_collect_test_files_runs_the_sweep_frozen(tmp_path: Path) -> None:
+    """Pin that the bulk sweep actually enters the context.
+
+    Without this the freeze could be dropped from ``collect_test_files`` and
+    every test above would still pass, because they exercise the context
+    directly. The cost would come back silently and reappear only as a
+    container timeout, which is the most expensive place to diagnose it.
+
+    The flag is read off ``frozen_typescript_tree.__module__`` rather than a
+    plain ``import testing.identity_extraction``. The generator is loaded from
+    a file path and imports ``backend.testing.identity_extraction``, while this
+    file's own imports resolve ``testing.identity_extraction`` -- two distinct
+    module objects with independent globals in the same process. Reading the
+    wrong one reports every record as unfrozen even when the sweep is fully
+    frozen, so the observation has to follow the generator's own binding.
+
+    Runs against a tmp fixture root, not ``REPOSITORY_ROOT``: a second full
+    sweep would add ~15s to a file that already spends ~16s on one, against a
+    30s per-test budget.
+    """
+    _write_fixture_root(tmp_path)
+
+    generator = _require_generator()
+    identity = sys.modules[generator.frozen_typescript_tree.__module__]
+    observed: list[bool] = []
+    real_record = generator._record
+
+    def observing_record(*args: Any, **kwargs: Any) -> Any:
+        # args[2] is the repo-relative path _record stamps onto the row.
+        observed.append((bool(identity._TYPESCRIPT_TREE_FROZEN), str(args[2])))
+        return real_record(*args, **kwargs)
+
+    generator._record = observing_record
+    try:
+        generator.collect_test_files(tmp_path)
+    finally:
+        generator._record = real_record
+
+    assert observed, "collect_test_files recorded nothing"
+    thawed = [relative for frozen, relative in observed if not frozen]
+    assert not thawed, (
+        f"{len(thawed)} of {len(observed)} records were built outside "
+        "frozen_typescript_tree()"
+        + NL
+        + format_offender_marker(sorted(thawed))
+    )
+    assert not identity._TYPESCRIPT_TREE_FROZEN, (
+        "collect_test_files left the tree frozen for everything that runs after it"
+    )

@@ -18,8 +18,12 @@ import subprocess
 import warnings
 from pathlib import Path
 
+import pytest
+
 from testing.estate_inventory import (
     is_vitest_test_path,
+    suite_scan_prefixes,
+    iter_vitest_test_files,
     vitest_test_file_inventory,
     vitest_test_file_inventory_from_paths,
 )
@@ -662,3 +666,77 @@ def test_adminui_artifact_sorted_descending() -> None:
         "admin-ui/.test_durations.json files are not sorted descending by duration_ms. "
         "Regenerate: node scripts/vitest-test-telemetry.mjs --suite admin-ui"
     )
+
+
+_ALL_VITEST_SUITES = ("agent", "admin-ui", "admin-ui-viewport")
+
+
+@pytest.mark.parametrize("suite", _ALL_VITEST_SUITES)
+def test_scan_prefixes_cover_every_path_the_predicate_accepts(suite: str) -> None:
+    """The walk's subtrees and the collection predicate must not drift apart.
+
+    ``iter_vitest_test_files`` descends only into ``suite_scan_prefixes(suite)``
+    instead of the whole suite root, because the whole suite root includes
+    ``node_modules`` -- stat-ing ~200k files to find a few hundred, which over a
+    bind mount is slow enough to blow the 30s pytest timeout and take this
+    inventory and the ranked-queue guard down with it.
+
+    That optimisation is only sound while the prefixes are a superset of what
+    the predicate accepts. If someone teaches ``is_vitest_test_path`` a new
+    location and forgets the prefix list, the files simply vanish from every
+    inventory -- silently, and looking exactly like "those tests do not exist".
+    So assert the implication directly rather than trusting the comment.
+    """
+    prefixes = suite_scan_prefixes(suite)
+    assert prefixes, f"{suite} must declare at least one scan prefix"
+
+    # Any accepted path must live under a declared prefix.
+    for relative in (
+        "src/a.test.ts",
+        "src/a.test.tsx",
+        "src/a.viewport.test.ts",
+        "src/a.viewport.test.tsx",
+        "src/nested/deep/a.test.ts",
+        "eslint-rules/a.test.js",
+        "eslint-rules/a.test.ts",
+        "lib/a.test.ts",
+        "test/a.test.ts",
+        "a.test.ts",
+        "node_modules/pkg/a.test.ts",
+        "src-gen/a.test.ts",
+    ):
+        if not is_vitest_test_path(suite, relative):
+            continue
+        assert relative.split("/", 1)[0] in prefixes, (
+            f"{suite} collects {relative!r}, which lives outside its declared "
+            f"scan prefixes {prefixes} -- iter_vitest_test_files will never "
+            "walk it and the file will silently disappear from the inventory"
+        )
+
+    # And the prefixes must not be padded with subtrees that cannot match,
+    # which would quietly re-admit the cost this exists to avoid.
+    assert "node_modules" not in prefixes
+
+
+@pytest.mark.parametrize("suite", _ALL_VITEST_SUITES)
+def test_inventory_walk_ignores_node_modules(suite: str, tmp_path: Path) -> None:
+    """A test-shaped file inside node_modules is not ours and is not walked."""
+    root = tmp_path
+    suite_dir = root / ("admin-ui" if suite.startswith("admin-ui") else suite)
+    real = suite_dir / "src" / "real.viewport.test.ts"
+    real.parent.mkdir(parents=True)
+    real.write_text("it('x', () => {});", encoding="utf-8")
+    plain = suite_dir / "src" / "plain.test.ts"
+    plain.write_text("it('x', () => {});", encoding="utf-8")
+
+    decoy = suite_dir / "node_modules" / "pkg" / "src" / "decoy.test.ts"
+    decoy.parent.mkdir(parents=True)
+    decoy.write_text("it('x', () => {});", encoding="utf-8")
+
+    found = iter_vitest_test_files(root, suite)
+    assert decoy not in found, (
+        "a vendored dependency's own tests are not part of our estate"
+    )
+    assert all("node_modules" not in part.parts for part in found)
+    expected = real if suite == "admin-ui-viewport" else plain
+    assert expected in found, "the suite's own test file must still be collected"

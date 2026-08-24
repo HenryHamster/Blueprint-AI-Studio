@@ -25,6 +25,23 @@ def iter_backend_test_files(workspace_root: Path) -> tuple[Path, ...]:
     return tuple(sorted((workspace_root / "backend" / "testing").glob("test_*.py")))
 
 
+def suite_scan_prefixes(suite: str) -> tuple[str, ...]:
+    """Return the only top-level subtrees ``is_vitest_test_path`` can accept.
+
+    Kept adjacent to the predicate on purpose: this is a restatement of the
+    predicate's ``relative.startswith(...)`` clauses, and the two drifting apart
+    would silently drop test files from every inventory. That is pinned by
+    ``test_scan_prefixes_cover_every_path_the_predicate_accepts``.
+    """
+    if suite == "agent":
+        return ("src",)
+    if suite == "admin-ui":
+        return ("src", "eslint-rules")
+    if suite == "admin-ui-viewport":
+        return ("src",)
+    raise ValueError(f"Unknown Vitest suite: {suite}")
+
+
 def is_vitest_test_path(suite: str, relative: str) -> bool:
     """Return whether *relative* is collected by a configured Vitest suite."""
     if suite == "agent":
@@ -51,14 +68,32 @@ def is_vitest_test_path(suite: str, relative: str) -> bool:
 
 
 def iter_vitest_test_files(workspace_root: Path, suite: str) -> tuple[Path, ...]:
-    """Return absolute paths in the files collected by *suite*'s config."""
+    """Return absolute paths in the files collected by *suite*'s config.
+
+    Two things here are load-bearing for cost, not for correctness, and the
+    result is identical without them.
+
+    This used to ``rglob("*")`` the whole suite root and call ``is_file()`` --
+    a stat syscall -- on every entry before asking whether the path could even
+    be a test. ``admin-ui`` contains ``node_modules``, so that stat-ed on the
+    order of 200k files to find ~500, and every one of them was then rejected
+    by the predicate for not starting with ``src/``. Cheap locally; over the
+    Docker-on-Windows bind mount the standalone lane runs on it blew the 30s
+    pytest timeout, taking down both this inventory and the ranked-queue guard
+    that consumes it -- reported as an inventory failure, which is not what it
+    was.
+
+    So: descend only into the subtrees the predicate can accept, and apply the
+    predicate (pure string work) before spending the stat.
+    """
     suite_root = _suite_root(workspace_root, suite)
-    paths = (
-        path
-        for path in suite_root.rglob("*")
-        if path.is_file()
-        and is_vitest_test_path(suite, path.relative_to(suite_root).as_posix())
-    )
+    paths: list[Path] = []
+    for prefix in suite_scan_prefixes(suite):
+        prefix_root = suite_root / prefix
+        for path in prefix_root.rglob("*"):
+            relative = path.relative_to(suite_root).as_posix()
+            if is_vitest_test_path(suite, relative) and path.is_file():
+                paths.append(path)
     return tuple(sorted(paths))
 
 
