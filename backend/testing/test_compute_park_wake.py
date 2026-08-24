@@ -149,6 +149,12 @@ async def test_wake_delivery_missing_job_is_truthfully_classified(db_session):
 # (USE_POSTGRES is imported from testing.conftest above — it was re-derived here
 # with the identical expression, which shadowed the import.)
 
+# The metric the race-safety experiment declares and its stub backend reports.
+# Named once so the payload declaration and the poll_status report cannot drift:
+# if they ever disagree the job finalizes FAILURE and the race assertions become
+# assertions about compute disposition instead.
+_RACE_METRIC = "race_ok"
+
 
 @pytest.mark.skipif(
     not USE_POSTGRES,
@@ -207,11 +213,16 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
             return ComputeCostResult(total_cost_usd=0.05, measured_at=as_of)
 
         async def poll_status(self, persisted_job):
+            # Report the declared metric. Ordering-1 hand-finalizes the job, but
+            # ordering-2 goes through the REAL finalizer, which reclassifies a
+            # SUCCEEDED run that measured nothing as outcome=FAILURE. Without a
+            # reported metric the two orderings would be racing different jobs.
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={_RACE_METRIC: 1.0},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -245,7 +256,20 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
             project_id=project.id,
             title="compute_experiment: race safety",
             status=TaskStatus.IN_PROGRESS,
-            payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "base_branch": "main",
+                    # A compute_experiment that declares no metric, no arms and no
+                    # success_criterion is a criterion-free experiment: the real
+                    # finalizer marks it outcome=FAILURE even on exit 0, which
+                    # terminates the task FAILED. This test is about park/wake race
+                    # safety, so the vehicle must be a well-formed experiment that
+                    # genuinely SUCCEEDs -- otherwise the ordering-2 assertion is
+                    # measuring compute disposition, not the race.
+                    "declared_metric": _RACE_METRIC,
+                }
+            ],
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
         )
         db_session.add(task)
@@ -433,8 +457,15 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
         .scalars()
         .one()
     )
+    # Name the job's own verdict in the failure message. The completion gate
+    # classifies job.outcome, so "task is FAILED" is unactionable without it --
+    # a stale read and a genuinely failed run look identical from the task row.
+    await db_session.refresh(job2)
     assert task2.status == TaskStatus.COMPLETED, (
-        f"task must be COMPLETED after ordering-2, got {task2.status!r}"
+        f"task must be COMPLETED after ordering-2, got {task2.status!r} "
+        f"(job outcome={job2.outcome!r} status={job2.status!r} "
+        f"terminal_reason={job2.terminal_reason!r}; gate="
+        f"{(task2.context or {}).get('evaluation_gate')!r})"
     )
     assert reg2_done.delivery_state == WakeDeliveryState.DELIVERED
     assert reg2_done.result_state == "finalized"
