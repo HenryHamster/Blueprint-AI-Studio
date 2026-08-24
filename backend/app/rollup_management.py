@@ -21,7 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal, resolve_dialect_name
-from app.closed_pr_reconciliation import reset_pr_attempt_state
+from app.closed_pr_reconciliation import (
+    _owns_superseded_review_wait_approval_hold,
+    append_superseded_pr_number,
+    reset_pr_attempt_state,
+)
 from app.rollup_locking import (  # noqa: F401 — re-exported for callers/tests
     _ParentMutatedDuringPRCreation,
     _capture_rollup_parent_snapshot,
@@ -3413,6 +3417,18 @@ async def _check_and_trigger_rollup(
                                 logger.warning(
                                     f"[ROLLUP] PR #{existing_pr} was closed without merge — clearing marker, will retry"
                                 )
+                                old_review_loop = parent_ctx.get("review_loop") or {}
+                                release_owned_review_wait_hold = (
+                                    _owns_superseded_review_wait_approval_hold(
+                                        parent,
+                                        old_review_loop,
+                                        pr_number=existing_pr,
+                                        pr_data=pr_state,
+                                    )
+                                )
+                                superseded_pr_numbers = append_superseded_pr_number(
+                                    old_review_loop, existing_pr
+                                )
                                 parent.context = {
                                     k: v
                                     for k, v in parent_ctx.items()
@@ -3422,10 +3438,25 @@ async def _check_and_trigger_rollup(
                                 # only audited chain metadata so approvals, CI,
                                 # verifier, and retry latches from the dead PR
                                 # cannot make its successor appear reviewed.
-                                parent.context["review_loop"] = reset_pr_attempt_state(
-                                    parent_ctx.get("review_loop")
+                                successor_loop = reset_pr_attempt_state(old_review_loop)
+                                successor_loop["superseded_pr_numbers"] = (
+                                    superseded_pr_numbers
                                 )
+                                parent.context["review_loop"] = successor_loop
                                 parent.context.pop("blueprint_review_verdict", None)
+                                from app.admin_approval_authority import (
+                                    APPROVAL_FOLLOWUP_CLAIM_KEY,
+                                )
+
+                                # The operator follow-up receipt belongs to the
+                                # closed PR attempt and cannot authorize its
+                                # replacement. Only the exact review-wait
+                                # backstop hold may release requires_approval;
+                                # independent/manual holds remain in force.
+                                parent.context.pop(APPROVAL_FOLLOWUP_CLAIM_KEY, None)
+                                if release_owned_review_wait_hold:
+                                    parent.requires_approval = False
+                                    parent.context.pop("_approval_set_at", None)
                                 # Durable ownership survives the volatile marker
                                 # clear: a requeue-clone on a foreign-named branch
                                 # whose rollup_pr_number is being dropped here to
@@ -3914,6 +3945,7 @@ async def _check_and_trigger_rollup(
                             project_id=str(project_id_local) if project_id_local else None,
                             commit_bump=_sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP,
                             expected_head_sha=_rollup_candidate_head,
+                            target_branch=target_branch,
                         )
                     if not isinstance(size_cap_result, SizeCapPreflightResult):
                         size_cap_result = SizeCapPreflightResult(

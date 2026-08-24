@@ -79,6 +79,37 @@ async def test_preflight_no_breach_returns_ok():
 
 
 @pytest.mark.asyncio
+async def test_small_rollup_verdict_is_reusable_at_the_merge_chokepoint():
+    """A small-rollup verdict carries the exact target/head merge identity."""
+    target_branch = "research/conflict-base"
+    file_content = "line\n" * 400  # 400 lines, cap 500
+
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+
+        result = await preflight_rollup_size_caps(
+            "tok",
+            "owner",
+            "repo",
+            42,
+            "staging/branch-1",
+            expected_head_sha=_PINNED_HEAD,
+            target_branch=target_branch,
+        )
+
+    assert result.status == "ok"
+    assert result.head_sha == _PINNED_HEAD
+    assert result.target_branch == target_branch
+    assert result.is_bound_to(_PINNED_HEAD)
+    mock_commit.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_preflight_rejects_branch_head_mismatch_before_reading_tree():
     """A branch tip other than the intended merge head has no merge authority."""
     with patch(

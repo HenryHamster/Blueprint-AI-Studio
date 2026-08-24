@@ -3648,6 +3648,35 @@ async def test_process_post_commit_task_not_found_returns_accepted(tl_db):
 
 
 @pytest.mark.asyncio
+async def test_process_post_commit_delegates_to_extracted_stages(tl_db, mocker):
+    """The orchestration entry point delegates setup and preserves its response.
+
+    This runs the real extracted setup stage against the task-not-found path;
+    the spy proves ``_process_post_commit`` is its caller rather than merely
+    duplicating the old setup logic inline.
+    """
+    from app.task_lifecycle_post_commit_setup import run_post_commit_setup
+
+    _, factory = tl_db
+    task_id = uuid.uuid4()
+    payload = AgentStatusPayload(task_id=task_id, status=TaskStatus.COMPLETED)
+    setup_stage = mocker.patch(
+        "app.task_lifecycle.run_post_commit_setup",
+        wraps=run_post_commit_setup,
+    )
+
+    result = await _process_post_commit(
+        task_id, payload, _session_factory=factory
+    )
+
+    assert result == {"status": "accepted"}
+    setup_stage.assert_awaited_once()
+    assert setup_stage.await_args.kwargs["task_id"] == task_id
+    assert setup_stage.await_args.kwargs["payload"] is payload
+    assert setup_stage.await_args.kwargs["expected_post_commit_claim_token"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("task_type", ["fix", "review", "research", "create"])
 async def test_process_post_commit_locks_project_before_task_for_nonstrategic(
     tl_db, mocker, task_type
@@ -3896,15 +3925,20 @@ async def test_childless_recovery_current_handler_failure_propagates(tl_db, mock
 
 
 def test_strategic_completion_reserves_message_block_before_authority_locks():
-    source = _post_commit_sources()
+    from app import task_lifecycle_post_commit_setup
+
+    source = inspect.getsource(task_lifecycle_post_commit_setup)
     reserve_at = source.index("await reserve_project_message_sequences(")
     reservation_commit_at = source.index("await session.commit()", reserve_at)
     authority_lock_at = source.index("async with lock_project_then_task(")
 
     assert reserve_at < reservation_commit_at < authority_lock_at
     assert '_peek_task_type == "strategic_review"' not in source
-    assert '_peek_completion_handler == "strategic"' in source
-    assert "message_sequences=preallocated_strategic_message_sequences" in source
+    assert 'peek_completion_handler == "strategic"' in source
+    assert (
+        "message_sequences=preallocated_strategic_message_sequences"
+        in _post_commit_sources()
+    )
 
 
 @pytest.mark.asyncio
