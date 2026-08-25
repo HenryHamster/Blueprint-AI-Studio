@@ -85,7 +85,9 @@ _archive_cache: "OrderedDict[Tuple[str, str, str], bytes]" = OrderedDict()
 _archive_cache_bytes = 0
 # Single-flight: concurrent grounding passes share one tree fetch per branch.
 _tree_fetch_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
-_archive_fetch_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
+# A completed task is removed by its own callback, so waiters that already
+# acquired this exact flight continue to share its success or failure.
+_archive_fetch_tasks: Dict[Tuple[str, str, str], asyncio.Task[bytes | None]] = {}
 
 
 def _bump_cache_stat(key: str) -> None:
@@ -330,6 +332,14 @@ def _archive_cache_put(key: Tuple[str, str, str], archive: bytes) -> None:
     global _archive_cache_bytes
     size = len(archive)
     if size > _ARCHIVE_CACHE_MAX_BYTES:
+        logger.warning(
+            "[REPO_SNAPSHOT] authoritative archive too large to cache for %s/%s@%s: %d bytes (limit %d)",
+            key[0],
+            key[1],
+            key[2][:12],
+            size,
+            _ARCHIVE_CACHE_MAX_BYTES,
+        )
         return
     existing = _archive_cache.pop(key, None)
     if existing is not None:
@@ -342,6 +352,57 @@ def _archive_cache_put(key: Tuple[str, str, str], archive: bytes) -> None:
     ):
         _, evicted = _archive_cache.popitem(last=False)
         _archive_cache_bytes -= len(evicted)
+
+
+async def _fetch_authoritative_archive(
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    project_id: str | None,
+) -> bytes | None:
+    """Fetch and admit one immutable archive, returning None on failure."""
+    from urllib.parse import quote
+
+    from app.github import _github_request
+
+    cache_key = (owner, repo, commit_sha)
+    cached = _archive_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{quote(commit_sha, safe='')}"
+    try:
+        response = await _github_request(
+            "GET",
+            url,
+            _headers(token),
+            max_retries=2,
+            project_id=project_id,
+            follow_redirects=True,
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "[REPO_SNAPSHOT] authoritative archive fetch for %s/%s@%s: HTTP %s",
+                owner,
+                repo,
+                commit_sha[:12],
+                response.status_code,
+            )
+            return None
+        archive = response.content
+        _archive_cache_put(cache_key, archive)
+        return archive
+    except Exception as e:  # noqa: BLE001 — merge reads must degrade, not raise
+        logger.warning(
+            "[REPO_SNAPSHOT] authoritative archive fetch failed for %s/%s@%s: %s",
+            owner,
+            repo,
+            commit_sha[:12],
+            e,
+        )
+        return None
 
 
 async def _fetch_blob_text(
@@ -406,36 +467,31 @@ async def authoritative_texts_at_commit(
     """
     if not paths or any(not path or path.startswith("/") or ".." in path.split("/") for path in paths):
         return None
-    from urllib.parse import quote
-
-    from app.github import _github_request
-
-    url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{quote(commit_sha, safe='')}"
     cache_key = (owner, repo, commit_sha)
     try:
         archive_bytes = _archive_cache_get(cache_key)
         if archive_bytes is None:
-            lock = _archive_fetch_locks.setdefault(cache_key, asyncio.Lock())
-            try:
-                async with lock:
-                    # Re-check after waiting: a concurrent preflight may have
-                    # populated the immutable archive while this caller waited.
-                    archive_bytes = _archive_cache_get(cache_key)
-                    if archive_bytes is None:
-                        response = await _github_request(
-                            "GET",
-                            url,
-                            _headers(token),
-                            max_retries=2,
-                            project_id=project_id,
-                            follow_redirects=True,
-                        )
-                        if response.status_code != 200:
-                            return None
-                        archive_bytes = response.content
-                        _archive_cache_put(cache_key, archive_bytes)
-            finally:
-                _archive_fetch_locks.pop(cache_key, None)
+            flight = _archive_fetch_tasks.get(cache_key)
+            if flight is None:
+                flight = asyncio.create_task(
+                    _fetch_authoritative_archive(
+                        token=token,
+                        owner=owner,
+                        repo=repo,
+                        commit_sha=commit_sha,
+                        project_id=project_id,
+                    )
+                )
+                _archive_fetch_tasks[cache_key] = flight
+
+                def _clear_completed_flight(done_task: asyncio.Task[bytes | None]) -> None:
+                    if _archive_fetch_tasks.get(cache_key) is done_task:
+                        _archive_fetch_tasks.pop(cache_key, None)
+
+                flight.add_done_callback(_clear_completed_flight)
+            # Shield the shared fetch from cancellation by one extraction
+            # caller; other callers still need its immutable result.
+            archive_bytes = await asyncio.shield(flight)
 
         if archive_bytes is None:
             return None
