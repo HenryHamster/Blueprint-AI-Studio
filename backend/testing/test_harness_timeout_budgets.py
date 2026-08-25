@@ -91,10 +91,13 @@ def _repo_root() -> Path:
 
     CWD-relative discovery is how a guard becomes vacuous: the standalone lane
     runs from ``backend/`` and the sharded lane from ``/app``, so a glob rooted
-    at "." scans a different (or empty) tree in each.
+    at "." scans a different (or empty) tree in each. CI mounts the full
+    checkout separately at ``/repo`` while the backend image is mounted at
+    ``/app``, so prefer that validated mount when it is available.
     """
     here = Path(__file__).resolve()
-    for candidate in here.parents:
+    candidates = (Path("/repo"), *here.parents)
+    for candidate in candidates:
         if (candidate / "backend" / "testing").is_dir():
             return candidate
     # Docker-only layout: the image carries backend/ as /app with no repo root.
