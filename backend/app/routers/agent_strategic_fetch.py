@@ -2711,6 +2711,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "efficiency_snapshot": "efficiency-snapshot",
     "ci_compliance": "ci-compliance",
     "open_completion_debt": "completion-debt",
+    "operator_attention": "attention",
     # Low — generic section endpoint (project-data-based, no complex async)
     "self_reflection_log": "sections",
     "strategic_memory_notes": "sections",

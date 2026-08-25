@@ -374,13 +374,16 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'compute-job' | 'compute-limits' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'fleet-sizing' | 'capability-trials' | 'sections' | 'task' | 'tasks' | 'completion-debt' | 'ui-load-timing' | 'skills' | 'tools';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'compute-job' | 'compute-limits' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'fleet-sizing' | 'capability-trials' | 'sections' | 'task' | 'tasks' | 'completion-debt' | 'ui-load-timing' | 'skills' | 'tools' | 'attention' | 'task-census' | 'autonomy-debug' | 'alerts' | 'deploy-state';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
 // distinct from the single-id project-path verbs that precede it.
+// The trailing five are the pipeline-visibility group: they describe the state
+// of the pipeline itself rather than the caller's own lineage, and every one of
+// them returns a byte-bounded projection (see backend app/agent_read_budget.py).
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'compute-job', 'compute-limits', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'fleet-sizing', 'capability-trials', 'sections', 'task', 'tasks', 'completion-debt', 'ui-load-timing', 'skills', 'tools',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'compute-job', 'compute-limits', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'fleet-sizing', 'capability-trials', 'sections', 'task', 'tasks', 'completion-debt', 'ui-load-timing', 'skills', 'tools', 'attention', 'task-census', 'autonomy-debug', 'alerts', 'deploy-state',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -421,6 +424,11 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'ui-load-timing':      'ui-load-timing)       PATH_SUFFIX="ui-load-timing"',
   'skills':              'skills)               PATH_SUFFIX="skills"',
   'tools':               'tools)                PATH_SUFFIX="tools"',
+  'attention':           'attention)            PATH_SUFFIX="attention"',
+  'task-census':         'task-census)          PATH_SUFFIX="task-census"',
+  'autonomy-debug':      'autonomy-debug)       PATH_SUFFIX="autonomy-debug"',
+  'alerts':              'alerts)               PATH_SUFFIX="alerts"',
+  'deploy-state':        'deploy-state)         PATH_SUFFIX="deploy-state"',
 };
 
 // Self-contained case arm for the SEARCH-shaped `knowledge` verb. Unlike the
@@ -489,6 +497,11 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'ui-load-timing':      '`./fetch ui-load-timing` — admin-UI initial-load timing samples grouped by surface: list of {ts, page_ready_ms, sample_type} ordered oldest-first; use to verify the >50% page-ready improvement retirement threshold (no id)',
   'skills':              '`./fetch skills` — project-declared shell skills from `.blueprint/tools.json`: slug, title, command, and optional description for each; an empty array means no skills are declared (no id)',
   'tools':               '`./fetch tools` — content of the project\'s ENABLED built-in tools (operator\'s notes markdown text, whiteboard presence/stroke-count summary): slug, title, kind, and text for each; empty content is skipped and an empty array means no enabled tool has content (no id)',
+  'attention':           '`./fetch attention` — the operator attention census the workbench rail renders: level, summary, counts, and up to 8 items (unanswered blockers/questions, stale tasks, stranded approved PRs, error alerts). Read cursors are omitted because an agent cannot advance them (no id)',
+  'task-census':         '`./fetch task-census` — project-wide census of in-flight work across EVERY created_by, not just your own lineage: non-terminal counts by status, by task type and by author, a 24h terminal breakdown, and the oldest non-terminal tasks with age_hours and blocked/parked reason. Use this, not `./fetch tasks`, to see what the pipeline is doing (no id)',
+  'autonomy-debug':      '`./fetch autonomy-debug` — why autonomy is or is not spawning: spawn_blocked, blocking_guards, circuit breaker, rate limits, headroom, and per-direction block_reason_code / block_reason / next_action with ineligible directions listed first. The diagnostic for a direction that has been stranded for days (no id)',
+  'alerts':              '`./fetch alerts` — shape of this project\'s undismissed operator-visible alert feed over the last 24h: exact totals by severity and by event_type plus a handful of newest examples. Aggregates first because the feed is dominated by point-in-time notices and a page of it characterises nothing (no id)',
+  'deploy-state':        '`./fetch deploy-state` — what is actually serving: current_revision/current_sha, status, pause and rollback state, monitoring window, failure rate, external health, and VM ramp. A merged fix is not live until a deploy carries it; this is how you tell. Global singleton, not project-scoped (no id)',
 };
 
 function shellSingleQuote(value: string): string {
@@ -565,7 +578,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "compute-limits" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "fleet-sizing" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ "$KIND" != "completion-debt" ] && [ "$KIND" != "ui-load-timing" ] && [ "$KIND" != "skills" ] && [ "$KIND" != "tools" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "compute-limits" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "fleet-sizing" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ "$KIND" != "completion-debt" ] && [ "$KIND" != "ui-load-timing" ] && [ "$KIND" != "skills" ] && [ "$KIND" != "tools" ] && [ "$KIND" != "attention" ] && [ "$KIND" != "task-census" ] && [ "$KIND" != "autonomy-debug" ] && [ "$KIND" != "alerts" ] && [ "$KIND" != "deploy-state" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi

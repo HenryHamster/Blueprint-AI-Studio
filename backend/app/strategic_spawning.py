@@ -2250,6 +2250,22 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # packer drops it whole under byte pressure rather than trimming — a coherence
     # aid, never load-bearing, so a low priority + exempt bound is correct.
     "recent_handled_conversation": {"priority": "medium", "exempt": True},
+    # The operator attention census — the same block the workbench rail renders
+    # (unanswered blockers/questions, stale tasks, stranded approved PRs, error
+    # alerts). Hard-bounded at build time by ``project_operator_attention``:
+    # ≤8 items, per-field text clip, and — because this copy goes straight into
+    # the envelope the byte ceiling exists to protect — the same
+    # ``clamp_read_response`` cap the HTTP surface applies, enforced inside the
+    # projection so this path cannot be the uncapped one. The packer therefore
+    # drops it whole under byte pressure rather than trimming;
+    # ``./fetch attention`` recovers it. High priority because it is the agent's
+    # only view of the backlog it is meant to be working down, exempt because it
+    # needs no summarize_fn.
+    "operator_attention": {
+        "priority": "high",
+        "exempt": True,
+        "fetch_verb": "attention",
+    },
     "running_update": {"priority": "high", "exempt": True},
     "running_update_acknowledged_at": {"priority": "high", "exempt": True},
     "user_last_active_at": {"priority": "high", "exempt": True},
@@ -6130,6 +6146,35 @@ async def _spawn_strategic_review(
         _res_recent_handled = await _fetch_recent_handled_conversation(
             session, project.id
         )
+        # Operator attention census. DB-only (no GitHub, no credential resolve,
+        # no subprocess), so it satisfies the same "cheap grounding" test as the
+        # reads above and does not reintroduce the connection-idle-close class
+        # this branch exists to avoid.
+        #
+        # ``project_operator_attention`` is the SAME projection ``/attention``
+        # serves, and it now applies the AGENT_READ_MAX_RESPONSE_BYTES clamp
+        # itself — deliberately inside the projection rather than at the HTTP
+        # call site. This path is the one that feeds the strategic envelope
+        # directly, so an uncapped copy here would defeat the cap on the copy
+        # that merely passes through the resident's context. Note the
+        # ``except Exception`` below: a silently-carried oversized block is
+        # exactly what that swallow would hide, which is why the bound belongs
+        # in the shared function and not in this try body. Failure is non-fatal:
+        # the resident can still reach the census with ``./fetch attention``.
+        _res_operator_attention: dict[str, Any] | None = None
+        try:
+            from app.operator_attention import build_operator_attention
+            from app.routers.agent_pipeline_visibility import (
+                project_operator_attention,
+            )
+
+            _res_operator_attention = project_operator_attention(
+                await build_operator_attention(session, project, project.user_id)
+            )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] operator_attention build failed; continuing"
+            )
         # Pre-spawn effort classification for the resident fast path: classify
         # from DB-only signals; the LTS version-phase is unexamined (its build
         # can hit GitHub), so an LTS split forces CONSEQUENTIAL.
@@ -6259,6 +6304,11 @@ async def _spawn_strategic_review(
                     **(
                         {"recent_handled_conversation": _res_recent_handled}
                         if _res_recent_handled
+                        else {}
+                    ),
+                    **(
+                        {"operator_attention": _res_operator_attention}
+                        if _res_operator_attention
                         else {}
                     ),
                     **({"model": review_model} if review_model else {}),

@@ -545,7 +545,7 @@
       "test_ids": [
         "writeStrategicHelpers > injects stable typed-consultation provenance across transport retries"
       ],
-      "test_count": 115
+      "test_count": 116
     },
     {
       "path": "agent/src/handlers/strategic-resident.test.ts",

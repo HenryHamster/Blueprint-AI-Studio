@@ -826,6 +826,7 @@ export async function handleStrategic(
       'efficiency_snapshot':        './fetch efficiency-snapshot',
       'ci_compliance':              './fetch ci-compliance',
       'open_completion_debt':       './fetch completion-debt',
+      'operator_attention':         './fetch attention',
       // sections-type keys: served by /api/agent/projects/{id}/sections/{name}.
       // retirement_deferrals is intentionally omitted: it has no recovery path
       // (SECTION_FETCH_INVENTORY maps it to None), so advertising any fetch

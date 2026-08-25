@@ -926,6 +926,40 @@ export async function handleStrategicResident(
       .join('\n\n');
   })();
 
+  // Format the operator attention census (payload.operator_attention) for the
+  // bootstrap context. Mirrors toolContentText: reads the bounded block the
+  // backend already clipped to <=8 items, renders one line per item, and yields
+  // '' when absent so the section is a no-op. The census is a snapshot; the
+  // prompt tells the resident to re-read it with `./fetch attention`.
+  const operatorAttentionText = ((): string => {
+    const raw = payload.operator_attention;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return '';
+    const block = raw as Record<string, unknown>;
+    const lines: string[] = [];
+    const level = strVal(block.level);
+    const summary = strVal(block.summary).trim();
+    if (level || summary) lines.push(`Level: ${level || 'unknown'}${summary ? ` — ${summary}` : ''}`);
+    const counts = block.counts;
+    if (counts !== null && typeof counts === 'object' && !Array.isArray(counts)) {
+      const pairs = Object.entries(counts as Record<string, unknown>)
+        .filter((pair): pair is [string, number] => typeof pair[1] === 'number' && pair[1] > 0)
+        .map(([k, v]) => `${k}=${v}`);
+      if (pairs.length > 0) lines.push(`Counts: ${pairs.join(', ')}`);
+    }
+    const items = Array.isArray(block.items) ? block.items : [];
+    for (const entry of items) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const item = entry as Record<string, unknown>;
+      const kind = strVal(item.kind);
+      const label = strVal(item.label).trim();
+      const detail = strVal(item.detail).trim();
+      if (!label && !detail) continue;
+      lines.push(`- ${kind ? `[${kind}] ` : ''}${label}${detail ? ` — ${detail}` : ''}`);
+    }
+    if (block.has_more === true) lines.push('- (more items exist — run `./fetch attention`)');
+    return lines.join('\n');
+  })();
+
   // ── Durable decisions register ──────────────────────────────────────────
   // Full-fidelity cross-tick memory of settled decisions, preserved across
   // compaction AND full session restarts (VM recycles, process crashes) so
@@ -963,6 +997,7 @@ export async function handleStrategicResident(
     purposeText,
     openMessagesText: buildOpenMessagesText(openMessages),
     recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
+    operatorAttentionText,
     sessionId,
     computeArtifactGuidanceText: artifactsHelperAvailable
       ? COMPUTE_ARTIFACT_GUIDANCE
