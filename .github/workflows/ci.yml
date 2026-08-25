@@ -637,14 +637,50 @@ jobs:
             -e POSTGRES_PASSWORD=test \
             -e POSTGRES_DB=test_blueprint \
             postgres:15
-          for i in $(seq 1 30); do
+          # Require the readiness probe to hold, and trust the loop's own
+          # result instead of re-running the check afterwards.
+          #
+          # Observed on run 32804531811, backend shard 3: the loop printed
+          # "PostgreSQL ready after 3 check(s)" and the job then failed with
+          # "PostgreSQL did not become ready" 0.14s later, on a database that
+          # was healthy -- the dumped container logs still showed initdb doing
+          # post-bootstrap initialization. So the first probe went true against
+          # a server that was about to go away, and the confirmation probe
+          # landed in that window.
+          #
+          # Two independent defects, and both are fixed here:
+          #
+          #  1. The confirmation re-ran pg_isready instead of recording what
+          #     the loop already determined. That re-poll can only ever turn a
+          #     success into a failure, never the reverse -- it is pure
+          #     downside. A $ready flag removes it.
+          #
+          #  2. A single successful probe was treated as settled. Requiring
+          #     two consecutive successes means a probe that goes true against
+          #     a server that is about to restart does not latch, which also
+          #     stops the suite from starting against one.
+          #
+          # This reds a random shard of a healthy candidate, so on the
+          # promotion PR -- where a red run deletes the PR and its release
+          # branch -- it presents as an unreproducible flake. It is not: it is
+          # a control-flow bug that fires whenever the probe and the restart
+          # overlap.
+          ready=
+          streak=0
+          for i in $(seq 1 60); do
             if docker exec "$POSTGRES_CONTAINER" pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
-              echo "PostgreSQL ready after $i check(s)"
-              break
+              streak=$((streak + 1))
+              if [ "$streak" -ge 2 ]; then
+                ready=1
+                echo "PostgreSQL ready after $i check(s)"
+                break
+              fi
+            else
+              streak=0
             fi
             sleep 2
           done
-          if ! docker exec "$POSTGRES_CONTAINER" pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
+          if [ -z "$ready" ]; then
             echo "::error::PostgreSQL did not become ready"
             docker logs "$POSTGRES_CONTAINER" || true
             exit 1
