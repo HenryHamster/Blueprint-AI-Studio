@@ -72,8 +72,18 @@ import sys
 _BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
-_SCRIPTS_DIR = os.path.normpath(os.path.join(_BACKEND_DIR, "..", "scripts"))
-if _SCRIPTS_DIR not in sys.path:
+# The shared receipt writers live in the repo's ``scripts/`` dir, which is NOT
+# a sibling of ``_BACKEND_DIR`` in every environment: the Docker test image
+# carries the backend tree as ``/app`` with no ``scripts/`` sibling and mounts
+# the repo root at ``/repo``. The old fixed ``<_BACKEND_DIR>/../scripts`` walk
+# resolved to a nonexistent ``/scripts`` there, so every receipt import failed
+# with nothing naming why. Probe both layouts, and keep the miss REASON so the
+# fail-open receipt warnings below can report it instead of a bare ImportError.
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
+
+_SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(_BACKEND_DIR)
+_SCRIPTS_DIR_HINT = f" — {_SCRIPTS_DIR_UNAVAILABLE}" if _SCRIPTS_DIR_UNAVAILABLE else ""
+if _SCRIPTS_DIR is not None and _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 try:  # absent from the backend-only Docker context, which has no scripts/
@@ -998,7 +1008,8 @@ def _record_baseline_attribution(
         )
     except Exception as exc:  # receipt evidence is fail-open
         print(
-            f"[verification-receipt] WARN could not record {_SIZE_LIMITS_LANE}: {exc}",
+            f"[verification-receipt] WARN could not record {_SIZE_LIMITS_LANE}: "
+            f"{exc}{_SCRIPTS_DIR_HINT}",
             file=sys.stderr,
         )
 
@@ -1013,7 +1024,8 @@ def _record_baseline_attribution(
         )
     except Exception as exc:  # receipt evidence is fail-open
         print(
-            f"[guard-suppression] WARN could not record {_SIZE_LIMITS_LANE}: {exc}",
+            f"[guard-suppression] WARN could not record {_SIZE_LIMITS_LANE}: "
+            f"{exc}{_SCRIPTS_DIR_HINT}",
             file=sys.stderr,
         )
 

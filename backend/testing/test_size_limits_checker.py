@@ -12,13 +12,21 @@ import shutil
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-
 import pytest
 
 import app.size_limit_policy as slp
 from app.size_limit_policy import bump_size_limit, stale_cap_limit
+
+# Importing the checker is what puts the repo ``scripts/`` dir on ``sys.path``
+# (``check_size_limits.resolve_scripts_dir_from_env``), which is what makes the
+# receipt-writer imports in the tests below resolve. Do NOT re-add a fixed
+# ``../../scripts`` walk here: in the Docker test image the backend tree is
+# ``/app`` with no ``scripts/`` sibling, so it pointed at a nonexistent
+# ``/scripts`` and the receipt tests passed only when
+# ``test_check_gate_fail_closed.py`` was collected first and inserted
+# ``/repo/scripts`` as a side effect.
 from testing import check_size_limits as csl
+from testing import repo_scripts_path as rsp
 
 
 def _read(path: str) -> str:
@@ -1048,6 +1056,130 @@ def test_base_root_unreadable_baseline_fails_closed(tmp_path, capsys):
     assert rc == 1
     assert "[baseline] unavailable" in out
     assert "[breach] backend/big.py" in out
+
+
+# --- repo scripts/ resolution: guarded under BOTH layouts, not just the live one
+
+
+def _plant_scripts_dir(root):
+    """Create a ``scripts/`` dir carrying the sentinel the resolver probes for."""
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / rsp.SCRIPTS_DIR_SENTINEL).write_text("# stand-in\n")
+    return os.path.normpath(str(scripts))
+
+
+def test_scripts_dir_resolves_under_developer_checkout_layout(tmp_path):
+    """Developer checkout: ``<repo>/backend`` IS a sibling of ``<repo>/scripts``."""
+    repo = tmp_path / "checkout"
+    (repo / "backend").mkdir(parents=True)
+    scripts = _plant_scripts_dir(repo)
+
+    resolved, reason = rsp.resolve_scripts_dir(
+        str(repo / "backend"), container_repo_root=str(tmp_path / "no-such-mount")
+    )
+
+    assert resolved == scripts
+    assert reason == ""
+
+
+def test_scripts_dir_resolves_under_container_layout_with_no_sibling(tmp_path):
+    """Docker image: backend is ``/app``, no ``scripts/`` sibling, repo at ``/repo``."""
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    mount = tmp_path / "repo"
+    scripts = _plant_scripts_dir(mount)
+    # The exact shape of the old defect: the relative walk has nowhere to land.
+    assert not (tmp_path / "scripts").exists()
+
+    resolved, reason = rsp.resolve_scripts_dir(
+        str(app_dir), container_repo_root=str(mount)
+    )
+
+    assert resolved == scripts
+    assert reason == ""
+
+
+def test_scripts_dir_absent_returns_named_reason_not_a_nonexistent_path(tmp_path):
+    """Neither layout present: a NAMED reason, never a path that does not exist."""
+    resolved, reason = rsp.resolve_scripts_dir(
+        str(tmp_path / "app"), container_repo_root=str(tmp_path / "absent")
+    )
+
+    assert resolved is None
+    assert "verification_receipt.py" in reason
+    assert "BLUEPRINT_SCRIPTS_DIR" in reason
+
+
+def test_scripts_dir_ignores_a_directory_without_the_sentinel(tmp_path):
+    """A bare ``scripts/`` dir is not the repo's — resolution must not accept it."""
+    repo = tmp_path / "checkout"
+    (repo / "backend").mkdir(parents=True)
+    (repo / "scripts").mkdir()
+
+    resolved, _reason = rsp.resolve_scripts_dir(
+        str(repo / "backend"), container_repo_root=str(tmp_path / "absent")
+    )
+
+    assert resolved is None
+
+
+def test_scripts_dir_env_override_wins_over_both_layouts(tmp_path):
+    override = _plant_scripts_dir(tmp_path / "override")
+    mount = tmp_path / "repo"
+    _plant_scripts_dir(mount)
+
+    resolved, reason = rsp.resolve_scripts_dir(
+        str(tmp_path / "app"),
+        container_repo_root=str(mount),
+        env_override=str(tmp_path / "override" / "scripts"),
+    )
+
+    assert resolved == override
+    assert reason == ""
+
+
+def test_live_scripts_dir_resolution_is_not_vacuous():
+    """The resolution THIS environment made must be real, on sys.path, usable.
+
+    The layout tests above could all pass against synthetic trees while live
+    resolution still pointed nowhere. Counting the writers found keeps this
+    guard from passing while scanning nothing.
+    """
+    assert csl._SCRIPTS_DIR is not None, csl._SCRIPTS_DIR_UNAVAILABLE
+    assert csl._SCRIPTS_DIR_UNAVAILABLE == ""
+    assert os.path.isdir(csl._SCRIPTS_DIR)
+    assert csl._SCRIPTS_DIR in sys.path
+    writers = [
+        name
+        for name in ("verification_receipt.py", "guard_suppression_receipt.py")
+        if os.path.isfile(os.path.join(csl._SCRIPTS_DIR, name))
+    ]
+    assert len(writers) == 2, f"only found {writers} under {csl._SCRIPTS_DIR}"
+
+
+def test_checker_alone_makes_the_receipt_writers_importable():
+    """Importing the checker — and nothing else — must supply the scripts path.
+
+    The ordering-dependency pin: the receipt tests used to pass only because
+    ``test_check_gate_fail_closed.py`` was collected first, and a fresh
+    interpreter is the one place that dependency cannot hide.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import testing.check_size_limits as csl;"
+            "assert csl._SCRIPTS_DIR, csl._SCRIPTS_DIR_UNAVAILABLE;"
+            "import guard_suppression_receipt, verification_receipt",
+        ],
+        cwd=csl._BACKEND_DIR,
+        env={**os.environ, "PYTHONPATH": csl._BACKEND_DIR},
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
 
 
 def _configure_baseline_receipts(tmp_path, monkeypatch):
