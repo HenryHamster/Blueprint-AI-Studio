@@ -86,10 +86,25 @@ def _current_test_files() -> dict[str, Path]:
 
 
 def _git_output(repo_root: Path, *args: str) -> str | None:
-    """Read one immutable git-tree object without allowing git errors through."""
+    """Read one immutable git-tree object without allowing git errors through.
+
+    ``-c safe.directory=<repo_root>`` is load-bearing, not defensive. The
+    ci.yml backend shards bind the checkout read-only at /repo into a container
+    that runs as ROOT while the runner user owns the files, so git refuses
+    every command there with "detected dubious ownership" (exit 128) unless the
+    path is marked safe. Without it EVERY read below returns None, the automain
+    baseline silently becomes unavailable, and the two guards downstream fall
+    back to their ABSOLUTE thresholds -- reporting inherited debt as though
+    this candidate introduced it. The guard-data lane cannot surface that:
+    scripts/test-backend.sh runs its container as the invoking uid, so git is
+    happy there and the baseline resolves. Same commit, opposite verdict,
+    decided purely by the checkout's ownership shape. The sibling guards
+    (test_vitest_durations_freshness, test_size_offender_governance) already
+    inject this; this one was missed.
+    """
     try:
         result = subprocess.run(
-            ["git", *args],
+            ["git", "-c", f"safe.directory={repo_root}", *args],
             cwd=repo_root,
             capture_output=True,
             text=True,
