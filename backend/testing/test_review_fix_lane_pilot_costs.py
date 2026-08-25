@@ -1226,11 +1226,13 @@ def test_lane_baseline_trend_reports_reviews_to_converge_and_retarget_scope():
     legacy_trend = compute_lane_baseline_trend([legacy_latest, legacy_prior])
 
     assert legacy_trend is not None
+    # Never-measured (legacy baseline) reads "unavailable", not "evicted".
     assert legacy_trend["retarget_convergence"]["reviews_to_converge"]["median"] == {
         "latest": None,
         "prior": None,
         "delta": None,
         "classification": None,
+        "availability": {"latest": "unavailable", "prior": "unavailable"},
     }
 
 
