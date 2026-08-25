@@ -12893,6 +12893,86 @@ class TestRouteContractOwnership:
             f"valid, got: {errors}"
         )
 
+# The scanner below flags exactly one shape: an ``ast.Call`` whose func is
+# ``ast.Attribute(attr="utcnow", value=ast.Name(id="datetime"))``. Reaching that
+# node requires the source text to contain a NAME token spelled ``utcnow``, and
+# Python's tokenizer cannot split an identifier — no whitespace, comment or
+# backslash continuation may appear inside one, and maximal munch means the
+# token is never a prefix of a longer identifier. So "the bare token ``utcnow``
+# is absent from the text" provably implies "no such Call node exists", and this
+# prefilter can never hide an offender the scanner would have reported. The
+# converse is not claimed: a file admitted here still gets the full AST check.
+#
+# The lookarounds exclude only ASCII identifier characters, so a non-ASCII
+# identifier such as ``éutcnow`` is admitted rather than skipped. That errs
+# toward parsing, which is the safe direction.
+_DATETIME_UTCNOW_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])utcnow(?![A-Za-z0-9_])")
+
+
+def _datetime_utcnow_call_linenos(source: str, filename: str) -> list[int]:
+    """Line numbers of every ``datetime.utcnow(...)`` call in *source*.
+
+    The authoritative scanner for :func:`test_no_deprecated_datetime_utcnow_calls`.
+    Factored out so the prefilter above can be pinned against the very code it
+    is allowed to skip, instead of the two drifting apart and leaving the guard
+    silently vacuous.
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+
+    linenos: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "utcnow"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "datetime"
+        ):
+            linenos.append(node.lineno)
+    return linenos
+
+
+def test_utcnow_prefilter_admits_every_form_the_scanner_flags():
+    """The cheap text prefilter must never skip a file the AST scanner would flag.
+
+    A prefilter that drifts from its scanner does not make the guard slower — it
+    makes it vacuous, and silently. Every spelling below is one the tokenizer
+    accepts for ``datetime.utcnow()``; each is asserted to be flagged by the
+    scanner AND admitted by the prefilter, so neither side can move alone.
+    """
+    flagged_forms = [
+        "import datetime\ndatetime.utcnow()\n",
+        # Whitespace is legal between any two adjacent tokens.
+        "import datetime\ndatetime . utcnow ()\n",
+        # Backslash continuation joins the logical line.
+        "import datetime\ndatetime.\\\n    utcnow()\n",
+        # Inside brackets a comment and a newline may separate the tokens.
+        "import datetime\n(datetime.  # noqa\n    utcnow())\n",
+        # Nested in an expression rather than a bare statement.
+        "import datetime\nx = {'k': [datetime.utcnow()]}\n",
+    ]
+    for source in flagged_forms:
+        assert _datetime_utcnow_call_linenos(source, "<synthetic>"), (
+            f"scanner failed to flag a datetime.utcnow() call:\n{source}"
+        )
+        assert _DATETIME_UTCNOW_TOKEN_RE.search(source), (
+            "prefilter would skip a file the scanner flags — the guard is "
+            f"vacuous for this spelling:\n{source}"
+        )
+
+    # The canonical replacement must stay cheap to skip: it is why the prefilter
+    # keys on the bare token rather than the substring (267 of 569 app files
+    # contain "utcnow" as part of "_utcnow"; only 3 carry the bare token).
+    replacement = "from app.time_utils import _utcnow\n_utcnow()\n"
+    assert not _datetime_utcnow_call_linenos(replacement, "<synthetic>")
+    assert not _DATETIME_UTCNOW_TOKEN_RE.search(replacement)
+
+
 def test_no_deprecated_datetime_utcnow_calls():
     """No app/ file may call datetime.utcnow() — use _utcnow() from app.time_utils instead.
 
@@ -12907,24 +12987,25 @@ def test_no_deprecated_datetime_utcnow_calls():
 
     for py_file in sorted(app_dir.rglob("*.py")):
         source = py_file.read_text(encoding="utf-8")
-        try:
-            tree = ast.parse(source, filename=str(py_file))
-        except SyntaxError:
+        # Sound prefilter (see _DATETIME_UTCNOW_TOKEN_RE): 3 of 569 app files
+        # carry the bare token, so 566 ast.parse calls are skipped.
+        #
+        # Why a guard that measures 9.85s needed this at all: that is the
+        # isolated cost over the Docker-on-Windows bind mount, but the lane
+        # runs it inside a 1842-test session against --timeout=30, and there
+        # it died on `Failed: Timeout (>30.0s) from pytest-timeout` -- reading
+        # 569 files off a contended bind mount is several times its solo cost,
+        # and the failure is intermittent precisely because it sat close to
+        # the line. A timeout, not an assertion, reports a slow filesystem as
+        # a de-utcnow regression. Isolated cost is now 9.85s -> 3.30s, moving
+        # the whole guard off that boundary rather than raising its budget.
+        if not _DATETIME_UTCNOW_TOKEN_RE.search(source):
             continue
 
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if (
-                isinstance(func, ast.Attribute)
-                and func.attr == "utcnow"
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "datetime"
-            ):
-                rel = py_file.relative_to(BACKEND_ROOT)
-                violating_files.append(f"  {rel}:{node.lineno}")
-                break  # one report per file is enough
+        linenos = _datetime_utcnow_call_linenos(source, str(py_file))
+        if linenos:
+            rel = py_file.relative_to(BACKEND_ROOT)
+            violating_files.append(f"  {rel}:{linenos[0]}")  # one report per file
 
     assert not violating_files, (
         f"Found datetime.utcnow() calls in {len(violating_files)} app/ file(s).\n"
