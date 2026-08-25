@@ -2347,6 +2347,16 @@ _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE = (
 # Compatibility name used by existing diagnostics/tests.
 _STRATEGIC_CYCLE_STALL_ALERT_TITLE = _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE
 
+# A fresh Resident proves that the worker is being restarted, not that a
+# strategic cycle is completing.  Let a few recovery attempts settle before
+# surfacing the existing halt alert, but never let that worker freshness mute
+# the signal indefinitely.  This is deliberately a small, durable budget:
+# reaper instances may be restarted between attempts.
+_RESIDENT_LIVENESS_SUPPRESSION_KEY = (
+    "_strategic_resident_liveness_suppression_count"
+)
+_RESIDENT_LIVENESS_SUPPRESSION_BUDGET = 3
+
 
 def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime | None:
     """Return the newest intentional no-delta receipt inside ``cutoff``."""
@@ -2366,6 +2376,41 @@ def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime 
         if parsed >= cutoff and (newest is None or parsed > newest):
             newest = parsed
     return newest
+
+
+async def _reset_resident_liveness_suppression(session, project_id) -> None:
+    """Clear recovery suppression after a genuine healthy project receipt."""
+    from app.task_locking import with_vision_locked
+
+    def _reset(vision: dict) -> None:
+        vision.pop(_RESIDENT_LIVENESS_SUPPRESSION_KEY, None)
+
+    await with_vision_locked(session, project_id, _reset)
+
+
+async def _consume_resident_liveness_suppression(session, project_id) -> bool:
+    """Consume one bounded Resident recovery suppression slot.
+
+    The counter is stored on ``Project.vision`` and mutated under the
+    canonical project row lock so concurrent reapers cannot lose increments.
+    Once the budget is exhausted, return ``False`` and keep the saturated
+    value; callers must fall through to the normal alert path.
+    """
+    from app.task_locking import with_vision_locked
+
+    count = 0
+
+    def _consume(vision: dict) -> None:
+        nonlocal count
+        raw_count = vision.get(_RESIDENT_LIVENESS_SUPPRESSION_KEY, 0)
+        if isinstance(raw_count, bool) or not isinstance(raw_count, int):
+            raw_count = 0
+        count = min(max(raw_count, 0) + 1, _RESIDENT_LIVENESS_SUPPRESSION_BUDGET + 1)
+        vision[_RESIDENT_LIVENESS_SUPPRESSION_KEY] = count
+
+    if not await with_vision_locked(session, project_id, _consume):
+        return False
+    return count <= _RESIDENT_LIVENESS_SUPPRESSION_BUDGET
 
 
 async def _retire_quiet_project_liveness_alerts(session, project_ids: list) -> int:
@@ -2416,7 +2461,9 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     ``_strategic_no_delta_skips`` entry is the explicit healthy-idle receipt;
     it suppresses the alert even though no new cycle row was created. An
     active/incomplete cycle, or phase-1-only completion, is deliberately not
-    evidence of full-cycle liveness.
+    evidence of full-cycle liveness. A Resident worker or successful Workday
+    restart only gets a bounded number of suppressions; it cannot mute this
+    detector forever without a completed-cycle or intentional-idle receipt.
     """
     from app.models import (
         Alert,
@@ -2547,6 +2594,9 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         automatic_cycles_allowed[project_id] = automatic_allowed
 
     if quiet_project_ids:
+        for project_id in quiet_project_ids:
+            await _reset_resident_liveness_suppression(session, project_id)
+        await session.commit()
         await _retire_quiet_project_liveness_alerts(session, quiet_project_ids)
 
     if not candidate_ids:
@@ -2654,14 +2704,29 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
 
     for project_id in candidate_ids:
         if project_id in recent_completions:
+            await _reset_resident_liveness_suppression(session, project_id)
+            await session.commit()
             await _resolve_strategic_cycle_liveness_alerts(session, project_id)
             continue
         if _recent_no_delta_skip_at(candidate_visions.get(project_id), cutoff) is not None:
+            await _reset_resident_liveness_suppression(session, project_id)
+            await session.commit()
             await _resolve_strategic_cycle_liveness_alerts(session, project_id)
             continue
         if project_id in healthy_resident_projects:
-            await _resolve_strategic_cycle_liveness_alerts(session, project_id)
-            continue
+            suppress = await _consume_resident_liveness_suppression(session, project_id)
+            await session.commit()
+            if suppress:
+                await _resolve_strategic_cycle_liveness_alerts(session, project_id)
+                continue
+            logger.warning(
+                "[STRATEGIC] Resident liveness suppression budget exhausted "
+                "for project %s; allowing halt alert",
+                project_id,
+            )
+            resident_suppression_exhausted = True
+        else:
+            resident_suppression_exhausted = False
         if automatic_cycles_allowed[project_id]:
             # An alert is only the operator-facing symptom. Arm the durable
             # coalesced refresh first so the next autonomous tick can recover
@@ -2681,11 +2746,19 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             # marker. Commit the sweep's writes before using the existing
             # Workday auto-start arm on its own fresh session. This runs before
             # alert deduplication so an open alert cannot suppress recovery.
-            await session.commit()
-            recovered = await _maybe_retry_resident_workday_auto_start(project_id)
-            if recovered:
-                await _resolve_strategic_cycle_liveness_alerts(session, project_id)
-                continue
+            if not resident_suppression_exhausted:
+                await session.commit()
+                recovered = await _maybe_retry_resident_workday_auto_start(project_id)
+                if recovered:
+                    suppress = await _consume_resident_liveness_suppression(
+                        session, project_id
+                    )
+                    await session.commit()
+                    if suppress:
+                        await _resolve_strategic_cycle_liveness_alerts(
+                            session, project_id
+                        )
+                        continue
             logger.info(
                 "[STRATEGIC] Liveness alert for project %s; autonomous refresh "
                 "not armed because automatic Strategic cycles are disabled",

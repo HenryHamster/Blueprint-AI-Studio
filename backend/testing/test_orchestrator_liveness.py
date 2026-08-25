@@ -321,6 +321,7 @@ class TestStrategicLoopLiveness:
         """A recovered liveness alert retires before a later halt re-alerts."""
         from app.alert_policy import AlertRetirementMode, get_alert_event_policy
         from app.reaper_sweeps import (
+            _RESIDENT_LIVENESS_SUPPRESSION_KEY,
             _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
             _sweep_strategic_cycle_starvation,
         )
@@ -334,6 +335,7 @@ class TestStrategicLoopLiveness:
         project = make_project(
             autonomous_enabled=True,
             created_at=now - timedelta(days=3),
+            vision={_RESIDENT_LIVENESS_SUPPRESSION_KEY: 3},
         )
         db_session.add(project)
         await db_session.commit()
@@ -378,6 +380,8 @@ class TestStrategicLoopLiveness:
         ) == 0
         await db_session.refresh(first_alert)
         assert first_alert.dismissed_at is not None
+        await db_session.refresh(project)
+        assert _RESIDENT_LIVENESS_SUPPRESSION_KEY not in (project.vision or {})
 
         # Once that receipt ages out, a distinct halt must create a new row.
         assert await _sweep_strategic_cycle_starvation(
@@ -408,6 +412,7 @@ class TestStrategicLoopLiveness:
     ):
         """A disabled, idle Resident portfolio is not a strategic halt."""
         from app.reaper_sweeps import (
+            _RESIDENT_LIVENESS_SUPPRESSION_KEY,
             _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
             _sweep_strategic_cycle_starvation,
         )
@@ -417,6 +422,7 @@ class TestStrategicLoopLiveness:
             autonomous_enabled=True,
             build_config={"automatic_strategic_cycles_enabled": False},
             created_at=now - timedelta(days=3),
+            vision={_RESIDENT_LIVENESS_SUPPRESSION_KEY: 3},
         )
         db_session.add(project)
         await db_session.commit()
@@ -424,6 +430,7 @@ class TestStrategicLoopLiveness:
         assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
         await db_session.refresh(project)
         assert (project.vision or {}).get("_strategic_refresh") is None
+        assert _RESIDENT_LIVENESS_SUPPRESSION_KEY not in (project.vision or {})
 
         # A repeated reaper pass remains quiet because no Resident ownership or
         # Workday recovery path makes this project a liveness candidate.
@@ -444,6 +451,7 @@ class TestStrategicLoopLiveness:
     ):
         """A successful Workday restart suppresses the same-pass halt alert."""
         from app.reaper_sweeps import (
+            _RESIDENT_LIVENESS_SUPPRESSION_KEY,
             _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
             _sweep_strategic_cycle_starvation,
         )
@@ -474,6 +482,8 @@ class TestStrategicLoopLiveness:
         assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
         assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
         assert attempts.await_count == 2
+        await db_session.refresh(project)
+        assert project.vision[_RESIDENT_LIVENESS_SUPPRESSION_KEY] == 2
         assert attempts.await_args.kwargs["operator_user_id"] == "workday-operator"
         assert not (
             await db_session.execute(
@@ -483,6 +493,60 @@ class TestStrategicLoopLiveness:
                 )
             )
         ).scalars().first()
+
+    async def test_endlessly_restarted_resident_eventually_raises_the_halt_signal(
+        self, db_session, monkeypatch
+    ):
+        """Repeated successful Resident restarts cannot mute liveness forever."""
+        from app.reaper_sweeps import (
+            _RESIDENT_LIVENESS_SUPPRESSION_BUDGET,
+            _RESIDENT_LIVENESS_SUPPRESSION_KEY,
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = await _make_resident_liveness_project(
+            db_session, now, timedelta(hours=2)
+        )
+        db_session.add(
+            MessagesNoisePrefs(
+                user_id="workday-operator",
+                project_id=project.id,
+                prefs={
+                    WORKBENCH_STATE_KEY: {
+                        "interaction_mode": "continuous",
+                    }
+                },
+            )
+        )
+        await db_session.commit()
+
+        restart = AsyncMock(return_value={"session_id": "restarted"})
+        monkeypatch.setattr(
+            "app.strategic_resident_session._auto_start_on_workday_entry",
+            restart,
+        )
+
+        for _ in range(_RESIDENT_LIVENESS_SUPPRESSION_BUDGET):
+            assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+
+        await db_session.refresh(project)
+        assert project.vision[_RESIDENT_LIVENESS_SUPPRESSION_KEY] == (
+            _RESIDENT_LIVENESS_SUPPRESSION_BUDGET
+        )
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        assert restart.await_count == _RESIDENT_LIVENESS_SUPPRESSION_BUDGET + 1
+
+        alert = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert "loop=strategic" in alert.message
 
     async def test_resident_halt_without_continuous_operator_is_not_a_candidate(
         self, db_session, monkeypatch
@@ -775,6 +839,7 @@ class TestStrategicLoopLiveness:
     async def test_quiet_healthy_portfolio_does_not_raise_signal(self, db_session):
         """A recent intentional no-delta receipt is healthy idle, not a halt."""
         from app.reaper_sweeps import (
+            _RESIDENT_LIVENESS_SUPPRESSION_KEY,
             _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
             _sweep_strategic_cycle_starvation,
         )
@@ -784,9 +849,10 @@ class TestStrategicLoopLiveness:
             autonomous_enabled=True,
             created_at=now - timedelta(days=3),
             vision={
+                _RESIDENT_LIVENESS_SUPPRESSION_KEY: 3,
                 "_strategic_no_delta_skips": [
                     {"skipped_at": (now - timedelta(hours=1)).isoformat()}
-                ]
+                ],
             },
         )
         db_session.add(project)
@@ -795,6 +861,7 @@ class TestStrategicLoopLiveness:
         assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
         await db_session.refresh(project)
         assert (project.vision or {}).get("_strategic_refresh") is None
+        assert _RESIDENT_LIVENESS_SUPPRESSION_KEY not in (project.vision or {})
         assert not (
             await db_session.execute(
                 select(Alert).where(
