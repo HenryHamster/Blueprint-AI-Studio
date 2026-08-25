@@ -1690,7 +1690,7 @@ async def test_agent_fetch_qualification_returns_latest_verdict_findings(
     assert body["candidate_sha"] == "abc12345def6789012345678901234567890abcd"
     assert body["confidence"] == pytest.approx(0.72)
     assert body["status"] == "dry_run"
-    assert body["finalized_at"] == "2026-06-01T12:00:00"
+    assert body["finalized_at"] == "2026-06-01T12:00:00+00:00"
     assert body["sub_scores"] == {"audit": 0.5, "test_erosion": 1.0}
     # Full findings list returned
     assert len(body["findings"]) == 2
@@ -2741,11 +2741,11 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     assert current["version_number"] == 10
     assert current["phase"] == "stabilize"
     assert current["goal"] == "Harden the release gate"
-    assert current["phase_changed_at"] == "2026-06-02T09:30:00"
+    assert current["phase_changed_at"] == "2026-06-02T09:30:00+00:00"
     assert current["qualification_attempts"] == 2
     assert current["qualification_state"]["state"] == "not_promoted"
     assert current["serving"]["status"] == "unconfirmed"
-    assert current["deploy_confirm_deadline"] == "2026-06-02T10:00:00"
+    assert current["deploy_confirm_deadline"] == "2026-06-02T10:00:00+00:00"
 
     qual = current["last_qualification"]
     assert qual["status"] == "not_promoted"
@@ -4797,7 +4797,7 @@ async def test_agent_fetch_qualification_prefers_verdict_terminal_status_over_st
     assert body["status"] == "promoted", (
         "verdict terminal_status should override stale pending status"
     )
-    assert body["finalized_at"] == "2026-06-20T14:00:00"
+    assert body["finalized_at"] == "2026-06-20T14:00:00+00:00"
     assert body["candidate_sha"] == sha
     # source_disagreement must be populated
     assert body["source_disagreement"] is not None

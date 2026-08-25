@@ -58,6 +58,7 @@ from app.release_models import (
     ReleaseVersion,
     VersionAcceptanceCriterion,
 )
+from app.time_utils import utc_iso
 
 router = APIRouter(
     prefix="/api/admin",
@@ -332,7 +333,7 @@ async def get_all_projects(
             {
                 "id": str(row.id),
                 "name": row.name,
-                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "created_at": utc_iso(row.created_at),
                 "status": row.status,
                 "status_semantics": "legacy_finite_lifecycle",
                 "operational_state": _project_operational_state(row),
@@ -350,11 +351,7 @@ async def get_all_projects(
                 "merge_verification_verdict": compute_merge_verification_verdict(row),
                 "merge_gate_runtime": merge_gate_runtime_block(row),
                 "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
-                "running_update_acknowledged_at": (
-                    row.running_update_acknowledged_at.isoformat()
-                    if row.running_update_acknowledged_at
-                    else None
-                ),
+                "running_update_acknowledged_at": utc_iso(row.running_update_acknowledged_at),
                 "directions_count": row.directions_count,
                 "my_role": row.my_role,
                 "task_status_counts": task_status_counts.get(
@@ -413,18 +410,14 @@ async def get_project(
         "operational_state": _project_operational_state(project),
         "github_owner": project.github_owner,
         "github_repo": project.github_repo,
-        "created_at": project.created_at.isoformat() if project.created_at else None,
+        "created_at": utc_iso(project.created_at),
         "directions": project.directions,
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
         "problem_model": proof_problem_model,
         "problem_model_size_health": size_health,
         "running_update": project.running_update,
-        "running_update_acknowledged_at": (
-            project.running_update_acknowledged_at.isoformat()
-            if project.running_update_acknowledged_at
-            else None
-        ),
+        "running_update_acknowledged_at": utc_iso(project.running_update_acknowledged_at),
         "self_reflection_log": project.self_reflection_log or [],
         "build_config": _redact_build_config(project.build_config or {}, role),
         "build_config_warnings": build_config_lint_warnings(project.build_config),
@@ -495,17 +488,13 @@ async def get_project_summary(
         "operational_state": _project_operational_state(project),
         "github_owner": project.github_owner,
         "github_repo": project.github_repo,
-        "created_at": project.created_at.isoformat() if project.created_at else None,
+        "created_at": utc_iso(project.created_at),
         "directions": project.directions,
         "vision": project.vision or {},
         "problem_model": proof_problem_model,
         "problem_model_size_health": size_health,
         "running_update": project.running_update,
-        "running_update_acknowledged_at": (
-            project.running_update_acknowledged_at.isoformat()
-            if project.running_update_acknowledged_at
-            else None
-        ),
+        "running_update_acknowledged_at": utc_iso(project.running_update_acknowledged_at),
         "build_config": _redact_build_config(project.build_config or {}, role),
         "build_config_warnings": build_config_lint_warnings(project.build_config),
         "merge_verification_verdict": compute_merge_verification_verdict(project),
@@ -681,7 +670,7 @@ async def update_project(
             )
         vision = dict(payload.vision)
         vision["revision"] = stored_rev + 1
-        vision["last_updated"] = _utcnow().isoformat()
+        vision["last_updated"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         project.vision = vision
         flag_modified(project, "vision")
     if payload.design_doc is not None:
@@ -722,7 +711,7 @@ async def update_project(
                 doc[_sys_key] = _sys_val
         meta = dict(stored_meta)
         meta["revision"] = stored_rev + 1
-        meta["last_updated"] = _utcnow().isoformat()
+        meta["last_updated"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         meta["updated_by"] = "user"
         doc["_meta"] = meta
         # Strip migrated telemetry keys before persist (safety net).
@@ -849,7 +838,7 @@ async def update_project(
             validated = apply_user_intent_patch(
                 sanitize_problem_model_raw(project.problem_model or {}),
                 payload.problem_model_patch,
-                _utcnow().isoformat(),
+                _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             )
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve)) from None
@@ -1154,7 +1143,7 @@ async def acknowledge_running_update(
     await session.commit()
     return {
         "status": "acknowledged",
-        "acknowledged_at": project.running_update_acknowledged_at.isoformat(),
+        "acknowledged_at": utc_iso(project.running_update_acknowledged_at),
     }
 
 
@@ -1354,7 +1343,7 @@ async def accept_pending_confirmation(
             status_code=404, detail=f"Pending confirmation '{pending_id}' not found"
         )
 
-    now = _utcnow().isoformat()
+    now = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
 
     if matched.type == "intent_change":
         # Apply the proposed text as the new operator-set intent.purpose.
@@ -2247,7 +2236,7 @@ async def get_autonomous_status(
                 "consecutive_failures": autonomous_failure_counts.get(
                     project_id_str, 0
                 ),
-                "last_research_at": last_research_map[project.id].isoformat()
+                "last_research_at": utc_iso(last_research_map[project.id])
                 if last_research_map.get(project.id)
                 else None,
                 "tasks_spawned_last_hour": project_stats[project.id][

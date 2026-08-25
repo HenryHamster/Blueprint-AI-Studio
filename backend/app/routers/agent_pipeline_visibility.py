@@ -58,6 +58,7 @@ from app.models import Alert
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.shared_state import limiter
+from app.time_utils import utc_iso
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -316,14 +317,14 @@ async def agent_alerts(
             "message": clip_text(alert.message),
             "occurrence_count": alert.occurrence_count,
             "task_id": str(alert.task_id) if alert.task_id else None,
-            "created_at": alert.created_at.isoformat() if alert.created_at else None,
-            "last_seen_at": alert.last_seen_at.isoformat() if alert.last_seen_at else None,
+            "created_at": utc_iso(alert.created_at),
+            "last_seen_at": utc_iso(alert.last_seen_at),
         }
         for alert in recent_rows
     ]
 
     data: dict[str, Any] = {
-        "generated_at": now.isoformat(),
+        "generated_at": utc_iso(now),
         "window_hours": window_hours,
         "total": total,
         "by_severity": by_severity,

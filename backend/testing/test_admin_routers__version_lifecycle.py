@@ -2900,14 +2900,11 @@ class TestVersionLifecyclePolicyProvenance:
         row = next(r for r in history if r["version_number"] == 1)
         assert row["serving_status"] == "unconfirmed"
         # The deadline is echoed in the history row (the field is the only place
-        # the unconfirmed serving state actually appears). Compare against the
-        # persisted value's isoformat — the column stores naive UTC.
-        await db_session.refresh(version)
-        assert (
-            row["deploy_confirm_deadline"]
-            == version.deploy_confirm_deadline.isoformat()
-        )
-        assert row["deploy_confirm_deadline"] is not None
+        # the unconfirmed serving state actually appears). The column stores
+        # naive UTC, so the wire form must re-stamp the offset a JS/Python
+        # consumer needs; pin the literal rather than re-deriving it from the
+        # ORM value, which would pass for either format.
+        assert row["deploy_confirm_deadline"] == "2026-01-01T01:00:00+00:00"
 
     @pytest.mark.asyncio
     async def test_merged_since_verdict_counts_merges_after_finalized_at(

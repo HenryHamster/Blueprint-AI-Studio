@@ -60,6 +60,7 @@ from app.task_evaluators import (
     evaluate_compute_success_criteria,
 )
 from app.storage import artifact_expires_at
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ def _artifact_descriptor(artifact: Artifact) -> Dict[str, Any]:
         ),
         "storage_uri": artifact.storage_uri,
         "logical_key": artifact.logical_key,
-        "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+        "created_at": utc_iso(artifact.created_at),
     }
     try:
         metadata = json.loads(artifact.logs or "{}")
@@ -748,7 +749,7 @@ def _awaiting_local_runner_entry(
         "awaiting_forced_runner_since": awaiting_forced,
         "forced_runner_target_id": forced_runner_target_id,
         "forced_runner": forced_runner_descriptor,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "created_at": utc_iso(task.created_at),
         "requires_approval": bool(task.requires_approval),
         "spend_cap_usd": float(raw_spend) if raw_spend is not None else None,
         "command": fp.get("command") or None,
@@ -934,8 +935,8 @@ async def gpu_contamination_audit(
             # as a plain str (not a ComputeJobStatus enum); getattr handles both
             # the in-memory enum and the persisted-string case.
             "status": getattr(job.status, "value", job.status) if job.status else None,
-            "started_at": job.started_at.isoformat() if job.started_at else None,
-            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "started_at": utc_iso(job.started_at),
+            "completed_at": utc_iso(job.completed_at),
             "suspect_reason": (
                 "started before /sys ro-bind fix (PR #14183); cuInit likely "
                 "returned CUDA_ERROR_OPERATING_SYSTEM (rc=304), causing silent "
@@ -944,7 +945,7 @@ async def gpu_contamination_audit(
         })
 
     return {
-        "fix_landed_at": _GPU_SYS_FIX_UTC.isoformat(),
+        "fix_landed_at": utc_iso(_GPU_SYS_FIX_UTC),
         "fix_pr": "#14183",
         "fix_commit": "b92e36823",
         "suspect_count": len(items),

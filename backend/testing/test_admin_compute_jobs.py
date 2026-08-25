@@ -263,7 +263,8 @@ async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
         "artifact_type": ArtifactType.COMPUTE_RESULT.value,
         "storage_uri": "gs://bucket/jobs/job-1/result.parquet",
         "logical_key": "compute-result-job-1",
-        "created_at": artifact.created_at.isoformat(),
+        # Naive UTC in the column; the response must re-stamp the zone.
+        "created_at": artifact.created_at.replace(tzinfo=timezone.utc).isoformat(),
         "download_available": True,
         "manifest": {
             "file_count": None,
@@ -3077,14 +3078,14 @@ async def test_gpu_contamination_audit_returns_completed_at(
     assert "completed_at" in item
     # ComputeJob datetime columns are NaiveUTCDateTime: a tz-aware value is stored
     # and read back as naive UTC (tz stripped), matching the codebase-wide naive-UTC
-    # convention and the canonical serializer. So the serialized value carries no
-    # offset — compare against the naive-UTC round-trip, not the aware original.
+    # convention. The wire form must put that UTC zone back, or a JS `new Date()`
+    # reads the string as local time.
     #
     # Anchored to the INPUT LITERAL (`suspect_completed`), deliberately NOT to
     # `job.completed_at.isoformat()`: the latter is a self-consistency round-trip
     # that would still pass if the storage layer mangled the timestamp, since both
     # sides of the comparison would shift together.
-    assert item["completed_at"] == suspect_completed.replace(tzinfo=None).isoformat()
+    assert item["completed_at"] == "2026-07-10T13:00:00+00:00"
     assert "ended_at" not in item
     # status must serialize to the plain enum value. job.status arrives as a str on
     # this load path, so a bare `.value` raises AttributeError and 500s the endpoint.

@@ -33,6 +33,7 @@ from app.evergreen_backlog import (
     get_fill_observability_from_db,
     list_backlog_items,
 )
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +67,8 @@ def _serialize_item(item) -> Dict[str, Any]:
         "attempts": item.attempts,
         "spawned_task_id": str(item.spawned_task_id) if item.spawned_task_id else None,
         "verified_against_sha": item.verified_against_sha,
-        "created_at": item.created_at.isoformat() if item.created_at else None,
-        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+        "created_at": utc_iso(item.created_at),
+        "updated_at": utc_iso(item.updated_at),
     }
 
 

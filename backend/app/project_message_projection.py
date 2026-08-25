@@ -8,9 +8,11 @@ timestamps, and empty context handling do not drift route-by-route.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any, Iterable, Mapping
 
 from app.models import ProjectMessage
+from app.time_utils import utc_iso
 from app.workbench_state import (
     sanitize_strategic_session_snapshot,
     strategic_session_snapshot_has_signal,
@@ -138,7 +140,11 @@ def enum_value(value: Any) -> str:
 
 
 def _isoformat(value: Any) -> str | None:
-    return value.isoformat() if value else None
+    if isinstance(value, datetime):
+        # Columns are naive UTC; the wire form must carry the offset or a
+        # JS `new Date()` reads it as local time.
+        return utc_iso(value)
+    return value.isoformat() if value else None  # utc-iso-ok: non-datetime (date) value -- no zone applies
 
 
 def _message_context(message: ProjectMessage) -> dict[str, Any]:

@@ -30,6 +30,7 @@ from app.routers.admin_notifications import (
 )
 from app.routers.admin_project_config import get_project_resource_summary
 from app.schemas import redact_command_log_text
+from app.time_utils import utc_iso
 
 
 router = APIRouter(prefix="/api/agent-access/v1", tags=["agent-access"])
@@ -1258,9 +1259,7 @@ async def get_agent_access_profile(
             "name": credential.name,
             "principal_user_id": credential.principal_user_id,
             "scopes": credential.scopes,
-            "expires_at": (
-                credential.expires_at.isoformat() if credential.expires_at else None
-            ),
+            "expires_at": utc_iso(credential.expires_at),
         },
         credential_state,
         serialized_strings=True,

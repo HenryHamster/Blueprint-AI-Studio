@@ -58,6 +58,7 @@ from app.models import Artifact, ArtifactType, Task, TaskStatus
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.shared_state import limiter
+from app.time_utils import utc_iso
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -92,7 +93,9 @@ _CENSUS_TERMINAL_WINDOW_HOURS = 24
 
 
 def _iso(dt: Any) -> str | None:
-    return dt.isoformat() if dt else None
+    if isinstance(dt, datetime):
+        return utc_iso(dt)
+    return dt.isoformat() if dt else None  # utc-iso-ok: non-datetime (date) value -- no zone applies
 
 
 def _task_type(task: Task) -> str | None:
@@ -574,7 +577,7 @@ async def agent_task_census(
         oldest_rows.append(item)
 
     data: dict[str, Any] = {
-        "generated_at": now.isoformat(),
+        "generated_at": utc_iso(now),
         "non_terminal_total": len(rows),
         "non_terminal_by_status": by_status,
         "non_terminal_by_type": bounded_by_type,

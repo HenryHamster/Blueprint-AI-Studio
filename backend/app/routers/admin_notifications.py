@@ -1773,7 +1773,7 @@ async def admin_playbook_set(
     new_entry: dict = {
         "content": payload.value,
         "source_task_id": None,
-        "updated_at": _utcnow().isoformat(),
+        "updated_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
         "confirmed_count": existing.get("confirmed_count", 0)
         if isinstance(existing, dict)
         else 0,
@@ -1799,7 +1799,7 @@ async def admin_playbook_set(
 
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1
-    meta["last_updated"] = _utcnow().isoformat()
+    meta["last_updated"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     meta["updated_by"] = "admin"
     doc["_meta"] = meta
 

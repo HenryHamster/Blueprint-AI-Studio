@@ -46,6 +46,7 @@ from app.models import (
     _utcnow,
 )
 from app.time_utils import _utcnow as _now
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +356,7 @@ async def get_fill_observability_from_db(
                     "reason": row.reason,
                     "trigger": row.trigger,
                     "project_id": str(row.project_id) if row.project_id else None,
-                    "ts": row.ts.isoformat() if row.ts else None,
+                    "ts": utc_iso(row.ts) if row.ts else None,
                 }
             )
 

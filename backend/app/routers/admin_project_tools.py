@@ -72,6 +72,7 @@ from app.task_locking import lock_project_or_429
 from app import compute_backends as _cb
 from app import compute_image_build as _cib
 from app import reaper_sweeps as _rs
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -1547,7 +1548,7 @@ async def mint_tool_asset_token(
         )
     token = _create_tool_asset_token(str(project_id), tool_slug)
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=ASSET_TOKEN_TTL_MINUTES)
-    return {"token": token, "expires_at": expires_at.isoformat()}
+    return {"token": token, "expires_at": utc_iso(expires_at)}
 
 
 # ── Asset serving endpoint (public router — JWT auth, no cookies) ────────────
@@ -2174,8 +2175,8 @@ async def get_project_compute_image_status(
         "dep_hash": row.dep_hash,
         "tag": row.tag,
         "built": bool(row.built),
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "created_at": utc_iso(row.created_at),
+        "updated_at": utc_iso(row.updated_at),
         "is_digest_pinned": row.digest is not None,
         "build_age_hours": build_age_hours,
     }

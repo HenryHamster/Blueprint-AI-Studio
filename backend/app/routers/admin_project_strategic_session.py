@@ -174,6 +174,7 @@ from app.strategic_resident_session import (
     stop_resident_session,
     sync_resident_session_for_interaction_mode,
 )
+from app.time_utils import utc_iso
 
 router = APIRouter(
     prefix="/api/admin",
@@ -3148,7 +3149,7 @@ async def create_project_strategic_session_check_in(
                     "version": 1,
                     "kind": kind,
                     "operator_user_id": current_user["user_id"],
-                    "captured_at": now.isoformat(),
+                    "captured_at": now.isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 },
             },
             _CHECK_IN_EVENT_TYPE,
@@ -3596,7 +3597,7 @@ async def get_message_attachment_upload_url(
         "attachment_id": attachment_id,
         "content_type": content_type,
         "size_bytes": req.size_bytes,
-        "expires_at": expires_at.isoformat(),
+        "expires_at": utc_iso(expires_at),
     }
 
 

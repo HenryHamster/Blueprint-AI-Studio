@@ -55,6 +55,7 @@ from app.routers.admin_pipeline_observability import (
     _load_escalation_alerts,
     _load_outer_loop_original_tasks,
 )
+from app.time_utils import utc_iso
 
 # Re-export for test and internal use (single source of truth is vm_cost_rates)
 ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # $/sec
@@ -667,7 +668,7 @@ async def get_task_cost_breakdown(
                 "task_title": task_title,
                 "task_type": task_type,
                 "direction_id": direction_id,
-                "completed_at": completed_at.isoformat(),
+                "completed_at": utc_iso(completed_at),
                 "estimated_cost_usd": round(float(cost), 2),
             }
             for task_id, task_title, task_type, direction_id, completed_at, cost in top_rows
@@ -676,7 +677,7 @@ async def get_task_cost_breakdown(
             "project_id": str(project_id) if project_id else None,
             "window": window,
             "window_ms": _TASK_COST_WINDOW_MS[window] if window != "all" else None,
-            "window_start": cutoff.isoformat() if cutoff else None,
+            "window_start": utc_iso(cutoff),
             "task_count": sum(item["task_count"] for item in task_type_breakdown),
             "max_tasks": max_tasks,
             "truncated": capped_count >= max_tasks,
@@ -804,7 +805,7 @@ async def get_task_cost_breakdown(
             "task_title": row["task_title"],
             "task_type": row["task_type"],
             "direction_id": row["direction_id"],
-            "completed_at": row["completed_at"].isoformat(),
+            "completed_at": utc_iso(row['completed_at']),
             "estimated_cost_usd": round(row["estimated_cost_usd"], 2),
         }
         for row in sorted(
@@ -821,7 +822,7 @@ async def get_task_cost_breakdown(
         "project_id": str(project_id) if project_id else None,
         "window": window,
         "window_ms": _TASK_COST_WINDOW_MS[window] if window != "all" else None,
-        "window_start": cutoff.isoformat() if cutoff else None,
+        "window_start": utc_iso(cutoff),
         "task_count": len(rows),
         "max_tasks": max_tasks,
         "truncated": len(tasks) >= max_tasks,
@@ -965,9 +966,9 @@ async def get_lane_diag(
             "version_number": rv.version_number,
             "phase": rv.phase,
             "status": rv.status,
-            "opened_at": rv.opened_at.isoformat(),
-            "promoted_at": rv.promoted_at.isoformat() if rv.promoted_at else None,
-            "abandoned_at": abandoned_at_dt.isoformat() if abandoned_at_dt else None,
+            "opened_at": utc_iso(rv.opened_at),
+            "promoted_at": utc_iso(rv.promoted_at),
+            "abandoned_at": utc_iso(abandoned_at_dt),
         }
         cutoff = window_start
     else:
@@ -1107,7 +1108,7 @@ async def get_lane_diag(
     )
     extra: dict = {
         "project_id": str(project_id) if project_id else None,
-        "window_start": cutoff.isoformat(),
+        "window_start": utc_iso(cutoff),
         "max_tasks": max_tasks,
         "truncated": len(completed_tasks) >= max_tasks
         or len(all_terminal_tasks) >= max_tasks,
@@ -1417,7 +1418,7 @@ async def get_failing_task_types(
         "global_failure_threshold": global_threshold,
         "anomaly_tightened": bool(_ss.anomaly_adjustments.get("active")),
         "window_minutes": WINDOW_MINUTES,
-        "generated_at": _utcnow().isoformat(),
+        "generated_at": utc_iso(_utcnow()),
     }
 
 
@@ -1742,11 +1743,7 @@ async def get_improvement_lanes(
         reservation_expires_at: str | None = None
         reserved_vm_instance_id: str | None = None
         if pvm is not None:
-            reservation_expires_at = (
-                pvm.reservation_expires_at.isoformat()
-                if pvm.reservation_expires_at
-                else None
-            )
+            reservation_expires_at = utc_iso(pvm.reservation_expires_at)
             reserved_vm_instance_id = pvm.vm_instance_id
 
         at_risk = (lane.phase_requeues or 0) >= (_LANE_MAX_PHASE_REQUEUES - 1)
@@ -1795,8 +1792,8 @@ async def get_improvement_lanes(
                     lane.reservation_force_expired_count or 0
                 ),
                 "shadow": shadow,
-                "created_at": lane.created_at.isoformat() if lane.created_at else None,
-                "updated_at": lane.updated_at.isoformat() if lane.updated_at else None,
+                "created_at": utc_iso(lane.created_at),
+                "updated_at": utc_iso(lane.updated_at),
             }
         )
 
@@ -1935,13 +1932,11 @@ async def get_improvement_lane_detail(
         "status": lane.status,
         "branch_name": lane.branch_name,
         "base_branch": lane.base_branch,
-        "created_at": lane.created_at.isoformat() if lane.created_at else None,
-        "parked_at": lane.parked_at.isoformat() if lane.parked_at else None,
-        "last_resumed_at": (
-            lane.last_resumed_at.isoformat() if lane.last_resumed_at else None
-        ),
-        "retired_at": lane.retired_at.isoformat() if lane.retired_at else None,
-        "updated_at": lane.updated_at.isoformat() if lane.updated_at else None,
+        "created_at": utc_iso(lane.created_at),
+        "parked_at": utc_iso(lane.parked_at),
+        "last_resumed_at": utc_iso(lane.last_resumed_at),
+        "retired_at": utc_iso(lane.retired_at),
+        "updated_at": utc_iso(lane.updated_at),
         "last_checkpoint_sha": lane.last_checkpoint_sha,
         "last_checkpoint_phase": lane.last_checkpoint_phase,
         "checkpoint_seq": lane.checkpoint_seq,

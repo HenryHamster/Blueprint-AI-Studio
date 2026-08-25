@@ -45,6 +45,7 @@ from app.models import (
     get_task_total_vm_cost_usd_or_none,
 )
 from app.vm_cost_rates import vm_cost_sql_expr
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -385,7 +386,7 @@ async def get_drift_snapshot(
             "total_directions": 0,
             "any_system_flagged": False,
             "by_system": {},
-            "generated_at": _utcnow().isoformat(),
+            "generated_at": utc_iso(_utcnow()),
             "window_days": window_days,
         }
 
@@ -405,7 +406,7 @@ async def get_drift_snapshot(
         # Reverse to chronological order for sparkline rendering (oldest first).
         history = [
             {
-                "snapshot_at": s.snapshot_at.isoformat(),
+                "snapshot_at": utc_iso(s.snapshot_at),
                 "claim_shipped_consistency": s.claim_shipped_consistency,
                 "over_claim_flag": s.over_claim_flag,
                 "stalled_despite_churn_flag": s.stalled_despite_churn_flag,
@@ -1446,9 +1447,7 @@ async def get_pipeline_regressions(
             {
                 "signal_name": alert.title,
                 "regression_class": reg_class,
-                "detected_at": alert.created_at.isoformat()
-                if alert.created_at
-                else None,
+                "detected_at": utc_iso(alert.created_at),
                 "severity": "critical",
                 "current_rate": None,
                 "prior_rate": None,
@@ -1481,9 +1480,7 @@ async def get_pipeline_regressions(
             {
                 "signal_name": alert.title,
                 "regression_class": f"signal_staleness:{signal_name or 'unknown'}",
-                "detected_at": alert.created_at.isoformat()
-                if alert.created_at
-                else None,
+                "detected_at": utc_iso(alert.created_at),
                 "severity": "warning",
                 "current_rate": None,
                 "prior_rate": None,
@@ -1551,9 +1548,7 @@ async def get_pipeline_regressions(
             {
                 "signal_name": signal_name,
                 "regression_class": regression_class,
-                "detected_at": (task.updated_at or task.created_at).isoformat()
-                if (task.updated_at or task.created_at)
-                else None,
+                "detected_at": utc_iso(task.updated_at or task.created_at),
                 "severity": "critical",
                 "current_rate": None,
                 "prior_rate": None,
@@ -1839,7 +1834,7 @@ async def get_pipeline_efficiency(
         }
 
     return {
-        "computed_at": now.isoformat(),
+        "computed_at": utc_iso(now),
         "window_24h": _augment(cur_24h, pri_24h),
         "window_7d": _augment(cur_7d, pri_7d),
     }
@@ -2062,7 +2057,7 @@ async def pin_ui_load_timing_baseline(
                 "p90": b.p90,
                 "count": b.count,
                 "label": b.label,
-                "pinned_at": b.pinned_at.isoformat() if b.pinned_at else None,
+                "pinned_at": utc_iso(b.pinned_at),
             }
             for b in baselines
         ],
@@ -2110,7 +2105,7 @@ async def get_ui_load_timing(
             "p90": b.p90,
             "count": b.count,
             "label": b.label,
-            "pinned_at": b.pinned_at.isoformat() if b.pinned_at else None,
+            "pinned_at": utc_iso(b.pinned_at),
         }
         for b in baseline_rows
     ]

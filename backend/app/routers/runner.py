@@ -88,6 +88,7 @@ from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
 from app.workbench_state import (
     refresh_strategic_local_continuation_on_runner_heartbeat,
 )
+from app.time_utils import utc_iso
 
 _MAX_RUNNER_COMMAND_LOG_BYTES = 65536
 _MAX_RUNNER_RESULT_METRICS_KEYS = 256
@@ -625,7 +626,7 @@ def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> tuple[dict
     return {
         "records": merged,
         "count": max(count, len(merged)),
-        "updated_at": now.isoformat(),
+        "updated_at": now.isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
     }, new_records
 
 
@@ -1872,16 +1873,16 @@ async def heartbeat(
             # within one heartbeat interval, so a long idle drain means the
             # update keeps failing.
             if not was_update_draining:
-                caps["update_draining_since"] = now.isoformat()
+                caps["update_draining_since"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 caps.pop("update_drain_alerted_at", None)
             elif not caps.get("update_draining_since"):
-                caps["update_draining_since"] = now.isoformat()
+                caps["update_draining_since"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
             try:
                 _drain_age_s = (
                     now - datetime.fromisoformat(str(caps["update_draining_since"]))
                 ).total_seconds()
             except (TypeError, ValueError):
-                caps["update_draining_since"] = now.isoformat()
+                caps["update_draining_since"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 _drain_age_s = 0.0
             if payload.active_work_report:
                 _drain_active_work = bool(
@@ -1897,7 +1898,7 @@ async def heartbeat(
                 and not _drain_active_work
                 and not caps.get("update_drain_alerted_at")
             ):
-                caps["update_drain_alerted_at"] = now.isoformat()
+                caps["update_drain_alerted_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 from app.main import _current_sha
 
                 # Lazy: app.alert_dispatch imports this router's package.
@@ -1970,7 +1971,7 @@ async def heartbeat(
     if payload.active_work_report:
         caps["active_task_ids"] = list(payload.active_task_ids)
         caps["active_compute_job_ids"] = list(payload.active_compute_job_ids)
-        caps["active_work_reported_at"] = now.isoformat()
+        caps["active_work_reported_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     # Merge runner-reported hardware capabilities when present.
     # These override the registration-time default but never clobber
     # operator-configured fields (task_types, max_concurrent).
@@ -2234,7 +2235,7 @@ async def heartbeat(
         # restart it. Only stamped on a genuine change so a steady-state runner
         # never carries a stale "just updated" marker.
         if previous_version is not None and new_version != previous_version:
-            caps["version_changed_at"] = now.isoformat()
+            caps["version_changed_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
             caps["previous_version"] = previous_version
         runner.version = new_version
     if "git_sha" in payload.model_fields_set:
@@ -2350,7 +2351,7 @@ async def heartbeat(
     generation = config_generation(live_config)
     return {
         "ok": True,
-        "last_seen_at": runner.last_seen_at.isoformat(),
+        "last_seen_at": utc_iso(runner.last_seen_at),
         "enrolled_max_concurrent": caps.get("max_concurrent"),
         "version_hint": _current_sha,
         "config": {**live_config, "config_generation": generation},
@@ -2608,7 +2609,7 @@ async def next_compute_job(
     # runs this job. Stamp the durable first-class record of the claiming runner.
     job.ran_on_runner_id = runner.id
     meta = dict(job.polling_metadata or {})
-    meta["runner_claimed_at"] = now.isoformat()
+    meta["runner_claimed_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     job.polling_metadata = meta
     session.add(job)
     await session.commit()
@@ -2890,7 +2891,7 @@ async def report_compute_job(
                         # useful display data in `progress`, but watchdog timing
                         # must use the server receipt time so a job cannot extend
                         # or backdate its own protection window.
-                        t=rec.get("ts") or now.isoformat(),
+                        t=rec.get("ts") or now.isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                         received_at=now,
                     )
         if payload.exec_status == "running" and isinstance(payload.viewable_omissions, dict):
@@ -2902,7 +2903,7 @@ async def report_compute_job(
             if omissions:
                 meta["viewable_live_omissions"] = omissions
         if payload.exec_status in ("succeeded", "failed"):
-            meta["runner_finished_at"] = now.isoformat()
+            meta["runner_finished_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         if isinstance(payload.resume_hydration, dict):
             # Whitelist known provenance keys so a runner cannot bloat the row.
             raw = payload.resume_hydration
@@ -2932,7 +2933,7 @@ async def report_compute_job(
             if isinstance(reason, str) and reason.strip():
                 provenance["reason"] = reason.strip()[:200]
             if provenance:
-                provenance["recorded_at"] = now.isoformat()
+                provenance["recorded_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 meta["resume_provenance"] = provenance
         if (
             payload.exec_status in ("succeeded", "failed")
@@ -2960,7 +2961,7 @@ async def report_compute_job(
                 if isinstance(value, str) and value.strip():
                     delivery[key] = value.strip()[:limit]
             if delivery:
-                delivery["recorded_at"] = now.isoformat()
+                delivery["recorded_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 meta["artifact_delivery"] = delivery
         job.polling_metadata = meta
         job.last_heartbeat_at = now
@@ -3448,7 +3449,7 @@ async def complete_compute_job_artifact_upload(
         "transfer_id": str(payload.transfer_id),
     }
     meta["runner_artifact"] = artifact_info
-    meta["runner_artifact_transfer"] = {**current, "status": "verified", "verified_at": _utcnow().isoformat()}
+    meta["runner_artifact_transfer"] = {**current, "status": "verified", "verified_at": _utcnow().isoformat()}  # utc-iso-ok: persisted JSON round-trip, not a wire field
     job.polling_metadata = meta
     job.updated_at = _utcnow()
     session.add(job)

@@ -18,6 +18,7 @@ from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
 from app.models import Alert, MessageType, ProjectMessage, StrategicCycle, Task
+from app.time_utils import utc_iso
 from app.workbench_contracts import (
     DEFAULT_REFETCH_SURFACES as CONTRACT_DEFAULT_REFETCH_SURFACES,
     SURFACE_DIRECTIONS,
@@ -54,7 +55,9 @@ def _enum_value(value: Any) -> str:
 
 
 def _isoformat(value: Any) -> str | None:
-    return value.isoformat() if value else None
+    if isinstance(value, datetime):
+        return utc_iso(value)
+    return value.isoformat() if value else None  # utc-iso-ok: non-datetime (date) value -- no zone applies
 
 
 def _parse_iso_datetime(value: Any) -> datetime | None:

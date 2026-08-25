@@ -54,7 +54,7 @@ from app.models import (
     _on_task_revive_callbacks,
     _utcnow,
 )
-from app.time_utils import _to_naive_utc
+from app.time_utils import _to_naive_utc, utc_iso
 from app.reaper_orphan_classify import _is_multiplexed_vm_instance_id
 from app.schemas import (
     ArtifactDownloadResponse,
@@ -744,7 +744,7 @@ async def agent_refresh_token(
         project_id=token.get("project_id", "") or str(task.project_id),
     )
     expires_at = datetime.now(timezone.utc) + timedelta(hours=AGENT_TOKEN_TTL_HOURS)
-    return {"token": new_token, "token_expires_at": expires_at.isoformat()}
+    return {"token": new_token, "token_expires_at": utc_iso(expires_at)}
 
 
 @router.get("/git-read-token")
@@ -1048,7 +1048,7 @@ async def claim_task(
         task.last_heartbeat = claim_started_at
         claim_context = dict(task.context or {})
         claim_context[_CLAIM_REPLAY_CONTEXT_KEY] = {
-            "claimed_at": claim_started_at.isoformat(),
+            "claimed_at": claim_started_at.isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             "token_jti": str(token.get("jti") or ""),
         }
         _reported_research_contract = request.headers.get(

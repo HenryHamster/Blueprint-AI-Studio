@@ -773,6 +773,7 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_monthly_budget_alerts.py
     testing/test_migration_chain.py
     testing/test_message_audience.py
+    testing/test_wire_timestamp_zone.py
     testing/test_event_type_invariants.py
     testing/test_salvage_bundle_standalone.py
     testing/test_test_durations_freshness.py

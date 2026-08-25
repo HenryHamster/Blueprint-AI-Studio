@@ -59,6 +59,7 @@ from app.autonomous_spawn_budget import (
     normalize_autonomous_spawn_budget_mode,
 )
 from app.field_encryption import encrypt_field
+from app.time_utils import utc_iso
 
 _VALID_PROVIDER_SELECTION_MODES = frozenset({"balanced", "preferred", "exclusive"})
 
@@ -559,7 +560,7 @@ async def get_settings(
     # Leader-memory 'armable-since' marker for the auto-arm reconciler. None on
     # non-leader instances (they do not run the reconciler) or when not holding.
     _armable_since = _get_usage_headroom_armable_since()
-    _armable_since_iso = _armable_since.isoformat() if _armable_since else None
+    _armable_since_iso = utc_iso(_armable_since)
 
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
@@ -4482,7 +4483,7 @@ async def repair_state(
         if cutoff and cutoff < fifteen_min_ago:
             original_status = t.status  # Capture before overwriting
             t.status = TaskStatus.FAILED
-            t.latest_status_message = f"Repaired: stuck in {original_status} with no heartbeat since {cutoff.isoformat()}"
+            t.latest_status_message = f"Repaired: stuck in {original_status} with no heartbeat since {cutoff.isoformat()}"  # utc-iso-ok: prose status message, not a wire timestamp field
             from app.failure_classification import persist_failure_category  # noqa: PLC0415
 
             persist_failure_category(t, "AGENT_TIMEOUT")

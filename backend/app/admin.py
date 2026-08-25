@@ -204,12 +204,8 @@ def _serialize_task_wake_registration(
         "wake_source_kind": registration.wake_source_kind,
         "wake_source_ref": registration.wake_source_ref,
         "delivery_state": _enum_value(registration.delivery_state),
-        "deadline_at": registration.deadline_at.isoformat()
-        if registration.deadline_at
-        else None,
-        "fired_at": registration.fired_at.isoformat()
-        if registration.fired_at
-        else None,
+        "deadline_at": utc_iso(registration.deadline_at),
+        "fired_at": utc_iso(registration.fired_at),
         "result_state": registration.result_state,
         "result_detail": registration.result_detail,
     }
@@ -679,7 +675,7 @@ async def get_all_tasks(
                 history_map[tid] = []
             history_map[tid].append(
                 {
-                    "timestamp": h.timestamp.isoformat() if h.timestamp else None,
+                    "timestamp": utc_iso(h.timestamp),
                     "action": h.action,
                     "details": h.details,
                 }
@@ -1444,7 +1440,7 @@ async def _bulk_cancel_task(
         if task.context and task.context.get("finding_hash"):
             task_priority = task.priority if task.priority is not None else 50
             if task_priority == 0:
-                suppress_until = (_utcnow() + timedelta(days=180)).isoformat()
+                suppress_until = (_utcnow() + timedelta(days=180)).isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 task.context = {
                     **task.context,
                     "suppress_until": suppress_until,
@@ -2014,11 +2010,9 @@ def _task_sideboard_context(
                     task.blocked_reason or task.park_reason,
                     max_chars=220,
                 ),
-                "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
-                "recheck_after": task.recheck_after.isoformat()
-                if task.recheck_after
-                else None,
-                "parked_at": task.parked_at.isoformat() if task.parked_at else None,
+                "blocked_at": utc_iso(task.blocked_at),
+                "recheck_after": utc_iso(task.recheck_after),
+                "parked_at": utc_iso(task.parked_at),
                 # Explicit operator-tier marker: True once automatic recovery
                 # has raised its one ERROR alert and given up resolving this
                 # blocker itself. The task STAYS on a bounded recheck cadence
@@ -2202,7 +2196,7 @@ async def get_task(
                 # gs:// reference for signed-download resolution, null otherwise.
                 "storage_uri": a.storage_uri,
                 "iteration": a.iteration,
-                "created_at": a.created_at.isoformat() if a.created_at else None,
+                "created_at": utc_iso(a.created_at),
             }
         )
         if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
@@ -2234,7 +2228,7 @@ async def get_task(
     all_history = (await session.execute(history_stmt)).scalars().all()
     history = [
         {
-            "timestamp": h.timestamp.isoformat() if h.timestamp else None,
+            "timestamp": utc_iso(h.timestamp),
             "action": h.action,
             "details": h.details,
         }
@@ -2349,19 +2343,15 @@ async def get_task(
             if task_type == "research"
             else task.plan_output
         ),
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "started_at": task.started_at.isoformat() if task.started_at else None,
-        "last_heartbeat": task.last_heartbeat.isoformat()
-        if task.last_heartbeat
-        else None,
+        "created_at": utc_iso(task.created_at),
+        "started_at": utc_iso(task.started_at),
+        "last_heartbeat": utc_iso(task.last_heartbeat),
         # Audit R3-W2 (H1): expose the heartbeat-hot columns directly so the
         # admin-ui System Metrics panel reads from the column source-of-truth.
         # Round 2 F retired the ctx.last_metrics JSONB mirror; this endpoint
         # was the missing piece that left the frontend silently stale.
         "last_metrics_json": task.last_metrics_json,
-        "last_tool_use_at": task.last_tool_use_at.isoformat()
-        if task.last_tool_use_at
-        else None,
+        "last_tool_use_at": utc_iso(task.last_tool_use_at),
         "attempt_count": task.attempt_count,
         "attempt_number": get_task_lifetime_attempt_ordinal(task),
         # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
@@ -2369,14 +2359,14 @@ async def get_task(
         "blocker_kind": task.blocker_kind,
         "blocked_reason": task.blocked_reason,
         "movement_explanation": movement_explanation,
-        "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
-        "recheck_after": task.recheck_after.isoformat() if task.recheck_after else None,
+        "blocked_at": utc_iso(task.blocked_at),
+        "recheck_after": utc_iso(task.recheck_after),
         # Explicit operator-tier marker — see the sideboard endpoint above for
         # the full rationale. Bounded recheck_after still applies regardless.
         "blocker_escalated": bool((task.context or {}).get("_blocked_escalated")),
         # Durable PARKED-state metadata (alembic 0199). Nullable for any
         # non-PARKED or pre-migration task; the admin UI guards on presence.
-        "parked_at": task.parked_at.isoformat() if task.parked_at else None,
+        "parked_at": utc_iso(task.parked_at),
         "park_reason": task.park_reason,
         "wake_registration": _serialize_task_wake_registration(wake_registration),
         "payloads": redact_task_payloads(task.payloads),
@@ -2488,7 +2478,7 @@ async def get_task_serial_console(
         "zone": zone if zone != "unknown" else None,
         "vm_status": vm_status,
         "serial_log": serial_log,
-        "captured_at": _utcnow().isoformat(),
+        "captured_at": utc_iso(_utcnow()),
         "source": source,
     }
 
@@ -3697,7 +3687,7 @@ async def create_compute_experiment_task(
         # and the autonomous-research gate (_bootstrap_pending) would defer
         # spawning for the project, both of which can starve the dispatch slot
         # that the compute_experiment task is waiting for.
-        _now_iso = _utcnow().isoformat()
+        _now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         project = Project(
             name=payload.github_repo,
             user_id=current_user.get("user_id", "admin"),
@@ -4604,7 +4594,7 @@ async def reset_iteration_cap(
     new_review_loop = dict(review_loop)
     previous_iteration = new_review_loop.get("iteration", 0)
     new_review_loop["iteration"] = 0
-    new_review_loop["iteration_reset_at"] = _utcnow().isoformat()
+    new_review_loop["iteration_reset_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     new_review_loop["iteration_reset_by"] = current_user.get(
         "email", current_user["user_id"]
     )
@@ -4782,7 +4772,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
     _last_check = external_health.get("last_check")
     external_health_serializable = {
         **external_health,
-        "last_check": _last_check.isoformat()
+        "last_check": utc_iso(_last_check)
         if isinstance(_last_check, datetime)
         else _last_check,
     }
@@ -4797,7 +4787,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
     return {
         "current_revision": state.current_revision,
         "current_sha": state.current_sha,
-        "deployed_at": state.deployed_at.isoformat() if state.deployed_at else None,
+        "deployed_at": utc_iso(state.deployed_at),
         "status": state.status,
         "last_known_good_revision": state.last_known_good_revision,
         "last_known_good_sha": state.last_known_good_sha,
@@ -4805,7 +4795,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "rollback_reason": state.rollback_reason,
         "rollback_count": state.rollback_count,
         "pause_reason": state.pause_reason,
-        "paused_at": state.paused_at.isoformat() if state.paused_at else None,
+        "paused_at": utc_iso(state.paused_at),
         "reason": state.pause_reason
         if state.status == DeploymentStatus.PAUSED
         else None,

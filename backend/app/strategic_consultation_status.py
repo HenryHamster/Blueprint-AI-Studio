@@ -422,7 +422,7 @@ def project_consultation_activity(
             autonomy_state="paused",
             autonomy_reason_code=prior_fence,
         )
-    now_iso = _utcnow().isoformat()
+    now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted vision JSON round-trip; sibling writers in strategic_resident_session.py use the same offsetless form and the UI normalises via parseTimestamp
     if updated.get("phase") != current.get("phase"):
         updated["phase_started_at"] = now_iso
     elif current.get("phase_started_at"):

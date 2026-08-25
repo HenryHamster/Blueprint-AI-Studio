@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, utc_iso
 
 from app import acceptance_criteria as ac
 from app.admin import _get_user_project_with_role
@@ -127,11 +127,7 @@ async def create_acceptance_criterion(
         "criterion_key": criterion.criterion_key,
         "text": criterion.text,
         "evidence_contract": criterion.evidence_contract,
-        "evidence_contract_updated_at": (
-            criterion.evidence_contract_updated_at.isoformat()
-            if criterion.evidence_contract_updated_at
-            else None
-        ),
+        "evidence_contract_updated_at": utc_iso(criterion.evidence_contract_updated_at),
         "evidence_contract_updated_by": criterion.evidence_contract_updated_by,
         "release_version_id": str(open_version.id),
     }
@@ -180,11 +176,7 @@ async def update_acceptance_criterion_evidence_contract(
         "criterion_key": criterion.criterion_key,
         "text": criterion.text,
         "evidence_contract": criterion.evidence_contract,
-        "evidence_contract_updated_at": (
-            criterion.evidence_contract_updated_at.isoformat()
-            if criterion.evidence_contract_updated_at
-            else None
-        ),
+        "evidence_contract_updated_at": utc_iso(criterion.evidence_contract_updated_at),
         "evidence_contract_updated_by": criterion.evidence_contract_updated_by,
         "release_version_id": str(open_version.id),
     }

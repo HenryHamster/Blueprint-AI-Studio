@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
@@ -12160,7 +12160,12 @@ async def test_efficiency_snapshot_history_surface_returns_captures_with_provena
     for i, entry in enumerate(history):
         row = rows[i]
         # captured_at / metric_def_version come from the durable row columns.
-        assert entry["captured_at"] == row.captured_at.isoformat(), (
+        # The column holds naive UTC; the response re-stamps the zone so a
+        # consumer cannot read it as local time. Written out rather than
+        # calling the production helper, so this pins the format not the call.
+        assert entry["captured_at"] == row.captured_at.replace(
+            tzinfo=timezone.utc
+        ).isoformat(), (
             f"history entry {i} captured_at must come from the row column"
         )
         assert entry["metric_def_version"] == METRIC_DEF_VERSION, (

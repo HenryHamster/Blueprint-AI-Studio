@@ -82,7 +82,7 @@ def test_admin_message_dict_normalizes_enum_timestamp_and_empty_context():
     assert data["resolution"] == "Owned by direction d-1"
     assert data["created_at"] == "2026-01-01T03:04:05+00:00"
     assert data["resolved_at"] == "2026-01-02T03:04:05+00:00"
-    assert data["updated_at"] == msg.updated_at.isoformat()
+    assert data["updated_at"] == msg.updated_at.replace(tzinfo=timezone.utc).isoformat()
 
 
 def test_compatibility_wrappers_keep_existing_public_aliases():
@@ -126,7 +126,7 @@ def test_compatibility_wrappers_keep_existing_public_aliases():
     assert fetched["reply_to_message_id"] == str(reply_to)
     assert fetched["idempotency_key"] == "client-send-17"
     assert fetched["client_idempotency_key"] == "client-send-17"
-    assert fetched["updated_at"] == msg.updated_at.isoformat()
+    assert fetched["updated_at"] == msg.updated_at.replace(tzinfo=timezone.utc).isoformat()
     assert fetched["resolved_at"] == "2026-01-02T03:04:05+00:00"
     assert "context" not in fetched
     assert fetched["convergence_link"] == {"kind": "task", "id": "t-1"}

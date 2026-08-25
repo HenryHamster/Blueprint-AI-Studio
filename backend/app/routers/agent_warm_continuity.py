@@ -969,7 +969,7 @@ async def _finalize_warm_claim(
         # that second request returns the authoritative task projection instead
         # of rejecting the already-IN_PROGRESS task.
         ctx[_CLAIM_REPLAY_CONTEXT_KEY] = {
-            "claimed_at": task.last_heartbeat.isoformat(),
+            "claimed_at": task.last_heartbeat.isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             "token_jti": token_jti,
         }
         task.context = ctx

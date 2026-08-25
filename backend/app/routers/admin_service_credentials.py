@@ -21,6 +21,7 @@ from app.auth import require_admin
 from app.database import get_session
 from app.models import Project, ProjectMember, ServiceCredential, _utcnow
 from app.service_credentials import SCOPE_DEFINITIONS, hash_service_token, mint_service_token
+from app.time_utils import utc_iso
 
 router = APIRouter(
     prefix="/api/admin",
@@ -90,11 +91,11 @@ def _credential_public_dict(cred: ServiceCredential) -> dict:
         "principal_user_id": cred.principal_user_id,
         "token_prefix": cred.token_prefix,
         "scopes": cred.scopes,
-        "expires_at": cred.expires_at.isoformat() if cred.expires_at else None,
-        "revoked_at": cred.revoked_at.isoformat() if cred.revoked_at else None,
+        "expires_at": utc_iso(cred.expires_at),
+        "revoked_at": utc_iso(cred.revoked_at),
         "created_by": cred.created_by,
-        "created_at": cred.created_at.isoformat() if cred.created_at else None,
-        "last_used_at": cred.last_used_at.isoformat() if cred.last_used_at else None,
+        "created_at": utc_iso(cred.created_at),
+        "last_used_at": utc_iso(cred.last_used_at),
         "last_used_path": cred.last_used_path,
     }
 

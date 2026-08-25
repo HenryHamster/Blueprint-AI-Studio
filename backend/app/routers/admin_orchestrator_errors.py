@@ -16,6 +16,7 @@ from sqlmodel import select
 from app.database import get_session
 from app.models import OrchestratorErrorAck, _utcnow
 from app.auth import get_current_user, require_admin
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -167,8 +168,8 @@ def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
                 if source_line
                 else source_file,
                 "count": 1,
-                "first_seen_iso": ts.isoformat(),
-                "last_seen_iso": ts.isoformat(),
+                "first_seen_iso": utc_iso(ts),
+                "last_seen_iso": utc_iso(ts),
                 "sample_message": sample,
             }
             continue

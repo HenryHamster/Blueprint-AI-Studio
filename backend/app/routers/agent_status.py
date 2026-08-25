@@ -102,7 +102,7 @@ from app.acceptance_gate import check_required_diff_paths
 from app.acceptance_gate import record_artifact_consumptions_for_task
 from app.acceptance_gate import stamp_changed_files_signal
 from app.acceptance_gate import stamp_premerge_acceptance_finding
-from app.time_utils import _utcnow, exponential_backoff, set_retry_after
+from app.time_utils import _utcnow, exponential_backoff, set_retry_after, utc_iso
 from app.agent_status_spawn import (
     _recover_poisoned_session,
     maybe_spawn_smoketest_fix,
@@ -2636,7 +2636,7 @@ async def update_agent_status(
                                     "effective": fallback_model,
                                     "provider": provider_name,
                                     "reason": "provider_model_config_rejection",
-                                    "at": _utcnow().isoformat(),
+                                    "at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                                 }
                                 ctx.pop("_api_failure_retries", None)
                                 task.retry_after_until = (
@@ -2874,9 +2874,9 @@ async def update_agent_status(
                             )
                             ctx["blacklisted_accounts"] = park_blacklisted
                             ctx["parked_for_retarget"] = True
-                            ctx["park_deadline"] = park_deadline.isoformat()
+                            ctx["park_deadline"] = park_deadline.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                             ctx["warm_target_vm_id"] = old_vm_id_rl
-                            ctx["warm_handoff_deadline"] = park_deadline.isoformat()
+                            ctx["warm_handoff_deadline"] = park_deadline.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                             pr_number = _task_pr_number(task)
                             if pr_number is not None:
                                 ctx["warm_target_pr"] = pr_number
@@ -2902,8 +2902,8 @@ async def update_agent_status(
                             return {
                                 "status": "accepted",
                                 "action": "park",
-                                "retry_after_until": retry_after_deadline.isoformat(),
-                                "park_deadline": park_deadline.isoformat(),
+                                "retry_after_until": utc_iso(retry_after_deadline),
+                                "park_deadline": utc_iso(park_deadline),
                             }
 
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -4056,7 +4056,7 @@ async def update_agent_status(
                     ctx["orphaned_push"] = {
                         "branch": payload.pushed_branch,
                         "head_sha": payload.pushed_head_sha,
-                        "recorded_at": _utcnow().isoformat(),
+                        "recorded_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     }
                     task.context = ctx
                     flag_modified(task, "context")
@@ -4804,7 +4804,7 @@ async def update_agent_status(
             task.context = {
                 **(task.context or {}),
                 "_post_commit_pending_meta": {
-                    "at": _utcnow().isoformat(),
+                    "at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     "generation_token": uuid.uuid4().hex,
                     "reason": "inline_running",
                     "payload": _payload_dump,

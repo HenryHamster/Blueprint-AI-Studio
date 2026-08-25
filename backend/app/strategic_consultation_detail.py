@@ -27,6 +27,7 @@ already refers to.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any, Mapping
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,7 +46,7 @@ from app.strategic_workday_mutation_rebind import (
     WORKDAY_OPERATION_LEDGER_CONTEXT_KEY,
     WORKDAY_OPERATION_LEDGER_LIMIT,
 )
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, utc_iso
 
 
 # Bounds. These are deliberately literal rather than derived from the writer
@@ -100,7 +101,9 @@ def _context(row: ProjectMessage | None) -> dict[str, Any]:
 
 
 def _iso(value: Any) -> str | None:
-    return value.isoformat() if hasattr(value, "isoformat") else None
+    if isinstance(value, datetime):
+        return utc_iso(value)
+    return value.isoformat() if hasattr(value, "isoformat") else None  # utc-iso-ok: non-datetime (date) value -- no zone applies
 
 
 def _bounded_text(value: Any, limit: int) -> dict[str, Any]:

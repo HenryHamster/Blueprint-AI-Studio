@@ -69,6 +69,7 @@ from app.source_ref_validation import (
     ground_design_doc_value,
     resolve_branch_verification_context,
 )
+from app.time_utils import utc_iso
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -185,7 +186,7 @@ async def _claim_agent_compute_image_build_request(
     requested_at = _utc_iso()
     lease_expires_at = (
         datetime.now(timezone.utc) + _COMPUTE_IMAGE_BUILD_LEASE
-    ).isoformat()
+    ).isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     state: dict[str, Any] = {
         "request_id": request_id,
         "status": "requested",
@@ -285,7 +286,7 @@ async def _renew_agent_compute_image_build_lease(
             state = dict(previous)
             state["lease_expires_at"] = (
                 datetime.now(timezone.utc) + _COMPUTE_IMAGE_BUILD_LEASE
-            ).isoformat()
+            ).isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
             renewed = await compare_and_set_project_telemetry_request(
                 state_session,
                 project_id,
@@ -596,7 +597,9 @@ async def _apply_agent_compute_image_build_state(
 
 
 def _iso(dt: Any) -> str | None:
-    return dt.isoformat() if dt else None
+    if isinstance(dt, datetime):
+        return utc_iso(dt)
+    return dt.isoformat() if dt else None  # utc-iso-ok: non-datetime (date) value -- no zone applies
 
 
 def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1917,7 +1920,7 @@ async def agent_fetch_qualification(
             rubric_redrive_count=int(_lq.get("rubric_redrive_count") or 0),
             last_attempt=_lq if _lq else None,
             knob=get_auto_qualification_triggers_mode(),
-            evaluated_at=_utcnow().isoformat(),
+            evaluated_at=utc_iso(_utcnow()),
         )
     except Exception:
         logger.exception(
@@ -1986,16 +1989,10 @@ async def agent_fetch_qualification(
         )
         if source_disagreement is not None:
             resolved_status = status_verdict.terminal_status
-            resolved_finalized_at = (
-                status_verdict.finalized_at.isoformat()
-                if status_verdict.finalized_at
-                else None
-            )
+            resolved_finalized_at = utc_iso(status_verdict.finalized_at)
         else:
             resolved_status = lq_status or verdict.terminal_status
-            resolved_finalized_at = lq.get("finalized_at") or (
-                verdict.finalized_at.isoformat() if verdict.finalized_at else None
-            )
+            resolved_finalized_at = lq.get("finalized_at") or utc_iso(verdict.finalized_at)
 
         out = {
             "candidate_sha": lq.get("candidate_sha") or verdict.candidate_sha,
@@ -2505,7 +2502,7 @@ async def agent_fetch_efficiency_snapshot(
     history = [
         {
             **_efficiency_blob_without_per_task(row.blob),
-            "captured_at": row.captured_at.isoformat(),
+            "captured_at": utc_iso(row.captured_at),
             "metric_def_version": row.metric_def_version,
         }
         for row in reversed(
@@ -2825,7 +2822,7 @@ async def agent_fetch_payload_section(
             await session.commit()
         data = _build_retired_directions_summary(project)
     elif section_name == "rejected_proposals":
-        cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+        cutoff = (_utcnow() - timedelta(days=30)).isoformat()  # utc-iso-ok: lexicographic bound compared against stored naive ISO strings; an offset here would break the comparison
         rows = [
             {
                 "text": (d.get("text") or "")[:300],
