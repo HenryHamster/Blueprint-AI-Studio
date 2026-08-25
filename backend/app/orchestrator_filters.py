@@ -2136,6 +2136,19 @@ async def filter_malformed_payloads(
     (not CANCELLED: this IS a platform kill and must stay visible in the failure
     feed) with MALFORMED_TASK_PAYLOAD and a message naming the exact field, and
     it does not touch ``attempt_count`` — there is no retry to budget for.
+
+    CALL SITE. Unlike its neighbours in this module, this is NOT a pre-ranking
+    bulk pass. The orchestrator calls it from inside the per-task dispatch loop
+    with a single locked task, at the point where every reversible gate has
+    already declined to defer and the only thing left is PLACEMENT. Its verdict
+    is terminal and MALFORMED_TASK_PAYLOAD sits outside INFRA_CLASSES, so the
+    reaper never resurrects it; running it ahead of the slot budget, the row
+    lock, the approval flag, the capability fence or the per-project
+    VM-cap/spend/budget deferral would convert "wait your turn" into
+    "permanently dead" and would judge every scanned candidate at once rather
+    than only the rows actually being placed. See the block comment at the call
+    site in orchestrator.py for the full rationale. It still runs before every
+    placement path, so the "zero VMs spent" guarantee is unchanged.
     """
     if not eligible_ids:
         return eligible_ids

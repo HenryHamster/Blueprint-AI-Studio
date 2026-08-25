@@ -10,6 +10,7 @@ Tests three areas:
 import os
 
 import asyncio
+import itertools
 import pytest
 import json
 import uuid
@@ -37,6 +38,38 @@ from app.models import Project, Task, TaskStatus, MaxPlanAccount
 from testing.factories import make_project, make_task
 
 _TEST_USER = "test-user-123"
+
+# ── Runner-entry contract for dispatch scaffolding ───────────────────────────
+# The orchestrator refuses to PLACE a `fix`/`review` task whose payload cannot
+# clear the agent's entry checks (#17936): `handleFix` throws
+# `branch is required` / `Invalid pr_number` on its first line of real work
+# (agent/src/handlers/review-fix.ts), so such a task provisions a VM only to
+# die. Production never produces one -- every fix/review spawn site
+# (auto_review, review_pipeline x3, warm_pool_maintainer) sets branch,
+# pr_number and prompt.
+#
+# The dispatch-pipeline tests below are about PLACEMENT -- VM caps, zone
+# gating, warm-pin continuity, pool leases, execution resources -- and treat
+# the payload as inert scaffolding. Scaffolding that omits these fields is
+# asserting that a task which can never run gets placed anyway, so it must
+# carry them. Nothing in these tests asserts on either value; they exist only
+# to make the fixture a task production could actually have created.
+_DISPATCHABLE_BRANCH = "blueprint/task-dispatch"
+_dispatchable_pr_seq = itertools.count(4242)
+
+
+def _next_dispatchable_pr() -> int:
+    """A DISTINCT PR number per scaffolded fix/review payload.
+
+    ``filter_pipeline_duplicates`` groups active pipeline tasks by
+    ``(project_id, pr_number, task_type)`` and CANCELS every loser but one, so
+    two scaffolded ``fix`` tasks sharing a PR number inside one project are a
+    duplicate pair by production's own definition -- the thing spawn-time dedup
+    exists to guarantee never happens. Handing out a fresh number keeps every
+    fixture a task production could have created. Nothing asserts on the value.
+    """
+
+    return next(_dispatchable_pr_seq)
 
 
 async def _handle_research_completion(task, logs, session, **kwargs):
@@ -8744,7 +8777,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": target_vm,
                     "warm_target_pr": "1234",
@@ -8814,7 +8854,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": target_vm,
                     "warm_target_pr": "5555",
@@ -8889,7 +8936,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": target_vm,
                     "warm_target_pr": "9999",
@@ -8980,7 +9034,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": target_vm,
                     "warm_target_pr": "1234",
@@ -9436,7 +9497,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 title="fix(size): attribute merge cap breaches",
                 status=TaskStatus.COMPLETED,
-                payloads=[{"type": "fix", "prompt": "prereq"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "prereq",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
             )
             session.add(prereq)
             await session.commit()
@@ -9556,7 +9624,14 @@ class TestWarmVMSkipProvision:
         task = make_task(
             project_id=project.id,
             status=TaskStatus.EVALUATING,
-            payloads=[{"type": "review", "pr_number": 123, "base_branch": "release"}],
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 123,
+                    "base_branch": "release",
+                    "branch": _DISPATCHABLE_BRANCH,
+                }
+            ],
             context={
                 "review_loop": {
                     "pr_number": 123,
@@ -9694,7 +9769,14 @@ class TestWarmVMSkipProvision:
                 task = make_task(
                     project_id=project.id,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     retry_after_until=self._naive_utcnow()
                     + timedelta(minutes=5),
@@ -9795,7 +9877,14 @@ class TestWarmVMSkipProvision:
                     # the clear branch must reset it.
                     vm_instance_id=target_vm,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={
                         "warm_target_vm_id": target_vm,
                         "warm_handoff_deadline": deadline,
@@ -10019,7 +10108,14 @@ class TestWarmVMSkipProvision:
                 # agent_status stamps the held VM id onto vm_instance_id
                 vm_instance_id=parked_vm,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": parked_vm,
                     "warm_handoff_deadline": deadline,
@@ -10094,7 +10190,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=parked_vm,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": parked_vm,
                     "warm_handoff_deadline": expired,
@@ -10180,7 +10283,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     # Sticky blacklist must flow into excluded_account_ids.
                     context={"provision_failed_accounts": ["acct-dead"]},
                 )
@@ -10257,7 +10367,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -10322,7 +10439,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -10405,7 +10529,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -10487,7 +10618,14 @@ class TestWarmVMSkipProvision:
                     make_task(
                         project_id=capped.id,
                         status=TaskStatus.IN_PROGRESS,
-                        payloads=[{"type": "fix", "prompt": "active"}],
+                        payloads=[
+                            {
+                                "type": "fix",
+                                "prompt": "active",
+                                "branch": _DISPATCHABLE_BRANCH,
+                                "pr_number": _next_dispatchable_pr(),
+                            }
+                        ],
                         created_at=now - timedelta(minutes=10),
                     )
                 )
@@ -10495,7 +10633,14 @@ class TestWarmVMSkipProvision:
                     project_id=capped.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "wait",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     created_at=now - timedelta(minutes=5),
                 )
@@ -10503,7 +10648,14 @@ class TestWarmVMSkipProvision:
                     project_id=open_project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "dispatch"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "dispatch",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     created_at=now - timedelta(minutes=4),
                 )
@@ -10533,6 +10685,151 @@ class TestWarmVMSkipProvision:
             assert capped_row.status == TaskStatus.QUEUED
             assert "project VM capacity" in (capped_row.latest_status_message or "")
             assert open_row.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_malformed_payload_never_preempts_a_reversible_deferral(
+        self, orch_warm_db, mocker
+    ):
+        """ORDERING GUARD: a TERMINAL verdict must never outrank a REVERSIBLE one.
+
+        The malformed-payload gate (#17936) fails a task whose payload can never
+        clear the agent's entry checks. That verdict is terminal, and
+        ``MALFORMED_TASK_PAYLOAD`` sits outside ``INFRA_CLASSES``, so the
+        reaper's resurrection sweep can never bring the row back.
+
+        #17936 first ran that gate as a pre-ranking bulk filter -- ahead of the
+        slot budget, the row lock, the approval flag, the capability fence and
+        the per-project VM-cap / spend-ceiling / monthly-budget deferral, and
+        applied to every scanned candidate rather than only the rows actually
+        being placed. That ordering converts "wait your turn" into "permanently
+        dead", and lets one false positive in a hand-mirrored copy of the
+        agent's TypeScript entry checks terminalize a whole queue in one cycle.
+
+        Pinned directly here rather than as a side effect of some other test:
+        the SAME row must come out QUEUED while its project is at its VM cap,
+        and FAILED once the cap frees and the orchestrator genuinely tries to
+        place it. Both halves matter -- the second is what stops the gate from
+        being quietly neutered into a no-op."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+        from app.failure_classification import MALFORMED_TASK_PAYLOAD
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Capped With Malformed Queue",
+                    user_id=_TEST_USER,
+                    build_config={"resource_envelope": {"max_concurrent_vms": 1}},
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                now = self._naive_utcnow()
+                active = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.IN_PROGRESS,
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "holds the only slot",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
+                    created_at=now - timedelta(minutes=10),
+                )
+                # No branch, no pr_number: the exact shape the gate exists for.
+                malformed = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "unrunnable"}],
+                    context={},
+                    created_at=now - timedelta(minutes=5),
+                )
+                session.add_all([active, malformed])
+                await session.commit()
+                await session.refresh(active)
+                await session.refresh(malformed)
+                active_id = active.id
+                malformed_id = malformed.id
+
+            await self._run_one_cycle(mocker)
+
+            async with orch_warm_db() as verify:
+                row = (
+                    (await verify.execute(_select(Task).where(Task.id == malformed_id)))
+                    .scalars()
+                    .one()
+                )
+                assert row.status == TaskStatus.QUEUED, (
+                    "a malformed payload sitting behind a project VM cap must be "
+                    f"DEFERRED, not terminalized -- got {row.status}. The cap says "
+                    "'not now'; only the gate that runs when the task is actually "
+                    "being placed may say 'never'."
+                )
+                assert MALFORMED_TASK_PAYLOAD not in (
+                    row.latest_status_message or ""
+                ), (
+                    "the terminal verdict leaked into a cycle where the task was "
+                    f"never placed: {row.latest_status_message!r}"
+                )
+                assert "project VM capacity" in (row.latest_status_message or "")
+
+            # Free the cap: the same row is now genuinely next to be placed.
+            async with orch_warm_db() as session:
+                active_row = (
+                    (await session.execute(_select(Task).where(Task.id == active_id)))
+                    .scalars()
+                    .one()
+                )
+                active_row.status = TaskStatus.COMPLETED
+                session.add(active_row)
+                await session.commit()
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == malformed_id)))
+                .scalars()
+                .one()
+            )
+            assert row.status == TaskStatus.FAILED, (
+                "with the cap freed the orchestrator does try to place this row, so "
+                "a payload that can never clear the agent's entry checks must be "
+                f"failed BEFORE a VM is spent -- got {row.status}"
+            )
+            assert MALFORMED_TASK_PAYLOAD in (row.latest_status_message or "")
+            assert "branch is required" in (row.latest_status_message or "")
 
     @pytest.mark.asyncio
     async def test_resident_session_task_excluded_from_project_vm_cap(
@@ -10606,7 +10903,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "should dispatch"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "should dispatch",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     created_at=now - timedelta(minutes=5),
                 )
@@ -10689,7 +10993,14 @@ class TestWarmVMSkipProvision:
                     make_task(
                         project_id=project.id,
                         status=TaskStatus.IN_PROGRESS,
-                        payloads=[{"type": "fix", "prompt": "active"}],
+                        payloads=[
+                            {
+                                "type": "fix",
+                                "prompt": "active",
+                                "branch": _DISPATCHABLE_BRANCH,
+                                "pr_number": _next_dispatchable_pr(),
+                            }
+                        ],
                         context={},
                         created_at=now - timedelta(minutes=10),
                     )
@@ -10698,7 +11009,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "should stay queued"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "should stay queued",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     created_at=now - timedelta(minutes=5),
                 )
@@ -10779,7 +11097,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "wait",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(queued)
@@ -10854,7 +11179,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "wait",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(queued)
@@ -10921,7 +11253,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "dispatch"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "dispatch",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(queued)
@@ -10981,7 +11320,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -11082,7 +11428,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -11160,7 +11513,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -11248,7 +11608,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -14473,7 +14840,14 @@ class TestDispatchCrashContainment:
                 project_id=project.id,
                 status=TaskStatus.QUEUED,
                 vm_instance_id=None,
-                payloads=[{"type": "review", "prompt": "healthy review task"}],
+                payloads=[
+                    {
+                        "type": "review",
+                        "prompt": "healthy review task",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={"_dispatch_prep_failures": threshold - 1},
             )
             session.add(contended)
@@ -18067,7 +18441,14 @@ class TestZoneExhaustionColdProvisionGate:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={},
             )
             session.add(task)
@@ -18116,7 +18497,14 @@ class TestZoneExhaustionColdProvisionGate:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={},
             )
             session.add(task)
@@ -18183,7 +18571,14 @@ class TestZoneExhaustionColdProvisionGate:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={},
             )
             session.add(task)
