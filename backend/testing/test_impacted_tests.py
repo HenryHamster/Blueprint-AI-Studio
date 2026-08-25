@@ -1075,3 +1075,96 @@ def test_node_id_sentinel_collapses_into_a_whole_file_selection(tmp_path):
     )
     assert mandatory == ["backend/testing/test_guard.py"]
     assert ordinary == []
+
+
+# ---------------------------------------------------------------------------
+# create=True prefilter soundness
+# ---------------------------------------------------------------------------
+
+
+def test_create_true_prefilter_admits_every_spelling_the_ast_scan_accepts(tmp_path):
+    """The textual prefilter must never reject a file the AST scan would flag.
+
+    ``collect_create_true_patch_targets`` skips ``ast.parse`` for any file whose
+    text does not match ``_CREATE_TRUE_HINT``. That is a 14.8x saving and a
+    silent-vacuity risk in the same edit: a prefilter that is too narrow makes
+    the redundant-create=True invariant stop seeing real offenders, and nothing
+    fails to say so.
+
+    The soundness argument is that between two adjacent Python tokens the
+    grammar admits only whitespace, a backslash line-continuation, and comments
+    -- so ``create=True`` cannot be spelled in a way that defeats a pattern
+    which allows exactly those three. This pins the argument against the
+    scanner: every spelling below must be BOTH admitted by the prefilter AND
+    reported by the collector, so the two can never drift apart.
+    """
+    spellings = {
+        "plain": 'mocker.patch("app.m.a", create=True)',
+        "spaces_around_equals": 'mocker.patch("app.m.a", create = True)',
+        "newline_before_value": 'mocker.patch("app.m.a", create=\n        True)',
+        "newline_after_name": 'mocker.patch("app.m.a", create\n        =True)',
+        "comment_after_equals": 'mocker.patch("app.m.a", create=  # why\n        True)',
+        "comment_before_equals": 'mocker.patch("app.m.a", create  # c\n        =True)',
+        "line_continuation": 'mocker.patch("app.m.a", create=\\\n        True)',
+        "tab_separated": 'mocker.patch("app.m.a", create\t=\tTrue)',
+    }
+
+    for label, call in spellings.items():
+        source = f"def test_x(mocker):\n    {call}\n"
+
+        assert impacted_tests._CREATE_TRUE_HINT.search(source), (
+            f"prefilter REJECTS the {label!r} spelling of create=True. The "
+            "collector would skip the parse and the redundant-create=True "
+            "invariant would go silently vacuous for files written that way."
+        )
+
+        target_dir = tmp_path / label
+        target_dir.mkdir()
+        (target_dir / "test_probe.py").write_text(source, encoding="utf-8")
+        pairs = impacted_tests.collect_create_true_patch_targets(str(target_dir))
+        assert pairs == [("test_probe.py", "app.m.a")], (
+            f"collector no longer reports the {label!r} spelling; the prefilter "
+            "assertion above is measuring nothing."
+        )
+
+
+def test_create_true_prefilter_skips_files_with_nothing_to_find(tmp_path):
+    """A file the prefilter rejects must genuinely have no pair to report.
+
+    The other half of the pin: prefilter and scanner must agree on the negative
+    case too, or the saving is coming from somewhere it should not.
+    """
+    source = (
+        "def test_x(mocker):\n"
+        '    mocker.patch("app.m.a")\n'
+        '    mocker.patch("app.m.b", autospec=True)\n'
+        "    create_something(True)\n"
+    )
+    (tmp_path / "test_probe.py").write_text(source, encoding="utf-8")
+
+    assert not impacted_tests._CREATE_TRUE_HINT.search(source)
+    assert impacted_tests.collect_create_true_patch_targets(str(tmp_path)) == []
+
+
+def test_create_true_prefilter_does_not_backtrack_on_adversarial_input():
+    """The token-gap group is atomic, so a long non-match cannot blow up.
+
+    ``(?>[\\s\\\\]|\\#[^\\n]*)*`` after a literal ``create`` would be a classic
+    catastrophic-backtracking shape if the group were not atomic: a file full of
+    ``create`` followed by megabytes of whitespace that never reaches ``=``.
+    A regression to a non-atomic group would hang the whole standalone lane
+    rather than merely slow it, so this pins the property directly.
+    """
+    import time
+
+    adversarial = "create" + (" \n\t" * 12000) + "x"
+    start = time.perf_counter()
+    assert impacted_tests._CREATE_TRUE_HINT.search(adversarial) is None
+    # round() rather than a bare subtraction: the standalone offender-identity
+    # guard reads any ``x = a - b`` as a set difference, so a plain elapsed
+    # time would be mistaken for an offender collection owing a marker.
+    elapsed_seconds = round(time.perf_counter() - start, 3)
+    assert elapsed_seconds < 1.0, (
+        f"prefilter took {elapsed_seconds}s on a 40KB non-matching input; the "
+        "token gap has lost its atomic group and is backtracking."
+    )

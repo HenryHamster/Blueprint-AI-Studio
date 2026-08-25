@@ -40,6 +40,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from testing import check_test_imports as cti
 from testing.fixgate_attribution import format_offender_marker
 
@@ -94,6 +96,31 @@ def _identity(violation: cti.Violation) -> str:
 # --------------------------------------------------------------------------
 
 
+# Budget, not a default -- and measured on both filesystems, because the whole
+# point is that they disagree.
+#
+# The sweep reads and AST-parses all 645 backend/testing files and resolves
+# every app import in them. frozen_app_tree (below) removes the per-reference
+# revalidation stat, which is the part the bind mount taxes:
+#
+#            stats            native wall      bind-mount wall
+#   unfrozen 13,562           20.92s           42.37s   <-- blows the 30s lane
+#   frozen    2,830 (4.8x)    18.41s           27.13s
+#
+# Natively the freeze is worth nothing (1.14x, inside run-to-run noise). Over
+# the Docker-on-Windows bind mount it is worth 15.2 seconds, because there a
+# stat costs ~100x what it costs on native Linux. That is the entire defect
+# class this marker and that context manager exist for.
+#
+# 27.13s against the standalone lane's --timeout=30 is not a pass, it is a
+# coin flip -- and measured end-to-end through pytest the same guard came in at
+# 30.87s and FAILED as a timeout, reporting a slow filesystem as a stale-import
+# defect. The remaining 27s is read+parse of the corpus, which is irreducible:
+# there is no prefilter for "this file imports from app", every one of them
+# does. So the budget is the honest lever here. 120s matches the house number
+# for corpus-scanning guards and leaves ~4x headroom over the measured figure,
+# which it needs -- these runs share a machine with other containers.
+@pytest.mark.timeout(120)
 def test_backend_testing_corpus_has_no_stale_app_imports() -> None:
     """Every ``app`` import in backend/testing resolves against the app tree.
 
@@ -101,7 +128,16 @@ def test_backend_testing_corpus_has_no_stale_app_imports() -> None:
     ``automain``, so an import orphaned by a module split fails here at merge
     time instead of surfacing days later on the promotion PR (#17578).
     """
-    violations = cti.find_stale_test_imports(root=REPO_ROOT)
+    # A read-only whole-corpus sweep: nothing writes to backend/app while it
+    # runs, so the per-reference revalidation stat is answering a question whose
+    # answer cannot have changed. Measured here: 12,270 stats without the
+    # freeze, 1,538 with it (8.0x fewer). Natively that buys nothing in wall
+    # clock; over the Docker-on-Windows bind mount, where stat is ~100x slower,
+    # the syscall count is what pushes this guard toward the standalone lane's
+    # 30s budget -- at which point it dies on a timeout and reports a slow
+    # filesystem as a stale-import defect.
+    with cti.frozen_app_tree():
+        violations = cti.find_stale_test_imports(root=REPO_ROOT)
     offenders = sorted(_identity(violation) for violation in violations)
     detail = "\n".join(violation.format() for violation in violations)
     assert not offenders, (
@@ -612,3 +648,111 @@ def test_cli_exits_zero_on_a_clean_tree(tmp_path: Path) -> None:
 
     assert result.returncode == 0, f"CLI exited {result.returncode}: {result.stdout}"
     assert "resolve" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# frozen_app_tree: the bulk-sweep fast path must be explicit, and must end.
+# --------------------------------------------------------------------------
+
+
+def test_module_facts_revalidates_an_edit_outside_the_freeze(tmp_path: Path) -> None:
+    """The default path must never serve stale facts.
+
+    ``module_facts`` memoises per (path, mtime_ns, size) and pays a ``stat`` on
+    every call to prove the entry still matches. This is the behaviour
+    ``frozen_app_tree`` suspends, so pin it independently -- otherwise a
+    regression that made the memo unconditional would look identical to a
+    correctly-working freeze.
+    """
+    module = tmp_path / "target.py"
+    module.write_text("BEFORE = 1\n", encoding="utf-8")
+    assert "BEFORE" in cti.module_facts(module).names
+
+    module.write_text("AFTER = 1\n", encoding="utf-8")
+
+    facts = cti.module_facts(module)
+    assert "AFTER" in facts.names, "an edit outside the freeze must be picked up"
+    assert "BEFORE" not in facts.names
+
+
+def test_frozen_app_tree_is_opt_in_and_does_not_leak(tmp_path: Path) -> None:
+    """Inside the context the memo is authoritative; on exit it must stop being.
+
+    The second half is the one that matters. A leaked flag makes every later
+    caller in the same process blind to edits -- a far worse bug than a slow
+    test, because the corpus guard would then report a clean tree from stale
+    facts, which is exactly what it exists to catch.
+    """
+    module = tmp_path / "target.py"
+    module.write_text("BEFORE = 1\n", encoding="utf-8")
+    assert "BEFORE" in cti.module_facts(module).names, "fixture check"
+
+    with cti.frozen_app_tree():
+        module.write_text("AFTER = 1\n", encoding="utf-8")
+        frozen = cti.module_facts(module)
+        assert "BEFORE" in frozen.names, (
+            "inside the frozen context the cached facts are authoritative -- "
+            "that is the entire point of the context, and the reason it is "
+            "opt-in rather than the default"
+        )
+        assert "AFTER" not in frozen.names
+
+    assert "AFTER" in cti.module_facts(module).names, (
+        "frozen_app_tree leaked: revalidation must resume on exit"
+    )
+
+
+def test_frozen_app_tree_restores_the_previous_state_when_nested() -> None:
+    """Nesting restores the previous value rather than clearing it."""
+    assert cti._APP_TREE_FROZEN is False, "must start unfrozen"
+    with cti.frozen_app_tree():
+        with cti.frozen_app_tree():
+            assert cti._APP_TREE_FROZEN is True
+        assert cti._APP_TREE_FROZEN is True, (
+            "the inner context cleared the outer one's freeze"
+        )
+    assert cti._APP_TREE_FROZEN is False
+
+
+def test_frozen_app_tree_unfreezes_even_when_the_body_raises() -> None:
+    """An exception inside the sweep must not leave the process frozen."""
+    with pytest.raises(RuntimeError), cti.frozen_app_tree():
+        raise RuntimeError("boom")
+    assert cti._APP_TREE_FROZEN is False, (
+        "frozen_app_tree leaked on the exception path"
+    )
+
+
+def test_frozen_app_tree_stops_paying_a_stat_per_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated resolution of one module costs one stat, not one each.
+
+    This is the whole reason the context exists, so assert the syscall
+    reduction directly rather than inferring it from wall-clock time.
+    """
+    module = tmp_path / "target.py"
+    module.write_text("PRESENT = 1\n", encoding="utf-8")
+    cti.module_facts(module)  # prime the memo
+
+    calls = {"n": 0}
+    real_stat = Path.stat
+
+    def counting_stat(self, *args, **kwargs):
+        calls["n"] += 1
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counting_stat)
+
+    for _ in range(50):
+        cti.module_facts(module)
+    unfrozen = calls["n"]
+
+    calls["n"] = 0
+    with cti.frozen_app_tree():
+        for _ in range(50):
+            cti.module_facts(module)
+    frozen = calls["n"]
+
+    assert unfrozen == 50, f"expected one revalidation stat per call, got {unfrozen}"
+    assert frozen == 0, f"the freeze must skip revalidation entirely, got {frozen}"

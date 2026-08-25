@@ -47,6 +47,7 @@ Safe to run standalone (``pytest --standalone --no-postgres``): no DB imports.
 from __future__ import annotations
 
 import ast
+import os
 import re
 import subprocess
 import textwrap
@@ -335,6 +336,46 @@ _EXCLUDE_RE = re.compile(
     r"|[/\\]test_audit_finding_class_guards\.py$"  # this file references the term in comments
 )
 
+# Directory names never descended into. Every one of these is already excluded
+# by ``_EXCLUDE_RE`` above, so pruning changes no result -- it only stops the
+# walk from enumerating and stat-ing a subtree whose every entry it would then
+# throw away. ``node_modules`` is the expensive one: the scan below used to
+# spend an ``is_file()`` stat on each of its ~200k entries *before* consulting
+# the exclusion, which is the same defect PR #17853 fixed in the Vitest
+# inventory walk.
+#
+# ``alembic/versions`` is deliberately NOT here: it needs both path components
+# to match, and pruning a bare ``versions`` directory would over-exclude. It
+# stays with the regex, where it costs nothing.
+#
+# Kept a strict subset of ``_EXCLUDE_RE`` by
+# ``test_pruned_directories_are_all_already_excluded``, so the two cannot drift
+# into the walk silently skipping a tree the guard is supposed to cover.
+_PRUNED_DIR_NAMES = frozenset(
+    {".git", "node_modules", "__pycache__", ".venv", "build", "dist", "coverage"}
+)
+
+
+def _iter_scannable_files(search_dir: Path):
+    """Yield candidate files under *search_dir*, skipping excluded subtrees.
+
+    ``os.walk`` rather than ``rglob("*")`` for two reasons, both cost:
+
+    * it separates directories from files without a ``stat`` per entry, where
+      ``Path.is_file()`` is a syscall each time; and
+    * pruning ``dirnames`` in place stops the descent at the top of an excluded
+      subtree instead of walking all of it and rejecting entry by entry.
+
+    The suffix test is pure string work and is applied before anything touches
+    the filesystem.
+    """
+    for dirpath, dirnames, filenames in os.walk(search_dir):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNED_DIR_NAMES]
+        for filename in filenames:
+            if os.path.splitext(filename)[1] not in _CODE_EXTENSIONS:
+                continue
+            yield Path(dirpath) / filename
+
 # Column name dropped in migration 0351
 _DROPPED_COLUMN = "theme" + "_delivery"  # split to avoid self-match
 
@@ -416,11 +457,7 @@ class TestDroppedColumnResidualAbsent:
 
         for search_dir in _resolve_search_dirs():
             checked_dirs.append(search_dir)
-            for path in search_dir.rglob("*"):
-                if not path.is_file():
-                    continue
-                if path.suffix not in _CODE_EXTENSIONS:
-                    continue
+            for path in _iter_scannable_files(search_dir):
                 path_str = str(path)
                 if _EXCLUDE_RE.search(path_str):
                     continue
@@ -453,6 +490,54 @@ class TestDroppedColumnResidualAbsent:
             "Files containing the dropped column name:\n"
             + "\n".join(f"  - {h}" for h in sorted(hits)) + "\n" + format_offender_marker(str(offender) for offender in hits)
         )
+
+    def test_pruned_directories_are_all_already_excluded(self):
+        """Pruning must never remove a tree the guard is supposed to search.
+
+        ``_iter_scannable_files`` stops descending at ``_PRUNED_DIR_NAMES`` for
+        speed. That is only sound while every pruned name is one ``_EXCLUDE_RE``
+        would have rejected anyway — otherwise the walk silently stops covering a
+        tree and the guard reports "no residual references" because it never
+        looked, which is indistinguishable from a pass.
+
+        The two lists are separate declarations and can drift, so assert the
+        implication directly rather than trusting adjacency.
+        """
+        for name in _PRUNED_DIR_NAMES:
+            probe = f"/repo/admin-ui/{name}/some_file.py"
+            assert _EXCLUDE_RE.search(probe), (
+                f"'{name}' is pruned from the walk but _EXCLUDE_RE does not "
+                f"exclude it — pruning it drops files the guard must scan. "
+                f"Either remove it from _PRUNED_DIR_NAMES or add it to "
+                f"_EXCLUDE_RE."
+            )
+
+        assert "node_modules" in _PRUNED_DIR_NAMES, (
+            "node_modules must stay pruned. Re-admitting it restores the ~200k "
+            "wasted stat calls that made this guard fail as a 30s timeout on the "
+            "Docker-on-Windows bind mount instead of on its assertion."
+        )
+
+    def test_scan_skips_pruned_subtrees_but_still_finds_real_files(self, tmp_path):
+        """The walk must ignore an excluded subtree and still collect its peers.
+
+        A decoy under ``node_modules`` proves the prune is live; the sibling
+        proves the prune did not take the whole tree with it.
+        """
+        (tmp_path / "app").mkdir()
+        real = tmp_path / "app" / "real.py"
+        real.write_text("x = 1", encoding="utf-8")
+
+        decoy_dir = tmp_path / "node_modules" / "pkg"
+        decoy_dir.mkdir(parents=True)
+        (decoy_dir / "decoy.py").write_text("x = 1", encoding="utf-8")
+
+        (tmp_path / "app" / "notes.rst").write_text("x", encoding="utf-8")
+
+        found = {p.name for p in _iter_scannable_files(tmp_path)}
+        assert "real.py" in found
+        assert "decoy.py" not in found, "node_modules subtree was descended into"
+        assert "notes.rst" not in found, "extension filter stopped applying"
 
 
 # ---------------------------------------------------------------------------

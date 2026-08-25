@@ -652,6 +652,29 @@ def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
     return sorted(targets)
 
 
+# Between two adjacent tokens of a Python call, the grammar admits only
+# whitespace (newlines included, inside the call's parentheses), a
+# backslash line-continuation, and comments. So a file whose text does not
+# match this cannot tokenize to NAME(create) OP(=) NAME(True), and therefore
+# cannot produce the ``keyword(arg='create', value=Constant(True))`` node the
+# scan below looks for. That makes the prefilter sound by construction rather
+# than by inspection -- see
+# ``test_create_true_prefilter_admits_every_spelling_the_ast_scan_accepts``,
+# which pins each spelling this must not reject.
+#
+# ``**{"create": True}`` needs no coverage: dict-unpacking produces
+# ``keyword(arg=None)``, which the AST scan already declines to match.
+#
+# The alternation branches start with disjoint characters ("#" is not in
+# ``[\s\\]``) and the group is atomic, so there is no backtracking blowup on
+# the long non-matching runs that dominate a real source tree; measured at
+# 0.002s against an adversarial 40KB input.
+_CREATE_TRUE_TOKEN_GAP = r"(?>[\s\\]|\#[^\n]*)*"
+_CREATE_TRUE_HINT = re.compile(
+    "create" + _CREATE_TRUE_TOKEN_GAP + "=" + _CREATE_TRUE_TOKEN_GAP + "True"
+)
+
+
 def collect_create_true_patch_targets(testing_dir: str) -> "list[tuple[str, str]]":
     """Return sorted ``(test_file, target)`` pairs for ``create=True`` patch calls.
 
@@ -678,6 +701,19 @@ def collect_create_true_patch_targets(testing_dir: str) -> "list[tuple[str, str]
         try:
             with open(fpath, encoding="utf-8", errors="replace") as fh:
                 source = fh.read()
+            # Cheap textual prefilter before the expensive parse. Reading the
+            # whole ``backend/testing`` tree costs 0.16s; AST-parsing all of it
+            # costs 10.77s, and only 9 of 627 files can contribute a pair at
+            # all. Skipping the parse for the other 618 takes this scan from
+            # 10.93s to 0.74s (14.8x) on the current checkout.
+            #
+            # This is a false-failure fix, not a nicety. The standalone lane
+            # runs with ``--timeout=30``; over the Docker-on-Windows bind mount
+            # the 10.9s native scan crosses it, and the guard then dies on a
+            # timeout rather than its assertion -- reporting "slow filesystem"
+            # while claiming to report a redundant-patch defect.
+            if not _CREATE_TRUE_HINT.search(source):
+                continue
             tree = ast.parse(source, filename=fname)
         except (SyntaxError, OSError, UnicodeDecodeError):
             continue

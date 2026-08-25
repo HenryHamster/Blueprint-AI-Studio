@@ -3729,6 +3729,28 @@ class TestPreMergeDualHeadGuardCoverage:
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
         guard_names = self._GUARD_NAMES
         merge_names = self._MERGE_NAMES
+        # Only a file that literally spells one of the merge identifiers can
+        # produce an offender: ``_collect_offenders`` appends only for calls
+        # whose ``_called_name`` is in ``merge_names``, and ``_called_name``
+        # reads ``ast.Name.id`` / ``ast.Attribute.attr`` -- a Python identifier,
+        # which the grammar forbids splitting across whitespace, comments or a
+        # backslash continuation. So "identifier absent from the text" implies
+        # "no such call node", and the prefilter is sound by construction rather
+        # than merely adequate in practice. (A dynamic ``getattr(m, "merge_" +
+        # "pull_request")()`` is invisible to the AST scan with or without it.)
+        #
+        # Derived from the authoritative frozensets, never hardcoded, so adding
+        # a name to either set widens the prefilter in the same edit;
+        # ``test_merge_site_scan_prefilter_cannot_narrow_the_scan`` pins that.
+        # The authority names are not offender-producing today -- including them
+        # is deliberately conservative.
+        #
+        # Measured over backend/app: 565 files / 23.2MB, of which 15 (3%,
+        # 1.35MB) contain any merge identifier. Whole scan 10.77s -> 0.67s,
+        # 16.0x, byte-identical offender list. The cost is per-file
+        # ``ast.parse`` plus a whole-tree ``parent_by_node`` map, so skipping
+        # 97% of the files skips essentially all of the work.
+        scan_hint_names = self._MERGE_NAMES | self._MERGE_AUTHORITY_NAMES
         offenders: list[str] = []
         for root, _dirs, files in os.walk(app_dir):
             for fname in sorted(files):
@@ -3739,6 +3761,8 @@ class TestPreMergeDualHeadGuardCoverage:
                 fpath = os.path.join(root, fname)
                 with open(fpath, encoding="utf-8") as f:
                     source = f.read()
+                if not any(name in source for name in scan_hint_names):
+                    continue
                 rel = os.path.relpath(fpath, app_dir)
                 offenders.extend(
                     self._collect_offenders(
@@ -3764,6 +3788,68 @@ class TestPreMergeDualHeadGuardCoverage:
             "TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES with a documented "
             "reason.\n"
             "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
+        )
+
+    def test_merge_site_scan_prefilter_cannot_narrow_the_scan(self):
+        """The text prefilter admits every source the AST scan could flag.
+
+        ``test_all_pr_merge_sites_guarded`` skips any app file whose text
+        contains none of ``_MERGE_NAMES | _MERGE_AUTHORITY_NAMES``. That is only
+        safe while the prefilter is a superset of the names the scan can flag
+        on, and the failure mode is silent -- a narrowed prefilter turns the
+        guard vacuous for the newly-added name without failing anything.
+
+        So this pins it behaviourally rather than by restating the constant:
+        for every flaggable name, an unguarded merge site written with that name
+        must be both admitted by the prefilter AND reported by the scanner.
+        Adding a name to ``_MERGE_NAMES`` and forgetting the prefilter fails
+        here.
+        """
+        import textwrap
+
+        scan_hint_names = self._MERGE_NAMES | self._MERGE_AUTHORITY_NAMES
+        assert scan_hint_names >= self._MERGE_NAMES
+
+        for name in sorted(self._MERGE_NAMES):
+            source = textwrap.dedent(
+                f"""
+                async def _unguarded_merge_site(client):
+                    await {name}(client, expected_head_sha=None)
+                """
+            )
+            assert any(hint in source for hint in scan_hint_names), (
+                f"prefilter would SKIP a file containing a {name}() merge site, "
+                "making the dual-head guard silently vacuous for that name. Add "
+                "the name to _MERGE_NAMES/_MERGE_AUTHORITY_NAMES so the derived "
+                "prefilter picks it up."
+            )
+            offenders = self._collect_offenders(
+                source,
+                filename="probe.py",
+                rel="probe.py",
+                guard_names=self._GUARD_NAMES,
+                merge_names=self._MERGE_NAMES,
+            )
+            assert offenders, (
+                f"scanner no longer flags an unguarded {name}() site; the "
+                "prefilter pin above is measuring nothing."
+            )
+
+        # A file with no merge identifier is skipped, and genuinely has nothing
+        # to report -- the two must agree, or the prefilter is hiding offenders.
+        benign = textwrap.dedent(
+            """
+            async def _no_merge_here(client):
+                await client.get("/x")
+            """
+        )
+        assert not any(hint in benign for hint in scan_hint_names)
+        assert not self._collect_offenders(
+            benign,
+            filename="probe.py",
+            rel="probe.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
         )
 
     def test_premerge_helper_whole_function_exemptions_are_not_blanket_trust_zones(
@@ -11661,6 +11747,21 @@ def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] |
                 names.add(alias.asname if alias.asname else alias.name)
     return names
 
+# Budget, not a default: this guard tokenises all 627 backend/testing/*.py
+# (37.1MB). Measured on this host it is 12.34s, and the work is irreducible --
+# the scanner already skips any file without "app." in its text, already
+# memoises the whole scan (_iter_app_patch_target_sites is @cache-d, so the
+# vacuous-mock guard below reuses it for free), and already memoises the app
+# module parses. What is left is one tokenize pass over the corpus.
+#
+# The standalone lane runs with --timeout=30 sized on a native Linux
+# filesystem. Over the Docker-on-Windows bind mount the same work is ~2.3x
+# slower (~28s), so the guard was landing on the wrong side of its budget and
+# failing as a TIMEOUT -- reporting a slow filesystem as a stale-patch-target
+# defect. 120s matches the house budget for corpus-scanning guards
+# (test_websocket_emitter_inventory, test_patched_app_symbols_have_production_
+# call_sites at 90s) and leaves ~4x headroom over the bind-mount figure.
+@pytest.mark.timeout(120)
 def test_string_patch_targets_resolve():
     """Every app.* string patch target in backend/testing/*.py must resolve to
     an existing top-level name in its module.
@@ -12921,6 +13022,23 @@ def test_orchestrator_health_vocab_guard_catches_injected_fake_type():
         "The standing vocab check would silently pass on real drift."
     )
 
+# Budget, not a default: collect_first_party_patch_targets AST-parses all 627
+# backend/testing/test_*.py (37.1MB) to recover 970 patch targets. Measured on
+# this host: 16.24s for the test, of which ast.parse is 11.03s of 11.67s
+# (94.5%) -- the read is 0.12s and the ast.walk only 2.47s, and an
+# ast.NodeVisitor is no faster (2.75s), so there is no traversal win to take.
+#
+# A textual prefilter was measured and rejected rather than skipped: the only
+# prefilter that is sound by construction here is the identifier "patch"
+# (a string-constant prefilter like "app." is defeated by implicit literal
+# concatenation), and 92% of the corpus bytes live in files containing it --
+# a 1.09x saving. Even the unsound "app. in a string" variant only reaches
+# 1.19x. The parse is the cost and the parse is required.
+#
+# So this is the case the sweep raises a budget for. See the note on
+# test_string_patch_targets_resolve above for why 30s is the wrong number over
+# the bind mount and why 120s is the right one.
+@pytest.mark.timeout(120)
 def test_mock_patch_targets_resolve():
     """Every first-party mock.patch() string target in the test suite must resolve.
 

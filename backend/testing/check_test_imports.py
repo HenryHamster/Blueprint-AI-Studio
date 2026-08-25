@@ -58,8 +58,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import json
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -243,13 +245,64 @@ def _module_facts_cached(path_str: str, _mtime_ns: int, _size: int) -> ModuleFac
     return ModuleFacts(frozenset(names), opaque_reason)
 
 
+_APP_TREE_FROZEN = False
+_MODULE_FACTS_BY_PATH: dict[str, ModuleFacts] = {}
+
+
+@contextlib.contextmanager
+def frozen_app_tree() -> Iterator[None]:
+    """Treat the ``backend/app`` tree as immutable for the duration.
+
+    Outside this context every ``module_facts`` cache hit still pays a ``stat``
+    to prove the module has not changed underneath it. That is the right
+    default -- this module's own fixtures write, rewrite and delete app modules
+    in-process, and
+    ``test_module_facts_revalidates_an_edit_outside_the_freeze`` pins that they
+    are never served a stale answer.
+
+    A whole-corpus sweep is not that. ``find_stale_test_imports`` resolves the
+    same few hundred app modules from every one of 645 test files, and measured
+    over the real estate it spends **12,270 stat calls; the freeze brings that
+    to 1,538, 8.0x fewer** -- roughly 19 revalidation stats per test file, all
+    asking a question whose answer cannot have changed because nothing writes
+    to the tree during the sweep. Natively the saving does not show up in wall
+    clock at all (18.4s frozen vs 20.9s unfrozen, inside run-to-run noise); the
+    syscall count is the whole point. Over the Docker-on-Windows bind mount the
+    standalone lane runs on, where ``stat`` is ~100x slower, that count is the
+    cost, and it is the difference between a guard that reports its assertion
+    and one that dies on the lane's 30s ``pytest-timeout``.
+
+    Inside the context a cached module is returned without the stat, so the
+    sweep costs one stat per distinct module instead of one per reference.
+    Nesting is safe -- the previous value is restored on exit, not cleared.
+
+    Deliberately NOT the default, for the same reason ``frozen_typescript_tree``
+    is not: being wrong here means silently reporting a clean corpus from stale
+    facts, which is exactly the class of bug this guard exists to catch.
+    """
+    global _APP_TREE_FROZEN
+    previous = _APP_TREE_FROZEN
+    _APP_TREE_FROZEN = True
+    try:
+        yield
+    finally:
+        _APP_TREE_FROZEN = previous
+
+
 def module_facts(path: Path) -> ModuleFacts:
     """Statically recovered export set for one app module (mtime-keyed cache)."""
+    path_str = str(path)
+    if _APP_TREE_FROZEN:
+        frozen_hit = _MODULE_FACTS_BY_PATH.get(path_str)
+        if frozen_hit is not None:
+            return frozen_hit
     try:
         stat = path.stat()
     except OSError:
         return ModuleFacts(frozenset(), "module source is unreadable or unparseable")
-    return _module_facts_cached(str(path), stat.st_mtime_ns, stat.st_size)
+    facts = _module_facts_cached(path_str, stat.st_mtime_ns, stat.st_size)
+    _MODULE_FACTS_BY_PATH[path_str] = facts
+    return facts
 
 
 def resolve_app_module(app_root: Path, dotted: str) -> Path | None:
