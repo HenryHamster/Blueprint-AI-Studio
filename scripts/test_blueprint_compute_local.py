@@ -13,8 +13,11 @@ import contextlib
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import blueprint
@@ -56,7 +59,28 @@ def _run_spec(tmp_path, **fields):
     return code, buf.getvalue()
 
 
+def _run_spec_json(tmp_path, **fields):
+    """Run a real local experiment in --json mode; return (exit code, result dict).
+
+    The human render is lossy, so the machine-readable result is what the
+    environment-record assertions read.
+    """
+    args = blueprint.build_parser().parse_args(
+        ["compute", "run", "--json", "--local", _spec(tmp_path, **fields)]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = blueprint._compute_run_local(args)
+    return code, json.loads(buf.getvalue())
+
+
 WRITE_ACCURACY = 'printf "%s" \'{"accuracy": 0.9688}\' > "$BLUEPRINT_RESULT_FILE"'
+
+PIP_PROBE = (
+    "{ python3 -m pip --version || python -m pip --version || pip --version; } "
+    "> /dev/null 2>&1 && " + WRITE_ACCURACY
+)
+
 
 # Literal Windows paths, built without os.sep/os.path.join so the Windows-side
 # assertions mean the same thing when this file runs on Linux CI.
@@ -599,3 +623,672 @@ def test_module_is_importable_without_a_blueprint_config(monkeypatch):
     monkeypatch.delenv("BLUEPRINT_CONFIG", raising=False)
     assert Path(blueprint.__file__).name == "blueprint.py"
     assert sys.modules["blueprint"] is blueprint
+
+
+# ---------------------------------------------------------------------------
+# P1-1: a LOCALLY BUILT image is usable
+#
+# `_compute_run_local` used to `docker pull` unconditionally and exit 2 when
+# the pull failed. A tag built on this machine exists in no registry, so it
+# could never be pulled and therefore could never be run -- which made "clean
+# images on local hardware" impossible. Verbatim, before the fix:
+#
+#   image       : blueprint-compute-selftest:manual
+#   docker pull : pulling...
+#   error: docker pull 'blueprint-compute-selftest:manual' failed (exit 1)
+#   EXITCODE=2
+#
+# MOCKED tests below pin the policy; the REAL ones at the bottom of this file
+# build an actual image and run an actual experiment in it, because the whole
+# reason nobody noticed this defect is that every pre-existing container test
+# was a subprocess-mocked argv assertion.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+_LOCAL_IDENTITY = {
+    "id": "sha256:" + "a" * 64,
+    "repo_digests": ["ghcr.io/acme/trainer@sha256:" + "b" * 64],
+}
+
+
+def _resolve_with(monkeypatch, *, local, pull_returncode=0, **kwargs):
+    """Resolve an image with docker replaced; return (block, calls)."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kw):
+        calls.append(list(argv))
+        if argv[:2] == ["docker", "pull"]:
+            return _FakeProc(pull_returncode)
+        return _FakeProc(0)
+
+    def fake_inspect(image, **_kw):
+        return dict(local) if local is not None else None
+
+    block = blueprint._compute_resolve_image(
+        kwargs.pop("image", "ghcr.io/acme/trainer:v3"),
+        _subprocess_run=fake_run,
+        _inspect=fake_inspect,
+        quiet=True,
+        **kwargs,
+    )
+    return block, calls
+
+
+def test_a_locally_present_image_is_run_without_any_pull(monkeypatch):
+    """THE FIX. An image already on this host is used as-is."""
+    block, calls = _resolve_with(monkeypatch, local=_LOCAL_IDENTITY)
+    assert block["source"] == "local"
+    assert "error" not in block, block
+    assert not any(c[:2] == ["docker", "pull"] for c in calls), calls
+
+
+def test_a_failed_pull_is_fatal_only_when_no_local_image_exists(monkeypatch):
+    """A locally built tag fails to pull BY DEFINITION; that must not end the run."""
+    kept, _ = _resolve_with(monkeypatch, local=_LOCAL_IDENTITY,
+                            pull_returncode=1, policy="always")
+    assert "error" not in kept, kept
+    assert kept["source"] == "local"
+    assert kept["pull_failed_exit_code"] == 1
+
+    nothing, _ = _resolve_with(monkeypatch, local=None, pull_returncode=1)
+    assert "no local copy of the image exists" in nothing["error"], nothing
+
+
+def test_pull_missing_fetches_only_when_the_image_is_absent(monkeypatch):
+    _, calls = _resolve_with(monkeypatch, local=None)
+    assert ["docker", "pull", "ghcr.io/acme/trainer:v3"] in calls, calls
+
+
+def test_pull_always_refreshes_an_image_that_is_already_here(monkeypatch):
+    _, calls = _resolve_with(monkeypatch, local=_LOCAL_IDENTITY, policy="always")
+    assert ["docker", "pull", "ghcr.io/acme/trainer:v3"] in calls, calls
+
+
+def test_pull_never_refuses_instead_of_reaching_the_network(monkeypatch):
+    block, calls = _resolve_with(monkeypatch, local=None, policy="never")
+    assert "--pull never" in block["error"], block
+    assert not any(c[:2] == ["docker", "pull"] for c in calls), calls
+
+
+def test_the_default_pull_policy_is_the_working_one():
+    """No flag may default to the behaviour that rejected a local image."""
+    args = blueprint.build_parser().parse_args(["compute", "run", "echo hi"])
+    assert args.pull_policy == "missing"
+    assert blueprint._COMPUTE_PULL_POLICIES == ("missing", "always", "never")
+
+
+def test_registry_login_is_attempted_only_when_a_pull_will_happen(monkeypatch):
+    """A credential-free local image must not drag in a docker login."""
+    logins: list[dict] = []
+
+    def fake_login(auth, **_kw):
+        logins.append(auth)
+        return True
+
+    blueprint._compute_resolve_image(
+        "ghcr.io/acme/trainer:v3",
+        registry_auth={"password": "s3cret"},
+        quiet=True,
+        _subprocess_run=lambda *a, **k: _FakeProc(0),
+        _inspect=lambda image, **kw: dict(_LOCAL_IDENTITY),
+        _login=fake_login,
+    )
+    assert logins == [], "a local image needs no registry credential"
+
+
+# ---------------------------------------------------------------------------
+# P1-2: setup_step is honoured, and no other spec field is dropped in silence
+# ---------------------------------------------------------------------------
+
+
+@_needs_shell
+def test_setup_step_runs_before_the_command_in_the_same_shell(tmp_path):
+    """The defect verbatim: setup_step was parsed by the cloud schema and dropped here.
+
+    The command can only produce this metric if the setup step ran first AND
+    its exported variable survived into the command's shell.
+    """
+    code, out = _run_spec(
+        tmp_path,
+        setup_step="BP_SETUP_ACCURACY=0.8125",
+        command='printf "%s" "{\\"accuracy\\": $BP_SETUP_ACCURACY}" > "$BLUEPRINT_RESULT_FILE"',
+        declared_metric="accuracy",
+        success_criterion={"metric": "accuracy", "operator": ">=", "threshold": 0.8},
+    )
+    assert "0.8125" in out, out
+    assert "verdict     : MET" in out, out
+    assert code == blueprint._COMPUTE_EXIT_OK, out
+
+
+@_needs_shell
+def test_a_failing_setup_step_aborts_before_the_command(tmp_path):
+    """`&&` between the brace groups: a broken environment never runs the experiment."""
+    marker = tmp_path / "command_ran"
+    code, out = _run_spec(
+        tmp_path,
+        setup_step="exit 3",
+        command=f'touch "{marker.as_posix()}"; printf "%s" \'{{"accuracy": 1}}\' > "$BLUEPRINT_RESULT_FILE"',
+        declared_metric="accuracy",
+    )
+    assert not marker.exists(), "the command ran despite a failed setup step"
+    assert code == blueprint._COMPUTE_EXIT_COMMAND_FAILED, out
+    assert "status      : FAILED" in out, out
+
+
+def test_setup_step_folds_with_the_command_the_way_the_runner_does():
+    folded = blueprint._compute_fold_setup_step("train.py", "pip install -r r.txt")
+    assert folded == "{\npip install -r r.txt\n} && {\ntrain.py\n}"
+    assert blueprint._compute_fold_setup_step("train.py", None) == "train.py"
+
+
+@_needs_shell
+def test_setup_step_reaches_every_arm_of_a_sweep(tmp_path):
+    code, out = _run_spec(
+        tmp_path,
+        setup_step="BP_BASE=0.5",
+        arms=[
+            {"name": "a", "command":
+                'printf "%s" "{\\"score\\": $BP_BASE}" > "$BLUEPRINT_RESULT_FILE"'},
+            {"name": "b", "setup_step": "BP_BASE=0.9", "command":
+                'printf "%s" "{\\"score\\": $BP_BASE}" > "$BLUEPRINT_RESULT_FILE"'},
+        ],
+        declared_metric="score",
+    )
+    assert "[a] score=0.5" in out, out
+    assert "[b] score=0.9" in out, out
+    assert code == blueprint._COMPUTE_EXIT_OK, out
+
+
+def test_a_spec_field_that_changes_the_measurement_is_refused_by_name(tmp_path, capsys):
+    """Silently ignoring a declared measurement is the defect class, not a courtesy."""
+    args = blueprint.build_parser().parse_args(
+        ["compute", "run", "--local",
+         _spec(tmp_path, command="true",
+               success_criteria=[{"metric": "acc", "operator": ">=", "threshold": 1}])]
+    )
+    with pytest.raises(SystemExit) as exc:
+        blueprint._compute_run_local(args)
+    assert exc.value.code == blueprint._COMPUTE_EXIT_HARNESS_FAILED
+    assert "'success_criteria'" in capsys.readouterr().err
+
+
+def test_every_unhonoured_spec_field_is_either_fatal_or_named(tmp_path):
+    fatal, ignored = blueprint._compute_spec_field_report({
+        "command": "true",
+        "setup_step": "true",
+        "machine_type": "a2-highgpu-1g",
+        "input_artifact_job_id": "cjob-1",
+        "totally_unknown": 1,
+    })
+    assert fatal == ["input_artifact_job_id"]
+    assert ignored == ["machine_type", "totally_unknown"]
+    assert "CLOUD launch" in blueprint._compute_spec_ignored_warning("machine_type")
+    assert "was ignored" in blueprint._compute_spec_ignored_warning("totally_unknown")
+    # The two sets must not overlap, or a field would be both honoured and warned about.
+    assert not (blueprint._COMPUTE_LOCAL_SPEC_HONOURED
+                & blueprint._COMPUTE_LOCAL_SPEC_CLOUD_ONLY)
+    assert not (blueprint._COMPUTE_LOCAL_SPEC_HONOURED
+                & set(blueprint._COMPUTE_LOCAL_SPEC_UNSUPPORTED))
+
+
+@_needs_shell
+def test_an_ignored_cloud_field_is_reported_on_stderr_and_in_the_result(tmp_path, capsys):
+    code, result = _run_spec_json(
+        tmp_path,
+        command=WRITE_ACCURACY,
+        declared_metric="accuracy",
+        machine_type="a2-highgpu-1g",
+    )
+    assert code == blueprint._COMPUTE_EXIT_OK, result
+    assert any("machine_type" in w for w in result["spec_warnings"]), result
+    assert "machine_type" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# P1-3: repo_clone -- the only way to get code into the container
+# ---------------------------------------------------------------------------
+
+
+def _container_argv(monkeypatch, tmp_path, **fields):
+    """Run the container path with docker replaced; return (argv, result)."""
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        blueprint, "_compute_resolve_image",
+        lambda image, **kw: {
+            "reference": image, "source": "local", "pull_policy": kw.get("policy"),
+            "digest": "sha256:" + "c" * 64, "image_id": "sha256:" + "c" * 64,
+            "repo_digests": [], "digest_pinned_reference": False,
+            "reproduce_reference": "sha256:" + "c" * 64,
+        },
+    )
+
+    def fake_run(argv, **_kw):
+        captured["argv"] = list(argv)
+        mount = next(
+            (argv[i + 1] for i, a in enumerate(argv)
+             if a == "-v" and argv[i + 1].endswith(":/tmp/blueprint_out")),
+            None,
+        )
+        if mount:
+            host_dir = mount[: -len(":/tmp/blueprint_out")]
+            Path(host_dir, "result.json").write_text('{"accuracy": 0.5}', encoding="utf-8")
+        return _FakeProc(0)
+
+    monkeypatch.setattr(blueprint, "_run_capturing_stderr", fake_run)
+    code, result = _run_spec_json(tmp_path, **fields)
+    return captured.get("argv", []), code, result
+
+
+def _init_repo(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for argv in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "t"],
+        ["git", "add", "-A"],
+        ["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"],
+    ):
+        subprocess.run(argv, cwd=str(root), capture_output=True, timeout=10, check=False)
+
+
+def test_repo_clone_mounts_the_repository_root_not_the_current_directory(
+    monkeypatch, tmp_path
+):
+    """`os.path.abspath('.')` mounted whatever directory you happened to be in."""
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    _init_repo(repo)
+    monkeypatch.chdir(repo / "pkg")
+
+    argv, code, result = _container_argv(
+        monkeypatch, tmp_path,
+        container_image="ghcr.io/acme/trainer:v3",
+        command="true",
+        repo_clone={"owner": "acme", "repo": "trainer", "ref": "main"},
+    )
+    mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
+    workspace = [m for m in mounts if m.endswith(":/workspace")]
+    assert workspace, argv
+    host = workspace[0][: -len(":/workspace")]
+    assert Path(host).resolve() == repo.resolve(), (host, str(repo))
+    assert "PYTHONPATH=/workspace" in argv, argv
+    assert argv[argv.index("-w") + 1] == "/workspace", argv
+    assert code == blueprint._COMPUTE_EXIT_OK, result
+
+
+def test_repo_clone_records_the_commit_the_run_actually_saw(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "seed.txt").parent.mkdir(parents=True, exist_ok=True)
+    (repo / "seed.txt").write_text("x", encoding="utf-8")
+    _init_repo(repo)
+    monkeypatch.chdir(repo)
+
+    _, code, result = _container_argv(
+        monkeypatch, tmp_path,
+        container_image="ghcr.io/acme/trainer:v3",
+        command="true",
+        repo_clone={"owner": "acme", "repo": "trainer", "ref": "deadbeef"},
+    )
+    recorded = result["environment"]["repo"]
+    assert recorded["resolved_by"] == "git", recorded
+    assert re.fullmatch(r"[0-9a-f]{40}", recorded["commit"] or ""), recorded
+    assert recorded["dirty"] is False, recorded
+    # The local path MOUNTS; it does not clone owner/repo@ref. Saying so is the
+    # difference between a record and a confident lie about which ref ran.
+    joined = " ".join(result["spec_warnings"])
+    assert "acme/trainer" in joined, result["spec_warnings"]
+    assert "deadbeef" in joined, result["spec_warnings"]
+    assert code == blueprint._COMPUTE_EXIT_OK, result
+
+
+def test_repo_clone_reports_a_dirty_tree(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "seed.txt").parent.mkdir(parents=True, exist_ok=True)
+    (repo / "seed.txt").write_text("x", encoding="utf-8")
+    _init_repo(repo)
+    (repo / "seed.txt").write_text("changed", encoding="utf-8")
+    state = blueprint._compute_git_repo_state(str(repo))
+    assert state["dirty"] is True, state
+    warnings = blueprint._compute_repo_clone_warnings({}, state)
+    assert any("uncommitted changes" in w for w in warnings), warnings
+
+
+def test_repo_state_uses_git_not_a_dot_git_isdir_probe(tmp_path):
+    """In a linked worktree `.git` is a FILE, so an isdir guard skips silently."""
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    state = blueprint._compute_git_repo_state(str(not_a_repo))
+    assert state["resolved_by"] == "cwd", state
+    assert state["commit"] is None, state
+    assert any("not a readable git repository" in w
+               for w in blueprint._compute_repo_clone_warnings({}, state))
+
+
+# ---------------------------------------------------------------------------
+# P1-4: the realised environment is recorded, so a run is reproducible
+# ---------------------------------------------------------------------------
+
+
+@_needs_shell
+def test_a_run_records_the_environment_it_actually_ran_in(tmp_path):
+    code, result = _run_spec_json(
+        tmp_path, command=WRITE_ACCURACY, declared_metric="accuracy",
+    )
+    assert code == blueprint._COMPUTE_EXIT_OK, result
+    environment = result["environment"]
+    assert environment["captured_at"], environment
+    assert environment["host"]["shell"], environment
+    written = Path(result["environment_file"])
+    assert written.name == blueprint._COMPUTE_ENVIRONMENT_FILENAME
+    assert json.loads(written.read_text(encoding="utf-8"))["host"] == environment["host"]
+
+
+@_needs_shell
+def test_the_package_set_is_frozen_inside_the_environment_that_ran(tmp_path):
+    """`pip freeze` runs in the experiment shell, after setup_step, not beside it.
+
+    The skip below asks the EXPERIMENT SHELL whether it has pip at all. Skipping
+    on "no packages were recorded" instead would make this test pass happily on
+    the very regression it exists to catch.
+    """
+    _, probe = _run_spec_json(
+        tmp_path,
+        # Reuses WRITE_ACCURACY so the probe carries no quoting of its own:
+        # a metric comes back only if the experiment shell has pip.
+        command=PIP_PROBE,
+    )
+    if not (probe.get("metrics") or {}).get("accuracy"):
+        pytest.skip("no pip inside the experiment shell on this host")
+
+    code, result = _run_spec_json(
+        tmp_path, command=WRITE_ACCURACY, declared_metric="accuracy",
+    )
+    packages = result["environment"]["python_packages"]
+    assert packages, "the shell has pip, so the run must record what it froze"
+    assert any("==" in line for line in packages), packages
+    assert code == blueprint._COMPUTE_EXIT_OK, result
+
+
+@_needs_shell
+def test_a_command_that_exits_the_shell_is_still_recorded_and_still_reports_7(tmp_path):
+    """`exit 7` ends the shell on the spot. The trap must still fire, and $? survive.
+
+    This is the ordinary shape of a failing experiment, and it is exactly the
+    run whose environment you want recorded.
+    """
+    _, probe = _run_spec_json(tmp_path, command=PIP_PROBE)
+    code, result = _run_spec_json(tmp_path, command="exit 7")
+    assert result["exit_code"] == 7, result
+    assert code == blueprint._COMPUTE_EXIT_COMMAND_FAILED, result
+    if (probe.get("metrics") or {}).get("accuracy"):
+        assert result["environment"]["python_packages"], (
+            "the capture trap did not fire for a command that exited the shell"
+        )
+
+
+def test_the_capture_is_an_exit_trap_installed_before_the_command():
+    """An appended epilogue would never run for a command that exits the shell."""
+    program = blueprint._compute_shell_command(
+        blueprint._ShellPlan("bash", blueprint._COMPUTE_SHELL_POSIX, "bash"),
+        "python3 train.py",
+        {"BLUEPRINT_RESULT_FILE": "/tmp/r.json"},
+    )
+    head, sep, tail = program.partition("python3 train.py")
+    assert sep, program
+    assert "trap __bp_capture_environment EXIT" in head, head
+    assert tail.strip() == "", "nothing may run after the experiment command"
+    # $? saved first and returned last, so recording cannot rewrite the verdict.
+    handler = blueprint._COMPUTE_ENVIRONMENT_CAPTURE
+    assert handler.index("__bp_status=$?") < handler.index("pip freeze")
+    assert handler.index("pip freeze") < handler.index("return $__bp_status")
+    # An opt-out exists only for callers that build a program by hand.
+    bare = blueprint._compute_shell_command(
+        blueprint._ShellPlan("bash", blueprint._COMPUTE_SHELL_POSIX, "bash"),
+        "python3 train.py", {}, capture_environment=False,
+    )
+    assert "__bp_capture_environment" not in bare
+    assert bare.endswith("python3 train.py")
+
+
+def test_a_mutable_tag_still_records_the_digest_that_actually_ran(monkeypatch):
+    """`container_image_digest_pinned` is a claim about the REFERENCE and fails open."""
+    block, _ = _resolve_with(monkeypatch, local=_LOCAL_IDENTITY, image="ghcr.io/acme/trainer:latest")
+    assert block["digest_pinned_reference"] is False
+    assert block["digest"] == "ghcr.io/acme/trainer@sha256:" + "b" * 64
+    assert block["reproduce_reference"] == block["digest"]
+
+
+def test_an_image_built_here_and_pushed_nowhere_still_pins_what_ran(monkeypatch):
+    block, _ = _resolve_with(
+        monkeypatch, local={"id": "sha256:" + "d" * 64, "repo_digests": []},
+        image="blueprint-selftest:local",
+    )
+    assert block["digest"] == "sha256:" + "d" * 64
+    assert block["reproduce_reference"] == "sha256:" + "d" * 64
+
+
+@_needs_shell
+def test_env_override_values_are_never_written_into_the_record(tmp_path):
+    """Overrides routinely carry tokens; the record keeps names, never values."""
+    secret = "tok-" + "9" * 20
+    code, result = _run_spec_json(
+        tmp_path, command=WRITE_ACCURACY, declared_metric="accuracy",
+        env={"HF_TOKEN": secret},
+    )
+    assert code == blueprint._COMPUTE_EXIT_OK, result
+    assert result["environment"]["env_override_keys"] == ["HF_TOKEN"]
+    assert secret not in json.dumps(result)
+    assert secret not in Path(result["environment_file"]).read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# P1-5: the contract is documented for a HUMAN, not only in agent prompts
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_COMPUTE_DOC = _REPO_ROOT / "docs" / "COMPUTE_RUN_LOCAL.md"
+
+
+def test_compute_run_is_documented_for_humans():
+    assert _COMPUTE_DOC.is_file(), f"{_COMPUTE_DOC} is missing"
+    text = _COMPUTE_DOC.read_text(encoding="utf-8")
+    for token in (
+        "blueprint compute run",
+        "BLUEPRINT_RESULT_FILE",
+        "BLUEPRINT_ARTIFACT_DIR",
+        "BLUEPRINT_LOCAL_GPU",
+        "repo_clone",
+        "setup_step",
+        "--pull",
+        "arms",
+        blueprint._COMPUTE_ENVIRONMENT_FILENAME,
+    ):
+        assert token in text, f"docs/COMPUTE_RUN_LOCAL.md never mentions {token!r}"
+
+
+def test_the_documented_exit_codes_match_the_shipped_constants():
+    """A doc that drifts from the contract is worse than no doc."""
+    text = _COMPUTE_DOC.read_text(encoding="utf-8")
+    for name, value in (
+        ("ran, measured", blueprint._COMPUTE_EXIT_OK),
+        ("command itself exited non-zero", blueprint._COMPUTE_EXIT_COMMAND_FAILED),
+        ("nothing was measured", blueprint._COMPUTE_EXIT_HARNESS_FAILED),
+        ("NOT MET", blueprint._COMPUTE_EXIT_CRITERION_NOT_MET),
+    ):
+        row = re.search(rf"^\|\s*`?(\d+)`?\s*\|[^|]*{re.escape(name)}", text,
+                        re.IGNORECASE | re.MULTILINE)
+        assert row, f"no exit-code table row documents {name!r}"
+        assert int(row.group(1)) == value, (name, row.group(1), value)
+
+
+def test_the_docs_index_links_the_compute_run_guide():
+    index = (_REPO_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    assert "COMPUTE_RUN_LOCAL.md" in index
+
+
+# ---------------------------------------------------------------------------
+# REAL container runs.
+#
+# Everything above this line that touches docker is MOCKED. The tests below are
+# not: they build an image on this machine, run a real experiment inside it,
+# and assert on the metric that came back. That distinction is the whole point
+# -- the repo's pre-existing container coverage was entirely `subprocess.run`-
+# mocked argv assertions, which is exactly why a container path that could not
+# run a local image at all went unnoticed.
+#
+# They skip where no docker daemon or no local base image is available (CI's
+# standalone lane, and the sharded lane inside the test image).
+# ---------------------------------------------------------------------------
+
+_DOCKER_CLI = shutil.which("docker")
+
+
+_BASE_IMAGE_CANDIDATES = ("python:3.11-slim", "python:3-slim", "python:3.12-slim")
+
+
+def _probe_base_image() -> "str | None":
+    """Pick a python base image that is ALREADY on this host.
+
+    ONE docker call, and a short timeout: this runs at collection time, so a
+    slow or wedged daemon must not eat the lane's per-test budget. `docker image
+    inspect` reports every reference it found and exits non-zero for the rest,
+    so the tags are read out of stdout rather than probed one at a time.
+    """
+    if not _DOCKER_CLI:
+        return None
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", *_BASE_IMAGE_CANDIDATES,
+             "--format", "{{index .RepoTags 0}}"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:  # noqa: BLE001 -- no daemon means "skip", not "fail"
+        return None
+    found = {ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()}
+    for candidate in _BASE_IMAGE_CANDIDATES:
+        if candidate in found:
+            return candidate
+    return None
+
+
+_BASE_IMAGE = _probe_base_image()
+_needs_docker = pytest.mark.skipif(
+    _BASE_IMAGE is None,
+    reason="needs a docker daemon and a locally present python slim base image",
+)
+
+
+@_needs_docker
+@pytest.mark.timeout(300)
+def test_real_locally_built_image_runs_an_experiment_end_to_end(tmp_path):
+    """The end-to-end proof for P1-1, with a tag that exists in NO registry.
+
+    Before the fix this exact spec produced:
+        error: docker pull '<tag>' failed (exit 1)   EXITCODE=2
+    """
+    tag = f"blueprint-compute-selftest:{uuid.uuid4().hex[:12]}"
+    dockerfile = f"FROM {_BASE_IMAGE}\nRUN printf '0.9312' > /opt/bp_baseline\n"
+    build = subprocess.run(
+        ["docker", "build", "-t", tag, "-"],
+        input=dockerfile.encode(), capture_output=True, timeout=180,
+    )
+    assert build.returncode == 0, build.stderr.decode("utf-8", "replace")[-2000:]
+    try:
+        # The tag is registry-less: a pull CANNOT succeed. This is what made the
+        # old unconditional-pull path fatal for every locally built image.
+        pull = subprocess.run(
+            ["docker", "pull", tag], capture_output=True, timeout=120,
+        )
+        assert pull.returncode != 0, "the fixture tag must exist in no registry"
+
+        code, result = _run_spec_json(
+            tmp_path,
+            container_image=tag,
+            setup_step="printf '0.0088' > /tmp/bp_delta",
+            command=(
+                "python3 -c \"import os,json;"
+                "b=float(open('/opt/bp_baseline').read());"
+                "d=float(open('/tmp/bp_delta').read());"
+                "open(os.environ['BLUEPRINT_RESULT_FILE'],'w')"
+                ".write(json.dumps({'accuracy': round(b+d,4)}))\""
+            ),
+            declared_metric="accuracy",
+            success_criterion={"metric": "accuracy", "operator": ">=", "threshold": 0.93},
+        )
+        assert code == blueprint._COMPUTE_EXIT_OK, result
+        # 0.9312 comes from the IMAGE, 0.0088 from the SETUP STEP. Getting 0.94
+        # back proves both halves reached the container.
+        assert result["metrics"]["accuracy"] == 0.94, result
+        assert result["verdict"]["verdict"] == "MET", result
+        image_block = result["environment"]["container_image"]
+        assert image_block["source"] == "local", image_block
+        assert "pull_failed_exit_code" not in image_block, image_block
+        assert image_block["digest"], image_block
+        # The freeze came from inside the container, not from the host.
+        assert result["environment"]["python_packages"], result["environment"]
+    finally:
+        subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, timeout=120)
+
+
+@_needs_docker
+@pytest.mark.timeout(300)
+def test_real_repo_clone_puts_this_checkout_inside_the_container(tmp_path):
+    """P1-3 for real: repo_clone is the only way to get code into the container."""
+    repo = tmp_path / "repo"
+    (repo / "bp_selftest_pkg").mkdir(parents=True)
+    (repo / "bp_selftest_pkg" / "__init__.py").write_text(
+        "SCORE = 0.771\n", encoding="utf-8"
+    )
+    _init_repo(repo)
+
+    tag = f"blueprint-compute-selftest:{uuid.uuid4().hex[:12]}"
+    build = subprocess.run(
+        ["docker", "build", "-t", tag, "-"],
+        input=f"FROM {_BASE_IMAGE}\n".encode(), capture_output=True, timeout=180,
+    )
+    assert build.returncode == 0, build.stderr.decode("utf-8", "replace")[-2000:]
+    cwd = os.getcwd()
+    try:
+        # Run from a SUBDIRECTORY: the mount must still be the repository root.
+        os.chdir(repo / "bp_selftest_pkg")
+        code, result = _run_spec_json(
+            tmp_path,
+            container_image=tag,
+            command=(
+                "python3 -c \"import os,json,bp_selftest_pkg as p;"
+                "open(os.environ['BLUEPRINT_RESULT_FILE'],'w')"
+                ".write(json.dumps({'score': p.SCORE}))\""
+            ),
+            declared_metric="score",
+            repo_clone={"owner": "acme", "repo": "selftest", "ref": "main"},
+        )
+        assert code == blueprint._COMPUTE_EXIT_OK, result
+        assert result["metrics"]["score"] == 0.771, result
+        assert result["environment"]["repo"]["commit"], result["environment"]["repo"]
+    finally:
+        os.chdir(cwd)
+        subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, timeout=120)
+
+
+@_needs_docker
+@pytest.mark.timeout(300)
+def test_real_missing_image_with_pull_never_fails_loudly(tmp_path):
+    """No usable image is still fatal -- the fix narrows the failure, not removes it."""
+    args = blueprint.build_parser().parse_args(
+        ["compute", "run", "--pull", "never", "--local",
+         _spec(tmp_path, container_image=f"blueprint-absent:{uuid.uuid4().hex[:12]}",
+               command="true", declared_metric="accuracy")]
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        blueprint._compute_run_local(args)
+    assert exc.value.code == blueprint._COMPUTE_EXIT_HARNESS_FAILED

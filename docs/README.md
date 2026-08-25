@@ -98,6 +98,13 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
   - Common failure fixes and bwrap/container troubleshooting
   - Multi-runner registration, observability, and partitioning
 
+- **[COMPUTE_RUN_LOCAL.md](COMPUTE_RUN_LOCAL.md)** - Running a compute experiment on your own hardware
+  - The BLUEPRINT_RESULT_FILE / BLUEPRINT_ARTIFACT_DIR / BLUEPRINT_LOCAL_GPU file contract
+  - Exit-code contract (0 met, 1 command failed, 2 nothing measured, 3 criterion not met)
+  - Spec files: setup_step, container_image, repo_clone, env, cwd, arms/sweeps
+  - `--pull` and using an image you built locally
+  - The realised-environment record (image digest, commit, pip freeze)
+
 - **[operator-experience-operating-model.md](operator-experience-operating-model.md)** — Canonical operator IA and decision loops
   - Five operator spaces: Operate, Work, Strategy, Fleet, Policy
   - Core object relationships (project, task, wave, PR, direction, finding, version, runner, account)
