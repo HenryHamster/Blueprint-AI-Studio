@@ -1825,22 +1825,159 @@ def _git_commit_parent_count(sha: str, repo_root: str) -> int | None:
     return len(result.stdout.split())
 
 
-def _git_commit_is_shallow_boundary(sha: str, repo_root: str) -> bool:
-    """Return whether ``sha`` is an explicit shallow-clone boundary.
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _shallow_boundary_shas(repo_root: str) -> frozenset[str]:
+    """Return every explicit shallow-clone boundary SHA, read ONCE.
 
     Git hides a shallow boundary's parent and renders ``git show`` as though
     the boundary were a root commit.  For ``module_size_limits.json`` that is
     a whole-file addition, so the ordinary ``old -> new`` pair parser cannot
     adjudicate a ledger record even when the cited commit made the real bump.
     The shallow file is positive evidence of that loss; an unreadable or
-    absent shallow file is not treated as a boundary.
+    absent shallow file is NOT treated as a boundary.
+
+    Replaces a per-SHA predicate that re-resolved the shallow file path (a
+    ``git rev-parse`` fork) and re-read the file for every SHA it was asked
+    about.  The ledger holds hundreds of records, so the per-record form forked
+    hundreds of times over one unchanging file.
     """
-    shallow_path = _git_shallow_file_path(repo_root)
     try:
-        with open(shallow_path, encoding="utf-8") as f:
-            return any(line.strip() == sha for line in f)
+        with open(_git_shallow_file_path(repo_root), encoding="utf-8") as f:
+            return frozenset(line.strip() for line in f if line.strip())
     except OSError:
-        return False
+        return frozenset()
+
+
+def _mainline_ancestor_shas(ref: str, repo_root: str) -> frozenset[str] | None:
+    """Every commit reachable from ``ref``, or ``None`` when git cannot answer.
+
+    For a full 40-hex SHA, ``sha in <this set>`` is the batched equivalent of
+    :func:`_commit_in_mainline_ancestry`: ``git merge-base --is-ancestor sha
+    ref`` asks exactly whether ``sha`` is reachable from ``ref``, and both
+    forms stop at the same shallow boundary.  One traversal answers every
+    ledger record instead of forking ``merge-base`` — plus its nested
+    :func:`_mainline_git_ref` probe — once per record.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-c", f"safe.directory={repo_root}", "rev-list", ref],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — a probe; the caller falls back per-SHA
+        return None
+    if result.returncode != 0:
+        return None
+    return frozenset(result.stdout.split())
+
+
+def _ancestry_verdict(
+    sha: str, ancestor_shas: frozenset[str] | None, repo_root: str
+) -> bool | None:
+    """Batched :func:`_commit_in_mainline_ancestry`, with a per-SHA fallback.
+
+    Membership in the batched reachability set answers a full 40-hex SHA
+    exactly.  An abbreviated SHA, or a batch git could not read, falls back to
+    the single-SHA ``merge-base --is-ancestor`` probe so every verdict —
+    including its ``None`` (the probe could not answer) polarity — is
+    unchanged by the batching.
+    """
+    if ancestor_shas is not None and _FULL_SHA_RE.fullmatch(sha):
+        return sha in ancestor_shas
+    return _commit_in_mainline_ancestry(sha, repo_root)
+
+
+def _batch_commit_parent_counts(
+    shas: list[str], repo_root: str
+) -> dict[str, int] | None:
+    """Parent counts for many commits in ONE ``git log --no-walk`` fork.
+
+    ``None`` means the batch could not be read; the caller then falls back to
+    the per-SHA :func:`_git_commit_parent_count`, so a batch failure never
+    changes a verdict.
+    """
+    if not shas:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "log",
+                "--no-walk=unsorted",
+                "--stdin",
+                "--format=%H %P",
+            ],
+            input="\n".join(shas) + "\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — a probe; the caller falls back per-SHA
+        return None
+    if result.returncode != 0:
+        return None
+    counts: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if parts:
+            counts[parts[0]] = len(parts) - 1
+    return counts
+
+
+def _batch_commit_file_diffs(shas: list[str], repo_root: str) -> dict[str, str] | None:
+    """``{sha: diff_text}`` for many commits in ONE ``git log -p`` fork.
+
+    The same per-commit diff of ``_MODULE_SIZE_LIMITS_RELPATH`` that
+    :func:`_git_show_file_diff` renders one fork at a time.  A commit that did
+    not touch the file is absent from the mapping, which the caller reads as
+    the empty diff ``git show`` would have rendered for it — the same verdict.
+    ``None`` means the batch could not be read; the caller then falls back to
+    the per-SHA helper.
+    """
+    if not shas:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "log",
+                "--no-walk=unsorted",
+                "--stdin",
+                "--format=COMMIT %H %aI",
+                "-p",
+                "--",
+                _MODULE_SIZE_LIMITS_RELPATH,
+            ],
+            input="\n".join(shas) + "\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — a probe; the caller falls back per-SHA
+        return None
+    if result.returncode != 0:
+        return None
+    return {
+        sha: diff_text
+        for sha, _date, diff_text in _split_git_log_chunks(result.stdout)
+        if sha
+    }
 
 
 def phantom_ledger_records(
@@ -1953,6 +2090,33 @@ def phantom_ledger_records(
                 records.append((section, key, old_cap, new_cap, sha))
     resolved = _resolve_shas(shas, root) if shas else {}
 
+    # Records whose commit is NOT in the (possibly partial) mainline log still
+    # have to be adjudicated one at a time.  On a truncated checkout — every CI
+    # shard and agent VM, where the log reaches only the shallow boundary —
+    # that is nearly EVERY record, and the per-record form forks git four times
+    # apiece: the ancestry probe plus its nested ref lookup, the shallow-file
+    # resolve, the parent count, and the diff render.  At the current ledger
+    # size that is thousands of forks inside one guard call, which is what
+    # pushed this check past CI's 30s pytest-timeout (run 32805982004, backend
+    # shard 8, inside _commit_in_mainline_ancestry).  Answer all of them up
+    # front in three forks instead.  Each batch falls back to its per-SHA
+    # helper when git cannot read it, so no verdict — and no polarity — moves.
+    beyond_log_shas = sorted(
+        {
+            sha
+            for _section, _key, _old_cap, _new_cap, sha in records
+            if sha
+            and sha != UNATTRIBUTED_COMMIT_SHA
+            and sha not in bump_map
+            and resolved.get(sha, False)
+        }
+    )
+    beyond_log_set = frozenset(beyond_log_shas)
+    ancestor_shas = _mainline_ancestor_shas(ref, root) if beyond_log_shas else None
+    boundary_shas = _shallow_boundary_shas(root)
+    parent_counts = _batch_commit_parent_counts(beyond_log_shas, root)
+    batched_diffs = _batch_commit_file_diffs(beyond_log_shas, root)
+
     phantoms: list[tuple[str, str, int, int, str, str]] = []
     for section, key, old_cap, new_cap, sha in records:
         if not sha or sha == UNATTRIBUTED_COMMIT_SHA:
@@ -1979,7 +2143,7 @@ def phantom_ledger_records(
         if not resolved.get(sha, False):
             # Evidence is absent, not positive proof of fabrication.
             continue
-        ancestry = _commit_in_mainline_ancestry(sha, root)
+        ancestry = _ancestry_verdict(sha, ancestor_shas, root)
         if ancestry is False:
             if not mainline_history_truncated:
                 phantoms.append(
@@ -2001,12 +2165,16 @@ def phantom_ledger_records(
             # An ancestry probe failure is evidence loss, not proof of a fake
             # record. Never delete on this polarity.
             continue
-        if _git_commit_is_shallow_boundary(sha, root):
+        if sha in boundary_shas:
             # The parent is deliberately hidden, so ``git show`` synthesizes a
             # root/full-file-add diff. A missing pair there is evidence loss,
             # not proof that the ledger row is fabricated.
             continue
-        parent_count = _git_commit_parent_count(sha, root)
+        parent_count = (
+            parent_counts[sha]
+            if parent_counts is not None and sha in parent_counts
+            else _git_commit_parent_count(sha, root)
+        )
         if parent_count is None or parent_count > 1:
             # A merge commit has no single-parent diff that can attribute a
             # cap pair. Likewise, a failed parent probe leaves the provenance
@@ -2014,7 +2182,11 @@ def phantom_ledger_records(
             continue
         # A beyond-boundary ancestor whose objects are present in this (possibly
         # shallow) checkout: render its diff directly and verify the pair.
-        diff_text = _git_show_file_diff(sha, root)
+        diff_text = (
+            batched_diffs.get(sha, "")
+            if batched_diffs is not None and sha in beyond_log_set
+            else _git_show_file_diff(sha, root)
+        )
         if diff_text is None:
             # An unreadable diff cannot establish fabrication.
             continue
