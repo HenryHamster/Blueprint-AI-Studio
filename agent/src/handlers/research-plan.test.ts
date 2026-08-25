@@ -5189,7 +5189,13 @@ describe('normalizePlanSubtaskTypes', () => {
 // RESEARCH_PROMPT_BYTE_CEILING: measured 25 505 bytes on first landing; set
 // to 31 000 (≈21% headroom) for the same reason.
 const PLAN_PROMPT_BYTE_CEILING = 19_600;
-const RESEARCH_PROMPT_BYTE_CEILING = 31_000;
+// Bumped 31_000 -> 32_000 when the compute_experiment schema doc gained the
+// $BLUEPRINT_PROGRESS_FILE heartbeat rule and the $BLUEPRINT_PYTHON contract.
+// Baseline before that change was 30_877 bytes, i.e. only 123 bytes of
+// headroom remained, so any correction to this doc had to move the ratchet.
+// The added text is ~908 bytes and closes a defect that silently KILLED long
+// compute jobs (watchdog reads the progress file's mtime, not declared_metric).
+const RESEARCH_PROMPT_BYTE_CEILING = 32_000;
 
 describe('research/plan prompt byte-budget ratchet', () => {
   const RB_TASK_ID = 'rb-task-001';
