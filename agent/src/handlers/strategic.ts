@@ -1452,9 +1452,21 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # sharing one expensive preprocessing step. A crashed run that still checkpointed is
 # a legal source (terminal + a bundle is the whole requirement). A resumed run MUST
 # also declare declared_metric and no_progress_timeout_seconds: resumed runs are long
-# by nature and that metric is the PROGRESS signal the watchdog reads (a liveness
-# heartbeat, not necessarily a success goal), so a stuck job is killed rather than
-# burning its whole deadline. The launch is refused without that pair.
+# by nature and need the stall watchdog armed. The launch is refused without that
+# pair. NOTE declared_metric is NOT the watchdog signal -- it only names the result
+# key used for scoring/arm comparison. The no-progress watchdog polls the MTIME of
+# the file named by '$BLUEPRINT_PROGRESS_FILE'; any advance counts as progress and
+# no advance within the window KILLS the job (exit 125, reason no_progress_timeout).
+# So the command must append one JSON line per step to it, e.g. in Python
+#   print(json.dumps({"metric": "loss", "value": v}),
+#         file=open(os.environ["BLUEPRINT_PROGRESS_FILE"], "a"), flush=True)
+# or from shell: echo '{"metric":"step","value":1}' >> "$BLUEPRINT_PROGRESS_FILE"
+# Append and flush, never rewrite. A command that emits its metric but never writes
+# this file is killed at exactly no_progress_timeout_seconds however healthy it is.
+# Python: on the imageless lane the runner exports '$BLUEPRINT_PYTHON' /
+# '$BLUEPRINT_PIP' / '$BLUEPRINT_VENV' for a provisioned per-job venv; inside a
+# container_image they are ABSENT. Use the both-lane fallback form
+# "\${BLUEPRINT_PYTHON:-python3}" and "\${BLUEPRINT_PIP:-pip3}", not bare python/pip.
 # Project compute-image environment (only when a workload actually needs a
 # container-only runtime such as CUDA/framework libraries): run
 # 'compute-image status' before authoring the launch. It returns one of four

@@ -1,18 +1,46 @@
 /**
- * Compute experiment handler — budgeted compute job provisioning and monitoring.
+ * Compute experiment handler — budgeted compute job LAUNCH-AND-PARK.
  *
- * Provisions a custom compute job (VM, container, or specialized hardware) with
- * a specified budget and success criteria, monitors it to a terminal state
- * (SUCCESS, FAILURE, TIMEOUT), and reports results. Compute jobs are durable
- * resources that persist beyond a single task's lifetime; the handler polls
- * backend ComputeJob endpoints until terminal state.
+ * Launches a budgeted, auto-torn-down compute job via
+ * POST /api/agent/compute-jobs and then PARKS this task on a durable
+ * `compute_job_terminal` wake keyed to the launched job, releasing the agent's
+ * VM/JWT/fleet slot immediately. It does NOT poll the job to completion and it
+ * does NOT interpret the result: the backend monitor accrues cost, enforces the
+ * spend cap and wall-clock deadline, tears the job down, and fires the wake, and
+ * the leader-owned wake-delivery worker finalizes this task through the
+ * compute_experiment completion path. See the note below for the full rationale.
  *
- * Payload specifies compute_type (e.g., "vm", "gpu_job"), resource_config,
- * setup_steps, run_command, and success_criteria (e.g., metric thresholds,
- * exit codes). Used for data-intensive research, training runs, large-scale
- * benchmarks, and other work that exceeds a single Claude Code task budget.
+ * Payload is the launch contract (see `payload_schemas` / the authoring prompts
+ * for the normative schema), whose principal fields are:
+ *   - `command`            — the shell command to run inside a clone of the repo
+ *                            (or `arms: [{name, command}]` for a multi-arm A/B,
+ *                            which additionally requires `declared_metric`).
+ *   - `spend_cap_usd`, `deadline_seconds` — both required and positive.
+ *   - `success_criterion`  — OPTIONAL, in one of two forms: a measured goal
+ *                            `{metric, operator, threshold}`, or
+ *                            `{kind: "artifact_produced", min_file_count: N}`
+ *                            when the run's value IS its durable output. A
+ *                            criterion-free experiment is fully supported.
+ *   - `declared_metric`    — the result key the command writes to
+ *                            `$BLUEPRINT_RESULT_FILE`; used for scoring and arm
+ *                            comparison. It is NOT a liveness signal.
+ *   - `no_progress_timeout_seconds` — arms the stall watchdog. The watchdog
+ *                            polls the MTIME of the file named by
+ *                            `$BLUEPRINT_PROGRESS_FILE` (see PROGRESS_FILE_ENV
+ *                            in backend/app/compute_backends.py) and kills the
+ *                            job with exit code 125 / terminal reason
+ *                            `no_progress_timeout` when it stops advancing. A
+ *                            command paired with this MUST append a JSON line
+ *                            per step to that file.
+ *   - `container_image`, `accelerator`, `machine_type`, `setup_step`,
+ *     `input_artifact_job_id`, `require_durable_artifact`, `cwd`, `env`.
  *
- * Completes with COMPLETED/FAILED based on the compute job's terminal outcome.
+ * Used for data-intensive research, training runs, and large-scale benchmarks
+ * that exceed a single Claude Code task budget.
+ *
+ * Completes with COMPLETED/FAILED based on the compute job's terminal outcome;
+ * killed-by-budget and killed-by-deadline are INTENTIONAL terminal outcomes and
+ * surface as COMPLETED, not crashes.
  */
 
 import type WebSocket from 'ws';
