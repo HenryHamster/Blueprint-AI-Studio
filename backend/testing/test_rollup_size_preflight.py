@@ -66,14 +66,27 @@ def _default_immutable_baseline():
     """Supply a clean synthetic base for tests that use legacy file mocks."""
     async def _archive(paths, *, commit_sha, **_kwargs):
         if commit_sha == _PINNED_HEAD:
+            pr_files = await rollup_size_preflight.get_pr_files("", "", "", 0)
+            changed_paths = {
+                item["filename"]
+                for item in pr_files
+                if isinstance(item, dict) and isinstance(item.get("filename"), str)
+            }
             fetched = {}
             for path in paths:
                 if path == _CAPS_JSON_PATH:
                     fetched[path] = _CAPS_JSON
+                elif path not in changed_paths:
+                    fetched[path] = ""
                 else:
-                    fetched[path] = await rollup_size_preflight.get_file_text_at_ref(
-                        path, ref=commit_sha, **_kwargs
-                    )
+                    try:
+                        fetched[path] = await rollup_size_preflight.get_file_text_at_ref(
+                            path, ref=commit_sha, **_kwargs
+                        )
+                    except StopAsyncIteration:
+                        # The default fixture only scripts changed-file reads;
+                        # newly evaluated untouched caps are clean by default.
+                        fetched[path] = ""
             return fetched
         assert commit_sha == "b" * 40
         return {
@@ -185,6 +198,62 @@ async def test_preflight_without_immutable_base_defers():
 
 
 @pytest.mark.asyncio
+async def test_preflight_without_merge_target_defers():
+    """A base SHA without its merge target cannot authorize a verdict."""
+    result = await _preflight_rollup_size_caps(
+        "tok",
+        "owner",
+        "repo",
+        42,
+        "staging/branch-1",
+        expected_base_sha="b" * 40,
+    )
+
+    assert result.status == "defer"
+    assert result.reason == "size-cap preflight lacks merge target branch"
+
+
+@pytest.mark.asyncio
+async def test_preflight_unavailable_base_archive_defers():
+    """An unavailable exact base archive never becomes absolute breach evidence."""
+    async def _archive(paths, *, commit_sha, **_kwargs):
+        if commit_sha == "b" * 40:
+            return None
+        return {path: ("line\n" * 400) for path in paths}
+
+    with (
+        patch(
+            "app.rollup_size_preflight.get_file_text_at_ref",
+            new_callable=AsyncMock,
+            return_value=_CAPS_JSON,
+        ),
+        patch(
+            "app.rollup_size_preflight.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=_pr_files("backend/app/models.py"),
+        ),
+        patch(
+            "app.rollup_size_preflight.authoritative_texts_at_commit",
+            new_callable=AsyncMock,
+            side_effect=_archive,
+        ),
+    ):
+        result = await _preflight_rollup_size_caps(
+            "tok",
+            "owner",
+            "repo",
+            42,
+            "staging/branch-1",
+            expected_head_sha=_PINNED_HEAD,
+            target_branch="automain",
+            expected_base_sha="b" * 40,
+        )
+
+    assert result.status == "defer"
+    assert "baseline evidence" in (result.reason or "")
+
+
+@pytest.mark.asyncio
 async def test_preflight_breach_auto_bumps_and_returns_bumped():
     """PR file over its cap → auto-bump committed, verdict bumped."""
     file_content = "line\n" * 600  # 600 lines, cap 500
@@ -268,10 +337,19 @@ def _baseline_archive_texts(*, candidate: str, base: str, base_caps: str = _CAPS
     async def _read(paths, *, commit_sha, **_kwargs):
         assert "backend/app/models.py" in paths
         if commit_sha == _PINNED_HEAD:
-            return dict.fromkeys(paths, candidate)
+            return {
+                path: (candidate if path == "backend/app/models.py" else "")
+                for path in paths
+            }
         assert commit_sha == "b" * 40
         return {
-            path: (base_caps if path == _CAPS_JSON_PATH else base)
+            path: (
+                base_caps
+                if path == _CAPS_JSON_PATH
+                else base
+                if path == "backend/app/models.py"
+                else ""
+            )
             for path in paths
         }
     return _read
@@ -302,6 +380,64 @@ async def test_inherited_breach_is_reported_on_ok_verdict():
 
 
 @pytest.mark.asyncio
+async def test_untouched_inherited_breach_is_reported_without_blocking():
+    """Unchanged target debt is visible even when the PR touches another file."""
+    over_cap = "line\n" * 600
+
+    async def _archive(paths, *, commit_sha, **_kwargs):
+        if commit_sha == _PINNED_HEAD:
+            return {
+                path: (over_cap if path == "backend/app/models.py" else "")
+                for path in paths
+            }
+        return {
+            path: (
+                _CAPS_JSON
+                if path == _CAPS_JSON_PATH
+                else over_cap
+                if path == "backend/app/models.py"
+                else ""
+            )
+            for path in paths
+        }
+
+    with (
+        patch(
+            "app.rollup_size_preflight.get_file_text_at_ref",
+            new_callable=AsyncMock,
+            return_value=_CAPS_JSON,
+        ),
+        patch(
+            "app.rollup_size_preflight.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=_pr_files("backend/app/unrelated.py"),
+        ),
+        patch(
+            "app.rollup_size_preflight.authoritative_texts_at_commit",
+            new_callable=AsyncMock,
+            side_effect=_archive,
+        ) as archive_read,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as commit,
+    ):
+        result = await preflight_rollup_size_caps(
+            "tok",
+            "owner",
+            "repo",
+            42,
+            "staging/branch-1",
+            expected_head_sha=_PINNED_HEAD,
+            target_branch="automain",
+            expected_base_sha="b" * 40,
+        )
+
+    assert result.status == "ok"
+    assert result.reason == "inherited breach backend/app/models.py: 600 lines (cap 500)"
+    assert archive_read.await_count == 2
+    assert "backend/app/models.py" in archive_read.await_args_list[0].args[0]
+    commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inherited_breach_is_reported_alongside_new_breach():
     """An introduced breach must not erase inherited debt from the report."""
     candidate = {
@@ -315,9 +451,13 @@ async def test_inherited_breach_is_reported_alongside_new_breach():
 
     async def _archive(paths, *, commit_sha, **_kwargs):
         if commit_sha == _PINNED_HEAD:
-            return {path: candidate[path] for path in paths}
+            return {path: candidate.get(path, "") for path in paths}
         return {
-            path: (_CAPS_JSON if path == _CAPS_JSON_PATH else baseline[path])
+            path: (
+                _CAPS_JSON
+                if path == _CAPS_JSON_PATH
+                else baseline.get(path, "")
+            )
             for path in paths
         }
 

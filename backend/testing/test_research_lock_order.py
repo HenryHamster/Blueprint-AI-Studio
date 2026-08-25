@@ -304,6 +304,7 @@ async def test_prelock_research_reads_never_autoflush_parent_task(
 async def test_post_branch_project_lock_waits_for_task_lock_release(db_session, mocker):
     """The Task-only lock returned by branch setup is released before Project."""
     import app.research_completion as research_completion
+    import app.research_type_routing as research_type_routing
     from test_autonomous_research import (
         _active_direction,
         _make_finding,
@@ -335,7 +336,11 @@ async def test_post_branch_project_lock_waits_for_task_lock_release(db_session, 
 
     phase = {"task_lock_held": False, "release_commits": 0, "project_lock": False}
     real_commit = db_session.commit
-    real_design_lock = research_completion.with_design_doc_locked
+    # The design-doc lock for a routed observation is taken by
+    # research_type_routing, which owns that route. The invariant under test
+    # is unchanged -- the task lock must be released before the project lock
+    # is taken -- only the module that calls the lock has moved.
+    real_design_lock = research_type_routing.with_design_doc_locked
 
     async def _tracked_commit():
         await real_commit()
@@ -357,7 +362,7 @@ async def test_post_branch_project_lock_waits_for_task_lock_release(db_session, 
     mocker.patch.object(db_session, "commit", side_effect=_tracked_commit)
     mocker.patch("app.task_completion._ensure_branch", _return_task_locked)
     mocker.patch.object(
-        research_completion,
+        research_type_routing,
         "with_design_doc_locked",
         side_effect=_assert_released_before_project,
     )
