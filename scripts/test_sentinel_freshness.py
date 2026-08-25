@@ -15,6 +15,12 @@ properties that make the lane worth having:
 * an INHERITED drift never blocks, but is reported as stale guard data on the
   base branch rather than silently swallowed;
 * an unusable current or baseline result fails CLOSED.
+
+Since ``--fix`` there is a fifth: a drifted artifact that carries no decision is
+REGENERATED and then re-verified, while every artifact that does carry one (a
+ratchet, a floor, a snapshot, a cap, a measured duration) is still only
+reported. Reporting alone was what cost three hand-written repair commits in
+three days, each cut after a promotion PR had already gone red.
 """
 
 from __future__ import annotations
@@ -29,11 +35,26 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import sentinel_freshness as lane  # noqa: E402
+from derived_artifact_repair import (  # noqa: E402
+    AUTOREPAIRABLE,
+    MEASUREMENT_TAX_GUIDANCE,
+    NEVER_AUTOREPAIR,
+    RepairOutcome,
+)
 from static_release_guard import SENTINEL_REPAIR_COMMANDS, JUnitReport  # noqa: E402
 
 _EMITTER_SENTINEL = "backend/testing/test_websocket_emitter_inventory.py"
 _EMITTER_SELECTOR = "testing/test_websocket_emitter_inventory.py"
 _EMITTER_ROUTE = "testing/test_websocket_emitter_inventory.py::test_snapshot"
+
+# The one artifact registered as decision-free: a pure report with no consumer
+# but its own guard. Pinned as a literal so a rename of the registry entry
+# cannot quietly move which artifact this lane is allowed to rewrite.
+_QUEUE_SENTINEL = "backend/testing/test_test_estate_ranked_queue.py"
+_QUEUE_ROUTE = (
+    "testing/test_test_estate_ranked_queue.py"
+    "::test_checked_in_queue_ranks_every_collected_test_file"
+)
 
 
 def _completed(returncode: int) -> subprocess.CompletedProcess[str]:
@@ -54,6 +75,9 @@ def _install_fakes(
     current_exit: int,
     baseline_exit: int = 0,
     baseline_raises: bool = False,
+    repaired: JUnitReport | None = None,
+    repaired_exit: int = 0,
+    repair_outcome: RepairOutcome | None = None,
 ) -> dict[str, list]:
     """Drive the lane without booting the real pytest harness.
 
@@ -61,7 +85,7 @@ def _install_fakes(
     harness runs reported). Selection, attribution and the block/report decision
     stay real, so a mutation to any of them shows up in these tests.
     """
-    calls: dict[str, list] = {"corpus": [], "extracted": []}
+    calls: dict[str, list] = {"corpus": [], "extracted": [], "repaired": []}
 
     monkeypatch.setattr(lane, "_changed_files", lambda repo, base: list(changed))
     monkeypatch.setattr(lane, "_base_ref", lambda repo, base: f"origin/{base}")
@@ -76,15 +100,48 @@ def _install_fakes(
 
     monkeypatch.setattr(lane, "_extract_base", _fake_extract)
 
+    def _fake_repair(repo, sentinels):
+        selected = tuple(sorted(sentinels))
+        calls["repaired"].append(selected)
+        if repair_outcome is not None:
+            return repair_outcome
+        return RepairOutcome(repaired=selected)
+
+    monkeypatch.setattr(lane, "repair_sentinels", _fake_repair)
+
+    def _phase() -> str:
+        """Which of the up-to-three harness runs this call is.
+
+        Order is current -> post-repair re-run (only when a repair ran) ->
+        base. Deriving it from the call log rather than from the parser's
+        ``label`` keeps the fakes honest about a repair that never happened.
+        """
+        if not calls["corpus"]:
+            return "current"
+        if calls["repaired"] and len(calls["corpus"]) == 1:
+            return "repaired"
+        return "base"
+
     def _fake_corpus(repo, junit, *, selectors=None):
-        calls["corpus"].append((Path(repo).name, tuple(selectors or ())))
-        return _completed(current_exit if len(calls["corpus"]) == 1 else baseline_exit)
+        phase = _phase()
+        calls["corpus"].append((Path(repo).name, tuple(selectors or ()), phase))
+        return _completed(
+            {
+                "current": current_exit,
+                "repaired": repaired_exit,
+                "base": baseline_exit,
+            }[phase]
+        )
 
     monkeypatch.setattr(lane, "_run_static_corpus", _fake_corpus)
 
     def _fake_parse(path, *, tree_root=None, label=""):
-        if label == "current":
+        phase = calls["corpus"][-1][2]
+        if phase == "current":
             return current
+        if phase == "repaired":
+            assert repaired is not None
+            return repaired
         if baseline_raises:
             raise RuntimeError("baseline junit is unreadable")
         assert baseline is not None
@@ -158,7 +215,7 @@ def test_the_current_run_is_scoped_to_the_selected_sentinels(
 
     lane._run_lane(REPO_ROOT, "automain")
 
-    (_tree, selectors) = calls["corpus"][0]
+    (_tree, selectors, _phase) = calls["corpus"][0]
     assert _EMITTER_SELECTOR in selectors
     # Harness form, not registry form: the harness runs pytest with cwd=backend.
     assert _EMITTER_SENTINEL not in selectors
@@ -265,36 +322,308 @@ def test_an_unresolvable_base_ref_fails_closed(
     assert "refusing to report clean without a baseline" in capsys.readouterr().err
 
 
-def test_the_lane_reports_drift_and_never_repairs_it() -> None:
-    """A guard that regenerates its own evidence is not a guard.
+def test_repair_is_opt_in_and_never_runs_without_fix(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``--fix`` the lane is exactly what it was: report only.
 
-    The repair command is printed for a human to run in a reviewable diff; the
-    lane itself must never invoke a regenerator.
+    Replaces an earlier source-text assertion that the strings ``--fix`` and
+    ``--write`` appeared nowhere in this module. That form could only ever
+    describe the default path, and any rename defeated it. This asserts the
+    behaviour instead: the regenerator is not merely un-named, it is not called.
     """
 
-    source = (REPO_ROOT / "scripts" / "sentinel_freshness.py").read_text(
-        encoding="utf-8"
+    calls = _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_new_thing.py"],
+        current=JUnitReport(failures={_QUEUE_ROUTE: "1181 ranked, 1182 collected"}),
+        baseline=JUnitReport(),
+        current_exit=1,
     )
 
-    assert "--fix" not in source
-    assert "--write" not in source
+    assert lane._run_lane(REPO_ROOT, "automain") == 1
+    assert calls["repaired"] == []
 
 
-def test_the_developer_gate_runs_this_lane_on_the_lint_only_path() -> None:
-    """``./check`` with no ``test`` argument must still enforce freshness.
+def test_only_decision_free_artifacts_are_registered_as_auto_repairable() -> None:
+    """A guard that regenerates its own evidence is not a guard.
+
+    That rule still holds for every artifact that encodes a DECISION -- a
+    ratchet, a floor, a snapshot, a cap -- and for every MEASUREMENT no
+    checkout can reproduce. The single admitted exception is a pure report:
+    derived from the tree, read by no consumer but its own guard, so
+    regenerating it discards no review signal.
+
+    Each exclusion is pinned by literal name. If a later change wants one of
+    these regenerated automatically, that is a decision to argue for in review,
+    not a line to delete quietly.
+    """
+
+    assert set(AUTOREPAIRABLE) == {_QUEUE_SENTINEL}
+
+    for sentinel in (
+        "backend/testing/test_test_durations_freshness.py",
+        "backend/testing/test_vitest_durations_freshness.py",
+        "backend/testing/test_conversational_workday_protection.py",
+        "backend/testing/test_event_type_invariants.py",
+        "backend/testing/test_websocket_emitter_inventory.py",
+        "backend/testing/test_operator_workbench_contracts.py",
+    ):
+        assert sentinel not in AUTOREPAIRABLE
+        assert NEVER_AUTOREPAIR.get(sentinel), (
+            f"{sentinel} is excluded from auto-repair but records no reason; "
+            "an unexplained exclusion is one nobody can review"
+        )
+
+    # Every auto-repairable sentinel must ALSO keep its human-facing repair
+    # hint, so a failure that survives the repair still tells a person what to
+    # run, and the two registries cannot describe different commands.
+    for sentinel, entry in AUTOREPAIRABLE.items():
+        hint = SENTINEL_REPAIR_COMMANDS[sentinel]
+        assert entry.script in hint
+        for argument in entry.args:
+            assert argument in hint
+
+
+def test_a_ratchet_sentinel_is_reported_and_never_regenerated(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--fix`` must not become a blanket regenerate-everything switch."""
+
+    calls = _install_fakes(
+        monkeypatch,
+        changed=["backend/app/anything.py"],
+        current=JUnitReport(failures={_EMITTER_ROUTE: "inventory mismatch"}),
+        baseline=JUnitReport(),
+        current_exit=1,
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 1
+    # The emitter sentinel is a reviewed snapshot: no repair is attempted at
+    # all, and the block still names the hand command.
+    assert calls["repaired"] == []
+    assert SENTINEL_REPAIR_COMMANDS[_EMITTER_SENTINEL] in capsys.readouterr().err
+
+
+def test_new_drift_in_a_pure_report_is_regenerated_and_reverified(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The #17936 shape: a test file added without regenerating the queue."""
+
+    calls = _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_filter_malformed_payload.py"],
+        current=JUnitReport(failures={_QUEUE_ROUTE: "1181 ranked, 1182 collected"}),
+        baseline=JUnitReport(),
+        current_exit=1,
+        repaired=JUnitReport(),
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 0
+    assert calls["repaired"] == [(_QUEUE_SENTINEL,)]
+    # Re-verified, not asserted: the repair is followed by a real re-run of the
+    # sentinel it claims to have healed.
+    assert [entry[2] for entry in calls["corpus"]] == ["current", "repaired"]
+    assert calls["corpus"][1][1] == ("testing/test_test_estate_ranked_queue.py",)
+    output = capsys.readouterr()
+    assert "SELF-HEALED" in output.err
+    assert "test-estate-ranked-queue.md" in output.out + output.err
+
+
+def test_inherited_drift_in_a_pure_report_is_healed_not_merely_reported(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fleet-level property, and the reason this fix is structural.
+
+    Inherited drift warn-passes, so before ``--fix`` nothing on any branch ever
+    repaired the integration branch and the promotion matrix was the first
+    thing to fail-close on it. Healing happens before attribution, so this case
+    needs no baseline at all: the repair rides out on whichever PR next touches
+    the surface.
+    """
+
+    calls = _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_new_thing.py"],
+        current=JUnitReport(failures={_QUEUE_ROUTE: "1181 ranked, 1182 collected"}),
+        baseline=JUnitReport(failures={_QUEUE_ROUTE: "1181 ranked, 1182 collected"}),
+        current_exit=1,
+        baseline_exit=1,
+        repaired=JUnitReport(),
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 0
+    assert calls["extracted"] == [], (
+        "a healed sentinel must not pay for a base tree just to learn whose "
+        "drift it was"
+    )
+    assert "SELF-HEALED" in capsys.readouterr().err
+
+
+def test_a_repair_that_does_not_clear_the_drift_still_blocks(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Never take the regenerator's word for it.
+
+    A generator can exit 0 and leave the guard failing -- the failure was not
+    staleness. Crediting the repair on its exit code alone would convert this
+    guard into one that cannot fail.
+    """
+
+    _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_new_thing.py"],
+        current=JUnitReport(failures={_QUEUE_ROUTE: "1181 ranked, 1182 collected"}),
+        baseline=JUnitReport(),
+        current_exit=1,
+        repaired=JUnitReport(failures={_QUEUE_ROUTE: "still 1181 ranked"}),
+        repaired_exit=1,
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 1
+    assert "this change leaves derived guard data stale" in capsys.readouterr().err
+
+
+def test_a_generator_that_cannot_run_fails_the_lane_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unrunnable regenerator must never be reported as a repair."""
+
+    _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_new_thing.py"],
+        current=JUnitReport(failures={_QUEUE_ROUTE: "1181 ranked, 1182 collected"}),
+        baseline=JUnitReport(),
+        current_exit=1,
+        repair_outcome=RepairOutcome(failed={_QUEUE_SENTINEL: "exited 2"}),
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 1
+    assert "a registered generator could not be run" in capsys.readouterr().err
+
+
+def test_an_unattributable_post_repair_run_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A re-run that proves nothing must not be allowed to clear a failure."""
+
+    _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_new_thing.py"],
+        current=JUnitReport(failures={_QUEUE_ROUTE: "1181 ranked, 1182 collected"}),
+        baseline=JUnitReport(),
+        current_exit=1,
+        repaired=JUnitReport(),
+        repaired_exit=2,
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 1
+    assert "post-repair sentinel run is not attributable" in capsys.readouterr().err
+
+
+def test_healing_one_sentinel_never_clears_another(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A mixed failure must keep the un-repairable half blocking."""
+
+    _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_new_thing.py", "backend/app/anything.py"],
+        current=JUnitReport(
+            failures={
+                _QUEUE_ROUTE: "1181 ranked, 1182 collected",
+                _EMITTER_ROUTE: "inventory mismatch",
+            }
+        ),
+        baseline=JUnitReport(),
+        current_exit=1,
+        repaired=JUnitReport(),
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 1
+    err = capsys.readouterr().err
+    assert "SELF-HEALED" in err
+    assert _EMITTER_ROUTE in err
+
+
+def test_a_measurement_sentinel_is_told_what_NOT_to_do_instead(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The new-file tax needs different words from ordinary drift.
+
+    Adding a test file leaves the durations artifacts with no entry for it, and
+    the honest repair is a 15-20 minute timed run nobody can do from a task VM.
+    A bare "regenerate it" then reads as an instruction to produce the artifact
+    by any means -- and the two cheapest means are deleting the new test (test
+    erosion is one of the two weights this repo scores releases on) or
+    hand-writing a duration (which marks the file covered forever so nothing
+    ever measures it). Both were observed; the block says so.
+    """
+
+    durations = "backend/testing/test_test_durations_freshness.py"
+    _install_fakes(
+        monkeypatch,
+        changed=["backend/.test_durations"],
+        current=JUnitReport(
+            failures={
+                "testing/test_test_durations_freshness.py"
+                "::test_durations_coverage_fraction_within_threshold": (
+                    "introduced 1 uncovered test file(s)"
+                )
+            }
+        ),
+        baseline=JUnitReport(),
+        current_exit=1,
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 1
+    err = capsys.readouterr().err
+    assert MEASUREMENT_TAX_GUIDANCE[durations] in err
+    assert "test erosion" in err
+
+
+def test_a_repairable_sentinel_carries_no_measurement_note(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The note is for artifacts a checkout cannot produce, not for all of them."""
+
+    _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_new_thing.py"],
+        current=JUnitReport(failures={_QUEUE_ROUTE: "1181 ranked, 1182 collected"}),
+        baseline=JUnitReport(),
+        current_exit=1,
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain") == 1
+    assert "note:" not in capsys.readouterr().err
+
+
+def test_the_developer_gate_runs_this_lane_on_every_path_before_the_corpus() -> None:
+    """``./check`` must enforce -- and repair -- freshness in BOTH modes.
 
     The developer host has no ``./pr open``: ``scripts/check-default.sh`` is the
     only in-repo publication gate it has, and before this lane its always-on
     portion covered exactly one derived artifact (the size cap ledger).
+
+    Two structural properties, both load-bearing:
+
+    * the lane is NOT nested under a ``WITH_TESTS`` branch, so the lint-only
+      path enforces it and the ``./check test`` path repairs on it;
+    * it runs BEFORE the static corpus. Under ``./check test`` the corpus runs
+      the whole roster, so a repair applied after it would be graded against
+      the pre-repair tree and fail the gate anyway.
     """
 
     gate = (REPO_ROOT / "scripts" / "check-default.sh").read_text(encoding="utf-8")
 
-    assert "python3 scripts/sentinel_freshness.py" in gate
+    assert "python3 scripts/sentinel_freshness.py --fix" in gate
     invocation = gate.index("python3 scripts/sentinel_freshness.py")
-    guard = gate.rindex('if [ "$WITH_TESTS" != "1" ]; then', 0, invocation)
-    # The lane must sit under the NOT-with-tests guard: under ``./check test``
-    # the attributed corpus already runs the whole roster.
-    assert 'if [ "$WITH_TESTS" = "1" ]; then' not in gate[guard:invocation]
+    opener = gate.rindex("source scripts/backend-test-route.sh", 0, invocation)
+    assert 'WITH_TESTS' not in gate[opener:invocation], (
+        "the freshness lane must run on both ./check and ./check test; a "
+        "WITH_TESTS branch above it is how it stops covering the lint-only path"
+    )
+    assert invocation < gate.index("python3 scripts/static_release_guard.py")
     # And its absence must fail closed rather than silently skip the gate.
     assert 'FAILED+=("sentinel freshness helper missing")' in gate
