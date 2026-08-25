@@ -63,6 +63,9 @@ from app.models import (
 )
 from app.schemas import serialize_compute_job_response_safe
 from app.time_utils import _utcnow
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
+
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ---------------------------------------------------------------------------
@@ -197,31 +200,14 @@ def test_build_local_wrapper_command_injects_progress_file_env():
 # ---------------------------------------------------------------------------
 
 
-def _resolve_scripts_dir():
-    candidates = []
-    env_override = os.getenv("BLUEPRINT_SCRIPTS_DIR")
-    if env_override:
-        candidates.append(env_override)
-    candidates.append("/repo/scripts")
-    candidates.append(
-        os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-    )
-    for path in candidates:
-        if os.path.isfile(os.path.join(path, "local_runner.py")):
-            return path
-    return None
-
-
 def _import_local_runner():
-    scripts_dir = _resolve_scripts_dir()
+    scripts_dir, unavailable = resolve_scripts_dir_from_env(_BACKEND_DIR)
     if scripts_dir is None:
-        msg = (
-            "scripts/local_runner.py not available "
-            "(checked BLUEPRINT_SCRIPTS_DIR, /repo/scripts, ../../scripts)"
-        )
+        # Report the resolver's NAMED reason (every candidate probed plus both
+        # escape hatches) rather than a restatement that can drift from it.
         if os.getenv("CI"):
-            pytest.fail(msg + " — refusing to skip in CI")
-        pytest.skip(msg)
+            pytest.fail(unavailable + " — refusing to skip in CI")
+        pytest.skip(unavailable)
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
     try:

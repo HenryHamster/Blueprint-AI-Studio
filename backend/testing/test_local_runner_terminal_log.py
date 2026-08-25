@@ -18,31 +18,47 @@ import os
 
 import pytest
 
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
-def _resolve_local_runner_path() -> "str | None":
-    """Locate ``scripts/local_runner.py`` across local + Docker test environments.
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+_LOCAL_RUNNER_ENV = "BLUEPRINT_LOCAL_RUNNER_PY"
 
-    Candidates, in order: explicit env override, the ``/repo`` bind-mount
-    (``scripts/test-backend.sh`` mounts the repo root read-only at ``/repo``
-    in its Docker harness), then the repo root two levels above this file
-    (plain checkouts and non-Docker runs).
+
+def _resolve_local_runner_path() -> "tuple[str | None, str]":
+    """Locate ``scripts/local_runner.py``, or return the NAMED reason it is absent.
+
+    The file-level ``BLUEPRINT_LOCAL_RUNNER_PY`` override is honoured first and
+    still points straight at a script. Everything below it is delegated to the
+    shared ``resolve_scripts_dir_from_env`` (backend/testing/repo_scripts_path.py)
+    so the candidate order, the ``/repo`` bind-mount constant and the sentinel
+    check live in ONE place instead of being re-typed per module. The old copy
+    here probed the same three locations by hand, which is correct only for as
+    long as nobody edits one copy and not the others.
+
+    Returns ``(path, "")`` on a hit and ``(None, reason)`` on a miss; the reason
+    is the resolver's own, naming every candidate it probed.
     """
-    candidates = []
-    env_override = os.getenv("BLUEPRINT_LOCAL_RUNNER_PY")
+    env_override = os.getenv(_LOCAL_RUNNER_ENV)
     if env_override:
-        candidates.append(env_override)
-    candidates.append("/repo/scripts/local_runner.py")
-    candidates.append(
-        os.path.normpath(
-            os.path.join(
-                os.path.dirname(__file__), "..", "..", "scripts", "local_runner.py"
-            )
+        if os.path.isfile(env_override):
+            return os.path.normpath(env_override), ""
+        return None, (
+            f"{_LOCAL_RUNNER_ENV}={env_override!r} does not name a file"
         )
+    scripts_dir, unavailable = resolve_scripts_dir_from_env(_BACKEND_DIR)
+    if scripts_dir is None:
+        return None, unavailable
+    candidate = os.path.join(scripts_dir, "local_runner.py")
+    if os.path.isfile(candidate):
+        return candidate, ""
+    # The scripts tree resolved (it carries the shared sentinel) and the script
+    # this guard reads is not in it. That is a BROKEN checkout, not an absent
+    # one, and it must not read as "nothing to check" (#17872).
+    return None, (
+        f"{scripts_dir} is the repo scripts/ tree (it carries the resolver "
+        f"sentinel) but local_runner.py is not in it — the scripts tree is "
+        f"present and broken, not missing"
     )
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
 
 
 def _require_local_runner_path() -> str:
@@ -51,19 +67,14 @@ def _require_local_runner_path() -> str:
     A silent skip in the promotion CI means the terminal-evidence invariant
     never enforces; only ad-hoc environments without the checkout may skip.
     """
-    path = _resolve_local_runner_path()
+    path, unavailable = _resolve_local_runner_path()
     if path is not None:
         return path
-    msg = (
-        "scripts/local_runner.py not available in this test environment "
-        "(checked BLUEPRINT_LOCAL_RUNNER_PY, the /repo bind-mount that "
-        "scripts/test-backend.sh provides, and ../../scripts relative to "
-        "this file)"
-    )
+    msg = f"scripts/local_runner.py not available in this test environment: {unavailable}"
     if os.getenv("CI"):
         pytest.fail(
             msg + " — refusing to skip in CI: mount the repo root at /repo "
-            "or set BLUEPRINT_LOCAL_RUNNER_PY so this invariant enforces"
+            f"or set {_LOCAL_RUNNER_ENV} so this invariant enforces"
         )
     pytest.skip(msg)
 

@@ -35,15 +35,31 @@ from testing.fixgate_attribution import (
     parse_junit_report,
     test_route_coverage_gaps as route_coverage_gaps,
 )
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if not (_REPO_ROOT / "check").exists() and Path("/repo/check").exists():
     _REPO_ROOT = Path("/repo")
 _CHECK = _REPO_ROOT / "check"
-_DEFAULT_CHECK = _REPO_ROOT / "scripts" / "check-default.sh"
-_ROUTE_HELPER = _REPO_ROOT / "scripts" / "backend-test-route.sh"
 
-sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+# The repo root above is resolved by probing for the tracked ``check`` gate,
+# which is the right sentinel for ``check`` and says nothing about ``scripts/``.
+# This module got the scripts dir right by ACCIDENT of the two happening to
+# coincide, and its import-time sys.path insert is what made several other
+# modules' broken fixed walks appear to work whenever pytest collected this
+# file first. Resolve scripts/ on its own terms, and fail with the NAMED reason
+# instead of inserting a path that may not exist and letting the import below
+# die as a bare ModuleNotFoundError.
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+_SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(_BACKEND_DIR)
+if _SCRIPTS_DIR is None:
+    raise RuntimeError(_SCRIPTS_DIR_UNAVAILABLE)
+_SCRIPTS_ROOT = Path(_SCRIPTS_DIR)
+_DEFAULT_CHECK = _SCRIPTS_ROOT / "check-default.sh"
+_ROUTE_HELPER = _SCRIPTS_ROOT / "backend-test-route.sh"
+
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 static_release_guard = importlib.import_module("static_release_guard")
 
 
@@ -499,7 +515,7 @@ def test_merge_affected_backend_tests_run_through_the_attributed_lane(
         backend / "testing" / "fixgate_attribution.py",
     )
     shutil.copy2(
-        _REPO_ROOT / "scripts" / "backend_verification_guard.py",
+        _SCRIPTS_ROOT / "backend_verification_guard.py",
         scripts / "backend_verification_guard.py",
     )
     (scripts / "backend-test-route.sh").write_text(
@@ -611,7 +627,7 @@ def test_inherited_failure_that_stops_reproducing_does_not_block_a_green_diff(
     for source, destination in (
         (_REPO_ROOT / "backend" / "testing" / "impacted_tests.py", backend / "testing" / "impacted_tests.py"),
         (_REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py", backend / "testing" / "fixgate_attribution.py"),
-        (_REPO_ROOT / "scripts" / "backend_verification_guard.py", scripts / "backend_verification_guard.py"),
+        (_SCRIPTS_ROOT / "backend_verification_guard.py", scripts / "backend_verification_guard.py"),
     ):
         shutil.copy2(source, destination)
     (scripts / "backend-test-route.sh").write_text(
@@ -1057,7 +1073,7 @@ def test_attributed_gate_names_unavailable_baseline_and_blocks(tmp_path: Path) -
     result = subprocess.run(
         [
             sys.executable,
-            str(_REPO_ROOT / "scripts" / "backend_verification_guard.py"),
+            str(_SCRIPTS_ROOT / "backend_verification_guard.py"),
             "--base",
             "missing-base",
             "--repo-root",
@@ -1105,7 +1121,7 @@ def test_rendered_gate_carries_all_matched_sentinels_past_ordinary_cap(tmp_path:
         backend / "testing" / "drift_sentinel_surfaces.json",
     )
     shutil.copy2(
-        _REPO_ROOT / "scripts" / "backend_verification_guard.py",
+        _SCRIPTS_ROOT / "backend_verification_guard.py",
         scripts / "backend_verification_guard.py",
     )
     (scripts / "backend-test-route.sh").write_text(
