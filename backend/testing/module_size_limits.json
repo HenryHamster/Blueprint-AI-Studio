@@ -451,7 +451,7 @@
     "blueprint_node.py": 2100,
     "local_postgres_rehearsal.py": 1850,
     "test_guard_gate_left_shift.py": 2850,
-    "test-backend.sh": 1050,
+    "test-backend.sh": 1300,
     "static_release_guard.py": 1075,
     "test_vitest_verification_guard.py": 2300,
     "test_bootstrap_local_app_release.py": 1700

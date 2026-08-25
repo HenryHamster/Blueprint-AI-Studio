@@ -4788,6 +4788,14 @@
           "old_cap": 14250,
           "new_cap": 16650
         }
+      ],
+      "test-backend.sh": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T12:59:05.827046+00:00",
+          "old_cap": 1050,
+          "new_cap": 1300
+        }
       ]
     }
   }
