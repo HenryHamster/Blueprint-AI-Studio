@@ -84,6 +84,47 @@ class VerificationToolchain:
         return os.path.dirname(os.path.dirname(self.python_path))
 
 
+# Env var a compute command may rely on for "the interpreter the PLATFORM
+# guarantees works, with a functioning pip". Every imageless (bwrap) compute job
+# gets this; an authored command must never have to hand-roll its own bootstrap.
+COMPUTE_PYTHON_ENV_KEY = "BLUEPRINT_PYTHON"
+COMPUTE_PIP_ENV_KEY = "BLUEPRINT_PIP"
+# In-sandbox path of the per-job virtualenv the runner materialises under the
+# job workspace. Writable, disposable with the job, and isolated from every
+# other job on the host (a shared writable runtime would let concurrent
+# experiments install conflicting dependency sets over each other).
+COMPUTE_VENV_ENV_KEY = "BLUEPRINT_VENV"
+# Directory name of that per-job venv inside the job workspace.
+COMPUTE_JOB_VENV_DIRNAME = ".bp-venv"
+
+
+@dataclass(frozen=True)
+class ComputePythonRuntime:
+    """A host interpreter with a PROVEN-working pip, shared by compute jobs.
+
+    Provisioned once per host by the runner (``local_runner._bootstrap_compute
+    _runtime``) and cached across jobs. ``root`` is read-only bound into the
+    imageless sandbox; ``site_packages`` is linked into each job's own writable
+    venv through a ``.pth`` file so pip is importable there without shadowing
+    anything the job installs for itself.
+    """
+
+    python_path: str
+    site_packages: str
+    base_python: str
+    python_version: str
+    pip_version: str
+    provisioner: str
+
+    @property
+    def bin_dir(self) -> str:
+        return os.path.dirname(self.python_path)
+
+    @property
+    def root(self) -> str:
+        return os.path.dirname(self.bin_dir)
+
+
 # ── Env allowlists (never os.environ.copy) ───────────────────────────────────
 
 # Provider creds + LLM config an AGENT task legitimately needs. Mirrors the
@@ -1429,6 +1470,7 @@ def build_compute_env(
     job_env: dict[str, str],
     injected: dict[str, str],
     source_env: dict[str, str],
+    tool_dirs: list[str] | None = None,
 ) -> dict[str, str]:
     """Build a compute job's env: passthrough allowlist + declared env + injected.
 
@@ -1436,6 +1478,15 @@ def build_compute_env(
     sees those keys) and never a full os.environ copy. ``injected`` =
     BLUEPRINT_RESULT_FILE, BLUEPRINT_ARTIFACT_DIR, BLUEPRINT_PROGRESS_FILE,
     CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES, PYTHONPATH, HOME.
+
+    PATH is rebuilt from ``tool_dirs`` exactly as :func:`build_agent_env` does.
+    Before that it was hardcoded to :data:`_DEFAULT_SANDBOX_PATH`, so the
+    sandbox bound the host's ``python3``/``uv``/``git`` into the jail and then
+    left their directories OFF PATH — the imageless compute lane's single most
+    common terminal log was ``no working pip found (tried "-m pip" and PATH)``
+    alongside exit-127 (command not found) and exit-126 (not executable). A
+    job-declared PATH is preserved but appended AFTER the bound tool dirs, so a
+    command cannot shadow the runtime the platform guarantees it.
     """
     env: dict[str, str] = {}
     for key in COMPUTE_ENV_PASSTHROUGH:
@@ -1444,7 +1495,10 @@ def build_compute_env(
             env[key] = val
     env.update({k: str(v) for k, v in job_env.items()})
     env.update({k: v for k, v in injected.items() if v is not None})
-    env.setdefault("PATH", _DEFAULT_SANDBOX_PATH)
+    declared_path = env.get("PATH") or ""
+    env["PATH"] = _sandbox_path(
+        [*(tool_dirs or []), *[d for d in declared_path.split(":") if d]]
+    )
     env.setdefault("HOME", SANDBOX_HOME)
     for forbidden in COMPUTE_FORBIDDEN_ENV_KEYS:
         env.pop(forbidden, None)
@@ -2410,6 +2464,8 @@ def plan_compute_execution(
     cpu_limit: str | None = None,
     mem_limit: str | None = None,
     allow_host_fallback: bool = False,
+    python_runtime: "ComputePythonRuntime | None" = None,
+    job_venv_host: str | None = None,
 ) -> ExecutionPlan:
     """Build the sandbox plan for a compute job, or DECLINE (fail-closed).
 
@@ -2423,6 +2479,15 @@ def plan_compute_execution(
     When ``image`` is set but no container runtime is available, the job is DECLINED
     by default.  Set ``allow_host_fallback=True`` in the launch contract to permit
     an explicit imageless bwrap fallback (reproducibility trade-off; operator opt-in).
+
+    ``python_runtime`` is the host-cached interpreter-with-pip the runner
+    established BEFORE the command starts; ``job_venv_host`` is the per-job
+    writable venv it materialised under ``workspace_host``. Both apply to the
+    imageless (bwrap) lane only — a container image ships its own interpreter.
+    Together they are the platform's Python contract: ``BLUEPRINT_PYTHON`` /
+    ``BLUEPRINT_PIP`` / ``BLUEPRINT_VENV`` in the env and the venv's ``bin`` at
+    the FRONT of PATH, so ``python``, ``python3``, ``pip`` and ``pip3`` all
+    resolve without the authored command bootstrapping anything.
     """
     has_image = bool(image)
     backend = decide_compute_backend(caps, has_image, allow_host_fallback=allow_host_fallback)
@@ -2590,7 +2655,32 @@ def plan_compute_execution(
                 for lib in nvidia_driver_libs(ldconfig_output)
                 if not _covered_by(lib, ("/usr", "/lib", "/lib64", "/lib32"))
             ]
-    env = build_compute_env(job_env, injected, source_env)
+    # Platform Python contract (imageless lane). The runtime venv lives outside
+    # the wholesale /usr bind (under the runner's ~/.blueprint), so bind it
+    # read-only; the per-job venv rides the workspace bind and stays writable.
+    tool_dirs: list[str] = []
+    if python_runtime is not None:
+        ro_binds.append(python_runtime.root)
+        ro_binds.append(os.path.realpath(python_runtime.base_python))
+        job_venv_in = _rel_to_sandbox(job_venv_host, workspace_host, SANDBOX_WORKSPACE)
+        if job_venv_in:
+            tool_dirs.append(f"{job_venv_in}/bin")
+            injected[COMPUTE_VENV_ENV_KEY] = job_venv_in
+            injected["VIRTUAL_ENV"] = job_venv_in
+            injected[COMPUTE_PYTHON_ENV_KEY] = f"{job_venv_in}/bin/python"
+            injected[COMPUTE_PIP_ENV_KEY] = f"{job_venv_in}/bin/pip"
+        else:
+            # No per-job venv could be materialised: fall back to the shared
+            # read-only runtime. Read-only ``pip install`` fails, but a working
+            # interpreter is still strictly better than none.
+            tool_dirs.append(python_runtime.bin_dir)
+            injected[COMPUTE_PYTHON_ENV_KEY] = python_runtime.python_path
+            # POSIX join on purpose: these are in-sandbox Linux paths even when
+            # the unit tests run on Windows (os.path.join would emit a "\").
+            injected[COMPUTE_PIP_ENV_KEY] = f"{python_runtime.bin_dir}/pip"
+        injected.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    tool_dirs += tool_dirs_for(tools)
+    env = build_compute_env(job_env, injected, source_env, tool_dirs)
     cwd_in = (
         _rel_to_sandbox(cwd_host, workspace_host, SANDBOX_WORKSPACE)
         if cwd_host

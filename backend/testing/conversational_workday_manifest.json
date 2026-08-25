@@ -331,7 +331,7 @@
         "TestProbeLlmClis::test_agent_plan_probe_uses_exact_bwrap_boundary",
         "TestProbeLlmClis::test_agent_plan_probe_reports_sandbox_missing_resident_flag"
       ],
-      "test_count": 177
+      "test_count": 184
     },
     {
       "path": "scripts/test_local_runner.py",
@@ -339,7 +339,7 @@
       "test_ids": [
         "TestLlmCliBackendProbe::test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ],
-      "test_count": 679
+      "test_count": 706
     },
     {
       "path": "agent/src/index.provider-runner.test.ts",
