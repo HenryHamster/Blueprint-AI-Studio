@@ -1,7 +1,7 @@
 {
   "_meta": {
     "suite": "agent",
-    "generated": "2026-08-25T15:13:29.454Z",
+    "generated": "2026-08-25T18:13:21.416Z",
     "runs": 1,
     "flake_detection": false
   },
@@ -416,6 +416,13 @@
       "file": "src/handlers/design.test.ts",
       "duration_ms": 45,
       "tests": 36,
+      "measured": true,
+      "flaky": false
+    },
+    {
+      "file": "src/prompts/compute-progress-contract.test.ts",
+      "duration_ms": 45,
+      "tests": 14,
       "measured": true,
       "flaky": false
     },
