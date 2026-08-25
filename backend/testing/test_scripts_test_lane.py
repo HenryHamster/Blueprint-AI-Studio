@@ -247,6 +247,20 @@ _FILE_BUDGET_SECONDS_OVERRIDES = {
     # both present, which is why 25s has held so far -- on an image that has
     # them it would blow the per-file budget instead of running. 180 + 60.
     "test_runner_isolation.py": 240,
+    # Real end-to-end compute-substrate checks: they build a throwaway Docker
+    # image and run a container to prove `blueprint compute run` honours a
+    # spec's image and setup_step. Measured 49.1s and 73.8s under CI conditions
+    # (docker-dependent tests deselected), so the 25s default is not
+    # survivable, and this file is deliberately NOT in test-backend.sh's
+    # CI_SCRIPT_TEST_EXEMPTIONS -- the static half of it must keep running.
+    #
+    # As with the two entries above, the number is sized by the largest marker
+    # in the file rather than by the measurement: three tests carry
+    # @pytest.mark.timeout(300), so the per-file budget must clear 300 + the
+    # same 60s grace the layers below use, or the marker promises headroom this
+    # wrapper would refuse to honour. 360 also leaves ~5x headroom over the
+    # slower measurement for a loaded 2-vCPU CI runner.
+    "test_blueprint_compute_local.py": 360,
 }
 
 # CI's sharded pytest invocation passes ``--timeout=30`` (pytest-timeout), which

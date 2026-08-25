@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 636 | 995,189 | 26,488 | 11,015.490s (630 files) | 6 |
+| backend | 636 | 995,391 | 26,490 | 11,015.490s (630 files) | 6 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 127 | 112,283 | 6,135 | 466.593s (127 files) | 0 |
@@ -30,7 +30,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 6 | P2 | backend | `backend/testing/test_reaper.py` | 21,152 | 492 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 492 |
 | 7 | P2 | backend | `backend/testing/test_research_completion.py` | 23,914 | 531 | critical (>5000 LOC) | 137.469s measured | — |
 | 8 | P2 | backend | `backend/testing/test_autonomous_research.py` | 20,226 | 393 | critical (>5000 LOC) | 125.162s measured | — |
-| 9 | P2 | backend | `backend/testing/test_invariants.py` | 15,614 | 276 | critical (>5000 LOC) | 120.389s measured | — |
+| 9 | P2 | backend | `backend/testing/test_invariants.py` | 15,802 | 278 | critical (>5000 LOC) | 120.389s measured | — |
 | 10 | P2 | backend | `backend/testing/test_local_runner.py` | 14,057 | 348 | critical (>5000 LOC) | 111.153s measured | — |
 | 11 | P2 | backend | `backend/testing/test_digest.py` | 11,003 | 231 | critical (>5000 LOC) | 86.555s measured | — |
 | 12 | P2 | backend | `backend/testing/test_directions.py` | 11,762 | 339 | critical (>5000 LOC) | 79.334s measured | — |
@@ -213,7 +213,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 189 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.utils.test.ts` | 1,622 | 168 | moderate (1500–2999 LOC) | 0.063s measured | — |
 | 190 | P5 | backend | `backend/testing/test_artifact_refs.py` | 1,546 | 29 | moderate (1500–2999 LOC) | 0.036s measured | — |
 | 191 | P5 | agent | `agent/src/prompt.format.test.ts` | 1,512 | 102 | moderate (1500–2999 LOC) | 0.032s measured | — |
-| 192 | G | backend | `backend/testing/test_scripts_test_lane.py` | 349 | 3 | under 1500 LOC | 208.064s measured | — |
+| 192 | G | backend | `backend/testing/test_scripts_test_lane.py` | 363 | 3 | under 1500 LOC | 208.064s measured | — |
 | 193 | G | backend | `backend/testing/test_task_outcomes.py` | 1,375 | 108 | under 1500 LOC | 187.368s measured | — |
 | 194 | G | backend | `backend/testing/test_task_evaluators.py` | 1,172 | 79 | under 1500 LOC | 153.388s measured | — |
 | 195 | G | backend | `backend/testing/test_qualification_triggers.py` | 938 | 72 | under 1500 LOC | 143.296s measured | — |

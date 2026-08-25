@@ -10,6 +10,7 @@ So the end-to-end cases here run a REAL shell and assert on what the harness
 concluded. Mutating any of the three fixes out of blueprint.py turns them red.
 """
 import contextlib
+import functools
 import io
 import json
 import os
@@ -1155,13 +1156,14 @@ _DOCKER_CLI = shutil.which("docker")
 _BASE_IMAGE_CANDIDATES = ("python:3.11-slim", "python:3-slim", "python:3.12-slim")
 
 
+@functools.lru_cache(maxsize=1)
 def _probe_base_image() -> "str | None":
     """Pick a python base image that is ALREADY on this host.
 
-    ONE docker call, and a short timeout: this runs at collection time, so a
-    slow or wedged daemon must not eat the lane's per-test budget. `docker image
-    inspect` reports every reference it found and exits non-zero for the rest,
-    so the tags are read out of stdout rather than probed one at a time.
+    ONE docker call, memoised, and reached only from the `base_image` fixture
+    below -- never at import. `docker image inspect` reports every reference it
+    found and exits non-zero for the rest, so the tags are read out of stdout
+    rather than probed one at a time.
     """
     if not _DOCKER_CLI:
         return None
@@ -1180,23 +1182,34 @@ def _probe_base_image() -> "str | None":
     return None
 
 
-_BASE_IMAGE = _probe_base_image()
-_needs_docker = pytest.mark.skipif(
-    _BASE_IMAGE is None,
-    reason="needs a docker daemon and a locally present python slim base image",
-)
+@pytest.fixture(scope="session")
+def base_image() -> str:
+    """The locally present python slim base image, or skip the test.
+
+    Probed HERE rather than at module scope. A module-level probe runs during
+    COLLECTION, before any test executes, so a present-but-unresponsive docker
+    socket burns the full subprocess timeout out of this file's per-file budget
+    in backend/testing/test_scripts_test_lane.py without a single test having
+    run. Deferring it into a session fixture means only the docker tests --
+    which are skipped outright when there is no daemon -- ever pay for it.
+    """
+    image = _probe_base_image()
+    if image is None:
+        pytest.skip(
+            "needs a docker daemon and a locally present python slim base image"
+        )
+    return image
 
 
-@_needs_docker
 @pytest.mark.timeout(300)
-def test_real_locally_built_image_runs_an_experiment_end_to_end(tmp_path):
+def test_real_locally_built_image_runs_an_experiment_end_to_end(tmp_path, base_image):
     """The end-to-end proof for P1-1, with a tag that exists in NO registry.
 
     Before the fix this exact spec produced:
         error: docker pull '<tag>' failed (exit 1)   EXITCODE=2
     """
     tag = f"blueprint-compute-selftest:{uuid.uuid4().hex[:12]}"
-    dockerfile = f"FROM {_BASE_IMAGE}\nRUN printf '0.9312' > /opt/bp_baseline\n"
+    dockerfile = f"FROM {base_image}\nRUN printf '0.9312' > /opt/bp_baseline\n"
     build = subprocess.run(
         ["docker", "build", "-t", tag, "-"],
         input=dockerfile.encode(), capture_output=True, timeout=180,
@@ -1239,9 +1252,8 @@ def test_real_locally_built_image_runs_an_experiment_end_to_end(tmp_path):
         subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, timeout=120)
 
 
-@_needs_docker
 @pytest.mark.timeout(300)
-def test_real_repo_clone_puts_this_checkout_inside_the_container(tmp_path):
+def test_real_repo_clone_puts_this_checkout_inside_the_container(tmp_path, base_image):
     """P1-3 for real: repo_clone is the only way to get code into the container."""
     repo = tmp_path / "repo"
     (repo / "bp_selftest_pkg").mkdir(parents=True)
@@ -1253,7 +1265,7 @@ def test_real_repo_clone_puts_this_checkout_inside_the_container(tmp_path):
     tag = f"blueprint-compute-selftest:{uuid.uuid4().hex[:12]}"
     build = subprocess.run(
         ["docker", "build", "-t", tag, "-"],
-        input=f"FROM {_BASE_IMAGE}\n".encode(), capture_output=True, timeout=180,
+        input=f"FROM {base_image}\n".encode(), capture_output=True, timeout=180,
     )
     assert build.returncode == 0, build.stderr.decode("utf-8", "replace")[-2000:]
     cwd = os.getcwd()
@@ -1279,9 +1291,8 @@ def test_real_repo_clone_puts_this_checkout_inside_the_container(tmp_path):
         subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, timeout=120)
 
 
-@_needs_docker
 @pytest.mark.timeout(300)
-def test_real_missing_image_with_pull_never_fails_loudly(tmp_path):
+def test_real_missing_image_with_pull_never_fails_loudly(tmp_path, base_image):
     """No usable image is still fatal -- the fix narrows the failure, not removes it."""
     args = blueprint.build_parser().parse_args(
         ["compute", "run", "--pull", "never", "--local",

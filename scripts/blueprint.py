@@ -6914,11 +6914,18 @@ def _compute_git_repo_state(start_dir: str, *, _subprocess_run=None) -> dict:
     """
     _run = _subprocess_run if _subprocess_run is not None else subprocess.run
 
+    # Every call here is a local plumbing read (rev-parse / status) against a
+    # tree already on disk. 5s is ample, and it keeps this well inside the
+    # per-file budget the scripts lane grants the test that drives it -- a 20s
+    # step would be most of that budget for a question git answers in
+    # milliseconds.
+    _GIT_READ_TIMEOUT = 5
+
     def _git(*a) -> "str | None":
         try:
             proc = _run(
                 ["git", "-C", start_dir, *a],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, timeout=_GIT_READ_TIMEOUT,
             )
         except Exception:  # noqa: BLE001 -- no git is "unknown", not a crash
             return None
