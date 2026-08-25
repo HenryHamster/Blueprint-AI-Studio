@@ -4337,3 +4337,145 @@ class TestSmoketestClaudeCodeFailedClassification:
         )
         # first_payload not explicitly set on the mock
         assert classify_failure(t) == CODE_ERROR
+
+
+# The exact payload shape of the four 2026-08-23 kills.
+_BRANCHLESS_FIX = {
+    "type": "fix",
+    "prompt": "Remove the named inherited guard failure.",
+}
+# Identical except for the two fields the runner actually needs.
+_RUNNABLE_FIX = {
+    "type": "fix",
+    "prompt": "Remove the named inherited guard failure.",
+    "pr_number": 17786,
+    "branch": "blueprint/fix-4fdd6113",
+}
+
+
+class TestMalformedTaskPayloadClassification:
+    """A task whose own payload cannot satisfy its declared type contract is a
+    PLATFORM defect in the spawner, not a code defect by the agent.
+
+    Production 2026-08-23: four ``guard_suppression_remediation`` tasks
+    (4fdd6113 / 9bfa5831 / 50531efe / b4121926) carried a ``fix`` payload with
+    no ``branch``.  The agent's ``handleFix`` rejects that on its first line of
+    real work (``Fatal error: branch is required``), each attempt was charged
+    CODE_ERROR, and all three retries re-read the same malformed row and died
+    identically — 16 VM provisions for work that could never run.
+    """
+
+    @staticmethod
+    def _payload_task(payload, msg="", ctx=None):
+        t = MagicMock(spec=Task)
+        t.latest_status_message = msg
+        t.context = ctx if ctx is not None else {}
+        t.payloads = [payload]
+        t.first_payload = payload
+        return t
+
+    def test_registered_terminal_and_not_resurrectable(self):
+        from app.failure_classification import (
+            INFRA_ANALYTICS_CLASSES,
+            INFRA_CLASSES,
+            MALFORMED_TASK_PAYLOAD,
+        )
+
+        assert MALFORMED_TASK_PAYLOAD == "MALFORMED_TASK_PAYLOAD"
+        assert MALFORMED_TASK_PAYLOAD in ALL_FAILURE_CLASSES
+        # Deterministic in the persisted payload: re-queuing re-reads the same
+        # malformed row, so the resurrection sweep (which flips only
+        # INFRA_CLASSES members back to QUEUED) must never see it.
+        assert MALFORMED_TASK_PAYLOAD not in INFRA_CLASSES
+        # ...but analytics must bucket it as a platform condition, never as an
+        # agent code defect, so a spawner bug is not charged to the agent.
+        assert MALFORMED_TASK_PAYLOAD in INFRA_ANALYTICS_CLASSES
+        assert MALFORMED_TASK_PAYLOAD != CODE_ERROR
+
+    def test_not_retryable(self):
+        from app.failure_classification import (
+            MALFORMED_TASK_PAYLOAD,
+            NON_RETRYABLE_PLATFORM_CLASSES,
+        )
+
+        assert MALFORMED_TASK_PAYLOAD in NON_RETRYABLE_PLATFORM_CLASSES
+        # A genuine code defect still earns its retries.
+        assert CODE_ERROR not in NON_RETRYABLE_PLATFORM_CLASSES
+
+    def test_reason_names_the_missing_field(self):
+        from app.failure_classification import malformed_task_payload_reason
+
+        reason = malformed_task_payload_reason(
+            self._payload_task(_BRANCHLESS_FIX)
+        )
+        assert reason is not None
+        assert "branch" in reason.lower()
+
+    def test_runnable_payload_has_no_reason(self):
+        from app.failure_classification import malformed_task_payload_reason
+
+        assert (
+            malformed_task_payload_reason(self._payload_task(_RUNNABLE_FIX))
+            is None
+        )
+
+    def test_missing_or_typeless_payload_is_out_of_scope(self):
+        """Only a payload that DECLARES a type and then violates that type's
+        contract is in scope — a typeless or non-dict payload must not be
+        terminalized by this class."""
+        from app.failure_classification import malformed_task_payload_reason
+
+        assert malformed_task_payload_reason(self._payload_task({})) is None
+        assert malformed_task_payload_reason(self._payload_task(None)) is None
+        assert malformed_task_payload_reason(_task()) is None
+
+    def test_agent_fatal_on_branchless_fix_is_platform_not_code_error(self):
+        from app.failure_classification import MALFORMED_TASK_PAYLOAD
+
+        task = self._payload_task(
+            _BRANCHLESS_FIX, msg="Fatal error: branch is required"
+        )
+        assert (
+            normalize_agent_failure_category("fatal", task)
+            == MALFORMED_TASK_PAYLOAD
+        )
+
+    def test_same_fatal_on_a_runnable_payload_stays_code_error(self):
+        """Control for over-matching: identical agent label and identical
+        status text — only the payload differs."""
+        task = self._payload_task(
+            _RUNNABLE_FIX, msg="Fatal error: branch is required"
+        )
+        assert normalize_agent_failure_category("fatal", task) == CODE_ERROR
+
+    def test_precise_agent_label_stays_authoritative(self):
+        """A specific label (test_failed) is a real verdict about the work and
+        must not be rewritten by the payload check."""
+        task = self._payload_task(_BRANCHLESS_FIX, msg="pytest failed")
+        assert normalize_agent_failure_category("test_failed", task) == CODE_ERROR
+
+    def test_taxonomy_buckets_as_infra_not_code_defect(self):
+        from app.failure_classification import MALFORMED_TASK_PAYLOAD
+
+        task = _task(ctx={"failure_category": MALFORMED_TASK_PAYLOAD})
+        assert classify_failure(task) == MALFORMED_TASK_PAYLOAD
+        assert classify_failure_taxonomy(task) == TAXONOMY_INFRA_RELATED
+
+    def test_normalize_round_trips_the_canonical_category(self):
+        from app.failure_classification import MALFORMED_TASK_PAYLOAD
+
+        task = _task(ctx={"failure_category": MALFORMED_TASK_PAYLOAD})
+        assert (
+            normalize_agent_failure_category(MALFORMED_TASK_PAYLOAD, task)
+            == MALFORMED_TASK_PAYLOAD
+        )
+        assert (
+            normalize_agent_failure_category("malformed_task_payload", task)
+            == MALFORMED_TASK_PAYLOAD
+        )
+
+    def test_operator_label_is_registered(self):
+        from app.digest_metrics import _FAILURE_CLASS_LABELS
+        from app.failure_classification import MALFORMED_TASK_PAYLOAD
+
+        assert MALFORMED_TASK_PAYLOAD in _FAILURE_CLASS_LABELS

@@ -451,6 +451,151 @@ COMPUTE_JOB_FAILED = "compute_job_failed"
 # mismatch is diagnosable without reading source.
 UNPLACEABLE_EXECUTION_SITE = "UNPLACEABLE_EXECUTION_SITE"
 
+# The task's OWN payload cannot satisfy the contract its declared task type
+# requires — a required field is absent or malformed.  Canonical case: a ``fix``
+# payload with no ``branch``, which the agent's ``handleFix``
+# (agent/src/handlers/review-fix.ts) rejects on its first line of real work with
+# ``Fatal error: branch is required`` before any model call happens.
+#
+# This is a PLATFORM defect in whatever SPAWNED the task, not a defect in the
+# agent's work.  Charging it to CODE_ERROR misattributes a spawner bug to the
+# agent and feeds that misattribution into failure-attribution and the
+# research/erosion scoring.  It is also DETERMINISTIC in the persisted row:
+# every retry re-reads the same malformed payload and dies identically, so a
+# retry can never succeed — the class is in ``NON_RETRYABLE_PLATFORM_CLASSES``
+# and terminal on FIRST detection.
+#
+# Deliberately OUTSIDE INFRA_CLASSES (the reaper's Step 5 resurrection sweep
+# flips only INFRA_CLASSES members back to QUEUED, and re-queuing walks straight
+# back into the same dead end) but INSIDE INFRA_ANALYTICS_CLASSES and
+# ALL_FAILURE_CLASSES, so the platform kill stays VISIBLE to operators and is
+# bucketed as a platform condition rather than an agent code defect — the same
+# shape as UNPLACEABLE_EXECUTION_SITE above.
+#
+# Production 2026-08-23 (Blueprint project 37d445e1): four
+# ``guard_suppression_remediation`` tasks (4fdd6113 / 9bfa5831 / 50531efe /
+# b4121926) each carried a branchless ``fix`` payload, provisioned four VMs
+# apiece, and all four died ``[CODE_ERROR] Retries exhausted (3/3)``.
+MALFORMED_TASK_PAYLOAD = "MALFORMED_TASK_PAYLOAD"
+
+# Failure classes that a retry can never clear because the cause is a permanent
+# property of the task ROW, not of the attempt.  The agent-status retry gate
+# refuses to re-queue these: the task lands terminal on first detection with a
+# reason instead of burning the whole budget on identical deaths.
+NON_RETRYABLE_PLATFORM_CLASSES: frozenset[str] = frozenset(
+    {
+        MALFORMED_TASK_PAYLOAD,
+    }
+)
+
+
+# The RUNNER-ENTRY contract, mirrored field-for-field from the agent handlers.
+# These are the fields a handler dereferences and hard-throws on BEFORE any
+# model call, clone, or useful work — i.e. the payload defects that make a task
+# unrunnable by construction rather than merely under-specified.
+#
+# This is deliberately NARROWER than the authoring schema in
+# app.payload_schemas.validate_task_payload. The authoring schema also enforces
+# planning-quality fields (acceptance_evidence, prompt length caps, research
+# envelopes) whose absence produces a WORSE task, not an IMPOSSIBLE one, and
+# many legitimately-created historical rows omit them. Terminalizing on the
+# authoring schema would kill runnable work; terminalizing on the runner-entry
+# contract kills only tasks that were already guaranteed to die.
+#
+# Keep in lockstep with the agent. Each entry cites its throw site:
+#   fix     branch      agent/src/handlers/review-fix.ts:1350 validateBranchName
+#           pr_number   agent/src/handlers/review-fix.ts:1354 Invalid pr_number
+#           prompt      agent/src/handlers/review-fix.ts:1359 missing prompt
+#   review  pr_number   agent/src/handlers/review-fix.ts:670  Invalid pr_number
+#           branch      agent/src/handlers/review-fix.ts:671  validateBranchName
+# (validateBranchName itself: agent/src/index.ts:2892.)
+_REQ_BRANCH = "branch_name"
+_REQ_POSITIVE_INT = "positive_int"
+_REQ_NON_EMPTY_STR = "non_empty_str"
+
+_RUNNER_ENTRY_CONTRACT: dict[str, tuple[tuple[str, str], ...]] = {
+    "fix": (
+        ("branch", _REQ_BRANCH),
+        ("pr_number", _REQ_POSITIVE_INT),
+        ("prompt", _REQ_NON_EMPTY_STR),
+    ),
+    "review": (
+        ("pr_number", _REQ_POSITIVE_INT),
+        ("branch", _REQ_BRANCH),
+    ),
+}
+
+# Same character class the agent's validateBranchName enforces
+# (agent/src/index.ts:2893).
+_AGENT_BRANCH_RE = re.compile(r"^[a-zA-Z0-9_./-]+$")
+
+
+def _runner_entry_field_defect(value: object, kind: str) -> str | None:
+    """Reason this value fails the agent's entry check, or None if it passes."""
+    if kind == _REQ_BRANCH:
+        if not isinstance(value, str) or not value:
+            return "is required"
+        if not _AGENT_BRANCH_RE.match(value):
+            return "has characters the agent rejects"
+        if ".." in value or value.startswith("-"):
+            return "is not a valid branch name"
+        return None
+    if kind == _REQ_POSITIVE_INT:
+        # The agent does Number(payload.pr_number) then Number.isInteger(...) &&
+        # > 0, so a numeric string passes there too.
+        try:
+            if isinstance(value, bool) or value is None or value == "":
+                return "is required"
+            as_int = int(str(value).strip())
+        except (TypeError, ValueError):
+            return "is not a positive integer"
+        return None if as_int > 0 else "is not a positive integer"
+    if kind == _REQ_NON_EMPTY_STR:
+        if not isinstance(value, str) or not value.strip():
+            return "is required"
+        return None
+    return None
+
+
+def malformed_task_payload_reason(task: "Task") -> str | None:
+    """One-line reason the payload can never clear the agent's entry checks.
+
+    Returns None when the payload is runnable, and also when the payload does
+    not DECLARE a task type this contract covers — an unknown or absent type is
+    a different question and must not be terminalized by this class.
+
+    Never raises: a classifier that can crash is worse than one that declines to
+    reclassify.
+    """
+    try:
+        payload = getattr(task, "first_payload", None)
+        if not isinstance(payload, dict):
+            return None
+        declared_type = payload.get("type")
+        if not isinstance(declared_type, str):
+            return None
+        contract = _RUNNER_ENTRY_CONTRACT.get(declared_type.strip().lower())
+        if not contract:
+            return None
+        defects = [
+            f"{field} {defect}"
+            for field, kind in contract
+            if (defect := _runner_entry_field_defect(payload.get(field), kind))
+        ]
+        if not defects:
+            return None
+        return (
+            f"{declared_type} payload cannot satisfy the agent's entry contract: "
+            + "; ".join(defects)
+        )
+    except Exception as exc:  # classification must never crash
+        logger.warning(
+            "[FAILURE_CLASS] malformed_task_payload_reason failed on task %s: %s",
+            getattr(task, "id", "?"),
+            exc,
+        )
+        return None
+
 
 def classify_compute_terminal_reason(
     terminal_reason: "str | None",
@@ -965,6 +1110,7 @@ INFRA_ANALYTICS_CLASSES: frozenset[str] = INFRA_CLASSES | {
     # defect, so it must not depress direction health / erosion scoring.  Kept
     # OUT of INFRA_CLASSES for the same resurrection reason as the entry above.
     ROLLUP_DELIVERABLE_DROPPED,
+    MALFORMED_TASK_PAYLOAD,
 }
 
 # ── Infra-resurrection eligibility: ONE predicate, two call sites ────────────
@@ -1103,6 +1249,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     ADMIN_CANCEL,
     UNPLACEABLE_EXECUTION_SITE,
     ROLLUP_DELIVERABLE_DROPPED,
+    MALFORMED_TASK_PAYLOAD,
 )
 
 
@@ -1168,6 +1315,10 @@ def classify_failure_taxonomy(task: "Task") -> str:
     # resurrection sweep never re-queues it), but it is an infra/routing
     # condition, not a code defect — keep it in the infra analytics bucket.
     if base == UNPLACEABLE_EXECUTION_SITE:
+        return TAXONOMY_INFRA_RELATED
+    # MALFORMED_TASK_PAYLOAD is likewise outside INFRA_CLASSES (terminal, never
+    # resurrected) but is a spawner/platform defect, not agent-written code.
+    if base == MALFORMED_TASK_PAYLOAD:
         return TAXONOMY_INFRA_RELATED
     # Migration errors are code defects (the schema is wrong / migration missing),
     # not review-quality or scope issues — route to code_defect bucket directly.
@@ -1401,6 +1552,12 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # registry-declared execution site has no eligible runner. Canonical terminal
     # class outside INFRA_CLASSES so the resurrection sweep never re-queues it.
     "unplaceable_execution_site": UNPLACEABLE_EXECUTION_SITE,
+    # ``malformed_task_payload`` — the task row's own payload cannot satisfy its
+    # declared type contract. Canonicalized here so the label round-trips; the
+    # generic-``fatal`` branch of normalize_agent_failure_category also DERIVES
+    # this class from the payload itself, because the agent reports only
+    # ``fatal`` when its handler rejects a missing required field.
+    "malformed_task_payload": MALFORMED_TASK_PAYLOAD,
 }
 
 
@@ -2372,6 +2529,17 @@ def normalize_agent_failure_category(
     mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
     if mapped:
         if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
+            # The task's own payload is checked FIRST. A payload that violates
+            # its declared type contract is unrunnable no matter what else the
+            # attempt hit: no provider rotation, backoff or retry can clear it,
+            # and blaming the agent for a spawner's missing required field
+            # poisons failure-attribution and erosion scoring. A PRECISE agent
+            # label (test_failed / lint_failed / ...) is a real verdict about
+            # the work and never reaches this branch, so this cannot overwrite
+            # one.
+            _malformed_payload = malformed_task_payload_reason(task)
+            if _malformed_payload:
+                return MALFORMED_TASK_PAYLOAD
             # Structured agent error report — the PRIMARY signal. A report
             # proving a provider-layer death (CLI died without completing a
             # model run) routes to the RATE_LIMIT requeue path (account

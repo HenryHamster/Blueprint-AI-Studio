@@ -3758,6 +3758,8 @@ async def update_agent_status(
         from app.failure_classification import (
             REASSIGNED,
             SCOPE_EMPTY,
+            NON_RETRYABLE_PLATFORM_CLASSES,
+            malformed_task_payload_reason,
             persist_failure_category,
         )
 
@@ -3805,6 +3807,14 @@ async def update_agent_status(
                 or task.attempt_count < _runtime_config["max_retries"]
             )
             and failure_class not in _NON_GENUINE_TERMINAL_CLASSES
+            # A failure whose cause is a permanent property of the task ROW
+            # (a payload that cannot satisfy the runner's entry contract) is
+            # re-read identically by every attempt. Retrying it three times
+            # produces three identical deaths, three VM provisions, and a
+            # "Retries exhausted (3/3)" message that reads like an agent that
+            # could not do the work. Land it terminal on the FIRST report with
+            # the real reason instead.
+            and failure_class not in NON_RETRYABLE_PLATFORM_CLASSES
         ):
             _current_attempt_ordinal = get_task_lifetime_attempt_ordinal(task)
             if (
@@ -4064,7 +4074,23 @@ async def update_agent_status(
             elif payload.status == TaskStatus.FAILED:
                 max_r = _runtime_config["max_retries"]
                 existing_msg = task.latest_status_message or ""
-                if "retries exhausted" not in existing_msg:
+                if failure_class in NON_RETRYABLE_PLATFORM_CLASSES:
+                    # No retry was ever attempted or possible, so "Retries
+                    # exhausted (n/3)" would be a lie that reads as an agent
+                    # that kept trying and kept failing. State the actual
+                    # cause, and name the surface that owns the fix.
+                    _payload_reason = malformed_task_payload_reason(task)
+                    task.latest_status_message = (
+                        f"[{failure_class}] Not retried: the failure is a permanent "
+                        "property of this task's payload, so every attempt would "
+                        "die identically. "
+                        + (f"{_payload_reason}. " if _payload_reason else "")
+                        + "Fix the spawner that created this task; requeueing it "
+                        "unchanged cannot succeed. "
+                        + existing_msg[:200]
+                    ).strip()
+                    session.add(task)
+                elif "retries exhausted" not in existing_msg:
                     task.latest_status_message = (
                         f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r}). "
                         + existing_msg[:300]
@@ -4072,11 +4098,15 @@ async def update_agent_status(
                     session.add(task)
                 # Record CODE_ERROR-class failures to 7-day account success-rate tracking.
                 # RATE_LIMIT is tracked via disable_account_model; COMPLETED via record_completion_event.
+                # MALFORMED_TASK_PAYLOAD is excluded for the same reason: the
+                # account never got a runnable task, so dinging its success rate
+                # charges a spawner defect to whichever account happened to be
+                # holding the dead row.
                 if failure_class not in (
                     "RATE_LIMIT",
                     "EXTERNAL_API",
                     "PROVISION_FAILURE",
-                ):
+                ) and failure_class not in NON_RETRYABLE_PLATFORM_CLASSES:
                     _acct_id_outcome = get_task_llm_account_id(task)
                     if _acct_id_outcome:
                         try:

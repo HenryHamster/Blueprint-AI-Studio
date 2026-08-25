@@ -146,6 +146,7 @@ from app.failure_classification import (
     TIMEOUT_PROCESS_CRASH,
     TIMEOUT_UNKNOWN,
     UNPLACEABLE_EXECUTION_SITE,
+    MALFORMED_TASK_PAYLOAD,
     VIEWPORT_REGRESSION,
 )
 
@@ -186,6 +187,7 @@ _FAILURE_CLASS_LABELS = {
         "Rollup deliverable dropped — conflict resolution erased a merged "
         "child PR's work"
     ),
+    MALFORMED_TASK_PAYLOAD: "Malformed payload — spawner omitted a field the runner requires",
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5

@@ -15695,6 +15695,92 @@ async def test_runtime_unavailable_local_runner_records_decline_without_retry_bu
 
 
 @pytest.mark.asyncio
+async def test_branchless_fix_payload_is_platform_terminal_not_a_retried_code_error(
+    client: AsyncClient, db_session, mocker
+):
+    """A ``fix`` payload with no ``branch`` is a spawner defect, not agent work.
+
+    Production 2026-08-23 (Blueprint tasks 4fdd6113 / 9bfa5831 / 50531efe /
+    b4121926): each was spawned with ``type: "fix"`` and no ``branch``, so the
+    agent's ``handleFix`` threw ``branch is required`` before doing anything.
+    All four were charged ``[CODE_ERROR] Retries exhausted (3/3)`` — blaming the
+    agent for a malformed payload AND burning three more VMs re-reading the
+    identical unrunnable row.
+
+    Two properties are asserted here, both of which the old behaviour violated:
+      * the class is the platform class, never CODE_ERROR; and
+      * the task is terminal on FIRST detection — the retry budget is untouched
+        and the operator message says why instead of "Retries exhausted".
+    """
+    from app.failure_classification import MALFORMED_TASK_PAYLOAD
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="Branchless Fix Payload",
+        user_id="test-user-branchless-fix",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "vm-branchless-fix"
+    task = Task(
+        project_id=project.id,
+        title="fix: resolve recurring vitest:agent baseline failure",
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "Remove the named inherited guard failure.",
+            }
+        ],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        created_by="SYSTEM_AUTO_REMEDIATION",
+        context={"spawned_by": "guard_suppression_remediation"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    _terminated_task_ids.pop(task_id, None)
+    token = create_agent_token(task_id, vm_id)
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id,
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "Fatal error: branch is required",
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] != "retrying"
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.FAILED
+    assert task.context["failure_category"] == MALFORMED_TASK_PAYLOAD
+    assert task.context["failure_class"] == MALFORMED_TASK_PAYLOAD
+    assert task.attempt_count == 0, (
+        "a payload that is deterministically unrunnable must not consume a "
+        "retry: every retry re-reads the same malformed row"
+    )
+    msg = task.latest_status_message or ""
+    assert "retries exhausted" not in msg.lower(), msg
+    assert "branch" in msg.lower(), msg
+
+    _terminated_task_ids.pop(task_id, None)
+
+
+@pytest.mark.asyncio
 async def test_postgres_runtime_sentinel_learns_verification_and_declines_runner(
     client: AsyncClient, db_session, mocker
 ):

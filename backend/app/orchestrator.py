@@ -87,6 +87,7 @@ from app.orchestrator_filters import (
     filter_pipeline_duplicates,
     reserve_migration_revisions,
     filter_scope_empty,
+    filter_malformed_payloads,
     cap_pipeline_slots,
     reserve_slots_for_types,
     apply_project_fairness,
@@ -2708,6 +2709,20 @@ async def orchestrator_worker():
                 # base missing its dependency's code — it stays QUEUED and retries.
                 eligible_ids = await recut_landed_cross_base_dependents(
                     eligible_ids, candidate_tasks, _dep_by_id, session
+                )
+
+                # Step 2.44: Malformed-payload gate — terminally fail a candidate
+                # whose payload can never clear the agent's entry checks (e.g. a
+                # `fix` with no `branch`). Runs BEFORE every downstream gate,
+                # ranking step and slot cut: such a task is guaranteed to die on
+                # the agent's first line of real work, so letting it occupy a
+                # dispatch slot provisions a VM to learn what the persisted row
+                # already states. 2026-08-23: four guard-remediation tasks did
+                # exactly this 4x each — 16 VMs, zero work possible, all four
+                # blamed on the agent as CODE_ERROR. See
+                # orchestrator_filters.filter_malformed_payloads.
+                eligible_ids = await filter_malformed_payloads(
+                    eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 
                 # Step 2.45: Per-type failure gate — drop candidates whose task type is

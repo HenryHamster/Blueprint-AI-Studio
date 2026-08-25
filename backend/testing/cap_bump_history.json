@@ -2393,14 +2393,6 @@
           "new_cap": 3450
         }
       ],
-      "orchestrator_filters.py": [
-        {
-          "commit_sha": "88c5145b3acbb6a4c6e78ab6a02f9a5f41ffe765",
-          "commit_date": "2026-08-05T12:27:58Z",
-          "old_cap": 1850,
-          "new_cap": 2200
-        }
-      ],
       "knowledge_completion.py": [
         {
           "commit_sha": "9fc57dc59fa41530062d9856f7d2a09625537f32",
@@ -3261,6 +3253,20 @@
           "commit_date": "2026-08-19T00:31:51-07:00",
           "old_cap": 1750,
           "new_cap": 2050
+        }
+      ],
+      "orchestrator_filters.py": [
+        {
+          "commit_sha": "88c5145b3acbb6a4c6e78ab6a02f9a5f41ffe765",
+          "commit_date": "2026-08-05T12:27:58Z",
+          "old_cap": 1850,
+          "new_cap": 2200
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T14:09:32.010787+00:00",
+          "old_cap": 2200,
+          "new_cap": 2550
         }
       ]
     },
