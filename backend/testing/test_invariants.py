@@ -14492,6 +14492,92 @@ def test_ci_runner_script_suite_names_only_files_that_exist_on_disk():
     )
 
 
+_GIT_READS_A_REMOTE_REF = re.compile(
+    r"""git\b[^\n]*?\b(?:diff|log|rev-parse|rev-list|merge-base|show)\b"""
+    r"""[^\n]*?origin/(?P<ref>[^\s"':]+)"""
+)
+_GIT_FETCHES = re.compile(r"""git\b[^\n]*?\bfetch\b[^\n]*""")
+
+
+def _ci_jobs_with_shallow_checkout(workflow_source: str) -> dict[str, dict]:
+    """Jobs whose actions/checkout leaves only the PR head in the object store.
+
+    actions/checkout defaults to ``fetch-depth: 1``. A job that does not
+    override it holds exactly one commit and one remote ref; every other
+    ``origin/<branch>`` is simply absent from the workspace.
+    """
+    import yaml
+
+    document = yaml.safe_load(workflow_source) or {}
+    shallow: dict[str, dict] = {}
+    for job_name, job in (document.get("jobs") or {}).items():
+        depths = [
+            (step.get("with") or {}).get("fetch-depth")
+            for step in (job.get("steps") or [])
+            if str(step.get("uses", "")).startswith("actions/checkout")
+        ]
+        if not depths:
+            continue
+        if all(depth is None or str(depth) == "1" for depth in depths):
+            shallow[job_name] = job
+    return shallow
+
+
+def test_ci_steps_fetch_every_remote_ref_they_read():
+    """A CI guard must never report "clean" because it could not look.
+
+    ci.yml's checkouts are shallow -- no step sets ``fetch-depth``, so every
+    one is depth 1 -- which means ``origin/main`` and ``origin/automain`` do
+    not exist in the workspace. A step that reads one without fetching it
+    first gets a git failure, and these guards uniformly funnel a git failure
+    into an empty result that reads as "nothing to check".
+
+    That is not hypothetical. The Migration linter shipped for its entire life
+    as ``git diff ... origin/$BASE_BRANCH ... 2>/dev/null || true``. It printed
+    "No new migrations - skipping" on every run -- including runs that added
+    migrations -- and so never once enforced the ``nullable=False``-without-
+    ``server_default`` rule it exists to enforce.
+
+    ci.yml is an operator-only surface for agents, so this test is the only
+    place the invariant can be pinned from inside the repo.
+    """
+    workflow = _ci_workflow_path()
+    source = workflow.read_text(encoding="utf-8")
+    offenders: list[str] = []
+
+    for job_name, job in _ci_jobs_with_shallow_checkout(source).items():
+        for step in job.get("steps") or []:
+            body = step.get("run")
+            if not isinstance(body, str):
+                continue
+            uncommented = "\n".join(
+                line
+                for line in body.splitlines()
+                if not line.strip().startswith("#")
+            )
+            read_refs = {
+                match.group("ref")
+                for match in _GIT_READS_A_REMOTE_REF.finditer(uncommented)
+            }
+            if not read_refs:
+                continue
+            fetches = " ".join(_GIT_FETCHES.findall(uncommented))
+            for ref in sorted(read_refs):
+                if ref not in fetches:
+                    offenders.append(
+                        f"{job_name}/{step.get('name', '<unnamed>')}"
+                        f":origin/{ref}"
+                    )
+
+    assert not offenders, (
+        "ci.yml step(s) read a remote ref that a depth-1 checkout does not "
+        "have, so the git command fails and the guard silently passes: "
+        + ", ".join(offenders)
+        + "\n"
+        + format_offender_marker(offenders)
+    )
+
+
 def _standalone_backend_roster_entries(harness: Path) -> list[str]:
     """Literal ``testing/...`` selectors from the harness STANDALONE_ARGS block.
 

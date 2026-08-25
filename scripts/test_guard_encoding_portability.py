@@ -45,6 +45,7 @@ import generate_test_estate_ranked_queue as estate_queue
 import guard_suppression_receipt
 import typecheck_verification_guard
 from testing.check_size_limits import load_limits, write_limits
+from testing.fixgate_attribution import format_offender_marker
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPOSITORY_ROOT / "scripts"
@@ -220,7 +221,7 @@ class TestForceUtf8Streams:
         ]
         assert not missing, (
             "guards echo captured tool output and must pin their own stdout to "
-            f"UTF-8 in main(): {missing}"
+            f"UTF-8 in main(): {missing}\n{format_offender_marker(missing)}"
         )
 
 
@@ -298,6 +299,7 @@ class TestGuardSubprocessDecoding:
             "text-mode subprocess output must be decoded with an explicit "
             'encoding="utf-8", errors="replace" so a guard reports a mangled '
             f"character instead of crashing on a cp1252 host: {offenders}"
+            f"\n{format_offender_marker(offenders)}"
         )
 
 
@@ -387,7 +389,10 @@ class TestTrackedArtifactWritersStayLf:
                         offenders.append(f"{relative}:{node.lineno}")
         assert not offenders, (
             'text-mode writes must pass newline="" so a Windows regeneration '
-            "does not rewrite a tracked artifact as CRLF: " + str(offenders)
+            "does not rewrite a tracked artifact as CRLF: "
+            + str(offenders)
+            + "\n"
+            + format_offender_marker(offenders)
         )
 
 
@@ -412,6 +417,7 @@ class TestGeneratedArtifactPathsPinLf:
         assert required <= declared, (
             "a hand-regenerated artifact without an eol=lf pin lands as a "
             f"whole-file CRLF diff from a Windows host: {sorted(required - declared)}"
+            f"\n{format_offender_marker(sorted(required - declared))}"
         )
 
 

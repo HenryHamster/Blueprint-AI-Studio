@@ -902,12 +902,24 @@ jobs:
       - name: Migration linter
         if: matrix.shard == 1
         run: |
+          set -euo pipefail
           BASE_BRANCH="${{ github.event.pull_request.base.ref || 'main' }}"
-          NEW_MIGRATIONS=$(git diff --name-only --diff-filter=A origin/$BASE_BRANCH -- backend/alembic/versions/*.py 2>/dev/null || true)
+          # This step was vacuous for its entire life. actions/checkout@v4
+          # defaults to fetch-depth 1, so origin/$BASE_BRANCH does not exist in
+          # this workspace; the diff below died, `2>/dev/null || true` swallowed
+          # the error, NEW_MIGRATIONS came back empty, and EVERY run printed
+          # "No new migrations — skipping" and exited 0 — including runs that
+          # did add migrations. Fetch the base ref explicitly and let a failure
+          # fail the job: a guard against a class that bricks a deploy must
+          # never report "clean" because it could not look.
+          git -c "safe.directory=$PWD" fetch --no-tags --depth=1 origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+          NEW_MIGRATIONS=$(git -c "safe.directory=$PWD" diff --name-only --diff-filter=A "origin/$BASE_BRANCH" -- 'backend/alembic/versions/*.py')
           if [ -z "$NEW_MIGRATIONS" ]; then
             echo "No new migrations — skipping"
             exit 0
           fi
+          echo "New migrations under review:"
+          echo "$NEW_MIGRATIONS"
           VIOLATIONS=$(echo "$NEW_MIGRATIONS" | xargs grep -l "nullable=False" 2>/dev/null | xargs grep -L "server_default" 2>/dev/null || true)
           if [ -n "$VIOLATIONS" ]; then
             echo "Migration safety violation: nullable=False without server_default in:"
