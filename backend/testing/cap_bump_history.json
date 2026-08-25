@@ -4820,6 +4820,14 @@
           "old_cap": 1050,
           "new_cap": 1300
         }
+      ],
+      "blueprint.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T16:38:54.776184+00:00",
+          "old_cap": 9900,
+          "new_cap": 11950
+        }
       ]
     }
   }
