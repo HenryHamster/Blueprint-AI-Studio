@@ -113,6 +113,12 @@ _ARTIFACT_TRANSFER_TTL_SECONDS = 60 * 60
 # writes (compute_jobs._apply_status_update + agent_compute_jobs heartbeat) and
 # the admin UI's live-output block reads. The runner sends ~4 KiB; server cap.
 _MAX_RUNNER_LIVE_OUTPUT_BYTES = 8192
+# Terminal-cause string a runner may attach to a terminal report
+# (ComputeJobReportRequest.terminal_reason). The real emitters are single
+# sentences ("runner provisioning failure: no usable python runtime on this
+# host"), so 500 chars is far beyond any legitimate value while bounding what
+# a crafted report can write into the JSONB polling_metadata column.
+_MAX_RUNNER_TERMINAL_REASON_CHARS = 500
 # Self-reported progress records (BLUEPRINT_PROGRESS_FILE protocol). Written by
 # sandboxed experiment code and relayed by the runner, so the server validates
 # every field and bounds every dimension before storing.
@@ -2385,6 +2391,24 @@ class ComputeJobReportRequest(BaseModel):
     # due to per-kind size cap or 25-file count cap. Only meaningful on "running"
     # reports; ignored on terminal ones.
     viewable_omissions: Any = None
+    # Structured cause for a terminal failure the COMMAND did not cause -- a
+    # host-capability gap, a runner-side deadline, a watchdog kill. The runner
+    # has been sending this key for as long as ``_report(terminal_reason=...)``
+    # has existed in scripts/local_runner.py; until this field was declared,
+    # pydantic's default ``extra="ignore"`` DESTROYED it at the API boundary --
+    # silently, with no log line. The consequence was not cosmetic: a host that
+    # could not produce a Python interpreter reported exit 123 plus "runner
+    # provisioning failure: no usable python runtime on this host", the reason
+    # never reached the row, ``poll_status`` fell through to the untyped
+    # "compute job failed" default, and classify_compute_terminal_reason billed
+    # the experiment's AUTHOR a CODE_ERROR -- not budget-exempt, not
+    # resurrection-eligible -- for a defect that was entirely in the host. The
+    # classifier was always correct; only this transport was missing.
+    #
+    # Stamped (bounded) into polling_metadata["runner_terminal_reason"] and
+    # preferred by RunnerSubprocessBackend.poll_status over the default, so
+    # EVERY future runner-side reason works, not just the interpreter one.
+    terminal_reason: str | None = None
 
 
 def _decrypt_registry_auth(auth: dict | None) -> dict | None:
@@ -2588,9 +2612,9 @@ async def report_compute_job(
 ):
     """Runner reports execution status for a claimed compute job.
 
-    Stamps exec_status, exit_code, result_metrics, and command_log into
-    ``polling_metadata`` so the monitor's existing ``poll_status``/finalize path
-    can pick up the terminal state. Does NOT finalize the job itself — the monitor
+    Stamps exec_status, exit_code, result_metrics, command_log and (on terminal
+    reports) terminal_reason into ``polling_metadata`` so the monitor's existing
+    ``poll_status``/finalize path can pick up the terminal state. Does NOT finalize the job itself — the monitor
     owns that transition so artifact-linking and wake delivery run on the normal path.
 
     Interim ``running`` reports may additionally carry:
@@ -2734,6 +2758,18 @@ async def report_compute_job(
             meta["runner_exec_status"] = payload.exec_status
         if payload.exit_code is not None and isinstance(payload.exit_code, int):
             meta["runner_exit_code"] = payload.exit_code
+        if payload.exec_status in ("succeeded", "failed") and isinstance(
+            payload.terminal_reason, str
+        ):
+            # Terminal-only: a mid-run report has no terminal cause to carry, and
+            # accepting one would let a live job pre-stamp the string the
+            # classifier keys on. Bounded before it lands in JSONB -- this is
+            # runner-supplied, attacker-adjacent input.
+            reason_text = payload.terminal_reason.strip()[
+                :_MAX_RUNNER_TERMINAL_REASON_CHARS
+            ]
+            if reason_text:
+                meta["runner_terminal_reason"] = reason_text
         if payload.result_metrics is not None and isinstance(payload.result_metrics, dict):
             meta["runner_result_metrics"] = _filter_result_metrics(payload.result_metrics)
         if payload.command_log is not None and payload.exec_status == "running":

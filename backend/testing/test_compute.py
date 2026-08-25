@@ -1517,8 +1517,8 @@ async def test_runner_subprocess_poll_cost_bounds_runtime_for_spend_cap():
 @pytest.mark.asyncio
 async def test_runner_subprocess_poll_status_exit_125_classifies_no_progress():
     """A runner no-progress watchdog kill reports exec_status=failed exit_code=125
-    with no reason field (the /report endpoint carries none). poll_status must
-    translate exit 125 into a terminal reason string that
+    and no terminal_reason (the reserved code is the whole signal). poll_status
+    must translate exit 125 into a terminal reason string that
     classify_compute_terminal_reason maps to NO_PROGRESS_TIMEOUT — otherwise the
     platform kill collapses to CODE_ERROR and burns retry budget."""
     from app.failure_classification import (
@@ -1586,9 +1586,10 @@ async def test_runner_subprocess_poll_status_environment_exit_is_provision_failu
     (noexec mount, missing +x, wrong-arch shim). A command BODY can never choose
     them: a traceback exits 1, pytest exits 1-5, a SIGKILL surfaces as 137.
 
-    The /report endpoint carries an exit_code but no reason field, so the exit
-    code is the ONLY evidence of how the job died — and poll_status used to throw
-    it away into the untyped prose "compute job failed", which
+    A bare shell death like this carries no ``terminal_reason`` for the runner to
+    report — the exit code is the ONLY evidence of how the job died — and
+    poll_status used to throw it away into the untyped prose "compute job
+    failed", which
     classify_compute_terminal_reason matched against nothing and returned
     CODE_ERROR for. Every bootstrap death therefore burned the owning task's
     retry budget and blamed the experiment's author.
@@ -1762,29 +1763,6 @@ def test_runtime_deadline_prose_rule_has_three_live_emitters():
         "an intentional server-side deadline kill must not be billed to the "
         "author as a work defect"
     )
-
-
-def test_runner_interpreter_bootstrap_reason_classifies_provision_failure():
-    """Contract with the runner-side fix: a terminal reason naming a failed
-    interpreter bootstrap must classify as PROVISION_FAILURE, not CODE_ERROR.
-
-    ``scripts/local_runner.py`` reports its own prose when it cannot establish a
-    Python interpreter before the command runs. That string carries the word
-    "provisioning"; this pins the classifier end of that agreement so the two
-    sides cannot drift apart across separate PRs.
-    """
-    from app.failure_classification import (
-        PROVISION_FAILURE,
-        classify_compute_terminal_reason,
-    )
-
-    for reason in (
-        "runner provisioning failed: no working pip found",
-        "compute runtime provisioning failed: python3 not on PATH",
-    ):
-        assert classify_compute_terminal_reason(reason, None) == PROVISION_FAILURE, (
-            reason
-        )
 
 
 # ── End-to-end: runner /report endpoint → monitor → failure classification ────
@@ -2177,6 +2155,161 @@ async def test_runner_report_generic_failure_finalizes_code_error_through_monito
     assert (
         classify_compute_terminal_reason(job.terminal_reason, None) == CODE_ERROR
     )
+
+
+def _runner_provision_terminal_reason() -> str:
+    """The EXACT terminal-reason literal ``scripts/local_runner.py`` emits when a
+    host cannot produce a Python interpreter.
+
+    Read out of the runner source rather than hand-typed. A hand-typed lookalike
+    is what let this seam ship believed-covered: the retired test fed two invented
+    strings straight into the classifier, so it passed with the entire runner-side
+    emitter deleted and could never notice that nothing carried the string across
+    the API boundary. Sourcing the literal means a drift on the runner side drifts
+    this test with it — and the assertion below is about the TRANSPORT, not about
+    the classifier, which was never in doubt.
+    """
+    import re
+    from pathlib import Path
+
+    runner_source = (
+        Path(__file__).resolve().parents[2] / "scripts" / "local_runner.py"
+    )
+    if not runner_source.exists():
+        # Same fallback as test_check_gate_fail_closed: the suite also runs with
+        # the repo bind-mounted at /repo.
+        runner_source = Path("/repo/scripts/local_runner.py")
+    source = runner_source.read_text(encoding="utf-8")
+    match = re.search(
+        r'COMPUTE_RUNTIME_PROVISION_TERMINAL_REASON = \(\s*"([^"]+)"',
+        source,
+    )
+    assert match, (
+        "scripts/local_runner.py no longer defines "
+        "COMPUTE_RUNTIME_PROVISION_TERMINAL_REASON as a parenthesised string "
+        "literal; update this reader rather than hand-typing the reason"
+    )
+    return match.group(1)
+
+
+@pytest.mark.asyncio
+async def test_runner_report_provisioning_failure_finalizes_provision_failure(
+    client, db_session
+):
+    """END-TO-END OVER THE TRANSPORT: a host that cannot produce a Python
+    interpreter must NOT be billed to the experiment's author.
+
+    ``scripts/local_runner.py`` reports exec_status=failed, exit_code=123 and a
+    ``terminal_reason`` naming the provisioning fault. The classifier has always
+    mapped that string to PROVISION_FAILURE — an INFRA class, so the attempt is
+    budget-exempt and resurrection-eligible. What was missing was the wire:
+    ``ComputeJobReportRequest`` did not DECLARE ``terminal_reason``, and pydantic's
+    default ``extra="ignore"`` destroyed it at the API boundary, silently and with
+    no log line. poll_status then fell through to the untyped "compute job failed"
+    default (123 is neither the 125 watchdog code nor one of the shell's 126/127
+    environment codes) and the whole platform fault landed on CODE_ERROR.
+
+    Every hop below is real: HTTP POST with runner Bearer auth → the report
+    handler's polling_metadata stamp → the monitor's poll/finalize → the durable
+    terminal_reason → the classifier. Nothing here is mocked, and deleting the
+    field from the request model fails this test.
+    """
+    from app.failure_classification import (
+        PROVISION_FAILURE,
+        classify_compute_terminal_reason,
+    )
+
+    emitted_reason = _runner_provision_terminal_reason()
+    project = await _make_project_owner(db_session, name="Runner Provision E2E")
+    runner, token = await _register_runner(db_session, project)
+    job = await _make_runner_subprocess_job(db_session, project, runner)
+
+    report = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "exec_status": "failed",
+            "exit_code": 123,
+            "terminal_reason": emitted_reason,
+        },
+    )
+    assert report.status_code == 200, report.text
+
+    # The field SURVIVED the boundary. Asserted separately from the classification
+    # so a regression reads as "the transport dropped it" rather than as a vague
+    # misclassification.
+    await db_session.refresh(job)
+    assert (job.polling_metadata or {}).get("runner_terminal_reason") == (
+        emitted_reason
+    ), (
+        "ComputeJobReportRequest.terminal_reason was dropped at the API boundary "
+        "(pydantic extra='ignore') or never stamped into polling_metadata"
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert (job.polling_metadata or {}).get("exit_code") == 123
+    assert job.terminal_reason == emitted_reason, (
+        "poll_status must prefer the runner-reported reason over the untyped "
+        f"'compute job failed' default; got {job.terminal_reason!r}"
+    )
+    assert (
+        classify_compute_terminal_reason(job.terminal_reason, "runtime")
+        == PROVISION_FAILURE
+    ), "a host-capability gap must not be billed to the experiment as a defect"
+
+
+@pytest.mark.asyncio
+async def test_runner_report_terminal_reason_is_bounded_and_terminal_only(
+    client, db_session
+):
+    """``terminal_reason`` is runner-supplied input that lands in a JSONB column,
+    so the server bounds it — and accepts it only on a TERMINAL report.
+
+    The length pin is deliberately a literal (500), not the constant it guards: an
+    assertion written as ``== _MAX_RUNNER_TERMINAL_REASON_CHARS`` would certify
+    whatever value a future edit chose. The terminal-only rule stops a live job
+    from pre-stamping the very string the failure classifier keys on.
+    """
+    project = await _make_project_owner(db_session, name="Runner Reason Bounds")
+    runner, token = await _register_runner(db_session, project)
+
+    job = await _make_runner_subprocess_job(db_session, project, runner)
+    report = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "exec_status": "failed",
+            "exit_code": 123,
+            "terminal_reason": "provisioning " + ("x" * 5000),
+        },
+    )
+    assert report.status_code == 200, report.text
+    await db_session.refresh(job)
+    stamped = (job.polling_metadata or {}).get("runner_terminal_reason")
+    assert isinstance(stamped, str)
+    assert len(stamped) == 500
+
+    running = await _make_runner_subprocess_job(db_session, project, runner)
+    report = await client.post(
+        f"/api/runner/compute-job/{running.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "exec_status": "running",
+            "terminal_reason": "provisioning failure claimed mid-run",
+        },
+    )
+    assert report.status_code == 200, report.text
+    await db_session.refresh(running)
+    assert "runner_terminal_reason" not in (running.polling_metadata or {})
 
 
 @pytest.mark.asyncio

@@ -1496,6 +1496,16 @@ class RunnerSubprocessBackend:
                     ).replace(tzinfo=None)
                 except (ValueError, AttributeError):
                     pass
+            raw_reason = meta.get("runner_terminal_reason")
+            # Structured cause the runner attached to its terminal report
+            # (ComputeJobReportRequest.terminal_reason). Server-bounded on stamp;
+            # re-validated here because polling_metadata is a JSONB column that
+            # older rows and other writers also touch.
+            reported_reason = (
+                raw_reason.strip()
+                if isinstance(raw_reason, str) and raw_reason.strip()
+                else None
+            )
             no_progress_timeout = exit_code == NO_PROGRESS_WATCHDOG_EXIT_CODE
             cjs = (
                 ComputeJobStatus.SUCCEEDED
@@ -1509,25 +1519,46 @@ class RunnerSubprocessBackend:
             if cjs == ComputeJobStatus.SUCCEEDED:
                 message = "compute job succeeded"
             elif no_progress_timeout:
-                # No-progress watchdog kill on the runner. The runner /report
-                # endpoint carries only exec_status/exit_code (no reason field),
-                # so translate the reserved exit code here into a terminal reason
-                # string classify_compute_terminal_reason keys on. Without this the
-                # kill collapses to CODE_ERROR (burns retry budget, misattributes
-                # blame) instead of NO_PROGRESS_TIMEOUT — matching the GCP/local
-                # -subprocess paths which emit REASON=no_progress_timeout directly.
+                # No-progress watchdog kill on the runner. The reserved exit code
+                # is translated here into the terminal reason string
+                # classify_compute_terminal_reason keys on. Without this the kill
+                # collapses to CODE_ERROR (burns retry budget, misattributes blame)
+                # instead of NO_PROGRESS_TIMEOUT — matching the GCP/local-subprocess
+                # paths which emit REASON=no_progress_timeout directly.
+                #
+                # A runner-reported ``terminal_reason`` deliberately does NOT
+                # override this one. 125 is a RESERVED code with exactly one
+                # meaning, shared literal-for-literal with the emitter, and the
+                # sentinel it maps to is pinned by test. Letting free prose win
+                # here would put the reserved code's classification at the mercy of
+                # whatever wording a future runner happens to send.
                 message = NO_PROGRESS_TIMEOUT_TERMINAL_REASON
             else:
-                # Same seam, same reason: the /report endpoint carries an
-                # exit_code but no reason field, so the exit code is the ONLY
-                # evidence of how the job died. Discarding it into the untyped
-                # prose "compute job failed" made exit 127 (no interpreter on the
-                # runner -- the commonest bootstrap death in the corpus) and exit
-                # 126 (found but not executable) classify as CODE_ERROR, burning
-                # the task's retry budget on a defect that is not in the code.
+                # Two independent channels of evidence for how the job died, in
+                # order of specificity:
+                #
+                # 1. ``reported_reason`` -- the runner's own structured cause,
+                #    posted as ComputeJobReportRequest.terminal_reason. This is the
+                #    precise string (e.g. "runner provisioning failure: no usable
+                #    python runtime on this host"), and the classifier already
+                #    routes it correctly. It arrives here only because the field is
+                #    DECLARED on the request model: pydantic's ``extra="ignore"``
+                #    default silently destroyed it at the API boundary for as long
+                #    as it was undeclared, which is exactly how a host-capability
+                #    gap came to be billed to the experiment's author.
+                # 2. The exit code, when the SHELL reserves it for "the environment
+                #    did not have what the command needed" (126/127). Discarding
+                #    that into the untyped prose "compute job failed" made no
+                #    interpreter on the runner -- the commonest bootstrap death in
+                #    the corpus -- classify as CODE_ERROR, burning the task's retry
+                #    budget on a defect that is not in the code.
+                #
+                # _terminal_failure_message resolves both: an environment exit code
+                # carries the typed sentinel (with the reason preserved as detail),
+                # otherwise the reported reason wins over the untyped default.
                 message = _terminal_failure_message(
                     exit_code=exit_code,
-                    reason=None,
+                    reason=reported_reason,
                     default="compute job failed",
                 )
             return ComputeStatusResult(
