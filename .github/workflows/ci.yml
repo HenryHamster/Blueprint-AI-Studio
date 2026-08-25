@@ -49,6 +49,37 @@ jobs:
       backend: ${{ steps.result.outputs.backend }}
       agent: ${{ steps.result.outputs.agent }}
     steps:
+      # Self-heal a workspace that a previous job left root-owned, BEFORE
+      # checkout -- because checkout is exactly what breaks.
+      #
+      # Self-hosted runners share _work/<repo>/<repo> across every workflow on
+      # that runner. A container that bind-mounts the tree read-write and runs
+      # as root leaves __pycache__, .pytest_cache and .testmondata the runner
+      # user cannot delete, and the next actions/checkout dies in seconds:
+      #
+      #   warning: failed to remove backend/app/routers/__pycache__/...pyc: Permission denied
+      #   ##[warning]Unable to clean or reset the repository. The repository will be recreated instead.
+      #   ##[error]File was unable to be removed Error: EACCES: permission denied,
+      #     unlink '.../backend/.pytest_cache/.gitignore'
+      #
+      # It presents as a landing lottery: the identical SHA is red on one
+      # runner and green on the next, so it reads as a flaky test rather than a
+      # broken host. That is expensive here specifically -- this workflow is
+      # what gates the automain->main promotion PR, and a red run deletes that
+      # PR and its release branch.
+      #
+      # scripts/test-backend.sh was the producer and is fixed (#17868 runs the
+      # container as the calling uid). This step is the consumer-side guard: it
+      # costs ~1s, it is idempotent, and it means ANY future producer -- another
+      # repo on this runner, an agent VM harness, a hand-run container -- cannot
+      # silently red the promotion. guard-data.yml carries the same pair.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
@@ -105,6 +136,14 @@ jobs:
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -154,6 +193,14 @@ jobs:
       matrix:
         shard: [1, 2]
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -199,6 +246,14 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -392,6 +447,14 @@ jobs:
     outputs:
       reqhash: ${{ steps.hash.outputs.reqhash }}
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - name: Compute deps hash
@@ -497,6 +560,14 @@ jobs:
       POSTGRES_CONTAINER: blueprint-ci-postgres-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
       TEST_DB_URL: postgresql+asyncpg://test:test@postgres:5432/test_blueprint
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       # Persistent runners are not discarded after every job. Each runner owns
@@ -844,6 +915,14 @@ jobs:
     needs: detect
     if: needs.detect.outputs.agent == 'true'
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
