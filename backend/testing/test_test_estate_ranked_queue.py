@@ -202,7 +202,7 @@ def test_checked_in_queue_ranks_every_collected_test_file() -> None:
     assert not missing, (
         "test files exist but are absent from test-estate-ranked-queue.md; "
         "regenerate with `python3 scripts/generate_test_estate_ranked_queue.py "
-        "--write`:" + NL
+        "--write` (`python` on Windows, which ships no `python3`):" + NL
         + NL.join(f"  - {path}" for path in missing)
         + NL
         + format_offender_marker(missing)
@@ -211,7 +211,7 @@ def test_checked_in_queue_ranks_every_collected_test_file() -> None:
     assert not vanished, (
         "test-estate-ranked-queue.md ranks files that are no longer collected; "
         "regenerate with `python3 scripts/generate_test_estate_ranked_queue.py "
-        "--write`:" + NL
+        "--write` (`python` on Windows, which ships no `python3`):" + NL
         + NL.join(f"  - {path}" for path in vanished)
         + NL
         + format_offender_marker(vanished)

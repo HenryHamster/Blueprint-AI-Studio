@@ -799,7 +799,9 @@ def main(argv=None) -> int:
     if args.mandatory_output is not None:
         ordinary, mandatory = resolve_impacted_partition(changed, repo_root)
         try:
-            with open(args.mandatory_output, "w", encoding="utf-8") as fh:
+            with open(
+                args.mandatory_output, "w", encoding="utf-8", newline=""
+            ) as fh:
                 for rel in mandatory:
                     fh.write(rel + "\n")
         except OSError as exc:

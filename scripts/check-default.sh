@@ -74,6 +74,20 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "[check] python3 is absent on PATH; routing python3 to $_PY3_FALLBACK"
 fi
 
+# Interpreter ENCODING, the companion to the interpreter identity above. Python
+# picks the host locale codec for print(), open() and `subprocess(text=True)`.
+# On Linux and in CI that is UTF-8; on the Windows developer host it is cp1252,
+# so the SAME guard behaves differently on the two hosts: it emits byte 0x97
+# where CI emits an em dash (the captured lane output then fails a strict UTF-8
+# decode), and it dies with UnicodeEncodeError the moment it echoes tool output
+# containing a character cp1252 lacks -- the box drawing, arrows and check marks
+# that pytest/tsc/vitest print. A guard that cannot print its own verdict
+# reports nothing. UTF-8 mode makes every python-backed lane below, including
+# the inline `python3 -c` helpers, behave the way CI already does. No-op on a
+# UTF-8 host.
+PYTHONUTF8=1
+export PYTHONUTF8
+
 WITH_TESTS=0
 FULL_SCOPE=0
 for arg in "$@"; do

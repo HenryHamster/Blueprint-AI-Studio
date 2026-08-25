@@ -510,6 +510,17 @@ DOCKER_USER_ARGS=()
 if _invoking_uid="$(id -u 2>/dev/null)" && _invoking_gid="$(id -g 2>/dev/null)" \
    && [ -n "$_invoking_uid" ] && [ -n "$_invoking_gid" ]; then
   DOCKER_USER_ARGS=(--user "${_invoking_uid}:${_invoking_gid}" -e HOME=/tmp)
+  # USER too: --user injects a uid the image's /etc/passwd does not know, so
+  # getpass.getuser() raises KeyError: 'getpwuid(): uid not found: 197609'
+  # (the MSYS mapping of a Windows account). That is exactly how 3 cases in
+  # scripts/test_blueprint_runner.py and 1 in scripts/test_local_runner.py
+  # fail in the scripts test lane on Windows. CI cannot see it: a root-owned
+  # checkout sends uid 0 in, and getpwuid(0) resolves. The only two consumers
+  # (_install_user in blueprint_runner.py / blueprint_node.py) prefer $USER,
+  # and under root the exported value is "root" -- what they already got.
+  if _invoking_user="$(id -un 2>/dev/null)" && [ -n "$_invoking_user" ]; then
+    DOCKER_USER_ARGS+=(-e "USER=${_invoking_user}")
+  fi
 fi
 
 # Mount admin-ui/src read-only so test_invariants.py's frontend size

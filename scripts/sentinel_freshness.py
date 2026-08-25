@@ -58,6 +58,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from utf8_io import force_utf8_streams  # noqa: E402
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
+
 from static_release_guard import (  # noqa: E402
     SENTINEL_REPAIR_COMMANDS,
     JUnitReport,
@@ -259,6 +265,7 @@ def _run_lane(repo: Path, base: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="automain")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())

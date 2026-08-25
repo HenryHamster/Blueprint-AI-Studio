@@ -38,6 +38,14 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from utf8_io import force_utf8_streams
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
+
 SCHEMA_VERSION = 1
 
 #: Maximum number of entries recorded per bucket (suppressed/disappeared/skipped).
@@ -57,7 +65,12 @@ DEFAULT_TASK_ID = "local-developer"
 
 _BUCKETS = ("suppressed", "disappeared", "skipped")
 
-_LANE_SAFE = re.compile(r"[^A-Za-z0-9._:-]+")
+# ``:`` is deliberately NOT in this set. Lane names carry one ("typecheck:agent"),
+# but a colon is an illegal filename character on Windows -- it opens an NTFS
+# alternate data stream -- so the receipt write failed with WinError 87 and the
+# fail-open handler swallowed it, leaving every developer-host guard aggregate
+# permanently empty. The true lane string still travels inside the record.
+_LANE_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def resolve_task_id(task_id: str | None = None) -> str:
@@ -190,7 +203,11 @@ def record_lane(
         destination = lane_receipt_path(lane, task_id)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(f".{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+        # newline="": receipts are machine-read (aggregate(), jq, the agent
+        # PR helper); their bytes must not vary with the writing host.
+        temporary.write_text(
+            json.dumps(record, sort_keys=True) + "\n", encoding="utf-8", newline=""
+        )
         temporary.replace(destination)
         return destination
     except Exception as exc:  # noqa: BLE001 - emitting must never block a lane
@@ -347,7 +364,9 @@ def merge_into_gate_receipt(aggregate_path: Path, gate_receipt_path: Path) -> bo
             return False
         gate["guard_suppressions"] = projection
         Path(gate_receipt_path).write_text(
-            json.dumps(gate, separators=(",", ":")) + "\n", encoding="utf-8"
+            json.dumps(gate, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+            newline="",
         )
         return True
     except Exception as exc:  # noqa: BLE001 - projection must never block ./pr
@@ -364,6 +383,7 @@ def _parse_identity(raw: str) -> tuple[str, str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -418,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.out is not None:
             try:
                 args.out.parent.mkdir(parents=True, exist_ok=True)
-                args.out.write_text(payload + "\n", encoding="utf-8")
+                args.out.write_text(payload + "\n", encoding="utf-8", newline="")
             except OSError as exc:
                 print(
                     f"[guard-suppression] WARNING: could not write aggregate: {exc}",

@@ -317,3 +317,58 @@ def test_the_static_corpus_hands_the_harness_a_shell_readable_junit_path(
     guard._run_static_corpus(tmp_path, tmp_path / "current.xml", selectors=["a.py"])
 
     assert seen["junit"] == "/posix" + str(tmp_path / "current.xml")
+
+
+def _docker_user_block() -> str:
+    """The one ``if`` block in the harness that builds ``DOCKER_USER_ARGS``."""
+    source = (REPO_ROOT / "scripts" / "test-backend.sh").read_text(encoding="utf-8")
+    start = source.find("DOCKER_USER_ARGS=()")
+    assert start >= 0, "scripts/test-backend.sh must build DOCKER_USER_ARGS"
+    end = source.find("\nfi\n", start)
+    assert end >= 0, "the DOCKER_USER_ARGS block must be closed"
+    return source[start:end]
+
+
+def test_the_harness_names_the_container_user_whose_uid_it_injects() -> None:
+    """``--user`` alone hands the image a uid its passwd file has never seen.
+
+    ``id -u`` answers 197609 on this host -- the MSYS mapping of the Windows
+    account -- and the backend test image has no ``/etc/passwd`` entry for it,
+    so anything reaching ``getpass.getuser()`` dies with
+    ``KeyError: 'getpwuid(): uid not found: 197609'``.  That is how three
+    cases in ``scripts/test_blueprint_runner.py`` and one in
+    ``scripts/test_local_runner.py`` failed in the scripts test lane here
+    while passing in CI, whose root-owned checkout sends uid 0 in and
+    resolves ``getpwuid(0)`` to "root".
+    """
+    block = _docker_user_block()
+    assert "--user" in block
+    assert 'USER=${_invoking_user}' in block, (
+        "test-backend.sh passes --user, so it must also export USER; "
+        "otherwise getpass.getuser() has no passwd entry to find"
+    )
+
+
+def test_the_runner_install_path_prefers_user_over_the_passwd_database() -> None:
+    """The harness fix only works because ``$USER`` short-circuits the lookup."""
+    import getpass
+
+    import blueprint_runner
+
+    def unresolvable_uid() -> str:
+        raise KeyError("getpwuid(): uid not found: 197609")
+
+    original_getuser = getpass.getuser
+    original_environ = dict(os.environ)
+    getpass.getuser = unresolvable_uid  # type: ignore[assignment]
+    try:
+        os.environ.pop("SUDO_USER", None)
+        os.environ.pop("USER", None)
+        with pytest.raises(KeyError):
+            blueprint_runner._install_user()
+        os.environ["USER"] = "invoking-operator"
+        assert blueprint_runner._install_user() == "invoking-operator"
+    finally:
+        getpass.getuser = original_getuser  # type: ignore[assignment]
+        os.environ.clear()
+        os.environ.update(original_environ)

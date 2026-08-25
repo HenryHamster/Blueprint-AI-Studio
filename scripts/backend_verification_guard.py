@@ -26,6 +26,12 @@ try:  # absent from synthetic fixtures that copy scripts/ piecemeal
 except ImportError:  # pragma: no cover - fixture trees are POSIX already
     bash_executable, posix_path = (lambda: "bash"), os.fspath  # noqa: E731
 
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from utf8_io import force_utf8_streams  # noqa: E402
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
+
 try:
     from guard_suppression_receipt import record_classification  # noqa: E402
 except ImportError:  # pragma: no cover - emitting is fail-open by contract
@@ -50,6 +56,8 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         cwd=repo,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 
@@ -104,6 +112,7 @@ def _blocking_outcome(args: argparse.Namespace, state: str, **extra: object) -> 
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="automain")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -172,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
                     env=env,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     check=False,
                 )
                 try:

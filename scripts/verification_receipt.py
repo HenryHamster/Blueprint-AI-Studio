@@ -33,6 +33,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from utf8_io import force_utf8_streams
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
+
 RECEIPT_VERSION = 1
 
 # Where ./check and the generated gate both put the sidecar.
@@ -619,8 +627,13 @@ def project_attribution_command(gate: Path, receipt: Path) -> int:
         if not isinstance(gate_payload, dict):
             return 0
         gate_payload.update(attribution)
+        # newline="": this receipt is parsed downstream by jq and by
+        # agent/src/prompts/pr-helper.ts, so its bytes must not depend on
+        # which host wrote it.
         gate.write_text(
-            json.dumps(gate_payload, separators=(",", ":")) + "\n", encoding="utf-8"
+            json.dumps(gate_payload, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+            newline="",
         )
     except Exception:  # noqa: BLE001 - a receipt never decides a verdict
         return 0
@@ -628,6 +641,7 @@ def project_attribution_command(gate: Path, receipt: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     backend = subparsers.add_parser(

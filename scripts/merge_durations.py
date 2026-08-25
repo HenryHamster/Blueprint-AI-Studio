@@ -61,7 +61,7 @@ def load_duration_baseline(path: str) -> dict:
     """Load the existing artifact, retaining only entries in the current tree."""
     if not os.path.exists(path):
         return {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError(f"duration baseline must be a JSON object: {path}")
@@ -81,7 +81,7 @@ def merge(src_dir: str, output_path: str) -> int:
             merged[k] = v
 
     for path in sorted(glob.glob(os.path.join(src_dir, "*/*.json"))):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         data = filter_current_entries(data, root)
         pre = len(merged)
@@ -107,7 +107,10 @@ def merge(src_dir: str, output_path: str) -> int:
     if outlier_count:
         print(f"  Dropped {outlier_count} outlier(s) > {OUTLIER_CAP}s (fixture-setup misattribution)")
 
-    with open(output_path, "w") as f:
+    # ``newline=""`` keeps the committed durations artifact LF-only when this
+    # runs on a Windows host: platform translation would rewrite every one of
+    # its thousands of lines as CRLF and produce a whole-file diff.
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
         json.dump(merged, f, indent=2, sort_keys=True)
         f.write("\n")
 

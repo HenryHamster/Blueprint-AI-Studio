@@ -3,13 +3,15 @@
 > GENERATED FILE. Do not hand-edit mutable estate facts.
 > Regenerate with `python3 scripts/generate_test_estate_ranked_queue.py --write`;
 > validate with `python3 scripts/generate_test_estate_ranked_queue.py --check`.
+> On Windows the interpreter is `python`: the python.org installer ships
+> no `python3`, so the two commands above cannot run there as written.
 > Policy and threshold definitions: `test-estate-rubric.md`.
 
 ## Estate summary
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 630 | 990,177 | 26,396 | 8,543.210s (378 files) | 252 |
+| backend | 630 | 990,247 | 26,397 | 8,543.210s (378 files) | 252 |
 | admin-ui | 254 | 101,304 | 4,529 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 125 | 111,823 | 6,142 | 72.033s (125 files) | 0 |
@@ -157,7 +159,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 135 | P5 | admin-ui | `admin-ui/src/components/WarmVmPanel.test.tsx` | 1,769 | 67 | moderate (1500–2999 LOC) | 3.029s measured | — |
 | 136 | P5 | admin-ui | `admin-ui/src/components/FleetRunnersPanel.test.tsx` | 2,942 | 94 | moderate (1500–2999 LOC) | 2.946s measured | — |
 | 137 | P5 | admin-ui | `admin-ui/src/components/TaskDetailDrawerMeta.test.tsx` | 2,200 | 109 | moderate (1500–2999 LOC) | 2.512s measured | — |
-| 138 | P5 | backend | `backend/testing/test_orchestrator_liveness.py` | 1,935 | 62 | moderate (1500–2999 LOC) | 1.893s measured | — |
+| 138 | P5 | backend | `backend/testing/test_orchestrator_liveness.py` | 2,002 | 63 | moderate (1500–2999 LOC) | 1.893s measured | — |
 | 139 | P5 | backend | `backend/testing/test_fleet_utilization.py` | 1,527 | 42 | moderate (1500–2999 LOC) | 1.586s measured | — |
 | 140 | P5 | backend | `backend/testing/test_empty_repo_onboarding.py` | 1,837 | 51 | moderate (1500–2999 LOC) | 1.565s measured | — |
 | 141 | P5 | agent | `agent/src/prompts/check-helper.test.ts` | 2,347 | 84 | moderate (1500–2999 LOC) | 1.473s measured | — |
@@ -870,9 +872,9 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 848 | G | backend | `backend/testing/test_publication_gate_receipt.py` | 632 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
 | 849 | G | backend | `backend/testing/test_release_qualification_pause_deferral.py` | 628 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
 | 850 | G | backend | `backend/testing/test_strategic_consultation_status.py` | 620 | 3 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 3 |
-| 851 | G | backend | `backend/testing/test_reaper_post_orphan_sweep.py` | 608 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 852 | G | backend | `backend/testing/test_blocked_retry_authority.py` | 605 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 853 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 605 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 851 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 608 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 852 | G | backend | `backend/testing/test_reaper_post_orphan_sweep.py` | 608 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 853 | G | backend | `backend/testing/test_blocked_retry_authority.py` | 605 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
 | 854 | G | backend | `backend/testing/test_migration_0682_workday_repair.py` | 600 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
 | 855 | G | backend | `backend/testing/test_runner_enroll_docs_accuracy.py` | 599 | 19 | under 1500 LOC | unknown (no committed measurement) | — |
 | 856 | G | backend | `backend/testing/test_github_onboarding_access.py` | 596 | 15 | under 1500 LOC | unknown (no committed measurement) | — |

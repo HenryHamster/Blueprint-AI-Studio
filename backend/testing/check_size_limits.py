@@ -76,6 +76,12 @@ _SCRIPTS_DIR = os.path.normpath(os.path.join(_BACKEND_DIR, "..", "scripts"))
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+try:  # absent from the backend-only Docker context, which has no scripts/
+    from utf8_io import force_utf8_streams
+except ImportError:  # pragma: no cover - that context is a UTF-8 host already
+    def force_utf8_streams() -> None:
+        return None
+
 # Inserting ``_BACKEND_DIR`` at the front of ``sys.path`` only wins the
 # ``app.size_limit_policy`` import when ``<_BACKEND_DIR>/app`` is a REGULAR
 # package. If it is a bare directory with no ``__init__.py`` (e.g. a stripped
@@ -504,8 +510,13 @@ def scan_governed_missing_cap(
 
 
 def load_limits(json_path: str) -> dict:
-    """Load the size-limits JSON, preserving key order (dicts are ordered)."""
-    with open(json_path) as f:
+    """Load the size-limits JSON, preserving key order (dicts are ordered).
+
+    Strict utf-8, NOT ``errors="replace"`` like :func:`count_lines`: ``--fix``
+    writes back what it read, so replacing here would launder mojibake into the
+    committed ledger. An undecodable ledger must fail loudly instead.
+    """
+    with open(json_path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -514,8 +525,11 @@ def write_limits(json_path: str, data: dict) -> None:
 
     Uses the same formatting as the tracked file (2-space indent, ASCII-escaped,
     trailing newline) so a --fix diff shows only the changed cap numbers.
+
+    ``newline=""`` stops a Windows ``--fix`` rewriting every line of this ledger
+    as CRLF -- a whole-file diff that defeats its ``sizecap`` merge driver.
     """
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8", newline="") as f:
         json.dump(data, f, indent=2, ensure_ascii=True)
         f.write("\n")
 
@@ -1030,6 +1044,7 @@ def _parse_repair_target(raw: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(
         description="Check (and optionally --fix) module size-limit guardrails."
     )
@@ -1336,7 +1351,10 @@ def main(argv: list[str] | None = None) -> int:
             if bumped or added or pruned:
                 write_limits(args.json_path, data)
             for source_path, source_text in source_rewrites:
-                with open(source_path, "w", encoding="utf-8") as source_file:
+                # newline="": source_text was read with universal newlines, so
+                # without it a Windows --fix rewrites the WHOLE tracked source
+                # file as CRLF to change one cap constant.
+                with open(source_path, "w", encoding="utf-8", newline="") as source_file:
                     source_file.write(source_text)
             if bumped or pruned or phantoms or missing_ledger_records:
                 # Keep the committed cap-bump-history ledger (the deployed

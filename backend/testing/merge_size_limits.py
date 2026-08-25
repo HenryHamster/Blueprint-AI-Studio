@@ -84,7 +84,10 @@ def merge_limits(ours: dict, theirs: dict) -> dict:
 
 
 def _load(path: str) -> dict:
-    with open(path) as f:
+    # Strict utf-8, not the host locale codec: git hands this driver three
+    # blobs and the resolved bytes are committed, so a locale-dependent read
+    # would make the merge result depend on which developer ran it.
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError(f"{path}: expected a JSON object, got {type(data).__name__}")
@@ -92,8 +95,14 @@ def _load(path: str) -> dict:
 
 
 def _write(path: str, data: dict) -> None:
-    """Write byte-identically to check_size_limits.write_limits."""
-    with open(path, "w") as f:
+    """Write byte-identically to check_size_limits.write_limits.
+
+    That promise is why ``encoding="utf-8", newline=""`` is spelled out rather
+    than inherited from the host: without them a Windows resolve emits CRLF
+    while ``--fix`` on the same file emits LF, so the two writers of this one
+    ledger would disagree on every line and each merge would re-conflict.
+    """
+    with open(path, "w", encoding="utf-8", newline="") as f:
         json.dump(data, f, indent=2, ensure_ascii=True)
         f.write("\n")
 

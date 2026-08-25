@@ -29,6 +29,12 @@ from backend.testing.identity_extraction import (  # noqa: E402
     frozen_typescript_tree,
 )
 
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from scripts.utf8_io import force_utf8_streams  # noqa: E402
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
+
 QUEUE_PATH = "test-estate-ranked-queue.md"
 MANIFEST_PATH = "backend/testing/conversational_workday_manifest.json"
 BACKEND_DURATIONS_PATH = "backend/.test_durations"
@@ -237,6 +243,8 @@ def render_queue(root: Path) -> str:
         "> GENERATED FILE. Do not hand-edit mutable estate facts.\n"
         "> Regenerate with `python3 scripts/generate_test_estate_ranked_queue.py --write`;\n"
         "> validate with `python3 scripts/generate_test_estate_ranked_queue.py --check`.\n"
+        "> On Windows the interpreter is `python`: the python.org installer ships\n"
+        "> no `python3`, so the two commands above cannot run there as written.\n"
         "> Policy and threshold definitions: `test-estate-rubric.md`.\n\n"
         "## Estate summary\n\n"
         + _summary(records)
@@ -265,7 +273,8 @@ def _check(root: Path, output: Path) -> int:
     )
     print(
         "Test-estate queue is stale. Regenerate it with "
-        "`python3 scripts/generate_test_estate_ranked_queue.py --write`.\n"
+        "`python3 scripts/generate_test_estate_ranked_queue.py --write` "
+        "(`python` on Windows, which ships no `python3`).\n"
         + "".join(diff),
         file=sys.stderr,
     )
@@ -273,6 +282,7 @@ def _check(root: Path, output: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--write", action="store_true", help="write the derived queue")
@@ -282,7 +292,10 @@ def main(argv: list[str] | None = None) -> int:
     root = args.root.resolve()
     output = root / QUEUE_PATH
     if args.write:
-        output.write_text(render_queue(root), encoding="utf-8")
+        # newline="" suppresses platform newline translation: a Windows
+        # --write otherwise emits CRLF for every one of the ~1200 rows,
+        # a whole-file diff that conflicts with every concurrent branch.
+        output.write_text(render_queue(root), encoding="utf-8", newline="")
         return 0
     return _check(root, output)
 

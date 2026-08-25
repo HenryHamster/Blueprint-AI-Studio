@@ -1229,7 +1229,9 @@ def rebuild_cap_bump_history_ledger(
         "history": base_history,
     }
     ledger = ledger_with_pending_bumps(ledger, pending or [])
-    with open(out_path, "w", encoding="utf-8") as f:
+    # newline="": this ledger is a tracked file, and platform newline
+    # translation on a Windows --fix would rewrite every line as CRLF.
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
         json.dump(ledger, f, indent=2, ensure_ascii=True)
         f.write("\n")
     return ledger
