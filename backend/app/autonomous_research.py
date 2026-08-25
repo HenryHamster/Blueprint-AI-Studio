@@ -915,6 +915,16 @@ def _strategic_backstop_due(
     return (now - last_strategic_at).total_seconds() / 60.0 >= max_interval_minutes
 
 
+# Starvation recovery bypasses BOTH the research circuit breaker and the
+# ``_strategic_failures < 3`` park, so it needs its own ceiling: the starvation
+# sweep re-arms its marker on EVERY reaper tick while the loop stays halted —
+# i.e. continuously, precisely when spawned cycles keep failing. Each bypassed
+# cycle that fails increments ``_strategic_failures``, so capping the bypass on
+# that counter bounds recovery to a few extra attempts beyond the ordinary
+# breaker and then parks until the 48h failure decay clears the latch.
+_STARVATION_BYPASS_FAILURE_CAP = 6
+
+
 async def _spawn_research_task_inner(
     project: Project,
     session: AsyncSession,
@@ -1109,21 +1119,62 @@ async def _spawn_research_task_inner(
             expected_legacy_generation=legacy_generation,
         )
         return
-    # Guard: circuit breaker must allow spawning
-    # A struggling project (breaker OPEN) is exactly when an operator is
-    # most likely to steer; never swallow that silently. Notify (once)
-    # that steering is queued while the breaker cools down. The marker is
-    # preserved — only the spawn returns — so steering still lands once
-    # the breaker clears.
+
+    # The starvation sweep arms this exact qualification refresh as the
+    # unattended recovery path for a halted Strategic loop. Unlike ordinary
+    # qualification refreshes, it must be allowed through an OPEN breaker:
+    # the breaker is open precisely because the loop has already failed, and
+    # waiting for it to cool would leave the sweep's promised self-heal marker
+    # unread. Keep the reason/origin narrow so unrelated qualification work
+    # remains breaker-protected, and keep the arm itself bounded by the raised
+    # ``_STARVATION_BYPASS_FAILURE_CAP`` failure ceiling: a loop whose recovery
+    # cycles keep failing stops bypassing and parks instead of re-firing forever.
+    from app.strategic_trigger import (
+        ORIGIN_QUALIFICATION as _ORIGIN_QUALIFICATION,
+        strategic_refresh_due,
+        strategic_refresh_origin as _strategic_refresh_origin,
+    )
+
+    _starvation_refresh_marker = vision_data.get("_strategic_refresh")
+    _starvation_refresh_due = (
+        automatic_strategic_cycles_allowed
+        and isinstance(_starvation_refresh_marker, dict)
+        and _starvation_refresh_marker.get("reason") == "strategic_cycle_starvation"
+        and _strategic_refresh_origin(vision_data) == _ORIGIN_QUALIFICATION
+        and strategic_failures < _STARVATION_BYPASS_FAILURE_CAP
+        and strategic_refresh_due(
+            vision_data,
+            _utcnow(),
+            min_interval_seconds=_runtime_config.get(
+                "strategic_refresh_min_interval_seconds", 120
+            ),
+        )
+    )
+
+    # Guard: circuit breaker must allow spawning. A struggling project (breaker
+    # OPEN) is exactly when an operator is most likely to steer; never swallow
+    # that silently. Generic refresh markers are preserved — only the spawn
+    # returns — so steering still lands once the breaker clears. The explicit
+    # starvation recovery arm above is the narrow exception: it must wake the
+    # halted loop that caused the breaker to open.
+    #
+    # The check itself always runs (it owns the OPEN→HALF_OPEN cooldown advance
+    # and the one-time operator deferral notice). Only the *return* is bypassed,
+    # and only for the strategic recovery spawn: several branches below reset
+    # ``is_strategic`` and fall through to ordinary tactical research, which must
+    # stay breaker-protected. ``_breaker_bypassed_for_starvation`` carries that
+    # obligation to the re-assertion immediately before the tactical path.
     breaker = _shared_state.get_circuit_breaker(str(project.id))
-    if await _advance_circuit_breaker_and_check(
+    _breaker_blocks = await _advance_circuit_breaker_and_check(
         project,
         session,
         breaker,
         "autonomous research spawn",
         expected_legacy_generation=legacy_generation,
-    ):
+    )
+    if _breaker_blocks and not _starvation_refresh_due:
         return
+    _breaker_bypassed_for_starvation = _breaker_blocks
     # Guard: defer autonomous research until repo_bootstrap completes for external-repo
     # projects. Strategic cycles already defer this way; keeping research consistent
     # prevents ungrounded findings against a half-onboarded repo. Terminal bootstraps
@@ -1391,14 +1442,12 @@ async def _spawn_research_task_inner(
     from app.strategic_trigger import (
         ORIGIN_OPERATOR as _ORIGIN_OPERATOR,
         refresh_breaker_applies,
-        strategic_refresh_due,
-        strategic_refresh_origin as _strategic_refresh_origin,
     )
 
     if (
         automatic_strategic_cycles_allowed
         and _strategic_refresh_origin(vision_data) == _ORIGIN_OPERATOR
-    ):
+    ) or _starvation_refresh_due:
         force_strategic = True
     elif automatic_strategic_cycles_allowed and not force_strategic:
         _refresh_min_interval = _runtime_config.get(
@@ -2020,14 +2069,16 @@ async def _spawn_research_task_inner(
                 # qualification verdict that couldn't spawn while a cycle was
                 # active) is a LEGITIMATE reason to bypass this anti-spam
                 # cooldown — distinct from the cancel/fail loop the cooldown
-                # guards against. Gated by the _strategic_failures breaker (< 3)
-                # and a min-interval floor, so a broken request that keeps
-                # failing stops bypassing instead of looping.
+                # guards against. Gated by the _strategic_failures breaker
+                # (< 3, or < _STARVATION_BYPASS_FAILURE_CAP for the starvation
+                # recovery arm) and a min-interval floor, so a broken request
+                # that keeps failing stops bypassing instead of looping.
                 _refresh_min_interval = _runtime_config.get(
                     "strategic_refresh_min_interval_seconds", 120
                 )
                 _breaker_gate_ok = (
-                    not refresh_breaker_applies(project.vision)
+                    _starvation_refresh_due
+                    or not refresh_breaker_applies(project.vision)
                     or strategic_failures < 3
                 )
                 _refresh_due = _breaker_gate_ok and strategic_refresh_due(
@@ -2304,6 +2355,22 @@ async def _spawn_research_task_inner(
     # never lazy-load — mirrors the refreshes the strategic paths above already
     # perform after committing.
     await session.refresh(project)
+
+    # Re-assert the circuit breaker before the tactical path. The starvation
+    # bypass above is scoped to the strategic recovery spawn ONLY — it exists to
+    # wake the halted loop that opened the breaker, not to admit ordinary
+    # direction research. Every branch above that resets ``is_strategic``
+    # (advisory-lock contention, an already-active strategic task, the spawn
+    # cooldown, the no-delta gate) falls through to here, so without this the
+    # bypass would silently spawn tactical research with the breaker OPEN.
+    if _breaker_bypassed_for_starvation:
+        logger.info(
+            "[AUTONOMOUS] Skipping tactical research spawn for project %s — "
+            "circuit breaker is open (the starvation bypass covers only the "
+            "strategic recovery spawn)",
+            project.id,
+        )
+        return
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.

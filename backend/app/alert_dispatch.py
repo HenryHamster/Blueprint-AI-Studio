@@ -2627,6 +2627,7 @@ _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE = (
     "Strategic engine halted: no completed cycle in window"
 )
 _STRATEGIC_CYCLE_LIVENESS_EVENT_TYPE = "research.strategic_cycle_liveness"
+_STRATEGIC_CYCLE_LIVENESS_WEBHOOK_EVENT = "STRATEGIC_ENGINE_HALTED"
 _STRATEGIC_CYCLE_LIVENESS_RESOLUTION_LIMIT = 100
 
 
@@ -2725,6 +2726,27 @@ async def _maybe_create_strategic_cycle_liveness_alert(
             "title": alert.title,
         },
     )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006  # fire-and-forget; caller does not await
+            dispatch_external_notification(
+                project_id,
+                _STRATEGIC_CYCLE_LIVENESS_WEBHOOK_EVENT,
+                {
+                    "alert_id": str(alert.id),
+                    "title": alert.title,
+                    "message": alert.message,
+                    "starvation_hours": starvation_hours,
+                    "last_successful_completed_at": last_successful_completed_label,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning(
+            "[NOTIFY] STRATEGIC_ENGINE_HALTED dispatch setup failed: %s", _ne
+        )
     return True
 
 

@@ -1009,6 +1009,257 @@ class TestStrategicLoopLiveness:
 
         assert mock_spawn.await_count == 1
 
+    async def test_halted_loop_with_open_breaker_still_consumes_the_sweep_refresh_marker(
+        self, db_session, mocker
+    ):
+        """The starvation sweep's recovery arm reaches a halted loop."""
+        from app.autonomous_research import _spawn_research_task
+        from app.models import TaskStatus
+        from app.reaper_sweeps import _sweep_strategic_cycle_starvation
+
+        strategic_spawn = mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.strategic_spawning._spawn_design_doc_update",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.autonomous_research._research_route_has_available_account",
+            return_value=True,
+        )
+        mocker.patch(
+            "app.autonomous_research.project_parallelism_cap", return_value=0
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={"automatic_strategic_cycles_enabled": True},
+            directions=[],
+            vision={"purpose": "test"},
+            design_doc={"systems/api": {"id": "api", "status": "working"}},
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        await db_session.refresh(project)
+        assert project.vision["_strategic_refresh"]["reason"] == (
+            "strategic_cycle_starvation"
+        )
+
+        _ss.circuit_breakers[str(project.id)] = {
+            "state": "OPEN",
+            "failure_count": 3,
+            "success_count": 0,
+            "opened_at": now,
+            "cooldown_seconds": 1_800,
+            "base_cooldown": 1_800,
+            "half_open_task_id": None,
+        }
+        try:
+            await _spawn_research_task(project, db_session)
+        finally:
+            _ss.circuit_breakers.pop(str(project.id), None)
+
+        await db_session.refresh(project)
+        assert strategic_spawn.await_count == 1
+        assert project.vision.get("_strategic_refresh") is None
+        assert project.vision["_strategic_refresh_last_fired_origin"] == (
+            "qualification"
+        )
+        assert not (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        ).scalars().all()
+
+    async def test_starvation_bypass_does_not_admit_tactical_research_through_open_breaker(
+        self, db_session, mocker
+    ):
+        """The bypass covers the strategic recovery spawn only, not tactical research.
+
+        An active strategic task resets ``is_strategic`` and the spawn falls
+        through to ordinary direction research. That fall-through must still be
+        blocked by the OPEN breaker — otherwise the starvation bypass silently
+        re-admits every tactical spawn on a struggling project.
+        """
+        from app.autonomous_research import _spawn_research_task
+        from app.reaper_sweeps import _sweep_strategic_cycle_starvation
+
+        strategic_spawn = mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.strategic_spawning._spawn_design_doc_update",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.autonomous_research._research_route_has_available_account",
+            return_value=True,
+        )
+
+        now = _utcnow()
+        direction = {
+            "id": "d-starvation-tactical",
+            "text": "Tactical direction",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+        }
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={"automatic_strategic_cycles_enabled": True},
+            directions=[direction],
+            vision={"purpose": "test"},
+            design_doc={"systems/api": {"id": "api", "status": "working"}},
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        await db_session.refresh(project)
+        assert project.vision["_strategic_refresh"]["reason"] == (
+            "strategic_cycle_starvation"
+        )
+
+        # An ACTIVE strategic task forces the is_strategic reset -> tactical
+        # fall-through, the exact path the bypass must not open.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title="Running strategic cycle",
+                payloads=[{"type": "strategic_review", "base_branch": "main"}],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
+        await db_session.commit()
+
+        async def _research_count() -> int:
+            rows = (
+                (
+                    await db_session.execute(
+                        select(Task).where(
+                            Task.project_id == project.id,
+                            Task.payloads[0]["type"].as_string() == "research",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return len(rows)
+
+        _ss.circuit_breakers[str(project.id)] = {
+            "state": "OPEN",
+            "failure_count": 3,
+            "success_count": 0,
+            "opened_at": now,
+            "cooldown_seconds": 1_800,
+            "base_cooldown": 1_800,
+            "half_open_task_id": None,
+        }
+        try:
+            await _spawn_research_task(project, db_session)
+            await db_session.refresh(project)
+            assert strategic_spawn.await_count == 0  # blocked by the active cycle
+            assert await _research_count() == 0  # breaker still guards tactical
+
+            # Positive control: with the breaker CLOSED the very same state DOES
+            # spawn tactical research, so the assertion above is the breaker's
+            # doing and not an unrelated guard.
+            _ss.circuit_breakers[str(project.id)]["state"] = "CLOSED"
+            await _spawn_research_task(project, db_session)
+            await db_session.refresh(project)
+            assert await _research_count() == 1
+        finally:
+            _ss.circuit_breakers.pop(str(project.id), None)
+
+    async def test_starvation_bypass_parks_once_the_failure_ceiling_is_reached(
+        self, db_session, mocker
+    ):
+        """A recovery loop whose cycles keep failing stops bypassing and parks.
+
+        The starvation sweep re-arms its marker on every reaper tick, so the
+        bypass needs its own ceiling: past ``_STARVATION_BYPASS_FAILURE_CAP``
+        recorded strategic failures it must stop crossing the OPEN breaker.
+        """
+        from app.autonomous_research import (
+            _STARVATION_BYPASS_FAILURE_CAP,
+            _spawn_research_task,
+        )
+        from app.reaper_sweeps import _sweep_strategic_cycle_starvation
+
+        strategic_spawn = mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.strategic_spawning._spawn_design_doc_update",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.autonomous_research._research_route_has_available_account",
+            return_value=True,
+        )
+        mocker.patch(
+            "app.autonomous_research.project_parallelism_cap", return_value=0
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={"automatic_strategic_cycles_enabled": True},
+            directions=[],
+            vision={
+                "purpose": "test",
+                # Recorded by the recovery cycles this bypass already spawned;
+                # recent enough that the 48h decay has not cleared it.
+                "_strategic_failures": _STARVATION_BYPASS_FAILURE_CAP,
+                "_strategic_failures_at": now.isoformat(),
+            },
+            design_doc={"systems/api": {"id": "api", "status": "working"}},
+            created_at=now - timedelta(days=3),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 1
+        await db_session.refresh(project)
+
+        _ss.circuit_breakers[str(project.id)] = {
+            "state": "OPEN",
+            "failure_count": 3,
+            "success_count": 0,
+            "opened_at": now,
+            "cooldown_seconds": 1_800,
+            "base_cooldown": 1_800,
+            "half_open_task_id": None,
+        }
+        try:
+            await _spawn_research_task(project, db_session)
+        finally:
+            _ss.circuit_breakers.pop(str(project.id), None)
+
+        await db_session.refresh(project)
+        assert strategic_spawn.await_count == 0
+        # The marker is preserved (parked, not consumed) so recovery resumes
+        # once the failure latch decays.
+        assert project.vision["_strategic_refresh"]["reason"] == (
+            "strategic_cycle_starvation"
+        )
+
     async def test_wall_clock_backstop_does_not_claim_fire_for_resident_owned_project(
         self, db_session, mocker, caplog
     ):

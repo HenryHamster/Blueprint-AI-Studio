@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import app.notification_dispatch as nd
+from app.alert_dispatch import _maybe_create_strategic_cycle_liveness_alert
 from app.notification_dispatch import (
     _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
     _RETRY_DELAYS,
@@ -46,6 +47,7 @@ from app.models import (
     ResidualCaseStatus,
     ResidualRemediationCase,
 )
+from app.time_utils import _utcnow
 from sqlmodel import select as _select
 
 
@@ -113,6 +115,42 @@ async def test_dispatch_increments_dispatched_and_delivered_on_success():
     assert stats["total_delivered"] == 1
     assert stats["total_failed"] == 0
     assert stats["retry_queue_depth"] == 0
+
+
+@pytest.mark.asyncio
+async def test_strategic_engine_halt_dispatches_one_external_notification(db_session):
+    """A newly-created strategic halt alert reaches the configured webhook once."""
+    _reset_stats()
+    project_id = await _persist_test_project(db_session)
+    last_completed = _utcnow()
+    deliver = AsyncMock(return_value=200)
+    with (
+        patch(
+            "app.shared_state.runtime_config",
+            _make_runtime_config(enabled_events=["STRATEGIC_ENGINE_HALTED"]),
+        ),
+        patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()),
+        patch("app.notification_dispatch._attempt_delivery", new=deliver),
+    ):
+        assert await _maybe_create_strategic_cycle_liveness_alert(
+            project_id,
+            db_session,
+            starvation_hours=24,
+            last_successful_completed_at=last_completed,
+        ) is True
+        assert await _maybe_create_strategic_cycle_liveness_alert(
+            project_id,
+            db_session,
+            starvation_hours=24,
+            last_successful_completed_at=last_completed,
+        ) is False
+        await asyncio.sleep(0)
+
+    assert deliver.await_count == 1
+    _url, body = deliver.await_args.args
+    assert body["event_type"] == "STRATEGIC_ENGINE_HALTED"
+    assert body["payload"]["starvation_hours"] == 24
+    assert body["payload"]["last_successful_completed_at"] == last_completed.isoformat()
 
 
 @pytest.mark.asyncio

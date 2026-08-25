@@ -311,6 +311,7 @@ _VALID_NOTIFICATION_EVENTS = frozenset(
         # Both are operator-actionable, so they join the default-on list.
         "SPEND_HOLD_CREATED",
         "SPEND_HOLD_EXPIRING",
+        "STRATEGIC_ENGINE_HALTED",
         # Runner-health fleet incidents dispatched by runner_health_alerts.
         # These are operator-actionable outages (a runner or the whole
         # fleet is down, out of disk, or an outage has aged past the
@@ -429,6 +430,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "MERGE_UNVERIFIED",
                 "SPEND_HOLD_CREATED",
                 "SPEND_HOLD_EXPIRING",
+                "STRATEGIC_ENGINE_HALTED",
                 "RUNNER_DEACTIVATED",
                 "RUNNER_DEGRADED",
                 "RUNNER_DEGRADED_ESCALATED",
@@ -969,6 +971,7 @@ async def get_settings(
                         "MERGE_UNVERIFIED",
                         "SPEND_HOLD_CREATED",
                         "SPEND_HOLD_EXPIRING",
+                        "STRATEGIC_ENGINE_HALTED",
                         "RUNNER_DEACTIVATED",
                         "RUNNER_DEGRADED",
                         "RUNNER_DEGRADED_ESCALATED",
@@ -3307,6 +3310,7 @@ async def _apply_settings(
                 "MERGE_UNVERIFIED",
                 "SPEND_HOLD_CREATED",
                 "SPEND_HOLD_EXPIRING",
+                "STRATEGIC_ENGINE_HALTED",
                 "RUNNER_DEACTIVATED",
                 "RUNNER_DEGRADED",
                 "RUNNER_DEGRADED_ESCALATED",
@@ -3760,6 +3764,7 @@ async def _apply_settings(
                                     "MERGE_UNVERIFIED",
                                     "SPEND_HOLD_CREATED",
                                     "SPEND_HOLD_EXPIRING",
+                                    "STRATEGIC_ENGINE_HALTED",
                                     "RUNNER_DEACTIVATED",
                                     "RUNNER_DEGRADED",
                                     "RUNNER_DEGRADED_ESCALATED",
