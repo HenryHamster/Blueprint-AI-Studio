@@ -1985,3 +1985,110 @@ async def resolve_pr_ci_status(
         "state": _CI_PENDING if (saw_pending or saw_error) else _CI_NO_CHECKS,
         "details": [],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Review-bypass merge gate
+# ─────────────────────────────────────────────────────────────────────────────
+# Verdicts returned by :func:`classify_bypass_merge_ci`.
+BYPASS_CI_PROCEED = "proceed"
+BYPASS_CI_BLOCKED_RED = "blocked_red"
+BYPASS_CI_WAIT_PENDING = "wait_pending"
+
+
+async def classify_bypass_merge_ci(
+    pr_number: int | None,
+    head_sha: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    project_id: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Decide whether a review-BYPASS merge may fire, given live check-runs.
+
+    The review-bypass path (``review_policy.should_skip_initial_review`` returns
+    True for every non-intermediate PR — i.e. every ordinary task PR into the
+    integration branch) used to hard-code ``ci_passed=True`` and merge without
+    ever asking GitHub.  Its own policy string claims "CI and promotion gate
+    backstop review", so skipping CI made that backstop vacuous: PRs #17933,
+    #17936 and #17942 all merged into ``automain`` carrying a RED
+    ``Derived artifacts`` check.  #17933 merged 15 s after its check started and
+    85 s before it finished — proof that nothing was consulted at all.
+
+    This is deliberately NOT symmetric with the CI-monitor gate.  It may only
+    ever *withhold* a merge that would otherwise have fired; it must never turn
+    a mergeable PR into a stuck or failed task, because the review bypass is the
+    highest-volume merge path in the pipeline and a false block cascades: a task
+    parked in CI-wait past ``recovery_evaluating_ci_backstop``'s timeout is
+    marked FAILED **and every non-terminal child is CANCELLED**.
+
+    Verdicts:
+
+    ``BYPASS_CI_PROCEED``
+        Merge exactly as before.  Returned for a completed green build, for a
+        *definitive* ``no_checks`` (every reachable SHA queried cleanly, zero
+        check-runs), and for any unresolved/errored lookup.  ``no_checks``
+        proceeds **unconditionally** — it is NOT routed through
+        :func:`proceed_on_no_checks`.  A merge-conflicted PR, a PR filtered out
+        by path filters, and a PR opened during an Actions outage all present as
+        zero check-runs and are indistinguishable from "not registered yet"; the
+        pre-existing behaviour for all of them is to merge, and tightening that
+        here would convert an Actions outage into a fleet-wide cascade-kill.
+        (``proceed_on_no_checks`` returns False for a default-configured project
+        on ``automain``, so gating on it would do exactly that.)
+
+    ``BYPASS_CI_BLOCKED_RED``
+        A completed build with at least one failure is present.  The caller must
+        NOT merge and must route the task to recovery.
+
+    ``BYPASS_CI_WAIT_PENDING``
+        At least one check-run is demonstrably PRESENT on a resolved SHA but has
+        not finished.  The caller must not merge early (the #17933 shape: a
+        check that has STARTED is not a check that has PASSED) and must not
+        hard-fail; park in the CI-wait loop and let the monitor reach a verdict.
+
+        Requiring a non-empty ``details`` list is load-bearing, not decoration.
+        ``resolve_pr_ci_status`` reports a GitHub I/O error — a 5xx, a
+        rate-limit exhaustion, an expired install token — as ``pending`` with an
+        EMPTY ``details``, indistinguishable by state alone from a real
+        in-progress build.  Waiting on that would convert a GitHub API blip into
+        a pipeline-wide stall, so an errored lookup keeps today's fail-open
+        merge.  Only an observed check-run holds a merge.
+
+    Never raises: any unexpected failure degrades to ``BYPASS_CI_PROCEED`` so a
+    resolution bug can only ever restore the previous behaviour, never wedge the
+    pipeline.
+    """
+    try:
+        resolved = await resolve_pr_ci_status(
+            pr_number,
+            str(head_sha or ""),
+            token=token,
+            owner=owner,
+            repo=repo,
+            project_id=project_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail OPEN, see docstring
+        logger.warning(
+            "[CI_RESOLUTION] bypass-merge CI classification failed for PR #%s: %s",
+            pr_number,
+            exc,
+        )
+        return BYPASS_CI_PROCEED, {"state": "error", "source": "unresolved"}
+
+    if not isinstance(resolved, dict):
+        return BYPASS_CI_PROCEED, {"state": "error", "source": "unresolved"}
+
+    state = str(resolved.get("state") or "")
+    details = resolved.get("details")
+    # Positive evidence that GitHub actually reported a check-run. Empty on a
+    # definitive no_checks AND on every error/unresolved degradation, so this is
+    # what separates "a check is present" from "we could not find out".
+    saw_check_run = isinstance(details, list) and len(details) > 0
+
+    if state == _CI_RED:
+        return BYPASS_CI_BLOCKED_RED, resolved
+    if state == _CI_PENDING and saw_check_run:
+        return BYPASS_CI_WAIT_PENDING, resolved
+    return BYPASS_CI_PROCEED, resolved

@@ -2607,6 +2607,125 @@ async def _process_post_commit(
                                 (_bypass_live_pr.get("head") or {}).get("sha") or ""
                             ),
                         }
+                        # ── CI gate for the review-BYPASS merge ──────────────
+                        # Until this gate existed, this path hard-coded
+                        # ``ci_passed=True`` below and merged WITHOUT EVER
+                        # QUERYING GITHUB. Because
+                        # ``review_policy.should_skip_initial_review`` returns
+                        # True for every non-intermediate PR, that is the path
+                        # every ordinary task PR into the integration branch
+                        # takes — so the policy's own justification ("CI and
+                        # promotion gate backstop review") was vacuous. PRs
+                        # #17933, #17936 and #17942 each merged into automain
+                        # carrying a RED ``Derived artifacts`` check; #17933
+                        # merged 15 s after its check STARTED and 85 s before it
+                        # finished, which is only possible with zero
+                        # consultation. #17936 shipped a regression that turned
+                        # every deferral/hold path into FAILED.
+                        #
+                        # Only a PRESENT check-run may hold this merge. A
+                        # definitive ``no_checks`` and any unresolved lookup
+                        # still merge exactly as before: a conflicted PR, a
+                        # path-filtered PR and a PR opened during an Actions
+                        # outage are all indistinguishable from "not registered
+                        # yet", and blocking them would strand tasks until
+                        # ``recovery_evaluating_ci_backstop`` FAILs the parent
+                        # and CANCELS every non-terminal child.
+                        from app.ci_resolution import (
+                            BYPASS_CI_BLOCKED_RED,
+                            BYPASS_CI_WAIT_PENDING,
+                            classify_bypass_merge_ci,
+                        )
+
+                        (
+                            _bypass_ci_verdict,
+                            _bypass_ci_detail,
+                        ) = await classify_bypass_merge_ci(
+                            pr_number,
+                            str(_bypass_live_target["head_sha"]),
+                            token=gh_token,
+                            owner=owner,
+                            repo=repo,
+                            project_id=str(task.project_id),
+                        )
+                        if _bypass_ci_verdict in (
+                            BYPASS_CI_BLOCKED_RED,
+                            BYPASS_CI_WAIT_PENDING,
+                        ):
+                            _bypass_ci_red = (
+                                _bypass_ci_verdict == BYPASS_CI_BLOCKED_RED
+                            )
+                            logger.warning(
+                                "[PIPELINE] Review-bypass merge withheld for PR "
+                                "#%s — CI %s (state=%s, source=%s); parking in "
+                                "CI-wait",
+                                pr_number,
+                                "FAILED" if _bypass_ci_red else "still running",
+                                _bypass_ci_detail.get("state"),
+                                _bypass_ci_detail.get("source"),
+                            )
+                            # Park in the shared CI-wait loop — never fail here.
+                            # A red means the work needs repair, not that the
+                            # task is worthless. ``orchestrator_ci_monitor``
+                            # polls EVALUATING + ``ci_waiting`` rows and routes a
+                            # red through ``ci_completion.handle_ci_completion``,
+                            # which spawns the ``fix`` recovery task
+                            # (``fix_reason="ci_failure"``); a green resolves and
+                            # merges through that same monitor. The task stays
+                            # recoverable and no child is cancelled. This mirrors
+                            # the deferred-bypass park already used below for a
+                            # non-``clean`` mergeable_state.
+                            #
+                            # ``review_not_required`` (carried in
+                            # ``_review_bypass_fields``) satisfies
+                            # ``ci_merge_helpers._review_approved``, so the
+                            # monitor retains merge authority once CI turns
+                            # green — the bypass decision itself is preserved,
+                            # only its CI blindness is removed.
+                            from app.ci_merge_helpers import arm_ci_wait
+
+                            _bypass_wait_loop = {
+                                **((task.context or {}).get("review_loop") or {}),
+                                "ci_passed": False,
+                                "review_approved": True,
+                                "branch": branch,
+                                "original_task_id": str(task.id),
+                                **_review_bypass_fields,
+                            }
+                            # orchestrator_ci_monitor SKIPS any row carrying
+                            # these latches, so a stale one inherited from an
+                            # earlier cycle would park this task where nothing
+                            # ever polls it — and an unpolled CI-wait row is
+                            # exactly what the backstop FAILs (cancelling its
+                            # children) an hour later. Scrub them on arm.
+                            for _latch in (
+                                "conflict_fix_spawned",
+                                "ci_fix_spawned",
+                                "merge_rule_blocked",
+                            ):
+                                _bypass_wait_loop.pop(_latch, None)
+                            arm_ci_wait(
+                                _bypass_wait_loop,
+                                pr_number=int(pr_number),
+                                head_sha=str(_bypass_live_target["head_sha"]),
+                                base_branch=base_branch,
+                                now_iso=_utcnow().isoformat(),
+                            )
+                            task.status = TaskStatus.EVALUATING
+                            task.latest_status_message = (
+                                f"PR #{pr_number} held: CI "
+                                f"{'failed' if _bypass_ci_red else 'in progress'}"
+                                " — parked for Blueprint's CI-gated merge"
+                            )
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": _bypass_wait_loop,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
+                            await session.commit()
+                            return {"status": "accepted"}
+
                         _bypass_loop = {
                             **((task.context or {}).get("review_loop") or {}),
                             "ci_passed": True,
