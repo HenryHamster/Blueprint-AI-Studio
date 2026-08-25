@@ -434,7 +434,8 @@
     "check_size_limits.py": 1800,
     "check_test_imports.py": 800,
     "test_test_imports_checker.py": 850,
-    "test_orchestrator_liveness.py": 1800
+    "test_orchestrator_liveness.py": 1800,
+    "test_lane_baseline_snapshot.py": 1750
   },
   "scripts": {
     "test_local_runner.py": 14250,

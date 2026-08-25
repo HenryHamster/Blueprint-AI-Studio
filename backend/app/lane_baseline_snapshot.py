@@ -56,7 +56,7 @@ from app.routers.admin_pipeline_observability import (
 logger = logging.getLogger(__name__)
 
 DESIGN_DOC_KEY = "lane_baselines"
-BASELINE_DEF_VERSION = "v4"
+BASELINE_DEF_VERSION = "v5"
 _SNAPSHOT_PR_BREAKDOWN_LIMIT = 100
 _MAX_TASKS_PER_SNAPSHOT = 5000
 _MAX_BASELINES_STORED = 20
@@ -66,11 +66,41 @@ _MAX_BASELINE_ENTRY_BYTES = 10_000
 # Fields dropped before persisting: large unread sub-blobs that inflate the entry.
 _SLIM_DROP_TOP_LEVEL = frozenset({"per_pr_phase_breakdown", "relay_counts_by_lane"})
 # Fallback fields to shed one-by-one if the entry still exceeds the byte budget after
-# the primary drops.  Ordered least-to-most critical for downstream readers.
+# the primary drops.  Lane waste is deliberately not in this list: its compact
+# grading counters are the durable evidence for the lane-retarget experiment.
 _SLIM_OVERFLOW_DROPPABLE = (
-    "lane_waste",
     "lane_iteration_distribution",
     "checkpoint_recovery_waste",
+)
+
+_LANE_WASTE_GRADING_FIELDS = frozenset(
+    {"retarget_review_scope_counts", "stale_head_discard_count"}
+)
+_LANE_WASTE_KNOWN_FIELDS = frozenset(
+    {
+        "waste_taxonomy",
+        "waste_task_count",
+        "cap_counted_task_count",
+        "cap_excluded_task_count",
+        "chain_count",
+        "cap_exhausted_chain_count",
+        "cap_exhausted_direction_count",
+        "cap_exhausted_directions",
+        "supersede_affected_chain_count",
+        "supersede_affected_reviews_to_converge",
+        "rollup_chain_count",
+        "rollup_supersede_affected_chain_count",
+        "rollup_supersede_unaffected_chain_count",
+        "rollup_supersede_affected_reviews_to_converge",
+        "rollup_supersede_unaffected_reviews_to_converge",
+        "reviews_to_converge",
+        "retarget_review_scope_counts",
+        "stale_head_discard_count",
+        "chain_limit",
+        "chains_truncated",
+        "chains",
+        "converged_review_counts",
+    }
 )
 
 
@@ -85,7 +115,7 @@ def _baseline_definition_number(version: str | None) -> int:
 
 
 def _baseline_needs_refresh(row: ProjectLaneBaseline) -> bool:
-    """Whether *row* predates the arm-bearing snapshot definition."""
+    """Whether *row* predates the current persisted snapshot definition."""
     return _baseline_definition_number(row.baseline_def_version) < _baseline_definition_number(
         BASELINE_DEF_VERSION
     )
@@ -101,10 +131,19 @@ def _slim_baseline(baseline: Dict[str, Any]) -> Dict[str, Any]:
 
     After the primary drops an entry should comfortably fit inside
     ``_MAX_BASELINE_ENTRY_BYTES``.  If it still exceeds the budget (e.g. because a
-    future heavy field was added), fields are shed in ``_SLIM_OVERFLOW_DROPPABLE``
-    order until the entry fits, and a warning is emitted so operators can diagnose.
+    future heavy field was added), fields are shed in
+    ``_SLIM_OVERFLOW_DROPPABLE`` order until the entry fits.  Overflow-only
+    removals are recorded in ``dropped_fields``; the primary drops above are
+    intentionally not reported as evictions.
     """
     entry = {k: v for k, v in baseline.items() if k not in _SLIM_DROP_TOP_LEVEL}
+    existing_dropped = {
+        field
+        for field in (baseline.get("dropped_fields") or [])
+        if isinstance(field, str) and field
+    }
+    if existing_dropped:
+        entry["dropped_fields"] = sorted(existing_dropped)
     if "lane_waste" in entry and isinstance(entry["lane_waste"], dict):
         lw = dict(entry["lane_waste"])
         lw.pop("chains", None)
@@ -113,18 +152,74 @@ def _slim_baseline(baseline: Dict[str, Any]) -> Dict[str, Any]:
         lw.pop("converged_review_counts", None)
         entry["lane_waste"] = lw
 
+    def _size() -> int:
+        return len(json.dumps(entry, default=str).encode())
+
+    def _record_drop(field: str) -> None:
+        existing_dropped.add(field)
+        entry["dropped_fields"] = sorted(existing_dropped)
+        logger.warning(
+            "[LANE_BASELINE] entry for v%s still over %d B after slim; dropping %s",
+            entry.get("version_number"),
+            _MAX_BASELINE_ENTRY_BYTES,
+            field,
+        )
+
     for field in _SLIM_OVERFLOW_DROPPABLE:
-        raw = json.dumps(entry, default=str)
-        if len(raw.encode()) <= _MAX_BASELINE_ENTRY_BYTES:
+        if _size() <= _MAX_BASELINE_ENTRY_BYTES:
             break
         if field in entry:
-            logger.warning(
-                "[LANE_BASELINE] entry for v%s still over %d B after slim; dropping %s",
-                entry.get("version_number"),
-                _MAX_BASELINE_ENTRY_BYTES,
-                field,
-            )
             entry.pop(field)
+            _record_drop(field)
+
+    # The lane-waste drilldown is the only large block that contains the
+    # direction-grading counters.  If it is the remaining source of overflow,
+    # remove nonessential nested additions first and retain all known scalar
+    # counters plus both retarget scope counts and stale-head discards.
+    while _size() > _MAX_BASELINE_ENTRY_BYTES:
+        lane_waste = entry.get("lane_waste")
+        if not isinstance(lane_waste, dict):
+            break
+        candidates = sorted(
+            key
+            for key in lane_waste
+            if key not in _LANE_WASTE_GRADING_FIELDS
+            and key not in {"dropped_fields"}
+            and (
+                key not in _LANE_WASTE_KNOWN_FIELDS
+                or isinstance(lane_waste[key], (dict, list, tuple))
+            )
+        )
+        if not candidates:
+            break
+        field = candidates[0]
+        lane_waste.pop(field)
+        _record_drop(f"lane_waste.{field}")
+
+    # Keep the byte bound future-proof for an unexpectedly large top-level
+    # addition.  Core baseline identity, convergence, and lane-waste grading
+    # evidence are retained; only non-core additions are eligible here.
+    mandatory = {
+        "captured_at",
+        "baseline_def_version",
+        "version_number",
+        "terminal_status",
+        "opened_at",
+        "closed_at",
+        "outer_loop_convergence",
+        "lane_waste",
+        "dropped_fields",
+    }
+    while _size() > _MAX_BASELINE_ENTRY_BYTES:
+        candidates = [field for field in entry if field not in mandatory]
+        if not candidates:
+            break
+        field = max(
+            candidates,
+            key=lambda key: (len(json.dumps(entry[key], default=str)), key),
+        )
+        entry.pop(field)
+        _record_drop(field)
 
     return entry
 

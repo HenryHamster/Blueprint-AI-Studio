@@ -929,6 +929,11 @@ export interface LaneBaselineTrendBlock {
   prior: number | null;
   delta: number | null;
   classification: 'improving' | 'declining' | 'stable' | null;
+  /** Per-version measurement provenance; optional for older API responses. */
+  availability?: {
+    latest: 'available' | 'evicted' | 'unavailable';
+    prior: 'available' | 'evicted' | 'unavailable';
+  };
 }
 
 export interface LaneBaselineDirectionRecord {
@@ -1017,6 +1022,8 @@ export interface LaneBaselineConvergence {
 
 export interface LaneBaseline {
   version_number: number;
+  /** Fields removed only because the persisted snapshot exceeded its byte budget. */
+  dropped_fields?: string[];
   outer_loop_convergence?: LaneBaselineConvergence;
   [key: string]: unknown;
 }

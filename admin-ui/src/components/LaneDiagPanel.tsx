@@ -39,6 +39,10 @@ function classificationLabel(c: LaneBaselineTrendBlock['classification']): strin
   return '—';
 }
 
+function liveCount(value: number | null | undefined): string | number {
+  return value == null ? '—' : value;
+}
+
 function WasteTaxonomyTable({ taxonomy }: { taxonomy: LaneWasteTaxonomy }) {
   const total = Object.values(taxonomy).reduce((a, b) => a + b, 0);
   if (total === 0) return <p className="text-xs text-neutral-500">No waste data available.</p>;
@@ -133,15 +137,15 @@ function RetargetConvergenceTable({
         )}
         <tr className="border-b border-neutral-800/50">
           <td className="py-1 text-neutral-300">Delta-scope retargets</td>
-          <td className="py-1 text-right text-neutral-200">{laneWaste.retarget_review_scope_counts?.delta ?? 0}</td>
+          <td className="py-1 text-right text-neutral-200">{liveCount(laneWaste.retarget_review_scope_counts?.delta)}</td>
         </tr>
         <tr className="border-b border-neutral-800/50">
           <td className="py-1 text-neutral-300">Full-scope retargets</td>
-          <td className="py-1 text-right text-neutral-200">{laneWaste.retarget_review_scope_counts?.full ?? 0}</td>
+          <td className="py-1 text-right text-neutral-200">{liveCount(laneWaste.retarget_review_scope_counts?.full)}</td>
         </tr>
         <tr className="border-b border-neutral-800/50">
           <td className="py-1 text-neutral-300">Stale-head discards</td>
-          <td className="py-1 text-right text-neutral-200">{laneWaste.stale_head_discard_count ?? 0}</td>
+          <td className="py-1 text-right text-neutral-200">{liveCount(laneWaste.stale_head_discard_count)}</td>
         </tr>
       </tbody>
     </table>
@@ -262,14 +266,20 @@ function TrendRow({
   block: LaneBaselineTrendBlock | undefined;
   fmt?: (v: number) => string;
 }) {
-  const display = (v: number | null | undefined) =>
-    v == null ? '—' : fmtVal ? fmtVal(v) : v.toFixed(1);
+  const display = (side: 'prior' | 'latest') => {
+    const value = block?.[side];
+    const availability = block?.availability?.[side]
+      ?? (value == null ? 'unavailable' : 'available');
+    if (availability === 'evicted') return 'Evicted';
+    if (availability === 'unavailable') return 'Unavailable';
+    return fmtVal ? fmtVal(value as number) : (value as number).toFixed(1);
+  };
 
   return (
     <tr className="border-b border-neutral-800/50">
       <td className="py-1 text-neutral-300">{label}</td>
-      <td className="py-1 text-right text-neutral-400">{display(block?.prior)}</td>
-      <td className="py-1 text-right text-neutral-200">{display(block?.latest)}</td>
+      <td className="py-1 text-right text-neutral-400">{display('prior')}</td>
+      <td className="py-1 text-right text-neutral-200">{display('latest')}</td>
       <td className={`py-1 text-right font-medium ${classificationBadge(block?.classification ?? null)}`}>
         {classificationLabel(block?.classification ?? null)}
       </td>

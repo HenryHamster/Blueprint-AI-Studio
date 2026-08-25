@@ -403,6 +403,10 @@ def compute_lane_baseline_trend(
             "prior": prev,
             "delta": delta,
             "classification": classification,
+            "availability": {
+                "latest": "available" if curr is not None else "unavailable",
+                "prior": "available" if prev is not None else "unavailable",
+            },
         }
 
     relay_curr = latest.get("relay_medians") or {}
@@ -445,12 +449,24 @@ def compute_lane_baseline_trend(
 
     waste_curr = (latest.get("lane_waste") or {}).get("waste_taxonomy") or {}
     waste_prev = (prior.get("lane_waste") or {}).get("waste_taxonomy") or {}
-    total_curr = (latest.get("lane_waste") or {}).get("waste_task_count") or 0
-    total_prev = (prior.get("lane_waste") or {}).get("waste_task_count") or 0
+    total_curr = (latest.get("lane_waste") or {}).get("waste_task_count")
+    total_prev = (prior.get("lane_waste") or {}).get("waste_task_count")
     waste_trend: Dict[str, Any] = {}
     for cat in LANE_WASTE_CATEGORIES:
-        share_curr = (waste_curr.get(cat, 0) / total_curr) if total_curr > 0 else None
-        share_prev = (waste_prev.get(cat, 0) / total_prev) if total_prev > 0 else None
+        share_curr = (
+            (waste_curr[cat] / total_curr)
+            if isinstance(total_curr, (int, float))
+            and total_curr > 0
+            and cat in waste_curr
+            else None
+        )
+        share_prev = (
+            (waste_prev[cat] / total_prev)
+            if isinstance(total_prev, (int, float))
+            and total_prev > 0
+            and cat in waste_prev
+            else None
+        )
         waste_trend[cat] = _block(
             share_curr,
             share_prev,
@@ -461,8 +477,8 @@ def compute_lane_baseline_trend(
     crw_curr = latest.get("checkpoint_recovery_waste") or {}
     crw_prev = prior.get("checkpoint_recovery_waste") or {}
     crw_trend = _block(
-        float(crw_curr.get("total", 0)),
-        float(crw_prev.get("total", 0)),
+        float(crw_curr["total"]) if "total" in crw_curr else None,
+        float(crw_prev["total"]) if "total" in crw_prev else None,
         threshold_abs=1.0,
         lower_is_better=True,
     )
@@ -619,7 +635,7 @@ def compute_lane_baseline_trend(
         ),
     }
 
-    return {
+    trend = {
         "latest_version": latest.get("version_number"),
         "prior_version": prior.get("version_number"),
         "relay_medians": relay_trend,
@@ -629,3 +645,48 @@ def compute_lane_baseline_trend(
         "outer_loop_convergence": convergence_trend,
         "retarget_convergence": retarget_convergence_trend,
     }
+
+    def _availability(
+        baseline: Dict[str, Any], path: str, value: Any
+    ) -> str:
+        """Classify a value without mistaking a real zero for missing data."""
+        dropped = baseline.get("dropped_fields") or []
+        if any(
+            isinstance(field, str)
+            and (path == field or path.startswith(f"{field}."))
+            for field in dropped
+        ):
+            return "evicted"
+        return "available" if value is not None else "unavailable"
+
+    def _set_availability(
+        block: Dict[str, Any], path: str
+    ) -> None:
+        block["availability"] = {
+            "latest": _availability(latest, path, block.get("latest")),
+            "prior": _availability(prior, path, block.get("prior")),
+        }
+
+    for key, block in relay_trend.items():
+        _set_availability(block, f"relay_medians.{key}")
+    for lane, lane_block in lane_iter_trend.items():
+        for percentile, block in lane_block.items():
+            _set_availability(
+                block, f"lane_iteration_distribution.{lane}.{percentile}_iterations"
+            )
+    for category, block in waste_trend.items():
+        _set_availability(block, f"lane_waste.waste_taxonomy.{category}")
+    _set_availability(crw_trend, "checkpoint_recovery_waste.total")
+    for key, block in convergence_trend.items():
+        if key != "cap_exhausted_directions" and isinstance(block, dict):
+            _set_availability(block, f"outer_loop_convergence.{key}")
+    for key, block in retarget_convergence_trend["reviews_to_converge"].items():
+        _set_availability(block, f"lane_waste.reviews_to_converge.{key}")
+    for key, block in retarget_convergence_trend["retarget_review_scope_counts"].items():
+        _set_availability(block, f"lane_waste.retarget_review_scope_counts.{key}")
+    _set_availability(
+        retarget_convergence_trend["stale_head_discard_count"],
+        "lane_waste.stale_head_discard_count",
+    )
+
+    return trend

@@ -317,6 +317,50 @@ describe('LaneDiagPanel', () => {
     expect(screen.getAllByText('Stale-head discards')).not.toHaveLength(0);
   });
 
+  it('renders missing live retarget counters as unavailable instead of zero', async () => {
+    apiFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ...mockLaneDiagResponse,
+          lane_waste: {
+            ...mockLaneDiagResponse.lane_waste,
+            retarget_review_scope_counts: undefined,
+            stale_head_discard_count: undefined,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Delta-scope retargets').closest('tr')).toHaveTextContent('—');
+    expect(screen.getByText('Full-scope retargets').closest('tr')).toHaveTextContent('—');
+    expect(screen.getByText('Stale-head discards').closest('tr')).toHaveTextContent('—');
+  });
+
+  it('renders a genuine zero live retarget counter as zero', async () => {
+    apiFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ...mockLaneDiagResponse,
+          lane_waste: {
+            ...mockLaneDiagResponse.lane_waste,
+            retarget_review_scope_counts: { delta: 0, full: 0 },
+            stale_head_discard_count: 0,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Delta-scope retargets').closest('tr')).toHaveTextContent('0');
+    expect(screen.getByText('Full-scope retargets').closest('tr')).toHaveTextContent('0');
+    expect(screen.getByText('Stale-head discards').closest('tr')).toHaveTextContent('0');
+  });
+
   it('surfaces the superseded-rollup median and the directions lost to the cap', async () => {
     render(<LaneDiagPanel />);
     await act(async () => { await Promise.resolve(); });
@@ -343,6 +387,45 @@ describe('LaneDiagPanel', () => {
     const sampleRow = screen.getByText('Converged chains (sample size)').closest('tr');
     if (!sampleRow) throw new Error('sample-size trend row was not rendered');
     expect(sampleRow.textContent).not.toContain('improving');
+  });
+
+  it('renders evicted and unavailable trend provenance explicitly', async () => {
+    fetchLaneBaselines.mockResolvedValueOnce({
+      ...mockBaselinesResponse,
+      trend: {
+        ...mockBaselinesResponse.trend,
+        retarget_convergence: {
+          ...mockBaselinesResponse.trend.retarget_convergence,
+          retarget_review_scope_counts: {
+            delta: {
+              latest: null,
+              prior: 0,
+              delta: null,
+              classification: null,
+              availability: { latest: 'evicted', prior: 'available' },
+            },
+            full: {
+              latest: null,
+              prior: null,
+              delta: null,
+              classification: null,
+              availability: { latest: 'unavailable', prior: 'unavailable' },
+            },
+          },
+        },
+      },
+    });
+    render(<LaneDiagPanel projectId="project-1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const deltaTrendRow = screen
+      .getAllByText('Delta-scope retargets')
+      .find((element) => element.closest('tr')?.textContent?.includes('Evicted'));
+    const fullTrendRow = screen
+      .getAllByText('Full-scope retargets')
+      .find((element) => element.closest('tr')?.textContent?.includes('Unavailable'));
+    expect(deltaTrendRow?.closest('tr')).toHaveTextContent('Evicted');
+    expect(fullTrendRow?.closest('tr')).toHaveTextContent('Unavailable');
   });
 
   it('renders None for versions without persisted cap-loss directions', async () => {

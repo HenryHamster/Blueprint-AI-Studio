@@ -165,6 +165,7 @@ class TestReadVersionLaneBaseline:
         assert lane_waste["retarget_review_scope_counts"] == {"delta": 1, "full": 2}
         assert lane_waste["stale_head_discard_count"] == 4
         assert "chains" not in lane_waste
+        assert "dropped_fields" not in result
 
     def test_slim_retains_lane_waste_at_snapshot_chain_ceiling(self):
         """A 5,000-sample legacy payload cannot evict durable lane-waste data."""
@@ -203,6 +204,71 @@ class TestReadVersionLaneBaseline:
             "full": 567,
         }
         assert lane_waste["stale_head_discard_count"] == 89
+
+    def test_overflow_shed_preserves_direction_grading_metrics(self):
+        """Overflow records its eviction while retaining retarget evidence."""
+        baseline = {
+            "version_number": 13,
+            "lane_waste": {
+                "retarget_review_scope_counts": {"delta": 7, "full": 3},
+                "stale_head_discard_count": 2,
+                "future_detail": "x" * (_MAX_BASELINE_ENTRY_BYTES * 2),
+            },
+            "lane_iteration_distribution": {"review": {"p50_iterations": 2}},
+        }
+
+        result = _slim_baseline(baseline)
+
+        assert len(json.dumps(result).encode()) <= _MAX_BASELINE_ENTRY_BYTES
+        assert result["dropped_fields"] == [
+            "lane_iteration_distribution",
+            "lane_waste.future_detail",
+        ]
+        assert result["lane_waste"]["retarget_review_scope_counts"] == {
+            "delta": 7,
+            "full": 3,
+        }
+        assert result["lane_waste"]["stale_head_discard_count"] == 2
+
+    def test_trend_provenance_distinguishes_evicted_absent_and_zero(self):
+        """Trend consumers can tell eviction, no measurement, and a real zero apart."""
+        from app.digest_metrics import compute_lane_baseline_trend
+
+        latest = {
+            "version_number": 13,
+            "dropped_fields": ["lane_waste.retarget_review_scope_counts"],
+            "lane_waste": {"stale_head_discard_count": 0},
+        }
+        prior = {
+            "version_number": 12,
+            "lane_waste": {
+                "retarget_review_scope_counts": {"delta": 0, "full": 0},
+                "stale_head_discard_count": 0,
+            },
+        }
+
+        trend = compute_lane_baseline_trend([latest, prior])
+
+        assert trend is not None
+        delta = trend["retarget_convergence"]["retarget_review_scope_counts"]["delta"]
+        assert delta["latest"] is None
+        assert delta["prior"] == 0
+        assert delta["availability"] == {
+            "latest": "evicted",
+            "prior": "available",
+        }
+        stale = trend["retarget_convergence"]["stale_head_discard_count"]
+        assert stale["latest"] == 0
+        assert stale["prior"] == 0
+        assert stale["availability"] == {
+            "latest": "available",
+            "prior": "available",
+        }
+        recovery = trend["checkpoint_recovery_waste_total"]
+        assert recovery["availability"] == {
+            "latest": "unavailable",
+            "prior": "unavailable",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +509,7 @@ class TestPersistVersionLaneBaseline:
                 terminal_status="promoted",
             )
             assert result is not None
-            assert result["baseline_def_version"] == "v4"
+            assert result["baseline_def_version"] == "v5"
             assert result["outer_loop_convergence"]["iteration_median"] is not None
             assert "chains" not in result["lane_waste"]
 
@@ -779,7 +845,7 @@ class TestBackfillMissingLaneBaselines:
         assert "relay_medians" in stored
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("definition", ["v4", "v5"])
+    @pytest.mark.parametrize("definition", ["v5", "v6"])
     async def test_backfill_skips_already_stored_version(self, db_session, definition):
         """Current table definitions remain first-write-wins during backfill."""
         from testing.conftest import USE_POSTGRES
@@ -847,7 +913,7 @@ class TestBackfillMissingLaneBaselines:
         assert backfilled == [9]
         refreshed = await _read_lane_baseline_row(db_session, project.id, 9)
         assert refreshed is not None
-        assert refreshed["baseline_def_version"] == "v4"
+        assert refreshed["baseline_def_version"] == "v5"
         await db_session.refresh(project)
         assert project.design_doc[DESIGN_DOC_KEY]["9"] == legacy
 
@@ -914,11 +980,11 @@ class TestBackfillMissingLaneBaselines:
                 project.id,
                 version_number,
                 now,
-                "v3",
+                "v4",
                 {
                     "version_number": version_number,
                     "captured_at": "2026-01-01T00:00:00",
-                    "baseline_def_version": "v3",
+                    "baseline_def_version": "v4",
                 },
             )
         await db_session.commit()
@@ -929,8 +995,8 @@ class TestBackfillMissingLaneBaselines:
         latest = await _read_lane_baseline_row(db_session, project.id, 10)
         prior = await _read_lane_baseline_row(db_session, project.id, 9)
         assert latest is not None and prior is not None
-        assert latest["baseline_def_version"] == "v4"
-        assert prior["baseline_def_version"] == "v4"
+        assert latest["baseline_def_version"] == "v5"
+        assert prior["baseline_def_version"] == "v5"
         assert (
             latest["outer_loop_convergence"]
             ["rollup_supersede_affected_reviews_to_converge_median"]
