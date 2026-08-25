@@ -20,11 +20,14 @@ stay aligned with ``FIRST_LAUNCH_COMMANDS`` and do not revert to the legacy
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
 
 import pytest
+
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
 _THIS_DIR = Path(__file__).resolve().parent
 _BACKEND_ROOT = _THIS_DIR.parent
@@ -39,13 +42,21 @@ if not (_REPO_ROOT / "docs").is_dir() and (Path("/repo") / "docs").is_dir():
 
 _RUNBOOK_PATH = _REPO_ROOT / "docs" / "RUNNER_RUNBOOK.md"
 _RUNNER_INSTALL_PATH = _REPO_ROOT / "docs" / "runner-install.md"
-_BLUEPRINT_RUNNER = _REPO_ROOT / "scripts" / "blueprint_runner.py"
 _LOCAL_RELEASE_RUNBOOK_PATH = (
     _REPO_ROOT / "docs" / "operations" / "local-app-release.md"
 )
-_SCRIPTS_ROOT = _REPO_ROOT / "scripts"
-if str(_SCRIPTS_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_ROOT))
+# The docs root above is resolved by a ``docs/`` probe, which says nothing
+# about where ``scripts/`` is. Resolve that separately through the shared
+# resolver -- and FAIL with its named reason rather than inserting a path that
+# may not exist and letting the import below die as a bare ModuleNotFoundError.
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+_SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(_BACKEND_DIR)
+if _SCRIPTS_DIR is None:
+    raise RuntimeError(_SCRIPTS_DIR_UNAVAILABLE)
+_SCRIPTS_ROOT = Path(_SCRIPTS_DIR)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+_BLUEPRINT_RUNNER = _SCRIPTS_ROOT / "blueprint_runner.py"
 
 import release_runbook_contract as release_contract  # noqa: E402
 

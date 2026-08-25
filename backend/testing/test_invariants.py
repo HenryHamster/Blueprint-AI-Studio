@@ -34,6 +34,7 @@ from testing.identity_extraction import (
     extract_python_test_ids_from_file,
     extract_python_test_nodes,
 )
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
@@ -47,15 +48,27 @@ os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
 
 
 def _script_test_harness() -> Path:
-    """Resolve the roster owner in both the CI mount and local checkout."""
-    candidates = (
-        Path("/repo/scripts/test-backend.sh"),
-        BACKEND_ROOT.parent / "scripts" / "test-backend.sh",
-    )
-    for candidate in candidates:
+    """Resolve the roster owner in both the CI mount and local checkout.
+
+    Delegated to the shared resolver (backend/testing/repo_scripts_path.py) so
+    the candidate order and the ``/repo`` bind-mount constant are defined once.
+    A miss still ``pytest.fail``s -- it must never degrade into "no roster to
+    check" (#17872) -- but it now carries the resolver's named reason, which
+    lists every candidate probed and both escape hatches.
+    """
+    scripts_dir, unavailable = resolve_scripts_dir_from_env(os.fspath(BACKEND_ROOT))
+    if scripts_dir is not None:
+        candidate = Path(scripts_dir) / "test-backend.sh"
         if candidate.is_file():
             return candidate
-    pytest.fail("scripts/test-backend.sh is unavailable; roster cannot be checked")
+        pytest.fail(
+            f"{scripts_dir} is the repo scripts/ tree (it carries the resolver "
+            f"sentinel) but test-backend.sh is not in it; roster cannot be checked"
+        )
+    pytest.fail(
+        f"scripts/test-backend.sh is unavailable; roster cannot be checked: "
+        f"{unavailable}"
+    )
 
 
 def _parse_test_module_roots(harness: Path) -> tuple[Path, ...]:
@@ -6403,41 +6416,32 @@ class TestTestFileSizeGuardrails:
         testing_root = os.path.dirname(__file__)
         _assert_no_stale_caps(TESTING_SIZE_LIMITS, testing_root, "testing")
 
-def _resolve_scripts_root() -> str | None:
-    """Resolve the repo's scripts/ directory across both test layouts.
-
-    The CI shard containers mount the backend at /app and the full repo at
-    /repo, so ``../../scripts`` relative to testing/ does not exist there —
-    /repo/scripts is the canonical location (same convention as
-    ``_script_test_harness``). Local checkouts resolve the sibling path.
-    When CI is set and neither candidate exists the guardrail must HARD-FAIL,
-    not skip: a silently unresolvable scripts/ tree would blind every scripts
-    cap in module_size_limits.json.
-    """
-    candidates = (
-        os.path.join("/repo", "scripts"),
-        os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
-        ),
-    )
-    for candidate in candidates:
-        if os.path.isdir(candidate):
-            return candidate
-    return None
-
-
-_SCRIPTS_ROOT = _resolve_scripts_root()
+# Resolve the repo's scripts/ dir through the shared resolver rather than a
+# private copy of the probe. The CI shard containers mount the backend at /app
+# and the full repo at /repo, so ``../../scripts`` relative to testing/ does not
+# exist there. The old copy accepted a candidate on ``os.path.isdir`` alone --
+# mere directory existence, the same predicate shape that made three other
+# guards vacuous (#17872). The shared resolver requires the sentinel, so a
+# directory that merely exists can never be mistaken for the repo's scripts/.
+_SCRIPTS_ROOT, _SCRIPTS_ROOT_UNAVAILABLE = resolve_scripts_dir_from_env(
+    os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+)
 
 
 def _require_scripts_root() -> str:
+    """Return the scripts root, or fail — HARD in CI, skip only ad hoc.
+
+    A silently unresolvable scripts/ tree would blind every scripts cap in
+    module_size_limits.json, so CI never skips. Either way the resolver's named
+    reason is reported instead of a restatement that can drift from it.
+    """
     if _SCRIPTS_ROOT is None:
         if os.environ.get("CI"):
             pytest.fail(
-                "scripts/ directory is unavailable (checked /repo/scripts and "
-                "the repo-relative sibling); the CI harness must mount the "
+                _SCRIPTS_ROOT_UNAVAILABLE + "; the CI harness must mount the "
                 "repo at /repo so scripts size caps stay enforced"
             )
-        pytest.skip("scripts/ directory not available in this environment")
+        pytest.skip(_SCRIPTS_ROOT_UNAVAILABLE)
     return _SCRIPTS_ROOT
 
 class TestScriptsModuleSizeGuardrails:
