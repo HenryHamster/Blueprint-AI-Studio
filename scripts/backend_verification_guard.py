@@ -21,6 +21,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from posix_bash import bash_executable, posix_path  # noqa: E402
+except ImportError:  # pragma: no cover - fixture trees are POSIX already
+    bash_executable, posix_path = (lambda: "bash"), os.fspath  # noqa: E731
+
 try:
     from guard_suppression_receipt import record_classification  # noqa: E402
 except ImportError:  # pragma: no cover - emitting is fail-open by contract
@@ -140,12 +145,29 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 env = {
                     **os.environ,
-                    "BLUEPRINT_VERIFICATION_JUNIT": str(base_junit),
+                    # The harness splits this value and bind-mounts its
+                    # directory. It has to arrive in the form the shell (and
+                    # the Docker daemon behind it) can resolve, or the base
+                    # run writes its report somewhere the host cannot read and
+                    # the lane reports "baseline_unavailable" for a reason
+                    # that has nothing to do with the baseline. The current
+                    # harness normalizes defensively too; this end must also,
+                    # because the harness actually invoked here is the *base*
+                    # tree's, which predates that normalization.
+                    "BLUEPRINT_VERIFICATION_JUNIT": posix_path(base_junit),
                     "TESTMON_NO_FETCH": "1",
                     "USE_TEST_POSTGRES": "true",
                 }
                 result = subprocess.run(
-                    ["bash", str(base_harness), args.route, *base_selectors],
+                    # Resolve bash explicitly: a bare "bash" on a Windows host
+                    # can hit the System32 WSL launcher, which drops the env
+                    # block assembled above.
+                    [
+                        bash_executable(),
+                        str(base_harness),
+                        args.route,
+                        *base_selectors,
+                    ],
                     cwd=base_root,
                     env=env,
                     capture_output=True,

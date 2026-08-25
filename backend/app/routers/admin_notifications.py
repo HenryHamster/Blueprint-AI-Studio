@@ -39,6 +39,7 @@ from app.admin_helpers import (
     _user_project_ids,
 )
 from app.task_locking import lock_project_or_429
+from app.time_utils import utc_iso
 from app.message_convergence import LINKED_STATUS, NEEDS_ACTION_MESSAGE_TYPES, RESOLVED_STATUS
 from app.message_audience import operator_visible_alert_filter, operator_visible_message_audience_filter
 from app.project_message_creation import (
@@ -481,10 +482,10 @@ async def get_alerts(
             "source": a.source,
             "dedupe_key": a.dedupe_key,
             "occurrence_count": a.occurrence_count,
-            "last_seen_at": a.last_seen_at.isoformat() if a.last_seen_at else None,
+            "last_seen_at": utc_iso(a.last_seen_at),
             "task_id": str(a.task_id) if a.task_id else None,
-            "created_at": a.created_at.isoformat(),
-            "dismissed_at": a.dismissed_at.isoformat() if a.dismissed_at else None,
+            "created_at": utc_iso(a.created_at),
+            "dismissed_at": utc_iso(a.dismissed_at),
         }
         for a in alerts
     ]

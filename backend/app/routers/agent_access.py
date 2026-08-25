@@ -784,6 +784,10 @@ def _project_agent_task_list(
         "parent_task_id",
         "depends_on",
         "created_at",
+        # Freshness. Without it a caller cannot separate a task that moved
+        # seconds ago from one frozen for hours -- the first question asked
+        # when diagnosing a wedge from this projection.
+        "updated_at",
         "started_at",
         "last_heartbeat",
         "blocker_kind",

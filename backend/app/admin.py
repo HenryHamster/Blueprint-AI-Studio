@@ -102,6 +102,7 @@ from app.task_direction_refs import first_task_direction_id
 from app.task_movement import build_task_movement_explanation
 from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.landed_signal import is_merged_completion
+from app.time_utils import utc_iso
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     PROJECT_WRITE_ROLES,
@@ -591,7 +592,7 @@ async def get_all_tasks(
                     # (null for code/log artifacts) — existing consumers ignore it.
                     "storage_uri": a.storage_uri,
                     "iteration": a.iteration,
-                    "created_at": a.created_at.isoformat() if a.created_at else None,
+                    "created_at": utc_iso(a.created_at),
                 }
             )
             if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
@@ -742,25 +743,27 @@ async def get_all_tasks(
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
             "depends_on": t.depends_on or [],
             "plan_subtasks": _plan_subtasks(t.plan_output),
-            "created_at": t.created_at.isoformat() if t.created_at else None,
-            "started_at": t.started_at.isoformat() if t.started_at else None,
-            "last_heartbeat": t.last_heartbeat.isoformat()
-            if t.last_heartbeat
-            else None,
+            "created_at": utc_iso(t.created_at),
+            # A frozen task and a task that moved five seconds ago are the same
+            # row without this: ``updated_at`` is the only field on the listing
+            # that answers "when did anything about this task last change?".
+            # It was loaded by _TASK_LIST_COLS all along and simply never
+            # reached the wire.
+            "updated_at": utc_iso(t.updated_at),
+            "started_at": utc_iso(t.started_at),
+            "last_heartbeat": utc_iso(t.last_heartbeat),
             # Audit R3-W2 (H1): expose heartbeat-hot columns directly so the
             # admin-ui System Metrics panel reads from the column source-of-truth.
             "last_metrics_json": t.last_metrics_json,
-            "last_tool_use_at": t.last_tool_use_at.isoformat()
-            if t.last_tool_use_at
-            else None,
+            "last_tool_use_at": utc_iso(t.last_tool_use_at),
             "attempt_count": t.attempt_count,
             "attempt_number": _attempt_number,
             # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
             # non-BLOCKED or pre-migration task; the admin UI guards on presence.
             "blocker_kind": t.blocker_kind,
             "blocked_reason": t.blocked_reason,
-            "blocked_at": t.blocked_at.isoformat() if t.blocked_at else None,
-            "recheck_after": t.recheck_after.isoformat() if t.recheck_after else None,
+            "blocked_at": utc_iso(t.blocked_at),
+            "recheck_after": utc_iso(t.recheck_after),
             # Explicit operator-tier marker (see the sideboard endpoint for the
             # full rationale): True once auto-recovery has raised its ERROR
             # alert and given up resolving this blocker itself. Bounded
@@ -769,7 +772,7 @@ async def get_all_tasks(
             "blocker_escalated": bool((t.context or {}).get("_blocked_escalated")),
             # Durable PARKED-state metadata (alembic 0199). Nullable for any
             # non-PARKED or pre-migration task; the admin UI guards on presence.
-            "parked_at": t.parked_at.isoformat() if t.parked_at else None,
+            "parked_at": utc_iso(t.parked_at),
             "park_reason": t.park_reason,
             "payloads": [_slim_payload] if _slim_payload else [],
             "context": {

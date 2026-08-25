@@ -48,6 +48,32 @@ def _strip_tz_assume_utc(dt: Optional[datetime]) -> Optional[datetime]:
 _to_naive_utc = _strip_tz_assume_utc  # deprecated alias
 
 
+def utc_iso(value: Optional[datetime]) -> Optional[str]:
+    """Render a stored datetime as ISO-8601 that carries its UTC offset.
+
+    Everything inside this app stores and passes naive UTC (``_utcnow`` above,
+    and the ``NaiveUTCDateTime`` column type that strips tzinfo on read). A
+    bare ``value.isoformat()`` therefore puts ``2026-08-24T12:34:56.789012`` on
+    the wire -- a string that states no zone at all. Both of its consumers get
+    a wrong answer rather than an error:
+
+    * Python callers that compare it against an aware ``now`` raise
+      ``TypeError: can't subtract offset-naive and offset-aware datetimes``,
+      or -- worse -- assume local time and compute a delta that is wrong by
+      the host's UTC offset.
+    * ``new Date(s)`` in JavaScript reads an offset-less ISO string as *local*
+      time (ES2016+), silently shifting every rendered timestamp.
+
+    Naive input is UTC by construction here, so it is stamped ``+00:00``.
+    Aware input is converted to UTC first so the wire format is single-valued.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc).isoformat()
+    return value.astimezone(timezone.utc).isoformat()
+
+
 def _coerce_naive_utc(dt: datetime) -> datetime:
     """Convert any datetime to naive UTC, or return it unchanged if already naive.
 

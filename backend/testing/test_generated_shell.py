@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -2448,3 +2449,261 @@ class TestVmSelfDestructTtl:
         )
         assert "TTL_SECONDS=86400" in script
         assert "TTL_SECONDS=14400" not in script
+
+
+# ---------------------------------------------------------------------------
+# scripts/test-backend.sh host contract: MSYS path resolution, and keeping the
+# container's writes off the host checkout.
+#
+# Both are silent-wrong-answer classes -- the harness exits 0 and something
+# downstream fails for a reason that names none of this -- so each is pinned
+# both functionally (the shared helper) and statically (the harness actually
+# using it). A helper nothing calls fixes nothing.
+# ---------------------------------------------------------------------------
+
+
+_POSIX_PATH_HELPER = _BLUEPRINT_ROOT / "scripts" / "posix-path.sh"
+
+
+def _eval_in_helper_shell(
+    bash: str, snippet: str, *, env: dict[str, str] | None = None
+) -> str:
+    """Source scripts/posix-path.sh and evaluate *snippet* in that shell."""
+    helper = str(_POSIX_PATH_HELPER).replace("\\", "/")
+    script = f'. "{helper}"\n{snippet}\n'
+    result = subprocess.run(
+        [bash, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"helper shell failed ({result.returncode}):\n{result.stdout}\n{result.stderr}"
+    )
+    return result.stdout
+
+
+class TestPosixPathHelper:
+    """scripts/posix-path.sh -- the shell twin of scripts/posix_bash.py."""
+
+    def test_windows_to_posix_transform_holds_on_every_host(
+        self, bash_executable: str | None
+    ):
+        """The transform itself carries no OS check, so it is provable here.
+
+        A drive-lettered path becomes the MSYS rendering of the same location;
+        anything else keeps its shape. This is the conversion that has to
+        happen before dirname/basename/`cd` ever see a caller-supplied path.
+        """
+        if not bash_executable:
+            pytest.skip("bash not available")
+        cases = {
+            r"C:\Users\a\Temp\g\report.xml": "/c/Users/a/Temp/g/report.xml",
+            r"D:\Henry\VSCode\x.xml": "/d/Henry/VSCode/x.xml",
+            "D:/Henry/VSCode/x.xml": "/d/Henry/VSCode/x.xml",
+            "/tmp/g/report.xml": "/tmp/g/report.xml",
+            "relative/report.xml": "relative/report.xml",
+        }
+        snippet = "\n".join(
+            f"blueprint_windows_to_posix_path {shlex.quote(value)}" for value in cases
+        )
+        got = _eval_in_helper_shell(bash_executable, snippet).splitlines()
+        assert got == list(cases.values())
+
+    def test_the_transform_is_gated_on_the_host_shell(
+        self, bash_executable: str | None
+    ):
+        """blueprint_posix_path must rewrite on MSYS and never off it.
+
+        A backslash is a legal character in a POSIX filename, so rewriting one
+        on Linux/CI would corrupt a path that is currently correct. The gate is
+        its own function precisely so both sides can be exercised from either
+        host.
+        """
+        if not bash_executable:
+            pytest.skip("bash not available")
+        windows_value = r"C:\Users\a\Temp\g\report.xml"
+        posix_value = "/tmp/g/report.xml"
+
+        as_msys = _eval_in_helper_shell(
+            bash_executable,
+            "blueprint_shell_is_msys() { return 0; }\n"
+            f"blueprint_posix_path {shlex.quote(windows_value)}\n"
+            f"blueprint_posix_path {shlex.quote(posix_value)}",
+        ).splitlines()
+        assert as_msys == ["/c/Users/a/Temp/g/report.xml", posix_value]
+
+        as_posix = _eval_in_helper_shell(
+            bash_executable,
+            "blueprint_shell_is_msys() { return 1; }\n"
+            f"blueprint_posix_path {shlex.quote(windows_value)}\n"
+            f"blueprint_posix_path {shlex.quote(posix_value)}",
+        ).splitlines()
+        assert as_posix == [windows_value, posix_value]
+
+    def test_docker_host_path_resolves_msys_virtual_directories(
+        self, bash_executable: str | None, tmp_path: Path
+    ):
+        """A bind-mount source has to be a host path, not an MSYS-virtual one.
+
+        `pwd -P` legitimately answers /tmp/... on Git Bash (Windows' Temp is
+        mounted there). `docker run -v /tmp/x:/out` does not fail on Docker
+        Desktop -- it binds a directory inside the VM, so the container writes
+        its report and the host directory stays empty. cygpath -m is what turns
+        that back into a real host path; the stub here proves the harness asks
+        for the mixed form and honours the answer, not what cygpath computes.
+        """
+        if not bash_executable:
+            pytest.skip("bash not available")
+        stub_dir = tmp_path / "stub-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "cygpath"
+        stub.write_text(
+            '#!/bin/sh\n[ "$1" = "-m" ] || { echo "expected -m, got $1" >&2; exit 3; }\n'
+            'printf "C:/host-form%s\\n" "$2"\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{stub_dir}{os.pathsep}{env.get('PATH', '')}"
+
+        as_msys = _eval_in_helper_shell(
+            bash_executable,
+            "blueprint_shell_is_msys() { return 0; }\n"
+            "blueprint_docker_host_path /tmp/blueprint-guard",
+            env=env,
+        ).strip()
+        assert as_msys == "C:/host-form/tmp/blueprint-guard"
+
+        as_posix = _eval_in_helper_shell(
+            bash_executable,
+            "blueprint_shell_is_msys() { return 1; }\n"
+            "blueprint_docker_host_path /tmp/blueprint-guard",
+            env=env,
+        ).strip()
+        assert as_posix == "/tmp/blueprint-guard", (
+            "a Linux/CI run must keep the path it has today"
+        )
+
+
+class TestBackendHarnessHostContract:
+    """The harness has to actually use the helper, and stay clean-up-able."""
+
+    def test_caller_supplied_junit_paths_are_split_after_normalization(self):
+        """dirname/basename must never see the raw environment value.
+
+        BLUEPRINT_STATIC_GUARD_JUNIT and BLUEPRINT_VERIFICATION_JUNIT arrive
+        from a guard process; on Windows that is a native "C:\\..." path.
+        Splitting it directly, and then `cd`-ing into the result, hands the
+        location back through the MSYS mount table and yields /tmp/... -- which
+        is then bind-mounted, silently, to nowhere the caller can read.
+        """
+        harness = _BACKEND_TEST_HARNESS.read_text(encoding="utf-8")
+        assert "source ../scripts/posix-path.sh" in harness, (
+            "the harness must source the shared MSYS path resolver"
+        )
+        assert _POSIX_PATH_HELPER.is_file(), (
+            f"the harness sources {_POSIX_PATH_HELPER.name}, which is not "
+            "in the tree"
+        )
+        # The source is tolerant because the guard fixtures build synthetic
+        # checkouts by copying scripts/ piecemeal, and the identity fallback
+        # is correct on Linux. It is not correct on Windows, so a missing
+        # helper has to stop the run there rather than silently reverting to
+        # the behaviour this closes.
+        assert (
+            'ERROR: scripts/posix-path.sh is missing' in harness
+        ), "a missing posix-path.sh must be fatal on an MSYS host"
+        fallback = harness[harness.index("if [ -f ../scripts/posix-path.sh ]") :]
+        fallback = fallback[: fallback.index("\nfi\n")]
+        assert fallback.index("MINGW*") < fallback.index(
+            "blueprint_posix_path() {"
+        ), "the MSYS host must exit before the identity fallback is defined"
+        for variable in (
+            "BLUEPRINT_STATIC_GUARD_JUNIT",
+            "BLUEPRINT_VERIFICATION_JUNIT",
+        ):
+            for splitter in ("dirname", "basename"):
+                raw = f'{splitter} -- "${variable}"'
+                assert raw not in harness, (
+                    f"{splitter} is applied to the raw {variable}; it must split "
+                    "the value returned by blueprint_posix_path instead"
+                )
+            assert f'blueprint_posix_path "${variable}"' in harness, (
+                f"{variable} must be normalized before it is split"
+            )
+
+    def test_every_bind_mount_source_is_resolved_to_a_host_path(self):
+        """No `-v` source may be a path only the MSYS shell can resolve.
+
+        `pwd` and `pwd -P` answer the MSYS rendering of a location, and
+        Windows' temp directory is mounted at /tmp, so a checkout or report
+        directory under it renders as "/tmp/...". Docker Desktop does not
+        reject that: it binds a directory *inside its VM*. The container then
+        reads an empty /app or writes a report the host never sees, and exits
+        with a code that names none of this. Enumerated over every mount
+        rather than the two known ones so a mount added later cannot
+        reintroduce the class silently.
+        """
+        harness = _BACKEND_TEST_HARNESS.read_text(encoding="utf-8")
+        mount_lines = [
+            line
+            for line in harness.splitlines()
+            if "-v \"" in line and ("DOCKER_ARGS+=" in line or "docker run" in line)
+        ]
+        assert mount_lines, "no bind mounts found in the harness"
+        sources: list[tuple[str, str]] = []
+        for line in mount_lines:
+            sources.extend(
+                (source, target)
+                for source, target in re.findall(
+                    r'-v "(.*?):(/[^:"]+?)(?::ro)?"', line
+                )
+            )
+        assert len(sources) >= 5, f"expected every mount to be matched, got {sources}"
+        for source, target in sources:
+            resolved = "blueprint_docker_host_path" in source
+            variable = re.fullmatch(r"\$\{?(\w+)\}?", source)
+            if not resolved and variable:
+                assignment = re.search(
+                    rf'^\s*(?:\w+=\S+ )*{variable.group(1)}=(.*)$',
+                    harness,
+                    re.MULTILINE,
+                )
+                assert assignment, f"cannot find where {source} is assigned"
+                resolved = "blueprint_docker_host_path" in assignment.group(1)
+            assert resolved, (
+                f"{target} is mounted from {source!r}, which is not resolved "
+                "to a host path; Docker Desktop will bind a VM-side directory"
+            )
+
+    def test_the_container_cannot_leave_root_owned_files_in_the_workspace(self):
+        """The bind-mounted checkout must survive the run for its owner.
+
+        /app is the host checkout mounted read-write and the image declares no
+        USER, so pytest ran as root and wrote root-owned __pycache__/,
+        .pytest_cache/ and .testmondata back into the workspace. Nothing failed
+        then; the next actions/checkout died with
+        "EACCES: permission denied, unlink .../.pytest_cache/.gitignore" in
+        seconds, and because a self-hosted runner shares _work between
+        workflows, one such run poisoned every later job on that runner.
+        """
+        harness = _BACKEND_TEST_HARNESS.read_text(encoding="utf-8")
+        assert '-e PYTHONDONTWRITEBYTECODE=1' in harness, (
+            "the harness must stop the container writing bytecode into the "
+            "bind-mounted checkout, as .github/workflows/ci.yml already does"
+        )
+        assert 'DOCKER_USER_ARGS=(--user "${_invoking_uid}:${_invoking_gid}"' in harness, (
+            "the harness must run the container as the invoking uid/gid"
+        )
+        workspace_runs = [
+            line
+            for line in harness.splitlines()
+            if "docker run" in line and re.search(r'-v "[^"]*:/app"', line)
+        ]
+        assert workspace_runs, "no read-write workspace mount found in the harness"
+        for line in workspace_runs:
+            assert '"${DOCKER_USER_ARGS[@]}"' in line, (
+                f"workspace-mounting docker run is still implicitly root: {line.strip()}"
+            )

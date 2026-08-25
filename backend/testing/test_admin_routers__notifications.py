@@ -103,6 +103,46 @@ class TestAlerts:
         assert resp.json()[0]["title"] == "Test Alert"
 
     @pytest.mark.asyncio
+    async def test_get_alerts_timestamps_carry_an_explicit_utc_offset(
+        self, client: AsyncClient, db_session
+    ):
+        """Alert timestamps were naive, so age against an aware clock blew up.
+
+        Same defect class as the task listing: the API stamped
+        ``2026-08-10T12:00:00`` with no zone. A Python consumer subtracting it
+        from ``datetime.now(timezone.utc)`` raises ``TypeError``; a browser
+        reads it as local time and shifts every displayed alert.
+        """
+        from datetime import datetime, timezone
+
+        project = await _make_project(db_session)
+        seen = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                severity="ERROR",
+                title="Zoned Alert",
+                message="Something failed",
+                event_type="failure_alert",
+                created_at=seen,
+                last_seen_at=seen,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/alerts")
+        assert resp.status_code == 200
+        row = next(a for a in resp.json() if a["title"] == "Zoned Alert")
+        for field in ("created_at", "last_seen_at", "dismissed_at"):
+            value = row[field]
+            if value is None:
+                continue
+            parsed = datetime.fromisoformat(value)
+            assert parsed.tzinfo is not None, f"{field} is naive: {value!r}"
+            assert parsed == seen
+            datetime.now(timezone.utc) - parsed
+
+    @pytest.mark.asyncio
     async def test_get_alerts_excludes_other_projects(
         self, client: AsyncClient, db_session
     ):

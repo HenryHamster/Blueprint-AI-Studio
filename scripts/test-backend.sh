@@ -21,6 +21,30 @@ set -euo pipefail
 cd "$(dirname "$0")/../backend"
 source ../scripts/backend-test-route.sh
 
+# Windows/Git-Bash path resolution. Every function it defines is the identity
+# on a non-MSYS host, so Linux and CI keep byte-for-byte the behaviour they
+# have today; see the helper's header for the two silent-wrong-answer failures
+# it exists to close.
+#
+# The guard fixtures build synthetic checkouts by copying scripts/ piecemeal,
+# so the helper can legitimately be absent. Degrade to the identity there
+# rather than refusing to run -- but only where the identity is *correct*. On
+# an MSYS host it is not, and a missing helper is fatal rather than a run that
+# quietly mounts VM-side directories and reports a missing report.
+if [ -f ../scripts/posix-path.sh ]; then
+  source ../scripts/posix-path.sh
+else
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW* | MSYS* | CYGWIN*)
+      echo "ERROR: scripts/posix-path.sh is missing; this host needs it to" >&2
+      echo "       resolve report and workspace paths for the Docker daemon." >&2
+      exit 1
+      ;;
+  esac
+  blueprint_posix_path() { printf '%s\n' "${1-}"; }
+  blueprint_docker_host_path() { printf '%s\n' "${1-}"; }
+fi
+
 # The real upgrade chain contains fail-closed encrypted-data migrations. Keep a
 # deterministic non-production Fernet key in the repo-owned harness so Alembic
 # proves the whole chain without weakening migration behavior or relying on the
@@ -448,6 +472,46 @@ else
   )
 fi
 
+# --- Keep the container's writes out of, and off, the host checkout ---
+#
+# _run bind-mounts the host checkout at /app READ-WRITE (the deps image bakes
+# no source), and the image has no USER directive, so by default pytest runs
+# as root and writes root-owned __pycache__/, .pytest_cache/ and .testmondata
+# straight back into the workspace. Nothing fails while that happens. The next
+# thing to touch the workspace is what dies: actions/checkout and `git clean`
+# report "EACCES: permission denied, unlink .../.pytest_cache/.gitignore" and
+# the job is over in seconds, before a single test runs. On a self-hosted
+# runner _work/<repo>/<repo> is shared between workflows, so one poisoned run
+# breaks every later job on that runner and the same SHA passes or fails
+# depending on which runner picks it up. Locally and on agent VMs the same
+# droppings make `git clean` silently unable to clean.
+#
+# PYTHONDONTWRITEBYTECODE stops the largest source of them being created at
+# all (this is what .github/workflows/ci.yml already does with the same
+# image), and --user makes anything still written land owned by the caller.
+# Both, because either alone leaves a hole: bytecode is not the only thing
+# pytest writes, and --user cannot help a lane that does not pass it.
+DOCKER_ARGS+=(-e PYTHONDONTWRITEBYTECODE=1)
+
+# The workspace bind-mount source has the same host-path requirement as the
+# report directories: `pwd` answers the MSYS rendering, and a checkout that
+# lives under the Windows temp directory (which is what the base-tree
+# verification lane extracts into) renders as /tmp/... -- a path Docker
+# Desktop binds to a VM-side directory instead of rejecting, so /app would
+# be empty and every selector would "fail" as a collection error.
+WORKSPACE_HOST_PATH="$(blueprint_docker_host_path "$PWD")"
+
+# Run the container as the invoking uid/gid. Root stays root (uid 0 in, uid 0
+# out) so a root-owned CI checkout is unaffected; HOME is redirected because
+# it defaults to "/", which a non-root uid cannot write. Fails open: if `id`
+# cannot answer, the run proceeds exactly as it does today rather than not at
+# all.
+DOCKER_USER_ARGS=()
+if _invoking_uid="$(id -u 2>/dev/null)" && _invoking_gid="$(id -g 2>/dev/null)" \
+   && [ -n "$_invoking_uid" ] && [ -n "$_invoking_gid" ]; then
+  DOCKER_USER_ARGS=(--user "${_invoking_uid}:${_invoking_gid}" -e HOME=/tmp)
+fi
+
 # Mount admin-ui/src read-only so test_invariants.py's frontend size
 # guardrails can actually run inside Docker. Without this they silently
 # skip (admin-ui isn't in the backend Dockerfile build context) and
@@ -456,7 +520,7 @@ fi
 # `_resolve_admin_ui_src_root()`. CI runs without this mount; the
 # guardrails fail loudly there until the workflow is updated similarly.
 if [ "$USE_DOCKER" = "1" ] && [ -d ../admin-ui/src ]; then
-  ADMIN_UI_HOST_PATH="$(cd ../admin-ui/src && pwd)"
+  ADMIN_UI_HOST_PATH="$(blueprint_docker_host_path "$(cd ../admin-ui/src && pwd)")"
   DOCKER_ARGS+=(-v "${ADMIN_UI_HOST_PATH}:/admin-ui/src:ro")
 fi
 
@@ -465,7 +529,7 @@ fi
 # AGENT_SELF_REVIEW_CATEGORIES mirror. The mount target /agent/src is
 # one of the candidate paths in `_resolve_prompt_ts_path()`.
 if [ "$USE_DOCKER" = "1" ] && [ -d ../agent/src ]; then
-  MSYS_NO_PATHCONV=1 AGENT_SRC_HOST_PATH="$(cd ../agent/src && pwd)"
+  MSYS_NO_PATHCONV=1 AGENT_SRC_HOST_PATH="$(blueprint_docker_host_path "$(cd ../agent/src && pwd)")"
   DOCKER_ARGS+=(-v "${AGENT_SRC_HOST_PATH}:/agent/src:ro")
 fi
 
@@ -473,7 +537,7 @@ fi
 # (scripts/test_blueprint_cli.py) can resolve REPO_ROOT to /repo and find
 # the ./check and ./blueprint wrappers it tests for existence/syntax.
 if [ "$USE_DOCKER" = "1" ] && [ -d .. ]; then
-  MSYS_NO_PATHCONV=1 REPO_HOST_PATH="$(cd .. && pwd)"
+  MSYS_NO_PATHCONV=1 REPO_HOST_PATH="$(blueprint_docker_host_path "$(cd .. && pwd)")"
   DOCKER_ARGS+=(-v "${REPO_HOST_PATH}:/repo:ro")
 fi
 
@@ -482,15 +546,25 @@ fi
 # the container also needs the remapped path in its environment. Keep the
 # caller's filename so the host can parse the report after `docker run` exits.
 if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
-  STATIC_GUARD_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_STATIC_GUARD_JUNIT")"
-  STATIC_GUARD_OUTPUT_NAME="$(basename -- "$BLUEPRINT_STATIC_GUARD_JUNIT")"
+  # The caller may hand us a native Windows path. Split the POSIX rendering
+  # of it, never the raw value: `cd` into a raw Windows path succeeds and
+  # then reports the location through the MSYS mount table, which turns
+  # C:\Users\...\Temp\g into /tmp/g -- a path the Docker daemon cannot
+  # bind-mount from the host.
+  STATIC_GUARD_JUNIT_POSIX="$(blueprint_posix_path "$BLUEPRINT_STATIC_GUARD_JUNIT")"
+  STATIC_GUARD_OUTPUT_DIR="$(dirname -- "$STATIC_GUARD_JUNIT_POSIX")"
+  STATIC_GUARD_OUTPUT_NAME="$(basename -- "$STATIC_GUARD_JUNIT_POSIX")"
   [ -d "$STATIC_GUARD_OUTPUT_DIR" ] || {
     echo "ERROR: static guard JUnit output directory is unavailable: $STATIC_GUARD_OUTPUT_DIR" >&2
     exit 2
   }
   if [ "$USE_DOCKER" = "1" ]; then
     STATIC_GUARD_OUTPUT_DIR="$(cd "$STATIC_GUARD_OUTPUT_DIR" && pwd -P)"
-    DOCKER_ARGS+=(-v "${STATIC_GUARD_OUTPUT_DIR}:/static-guard-output")
+    # A bind-mount source has to be a host path. `pwd -P` can legitimately
+    # answer an MSYS-virtual one (mktemp lives under /tmp), and Docker
+    # Desktop silently binds a VM-side directory for those instead of
+    # failing, so the report never lands where the caller reads it.
+    DOCKER_ARGS+=(-v "$(blueprint_docker_host_path "$STATIC_GUARD_OUTPUT_DIR"):/static-guard-output")
     BLUEPRINT_STATIC_GUARD_JUNIT="/static-guard-output/${STATIC_GUARD_OUTPUT_NAME}"
     DOCKER_ARGS+=(-e "BLUEPRINT_STATIC_GUARD_JUNIT=$BLUEPRINT_STATIC_GUARD_JUNIT")
   fi
@@ -528,9 +602,9 @@ _run() {
       # CI shards do. $PWD is the backend dir here (we cd'd at the top), so
       # /app/CLAUDE.md (cp'd above), the agent/admin-ui mounts in DOCKER_ARGS,
       # alembic, and `app.*` all resolve identically to the built image.
-      MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/app" "${DOCKER_ARGS[@]}" "$DEPS_IMAGE" "$@"
+      MSYS_NO_PATHCONV=1 docker run --rm "${DOCKER_USER_ARGS[@]}" -v "${WORKSPACE_HOST_PATH}:/app" "${DOCKER_ARGS[@]}" "$DEPS_IMAGE" "$@"
     else
-      MSYS_NO_PATHCONV=1 docker run --rm "${DOCKER_ARGS[@]}" blueprint-backend-test "$@"
+      MSYS_NO_PATHCONV=1 docker run --rm "${DOCKER_USER_ARGS[@]}" "${DOCKER_ARGS[@]}" blueprint-backend-test "$@"
     fi
   else
     # Replace leading "python3" only when the harness selected the venv.
@@ -881,8 +955,9 @@ if [ $# -gt 0 ]; then
     }
     rm -f "$BLUEPRINT_VERIFICATION_RESULT_FILE"
     if [ -n "${BLUEPRINT_VERIFICATION_JUNIT:-}" ]; then
-      VERIFICATION_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_VERIFICATION_JUNIT")"
-      VERIFICATION_JUNIT_NAME="$(basename -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      VERIFICATION_JUNIT_POSIX="$(blueprint_posix_path "$BLUEPRINT_VERIFICATION_JUNIT")"
+      VERIFICATION_OUTPUT_DIR="$(dirname -- "$VERIFICATION_JUNIT_POSIX")"
+      VERIFICATION_JUNIT_NAME="$(basename -- "$VERIFICATION_JUNIT_POSIX")"
       [ -d "$VERIFICATION_OUTPUT_DIR" ] || {
         echo "ERROR: verification JUnit output directory is unavailable: $VERIFICATION_OUTPUT_DIR" >&2
         exit 2
@@ -895,7 +970,7 @@ if [ $# -gt 0 ]; then
     fi
     VERIFICATION_HOST_JUNIT="$VERIFICATION_OUTPUT_DIR/${VERIFICATION_JUNIT_NAME:-junit.xml}"
     if [ "$USE_DOCKER" = "1" ]; then
-      DOCKER_ARGS+=(-v "${VERIFICATION_OUTPUT_DIR}:/verification-output")
+      DOCKER_ARGS+=(-v "$(blueprint_docker_host_path "$VERIFICATION_OUTPUT_DIR"):/verification-output")
       if [ -n "$VERIFICATION_JUNIT_NAME" ]; then
         verification_junit="/verification-output/${VERIFICATION_JUNIT_NAME}"
         DOCKER_ARGS+=(-e "BLUEPRINT_VERIFICATION_JUNIT=$verification_junit")
@@ -911,15 +986,16 @@ if [ $# -gt 0 ]; then
     mv -f "$verification_tmp" "$BLUEPRINT_VERIFICATION_RESULT_FILE"
   else
     if [ -n "${BLUEPRINT_VERIFICATION_JUNIT:-}" ]; then
-      VERIFICATION_OUTPUT_DIR="$(dirname -- "$BLUEPRINT_VERIFICATION_JUNIT")"
-      VERIFICATION_JUNIT_NAME="$(basename -- "$BLUEPRINT_VERIFICATION_JUNIT")"
+      VERIFICATION_JUNIT_POSIX="$(blueprint_posix_path "$BLUEPRINT_VERIFICATION_JUNIT")"
+      VERIFICATION_OUTPUT_DIR="$(dirname -- "$VERIFICATION_JUNIT_POSIX")"
+      VERIFICATION_JUNIT_NAME="$(basename -- "$VERIFICATION_JUNIT_POSIX")"
       [ -d "$VERIFICATION_OUTPUT_DIR" ] || {
         echo "ERROR: verification JUnit output directory is unavailable: $VERIFICATION_OUTPUT_DIR" >&2
         exit 2
       }
       VERIFICATION_OUTPUT_DIR="$(cd "$VERIFICATION_OUTPUT_DIR" && pwd -P)"
       if [ "$USE_DOCKER" = "1" ]; then
-        DOCKER_ARGS+=(-v "${VERIFICATION_OUTPUT_DIR}:/verification-output")
+        DOCKER_ARGS+=(-v "$(blueprint_docker_host_path "$VERIFICATION_OUTPUT_DIR"):/verification-output")
         verification_junit="/verification-output/${VERIFICATION_JUNIT_NAME}"
         DOCKER_ARGS+=(-e "BLUEPRINT_VERIFICATION_JUNIT=$verification_junit")
       else
