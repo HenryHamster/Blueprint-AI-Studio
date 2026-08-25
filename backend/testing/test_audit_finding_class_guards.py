@@ -49,16 +49,16 @@ from __future__ import annotations
 import ast
 import os
 import re
-import subprocess
 import textwrap
 from pathlib import Path
 
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
-from testing.git_checkout_probe import (
-    git_readable_repo_root,
-    unreadable_repo_skip_reason,
+from testing.repo_checkout import (
+    git_command,
+    require_git_readable_repo_root,
+    require_repo_root,
 )
 from testing.identity_extraction import extract_python_test_nodes
 
@@ -84,24 +84,15 @@ from app.greenlet_fidelity import (
 
 _THIS_DIR = Path(__file__).resolve().parent
 _BACKEND_ROOT = _THIS_DIR.parent
+# NOTE: correct only in a plain checkout. Every containerised lane mounts
+# backend/ at /app and the repo root separately at /repo, so this resolves to
+# ``/``. Guards that need the repo root must go through
+# ``testing.repo_checkout`` (which tries /repo first and FAILS rather than
+# skipping); this name is kept for the paths that legitimately want the
+# sibling-of-backend spelling and already handle its absence.
 _REPO_ROOT = _BACKEND_ROOT.parent
 _VERSIONS_DIR = _BACKEND_ROOT / "alembic" / "versions"
 _RECONCILIATION_PATH = _BACKEND_ROOT / "app" / "migration_reconciliation.py"
-
-
-def _readable_repo_root() -> str | None:
-    """Return the repo root if git can READ it from here, else None.
-
-    Presence of ``.git`` is not the predicate, in either spelling. ``is_dir``
-    was the original check and skipped in every LINKED WORKTREE, where ``.git``
-    is a FILE holding ``gitdir: ...`` -- so this guard only ever ran in a real
-    clone and a green local run proved nothing about it (#17872/#17887).
-    ``exists`` overshoots: a worktree mounted into a container names a HOST
-    gitdir that does not exist there, git dies, and the guard ERRORS instead of
-    skipping (#17892). So ask git, with the cheapest question that fails
-    exactly when the ``git ls-files`` below would.
-    """
-    return git_readable_repo_root(_REPO_ROOT)
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +574,11 @@ class TestTestDurationsCommittedAndFresh:
         bash scripts/store-backend-durations.sh
     then commit the updated backend/.test_durations.
 
-    Skipped when the repo root is unavailable (CI backend-only Docker context).
+    Resolves the repo root through ``testing.repo_checkout``: the old
+    ``(_BACKEND_ROOT.parent / ".git").is_dir()`` precondition resolved to
+    ``/.git`` inside every containerised lane, so this guard reported SKIPPED
+    on every CI run and had never enforced anything. A missing checkout now
+    FAILS instead of skipping.
     """
 
     def test_test_durations_committed_valid_and_covers_collection(self):
@@ -591,42 +586,28 @@ class TestTestDurationsCommittedAndFresh:
         import json
         import random
 
-        gitignore_path = _REPO_ROOT / ".gitignore"
+        repo_root = require_repo_root()
+        gitignore_path = repo_root / ".gitignore"
         durations_path = _BACKEND_ROOT / ".test_durations"
 
-        readable_root = _readable_repo_root()
-        if readable_root is None:
-            pytest.skip(
-                unreadable_repo_skip_reason(
-                    "neither backend lane exercises this guard -- both run from "
-                    "a backend-only context whose repo root resolves to `/`, "
-                    "which carries no checkout. It runs on a developer or agent "
-                    "checkout, where a skip here means the local repo is "
-                    "unreadable, not that .test_durations was verified."
-                )
-            )
-
         # (a) .gitignore must NOT contain the pattern
-        if gitignore_path.exists():
-            lines = gitignore_path.read_text().splitlines()
-            assert "backend/.test_durations" not in lines, (
-                ".gitignore still lists 'backend/.test_durations'. "
-                "Remove the line so the committed durations file can be tracked. "
-                "Time-balanced CI shard splitting requires this file to be committed."
-            )
+        assert gitignore_path.is_file(), (
+            f"{gitignore_path} is missing from the checkout at {repo_root}; "
+            "this guard cannot report clean without reading it."
+        )
+        lines = gitignore_path.read_text().splitlines()
+        assert "backend/.test_durations" not in lines, (
+            ".gitignore still lists 'backend/.test_durations'. "
+            "Remove the line so the committed durations file can be tracked. "
+            "Time-balanced CI shard splitting requires this file to be committed."
+        )
 
         # (b) File must be tracked by git
-        result = subprocess.run(
-            [
-                "git",
-                "-c",
-                f"safe.directory={readable_root}",
-                "ls-files",
-                "backend/.test_durations",
-            ],
-            cwd=readable_root,
-            capture_output=True,
-            text=True,
+        git_root = require_git_readable_repo_root()
+        result = git_command(git_root, "ls-files", "backend/.test_durations")
+        assert result.returncode == 0, (
+            f"git ls-files failed in {git_root} (exit {result.returncode}): "
+            f"{result.stderr.strip()}"
         )
         tracked_paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         assert tracked_paths, (
@@ -711,8 +692,10 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
     contain references to removed components, preventing future implementers
     from following stale guidance.
 
-    Skipped only when the repo root is unavailable (CI backend-only Docker
-    context that doesn't have the docs/ directory mounted).
+    Resolves the repo root through ``testing.repo_checkout`` -- the previous
+    ``_REPO_ROOT / "docs"`` spelling looked at ``/docs`` inside every
+    containerised lane, so this scan reported SKIPPED on every CI run. An
+    absent docs/ tree is now a FAILURE, not a skip.
     """
 
     def test_long_lived_docs_do_not_reference_removed_code_paths(self):
@@ -740,23 +723,23 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
             )
 
         # Scan documentation directories
-        docs_root = _REPO_ROOT / "docs"
-        if not docs_root.is_dir():
-            pytest.skip(
-                "docs/ directory not available in this test environment "
-                "(CI docker context may not mount the docs directory)"
-            )
+        repo_root = require_repo_root()
+        docs_root = repo_root / "docs"
+        assert docs_root.is_dir(), (
+            f"{docs_root} is missing from the checkout at {repo_root}; the "
+            "removed-code scan below would be vacuous, so it must not report "
+            "clean."
+        )
 
         # Collect all .md files in docs/ and docs/plans/
         doc_files: list[Path] = []
         for pattern in ["*.md", "plans/*.md"]:
             doc_files.extend(docs_root.glob(pattern))
 
-        if not doc_files:
-            pytest.skip(
-                "No .md files found in docs/ or docs/plans/. "
-                "Cannot verify removed code references."
-            )
+        assert doc_files, (
+            f"No .md files found under {docs_root} or its plans/ subdirectory "
+            "-- the removed-code scan would be vacuous."
+        )
 
         # Scan each doc file for references to removed code
         violations: list[str] = []
@@ -766,7 +749,7 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
             except OSError:
                 continue
 
-            rel_path = doc_path.relative_to(_REPO_ROOT)
+            rel_path = doc_path.relative_to(repo_root)
             for removed_ref in removed_refs:
                 violations.extend(
                     f"{rel_path}: contains '{pattern}' "
@@ -1192,27 +1175,24 @@ class TestStandaloneRosterIncludesGuardModule:
         assert guard_classes, "Guard classes must be defined in this module"
 
         # Verify the standalone roster includes the guard module so audit-finding
-        # guards run in all test contexts (including CI backend-only Docker where
-        # repo root is unavailable and guards would otherwise skip).
-        # In Docker, the repo root is mounted at /repo; check there first.
-        script_path = Path("/repo") / "scripts" / "test-backend.sh"
-        if not script_path.exists():
-            script_path = _REPO_ROOT / "scripts" / "test-backend.sh"
-        if not script_path.exists():
-            pytest.skip(
-                "scripts/test-backend.sh not found in this environment "
-                "(repo root not available in CI backend-only Docker context)"
-            )
+        # guards run in all test contexts. ``require_repo_root`` tries the /repo
+        # bind mount first and FAILS rather than skipping when no checkout is
+        # visible -- a roster check that reports clean without reading the
+        # roster is exactly the defect this module guards.
+        script_path = require_repo_root() / "scripts" / "test-backend.sh"
+        assert script_path.is_file(), (
+            f"{script_path} is missing; the standalone roster cannot be read."
+        )
 
         content = script_path.read_text()
         assert "testing/test_audit_finding_class_guards.py" in content, (
             "testing/test_audit_finding_class_guards.py must be included in the "
             "STANDALONE_ARGS array in scripts/test-backend.sh. The guards check for "
             "module-size violations, migration divergences, dropped-column residuals, "
-            ".test_durations freshness, and stale documentation references. Three of "
-            "these guards silently skip when the repo root is unavailable; including "
-            "this module in --standalone ensures all guards run in CI backend-only "
-            "Docker context and catch regressions on every commit."
+            ".test_durations freshness, and stale documentation references. They "
+            "resolve the checkout through testing/repo_checkout.py and FAIL rather "
+            "than skip when none is visible; including this module in --standalone "
+            "is what puts them in front of every commit."
         )
 
 
