@@ -608,12 +608,19 @@ class AssetSecurityTests(unittest.TestCase):
                 }
             )
 
-            def run(command: str) -> subprocess.CompletedProcess[str]:
+            # The per-attempt budget has to clear process startup for the
+            # two nested bash spawns below, or every case that is supposed
+            # to RUN TO COMPLETION gets wall-clock killed instead and
+            # silently exercises the timeout path. The previous 0.1s was
+            # under startup cost on a slow or Windows host.
+            def run(
+                command: str, attempt_timeout: str = "2s"
+            ) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(
                     [
                         bash,
                         bash_path(helper),
-                        "0.1s",
+                        attempt_timeout,
                         "blueprint-viewport-test",
                         "/usr/bin/bash",
                         "-c",
@@ -623,20 +630,195 @@ class AssetSecurityTests(unittest.TestCase):
                     capture_output=True,
                     env=env,
                     text=True,
-                    timeout=10,
+                    timeout=180,
                 )
 
+            def sample(name: str, text: str) -> str:
+                """Materialize a verbatim runner transcript for a fake attempt."""
+                path = temp / name
+                # write_bytes, not write_text: the ANSI-coded fixtures below
+                # must reach the classifier byte for byte, with no newline
+                # translation on Windows.
+                path.write_bytes(text.encode("utf-8"))
+                return bash_path(path)
+
+            def reset() -> None:
+                for path in (docker_log, attempt_log):
+                    if path.exists():
+                        path.unlink()
+
+            def docker_removals() -> int:
+                if not docker_log.exists():
+                    return 0
+                return docker_log.read_text(encoding="utf-8").count("rm -f")
+
+            def attempts() -> int:
+                if not attempt_log.exists():
+                    return 0
+                return attempt_log.read_text(encoding="utf-8").count("attempt")
+
+            # ---------------------------------------------------------------
+            # Fixtures. Every one is a verbatim transcript from a real vitest
+            # 4.1.10 browser-mode run -- either CI run 32805982004 or a locally
+            # planted defect -- not a hand-written approximation. The SGR
+            # escapes are real: vitest interleaves them inside the summary line
+            # under CI, so "Tests" and "1 failed" are not adjacent in the raw
+            # bytes and the classifier only works if it normalizes them first.
+            # ---------------------------------------------------------------
+
+            # CI run 32805982004, shard 3/4, attempt 1. The dev server never
+            # served the module and never said why: not one "[vite]" line
+            # appears anywhere in that job, and every test that did run passed.
+            # This is the retryable class.
+            provider_disconnect = (
+                " \u276f  chromium  src/components/DependencyHealthCard"
+                ".viewport.test.tsx (0 test)\n"
+                "\u23af\u23af\u23af Failed Suites 1 \u23af\u23af\u23af\n"
+                " FAIL   chromium  src/components/DependencyHealthCard"
+                ".viewport.test.tsx\n"
+                "Error: Failed to import test file /work/admin-ui/src/components"
+                "/DependencyHealthCard.viewport.test.tsx\n"
+                "Caused by: TypeError: Failed to fetch dynamically imported module: "
+                "http://localhost:63315/work/admin-ui/src/components"
+                "/DependencyHealthCard.viewport.test.tsx?import&browserv=1787630480373\n"
+                "Vitest caught 1 unhandled error during the test run.\n"
+                "Error: Failed to run the test /work/admin-ui/src/components"
+                "/AcceptanceGradeBadge.viewport.test.tsx.\n"
+                "Caused by: Error: Cannot connect to the iframe. Did you change the "
+                "location or submitted a form?\n"
+                "\x1b[2m Test Files \x1b[22m \x1b[1m\x1b[31m1 failed\x1b[39m\x1b[22m"
+                "\x1b[2m | \x1b[22m\x1b[1m\x1b[32m36 passed\x1b[39m\x1b[22m"
+                "\x1b[90m (41)\x1b[39m\n"
+                "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m264 passed\x1b[39m"
+                "\x1b[22m\x1b[90m (264)\x1b[39m\n"
+            )
+
+            # Same job, the retry, which passed every file it reached.
+            clean_pass = (
+                " \u2713 |chromium| src/components/DependencyHealthCard"
+                ".viewport.test.tsx (3 tests) 111ms\n"
+                "\x1b[2m Test Files \x1b[22m \x1b[1m\x1b[32m41 passed\x1b[39m"
+                "\x1b[22m\x1b[90m (41)\x1b[39m\n"
+                "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m273 passed\x1b[39m"
+                "\x1b[22m\x1b[90m (273)\x1b[39m\n"
+            )
+
+            # A real unresolvable import, planted locally. It prints the SAME
+            # client-side "Failed to fetch dynamically imported module:" string
+            # as the transient above, because Vite answers the module request
+            # with a 500. What separates them is that the dev server states its
+            # reason.
+            unresolved_import = (
+                "9:43:46 PM [vite] Internal server error: Failed to resolve import "
+                '"./ZzThisModuleDoesNotExist" from '
+                '"src/components/ZzTmpBadImport.viewport.test.tsx". '
+                "Does the file exist?\n"
+                "  Plugin: vite:import-analysis\n"
+                "\u23af\u23af\u23af Failed Suites 1 \u23af\u23af\u23af\n"
+                " FAIL  |chromium| src/components/ZzTmpBadImport.viewport.test.tsx\n"
+                "Error: Failed to import test file "
+                "src/components/ZzTmpBadImport.viewport.test.tsx\n"
+                "Caused by: TypeError: Failed to fetch dynamically imported module: "
+                "http://localhost:63315/@fs/src/components"
+                "/ZzTmpBadImport.viewport.test.tsx?import&browserv=1787633026754\n"
+                " Test Files  1 failed (1)\n"
+                "      Tests  no tests\n"
+            )
+
+            # A real syntax error, planted locally. Same client-side string
+            # again; only the server-side reason differs.
+            syntax_error = (
+                "9:43:55 PM [vite] Internal server error: "
+                "Transform failed with 1 error:\n"
+                "src/components/ZzTmpSyntax.viewport.test.tsx:5:2: "
+                'ERROR: Expected ")" but found "}"\n'
+                "  Plugin: vite:esbuild\n"
+                "Error: Failed to import test file "
+                "src/components/ZzTmpSyntax.viewport.test.tsx\n"
+                "Caused by: TypeError: Failed to fetch dynamically imported module: "
+                "http://localhost:63315/@fs/src/components"
+                "/ZzTmpSyntax.viewport.test.tsx?import&browserv=1787633034993\n"
+                " Test Files  1 failed (1)\n"
+                "      Tests  no tests\n"
+            )
+
+            # A test that ran and asserted false, planted locally.
+            assertion_failure = (
+                " \u276f |chromium| src/components/ZzTmpAssert.viewport.test.tsx "
+                "(1 test | 1 failed) 189ms\n"
+                "     \u00d7 renders without horizontal overflow at 375px 188ms\n"
+                "\u23af\u23af\u23af Failed Tests 1 \u23af\u23af\u23af\n"
+                " FAIL  |chromium| src/components/ZzTmpAssert.viewport.test.tsx > "
+                "renders without horizontal overflow at 375px\n"
+                "AssertionError: expected 2 to be 3 // Object.is equality\n"
+                "\x1b[2m Test Files \x1b[22m \x1b[1m\x1b[31m1 failed\x1b[39m"
+                "\x1b[22m\x1b[90m (1)\x1b[39m\n"
+                "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[31m1 failed\x1b[39m"
+                "\x1b[22m\x1b[90m (1)\x1b[39m\n"
+            )
+
+            # A real exception thrown inside a running test, planted locally.
+            thrown_exception = (
+                " \u276f |chromium| src/components/ZzTmpThrow.viewport.test.tsx "
+                "(1 test | 1 failed) 34ms\n"
+                "\u23af\u23af\u23af Failed Tests 1 \u23af\u23af\u23af\n"
+                " FAIL  |chromium| src/components/ZzTmpThrow.viewport.test.tsx > "
+                "renders without horizontal overflow at 375px\n"
+                "TypeError: Cannot read properties of null (reading 'width')\n"
+                "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[31m1 failed\x1b[39m"
+                "\x1b[22m\x1b[90m (1)\x1b[39m\n"
+            )
+
+            # A real failure carrying transport noise on top. A transport
+            # signature must never be able to outvote a reported test failure.
+            failure_under_transport_noise = (
+                "Caused by: TypeError: Failed to fetch dynamically imported module: "
+                "http://localhost:63315/x.tsx\n"
+                "Cannot connect to the iframe.\n" + assertion_failure
+            )
+
+            # A test failure reported inline, with the run then truncated by a
+            # wall-clock kill before any summary block is written.
+            truncated_after_failure = (
+                " \u276f |chromium| src/components/ZzTmpAssert.viewport.test.tsx "
+                "(1 test | 1 failed) 189ms\n"
+            )
+
+            # Each veto fixture must actually contain the string the retry keys
+            # on -- otherwise the "does not retry" assertions below would pass
+            # vacuously against a condition that never had to decide anything.
+            for fixture in (
+                unresolved_import,
+                syntax_error,
+                failure_under_transport_noise,
+            ):
+                self.assertIn("Failed to fetch dynamically imported module:", fixture)
+
+            disconnect_path = sample("provider_disconnect.txt", provider_disconnect)
+            clean_pass_path = sample("clean_pass.txt", clean_pass)
+            veto_paths = {
+                "assertion failure": sample("assert.txt", assertion_failure),
+                "thrown exception": sample("throw.txt", thrown_exception),
+                "unresolved import": sample("unresolved.txt", unresolved_import),
+                "syntax error": sample("syntax.txt", syntax_error),
+                "real failure under transport noise": sample(
+                    "laundering.txt", failure_under_transport_noise
+                ),
+            }
+            truncated_path = sample("truncated.txt", truncated_after_failure)
+
+            # --- Child exit codes stay the child's, never the harness's. -----
             genuine_124 = run("exit 124")
             self.assertEqual(genuine_124.returncode, 124, genuine_124.stderr)
-            self.assertFalse(docker_log.exists())
+            self.assertEqual(docker_removals(), 0)
 
             genuine_137 = run("exit 137")
             self.assertEqual(genuine_137.returncode, 137, genuine_137.stderr)
-            self.assertFalse(docker_log.exists())
+            self.assertEqual(docker_removals(), 0)
 
             normal_failure = run("exit 42")
             self.assertEqual(normal_failure.returncode, 42, normal_failure.stderr)
-            self.assertFalse(docker_log.exists())
+            self.assertEqual(docker_removals(), 0)
 
             env["FAIL_TEE"] = "1"
             capture_failure = run("exit 0")
@@ -645,90 +827,145 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertIn(
                 "Could not capture viewport provider output", capture_failure.stderr
             )
-            self.assertFalse(docker_log.exists())
+            self.assertEqual(docker_removals(), 0)
 
-            partial_provider_error = run(
-                'printf "%s\\n" "Cannot connect to the iframe."; exit 43'
+            # --- Never retry a run in which a test produced a failure. -------
+            # Assertion failures, exceptions thrown inside tests, and real
+            # compile errors all stay red on the first attempt. Retrying any of
+            # them is how a flaky product bug gets laundered into a green
+            # promotion.
+            for label, path in veto_paths.items():
+                reset()
+                result = run(
+                    f'echo attempt >> "$ATTEMPT_LOG"; cat "{path}"; exit 1',
+                )
+                self.assertEqual(result.returncode, 1, f"{label}: {result.stderr}")
+                self.assertEqual(attempts(), 1, f"{label} was retried")
+                self.assertEqual(docker_removals(), 0, f"{label} was retried")
+
+            # A test failure reported inline, then a wall-clock hang: the
+            # summary block never gets written, so the veto has to key on the
+            # per-file progress line instead.
+            reset()
+            truncated = run(
+                f'echo attempt >> "$ATTEMPT_LOG"; cat "{truncated_path}"; sleep 30',
+            )
+            self.assertIn(truncated.returncode, (124, 137))
+            self.assertEqual(attempts(), 1, truncated.stderr)
+            self.assertEqual(docker_removals(), 0, truncated.stderr)
+
+            # --- Retry the transport class, on ANY single signature. ---------
+            # The previous condition required three strings to co-occur, so a
+            # disconnect that presented even slightly differently got no retry
+            # at all. Each signature now stands on its own.
+            transport_signatures = (
+                "Failed to fetch dynamically imported module: http://localhost:1/x",
+                "Cannot connect to the iframe.",
+                "[vitest] Browser connection was closed while running tests.",
+                "Target page, context or browser has been closed",
+                "Page crashed",
+                "browserType.launch: Target closed",
+                "page.goto: net::ERR_CONNECTION_REFUSED",
+            )
+            for index, signature in enumerate(transport_signatures):
+                signature_path = sample(f"signature_{index}.txt", signature + "\n")
+                reset()
+                result = run(
+                    f'echo attempt >> "$ATTEMPT_LOG"; cat "{signature_path}"; exit 1',
+                )
+                self.assertEqual(
+                    attempts(), 3, f"{signature!r} did not exhaust the retry budget"
+                )
+                self.assertEqual(
+                    docker_removals(), 2, f"{signature!r}: {result.stderr}"
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("attempt budget exhausted", result.stderr)
+
+            # --- The real CI transcript, end to end. -------------------------
+            reset()
+            disconnect_then_success = run(
+                'echo attempt >> "$ATTEMPT_LOG"; '
+                'if [[ "$(grep -c attempt "$ATTEMPT_LOG")" == "1" ]]; then '
+                f'cat "{disconnect_path}"; exit 1; fi; '
+                f'cat "{clean_pass_path}"',
             )
             self.assertEqual(
-                partial_provider_error.returncode, 43, partial_provider_error.stderr
+                disconnect_then_success.returncode, 0, disconnect_then_success.stderr
             )
-            self.assertFalse(docker_log.exists())
+            self.assertIn("lost its browser transport", disconnect_then_success.stderr)
+            self.assertEqual(attempts(), 2)
+            self.assertEqual(docker_removals(), 1)
 
-            provider_disconnect_then_success = run(
-                'if [[ ! -e "$ATTEMPT_LOG" ]]; then '
-                'printf "attempt\\n" > "$ATTEMPT_LOG"; '
-                'printf "%s\\n" "Failed to fetch dynamically imported module: test" '
-                '"Cannot connect to the iframe." '
-                '"Vitest caught 1 unhandled error during the test run."; '
-                "exit 1; "
-                "fi; "
-                'printf "attempt\\n" >> "$ATTEMPT_LOG"'
+            # Exactly what happened in run 32805982004: attempt 1 lost its
+            # transport, the retry fired correctly, and the retry itself then
+            # wall-clock hung after passing 40 of 41 files. One spare attempt
+            # could not absorb that, and a shard with zero failing tests went
+            # red and took the promotion with it.
+            reset()
+            disconnect_then_hang_then_success = run(
+                'echo attempt >> "$ATTEMPT_LOG"; '
+                'n="$(grep -c attempt "$ATTEMPT_LOG")"; '
+                f'if [[ "$n" == "1" ]]; then cat "{disconnect_path}"; exit 1; fi; '
+                'if [[ "$n" == "2" ]]; then sleep 30; fi; '
+                f'cat "{clean_pass_path}"',
             )
             self.assertEqual(
-                provider_disconnect_then_success.returncode,
+                disconnect_then_hang_then_success.returncode,
                 0,
-                provider_disconnect_then_success.stderr,
+                disconnect_then_hang_then_success.stderr,
             )
-            self.assertIn(
-                "disconnected from its browser iframe; retrying once",
-                provider_disconnect_then_success.stderr,
-            )
-            self.assertEqual(
-                attempt_log.read_text(encoding="utf-8").count("attempt"), 2
-            )
-            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
+            self.assertEqual(attempts(), 3)
+            self.assertEqual(docker_removals(), 2)
 
-            docker_log.unlink()
-            attempt_log.unlink()
-            persistent_provider_disconnect = run(
-                'printf "%s\\n" "Failed to fetch dynamically imported module: test" '
-                '"Cannot connect to the iframe." '
-                '"Vitest caught 1 unhandled error during the test run."; '
-                "exit 44"
-            )
-            self.assertEqual(
-                persistent_provider_disconnect.returncode,
-                44,
-                persistent_provider_disconnect.stderr,
-            )
-            self.assertIn(
-                "disconnected from its browser iframe; retrying once",
-                persistent_provider_disconnect.stderr,
-            )
-            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
+            # --- Wall-clock hangs with no reported test failure. -------------
+            reset()
+            responsive_timeout = run('echo attempt >> "$ATTEMPT_LOG"; sleep 30')
+            self.assertIn(responsive_timeout.returncode, (124, 137))
+            self.assertIn("wall clock", responsive_timeout.stderr)
+            self.assertEqual(attempts(), 3)
+            self.assertEqual(docker_removals(), 2)
 
-            docker_log.unlink()
-            responsive_timeout = run('echo attempt >> "$ATTEMPT_LOG"; sleep 2')
-            self.assertEqual(responsive_timeout.returncode, 124)
-            self.assertIn("timed out; retrying once", responsive_timeout.stderr)
-            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
-            self.assertEqual(
-                attempt_log.read_text(encoding="utf-8").count("attempt"), 2
-            )
-
-            docker_log.unlink()
-            attempt_log.unlink()
+            reset()
             timeout_then_success = run(
-                'if [[ ! -e "$ATTEMPT_LOG" ]]; then touch "$ATTEMPT_LOG"; sleep 2; fi'
+                'echo attempt >> "$ATTEMPT_LOG"; '
+                'if [[ "$(grep -c attempt "$ATTEMPT_LOG")" == "1" ]]; then '
+                "sleep 30; fi"
             )
             self.assertEqual(
                 timeout_then_success.returncode, 0, timeout_then_success.stderr
             )
-            self.assertIn("timed out; retrying once", timeout_then_success.stderr)
-            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
+            self.assertIn("wall clock", timeout_then_success.stderr)
+            self.assertEqual(attempts(), 2)
+            self.assertEqual(docker_removals(), 1)
 
-            docker_log.unlink()
-            attempt_log.unlink()
+            reset()
+            # A child that ignores TERM keeps its own grandchild alive holding
+            # the pipe open until that grandchild exits, so keep this sleep
+            # short: the attempt costs the full sleep, not the 2s budget.
             hard_timeout = run(
-                "echo attempt >> \"$ATTEMPT_LOG\"; trap '' TERM; sleep 2"
+                "echo attempt >> \"$ATTEMPT_LOG\"; trap '' TERM; sleep 5"
             )
             self.assertIn(hard_timeout.returncode, (124, 137))
-            self.assertIn("timed out; retrying once", hard_timeout.stderr)
-            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
-            self.assertEqual(
-                attempt_log.read_text(encoding="utf-8").count("attempt"), 2
+            self.assertIn("wall clock", hard_timeout.stderr)
+            self.assertEqual(attempts(), 3)
+            self.assertEqual(docker_removals(), 2)
+
+            # --- The attempt budget is configurable, bounded and validated. --
+            reset()
+            env["BLUEPRINT_VIEWPORT_MAX_ATTEMPTS"] = "1"
+            single_attempt = run(
+                f'echo attempt >> "$ATTEMPT_LOG"; cat "{disconnect_path}"; exit 1',
             )
+            self.assertEqual(single_attempt.returncode, 1, single_attempt.stderr)
+            self.assertEqual(attempts(), 1)
+            self.assertEqual(docker_removals(), 0)
+
+            env["BLUEPRINT_VIEWPORT_MAX_ATTEMPTS"] = "99"
+            rejected_budget = run("exit 0")
+            self.assertEqual(rejected_budget.returncode, 2, rejected_budget.stderr)
+            self.assertIn("invalid viewport max attempts", rejected_budget.stderr)
+            env.pop("BLUEPRINT_VIEWPORT_MAX_ATTEMPTS")
 
     def test_backend_scrubs_cross_run_postgres_leftovers(self):
         workflow = (
