@@ -366,3 +366,175 @@ def test_the_guard_rejects_a_known_bad_shape() -> None:
 
 if __name__ == "__main__":  # pragma: no cover - developer convenience
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# The THIRD budget layer: the scripts test lane's per-FILE budget.
+# ---------------------------------------------------------------------------
+#
+# backend/testing/test_scripts_test_lane.py runs each scripts/test_*.py file as
+# ONE subprocess and applies a per-FILE budget to the whole thing. That budget
+# is a third layer above the two the guard above reconciles, and the marker
+# escape hatch does not reach it: a @pytest.mark.timeout(M) inside a scripts/
+# file is honoured by the sharded lane and ignored by the scripts lane, which
+# only ever grants the file its per-file budget.
+#
+# #17887 closed the inner-vs-lane inversion and opened this one in the same
+# commit -- it raised scripts/test_github_actions_vm.py to
+# @pytest.mark.timeout(120) while the scripts lane still granted the file 25s,
+# and CI shard 8 went red with "exceeded the 25-second per-file test budget":
+# a healthy file killed by the outer layer, the same class one level further
+# out. This section makes that relationship checkable.
+
+_SCRIPTS_LANE = BACKEND_TESTING / "test_scripts_test_lane.py"
+
+# Same grace the lane already uses between its own inner and outer layers, so
+# the per-file budget clears the largest marker in the file instead of tying.
+_SCRIPTS_LANE_MARKER_GRACE_SECONDS = 60
+
+
+def _scripts_lane_file_budgets() -> tuple[float, dict[str, float]]:
+    """Read the lane's per-file budgets from their owner, via AST not import.
+
+    Importing the lane module would execute its ``_repository_root()``, which
+    raises when ``scripts/`` is absent -- a layout this guard legitimately runs
+    in. Parsing keeps the guard readable in every layout.
+    """
+    tree = ast.parse(_SCRIPTS_LANE.read_text(encoding="utf-8"))
+    default: float | None = None
+    overrides: dict[str, float] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = {getattr(target, "id", "") for target in node.targets}
+        if "_FILE_BUDGET_SECONDS_DEFAULT" in names:
+            default = float(ast.literal_eval(node.value))
+        elif "_FILE_BUDGET_SECONDS_OVERRIDES" in names:
+            overrides = {
+                str(key): float(value)
+                for key, value in ast.literal_eval(node.value).items()
+            }
+    assert default is not None, (
+        f"{_SCRIPTS_LANE.name} must declare _FILE_BUDGET_SECONDS_DEFAULT"
+    )
+    return default, overrides
+
+
+def _scripts_lane_exempt_files() -> set[str]:
+    """Files the scripts lane skips; their per-file budget never applies."""
+    harness = SCRIPTS_DIR / "test-backend.sh"
+    if not harness.is_file():
+        return set()
+    source = harness.read_text(encoding="utf-8")
+    marker = "CI_SCRIPT_TEST_EXEMPTIONS=("
+    start = source.find(marker)
+    if start == -1:
+        return set()
+    end = source.index("\n)", start)
+    exempt: set[str] = set()
+    for line in source[start + len(marker):end].splitlines():
+        entry = line.strip().strip('"').strip()
+        if not entry or entry.startswith("#"):
+            continue
+        exempt.add(entry.partition("|")[0])
+    return exempt
+
+
+def _max_timeout_marker(tree: ast.Module) -> tuple[str, float] | None:
+    """Largest ``@pytest.mark.timeout`` in a module, with the owner's name."""
+    markers: list[tuple[str, float]] = []
+    module_marker = _module_marker_seconds(tree)
+    if module_marker is not None:
+        markers.append(("pytestmark", module_marker))
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue
+        seconds = _timeout_marker_seconds(node)
+        if seconds is not None:
+            markers.append((node.name, seconds))
+    if not markers:
+        return None
+    owner, worst = max(markers, key=lambda item: item[1])
+    return owner, worst
+
+
+def test_scripts_lane_file_budgets_clear_their_own_timeout_markers() -> None:
+    """A marker inside scripts/ must fit the lane's per-file budget for that file.
+
+    A marker the outer wrapper will not honour is worse than no marker: it
+    reads as deliberate headroom while guaranteeing the file dies at the
+    smaller number. Either the per-file budget clears the marker with grace, or
+    the marker comes down.
+    """
+    if not SCRIPTS_DIR.is_dir():
+        pytest.skip(
+            "scripts/ absent in this layout: the Docker test image carries "
+            "backend/ as /app only, so the scripts lane does not run here"
+        )
+    if not _SCRIPTS_LANE.is_file():
+        pytest.skip(f"{_SCRIPTS_LANE.name} absent in this layout")
+
+    default_budget, overrides = _scripts_lane_file_budgets()
+    exempt = _scripts_lane_exempt_files()
+
+    scanned = 0
+    offenders: list[str] = []
+    for path in sorted(SCRIPTS_DIR.glob("test_*.py")):
+        scanned += 1
+        if path.name in exempt:
+            continue
+        worst = _max_timeout_marker(ast.parse(path.read_text(encoding="utf-8")))
+        if worst is None:
+            continue
+        owner, seconds = worst
+        budget = overrides.get(path.name, default_budget)
+        required = seconds + _SCRIPTS_LANE_MARKER_GRACE_SECONDS
+        if budget < required:
+            offenders.append(
+                f"scripts/{path.name}: {owner} carries "
+                f"@pytest.mark.timeout({seconds:g}) but the scripts lane grants "
+                f"the whole file only {budget:g}s, so the file is killed at "
+                f"{budget:g}s and the marker can never fire. Either raise "
+                f'_FILE_BUDGET_SECONDS_OVERRIDES["{path.name}"] in '
+                f"backend/testing/test_scripts_test_lane.py to at least "
+                f"{required:g} (marker + {_SCRIPTS_LANE_MARKER_GRACE_SECONDS}s "
+                f"grace) WITH a comment saying why the work is legitimately "
+                f"that slow, or lower the marker."
+            )
+
+    # Never pass vacuously (#17872). An empty or unreadable scripts/ corpus
+    # would satisfy the offender assertion below without checking anything.
+    assert scanned >= _ROOT_FLOORS["scripts"]["files"], (
+        f"scanned only {scanned} scripts/test_*.py files against a corpus floor "
+        f"of {_ROOT_FLOORS['scripts']['files']}: this guard scanned nothing and "
+        f"would have passed regardless of the budgets."
+    )
+    assert not offenders, "\n".join(
+        [
+            "scripts-lane per-file budget is below a marker it must honour:",
+            *offenders,
+        ]
+    )
+
+
+def test_the_scripts_lane_marker_extractor_is_not_vacuous() -> None:
+    """The extractor must actually find markers, in both shapes it must handle.
+
+    Without this, a parser that silently returned None for everything would
+    make the guard above green forever while checking nothing.
+    """
+    method_shape = ast.parse(
+        "import pytest\n"
+        "class T:\n"
+        "    @pytest.mark.timeout(120)\n"
+        "    def test_x(self):\n"
+        "        pass\n"
+    )
+    assert _max_timeout_marker(method_shape) == ("test_x", 120.0)
+
+    module_shape = ast.parse("import pytest\npytestmark = pytest.mark.timeout(45)\n")
+    assert _max_timeout_marker(module_shape) == ("pytestmark", 45.0)
+
+    assert _max_timeout_marker(ast.parse("def test_x():\n    pass\n")) is None

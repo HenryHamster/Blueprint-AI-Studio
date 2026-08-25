@@ -158,6 +158,31 @@ _FILE_BUDGET_SECONDS_OVERRIDES = {
     # mocking the layer under test. Budgeted at ~3x measured for slower CI
     # hosts; a genuine wedge still trips it.
     "test_guard_gate_left_shift.py": 120,
+    # 30 tests that fork real shells to exercise the VM bootstrap/retry shell
+    # generators. Measured 31.73s in the backend test image (#17887), so the
+    # 25s default was never survivable here -- it went red on CI shard 8 the
+    # moment #17887 landed.
+    #
+    # The number is NOT sized against that measurement, though. This file
+    # carries `@pytest.mark.timeout(120)` on
+    # test_viewport_retry_distinguishes_infrastructure_from_child_exit, whose
+    # worst case is a child that traps TERM and sleeps. A per-test marker of
+    # 120s inside a file the lane only grants 25s is the SAME budget-inversion
+    # class #17887 set out to close, just one layer further out: the marker
+    # promises headroom this wrapper would refuse to honour. So the per-file
+    # budget must clear the largest marker in the file, plus the same grace the
+    # layers below use -- 120 + 60. test_scripts_lane_file_budgets_clear_their
+    # _own_timeout_markers in backend/testing/test_harness_timeout_budgets.py
+    # enforces exactly that relationship, so a future marker bump here fails
+    # loudly instead of reddening a promotion PR.
+    "test_github_actions_vm.py": 180,
+    # Latent instance of the same inversion, found by the guard below rather
+    # than by a red shard: test_real_probe_runs_live_sandbox_postgres_when
+    # _installed boots a live sandbox PostgreSQL under an inner 90s budget and
+    # carries @pytest.mark.timeout(180). It skips unless pg_config AND Ruff are
+    # both present, which is why 25s has held so far -- on an image that has
+    # them it would blow the per-file budget instead of running. 180 + 60.
+    "test_runner_isolation.py": 240,
 }
 
 # CI's sharded pytest invocation passes ``--timeout=30`` (pytest-timeout), which

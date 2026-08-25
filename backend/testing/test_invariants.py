@@ -14492,6 +14492,42 @@ def test_ci_runner_script_suite_names_only_files_that_exist_on_disk():
     )
 
 
+def _standalone_backend_roster_entries(harness: Path) -> list[str]:
+    """Literal ``testing/...`` selectors from the harness STANDALONE_ARGS block.
+
+    DERIVED, never hand-mirrored.  The fixture below has to materialise a
+    stand-in for every backend entry the harness will execute, and a
+    hand-maintained second copy of that list rots silently the moment anyone
+    adds a roster entry: #17890 added ``testing/test_wire_timestamp_zone.py``
+    to the harness, the copy did not follow, and the harness aborted with
+    "ERROR: file or directory not found" -- reddening this invariant on the
+    promotion rehearsal for a roster that was in fact perfectly correct.
+    Reading the roster from its single owner makes that rot unrepresentable.
+
+    Parsed by literal marker rather than by invoking the harness: this
+    assertion has to hold in the --noconftest, Docker-less standalone lane,
+    which cannot start the harness it is checking.
+    """
+    source = harness.read_text(encoding="utf-8")
+    marker = "STANDALONE_ARGS=(\n"
+    start = source.find(marker)
+    assert start != -1, "standalone harness must declare a STANDALONE_ARGS block"
+    start += len(marker)
+    end = source.index("\n    )", start)
+    entries = [
+        line.strip()
+        for line in source[start:end].splitlines()
+        if line.strip().startswith("testing/")
+    ]
+    # Never scan vacuously: a parser that silently matched nothing would let
+    # every assertion below pass against an empty fake checkout (#17872).
+    assert entries, (
+        "standalone harness declared no literal testing/ roster entries; "
+        "the STANDALONE_ARGS parser matched nothing"
+    )
+    return entries
+
+
 def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path):
     """Docker-less standalone execution must not silently drop discovered entries."""
     bash_executable = "bash"
@@ -14563,41 +14599,25 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         (run_scripts / filename).write_text(
             "def test_roster_placeholder():\n    pass\n", encoding="utf-8"
         )
-    backend_tests = [
-        "test_security.py",
-        "test_pipeline.py",
-        "test_invariants.py",
-        "test_impacted_tests.py",
-        "test_audit_finding_class_guards.py",
-        "test_admin_auth_invariant.py",
-        "test_release_promotion_metric_manifest.py",
-        "test_dependency_deprecations.py",
-        "test_websocket_emitter_inventory.py",
-        "test_operator_workbench_contracts.py",
-        "test_monthly_budget_alerts.py",
-        "test_migration_chain.py",
-        "test_message_audience.py",
-        "test_event_type_invariants.py",
-        "test_salvage_bundle_standalone.py",
-        "test_test_durations_freshness.py",
-        "test_test_estate_ranked_queue.py",
-        "test_shard_balance.py",
-        "test_conversational_workday_protection.py",
-        "test_vitest_durations_freshness.py",
-        "test_test_imports_checker.py",
-    ]
+    # Materialise a stand-in for every literal backend entry the harness will
+    # execute, derived from the harness roster itself (see the helper above).
+    # A ``file.py::selector`` entry also needs that selector to exist, or the
+    # harness aborts with "no tests ran" instead of exercising the roster.
+    roster_selectors: dict[str, set[str]] = {}
+    for entry in _standalone_backend_roster_entries(harness):
+        relative, _, selector = entry.partition("::")
+        filename = relative.rsplit("/", 1)[-1]
+        roster_selectors.setdefault(filename, set())
+        if selector:
+            roster_selectors[filename].add(selector)
+    assert roster_selectors, "standalone backend roster resolved to no files"
     run_testing = run_backend / "testing"
     run_testing.mkdir()
-    for filename in backend_tests:
+    for filename, selected in sorted(roster_selectors.items()):
         test_body = "def test_roster_placeholder():\n    pass\n"
-        if filename == "test_operator_workbench_contracts.py":
-            test_body += (
-                "\ndef test_websocket_emitter_inventory_covers_current_emitters():\n"
-                "    pass\n"
-            )
-        (run_testing / filename).write_text(
-            test_body, encoding="utf-8"
-        )
+        for function_name in sorted(selected):
+            test_body += f"\n\ndef {function_name}():\n    pass\n"
+        (run_testing / filename).write_text(test_body, encoding="utf-8")
     run_harness = run_scripts / harness.name
 
     for path in sorted(

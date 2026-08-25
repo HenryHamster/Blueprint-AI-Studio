@@ -1058,13 +1058,33 @@ def _is_local_only_cli_command(args: argparse.Namespace) -> bool:
 
 
 def _enforce_scoped_cli_command(args: argparse.Namespace) -> None:
-    """Deny unsupported ServiceCredential commands before any local side effect."""
-    if _is_local_only_cli_command(args):
-        # Credential-free by contract: resolving a credential here is what made
-        # a purely local `compute run` fail with a `gcloud auth login` hint.
+    """Deny unsupported ServiceCredential commands before any local side effect.
+
+    The credential-free contract for local-only verbs (#17889) is "never DIE on
+    a missing config", NOT "never READ the config". Those are different, and
+    conflating them opened a hole: `compute` is a host command that
+    CLAUDE.md requires to fail closed for the project-operator profile, but the
+    local-only exemption used to be taken BEFORE the scoped check, so a scoped
+    ServiceCredential ran `compute run` unfenced. You cannot decide whether a
+    scoped credential is selected without looking at the config, so the probe
+    happens here and only a genuinely unresolvable config is waved through.
+    """
+    try:
+        scoped = _using_scoped_service_credential()
+    except (APIError, OSError, ValueError):
+        # No resolvable Blueprint config: absent (APIError), unreadable
+        # (OSError), or malformed (ValueError, which json.JSONDecodeError
+        # subclasses). A local-only verb is credential-free by contract and
+        # must still run; every other verb reaches its own load_config()
+        # moments later and fails there with the actionable setup hint.
+        # Waving THIS case through cannot grant a scoped credential anything,
+        # because a config that will not resolve holds no usable credential.
         return
-    if not _using_scoped_service_credential():
+    if not scoped:
         return
+    # A scoped ServiceCredential IS selected. Local-only verbs get no exemption
+    # from here down: the allowlists below are the whole authority, and
+    # ("compute", "run") is deliberately absent from both.
     key = _scoped_command_key(args)
     profile = _scoped_service_profile()
     scopes = set((profile.get("credential") or {}).get("scopes") or [])
@@ -9750,18 +9770,21 @@ def main(argv: list | None = None) -> int:
         return 1
     handler = _DISPATCH[args.command]
     try:
-        if _is_local_only_cli_command(args):
-            # `compute run` is documented as "no orchestrator, no DB, no GCP".
-            # Skip credential enforcement AND project/task-id resolution — every
-            # one of those paths calls load_config()/api(), which is why a local
-            # run died on a missing Blueprint config it never needed.
-            local_result = handler(args)
-            return local_result if isinstance(local_result, int) else 0
         # ServiceCredentials are machine principals, not ambient admin keys.
         # Fence the complete CLI before project resolution or handler dispatch so
         # a denied command cannot reach subprocess, Docker, gcloud, git, SSH, or
-        # even an unintended API route.
+        # even an unintended API route. This runs BEFORE the local-only fast path
+        # below: a local verb still performs host work, so "needs no credential"
+        # must not mean "escapes the fence". The fence is a no-op when no scoped
+        # credential is selected, including when no config resolves at all.
         _enforce_scoped_cli_command(args)
+        if _is_local_only_cli_command(args):
+            # `compute run` is documented as "no orchestrator, no DB, no GCP".
+            # Skip project/task-id resolution — every one of those paths calls
+            # load_config()/api(), which is why a local run died on a missing
+            # Blueprint config it never needed.
+            local_result = handler(args)
+            return local_result if isinstance(local_result, int) else 0
         # Resolve --project <name> to an id once, up front, so every
         # get_project_id(args.project_id) call site targets it. An explicit
         # --project-id wins if both are supplied.

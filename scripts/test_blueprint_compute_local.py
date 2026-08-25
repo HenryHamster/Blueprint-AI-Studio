@@ -315,18 +315,29 @@ def test_compute_run_is_declared_local_only():
 
 
 @_needs_shell
-def test_local_only_verb_never_touches_load_config(monkeypatch, tmp_path):
+def test_local_only_verb_survives_a_missing_api_config(monkeypatch, tmp_path):
     """The exact P0-2 failure: a purely local run died on a missing API config.
 
-    load_config() is replaced with a landmine, so any credential resolution on
-    the way to the handler fails the test rather than being papered over by a
-    dev host that happens to have a config file.
+    The contract this pins is "never DIE on a missing config", not "never READ
+    the config". The distinction matters: the scoped-credential fence has to
+    read the config to know whether a scoped credential is even selected, and
+    an earlier version of this test asserted the stronger "never touched"
+    property, which is what licensed `compute run` to skip the fence entirely
+    and let a project-operator credential run a host command (see
+    ``test_local_only_verb_is_still_fenced_for_a_scoped_credential``).
+
+    So load_config() is replaced with the real missing-config behaviour -- it
+    raises APIError, exactly as blueprint_api does after printing the
+    `gcloud auth login` hint -- on BOTH module bindings. blueprint.py does
+    `from blueprint_api import load_config`, so patching only blueprint_api
+    left blueprint's own binding live and the old landmine never fired there.
     """
 
-    def _landmine(*a, **k):
-        raise AssertionError("load_config() must not be reached by a local-only verb")
+    def _no_config(*_a, **_k):
+        raise blueprint_api.APIError("no Blueprint API config found")
 
-    monkeypatch.setattr(blueprint_api, "load_config", _landmine)
+    monkeypatch.setattr(blueprint_api, "load_config", _no_config)
+    monkeypatch.setattr(blueprint, "load_config", _no_config)
     monkeypatch.setattr(blueprint_api, "_config_cache", None)
     monkeypatch.delenv("BLUEPRINT_CONFIG", raising=False)
     monkeypatch.delenv("BLUEPRINT_API_URL", raising=False)
@@ -336,13 +347,48 @@ def test_local_only_verb_never_touches_load_config(monkeypatch, tmp_path):
     assert blueprint.main(["compute", "run", "--local", spec]) == blueprint._COMPUTE_EXIT_OK
 
 
-def test_local_only_exemption_is_checked_before_the_scoped_fence(monkeypatch):
-    """`compute run` is exempt from the ServiceCredential fence, by declaration."""
+def test_local_only_verb_resolves_no_profile_without_a_scoped_credential(monkeypatch):
+    """An ordinary (non-scoped) host runs `compute run` with no profile lookup."""
 
     def _landmine():
-        raise AssertionError("credential resolved for a local-only verb")
+        raise AssertionError("scoped profile resolved without a scoped credential")
 
-    monkeypatch.setattr(blueprint, "_using_scoped_service_credential", _landmine)
+    monkeypatch.setattr(blueprint, "_using_scoped_service_credential", lambda: False)
+    monkeypatch.setattr(blueprint, "_scoped_service_profile", _landmine)
+    args = blueprint.build_parser().parse_args(["compute", "run", "true"])
+    blueprint._enforce_scoped_cli_command(args)  # must not raise
+
+
+def test_local_only_verb_is_still_fenced_for_a_scoped_credential(monkeypatch, capsys):
+    """SECURITY PIN: local-only is not a fence exemption.
+
+    `compute` is a host command. CLAUDE.md requires the project-operator
+    profile to fail closed on platform/host commands, and ("compute", "run") is
+    deliberately absent from both allowlists. The credential-free contract for
+    local verbs must therefore be scoped to "no credential is configured" --
+    never to "skip the fence". An earlier ordering took the local-only
+    exemption first, so a scoped credential reached `cmd_compute` unfenced;
+    scripts/test_hermes_operator_cli.py caught it in the scripts test lane.
+    """
+    monkeypatch.setattr(blueprint, "_using_scoped_service_credential", lambda: True)
+    monkeypatch.setattr(
+        blueprint,
+        "_scoped_service_profile",
+        lambda: {"credential": {"scopes": ["project-operator"]}},
+    )
+    args = blueprint.build_parser().parse_args(["compute", "run", "true"])
+    with pytest.raises(blueprint_api.APIError):
+        blueprint._enforce_scoped_cli_command(args)
+    assert "scoped ServiceCredential command not permitted" in capsys.readouterr().err
+
+
+def test_missing_config_does_not_wedge_the_fence(monkeypatch):
+    """An unresolvable config is waved through: there is no credential to scope."""
+
+    def _no_config():
+        raise blueprint_api.APIError("no Blueprint API config found")
+
+    monkeypatch.setattr(blueprint, "_using_scoped_service_credential", _no_config)
     args = blueprint.build_parser().parse_args(["compute", "run", "true"])
     blueprint._enforce_scoped_cli_command(args)  # must not raise
 
