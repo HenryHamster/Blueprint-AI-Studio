@@ -16,7 +16,7 @@ except (OSError,ValueError):
 lanes=payload.get("lanes") if isinstance(payload.get("lanes"),dict) else {}
 lanes["backend-pytest"]={"lane":"backend-pytest","state":state,"blocking":True,"current_exit_code":int(code),"error":reason,"new_failures":{},"suppressed_failures":{},"disappeared_failures":{},"skipped_failures":{}}
 payload["version"]=1; payload["lanes"]=lanes
-open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\\n")' \
+open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' \
           "$_VERIFY_RECEIPT" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$state" "$reason" 1; then
         :
       fi

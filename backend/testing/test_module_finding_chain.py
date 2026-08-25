@@ -399,6 +399,56 @@ def test_guard_suppression_extractor_uses_cross_lane_projection_over_legacy():
     assert extract_guard_suppression_identities(receipt) == [("backend-pytest", identity)]
 
 
+@pytest.mark.asyncio
+async def test_blocking_receipt_with_baseline_unavailable_lane_becomes_chain_evidence():
+    """A blocked baseline lookup remains actionable without a test identity."""
+    project_id = uuid.uuid4()
+
+    def _blocked_receipt() -> dict:
+        receipt = _passing_gate_receipt(
+            suppressions={
+                "backend-pytest": {
+                    "state": "baseline_unavailable",
+                    "suppressed": {},
+                }
+            }
+        )
+        receipt["status"] = "failed"
+        receipt["exit_code"] = 1
+        return receipt
+
+    blocked = _blocked_receipt()
+    assert extract_guard_suppression_identities(blocked) == [
+        ("backend-pytest", "baseline_unavailable")
+    ]
+
+    generic_failed = _passing_gate_receipt(
+        suppressions={"backend-pytest": {"state": "execution_failure", "suppressed": {}}}
+    )
+    generic_failed["status"] = "failed"
+    generic_failed["exit_code"] = 1
+    assert extract_guard_suppression_identities(generic_failed) is None
+
+    timed_out = _blocked_receipt()
+    timed_out["status"] = "timed_out"
+    assert extract_guard_suppression_identities(timed_out) is None
+
+    session = _Session()
+    source_tasks = [
+        Task(project_id=project_id, context={"publication_gate_receipt": _blocked_receipt()})
+        for _ in range(CHAIN_ESCALATION_THRESHOLD)
+    ]
+    for task in source_tasks:
+        assert await ingest_guard_suppression_receipt(task, session)
+
+    assert len(session.rows) == 1
+    chain = session.rows[0]
+    assert chain.finding_key == _guard_chain_key("backend-pytest", "baseline_unavailable")
+    assert chain.suppression_lane == "backend-pytest"
+    assert chain.failure_identity == "baseline_unavailable"
+    assert chain.occurrences == CHAIN_ESCALATION_THRESHOLD
+
+
 class _ConflictOnceSession(_Session):
     """Model a first-insert race won by another independent task."""
 

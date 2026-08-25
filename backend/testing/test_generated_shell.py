@@ -2291,6 +2291,15 @@ def _extract_default_backend_verification() -> str:
 def test_default_check_backend_verification_is_rendered_from_fragment():
     """The committed fallback must not drift from its generator fragment."""
     tracked = _DEFAULT_CHECK.read_text(encoding="utf-8")
+    for source in (
+        _BACKEND_VERIFICATION_FRAGMENT.read_text(encoding="utf-8"),
+        tracked,
+    ):
+        abort_start = source.index("_record_backend_abort")
+        abort_end = source.index("_VERIFICATION_ROUTE_HELPER_OK", abort_start)
+        abort_source = source[abort_start:abort_end]
+        assert 'json.dumps(payload,sort_keys=True)+"\\n")' in abort_source
+        assert 'json.dumps(payload,sort_keys=True)+"\\\\n")' not in abort_source
     assert (
         '_VERIFY_CAPABILITY_RECEIPT="/tmp/execution_capability_receipt_${_VERIFY_TASK_ID}"'
         in tracked
