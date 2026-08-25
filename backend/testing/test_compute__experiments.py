@@ -756,9 +756,14 @@ def test_gcp_startup_script_no_progress_watchdog_armed_after_setup():
     )
     # Pre-declared empty init (for the set -u cleanup kills in setup branches).
     empty_init_idx = script.index("\n_NP_WATCHDOG_PID=\n")
-    # The watchdog clock is anchored (touch + stat _NP_START) then armed ($!).
+    # The watchdog samples the progress mtime inside its loop and is armed ($!).
+    # It no longer pre-``touch``es the progress file to anchor the clock: nothing
+    # but the experiment's own command writes that file, so pre-creating it made
+    # the mtime constant by construction and turned the watchdog into an
+    # unconditional fixed-duration kill. The first observed sample now arms the
+    # window; only a second, identical one is a plateau.
     arm_idx = script.index("_NP_WATCHDOG_PID=$!")
-    np_start_idx = script.index("_NP_START=$(stat")
+    np_start_idx = script.index("_NP_NOW=$(stat")
     # Every setup phase precedes the arm; the command follows it.
     clone_idx = script.index("repo_clone_failed")
     setup_idx = script.index("setup_step_failed")
@@ -769,11 +774,21 @@ def test_gcp_startup_script_no_progress_watchdog_armed_after_setup():
     assert empty_init_idx < setup_idx < arm_idx
     assert empty_init_idx < pull_idx < arm_idx
     assert empty_init_idx < resume_idx < arm_idx
-    assert np_start_idx < arm_idx, "clock must be anchored before the arm"
+    assert np_start_idx < arm_idx, "the sampling loop is part of the armed subshell"
     assert clone_idx < np_start_idx, "watchdog must arm AFTER the clone runs"
     assert setup_idx < np_start_idx, "watchdog must arm AFTER the setup step"
     assert pull_idx < np_start_idx, "watchdog must arm AFTER the image pull"
     assert arm_idx < command_idx, "watchdog must be armed before the command runs"
+    # INERT UNTIL TELEMETRY REPORTS: the script must not create the progress file
+    # itself, and the loop must skip every interval in which it does not exist.
+    assert "touch " not in script, (
+        "the startup script must never pre-create the progress file: only the "
+        "experiment's own command writes it"
+    )
+    assert "] || continue" in script, (
+        "the watchdog must skip intervals with no telemetry file instead of "
+        "killing on the absence of a channel it cannot observe"
+    )
 
 
 def test_no_progress_stalled_detects_plateau_and_spares_advancing_metric():

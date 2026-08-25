@@ -246,6 +246,92 @@ NO_PROGRESS_TIMEOUT = "no_progress_timeout"
 # command.  Keeping it adjacent to the canonical failure class prevents backend
 # emitters and the completion taxonomy from drifting apart.
 NO_PROGRESS_TIMEOUT_TERMINAL_REASON = NO_PROGRESS_TIMEOUT
+
+# ── Shell-level environment exit codes ─────────────────────────────────────────
+# POSIX reserves two exit statuses for the SHELL's own verdict on whether the
+# command could be run at all. A command body can never choose them: a Python
+# traceback exits 1, pytest exits 1-5, a SIGKILL surfaces as 137. So observing
+# one of these is direct evidence that the execution ENVIRONMENT did not have
+# what the command needed -- no interpreter on PATH, a binary that is not
+# executable, a noexec mount, a wrong-arch shim. That is a provisioning fault,
+# not a defect in the experiment's algorithm.
+#
+# Why this matters: every compute backend used to launder its failure into the
+# prose string "compute job failed" / "local subprocess exited with code N",
+# which classify_compute_terminal_reason substring-matches against nothing and
+# therefore returned CODE_ERROR -- the class reserved for a genuine work defect.
+# Exit 127 ("no working pip found", "python3: command not found") is the single
+# commonest bootstrap death on self-hosted runners, and every one of them burned
+# the owning task's retry budget and blamed the experiment's author, producing
+# rounds of hand-patching retries instead of one platform fix.
+ENVIRONMENT_EXIT_CODES: dict[int, str] = {
+    126: "command found but not executable",
+    127: "command not found",
+}
+# Exact sentinel the compute backends prefix onto a terminal reason when they
+# observe an environment exit code. classify_compute_terminal_reason keys on
+# this constant BEFORE its generic substring rules, so emitter and classifier
+# share one source of truth and cannot silently drift the way the 125 /
+# no_progress_timeout pair nearly did. The word "provisioning" is also present so
+# the generic rule below (and any not-yet-deployed reader) still routes it
+# correctly during a rolling deploy.
+ENVIRONMENT_FAILURE_TERMINAL_REASON = "environment provisioning failed"
+
+
+def is_environment_exit_code(exit_code: object) -> bool:
+    """True when ``exit_code`` is a shell-reserved environment-failure status.
+
+    ``bool`` is an ``int`` subclass, so a stray ``True`` must not read as 1.
+    """
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return False
+    return exit_code in ENVIRONMENT_EXIT_CODES
+
+
+def environment_failure_terminal_reason(
+    exit_code: int, existing_reason: str | None = None
+) -> str:
+    """Build the terminal reason a backend records for an environment exit code.
+
+    The substrate's own reason (when it carries anything beyond the generic
+    default) is appended after the sentinel so the reclassification discards no
+    diagnostic evidence.
+    """
+    detail = ENVIRONMENT_EXIT_CODES.get(exit_code, "environment unusable")
+    base = f"{ENVIRONMENT_FAILURE_TERMINAL_REASON}: {detail} (exit {exit_code})"
+    trimmed = (existing_reason or "").strip()
+    if trimmed and trimmed.lower() not in base.lower():
+        return f"{base}; {trimmed}"
+    return base
+
+
+# ── VM self-destruct clock terminal reasons ────────────────────────────────────
+# The GCP startup script arms a TWO-PHASE self-destruct clock. Phase 1 bounds
+# provisioning (boot, repo clone, image pull, checkpoint hydration, setup step);
+# phase 2, armed at the same point as the no-progress watchdog, bounds the
+# experiment's own runtime. Each phase records a DIFFERENT terminal reason so the
+# taxonomy can tell "we never got the experiment started" apart from "the
+# experiment ran and exceeded its declared deadline".
+#
+# Named here, next to the classes they map to, for the same reason as the 125 /
+# no_progress_timeout pair above: the emitter (compute_backends) and the consumer
+# (classify_compute_terminal_reason) must not drift. They HAD drifted, on the
+# VM-side token specifically: the classifier's prose rule "runtime deadline"
+# covers the SERVER-side deadline cuts (compute_jobs.py emits the literal
+# "compute job exceeded runtime deadline" from three call sites: the poll-status
+# timeout branch, the terminate-and-record path, and the poll-failure deadline
+# check), but the GCP startup script's phase-2 token ``runtime_ttl`` shares no
+# substring with that prose and fell through every rule to CODE_ERROR. An
+# intentional platform kill was therefore billed to the experiment's author as a
+# work defect.
+#
+# Do NOT "clean up" the prose rule as dead: deleting it would re-bill every
+# server-side runtime-deadline kill to the author. Both spellings are live and
+# both are load-bearing.
+PROVISIONING_TTL_TERMINAL_REASON = "provisioning_ttl"
+RUNTIME_TTL_TERMINAL_REASON = "runtime_ttl"
+
+
 # Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
 # for longer than the scope-aware threshold (8 min small / 12 min medium /
 # 18 min large). Detected by the reaper's progress-staleness sweep, which
@@ -356,11 +442,19 @@ def classify_compute_terminal_reason(
 
     Mapping rules (first match wins):
     - vm_phase == "provisioning" → PROVISION_FAILURE (VM never started)
-    - reason contains "provisioning" → PROVISION_FAILURE (launch/RPC failure)
-    - reason contains "runtime deadline" or "spend cap" → AGENT_TIMEOUT
-      (intentional platform kills; these should normally PASS the gate, but if
-      they somehow reach a failure branch the class must be AGENT_TIMEOUT, not
-      CODE_ERROR)
+    - reason contains ``ENVIRONMENT_FAILURE_TERMINAL_REASON`` → PROVISION_FAILURE
+      (the shell reported exit 126/127: the execution environment did not have
+      what the command needed. Pinned on the exact constant, ahead of the generic
+      substring rule, so a rename of the sentinel cannot silently drop the
+      mapping back to CODE_ERROR)
+    - reason contains "provisioning" → PROVISION_FAILURE (launch/RPC failure,
+      the ``provisioning_ttl`` phase-1 self-destruct expiry, and the runner's own
+      "cannot establish a Python interpreter" bootstrap reasons, which all carry
+      the same word)
+    - reason contains ``RUNTIME_TTL_TERMINAL_REASON``, "runtime deadline" or
+      "spend cap" → AGENT_TIMEOUT (intentional platform kills; these should
+      normally PASS the gate, but if they somehow reach a failure branch the
+      class must be AGENT_TIMEOUT, not CODE_ERROR)
     - reason contains "cancelled" or "operator" → ADMIN_CANCEL
     - reason contains ``NO_PROGRESS_TIMEOUT_TERMINAL_REASON`` → NO_PROGRESS_TIMEOUT
       (job was cut early by the no-progress watchdog — a configurable platform
@@ -371,9 +465,17 @@ def classify_compute_terminal_reason(
         return PROVISION_FAILURE
     if terminal_reason:
         lower = terminal_reason.lower()
+        if ENVIRONMENT_FAILURE_TERMINAL_REASON in lower:
+            return PROVISION_FAILURE
+        if PROVISIONING_TTL_TERMINAL_REASON in lower:
+            return PROVISION_FAILURE
         if "provisioning" in lower:
             return PROVISION_FAILURE
-        if "runtime deadline" in lower or "spend cap" in lower:
+        if (
+            RUNTIME_TTL_TERMINAL_REASON in lower
+            or "runtime deadline" in lower
+            or "spend cap" in lower
+        ):
             return AGENT_TIMEOUT
         if "cancelled" in lower or "operator" in lower:
             return ADMIN_CANCEL

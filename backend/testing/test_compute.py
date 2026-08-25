@@ -1572,6 +1572,221 @@ async def test_runner_subprocess_poll_status_generic_failure_not_no_progress():
     assert "no_progress_timeout" not in result.message
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [127, 126])
+async def test_runner_subprocess_poll_status_environment_exit_is_provision_failure(
+    exit_code,
+):
+    """Exit 127/126 from a runner job is an ENVIRONMENT fault, not a code defect.
+
+    POSIX reserves these two statuses for the shell's own verdict on whether the
+    command could be run at all: 127 "command not found" (no interpreter on PATH
+    — ``no working pip found``, ``python3: command not found``, the commonest
+    bootstrap death on self-hosted runners) and 126 "found but not executable"
+    (noexec mount, missing +x, wrong-arch shim). A command BODY can never choose
+    them: a traceback exits 1, pytest exits 1-5, a SIGKILL surfaces as 137.
+
+    The /report endpoint carries an exit_code but no reason field, so the exit
+    code is the ONLY evidence of how the job died — and poll_status used to throw
+    it away into the untyped prose "compute job failed", which
+    classify_compute_terminal_reason matched against nothing and returned
+    CODE_ERROR for. Every bootstrap death therefore burned the owning task's
+    retry budget and blamed the experiment's author.
+    """
+    from app.failure_classification import (
+        ENVIRONMENT_FAILURE_TERMINAL_REASON,
+        PROVISION_FAILURE,
+        classify_compute_terminal_reason,
+    )
+
+    backend = RunnerSubprocessBackend()
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "runner_exec_status": "failed",
+            "runner_exit_code": exit_code,
+        },
+    )
+    result = await backend.poll_status(job)
+    assert result.status == ComputeJobStatus.FAILED
+    assert result.exit_code == exit_code
+    # The exit code survives into the durable reason: reclassifying must not cost
+    # the operator the one diagnostic the substrate actually reported.
+    assert ENVIRONMENT_FAILURE_TERMINAL_REASON in result.message
+    assert f"exit {exit_code}" in result.message
+    assert (
+        classify_compute_terminal_reason(result.message, None) == PROVISION_FAILURE
+    ), "a missing interpreter is a provisioning fault, not a defect in the command"
+
+
+def test_environment_exit_codes_are_exactly_the_posix_reserved_pair():
+    """Literal pin on the reclassification's blast radius.
+
+    PROVISION_FAILURE is budget-exempt and resurrection-eligible, so widening
+    this set silently converts real code defects into infinitely-retried infra
+    failures. 125 in particular is Blueprint's OWN reserved no-progress watchdog
+    code and must keep its distinct class.
+    """
+    from app.failure_classification import (
+        ENVIRONMENT_EXIT_CODES,
+        NO_PROGRESS_TIMEOUT,
+        PROVISION_FAILURE,
+        INFRA_CLASSES,
+        classify_compute_terminal_reason,
+        is_environment_exit_code,
+    )
+
+    assert sorted(ENVIRONMENT_EXIT_CODES) == [126, 127]
+    for other in (0, 1, 2, 5, 124, 125, 137, 143):
+        assert not is_environment_exit_code(other), other
+    # bool is an int subclass — a stray True must not read as 1 (or as anything).
+    assert not is_environment_exit_code(True)
+    assert not is_environment_exit_code(None)
+    assert not is_environment_exit_code("127")
+    # The class this routes to is the budget-exempt one, and the watchdog code
+    # keeps its own distinct class.
+    assert PROVISION_FAILURE in INFRA_CLASSES
+    assert (
+        classify_compute_terminal_reason("no_progress_timeout", None)
+        == NO_PROGRESS_TIMEOUT
+    )
+
+
+def test_terminal_failure_message_preserves_exit_code_across_every_backend():
+    """All four substrates route their FAILED reason through one helper.
+
+    Each backend used to launder its failure into its own prose string, so the
+    identical bug had to be fixed (and can now regress) in five places. The
+    helper keeps the substrate's own reason when it has one, and only overrides
+    for the two shell-reserved environment codes.
+    """
+    from app.failure_classification import (
+        CODE_ERROR,
+        PROVISION_FAILURE,
+        classify_compute_terminal_reason,
+    )
+
+    helper = compute_backends_module._terminal_failure_message
+
+    # Ordinary failures are untouched: prose default preserved, still CODE_ERROR.
+    for exit_code, default in (
+        (1, "compute job failed"),
+        (2, "local subprocess exited with code 2"),
+        (137, "compute-job startup script failed"),
+    ):
+        msg = helper(exit_code=exit_code, reason=None, default=default)
+        assert msg == default
+        assert classify_compute_terminal_reason(msg, None) == CODE_ERROR
+
+    # A substrate-supplied reason wins over the generic default.
+    assert (
+        helper(exit_code=1, reason="setup_step_failed", default="x")
+        == "setup_step_failed"
+    )
+
+    # Environment codes are reclassified, and the substrate's own reason is
+    # APPENDED rather than discarded.
+    msg = helper(
+        exit_code=127,
+        reason="no working pip found (tried '-m pip' and PATH)",
+        default="compute job failed",
+    )
+    assert "exit 127" in msg
+    assert "no working pip found" in msg
+    assert classify_compute_terminal_reason(msg, None) == PROVISION_FAILURE
+
+
+def test_gcp_serial_environment_exit_code_classifies_provision_failure():
+    """The GCP serial/reconcile paths carry the same fix as the runner path."""
+    from app.failure_classification import (
+        PROVISION_FAILURE,
+        classify_compute_terminal_reason,
+    )
+
+    serial = "\n".join(
+        [
+            f"{compute_backends_module._SERIAL_STATUS_PREFIX}FAILED",
+            f"{compute_backends_module._SERIAL_EXIT_PREFIX}127",
+        ]
+    )
+    parsed = compute_backends_module._parse_serial_status(serial)
+    assert parsed is not None
+    assert parsed.exit_code == 127
+    assert classify_compute_terminal_reason(parsed.message, None) == PROVISION_FAILURE
+
+    reconciled = compute_backends_module._reconcile_terminal_record_to_status(
+        {"status": "FAILED", "exit_code": 126}
+    )
+    assert reconciled is not None
+    assert (
+        classify_compute_terminal_reason(reconciled.message, None)
+        == PROVISION_FAILURE
+    )
+
+
+def test_runtime_deadline_prose_rule_has_three_live_emitters():
+    """The classifier's "runtime deadline" prose rule is NOT dead code.
+
+    ``runtime_ttl`` (the GCP startup script's phase-2 token) and the prose
+    "compute job exceeded runtime deadline" are two DIFFERENT spellings of the
+    same platform kill, emitted by two different layers, and both are live.
+    Deleting the prose rule as unused would re-bill every server-side
+    runtime-deadline kill to the experiment's author as CODE_ERROR.
+
+    Pinned against the emitter source, not against a constant: the literal is
+    written out at three ``terminal_reason=`` call sites in compute_jobs.py and
+    there is no shared symbol to import, so a rename must break this test rather
+    than silently take the rule out of reach.
+    """
+    from pathlib import Path
+
+    from app.failure_classification import (
+        AGENT_TIMEOUT,
+        classify_compute_terminal_reason,
+    )
+
+    emitted = "compute job exceeded runtime deadline"
+    source = (
+        Path(__file__).resolve().parents[1] / "app" / "compute_jobs.py"
+    ).read_text(encoding="utf-8")
+    assert source.count(f'"{emitted}"') == 3, (
+        "expected three live emitters of the runtime-deadline prose in "
+        f"compute_jobs.py; got {source.count(chr(34) + emitted + chr(34))}. If a "
+        "call site was legitimately removed, update the count -- do NOT remove "
+        "the classifier rule while any remain."
+    )
+    assert classify_compute_terminal_reason(emitted, "runtime") == AGENT_TIMEOUT, (
+        "an intentional server-side deadline kill must not be billed to the "
+        "author as a work defect"
+    )
+
+
+def test_runner_interpreter_bootstrap_reason_classifies_provision_failure():
+    """Contract with the runner-side fix: a terminal reason naming a failed
+    interpreter bootstrap must classify as PROVISION_FAILURE, not CODE_ERROR.
+
+    ``scripts/local_runner.py`` reports its own prose when it cannot establish a
+    Python interpreter before the command runs. That string carries the word
+    "provisioning"; this pins the classifier end of that agreement so the two
+    sides cannot drift apart across separate PRs.
+    """
+    from app.failure_classification import (
+        PROVISION_FAILURE,
+        classify_compute_terminal_reason,
+    )
+
+    for reason in (
+        "runner provisioning failed: no working pip found",
+        "compute runtime provisioning failed: python3 not on PATH",
+    ):
+        assert classify_compute_terminal_reason(reason, None) == PROVISION_FAILURE, (
+            reason
+        )
+
+
 # ── End-to-end: runner /report endpoint → monitor → failure classification ────
 #
 # The unit tests above cover RunnerSubprocessBackend.poll_status in isolation.
@@ -2579,17 +2794,23 @@ def test_is_safe_tar_member_guards():
 
 @pytest.mark.asyncio
 async def test_no_progress_watchdog_terminates_stalled_job():
-    """The no-progress watchdog cuts a stalled job early with exit code 125
-    and terminal reason ``no_progress_timeout`` when the job produces no
-    progress signal (does not touch BLUEPRINT_PROGRESS_FILE) within the
-    configured window."""
+    """The no-progress watchdog cuts an OBSERVED plateau early with exit code 125
+    and terminal reason ``no_progress_timeout``.
+
+    "Observed" is load-bearing: the job reports progress once (writes
+    BLUEPRINT_PROGRESS_FILE) and then stalls, so the watchdog has real telemetry
+    and the flat mtime it measures is a genuine plateau rather than the absence
+    of any channel at all. The complementary case — a job that NEVER reports —
+    is covered by test_no_progress_watchdog_inert_until_telemetry_reports below.
+    """
     backend = LocalSubprocessComputeBackend()
-    # Use a generous 5s watchdog window — the command sleeps 60s without
-    # touching the progress file, so the watchdog fires well before the
-    # command would finish naturally.
+    # 5s window: the command reports progress once and then sleeps 120s, so the
+    # watchdog samples a first mtime at ~5s and an identical one at ~10s — a
+    # plateau — and fires well before the sleep would finish naturally.
     spec = ComputeLaunchSpec(
         job_id=uuid.uuid4(),
-        command="sleep 60",
+        command='printf \'{"metric":"loss","value":1}\\n\' '
+        '> "$BLUEPRINT_PROGRESS_FILE"; sleep 120',
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_at=None,
@@ -2605,21 +2826,100 @@ async def test_no_progress_watchdog_terminates_stalled_job():
         polling_metadata={"pid": result.metadata["pid"]},
     )
 
-    # Poll for the terminal marker — the watchdog should fire within
-    # ~5s + overhead, well before the 60s sleep expires.
+    # Poll for the terminal marker — two 5s windows plus overhead.
     terminal = None
-    for _ in range(80):  # up to ~8s at 0.1s intervals
+    for _ in range(250):  # up to ~25s at 0.1s intervals
         terminal = compute_backends_module._read_local_terminal_status(compute_job)
         if terminal is not None:
             break
         await asyncio.sleep(0.1)
     assert terminal is not None, (
         "expected terminal marker from no-progress watchdog, "
-        "but none appeared within 8s"
+        "but none appeared within 25s"
     )
     assert terminal.status == ComputeJobStatus.FAILED
     assert terminal.exit_code == 125
     assert terminal.message == "no_progress_timeout"
+
+
+@pytest.mark.asyncio
+async def test_no_progress_watchdog_inert_until_telemetry_reports():
+    """A watchdog that cannot OBSERVE progress must not kill on its absence.
+
+    Nothing but the experiment's own command writes ``BLUEPRINT_PROGRESS_FILE``.
+    The wrapper used to ``touch`` that file itself and then compare mtimes, so
+    for a command that never reports the mtime was constant BY CONSTRUCTION and
+    the "watchdog" degenerated into an unconditional fixed-duration kill of a
+    perfectly healthy job — recorded as ``no_progress_timeout``, exit 125.
+
+    Here the command never writes the progress file and runs for ~8s with a 2s
+    window: under the old semantics the watchdog fired at ~4s and killed it.
+    It must now stay inert and let the job finish normally.
+    """
+    backend = LocalSubprocessComputeBackend()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="sleep 8",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        no_progress_timeout_seconds=2,
+    )
+    result = await backend.launch(spec)
+    compute_job = ComputeJob(
+        id=spec.job_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": result.metadata["pid"]},
+    )
+
+    terminal = None
+    for _ in range(300):  # up to ~30s at 0.1s intervals
+        terminal = compute_backends_module._read_local_terminal_status(compute_job)
+        if terminal is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert terminal is not None, "the job never reached a terminal state"
+    assert terminal.exit_code != 125, (
+        "the no-progress watchdog killed a job that never reported progress at "
+        "all — it cannot observe the channel it is policing, so its verdict is "
+        "an unconditional timer, not a stall detection"
+    )
+    assert terminal.status == ComputeJobStatus.SUCCEEDED
+
+
+def test_no_progress_watchdog_does_not_pre_create_the_progress_file():
+    """Shape guard for the inert-until-observed rule (runs on every platform).
+
+    Pairs with the e2e test above: the emitted wrapper must NOT create
+    ``BLUEPRINT_PROGRESS_FILE`` itself, and its sampling loop must skip every
+    interval in which the file does not yet exist. A single ``touch`` of that
+    path anywhere in the wrapper silently restores the unconditional timer.
+    """
+    progress_path = compute_backends_module._local_progress_file_path_for_external_id(
+        "np-inert-shape"
+    )
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py",
+        external_id="np-inert-shape",
+        no_progress_timeout_seconds=30,
+    )
+    quoted = shlex.quote(progress_path)
+    assert f"touch {quoted}" not in wrapper, (
+        "the wrapper pre-creates the progress file, so a command that never "
+        "reports still yields a constant mtime and the watchdog degenerates "
+        "into a fixed-duration kill"
+    )
+    lines = [line.strip() for line in wrapper.splitlines()]
+    assert f"[ -e {quoted} ] || continue" in lines, (
+        "the watchdog loop must skip intervals where no telemetry file exists"
+    )
+    # The first observed sample only ARMS the window; only a second, identical
+    # sample is a plateau. An empty _NP_START must therefore never kill.
+    assert "_NP_START=" in wrapper
+    assert '[ -n "$_NP_START" ]' in wrapper
 
 
 @pytest.mark.asyncio
