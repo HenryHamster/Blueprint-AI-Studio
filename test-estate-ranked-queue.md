@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 637 | 997,008 | 26,524 | 11,079.328s (635 files) | 2 |
+| backend | 637 | 997,306 | 26,530 | 11,079.328s (635 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 128 | 112,694 | 6,151 | 466.638s (128 files) | 0 |
@@ -192,7 +192,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 168 | P5 | agent | `agent/src/handlers/specialized.test.ts` | 2,570 | 146 | moderate (1500–2999 LOC) | 0.765s measured | — |
 | 169 | P5 | backend | `backend/testing/test_migration_chain.py` | 1,679 | 80 | moderate (1500–2999 LOC) | 0.714s measured | — |
 | 170 | P5 | agent | `agent/src/index.test.ts` | 1,885 | 201 | moderate (1500–2999 LOC) | 0.595s measured | — |
-| 171 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,122 | 68 | moderate (1500–2999 LOC) | 0.565s measured | — |
+| 171 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,175 | 69 | moderate (1500–2999 LOC) | 0.565s measured | — |
 | 172 | P5 | agent | `agent/src/prompt.test.ts` | 2,513 | 178 | moderate (1500–2999 LOC) | 0.558s measured | — |
 | 173 | P5 | backend | `backend/testing/test_dependency_contracts.py` | 1,804 | 44 | moderate (1500–2999 LOC) | 0.551s measured | — |
 | 174 | P5 | backend | `backend/testing/test_ci_resolution.py` | 2,942 | 165 | moderate (1500–2999 LOC) | 0.331s measured | — |
@@ -204,7 +204,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 180 | P5 | backend | `backend/testing/test_ci_compliance.py` | 1,617 | 37 | moderate (1500–2999 LOC) | 0.253s measured | — |
 | 181 | P5 | backend | `backend/testing/test_health_zone_pool.py` | 2,149 | 118 | moderate (1500–2999 LOC) | 0.236s measured | — |
 | 182 | P5 | admin-ui | `admin-ui/src/hooks/useLogViewer.test.ts` | 1,593 | 48 | moderate (1500–2999 LOC) | 0.217s measured | — |
-| 183 | P5 | backend | `backend/testing/test_size_limits_checker.py` | 2,094 | 91 | moderate (1500–2999 LOC) | 0.162s measured | — |
+| 183 | P5 | backend | `backend/testing/test_size_limits_checker.py` | 2,339 | 96 | moderate (1500–2999 LOC) | 0.162s measured | — |
 | 184 | P5 | agent | `agent/src/prompts/thinker.test.ts` | 1,904 | 101 | moderate (1500–2999 LOC) | 0.124s measured | — |
 | 185 | P5 | agent | `agent/src/workspacePrep.test.ts` | 1,887 | 74 | moderate (1500–2999 LOC) | 0.122s measured | protected; declared floor 74 |
 | 186 | P5 | backend | `backend/testing/test_llm_runtime.py` | 1,885 | 47 | moderate (1500–2999 LOC) | 0.100s measured | — |
