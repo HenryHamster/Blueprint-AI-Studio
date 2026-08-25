@@ -14,7 +14,10 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.compute import any_zone_available
-from app.failure_classification import INFRA_CLASSES
+from app.failure_classification import (
+    RESURRECTION_BLOCK_PR_PIPELINE_TASK,
+    infra_resurrection_block_reason,
+)
 from app.models import (
     Alert,
     AlertSeverity,
@@ -325,39 +328,23 @@ async def run_infra_recovery_and_hold_maintenance(
         for _t in _infra_failed:
             _ctx = _t.context or {}
             _payload = _t.first_payload
-            # PR review/fix failures must be re-driven from current GitHub state
-            # through canonical review admission. A generic FAILED -> QUEUED
-            # flip can resurrect a stale review target or writer and wastes an
-            # agent even though the claim fence would ultimately reject it.
-            if (
-                _payload.get("type") in {"review", "fix"}
-                and _payload.get("pr_number")
-            ):
-                logger.info(
-                    "[REAPER] Skipping generic resurrection of PR %s task %s",
-                    _payload.get("type"),
-                    _t.id,
-                )
+            # Intrinsic eligibility (PR-pipeline review/fix, failure class,
+            # one-per-task, terminal PR closure, OOM) comes from the SHARED
+            # predicate in failure_classification. rollup_management holds an
+            # EVALUATING parent on the same call, so a task this sweep refuses
+            # can never become a hold the parent waits on forever.
+            _block_reason = infra_resurrection_block_reason(_t)
+            if _block_reason is not None:
+                if _block_reason == RESURRECTION_BLOCK_PR_PIPELINE_TASK:
+                    logger.info(
+                        "[REAPER] Skipping generic resurrection of PR %s task "
+                        "%s (reason=%s)",
+                        _payload.get("type"),
+                        _t.id,
+                        _block_reason,
+                    )
                 continue
-            # Only resurrect infra-class failures, and only once per task.
             _fail_cat = _ctx.get("failure_category", "")
-            if _fail_cat not in INFRA_CLASSES:
-                continue
-            if _ctx.get("_resurrection_count", 0) >= 1:
-                continue
-            # Skip terminal PR-closure outcomes. classify_failure routes
-            # "closed without merging" / empty-rollup closures into
-            # EXTERNAL_API (it shares the merge-blocking GitHub bank),
-            # but operator rejection and empty-rollup short-circuit are
-            # not infrastructure failures — re-running produces the same
-            # rejected/empty PR. Mirrors the closure markers documented
-            # in services._pr_possibly_open.
-            if (
-                _ctx.get("pr_closed_unmerged") is True
-                or _ctx.get("pr_closed_empty") is True
-                or _ctx.get("pr_rejected") is True
-            ):
-                continue
             # Skip parents — they must re-evaluate via _requeue_parent_task, not
             # resurrect as leaf dispatches.
             if _t.id in _parent_ids_with_children:
@@ -403,11 +390,8 @@ async def run_infra_recovery_and_hold_maintenance(
                 ) and _external_health.get("dispatch_api", False)
             elif _fail_cat == "AGENT_TIMEOUT":
                 # Process crashes and heartbeat timeouts are transient per-VM
-                # issues. OOM kills are NOT transient — the task scope hasn't
-                # changed and it will OOM again on the same VM type. Skip
-                # resurrection for OOM; let scope reduction handle it.
-                if _ctx.get("timeout_subtype") == "oom":
-                    continue
+                # issues; the non-transient OOM case is excluded upstream by
+                # infra_resurrection_block_reason (RESURRECTION_BLOCK_OOM).
                 _infra_ready = any_zone_available()
 
             if not _infra_ready:

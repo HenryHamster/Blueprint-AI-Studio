@@ -2023,29 +2023,45 @@ async def _check_and_trigger_rollup(
     # CANCELLED, mark the parent FAILED ("All N subtasks were cancelled"), and
     # then watch the review child auto-resurrect seconds later — leaving live
     # recovery work underneath a terminal parent.
-    from app.failure_classification import INFRA_CLASSES
+    # Eligibility is the SHARED predicate the sweep itself gates on
+    # (failure_classification.infra_resurrection_block_reason), never a local
+    # copy of its rules. A local copy is how this became a permanent wedge: it
+    # omitted the sweep's outright refusal to resurrect a review/fix task
+    # carrying a pr_number, so a parent whose PR review child failed on an
+    # infra class held here for the full window waiting on a flip the sweep
+    # would never perform — with every child already terminal, nothing else
+    # could advance it. Hold only for a recovery that can actually arrive.
+    from app.failure_classification import infra_resurrection_block_reason
 
     _infra_resurrection_cutoff = _utcnow() - timedelta(hours=2)
+    _recovery_pending_child = None
     for c in all_children:
         if (c.first_payload).get("type") not in ("review", "fix"):
             continue
         if c.status == TaskStatus.FAILED:
             ctx = c.context or {}
-            failure_category = ctx.get("failure_category")
+            _block_reason = infra_resurrection_block_reason(c)
             resurrection_pending = (
-                failure_category in INFRA_CLASSES
-                and int(ctx.get("_resurrection_count", 0)) < 1
+                _block_reason is None
                 and c.updated_at is not None
                 and c.updated_at >= _infra_resurrection_cutoff
-                and ctx.get("timeout_subtype") != "oom"
-                and ctx.get("pr_closed_unmerged") is not True
-                and ctx.get("pr_closed_empty") is not True
-                and ctx.get("pr_rejected") is not True
             )
             if resurrection_pending:
                 pipeline_active = True
                 pipeline_recovery_pending = True
+                _recovery_pending_child = c
                 break
+            if _block_reason is not None:
+                logger.info(
+                    "[ROLLUP] Parent %s not holding for infra-failed %s child "
+                    "%s: the recovery sweep will never resurrect it "
+                    "(reason=%s, class=%s) — converging via the rollup path",
+                    str(parent.id)[:8],
+                    (c.first_payload).get("type"),
+                    str(c.id)[:8],
+                    _block_reason,
+                    ctx.get("failure_category") or "unknown",
+                )
             continue
         if c.status not in (
             TaskStatus.QUEUED,
@@ -2134,9 +2150,18 @@ async def _check_and_trigger_rollup(
     # Don't rollup if there are still active tasks or active review/fix pipeline
     if active_count > 0 or pipeline_active:
         if pipeline_recovery_pending:
+            # Name the child and its class: an operator reading a held parent
+            # must be able to go straight to the task the hold is waiting on.
+            _rc = _recovery_pending_child
             parent.latest_status_message = (
                 "Recovering: infrastructure-failed review/fix task is eligible "
                 "for auto-resurrection"
+                + (
+                    f" (child {str(_rc.id)[:8]}, "
+                    f"{(_rc.context or {}).get('failure_category') or 'unknown'})"
+                    if _rc is not None
+                    else ""
+                )
             )
             session.add(parent)
             await session.commit()

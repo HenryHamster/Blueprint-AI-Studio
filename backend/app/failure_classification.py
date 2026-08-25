@@ -941,6 +941,86 @@ INFRA_ANALYTICS_CLASSES: frozenset[str] = INFRA_CLASSES | {
     UNPLACEABLE_EXECUTION_SITE,
 }
 
+# ── Infra-resurrection eligibility: ONE predicate, two call sites ────────────
+#
+# Two places decide whether a FAILED task will be auto-resurrected by the
+# reaper's Step 5 infra-recovery sweep:
+#
+#   * ``reaper_infra_recovery.run_infra_recovery_and_hold_maintenance`` — the
+#     sweep that performs the FAILED -> QUEUED flip, and
+#   * ``rollup_management._check_and_trigger_rollup`` — which HOLDS an
+#     EVALUATING parent ("Recovering: … eligible for auto-resurrection") while
+#     one of its review/fix children waits for that flip.
+#
+# They used to carry two hand-copied predicates, and those had drifted into
+# being DISJOINT rather than merely unequal: the sweep refuses outright to
+# resurrect a review/fix task carrying a ``pr_number`` (it must be re-driven
+# through canonical review admission, not a generic QUEUED flip), while the
+# rollup's copy never learned that rule — and the rollup's copy only ever looks
+# at review/fix children. So an EVALUATING parent whose review/fix child failed
+# on an infra class was held for the full recovery window waiting on a
+# resurrection the other side guaranteed would never happen, with every child
+# already terminal: a permanent wedge, advertised to the operator as recovery
+# in progress. Naming the predicate ONCE makes that divergence unrepresentable.
+#
+# Reason codes rather than a bare bool: a caller that declines to act has to be
+# able to say why, in logs and in operator-facing status.
+RESURRECTION_BLOCK_PR_PIPELINE_TASK = "pr_pipeline_requires_review_admission"
+RESURRECTION_BLOCK_NOT_INFRA_CLASS = "failure_class_not_infra"
+RESURRECTION_BLOCK_ALREADY_RESURRECTED = "already_resurrected"
+RESURRECTION_BLOCK_PR_TERMINAL_CLOSURE = "pr_terminal_closure"
+RESURRECTION_BLOCK_OOM = "oom_not_transient"
+
+
+def infra_resurrection_block_reason(task: "Task") -> str | None:
+    """Why Step 5 will not resurrect ``task``, or ``None`` if it may.
+
+    Intrinsic reasons only — properties of the task itself, stable across
+    cycles. Situational gates that can flip between cycles (upstream API health
+    zone availability, a live duplicate holding the idempotency key, the task
+    being a parent) stay in the sweep: a caller that HOLDS on this predicate is
+    asserting the block is permanent, and must not hold on a transient one.
+    """
+    ctx = task.context or {}
+    payload = task.first_payload or {}
+
+    # PR review/fix failures must be re-driven from current GitHub state
+    # through canonical review admission. A generic FAILED -> QUEUED flip can
+    # resurrect a stale review target or writer and wastes an agent even though
+    # the claim fence would ultimately reject it.
+    if payload.get("type") in {"review", "fix"} and payload.get("pr_number"):
+        return RESURRECTION_BLOCK_PR_PIPELINE_TASK
+
+    # Only infra-class failures are resurrectable at all.
+    if ctx.get("failure_category", "") not in INFRA_CLASSES:
+        return RESURRECTION_BLOCK_NOT_INFRA_CLASS
+
+    # At most one resurrection per task, ever.
+    if int(ctx.get("_resurrection_count", 0) or 0) >= 1:
+        return RESURRECTION_BLOCK_ALREADY_RESURRECTED
+
+    # Terminal PR-closure outcomes. classify_failure routes "closed without
+    # merging" / empty-rollup closures into EXTERNAL_API (it shares the
+    # merge-blocking GitHub bank), but operator rejection and empty-rollup
+    # short-circuit are not infrastructure failures — re-running produces the
+    # same rejected/empty PR. Mirrors the closure markers documented in
+    # services._pr_possibly_open.
+    if (
+        ctx.get("pr_closed_unmerged") is True
+        or ctx.get("pr_closed_empty") is True
+        or ctx.get("pr_rejected") is True
+    ):
+        return RESURRECTION_BLOCK_PR_TERMINAL_CLOSURE
+
+    # Process crashes and heartbeat timeouts are transient per-VM issues. OOM
+    # kills are NOT: the task scope hasn't changed and it will OOM again on the
+    # same VM type. Let scope reduction handle it.
+    if ctx.get("timeout_subtype") == "oom":
+        return RESURRECTION_BLOCK_OOM
+
+    return None
+
+
 # Cause frozensets for adversarial grader non-response routing.  Each set
 # names the cause categories (from classify_grader_nonresponse_cause) that
 # map to a specific retry strategy.  Defined here so research_completion.py
