@@ -2983,32 +2983,45 @@ export function git(args: string[], cwd = WORKSPACE): string {
 }
 
 /**
- * Register the `sizecap` custom merge driver in the workspace's LOCAL git config.
+ * The repo's custom merge drivers, as [config name, description, command].
  *
- * `.gitattributes` maps `backend/testing/module_size_limits.json` to
- * `merge=sizecap`, but git ignores that mapping unless the driver command is
- * registered in the repo's `.git/config` — and a clone does NOT carry git config.
- * So every workspace-prep site (cold clone, warm reuse, setupWorkspace) must call
- * this so a rebase/merge of competing size-cap bumps auto-resolves with no markers
- * (max-cap union; see backend/testing/merge_size_limits.py). Idempotent — git
- * config overwrites the keys on repeat calls. The driver runs from the worktree
- * root, so the script path is repo-relative. Best-effort: a failure here only
- * means the JSON falls back to the normal conflict path, so we log and continue.
+ * Both exist for the same defect: a shared derived file that parallel in-flight
+ * PRs only ever ADD to, so the intent never conflicts, yet git reports a textual
+ * conflict and every merge into automain re-conflicts every other open PR.
+ * Each driver resolves that mechanically and each FAILS CLOSED — a non-zero exit
+ * leaves the conflict for the normal path, so a real divergence (a lowered cap, a
+ * re-timed measurement) still reaches a human instead of being silently merged.
  */
-export function registerSizeCapMergeDriver(workspace = WORKSPACE): void {
-  try {
-    execFileSync(
-      'git',
-      ['-C', workspace, 'config', 'merge.sizecap.name', 'max-cap union merge for module_size_limits.json'],
-      { encoding: 'utf-8', timeout: 30_000 },
-    );
-    execFileSync(
-      'git',
-      ['-C', workspace, 'config', 'merge.sizecap.driver', 'python3 backend/testing/merge_size_limits.py %O %A %B'],
-      { encoding: 'utf-8', timeout: 30_000 },
-    );
-  } catch (e) {
-    log(`registerSizeCapMergeDriver: failed to register sizecap merge driver: ${String(e)}`);
+const DERIVED_ARTIFACT_MERGE_DRIVERS: ReadonlyArray<readonly [string, string, string]> = [
+  ['sizecap', 'max-cap union merge for module_size_limits.json',
+    'python3 backend/testing/merge_size_limits.py %O %A %B'],
+  ['testdurations', 'insert-only union merge for backend/.test_durations',
+    'python3 scripts/derived_artifact_merge_resolve.py --merge-driver %O %A %B'],
+];
+
+/**
+ * Register the custom merge drivers in the workspace's LOCAL git config.
+ *
+ * `.gitattributes` maps the paths to `merge=sizecap` / `merge=testdurations`, but
+ * git ignores that mapping unless the driver command is registered in the repo's
+ * `.git/config` — and a clone does NOT carry git config. So every workspace-prep
+ * site (cold clone, warm reuse, setupWorkspace) must call this so a rebase/merge
+ * of competing cap bumps or duration inserts auto-resolves with no markers.
+ * Idempotent — git config overwrites the keys on repeat calls. The drivers run
+ * from the worktree root, so the script paths are repo-relative. Best-effort and
+ * PER-DRIVER: failing to register one only means that file falls back to the
+ * normal conflict path, so we log and continue with the others.
+ */
+export function registerDerivedArtifactMergeDrivers(workspace = WORKSPACE): void {
+  for (const [name, description, driver] of DERIVED_ARTIFACT_MERGE_DRIVERS) {
+    try {
+      execFileSync('git', ['-C', workspace, 'config', `merge.${name}.name`, description],
+        { encoding: 'utf-8', timeout: 30_000 });
+      execFileSync('git', ['-C', workspace, 'config', `merge.${name}.driver`, driver],
+        { encoding: 'utf-8', timeout: 30_000 });
+    } catch (e) {
+      log(`registerDerivedArtifactMergeDrivers: failed to register ${name}: ${String(e)}`);
+    }
   }
 }
 
@@ -3354,7 +3367,7 @@ export async function setupWorkspace(
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
   // Activate the max-cap union merge driver for module_size_limits.json so a
   // pre-push rebase of competing cap bumps auto-resolves (see .gitattributes).
-  registerSizeCapMergeDriver(WORKSPACE);
+  registerDerivedArtifactMergeDrivers(WORKSPACE);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
   // Namespace is resolved by the caller (from the raw task) and threaded in, so
   // it survives an empty build_config.directories (resolveBuildConfig → undefined).

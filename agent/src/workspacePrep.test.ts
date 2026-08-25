@@ -37,14 +37,14 @@ vi.mock('child_process', () => ({
 // workspacePrep imports it for warning output.
 const cloneWithRetryMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const logMock = vi.hoisted(() => vi.fn());
-const registerSizeCapMergeDriverMock = vi.hoisted(() => vi.fn());
+const registerDerivedArtifactMergeDriversMock = vi.hoisted(() => vi.fn());
 
 vi.mock('./index.js', () => ({
   normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   cloneWithRetry: cloneWithRetryMock,
   log: logMock,
   GIT_REFERENCE_CACHE_ROOT: '/opt/agent-cache/git',
-  registerSizeCapMergeDriver: registerSizeCapMergeDriverMock,
+  registerDerivedArtifactMergeDrivers: registerDerivedArtifactMergeDriversMock,
 }));
 
 // Mock git-credential helpers so tests don't touch the filesystem or git config.
@@ -103,7 +103,7 @@ describe('prepareWorkspaceForRole', () => {
     fsMocks.statSync.mockReset();
     fsMocks.statSync.mockReturnValue(undefined);
     logMock.mockReset();
-    registerSizeCapMergeDriverMock.mockReset();
+    registerDerivedArtifactMergeDriversMock.mockReset();
     writeGitTokenFileMock.mockReset();
     writeGitTokenFileMock.mockReturnValue(true);
     setupGitCredentialHelperMock.mockReset();
@@ -250,7 +250,7 @@ describe('prepareWorkspaceForRole', () => {
     expect(setupGitCredentialHelperMock).toHaveBeenCalledWith('o', 'r', '/ws');
     // The sizecap merge driver is registered after the clone so the
     // .gitattributes mapping is actually active.
-    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
+    expect(registerDerivedArtifactMergeDriversMock).toHaveBeenCalledWith('/ws');
   });
 
   it('cold path: baseBranch present → fetch base into a remote-tracking ref so ./check can compute its diff', async () => {
@@ -271,7 +271,7 @@ describe('prepareWorkspaceForRole', () => {
       .filter(c => c[0] === 'git')
       .map(c => (c[1] as string[]).join(' '));
     expect(gitCalls).toContain('-C /ws fetch origin main:refs/remotes/origin/main');
-    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
+    expect(registerDerivedArtifactMergeDriversMock).toHaveBeenCalledWith('/ws');
   });
 
   it('cold path: baseBranch === branch → no separate base fetch (already cloned)', async () => {
@@ -571,7 +571,7 @@ describe('prepareWorkspaceForRole', () => {
     expect(cleanLine).toContain('-e .vitest_cache');
     expect(cleanLine).toContain('-e .pnpm-store');
     // Warm reuse also (re-)registers the sizecap merge driver.
-    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
+    expect(registerDerivedArtifactMergeDriversMock).toHaveBeenCalledWith('/ws');
   });
 
   // ── Review-fix lane pilot: warm-resume guard ───────────────────────────────

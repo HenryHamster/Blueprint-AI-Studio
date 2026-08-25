@@ -78,6 +78,8 @@ export { computeMaxFixIterations, formatTrajectorySection, formatDriftSection, v
 import { detectMigrationConflict, buildMigrationConflictGuidance, extractReservedMigrationRevision } from './review-fix-migration.js';
 import { fetchAuthoritativeMergeState } from './review-fix-merge-state.js';
 export { fetchAuthoritativeMergeState } from './review-fix-merge-state.js';
+import { resolveDerivedArtifactConflicts, isConflictOnlyFixTask } from './review-fix-derived-conflicts.js';
+import type { DerivedResolveOutcome } from './review-fix-derived-conflicts.js';
 import { resolveMigrationLayout } from './specialized.js';
 import { downloadViewportShots } from '../utils/viewport-shot-download.js';
 import { recordViewportScreenshotDownload, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
@@ -1440,6 +1442,7 @@ export async function handleFix(
   statusRef.value = `Rebasing onto ${baseBranch}...`;
   sendLog(ws, `Rebasing ${branch} onto origin/${baseBranch}...\n`);
   let hasConflicts = false;
+  let derivedResolution: DerivedResolveOutcome | null = null;
   try {
     git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`]);
     git(['rebase', `origin/${baseBranch}`]);
@@ -1455,6 +1458,16 @@ export async function handleFix(
       hasConflicts = true;
       sendLog(ws, `Merge conflicts present — Claude will resolve\n`);
     }
+  }
+  // Try to finish the merge mechanically before spending a Claude turn on it.
+  // Derived-artifact conflicts have exactly one correct resolution; the resolver
+  // declines everything else, leaving the tree exactly as the merge left it.
+  if (hasConflicts) {
+    derivedResolution = await resolveDerivedArtifactConflicts({
+      workspace: WORKSPACE, branch, log: (line: string) => sendLog(ws, line),
+      push: (target: string) => pushForceWithLeaseRetrying(target, ws),
+    });
+    if (derivedResolution.complete) hasConflicts = false;
   }
 
   // Prepend accumulated review history so the agent knows what was previously requested
@@ -1639,23 +1652,25 @@ export async function handleFix(
   // but our rebase came up clean and no markers are present, re-query GitHub directly
   // and pivot Claude's plan to whatever is actually blocking the PR now.
   const promptMentionsConflicts = /merge conflicts?|conflict markers|rebase.*resolve/i.test(prompt);
-  // Positive evidence that conflict resolution was this task's ENTIRE job.
-  // The obsolete-exit below completes the task without running Claude, so it
-  // destroys any other work the prompt demanded. `promptMentionsConflicts` is
-  // prose matching and cannot carry that weight: a prompt merely REFERRING to
-  // a conflict ("an operator resolved the merge conflict") matches it.
-  // Regression 2026-08-20: operator fix task 10384f8e was scoped to three BP-
-  // review issue ids, said a conflict had already been resolved, hit a clean
-  // PR, and was voided with all three findings untouched.
-  //
-  // `fix_reason` is the backend's structured spawn reason
-  // (review_pipeline.py `_spawn_pipeline_task`). Absent it, assume the task
-  // has real work: running Claude on an already-clean PR wastes a little
-  // spend, whereas voiding a task discards work with no trace.
-  const CONFLICT_ONLY_FIX_REASONS = new Set(['merge_conflict', 'update_branch_failed']);
+  // Positive evidence that conflict resolution was this task's ENTIRE job. Both
+  // exits below complete the task without running Claude, so they destroy any
+  // other work the prompt demanded, and `promptMentionsConflicts` is prose
+  // matching that cannot carry that weight (regression 2026-08-20: fix task
+  // 10384f8e was scoped to three BP- issue ids and voided with all three
+  // untouched). See review-fix-derived-conflicts.ts for the full rationale.
   const carriesReviewIssueIds = /\bBP-[0-9a-f]{12}\b/.test(prompt);
-  const conflictOnlyTask =
-    CONFLICT_ONLY_FIX_REASONS.has(fixReason ?? '') && !carriesReviewIssueIds;
+  const conflictOnlyTask = isConflictOnlyFixTask(fixReason, prompt);
+
+  // The merge was finished mechanically and pushed. When that WAS the whole job
+  // the task is done — completed here rather than at the stale-premise probe
+  // below, which re-reads GitHub's lazily-recomputed `mergeable` and would still
+  // see `false` right after a push and re-run Claude anyway.
+  if (derivedResolution?.complete && conflictOnlyTask) {
+    sendLog(ws, `${derivedResolution.summary} — completing without a Claude turn.\n`);
+    await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED',
+      logs: `${derivedResolution.summary}\nPushed to ${branch}; no agent turn was required.` });
+    return;
+  }
 
   if (promptMentionsConflicts && !hasConflicts) {
     sendLog(ws, `Prompt claims conflicts but rebase was clean — verifying PR state against GitHub...\n`);

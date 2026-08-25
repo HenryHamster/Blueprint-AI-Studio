@@ -137,7 +137,7 @@ const {
     'recordToolResultBytes',
     'recordToolUse',
     'refreshRuntimeState',
-    'registerSizeCapMergeDriver',
+    'registerDerivedArtifactMergeDrivers',
     'replayLogBufferRateLimited',
     'requiredProviderConfigFiles',
     'resetFormatComplianceTelemetry',
