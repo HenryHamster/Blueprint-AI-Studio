@@ -6466,7 +6466,13 @@ def test_compute_run_local_single_command_docker_gpus_when_gpu_detected(tmp_path
 
 
 def test_compute_run_local_no_container_uses_bare_bash(tmp_path, monkeypatch, capsys):
-    """When container_image is absent, the command runs via bare bash -lc (unchanged path)."""
+    """Without a container image the command runs under the RESOLVED host shell.
+
+    Asserts against _compute_resolve_shell() rather than the literal string
+    "bash": on Windows the bare name is exactly the defect (CreateProcess
+    searches System32 before PATH, so "bash" is the WSL launcher), so the
+    resolved plan -- not a hardcoded name -- is the contract this test pins.
+    """
     import subprocess as _subprocess
 
     captured_cmds = []
@@ -6492,11 +6498,12 @@ def test_compute_run_local_no_container_uses_bare_bash(tmp_path, monkeypatch, ca
     args = blueprint.build_parser().parse_args(["compute", "run", "echo hi"])
     blueprint._compute_run_local(args)
 
+    shell_exe = blueprint._compute_resolve_shell().exe
     assert any(
-        isinstance(c, list) and c[:2] == ["bash", "-lc"]
+        isinstance(c, list) and c and c[0] == shell_exe
         for c in captured_cmds
     ), (
-        f"expected bare 'bash -lc'; got: {captured_cmds}"
+        f"expected the resolved shell {shell_exe!r}; got: {captured_cmds}"
         + "\n"
         + format_offender_marker(str(command) for command in captured_cmds)
     )
@@ -6601,7 +6608,10 @@ def test_compute_run_docker_login_password_only_and_failure(tmp_path, monkeypatc
     with pytest.raises(SystemExit) as exc_info:
         blueprint._compute_run_local(args)
 
-    assert exc_info.value.code == 1
+    # A failed login means nothing was measured: that is a harness failure (2)
+    # under the documented `compute run` exit-code contract, not a command
+    # failure (1). See _COMPUTE_RUN_EXIT_CODE_HELP.
+    assert exc_info.value.code == blueprint._COMPUTE_EXIT_HARNESS_FAILED
     # login was attempted
     login_invocations = [c for c in login_calls if isinstance(c, list) and c[:2] == ["docker", "login"]]
     assert login_invocations, "docker login must be called when password is present"
