@@ -3983,6 +3983,11 @@ async def _check_and_trigger_rollup(
                         )
                     size_cap_status = size_cap_result.status
                     size_cap_reason = size_cap_result.reason
+                    if size_cap_status == "ok" and size_cap_reason:
+                        logger.warning(
+                            f"[ROLLUP] PR #{rollup_pr_number} size-cap preflight "
+                            f"reports inherited debt without blocking: {size_cap_reason}"
+                        )
 
                     # ── K7: post the security-scan report HERE, while the parent
                     # lock is still released (2026-07-12 concurrency audit).

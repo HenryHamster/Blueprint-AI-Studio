@@ -6,7 +6,11 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
-from app.rollup_size_preflight import preflight_rollup_size_caps, _CAPS_JSON_PATH
+from app import rollup_size_preflight
+from app.rollup_size_preflight import (
+    _CAPS_JSON_PATH,
+    preflight_rollup_size_caps as _preflight_rollup_size_caps,
+)
 from app.size_limit_policy import BumpRecord, CHRONIC_WINDOW_DAYS
 
 
@@ -38,6 +42,14 @@ _LEDGER = {"schema_version": 1, "history": {}}
 _LEDGER_JSON = json.dumps(_LEDGER, indent=2) + "\n"
 
 
+async def preflight_rollup_size_caps(*args, **kwargs):
+    """Bind legacy fixtures to the immutable merge identity by default."""
+    kwargs.setdefault("expected_head_sha", _PINNED_HEAD)
+    kwargs.setdefault("target_branch", "automain")
+    kwargs.setdefault("expected_base_sha", "b" * 40)
+    return await _preflight_rollup_size_caps(*args, **kwargs)
+
+
 @pytest.fixture(autouse=True)
 def _stable_live_branch_head():
     """Keep existing preflight tests on one immutable synthetic branch tip."""
@@ -47,6 +59,34 @@ def _stable_live_branch_head():
         return_value=_PINNED_HEAD,
     ) as mock_head:
         yield mock_head
+
+
+@pytest.fixture(autouse=True)
+def _default_immutable_baseline():
+    """Supply a clean synthetic base for tests that use legacy file mocks."""
+    async def _archive(paths, *, commit_sha, **_kwargs):
+        if commit_sha == _PINNED_HEAD:
+            fetched = {}
+            for path in paths:
+                if path == _CAPS_JSON_PATH:
+                    fetched[path] = _CAPS_JSON
+                else:
+                    fetched[path] = await rollup_size_preflight.get_file_text_at_ref(
+                        path, ref=commit_sha, **_kwargs
+                    )
+            return fetched
+        assert commit_sha == "b" * 40
+        return {
+            path: (_CAPS_JSON if path == _CAPS_JSON_PATH else "")
+            for path in paths
+        }
+
+    with patch(
+        "app.rollup_size_preflight.authoritative_texts_at_commit",
+        new_callable=AsyncMock,
+        side_effect=_archive,
+    ):
+        yield
 
 
 def _pr_files(*paths):
@@ -131,6 +171,17 @@ async def test_preflight_rejects_branch_head_mismatch_before_reading_tree():
     assert result.head_sha == _PINNED_HEAD
     assert "differs from the immutable merge candidate" in (result.reason or "")
     mock_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preflight_without_immutable_base_defers():
+    """An unbound call cannot silently fall back to absolute ratchet checks."""
+    result = await _preflight_rollup_size_caps(
+        "tok", "owner", "repo", 42, "staging/branch-1"
+    )
+
+    assert result.status == "defer"
+    assert result.reason == "size-cap preflight lacks immutable merge-base SHA"
 
 
 @pytest.mark.asyncio
@@ -227,7 +278,7 @@ def _baseline_archive_texts(*, candidate: str, base: str, base_caps: str = _CAPS
 
 
 @pytest.mark.asyncio
-async def test_touched_but_inherited_breach_is_not_attributed_to_this_pr():
+async def test_inherited_breach_is_reported_on_ok_verdict():
     """A touched over-cap file unchanged from the immutable base is reported, not repaired."""
     over_cap = "line\n" * 600
     with (
@@ -248,6 +299,66 @@ async def test_touched_but_inherited_breach_is_not_attributed_to_this_pr():
     assert result.reason == "inherited breach backend/app/models.py: 600 lines (cap 500)"
     assert archive_read.await_count == 2
     commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inherited_breach_is_reported_alongside_new_breach():
+    """An introduced breach must not erase inherited debt from the report."""
+    candidate = {
+        "backend/app/models.py": "line\n" * 600,
+        "agent/src/handlers/strategic.ts": "line\n" * 1500,
+    }
+    baseline = {
+        "backend/app/models.py": "line\n" * 600,
+        "agent/src/handlers/strategic.ts": "line\n" * 1200,
+    }
+
+    async def _archive(paths, *, commit_sha, **_kwargs):
+        if commit_sha == _PINNED_HEAD:
+            return {path: candidate[path] for path in paths}
+        return {
+            path: (_CAPS_JSON if path == _CAPS_JSON_PATH else baseline[path])
+            for path in paths
+        }
+
+    with (
+        patch(
+            "app.rollup_size_preflight.get_file_text_at_ref",
+            new_callable=AsyncMock,
+            side_effect=[_CAPS_JSON, _LEDGER_JSON],
+        ),
+        patch(
+            "app.rollup_size_preflight.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=_pr_files(
+                "backend/app/models.py",
+                "agent/src/handlers/strategic.ts",
+            ),
+        ),
+        patch(
+            "app.rollup_size_preflight.authoritative_texts_at_commit",
+            new_callable=AsyncMock,
+            side_effect=_archive,
+        ),
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock),
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        result = await preflight_rollup_size_caps(
+            "tok",
+            "owner",
+            "repo",
+            42,
+            "staging/branch-1",
+            expected_head_sha=_PINNED_HEAD,
+            target_branch="automain",
+            expected_base_sha="b" * 40,
+        )
+
+    assert result.status == "bumped"
+    assert "strategic.ts" in (result.reason or "")
+    assert "inherited breach backend/app/models.py: 600 lines (cap 500)" in (
+        result.reason or ""
+    )
 
 
 @pytest.mark.asyncio

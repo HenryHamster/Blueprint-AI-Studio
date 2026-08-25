@@ -7089,7 +7089,9 @@ async def test_precomputed_size_cap_without_merge_target_is_not_adopted(
 
 
 @pytest.mark.asyncio
-async def test_size_cap_matching_precomputed_target_is_reused(db_session, mocker):
+async def test_size_cap_matching_precomputed_target_is_reused(
+    db_session, mocker, caplog
+):
     """A pre-lock verdict with matching target and head skips recomputation."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
@@ -7117,7 +7119,7 @@ async def test_size_cap_matching_precomputed_target_is_reused(db_session, mocker
         db_session,
         source="review_approval",
         precomputed_size_cap=SizeCapPreflightResult(
-            "ok", None, "test-head-42", "main"
+            "ok", "inherited breach backend/app/models.py: 600 lines (cap 500)", "test-head-42", "main"
             , "test-base-42"
         ),
         checked_head_sha="test-head-42",
@@ -7127,6 +7129,8 @@ async def test_size_cap_matching_precomputed_target_is_reused(db_session, mocker
     assert result is True
     preflight_mock.assert_not_awaited()
     merge_mock.assert_awaited_once()
+    assert "reports inherited debt without blocking" in caplog.text
+    assert "models.py" in caplog.text
 
 
 @pytest.mark.asyncio

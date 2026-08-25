@@ -18236,7 +18236,6 @@
   "testing/test_rollup_size_preflight.py::test_preflight_transient_commit_failure_returns_defer[commit_error4]": 0.7796837550704367,
   "testing/test_rollup_size_preflight.py::test_preflight_uncapped_file_ignored": 0.006651832023635507,
   "testing/test_rollup_size_preflight.py::test_small_rollup_verdict_is_reusable_at_the_merge_chokepoint": 0.010838121990673244,
-  "testing/test_rollup_size_preflight.py::test_touched_but_inherited_breach_is_not_attributed_to_this_pr": 0.01239460101351142,
   "testing/test_rollup_size_preflight.py::test_worsened_inherited_breach_still_holds_without_repair_budget": 0.013638427015393972,
   "testing/test_rollup_state.py::TestBuildRollupPrBody::test_cost_line_present_when_timing_available": 0.83,
   "testing/test_rollup_state.py::TestBuildRollupPrBody::test_direction_id_truncated_to_8_chars": 4.35,

@@ -187,7 +187,10 @@ async def preflight_rollup_size_caps(
             base_sha=expected_base_sha,
         )
 
-    if target_branch and not expected_base_sha:
+    # Baseline attribution is part of the authority contract, not optional
+    # metadata. Without an immutable merge base, an over-cap file cannot be
+    # distinguished from inherited debt, so absolute evaluation is unsafe.
+    if not expected_base_sha:
         return _result(
             "defer",
             "size-cap preflight lacks immutable merge-base SHA",
@@ -321,25 +324,32 @@ async def preflight_rollup_size_caps(
             for section, key, _cap, _full_path in capped_paths
             if (source_path := governance_source_relpath(section, key)) is not None
         )
-        candidate_texts, base_texts = await asyncio.gather(
-            authoritative_texts_at_commit(
-                source_paths,
-                token=gh_token,
-                owner=owner,
-                repo=repo,
-                commit_sha=observed_head_sha,
-                project_id=project_id,
-            ),
-            authoritative_texts_at_commit(
-                source_paths | {_CAPS_JSON_PATH},
-                token=gh_token,
-                owner=owner,
-                repo=repo,
-                commit_sha=expected_base_sha,
-                project_id=project_id,
-                allow_missing_paths=True,
-            ),
-        )
+        try:
+            candidate_texts, base_texts = await asyncio.gather(
+                authoritative_texts_at_commit(
+                    source_paths,
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo,
+                    commit_sha=observed_head_sha,
+                    project_id=project_id,
+                ),
+                authoritative_texts_at_commit(
+                    source_paths | {_CAPS_JSON_PATH},
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo,
+                    commit_sha=expected_base_sha,
+                    project_id=project_id,
+                    allow_missing_paths=True,
+                ),
+            )
+        except Exception as exc:
+            return _result(
+                "defer",
+                "could not fetch immutable size-cap baseline evidence for "
+                f"{', '.join(sorted(source_paths))}: {exc}",
+            )
         if candidate_texts is None or base_texts is None:
             return _result("defer", "could not fetch immutable size-cap baseline evidence")
         try:
@@ -486,6 +496,19 @@ async def preflight_rollup_size_caps(
             f"({observed_head_sha[:12]} -> {current_head_sha[:12]})",
         )
 
+    inherited_summary = "; ".join(
+        f"inherited breach {path}: {count} lines (cap {cap})"
+        for path, count, cap in inherited_breaches
+    )
+
+    def _with_inherited_summary(reason: str | None) -> str | None:
+        """Keep inherited debt visible on every post-evaluation verdict."""
+        if not inherited_summary:
+            return reason
+        if not reason:
+            return inherited_summary
+        return f"{reason}; {inherited_summary}"
+
     # Any chronic offender blocks ALL auto-bumps — never partially commit caps
     # while an operator decomposition decision is pending.
     if chronic_holders:
@@ -497,13 +520,15 @@ async def preflight_rollup_size_caps(
             rollup_pr_number,
             names,
         )
-        return _result("hold", f"chronic offender(s) require decomposition: {names}", head_sha=observed_head_sha)
+        return _result(
+            "hold",
+            _with_inherited_summary(
+                f"chronic offender(s) require decomposition: {names}"
+            ),
+            head_sha=observed_head_sha,
+        )
 
     if not breaches and not removed_caps:
-        inherited_summary = "; ".join(
-            f"inherited breach {path}: {count} lines (cap {cap})"
-            for path, count, cap in inherited_breaches
-        )
         return _result("ok", inherited_summary or None, head_sha=observed_head_sha)
 
     summary_parts = [
@@ -522,7 +547,11 @@ async def preflight_rollup_size_caps(
             rollup_pr_number,
             summary,
         )
-        return _result("hold", f"auto-bump budget exhausted; breach: {summary}", head_sha=observed_head_sha)
+        return _result(
+            "hold",
+            _with_inherited_summary(f"auto-bump budget exhausted; breach: {summary}"),
+            head_sha=observed_head_sha,
+        )
 
     # 4. Write repaired caps into a copy of the parsed JSON and commit.
     updated: dict = dict(caps_data)
@@ -561,15 +590,31 @@ async def preflight_rollup_size_caps(
                 project_id=project_id,
             )
         except Exception as exc:
-            return _result("defer", f"could not fetch governing cap source {source_path}: {exc}")
+            return _result(
+                "defer",
+                _with_inherited_summary(
+                    f"could not fetch governing cap source {source_path}: {exc}"
+                ),
+            )
         if source_text is None:
-            return _result("defer", f"governing cap source {source_path} was unreadable")
+            return _result(
+                "defer",
+                _with_inherited_summary(
+                    f"governing cap source {source_path} was unreadable"
+                ),
+            )
         try:
             upserts[source_path] = rewrite_governing_cap_constant(
                 section, key, source_text, new_cap
             )
         except ValueError as exc:
-            return _result("hold", f"invalid governing cap declaration in {source_path}: {exc}", head_sha=observed_head_sha)
+            return _result(
+                "hold",
+                _with_inherited_summary(
+                    f"invalid governing cap declaration in {source_path}: {exc}"
+                ),
+                head_sha=observed_head_sha,
+            )
     try:
         ledger_text = await get_file_text_at_ref(
             _CAP_BUMP_HISTORY_LEDGER_RELPATH,
@@ -582,7 +627,9 @@ async def preflight_rollup_size_caps(
     except Exception as exc:
         return _result(
             "defer",
-            f"could not fetch cap-bump-history ledger before auto-bump commit: {exc}",
+            _with_inherited_summary(
+                f"could not fetch cap-bump-history ledger before auto-bump commit: {exc}"
+            ),
         )
     if ledger_text is None:
         # ``get_file_text_at_ref`` collapses "file genuinely absent (404)" and
@@ -613,13 +660,20 @@ async def preflight_rollup_size_caps(
         else:
             return _result(
                 "defer",
-                "cap-bump-history ledger present but unreadable at staging branch tip",
+                _with_inherited_summary(
+                    "cap-bump-history ledger present but unreadable at staging branch tip"
+                ),
             )
     else:
         try:
             ledger_data = json.loads(ledger_text)
         except Exception as exc:
-            return _result("defer", f"could not parse cap-bump-history ledger: {exc}")
+            return _result(
+                "defer",
+                _with_inherited_summary(
+                    f"could not parse cap-bump-history ledger: {exc}"
+                ),
+            )
         pending = [
             (section, key, cap, new_cap)
             for section, key, _count, cap, new_cap in breaches
@@ -655,14 +709,23 @@ async def preflight_rollup_size_caps(
                 type(exc).__name__,
                 exc,
             )
-            return _result("defer", f"auto-bump commit failed (transient): {exc}")
+            return _result(
+                "defer",
+                _with_inherited_summary(
+                    f"auto-bump commit failed (transient): {exc}"
+                ),
+            )
         logger.warning(
             "[ROLLUP-SIZE] PR #%s: auto-bump commit failed (%s: %s); holding for approval",
             rollup_pr_number,
             type(exc).__name__,
             exc,
         )
-        return _result("hold", f"auto-bump commit failed: {exc}", head_sha=observed_head_sha)
+        return _result(
+            "hold",
+            _with_inherited_summary(f"auto-bump commit failed: {exc}"),
+            head_sha=observed_head_sha,
+        )
 
     if committed_sha == observed_head_sha:
         logger.info(
@@ -671,7 +734,7 @@ async def preflight_rollup_size_caps(
             rollup_pr_number,
             staging_branch,
         )
-        return _result("ok", head_sha=observed_head_sha)
+        return _result("ok", inherited_summary or None, head_sha=observed_head_sha)
 
     logger.info(
         "[ROLLUP-SIZE] PR #%s: committed size-cap bumps on %s: %s",
@@ -679,4 +742,8 @@ async def preflight_rollup_size_caps(
         staging_branch,
         summary,
     )
-    return _result("bumped", summary, head_sha=observed_head_sha)
+    return _result(
+        "bumped",
+        _with_inherited_summary(summary),
+        head_sha=observed_head_sha,
+    )

@@ -520,6 +520,12 @@ async def _attempt_merge_with_retry_and_escalation(
             )[:500]
             session.add(task)
             return False
+        if _sc_reason:
+            logger.warning(
+                "[CI] PR #%s size-cap preflight reports inherited debt without blocking: %s",
+                ci_pr_number,
+                _sc_reason,
+            )
         # The merge authority below must submit the very head the cap guard
         # evaluated, not merely the prior CI-loop read of it.
         checked_head_sha = _sc_result.head_sha
