@@ -505,6 +505,20 @@ def is_breach(
     )
 
 
+def eligible_baseline_count(
+    base_count: int | None,
+    base_effective_cap: int | None,
+) -> int | None:
+    """Return baseline evidence only when the base breached its own cap.
+
+    Baseline attribution is valid only for a file that was already over the
+    effective cap in the base tree. Keeping this eligibility rule next to
+    :func:`is_breach` prevents evaluators from accepting a clean base as
+    evidence that a candidate breach was inherited.
+    """
+    return base_count if is_breach(base_count, base_effective_cap) else None
+
+
 def resolve_effective_cap(
     module_key: str,
     section: str,

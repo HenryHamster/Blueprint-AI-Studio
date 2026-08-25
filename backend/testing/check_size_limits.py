@@ -619,12 +619,16 @@ def _collect_baseline_offenders(
     except (OSError, ValueError) as exc:
         return {}, {}, f"cannot read {base_json}: {exc}"
     checked, _skipped = evaluate(base_data, sections, base_root, use_env_overrides=False)
-    breached = {
-        (section, rec["rel"]): rec["count"]
-        for section, recs in checked.items()
-        for rec in recs
-        if rec["breach"]
-    }
+    from app.size_limit_policy import eligible_baseline_count
+
+    breached: dict = {}
+    for section, recs in checked.items():
+        for rec in recs:
+            base_count = eligible_baseline_count(
+                rec.get("count"), rec.get("effective_cap", rec.get("cap"))
+            )
+            if base_count is not None:
+                breached[(section, rec["rel"])] = base_count
     uncapped: dict = {}
     for section in sections:
         root = resolve_section_root(section, base_root, use_env_overrides=False)

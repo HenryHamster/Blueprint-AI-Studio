@@ -41,6 +41,7 @@ from app.json_extract import async_json_loads
 from app.size_limit_policy import (
     SECTION_PATH_PREFIXES,
     classify_breach,
+    eligible_baseline_count,
     governance_caps_from_source_text,
     governance_source_relpath,
     is_breach,
@@ -420,8 +421,9 @@ async def preflight_rollup_size_caps(
                 baseline_source = base_texts.get(full_path)
                 if baseline_source is not None:
                     candidate_base_count = len(baseline_source.splitlines())
-                    if is_breach(candidate_base_count, base_effective_cap):
-                        base_count = candidate_base_count
+                    base_count = eligible_baseline_count(
+                        candidate_base_count, base_effective_cap
+                    )
             if (
                 base_count is not None
                 and line_count > (effective_cap or line_count)

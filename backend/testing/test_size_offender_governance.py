@@ -494,6 +494,25 @@ def test_is_breach_missing_baseline_fails_closed():
     assert slp.is_breach(1201, 1200, base_count=None)
 
 
+@pytest.mark.parametrize(
+    ("base_count", "base_effective_cap", "expected"),
+    [
+        (None, 1200, None),
+        (1200, None, None),
+        (1200, 1200, None),
+        (1199, 1200, None),
+        (1201, 1200, 1201),
+    ],
+)
+def test_eligible_baseline_count_requires_a_base_tree_breach(
+    base_count, base_effective_cap, expected
+):
+    """The shared policy permits only a base-side effective-cap breach."""
+    assert (
+        slp.eligible_baseline_count(base_count, base_effective_cap) == expected
+    )
+
+
 def test_classify_size_record_delegates_breach_to_policy():
     """check_size_limits.classify_size_record must use the production predicate.
 
