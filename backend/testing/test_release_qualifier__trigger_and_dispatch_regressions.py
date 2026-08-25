@@ -612,3 +612,279 @@ async def test_a_different_rejection_diagnosis_opens_its_own_incident(
         f"drift_sentinel:dispatch_rejected:{project_id}:rejected",
         f"drift_sentinel:dispatch_rejected:{project_id}:rejected_permanent_404",
     ], f"expected one incident per diagnosis, got {keys}"
+
+
+# ===========================================================================
+# Drift-sentinel alert LIFECYCLE (release.ci_unresolved)
+#
+# Measured on the live control plane 2026-08-24: 126 open
+# ``release.ci_unresolved`` rows spanning twelve days and 122 distinct
+# integration HEADs, and NOT ONE described a condition that was still true.
+# Every row carried the model's ``core`` domain default and a NULL source, the
+# ``red`` / ``cancelled`` keys were still per-HEAD, and the producer owned no
+# resolver at all despite the event declaring
+# ``AlertRetirementMode.SOURCE_CONDITION``.  The three tests below pin each of
+# those defects.
+# ===========================================================================
+
+
+async def _sentinel_alert_rows(db_session, project_id, *, include_dismissed=False):
+    """Open drift-sentinel ``release.ci_unresolved`` rows, column-level.
+
+    Column-level (not entity-level) for the same reason as
+    ``_dispatch_rejected_alerts``: an expired ORM instance would refresh lazily
+    and raise ``MissingGreenlet`` under the async session.
+    """
+    where = [
+        Alert.project_id == project_id,
+        Alert.event_type == "release.ci_unresolved",
+    ]
+    if not include_dismissed:
+        where.append(Alert.dismissed_at.is_(None))
+    rows = (
+        await db_session.execute(
+            select(
+                Alert.dedupe_key,
+                Alert.title,
+                Alert.message,
+                Alert.domain,
+                Alert.source,
+                Alert.occurrence_count,
+                Alert.dismissed_at,
+            ).where(*where)
+        )
+    ).all()
+    return [r for r in rows if str(r.dedupe_key or "").startswith("drift_sentinel:")]
+
+
+async def _seed_legacy_sentinel_alert(db_session, project_id, dedupe_key):
+    """A row exactly as the pre-fix producer wrote it: core domain, NULL source."""
+    from app.models import AlertSeverity as _Sev
+
+    db_session.add(
+        Alert(
+            project_id=project_id,
+            severity=_Sev.WARNING,
+            title="legacy sentinel incident",
+            message="written by the pre-fix per-HEAD producer",
+            event_type="release.ci_unresolved",
+            dedupe_key=dedupe_key,
+        )
+    )
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_sentinel_incident_carries_its_policy_domain_and_source(
+    db_session, mocker
+):
+    """The producer must stamp what ``alert_policy`` already declares.
+
+    ``ALERT_EVENT_POLICIES["release.ci_unresolved"]`` declares the
+    ``release_lifecycle`` domain, but the sentinel wrote raw ``Alert(...)`` rows
+    and every one landed as ``core`` with a NULL source.  All 126 live rows were
+    therefore invisible to the ``?domain=`` / ``?source=`` filters on
+    ``/api/admin/alerts`` and mis-attributed in every domain rollup — the feed
+    could not even be triaged by owner.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    head = "71bfe706590e"
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            side_effect=[
+                {"gate_state": "no_signal", "head_sha": head, "reason": "none"},
+                _rejected_gate(project.github_owner, project.github_repo, head),
+            ]
+        ),
+    )
+
+    assert (
+        await _check_full_suite_drift_sentinel(
+            version_id, session_factory=_shared_session_factory(db_session)
+        )
+        is True
+    )
+
+    rows = await _sentinel_alert_rows(db_session, project_id)
+    assert len(rows) == 1
+    assert rows[0].domain == "release_lifecycle", (
+        "the sentinel bypassed alert_policy and stamped the model's default "
+        f"domain {rows[0].domain!r}; the row is unfilterable and mis-attributed"
+    )
+    assert rows[0].source == "drift_sentinel", (
+        f"source must name the producer for triage, got {rows[0].source!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_red_sentinel_is_one_standing_incident_not_one_per_head(
+    db_session, mocker
+):
+    """Red on the integration branch is ONE condition, not one per merge.
+
+    #17604 collapsed the ``dispatch_rejected`` key to per-project and left
+    ``red`` and ``cancelled`` keyed per HEAD, so they kept minting: the live feed
+    held 12 red rows across 12 distinct shas for a branch that is red or not red
+    exactly once at a time.  Raising the standing incident must also SUPERSEDE
+    any per-HEAD row a previous serving image left behind, which is what makes
+    the existing backlog reap itself condition-derivedly.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    heads = ["13122be6aa01", "8a9bd18f0b22", "3ef760b2cc33"]
+    # A row minted by the pre-fix per-HEAD producer, still open.
+    await _seed_legacy_sentinel_alert(
+        db_session, project_id, f"drift_sentinel:red:{project_id}:20086f09dd44"
+    )
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            side_effect=[
+                {
+                    "gate_state": "red",
+                    "head_sha": head,
+                    "html_url": f"https://github.test/runs/{i}",
+                }
+                for i, head in enumerate(heads)
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value="spawned"),
+    )
+    factory = _shared_session_factory(db_session)
+
+    for _ in heads:
+        assert (
+            await _check_full_suite_drift_sentinel(version_id, session_factory=factory)
+            is True
+        )
+
+    rows = await _sentinel_alert_rows(db_session, project_id)
+    assert len(rows) == 1, (
+        "Three red integration HEADs plus one legacy per-HEAD row must leave ONE "
+        f"standing incident, got {len(rows)}: {[r.dedupe_key for r in rows]}"
+    )
+    row = rows[0]
+    assert row.dedupe_key == f"drift_sentinel:red:{project_id}", (
+        f"dedupe_key {row.dedupe_key!r} is still per-delta and will mint one "
+        "operator incident per automain merge"
+    )
+    assert heads[-1][:12] in row.message, (
+        f"the standing incident must name the CURRENT HEAD: {row.message!r}"
+    )
+    assert int(row.occurrence_count or 1) == 3, (
+        "each recurrence must bump occurrence_count — it is the only remaining "
+        "signal for how long the branch has been red"
+    )
+
+
+@pytest.mark.asyncio
+async def test_green_full_suite_gate_retires_every_open_sentinel_incident(
+    db_session, mocker
+):
+    """``SOURCE_CONDITION`` means this producer OWNS retirement.
+
+    ``release.ci_unresolved`` declares ``AlertRetirementMode.SOURCE_CONDITION``
+    — "the producer owns a condition-specific resolver" — and the producer had
+    none.  A sentinel sweep that read green simply returned, so incidents from
+    releases that had since promoted AND deployed stayed open forever; the live
+    backlog's red rows all pointed at shas that were provably ancestors of
+    ``main``.  Green is the one state that falsifies every sentinel claim at
+    once, so it must retire all of them.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    for key in (
+        f"drift_sentinel:red:{project_id}:13122be6aa01",
+        f"drift_sentinel:red:{project_id}",
+        f"drift_sentinel:cancelled:{project_id}:8a9bd18f0b22",
+        f"drift_sentinel:unavailable:{project_id}",
+        f"drift_sentinel:dispatch_rejected:{project_id}:rejected",
+    ):
+        await _seed_legacy_sentinel_alert(db_session, project_id, key)
+    assert len(await _sentinel_alert_rows(db_session, project_id)) == 5
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(return_value={"gate_state": "green", "head_sha": "aa11bb22cc33"}),
+    )
+
+    assert (
+        await _check_full_suite_drift_sentinel(
+            version_id, session_factory=_shared_session_factory(db_session)
+        )
+        is False
+    )
+
+    open_rows = await _sentinel_alert_rows(db_session, project_id)
+    assert open_rows == [], (
+        "a green full-suite gate falsifies every sentinel claim, but these "
+        f"incidents are still open: {[r.dedupe_key for r in open_rows]}"
+    )
+    assert (
+        len(await _sentinel_alert_rows(db_session, project_id, include_dismissed=True))
+        == 5
+    ), "retirement must DISMISS the rows, never delete the operator's history"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_red_retires_only_the_could_not_evaluate_incidents(
+    db_session, mocker
+):
+    """A real conclusion ends "unverified" — it does not end "red".
+
+    ``unavailable`` / ``dispatch_rejected`` / ``cancelled`` all make the same
+    claim: full-suite CI drift could not be EVALUATED.  An authoritative red is
+    direct positive evidence that the claim is now false, so those retire; the
+    red incident itself must stay open, because red is still true.  Retiring
+    fails OPEN — a still-broken dispatch authority re-raises its standing
+    incident the very next time the gate has to dispatch.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    for key in (
+        f"drift_sentinel:unavailable:{project_id}",
+        f"drift_sentinel:dispatch_rejected:{project_id}:rejected",
+        f"drift_sentinel:cancelled:{project_id}:8a9bd18f0b22",
+    ):
+        await _seed_legacy_sentinel_alert(db_session, project_id, key)
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": "3ef760b2cc33",
+                "html_url": "https://github.test/runs/9",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value="spawned"),
+    )
+
+    assert (
+        await _check_full_suite_drift_sentinel(
+            version_id, session_factory=_shared_session_factory(db_session)
+        )
+        is True
+    )
+
+    keys = sorted(
+        r.dedupe_key for r in await _sentinel_alert_rows(db_session, project_id)
+    )
+    assert keys == [f"drift_sentinel:red:{project_id}"], (
+        "an authoritative ci.yml conclusion ends every 'could not evaluate' "
+        f"incident and only those; open incidents are {keys}"
+    )
