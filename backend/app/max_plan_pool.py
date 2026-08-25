@@ -238,16 +238,69 @@ def get_task_llm_execution_mode(task_or_ctx: Any) -> str | None:
     return None
 
 
+def _operator_configured_models(
+    provider_name: str, runtime_config: Mapping[str, Any]
+) -> set[str]:
+    """Every concrete model id the operator configured for ``provider_name``.
+
+    Reads the two surfaces a dispatch actually pulls a model out of when no
+    tier default applies: the per-effort matrix
+    (``provider_settings_by_effort[provider][effort]["model"]``) and the
+    effort-independent base bag (``provider_settings_defaults[provider]["model"]``).
+    See ``resolve_task_provider_settings`` for the full merge order.
+
+    ``provider_tier_model_map`` is deliberately NOT read here — the caller
+    checks it first so that every model already inferable from the tier map
+    keeps its exact existing answer.
+    """
+    models: set[str] = set()
+    matrix_all = runtime_config.get("provider_settings_by_effort") or {}
+    if isinstance(matrix_all, Mapping):
+        per_provider = matrix_all.get(provider_name)
+        if isinstance(per_provider, Mapping):
+            for cell in per_provider.values():
+                model = _settings_bag_model(cell)
+                if model:
+                    models.add(model)
+    defaults_all = runtime_config.get("provider_settings_defaults") or {}
+    if isinstance(defaults_all, Mapping):
+        model = _settings_bag_model(defaults_all.get(provider_name))
+        if model:
+            models.add(model)
+    return models
+
+
 def infer_provider_for_model(
     model: str | None, runtime_config: Mapping[str, Any]
 ) -> str | None:
     if not model:
         return None
+    # Pass 1 — the tier map. Unchanged and checked FIRST so every model that
+    # was inferable before this function grew a second pass still resolves to
+    # exactly the same provider.
     for provider_name in LLMProviderName:
         provider = get_provider(provider_name)
         for tier in ("opus", "sonnet", "haiku"):
             if provider.tier_to_model(tier, runtime_config) == model:
                 return provider_name.value
+    # Pass 2 — the effort matrix and defaults bag. A model the operator pinned
+    # in `provider_settings_by_effort` belongs to that provider just as much as
+    # a tier-map entry does, and the effort matrix is what the dispatch path
+    # actually reads. Scanning only the tier map made an operator-configured
+    # model look like an unknown custom string:
+    #
+    #   provider_tier_model_map.anthropic.opus       = "claude-opus-4-8"
+    #   provider_settings_by_effort.anthropic.max    = {"model": "claude-opus-5"}
+    #
+    # so `claude-opus-5` — anthropic's own live max-effort model — inferred to
+    # None, was treated as un-attributable, and got paired with whichever
+    # provider happened to lead the task's route. That is the root of the
+    # 2026-08-24 `zai/claude-opus-5` strand (a research task held PROVISIONING
+    # for hours because the only zai account was disabled, while four healthy
+    # anthropic/deepseek/openai accounts sat unused in the same route).
+    for provider_name in LLMProviderName:
+        if model in _operator_configured_models(provider_name.value, runtime_config):
+            return provider_name.value
     return None
 
 
@@ -1808,6 +1861,78 @@ def _account_available_for_model(acct: dict, model: str | None) -> bool:
     Probing accounts are serialized inside select_max_plan_account; outside
     callers (blacklist pruning, gates, health checks) treat them as usable."""
     return _account_state_for_model(acct, model) != "unavailable"
+
+
+def task_route_has_eligible_account(
+    task: Any,
+    runtime_config: Mapping[str, Any],
+    user_id: str | None = None,
+) -> bool:
+    """True when SOME pooled account can currently serve this task's route.
+
+    The read-only counterpart of ``select_llm_runtime_for_task``: it walks the
+    same routed provider list and resolves the same per-provider model, but only
+    asks whether an ENABLED, runtime-ready account exists for that pair. No
+    slots are taken and no lock is held, so it is safe from a sweep.
+
+    This is the self-heal side of the unroutable block: a task blocked because
+    its only routed account was disabled must come back on its own the moment
+    that account is re-enabled (or the routing is widened), without an operator
+    having to find and requeue it by hand.
+
+    Conservative by construction — an empty pool answers False (nothing can
+    serve it), and a settings bag that fails validation is skipped rather than
+    guessed at.
+    """
+    try:
+        runtime_config = _ensure_migrated(runtime_config)
+        providers = resolve_task_provider_preference(task, runtime_config)
+        if not providers:
+            return False
+        quality_tier = resolve_task_quality_tier(task, runtime_config)
+        explicit_model = _extract_task_model(task)
+        explicit_provider = get_task_llm_provider(task) or infer_provider_for_model(
+            explicit_model, runtime_config
+        )
+        if user_id:
+            accounts = list(_max_plan_pools.get(str(user_id)) or [])
+        else:
+            accounts = list(_account_by_id.values())
+        if not accounts:
+            return False
+
+        for provider_name in providers:
+            if explicit_model and (
+                explicit_provider is None or provider_name == explicit_provider
+            ):
+                model = explicit_model
+            else:
+                try:
+                    bag = resolve_task_provider_settings(
+                        task, runtime_config, provider_name
+                    )
+                except ValueError:
+                    continue
+                model = _settings_bag_model(bag) or get_provider(
+                    provider_name
+                ).tier_to_model(quality_tier, runtime_config)
+            if not model:
+                continue
+            for acct in accounts:
+                acct_provider = (
+                    _normalize_provider_name(acct.get("provider"))
+                    or LLMProviderName.ANTHROPIC.value
+                )
+                if acct_provider != provider_name:
+                    continue
+                if not _account_runtime_ready(acct):
+                    continue
+                if _account_available_for_model(acct, model):
+                    return True
+        return False
+    except Exception:  # pragma: no cover - a probe must never raise into a sweep
+        logger.exception("[LLM_SELECT] route eligibility probe failed")
+        return False
 
 
 def summarize_pool_state(
@@ -4818,6 +4943,12 @@ async def select_llm_runtime_for_task(
         if provider_preference:
             provider_preference = provider_preference[:1]
 
+    # Which provider the EXPLICIT model id may be handed to. An inferable model
+    # belongs to its own provider; an un-inferable one is scoped to the first
+    # routed provider (below) so it can never silently degrade into a tier
+    # default on some unrelated provider.
+    explicit_model_provider: str | None = explicit_provider
+
     # Reconcile an explicit provider before applying runner capability filters.
     # Otherwise the pin could be inserted after filtering and bypass a failed
     # Resident readiness proof on the claimed runner.
@@ -4829,10 +4960,23 @@ async def select_llm_runtime_for_task(
         else:
             provider_preference = [explicit_provider]
     elif explicit_model and provider_preference:
-        # Unknown/custom model strings must not silently degrade into tier defaults
-        # or cross-provider retries. Keep the caller's requested model on the
-        # first configured provider only until mappings are updated.
-        provider_preference = provider_preference[:1]
+        # Unknown/custom model strings must not silently degrade into tier
+        # defaults or cross-provider retries, so the requested model id is
+        # applied to the FIRST routed provider ONLY. Every other provider in
+        # the route keeps its own configured model.
+        #
+        # The ROUTE itself is not trimmed. Trimming it to `[:1]` here is what
+        # stranded the 2026-08-24 research task: its route listed five
+        # providers, four of them had healthy enabled accounts, and the trim
+        # discarded all four — leaving a single attempt against `zai` carrying
+        # an anthropic model id that zai could not have served even with its
+        # account enabled. A model id nobody can attribute is a reason to be
+        # careful about WHICH provider receives that id; it is never a reason
+        # to delete the operator's fallback route.
+        # "exclusive" mode (allow_fallback False) has ALREADY trimmed the route
+        # to one entry above, so an operator who deliberately switched
+        # cross-provider fallback off still gets exactly one attempt.
+        explicit_model_provider = provider_preference[0]
 
     # Filter providers by runner CLI inventory: when a concrete runner is
     # known (runner claim path), remove providers whose required CLI is not
@@ -4990,7 +5134,8 @@ async def select_llm_runtime_for_task(
         )
         bag_model = _settings_bag_model(pre_settings)
         if explicit_model and (
-            explicit_provider is None or provider_name == explicit_provider
+            explicit_model_provider is None
+            or provider_name == explicit_model_provider
         ):
             model = explicit_model
         elif isinstance(bag_model, str) and bag_model:

@@ -3796,6 +3796,150 @@ class TestRunnerEndpoints:
         # The audit trail survives in its own key, where it cannot make a drained
         # task look "already examined".
         assert poisoned.context["runner_pull_unpins"] == 1
+        # ...and the episode-scoped budget that decides when to STOP recycling
+        # advanced with it. Without a reader the recycle loop is unbounded.
+        assert poisoned.context["runner_pull_unpin_cycles"] == 1
+
+    @pytest.mark.asyncio
+    async def test_unroutable_task_blocks_instead_of_recycling_forever(
+        self, client: AsyncClient, db_session
+    ):
+        """Past MAX_PULL_UNPIN_CYCLES the task BLOCKS with a reason — it does not
+        orbit PROVISIONING -> QUEUED -> PROVISIONING for the rest of time.
+
+        The unpin at SKIP_UNPIN_THRESHOLD only helps when the cause is transient.
+        When no enabled account can serve the task's routed model, the re-dispatch
+        re-pins it, it skips again, and ~25 minutes later it is unpinned again.
+        RUNNER_PULL_UNPINS_CONTEXT_KEY was WRITE-ONLY — nothing read it, so
+        nothing ever concluded the recycling was not working. That is how task
+        9ca108c5 held PROVISIONING for 68+ minutes behind an accurate status
+        message, in no terminal state and in no failed/blocked view.
+        """
+        from app.models import Alert
+        from app.runner_pull_skip import (
+            LLM_ROUTE_ALERT_TITLE,
+            LLM_ROUTE_BLOCKER_KIND,
+            MAX_PULL_UNPIN_CYCLES,
+            SKIP_UNPIN_THRESHOLD,
+        )
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        poisoned = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=SKIP_UNPIN_THRESHOLD - 1
+        )
+        # Already recycled the full budget: this is cycle N+1 of the same episode.
+        ctx = dict(poisoned.context or {})
+        ctx["runner_pull_unpin_cycles"] = MAX_PULL_UNPIN_CYCLES
+        poisoned.context = ctx
+        db_session.add(poisoned)
+        await db_session.commit()
+
+        # The EXACT live failure string from the incident.
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append(
+                "zai/claude-opus-5: glm: account disabled (manually)"
+            )
+            return None
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+
+        await db_session.refresh(poisoned)
+        # TERMINAL-for-now, not another lap. BLOCKED (not FAILED): nothing is
+        # wrong with the task, the pool cannot serve it, so no retry budget burns
+        # and no work is destroyed over an account toggle.
+        assert poisoned.status == TaskStatus.BLOCKED
+        assert poisoned.status != TaskStatus.PROVISIONING
+        assert poisoned.status != TaskStatus.QUEUED
+        assert poisoned.blocker_kind == LLM_ROUTE_BLOCKER_KIND
+        # The pin is gone, so it stops occupying a candidate-scan slot.
+        assert poisoned.vm_instance_id is None
+        assert "runner_target_id" not in (poisoned.context or {})
+
+        # REASONS, not just a state: machine-readable code + the exact model,
+        # provider and account, parsed out of the runner's own failure line.
+        block = poisoned.context["llm_route_block"]
+        assert block["code"] == "no_eligible_account"
+        assert block["provider"] == "zai"
+        assert block["model"] == "claude-opus-5"
+        assert block["unpin_cycles"] == MAX_PULL_UNPIN_CYCLES
+        assert "glm: account disabled (manually)" in block["reason"]
+
+        # ...and the human-readable half names the model AND the account.
+        assert "claude-opus-5" in (poisoned.blocked_reason or "")
+        assert "glm" in (poisoned.blocked_reason or "")
+        assert "claude-opus-5" in (poisoned.latest_status_message or "")
+
+        alerts = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.task_id == poisoned.id,
+                    Alert.title == LLM_ROUTE_ALERT_TITLE,
+                )
+            )
+        ).scalars().all()
+        assert len(alerts) == 1, "giving up on a task must reach an operator"
+        # ERROR, not WARNING: the repeated-skip alert promises a retry. This one
+        # says the platform has given up and a human must act.
+        assert alerts[0].severity == AlertSeverity.ERROR
+        assert "claude-opus-5" in alerts[0].message
+        assert "glm" in alerts[0].message
+
+    @pytest.mark.asyncio
+    async def test_dispatch_resets_the_unpin_cycle_budget(
+        self, client: AsyncClient, db_session
+    ):
+        """A task that actually DISPATCHES starts its next episode with a full budget.
+
+        The give-up counter is episode-scoped on purpose. If it survived a
+        successful dispatch, a task that hit three unrelated transient pool
+        cooldowns over its lifetime would be BLOCKED on the first skip of a
+        fourth — turning a bound on a broken loop into a new false-positive
+        wedge. The LIFETIME audit tally is untouched.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        healthy = self._pinned(project.id, runner.id)
+        ctx = dict(healthy.context or {})
+        ctx["runner_pull_unpin_cycles"] = 2
+        ctx["runner_pull_unpins"] = 7
+        healthy.context = ctx
+        db_session.add(healthy)
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(healthy.id)
+
+        await db_session.refresh(healthy)
+        assert "runner_pull_unpin_cycles" not in (healthy.context or {})
+        # The audit trail is NOT reset - it is the record of what happened.
+        assert healthy.context["runner_pull_unpins"] == 7
 
     @pytest.mark.asyncio
     async def test_fresh_skip_marker_short_circuits_credential_resolution(

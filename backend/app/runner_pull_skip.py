@@ -25,6 +25,14 @@ counterpart already alerts at 3):
     pin cleared — so the orchestrator re-dispatches it (other hardware, or cloud)
     and, critically, it stops occupying a slot in every future candidate scan.
     That is what makes the poisoned set self-draining instead of permanent.
+  * And past :data:`MAX_PULL_UNPIN_CYCLES` of that recycling it stops recycling
+    and BLOCKS the task with a machine-readable reason. Unpinning only helps when
+    the cause is TRANSIENT; when no enabled account can serve the task's routed
+    model, re-dispatch just re-pins it and the whole clock runs again. The
+    lifetime unpin tally existed but was WRITE-ONLY, so nothing ever noticed the
+    loop was not converging — which is how a task can sit in PROVISIONING for
+    hours behind an accurate status message, in no terminal state and in no
+    failed/blocked view. See :func:`_block_unroutable_task`.
 
 Counting is throttled, not per-poll: ``count`` advances at most once per
 :data:`SKIP_RESTAMP_SECONDS` (300s), so it is a proxy for elapsed time
@@ -122,7 +130,54 @@ SKIP_RESOLVE_TTL_SECONDS = 90
 SKIP_ALERT_THRESHOLD = 3
 SKIP_UNPIN_THRESHOLD = 5
 
+# Full skip->unpin->re-dispatch cycles a task may burn before the platform stops
+# recycling it and hands it to an operator as BLOCKED.
+#
+# The unpin at SKIP_UNPIN_THRESHOLD returns the task to QUEUED so the
+# orchestrator can re-dispatch it. When the cause is TRANSIENT (a rate-limit
+# storm, a credential refresh, one runner missing a CLI) that works: the next
+# dispatch resolves and the episode ends. When the cause is STRUCTURAL — no
+# enabled account anywhere can serve the task's routed provider/model — the
+# re-dispatch pins the task to a runner again, it skips again, and ~25 minutes
+# later it is unpinned again. Forever.
+#
+# That loop had no exit. RUNNER_PULL_UNPINS_CONTEXT_KEY was WRITE-ONLY: nothing
+# in the codebase read it, so nothing ever concluded "recycling is not working"
+# — which is how a task can hold PROVISIONING for hours behind a perfectly
+# accurate status message, never reaching a terminal state and never appearing
+# in any failed/blocked view (live: 2026-08-24, a research task whose only
+# routed account had been manually disabled).
+#
+# Three cycles is ~75 minutes of continuous unroutability: long enough that any
+# transient pool condition has healed and never reaches here, short enough that
+# a structurally-unroutable task stops consuming dispatch slots while an
+# operator still cares. It is deliberately counted in CYCLES, not in skips: a
+# single episode's five skips is the transient budget, and only a repeat after a
+# full re-dispatch is evidence the platform cannot fix this by itself.
+MAX_PULL_UNPIN_CYCLES = 3
+
+# Episode-scoped cycle counter feeding MAX_PULL_UNPIN_CYCLES. Distinct from the
+# lifetime RUNNER_PULL_UNPINS_CONTEXT_KEY audit tally, which must never be reset
+# (it is the audit trail). This one is cleared the moment the task DISPATCHES,
+# because a task that actually ran proves the recycle worked and must start any
+# future episode with a full budget.
+RUNNER_PULL_UNPIN_CYCLES_CONTEXT_KEY = "runner_pull_unpin_cycles"
+
+# blocker_kind for a task the account pool structurally cannot route.
+LLM_ROUTE_BLOCKER_KIND = "llm_route_unroutable"
+# task.context key carrying the machine-readable WHY behind that block: the
+# skip code, the reason text (which names the model and the offending account),
+# the routed model/provider, and how many cycles were burned proving it.
+LLM_ROUTE_BLOCK_CONTEXT_KEY = "llm_route_block"
+
+# How long before a blocked-unroutable task is re-examined. The block is not
+# terminal-forever: re-enabling the account, or fixing the routing so another
+# provider can serve the model, clears it (see
+# app.blocked_retry_authority.blocked_precondition_state).
+LLM_ROUTE_RECHECK_SECONDS = 900
+
 SKIP_ALERT_TITLE = "Task repeatedly skipped by runner pull"
+LLM_ROUTE_ALERT_TITLE = "Task unroutable — no enabled LLM account for its model"
 
 
 def _marker(task: Any, runner_id: str | None = None) -> dict:
@@ -162,12 +217,34 @@ def clear_skip_marker(task: Any) -> None:
     unroutability.
     """
     ctx = getattr(task, "context", None) or {}
-    if RUNNER_PULL_SKIP_CONTEXT_KEY not in ctx:
+    if (
+        RUNNER_PULL_SKIP_CONTEXT_KEY not in ctx
+        and RUNNER_PULL_UNPIN_CYCLES_CONTEXT_KEY not in ctx
+    ):
         return
     ctx = dict(ctx)
     ctx.pop(RUNNER_PULL_SKIP_CONTEXT_KEY, None)
+    # The episode-scoped unpin-cycle budget resets too: the task DISPATCHED, so
+    # recycling demonstrably worked and a future unrelated episode must not
+    # inherit a spent budget and give up early. The lifetime tally under
+    # RUNNER_PULL_UNPINS_CONTEXT_KEY is left alone — it is the audit trail.
+    ctx.pop(RUNNER_PULL_UNPIN_CYCLES_CONTEXT_KEY, None)
     task.context = ctx
     flag_modified(task, "context")
+
+
+def pull_unpin_cycles(task: Any) -> int:
+    """How many skip->unpin->re-dispatch cycles this episode has burned.
+
+    The READER that RUNNER_PULL_UNPINS_CONTEXT_KEY never had. A counter nobody
+    reads cannot bound anything, which is exactly how the recycle loop became
+    unbounded.
+    """
+    ctx = getattr(task, "context", None) or {}
+    try:
+        return int(ctx.get(RUNNER_PULL_UNPIN_CYCLES_CONTEXT_KEY) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def skip_count(task: Any, runner_id: str | None = None) -> int:
@@ -386,7 +463,9 @@ async def _maybe_create_skip_alert(
         f"scan without ever dispatching. It will be unpinned back to QUEUED "
         f"after {SKIP_UNPIN_THRESHOLD} skips so it can re-dispatch elsewhere, "
         f"but the underlying cause — an exhausted account pool for this task's "
-        f"model, or a payload that crashes credential resolution — needs fixing."
+        f"model, or a payload that crashes credential resolution — needs fixing. "
+        f"After {MAX_PULL_UNPIN_CYCLES} unpin/re-dispatch cycles without ever "
+        f"resolving, the task is BLOCKED rather than recycled again."
     )[:1000]
     alert = Alert(
         project_id=task.project_id,
@@ -412,8 +491,31 @@ async def _maybe_create_skip_alert(
     return True
 
 
+async def _relock_pinned_under_claim_guard(
+    session: AsyncSession, task: Task
+) -> Task | None:
+    """Re-select a pinned task ``FOR UPDATE SKIP LOCKED`` under the claim guard.
+
+    ``PROVISIONING`` + ``started_at IS NULL`` is the SAME guard the dispatch path
+    uses. A concurrent poll may have resolved and claimed this task since the
+    caller read it unlocked, and mutating a task that is booting an agent would
+    strand it. Losing that race returns None — a no-op, not an error.
+    """
+    return (
+        await session.execute(
+            select(Task)
+            .where(
+                Task.id == task.id,
+                Task.status == TaskStatus.PROVISIONING,
+                Task.started_at.is_(None),
+            )
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().first()
+
+
 async def _return_pin_to_queue(
-    session: AsyncSession, task: Task, *, status_message: str
+    session: AsyncSession, task: Task, *, status_message: str, count_cycle: bool = False
 ) -> bool:
     """Re-lock a pinned task under the dispatch claim guard and return it to QUEUED.
 
@@ -429,17 +531,7 @@ async def _return_pin_to_queue(
     THIS runner is cleared. Clearing the requirement would force a cloud fallback,
     which is the eviction the hold-timeout sweep owns, not this one.
     """
-    locked = (
-        await session.execute(
-            select(Task)
-            .where(
-                Task.id == task.id,
-                Task.status == TaskStatus.PROVISIONING,
-                Task.started_at.is_(None),
-            )
-            .with_for_update(skip_locked=True)
-        )
-    ).scalars().first()
+    locked = await _relock_pinned_under_claim_guard(session, task)
     if locked is None:
         return False
 
@@ -456,6 +548,21 @@ async def _return_pin_to_queue(
     ctx[RUNNER_PULL_UNPINS_CONTEXT_KEY] = (
         int(ctx.get(RUNNER_PULL_UNPINS_CONTEXT_KEY) or 0) + 1
     )
+    if count_cycle:
+        # Episode-scoped twin of the tally above, and the one that is actually
+        # READ (see MAX_PULL_UNPIN_CYCLES). Cleared on dispatch; the lifetime
+        # tally is not.
+        #
+        # Bumped ONLY by the repeated-skip unpin. A deterministic capability
+        # release is a different loop with a different fix (dispatch routes
+        # browser work to Chromium-capable runners), and letting it spend this
+        # budget would BLOCK a task that is perfectly routable — turning a bound
+        # on one broken loop into a false positive on another.
+        try:
+            _cycles = int(ctx.get(RUNNER_PULL_UNPIN_CYCLES_CONTEXT_KEY) or 0)
+        except (TypeError, ValueError):
+            _cycles = 0
+        ctx[RUNNER_PULL_UNPIN_CYCLES_CONTEXT_KEY] = _cycles + 1
     ctx["runner_pull_unpinned_at"] = _utcnow().isoformat()
     locked.context = ctx
     flag_modified(locked, "context")
@@ -476,6 +583,7 @@ async def _unpin_skipped_task(session: AsyncSession, task: Task) -> bool:
             "Unpinned from local runner after repeated pull skips "
             "(credentials unresolvable); returned to QUEUED for re-dispatch."
         ),
+        count_cycle=True,
     )
     if released:
         logger.warning(
@@ -519,6 +627,147 @@ async def release_capability_mismatched_task(
     return released
 
 
+def _routed_pair_from_reason(reason: str) -> tuple[str | None, str | None]:
+    """Pull ``(provider, model)`` out of the first attempt line of a skip reason.
+
+    Attempt lines are built by ``max_plan_pool._note_attempt`` as
+    ``"{provider}/{model}: {detail}"`` and joined with ``" | "``. Best-effort:
+    the structured block record degrades to None rather than guessing.
+    """
+    head = (reason or "").split(" | ", 1)[0]
+    prefix = head.split(":", 1)[0].strip()
+    if "/" not in prefix:
+        return None, None
+    provider, _, model = prefix.partition("/")
+    provider = provider.strip() or None
+    model = model.strip() or None
+    if model == "any":
+        model = None
+    return provider, model
+
+
+def _unroutable_message(
+    code: str, reason: str, cycles: int, provider: str | None, model: str | None
+) -> str:
+    """Operator-facing WHY — names the model, the provider, and the account."""
+    target = (
+        f"{provider}/{model}"
+        if provider and model
+        else (model or provider or "its routed provider/model")
+    )
+    return (
+        f"Unroutable ({code}): no enabled LLM account can serve {target}. "
+        f"Returned to the queue and re-dispatched {cycles} times without ever "
+        f"resolving credentials, so it is BLOCKED instead of holding a "
+        f"provisioning slot indefinitely. Runner reason: {reason}. "
+        f"Fix by re-enabling the named account, or by routing this task type to "
+        f"a provider that has one — the task unblocks automatically once the "
+        f"pool can serve it."
+    )
+
+
+async def _create_unroutable_alert(
+    session: AsyncSession, task: Task, message: str
+) -> bool:
+    """Deduplicated ERROR alert for a structurally unroutable task.
+
+    ERROR, not WARNING: the repeated-skip alert says "this will be unpinned and
+    retried". This one says "the platform has given up and a human must act",
+    which is a different severity of claim and must not be filtered out with the
+    routine degradation noise.
+    """
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == LLM_ROUTE_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.ERROR,
+        title=LLM_ROUTE_ALERT_TITLE,
+        message=message[:1000],
+        task_id=task.id,
+        event_type="runner.degraded",
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
+    )
+    return True
+
+
+async def _block_unroutable_task(
+    session: AsyncSession, task: Task, code: str, reason: str
+) -> bool:
+    """Stop recycling a structurally-unroutable task; BLOCK it with the WHY.
+
+    BLOCKED, not FAILED: nothing is wrong with the task, the pool cannot serve
+    it. BLOCKED is the durable holding state — it does not burn retry budget,
+    it is visible to operators, and it self-heals when the precondition clears
+    (``blocked_retry_authority.blocked_precondition_state``). Failing the task
+    would destroy work over an account toggle.
+    """
+    # Imported lazily: task_blocked pulls in a wide slice of the model layer and
+    # this module is imported by the runner router on a hot path.
+    from app.task_blocked import enter_blocked_state
+
+    locked = await _relock_pinned_under_claim_guard(session, task)
+    if locked is None:
+        return False
+
+    ctx = dict(locked.context or {})
+    cycles = int(ctx.get(RUNNER_PULL_UNPIN_CYCLES_CONTEXT_KEY) or 0)
+    provider, model = _routed_pair_from_reason(reason)
+    ctx.pop("runner_target_id", None)
+    ctx.pop("runner_hostname", None)
+    ctx.pop(RUNNER_PULL_SKIP_CONTEXT_KEY, None)
+    ctx[LLM_ROUTE_BLOCK_CONTEXT_KEY] = {
+        "code": code or SKIP_CODE_NO_ACCOUNT,
+        "reason": (reason or "")[:1000],
+        "provider": provider,
+        "model": model,
+        "unpin_cycles": cycles,
+        "at": _utcnow().isoformat(),
+    }
+    locked.context = ctx
+    flag_modified(locked, "context")
+
+    message = _unroutable_message(
+        code or SKIP_CODE_NO_ACCOUNT, (reason or "")[:400], cycles, provider, model
+    )
+    enter_blocked_state(
+        locked,
+        waiting_on="an enabled LLM account that can serve this task's routed model",
+        reason=message,
+        source="platform",
+        blocker_kind=LLM_ROUTE_BLOCKER_KIND,
+        recheck_in_seconds=LLM_ROUTE_RECHECK_SECONDS,
+    )
+    flag_modified(locked, "context")
+    locked.vm_instance_id = None
+    locked.vm_provisioned_at = None
+    locked.latest_status_message = message[:500]
+    session.add(locked)
+    await _create_unroutable_alert(session, locked, message)
+    logger.error(
+        "[RUNNERS] Task %s BLOCKED as unroutable after %d unpin cycles "
+        "(code=%s provider=%s model=%s): %s",
+        locked.id,
+        cycles,
+        code,
+        provider,
+        model,
+        (reason or "")[:500],
+    )
+    return True
+
+
 async def maybe_escalate_pull_skip(
     session: AsyncSession,
     task: Task,
@@ -551,6 +800,22 @@ async def maybe_escalate_pull_skip(
         )
 
     if count >= SKIP_UNPIN_THRESHOLD:
+        # The unpin tally is now READ, not merely written. Past
+        # MAX_PULL_UNPIN_CYCLES the recycle loop has provably failed to help, so
+        # stop recycling and hand the task to an operator in a terminal-for-now
+        # state with a machine-readable reason, instead of orbiting
+        # PROVISIONING -> QUEUED -> PROVISIONING forever.
+        if pull_unpin_cycles(task) >= MAX_PULL_UNPIN_CYCLES:
+            try:
+                if await _block_unroutable_task(session, task, code, reason):
+                    return "blocked"
+            except Exception:
+                # Never strand: fall through to the ordinary unpin, which at
+                # least keeps the runner's candidate scan clear.
+                logger.exception(
+                    "[RUNNERS] unroutable block failed for task %s (non-fatal)",
+                    task.id,
+                )
         try:
             if await _unpin_skipped_task(session, task):
                 outcome = "unpinned"
