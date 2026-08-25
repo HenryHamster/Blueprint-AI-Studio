@@ -48,7 +48,7 @@
 ## Common Patterns
 - `task.first_payload` is the standard accessor for the first payload element (not `(task.payloads or [{}])[0]`)
 - Verify before finishing with TARGETED tests: run the backend test files covering your change (`bash scripts/test-backend.sh testing/test_<module>.py`), plus `cd admin-ui && npm run typecheck` if you touched frontend (use this on agent VMs — `npm run build` OOMs there; CI runs the full vite build). Do NOT run the full backend suite on an agent VM — your task PR gets targeted/per-change CI; the full sharded matrix runs once at the automain→main promotion PR.
-- New admin endpoints need `@require_project_access` or `@require_role` decorators
+- New admin endpoints are authorized with dependencies, not decorators: there is no `@require_project_access` or `@require_role` in this codebase. Use router-level `dependencies=[Depends(get_current_user)]`, a handler-level `current_user: dict = Depends(require_admin)`, and then call `await _get_user_project_with_role(project_id, current_user["user_id"], session, min_role=...)` in the body. That helper is the tenant-isolation boundary: absent membership raises 404 (deliberately indistinguishable from a missing project), an insufficient role raises 403.
 
 ## Generating Code for One Language From Another
 When one language generates source code for a different language

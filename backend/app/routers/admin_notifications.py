@@ -404,8 +404,9 @@ _SEED_ENTRIES: Dict[str, dict] = {
     },
     "admin-auth": {
         "content": (
-            "New admin endpoints require @require_project_access or @require_role decorators. "
-            "Follow the pattern in admin.py using _get_user_project_with_role()."
+            "New admin endpoints are authorized with dependencies, not decorators: "
+            "there is no @require_project_access or @require_role in this codebase. "
+            "Use Depends(require_admin), then _get_user_project_with_role() in the body."
         ),
         "applicable_types": ["create", "fix"],
     },

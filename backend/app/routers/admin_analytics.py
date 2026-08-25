@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import DateTime, case, cast, func, text, or_
+from sqlalchemy import DateTime, and_, case, cast, func, text, or_
 from sqlalchemy import select as sa_select
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,6 +51,7 @@ from app.digest_metrics import (
     compute_lane_baseline_trend,
     compute_lane_waste_diagnostics,
 )
+from app.platform_kill_metrics import compute_platform_kill_metrics
 from app.routers.admin_pipeline_observability import (
     _load_escalation_alerts,
     _load_outer_loop_original_tasks,
@@ -2354,3 +2355,75 @@ async def reclaim_orphaned_lane_workspaces(
         "reclaimed": result["lanes_cleared"],
         "would_reclaim": result["lanes_would_clear"],
     }
+
+
+# ── platform-kill metrics ────────────────────────────────────────────────────
+
+
+@router.get("/platform-kill-metrics")
+async def get_platform_kill_metrics(
+    project_id: uuid.UUID | None = Query(None),
+    days: int = Query(7, ge=1, le=90),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Platform-killed tasks per day, broken down by class, with an honest unknown.
+
+    The operator's reliability metric is "platform-killed tasks per day, driven
+    to zero". This endpoint is the measurement: it classifies every terminal
+    (FAILED / CANCELLED) task in the window as a platform kill, a work outcome,
+    a not-a-death, or — when the terminalizing path recorded no reason —
+    ``unclassified``.
+
+    Read ``platform_kills_per_day`` together with ``classified_fraction``. A zero
+    rate next to a low classified fraction means "not measured", not "no
+    defects"; the two are only meaningful side by side.
+
+    Classification reads persisted per-task ground truth only and never
+    re-derives from log text — see ``app.platform_kill_metrics``.
+    """
+    if project_id is not None:
+        await _get_user_project_with_role(
+            project_id, current_user["user_id"], session, min_role="viewer"
+        )
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=days)
+
+    filters = [
+        Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+        or_(
+            Task.completed_at >= cutoff,
+            and_(Task.completed_at.is_(None), Task.updated_at >= cutoff),
+        ),
+    ]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
+
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        Task.latest_status_message,
+                        Task.completed_at,
+                        Task.updated_at,
+                        raiseload=True,
+                    )
+                )
+                .where(*filters)
+                .order_by(Task.updated_at.desc())
+                .limit(20_000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    result = compute_platform_kill_metrics(tasks, window_days=days, now=now)
+    result["project_id"] = str(project_id) if project_id is not None else None
+    return result
