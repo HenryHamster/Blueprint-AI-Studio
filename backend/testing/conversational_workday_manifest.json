@@ -8,7 +8,7 @@
       "test_ids": [
         "test_message_preview_preserves_bounded_workday_chat_provenance"
       ],
-      "test_count": 24
+      "test_count": 29
     },
     {
       "path": "backend/testing/test_strategic_session_messages.py",
@@ -189,7 +189,7 @@
       "test_ids": [
         "MessageBubble > renders only strict server-owned Workday consultation receipts"
       ],
-      "test_count": 40
+      "test_count": 41
     },
     {
       "path": "admin-ui/src/components/ConversationUtilityBar.test.tsx",
@@ -752,7 +752,7 @@
         "sendAck callback > can acknowledge the same canonical message again on a recovery frame",
         "sendAck callback > re-acknowledges an admitted replay after conversation navigation"
       ],
-      "test_count": 29
+      "test_count": 36
     },
     {
       "path": "admin-ui/src/components/MessagesPanel.advanced.test.tsx",

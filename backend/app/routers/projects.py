@@ -48,6 +48,12 @@ from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
 from app.event_fanout import enqueue_agent_log
 from app.project_message_projection import message_event_payload
+from app.conversation_streaming import (
+    build_streaming_reply_message,
+    select_live_fast_claim,
+    select_max_conversation_sequence,
+    streaming_reply_event_payload,
+)
 from app.strategic_events import emit_strategic_session_delta
 from app.time_utils import _utcnow
 
@@ -62,6 +68,137 @@ _AGENT_WS_TERMINAL_STATUSES = (
     # websocket should close — there is no live agent to relay to.
     TaskStatus.PARKED,
 )
+# Keep in sync with `STREAM_DELTA_MAX_CHARS` in
+# `agent/src/handlers/conversation-message-streamer.ts`; the agent slices its
+# raw text below this so redaction has headroom.
+# `backend/testing/test_agent.py::test_streaming_preview_chunk_cap_matches_agent_constant`
+# pins the two together.
+_STREAMING_PREVIEW_MAX_CHUNK_CHARS = 1_200
+_STREAMING_PREVIEW_TERMINAL_STATES = frozenset({"failed", "abandoned"})
+
+
+async def _broadcast_conversation_message_delta(
+    project_id: str,
+    task_id: uuid.UUID,
+    payload: object,
+) -> None:
+    """Relay one authenticated, claim-bound bounded Fast reply chunk.
+
+    Two properties this function owns:
+
+    * **Redaction.** The chunk is raw model output heading for an operator
+      screen.  The agent already runs it through ``sanitize()``, and this is the
+      defence-in-depth second pass — matching the sibling ``log`` branch, which
+      calls ``_sanitize_log``, and ``emit_strategic_session_delta``, which
+      secret-sanitizes its text.  This branch must never be the one unredacted
+      operator-reaching frame type in this loop.
+    * **Terminal frames are NOT liveness-gated.**  A tombstone retracts a
+      preview that is not persisted anywhere.  The failure modes that most need
+      one — claim released, controller retired, task moved off IN_PROGRESS —
+      are exactly the ones the liveness fence rejects, so gating the tombstone
+      on the healthy path strands the preview as a complete-looking answer that
+      does not exist server-side.  The frame is still authenticated: it arrived
+      on this task's agent socket and must name this task.
+    """
+
+    if not isinstance(payload, dict):
+        return
+    session_id = payload.get("session_id")
+    idempotency_key = payload.get("idempotency_key")
+    content = payload.get("content")
+    claim_id_raw = payload.get("claim_id")
+    stream_seq = payload.get("seq")
+    payload_task_id = payload.get("task_id")
+    terminal = payload.get("terminal")
+    attempt = payload.get("attempt", 0)
+    is_terminal = isinstance(terminal, str) and terminal in _STREAMING_PREVIEW_TERMINAL_STATES
+    if (
+        not isinstance(session_id, str)
+        or not session_id.strip()
+        or len(session_id) > 255
+        or not isinstance(idempotency_key, str)
+        or not idempotency_key.startswith("typed-fast:")
+        or len(idempotency_key) > 255
+        or not isinstance(payload_task_id, str)
+        or payload_task_id != str(task_id)
+        or not isinstance(content, str)
+        # Whitespace-only chunks are REAL content: dropping them deletes the
+        # paragraph breaks out of a streamed reply.  Only a truly empty
+        # non-terminal chunk is meaningless.
+        or (not is_terminal and not content)
+        or len(content) > _STREAMING_PREVIEW_MAX_CHUNK_CHARS
+        or not isinstance(stream_seq, int)
+        or isinstance(stream_seq, bool)
+        or stream_seq < 0
+        or not isinstance(attempt, int)
+        or isinstance(attempt, bool)
+        or attempt < 0
+        or (terminal is not None and not is_terminal)
+    ):
+        return
+    try:
+        claim_id = uuid.UUID(str(claim_id_raw))
+    except (TypeError, ValueError, AttributeError):
+        return
+    try:
+        project_uuid = uuid.UUID(project_id)
+    except ValueError:
+        return
+
+    # Redact before anything reaches an operator socket.  `_sanitize_log` only
+    # ever replaces secrets with shorter placeholders in practice; clamp anyway
+    # so a pathological pattern cannot push the frame over the wire cap.
+    safe_content = _sanitize_log(content)[:_STREAMING_PREVIEW_MAX_CHUNK_CHARS]
+
+    if is_terminal:
+        # No DB round trip: the tombstone must survive the claim row being gone.
+        sequence = 0
+    else:
+        async with AsyncSessionLocal() as session:
+            task = await session.get(Task, task_id)
+            task_context = task.context if task is not None and isinstance(task.context, dict) else {}
+            if (
+                task is None
+                or str(task.project_id) != project_id
+                or task.status != TaskStatus.IN_PROGRESS
+                or str(task_context.get("strategic_session_id") or "") != session_id
+            ):
+                return
+            claim_row = (
+                await session.execute(
+                    select_live_fast_claim(
+                        project_id=project_uuid,
+                        claim_id=claim_id,
+                        task_id=task_id,
+                        now=_utcnow(),
+                    )
+                )
+            ).scalar_one_or_none()
+            if claim_row is None:
+                return
+            max_sequence = await session.scalar(
+                select_max_conversation_sequence(project_uuid)
+            )
+            sequence = int(max_sequence or 0) + 1
+
+    message = build_streaming_reply_message(
+        project_id=project_uuid,
+        task_id=task_id,
+        session_id=session_id,
+        claim_id=claim_id,
+        idempotency_key=idempotency_key,
+        content=safe_content,
+        sequence=sequence,
+        attempt=attempt,
+    )
+
+    await broadcast_to_project(
+        project_id,
+        "message_created" if stream_seq == 0 else "message_updated",
+        streaming_reply_event_payload(
+            message, stream_seq=stream_seq, terminal=terminal if is_terminal else None
+        ),
+    )
 
 
 def _agent_ws_binding_invalid(task: Task | None, payload: dict) -> bool:
@@ -927,6 +1064,13 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                         await emit_strategic_session_delta(
                             project_id, session_payload
                         )
+                elif data.get("type") == "conversation_message_delta":
+                    # Typed Fast sends bounded reply chunks through the same
+                    # authenticated agent socket. The relay re-checks the live
+                    # claim before projecting it onto the operator WebSocket.
+                    await _broadcast_conversation_message_delta(
+                        project_id, task_id, data.get("payload")
+                    )
                 # Unknown frame types fall through and are ignored safely.
 
                 receive_task = asyncio.create_task(websocket.receive_text())

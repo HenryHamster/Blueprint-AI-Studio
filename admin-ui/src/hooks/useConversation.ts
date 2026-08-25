@@ -43,6 +43,70 @@ export function canDirectlyMergeRealtimeConversationMessage(message: ProjectMess
   return typeof audience !== 'string' || !INTERNAL_CONVERSATION_AUDIENCES.has(audience);
 }
 
+/** Idle window after which an unterminated preview is dropped. Every delta
+ *  resets it. The preview is never persisted, so if its turn dies without a
+ *  tombstone reaching us the row would otherwise sit there looking like a
+ *  delivered answer until the next remount. */
+export const STREAMING_PREVIEW_IDLE_TTL_MS = 45_000;
+
+export function isStreamingConversationPreview(message: ProjectMessage): boolean {
+  return message.context?._conversation_streaming_preview === true;
+}
+
+function streamingPreviewSequence(message: ProjectMessage): number | null {
+  const value = message.context?._conversation_streaming_seq;
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function isStreamingPreviewDelta(message: ProjectMessage): boolean {
+  return isStreamingConversationPreview(message)
+    && message.context?._conversation_streaming_delta === true;
+}
+
+function streamingPreviewTerminal(message: ProjectMessage): boolean {
+  return isStreamingConversationPreview(message)
+    && (message.context?._conversation_streaming_terminal === 'failed'
+      || message.context?._conversation_streaming_terminal === 'abandoned');
+}
+
+/** Append an ephemeral transport chunk without ever asking the durable API for it. */
+export function mergeStreamingConversationPreview(
+  existing: ProjectMessage[],
+  incoming: ProjectMessage,
+): ProjectMessage[] {
+  if (!isStreamingPreviewDelta(incoming)) return existing;
+  const current = existing.find(message => message.id === incoming.id);
+  if (current && !isStreamingConversationPreview(current)) return existing;
+  const identity = incoming.idempotency_key ?? incoming.client_idempotency_key ?? null;
+  if (identity && existing.some(message => (
+    !isStreamingConversationPreview(message) && messageHasClientIdentity(message, identity)
+  ))) return existing;
+  const incomingSequence = streamingPreviewSequence(incoming);
+  const currentSequence = current ? streamingPreviewSequence(current) : null;
+  if (currentSequence != null && incomingSequence != null && incomingSequence <= currentSequence) {
+    return existing;
+  }
+  const message = current
+    ? { ...incoming, content: `${current.content}${incoming.content}` }
+    : incoming;
+  // A retry of the same receipt arrives under a NEW preview id (the backend
+  // keys the id by attempt). Evict the superseded attempt's partial even if its
+  // tombstone never landed, so the two are never shown as two answers.
+  const superseded = identity
+    ? existing.filter(other => (
+      other.id !== incoming.id
+      && isStreamingConversationPreview(other)
+      && messageHasClientIdentity(other, identity)
+    )).map(other => other.id)
+    : [];
+  return mergeConversationPages(
+    existing.filter(other => (
+      isCanonicalConversationEnvelope(other) && !superseded.includes(other.id)
+    )),
+    [message],
+  );
+}
+
 export function compareConversationMessages(a: ProjectMessage, b: ProjectMessage): number {
   if (a.sequence != null || b.sequence != null) {
     if (a.sequence == null) return -1;
@@ -161,6 +225,16 @@ export function useConversation({
   const activeScopeRef = useRef(`${actorUserId ?? ''}:${projectId ?? ''}:${normalizedSearch}`);
   const fetchedTargetKeyRef = useRef<string | null>(null);
   const gapContinuationRef = useRef<() => void>(() => {});
+  const previewIdleTimerRef = useRef<number | null>(null);
+  // The preview TTL outlives the realtime effect that armed it (a delta effect
+  // returns no cleanup on purpose, so the timer survives the next delta's
+  // re-render); cancel it once at unmount.
+  useEffect(() => () => {
+    if (previewIdleTimerRef.current != null) {
+      window.clearTimeout(previewIdleTimerRef.current);
+      previewIdleTimerRef.current = null;
+    }
+  }, []);
   const refreshAbortRef = useRef<AbortController | null>(null);
   const olderAbortRef = useRef<AbortController | null>(null);
   const initialFetchScopeRef = useRef<string | null>(null);
@@ -390,7 +464,15 @@ export function useConversation({
       return;
     }
     const existing = getMessages().filter(message => message.project_id === projectId);
-    const sequences = existing.flatMap(message => message.sequence == null ? [] : [message.sequence]);
+    // Previews carry a FABRICATED sequence (max durable + 1) so they sort last.
+    // Letting one into priorMax would start the forward-gap recovery fetch at
+    // exactly the slot the durable reply is about to occupy, blinding the
+    // recovery net to it when its realtime `message_created` is missed.
+    const sequences = existing.flatMap(message => (
+      message.sequence == null || isStreamingConversationPreview(message)
+        ? []
+        : [message.sequence]
+    ));
     const priorMax = sequences.length ? Math.max(...sequences) : null;
     if (!canDirectlyMergeRealtimeConversationMessage(realtimeMessage)) {
       // An internal row may be a valid legacy reply, but only the canonical
@@ -400,7 +482,9 @@ export function useConversation({
         : previous);
       const timer = window.setTimeout(() => {
         void refetchCanonicalMessage(realtimeMessage.id).then(canonicalFound => {
-          if (canonicalFound && sendAck) sendAck(realtimeMessage.id);
+          if (canonicalFound && sendAck && !isStreamingConversationPreview(realtimeMessage)) {
+            sendAck(realtimeMessage.id);
+          }
         });
       }, 0);
       return () => window.clearTimeout(timer);
@@ -408,13 +492,50 @@ export function useConversation({
     if (realtimeMessageRequiresCanonicalRefetch) {
       const timer = window.setTimeout(() => {
         void refetchCanonicalMessage(realtimeMessage.id).then(canonicalFound => {
-          if (canonicalFound && sendAck) sendAck(realtimeMessage.id);
+          if (canonicalFound && sendAck && !isStreamingConversationPreview(realtimeMessage)) {
+            sendAck(realtimeMessage.id);
+          }
           return refresh(priorMax != null, priorMax);
         });
       }, 0);
       return () => window.clearTimeout(timer);
     }
-    if (sendAck) sendAck(realtimeMessage.id);
+    if (streamingPreviewTerminal(realtimeMessage)) {
+      // Terminal cleanup frames are tombstones for a preview that was never
+      // persisted. Never ACK or refetch them: the durable endpoint correctly
+      // has no row to return.
+      if (previewIdleTimerRef.current != null) {
+        window.clearTimeout(previewIdleTimerRef.current);
+        previewIdleTimerRef.current = null;
+      }
+      setMessages(previous => previous.some(message => (
+        message.id === realtimeMessage.id && isStreamingConversationPreview(message)
+      )) ? previous.filter(message => message.id !== realtimeMessage.id) : previous);
+      return;
+    }
+    if (isStreamingPreviewDelta(realtimeMessage)) {
+      if (normalizedSearch) return;
+      setMessages(previous => mergeStreamingConversationPreview(previous, realtimeMessage));
+      // Deliberately NO canonical refresh here. A preview is ephemeral and has
+      // no durable row to reconcile against, and deltas arrive at up to 10 Hz —
+      // refetching on each one would cost three backend queries per frame for
+      // nothing. The durable reply arrives on its own `message_created`.
+      // Instead, arm the idle TTL so a turn that dies without a tombstone can
+      // never leave the partial on screen looking like a delivered answer.
+      if (previewIdleTimerRef.current != null) {
+        window.clearTimeout(previewIdleTimerRef.current);
+      }
+      previewIdleTimerRef.current = window.setTimeout(() => {
+        previewIdleTimerRef.current = null;
+        setMessages(previous => (previous.some(isStreamingConversationPreview)
+          ? previous.filter(message => !isStreamingConversationPreview(message))
+          : previous));
+      }, STREAMING_PREVIEW_IDLE_TTL_MS);
+      return;
+    }
+    if (sendAck && !isStreamingConversationPreview(realtimeMessage)) {
+      sendAck(realtimeMessage.id);
+    }
     if (normalizedSearch) {
       const timer = window.setTimeout(() => { void refresh(false); }, 100);
       return () => window.clearTimeout(timer);

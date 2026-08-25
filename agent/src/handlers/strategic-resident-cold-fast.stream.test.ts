@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ResidentSessionEvent } from '../providers/resident-session.js';
+import { ConversationMessageStreamer, STREAM_DELTA_MAX_CHARS } from './conversation-message-streamer.js';
 
 // ── Hoisted test doubles ─────────────────────────────────────────────────────
 const mocks = vi.hoisted(() => ({
@@ -106,6 +107,12 @@ const sessionFrames = (): Array<{ kind: string; text: string; status?: string; s
     .filter(frame => frame.type === 'strategic_session')
     .map(frame => frame.payload as unknown as { kind: string; text: string; status?: string; seq: number });
 
+const conversationFrames = (): Array<{ content: string; seq: number }> =>
+  mocks.sendWsFrame.mock.calls
+    .map(([, frame]) => frame as { type: string; payload: Record<string, unknown> })
+    .filter(frame => frame.type === 'conversation_message_delta')
+    .map(frame => frame.payload as unknown as { content: string; seq: number });
+
 const completeCalls = (): unknown[][] =>
   mocks.apiPost.mock.calls.filter(([url]) => String(url).endsWith('/conversation/turns/complete'));
 
@@ -145,6 +152,89 @@ const waitForDone = async (): Promise<void> => {
 };
 
 describe('cold-start Fast lane — live strategic_session stream', () => {
+  it('coalesces typed deltas into bounded conversation-message chunks', async () => {
+    vi.useFakeTimers();
+    const streamer = new ConversationMessageStreamer(
+      {} as never, 'session-1', 'task-1', 'claim-1', 'typed-fast:reply-1',
+    );
+    streamer.delta('A');
+    streamer.delta('nswer');
+    await vi.advanceTimersByTimeAsync(100);
+    streamer.delta('!');
+    const finished = streamer.finish();
+    await vi.advanceTimersByTimeAsync(300);
+    await finished;
+
+    const frames = (mocks.sendWsFrame.mock.calls as unknown as Array<[unknown, unknown]>)
+      .map(([, frame]) => frame as { type: string; payload: Record<string, unknown> });
+    expect(frames.filter(frame => frame.type === 'conversation_message_delta').map(frame => frame.payload))
+      .toEqual([
+        {
+          session_id: 'session-1', task_id: 'task-1', claim_id: 'claim-1',
+          idempotency_key: 'typed-fast:reply-1', attempt: 0, seq: 0, content: 'Answer',
+        },
+        {
+          session_id: 'session-1', task_id: 'task-1', claim_id: 'claim-1',
+          idempotency_key: 'typed-fast:reply-1', attempt: 0, seq: 1, content: '!',
+        },
+      ]);
+  });
+
+  it('splits a long provider response before it reaches the websocket transport', async () => {
+    vi.useFakeTimers();
+    const streamer = new ConversationMessageStreamer(
+      {} as never, 'session-1', 'task-1', 'claim-1', 'typed-fast:long-reply',
+    );
+    const reply = 'x'.repeat(STREAM_DELTA_MAX_CHARS + 17);
+    streamer.delta(reply);
+    const finished = streamer.finish();
+    await vi.advanceTimersByTimeAsync(900);
+    await finished;
+
+    const payloads = (mocks.sendWsFrame.mock.calls as unknown as Array<[unknown, unknown]>)
+      .map(([, frame]) => frame as { type: string; payload: { content: string } })
+      .filter(frame => frame.type === 'conversation_message_delta')
+      .map(frame => frame.payload);
+    // The raw slice is deliberately BELOW the wire cap so redaction has
+    // headroom. 1_200 is the literal the backend relay drops chunks above
+    // (_STREAMING_PREVIEW_MAX_CHUNK_CHARS) -- pinned here, not imported.
+    expect(payloads.map(payload => payload.content.length)).toEqual([1_000, 217]);
+    for (const payload of payloads) expect(payload.content.length).toBeLessThanOrEqual(1_200);
+    // Nothing is lost by the split.
+    expect(payloads.map(payload => payload.content).join('')).toBe(reply);
+  });
+
+  it('emits a failed terminal tombstone for an abandoned preview', async () => {
+    const streamer = new ConversationMessageStreamer(
+      {} as never, 'session-1', 'task-1', 'claim-1', 'typed-fast:failed-reply',
+    );
+    streamer.delta('partial');
+    await streamer.finish('abandoned');
+
+    const frames = (mocks.sendWsFrame.mock.calls as unknown as Array<[unknown, unknown]>)
+      .map(([, frame]) => frame as { type: string; payload: Record<string, unknown> })
+      .filter(frame => frame.type === 'conversation_message_delta');
+    expect(frames.at(-1)?.payload).toMatchObject({ content: '', terminal: 'abandoned' });
+  });
+
+  it('still emits the tombstone when finish() already ran without a terminal', async () => {
+    // The success path calls finish() with no terminal, then the completion
+    // POST throws. Without a late tombstone the operator keeps a
+    // complete-looking answer that does not exist server-side.
+    const streamer = new ConversationMessageStreamer(
+      {} as never, 'session-1', 'task-1', 'claim-1', 'typed-fast:late-terminal',
+    );
+    streamer.delta('partial');
+    await streamer.finish();
+    await streamer.finish('failed');
+
+    const frames = (mocks.sendWsFrame.mock.calls as unknown as Array<[unknown, unknown]>)
+      .map(([, frame]) => frame as { type: string; payload: Record<string, unknown> })
+      .filter(frame => frame.type === 'conversation_message_delta');
+    expect(frames.filter(frame => frame.payload.terminal !== undefined)).toHaveLength(1);
+    expect(frames.at(-1)?.payload).toMatchObject({ content: '', terminal: 'failed' });
+  });
+
   it('emits responding, incremental deltas and a terminating done for a normal turn', async () => {
     mocks.dispatch.mockImplementation(() => {
       emit({ kind: 'text', text: 'Looking' });
@@ -168,9 +258,16 @@ describe('cold-start Fast lane — live strategic_session stream', () => {
     expect(frames[frames.length - 1].status).toBe('done');
     // seq is monotonic so the UI can order/dedupe.
     expect(frames.map(f => f.seq)).toEqual(frames.map((_, i) => i));
-    // Assistant text streams as `message`; the two deltas coalesce in order.
+    // Assistant text streams as `message` on the PROTECTED /strategic-session
+    // live transcript; the two deltas coalesce in order. This must keep holding
+    // now that the conversation preview exists: the preview MIRRORS the text,
+    // it does not divert it off the transcript.
     expect(frames.filter(f => f.kind === 'message').map(f => f.text).join(''))
       .toBe('Looking at it.');
+    // ...and the same text also streams as ordered conversation chunks, which
+    // the UI appends without a canonical refetch for an ephemeral preview.
+    expect(conversationFrames().map(f => f.content)).toEqual(['Looking at it.']);
+    expect(conversationFrames().map(f => f.seq)).toEqual([0]);
     expect(frames.some(f => f.kind === 'tool' && f.text === '[tool: Bash] ls -1')).toBe(true);
     expect(frames.some(f => f.kind === 'action' && f.text === 'Read foo.ts')).toBe(true);
     // Exactly one durable commit through the unchanged completion protocol.

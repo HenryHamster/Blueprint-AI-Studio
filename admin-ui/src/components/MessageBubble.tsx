@@ -294,13 +294,19 @@ export const MessageBubble = memo(function MessageBubble({
     && !userMsg
     && msg.context.message_role === 'operator_reply'
     && msg.context._workday_consultation_requested === false;
+  // A live reply preview is NOT a delivered answer: it is an ephemeral,
+  // never-persisted projection of the text the strategist is still writing, and
+  // it disappears on remount. It must therefore never render byte-identically
+  // to a durable reply, or a stranded partial reads as a complete response.
+  const streamingPreview = msg.context._conversation_streaming_preview === true;
 
   return (
     <>
     <div
       data-testid="message-bubble"
       data-message-id={msg.id}
-      className={`group flex scroll-mt-24 rounded-md transition-colors ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''} ${highlighted ? 'bg-amber-400/5 ring-1 ring-amber-300/35' : ''}`}
+      data-streaming-preview={streamingPreview ? 'true' : undefined}
+      className={`group flex scroll-mt-24 rounded-md transition-colors ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''} ${streamingPreview ? 'opacity-80' : ''} ${highlighted ? 'bg-amber-400/5 ring-1 ring-amber-300/35' : ''}`}
     >
       <div className={`${
         chatMode
@@ -423,6 +429,15 @@ export const MessageBubble = memo(function MessageBubble({
           ) : (
             <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
               <MarkdownContent content={msg.content} onOpenTask={onOpenTask} onOpenDirection={onOpenDirection} githubRepo={githubRepo} />
+            </div>
+          )}
+          {streamingPreview && (
+            <div
+              data-testid="message-streaming-indicator"
+              className="mt-1 flex items-center gap-1.5 text-ui-md text-neutral-500"
+            >
+              <span className="h-[5px] w-[5px] rounded-full bg-amber-400 animate-pulse" aria-hidden="true" />
+              <span>Writing…</span>
             </div>
           )}
           {msg.context.attachments && Array.isArray(msg.context.attachments) && msg.context.attachments.length > 0 && (

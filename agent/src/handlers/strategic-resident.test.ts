@@ -225,7 +225,7 @@ import { HEARTBEAT_API_TIMEOUT } from '../constants.js';
 // STREAM_FLUSH_MS in strategic-resident.ts); mirrored here for the timing math.
 const STREAM_FLUSH_MS = 100;
 
-interface SessionFrame { payload: { kind: string; text: string } }
+interface SessionFrame { type: string; payload: { kind: string; text: string } }
 const emittedTexts = (): string[] =>
   mockSendWsFrame.mock.calls.map((c) => (c[1] as SessionFrame).payload.text);
 
@@ -1095,8 +1095,20 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(typedFastMocks.onEvent.mock.calls.length).toBeGreaterThanOrEqual(1);
     expect(typeof typedFastMocks.onEvent.mock.calls[0]?.[0]).toBe('function');
     await vi.waitFor(() => {
+      // The canonical conversation preview carries the chunk...
       expect(mockSendWsFrame.mock.calls.some((c) => (
-        (c[1] as SessionFrame).payload.text === 'streamed chunk'
+        (c[1] as { type: string; payload: { content?: string } }).type
+          === 'conversation_message_delta'
+        && (c[1] as { type: string; payload: { content?: string } }).payload.content
+          === 'streamed chunk'
+      ))).toBe(true);
+      // ...and the PROTECTED /strategic-session live transcript still does too.
+      // Assistant text is mirrored onto both surfaces, never diverted: the
+      // reply streamer is unbound for the READY probe, after replaceAfterCrash,
+      // and between a failed turn and the next dispatch.
+      expect(mockSendWsFrame.mock.calls.some((c) => (
+        (c[1] as SessionFrame).type === 'strategic_session'
+        && (c[1] as SessionFrame).payload.text === 'streamed chunk'
       ))).toBe(true);
     });
   });

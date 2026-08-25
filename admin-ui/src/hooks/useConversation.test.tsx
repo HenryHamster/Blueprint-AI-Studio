@@ -3,9 +3,11 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ProjectMessage } from '../types/messages';
 import {
   CONVERSATION_INITIAL_WINDOW,
+  STREAMING_PREVIEW_IDLE_TTL_MS,
   canDirectlyMergeRealtimeConversationMessage,
   isCanonicalConversationEnvelope,
   mergeConversationPages,
+  mergeStreamingConversationPreview,
   useConversation,
 } from './useConversation';
 
@@ -89,6 +91,281 @@ describe('conversation pagination', () => {
     expect(canDirectlyMergeRealtimeConversationMessage(checkIn)).toBe(false);
     expect(isCanonicalConversationEnvelope(retiredModeKnobCut)).toBe(false);
     expect(canDirectlyMergeRealtimeConversationMessage(retiredModeKnobCut)).toBe(false);
+  });
+
+  test('renders cumulative Fast previews without acknowledging them, then replaces by receipt identity', () => {
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const sendAck = vi.fn();
+    const preview = {
+      ...message(1445),
+      id: 'preview-1',
+      content: 'The answer is still being written',
+      idempotency_key: 'typed-fast:claim-1:reply-1',
+      context: {
+        audience: 'operator-fyi', event_type: 'question_answer',
+        message_role: 'operator_reply', _conversation_streaming_preview: true,
+      },
+    };
+    const durable = {
+      ...message(1446),
+      id: 'durable-1',
+      content: 'The complete answer.',
+      idempotency_key: 'typed-fast:claim-1:reply-1',
+      client_idempotency_key: 'typed-fast:claim-1:reply-1',
+      context: {
+        audience: 'operator-fyi', event_type: 'question_answer',
+        message_role: 'operator_reply',
+      },
+    };
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true, projectId: 'project-1', actorUserId: 'actor-1',
+        includeMessageId: null, realtimeMessage, sendAck,
+        getMessages: () => messages, setMessages,
+        onLoadingChange: vi.fn(), onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    rerender({ realtimeMessage: preview });
+    expect(messages).toEqual([preview]);
+    expect(sendAck).not.toHaveBeenCalled();
+    rerender({ realtimeMessage: durable });
+    expect(messages).toEqual([durable]);
+    expect(sendAck).toHaveBeenCalledWith('durable-1');
+  });
+
+  test('appends bounded streaming chunks and ignores duplicate sequence numbers', () => {
+    const first = {
+      ...message(1445),
+      id: 'preview-1',
+      content: 'First ',
+      context: {
+        _conversation_streaming_preview: true,
+        _conversation_streaming_delta: true,
+        _conversation_streaming_seq: 0,
+      },
+    };
+    const second = {
+      ...first,
+      sequence: 1446,
+      content: 'chunk',
+      context: { ...first.context, _conversation_streaming_seq: 1 },
+    };
+    const duplicate = { ...second, content: 'duplicate' };
+
+    const once = mergeStreamingConversationPreview([], first);
+    const twice = mergeStreamingConversationPreview(once, second);
+    const deduped = mergeStreamingConversationPreview(twice, duplicate);
+
+    expect(twice.find(item => item.id === 'preview-1')?.content).toBe('First chunk');
+    expect(deduped).toBe(twice);
+  });
+
+  test('removes a failed streaming preview from the local transcript', () => {
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const preview = {
+      ...message(1445),
+      id: 'preview-1',
+      content: 'partial answer',
+      context: {
+        _conversation_streaming_preview: true,
+        _conversation_streaming_delta: true,
+        _conversation_streaming_seq: 0,
+      },
+    };
+    const tombstone = {
+      ...preview,
+      content: '',
+      context: {
+        _conversation_streaming_preview: true,
+        _conversation_streaming_delta: false,
+        _conversation_streaming_seq: 1,
+        _conversation_streaming_terminal: 'failed',
+      },
+    };
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    rerender({ realtimeMessage: preview });
+    expect(messages).toHaveLength(1);
+    rerender({ realtimeMessage: tombstone });
+    expect(messages).toHaveLength(0);
+  });
+
+  test('drops an unterminated preview at the idle TTL, and every delta rearms it', () => {
+    vi.useFakeTimers();
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const chunk = (seq: number, content: string): ProjectMessage => ({
+      ...message(1445),
+      id: 'preview-1',
+      content,
+      context: {
+        _conversation_streaming_preview: true,
+        _conversation_streaming_delta: true,
+        _conversation_streaming_seq: seq,
+      },
+    });
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true, projectId: 'project-1', actorUserId: 'actor-1',
+        includeMessageId: null, realtimeMessage,
+        getMessages: () => messages, setMessages,
+        onLoadingChange: vi.fn(), onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    rerender({ realtimeMessage: chunk(0, 'partial') });
+    act(() => { vi.advanceTimersByTime(STREAMING_PREVIEW_IDLE_TTL_MS - 1); });
+    expect(messages).toHaveLength(1);
+
+    // A live stream keeps its preview: the window restarts on every chunk.
+    rerender({ realtimeMessage: chunk(1, ' answer') });
+    act(() => { vi.advanceTimersByTime(STREAMING_PREVIEW_IDLE_TTL_MS - 1); });
+    expect(messages.map(item => item.content)).toEqual(['partial answer']);
+
+    // A turn that dies without ever sending a tombstone (agent killed, socket
+    // dropped) must not leave a partial on screen reading as a full answer.
+    act(() => { vi.advanceTimersByTime(2); });
+    expect(messages).toHaveLength(0);
+  });
+
+  test('never refetches the durable conversation for an ephemeral preview chunk', async () => {
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { items: [], has_more: false, next_before_sequence: null }, etag: null,
+    });
+    const chunk = (seq: number): ProjectMessage => ({
+      ...message(1445),
+      id: 'preview-1',
+      content: 'x',
+      context: {
+        _conversation_streaming_preview: true,
+        _conversation_streaming_delta: true,
+        _conversation_streaming_seq: seq,
+      },
+    });
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true, projectId: 'project-1', actorUserId: 'actor-1',
+        includeMessageId: null, realtimeMessage,
+        getMessages: () => messages, setMessages,
+        onLoadingChange: vi.fn(), onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+    await act(async () => { await Promise.resolve(); });
+    const afterMount = fetchStrategicConversation.mock.calls.length;
+
+    // Deltas arrive at up to 10 Hz. A canonical refetch per chunk costs three
+    // backend queries per frame to reconcile a row that is never persisted.
+    for (let seq = 0; seq < 6; seq += 1) rerender({ realtimeMessage: chunk(seq) });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(fetchStrategicConversation.mock.calls.length).toBe(afterMount);
+    expect(messages).toHaveLength(1);
+  });
+
+  test('evicts a superseded attempt when the retried reply streams under a new id', () => {
+    const identity = 'typed-fast:claim-1:reply-1';
+    const attemptOne: ProjectMessage = {
+      ...message(1445),
+      id: 'preview-attempt-0',
+      content: 'Half an ans',
+      idempotency_key: identity,
+      context: {
+        _conversation_streaming_preview: true,
+        _conversation_streaming_delta: true,
+        _conversation_streaming_seq: 3,
+      },
+    };
+    // A provider crash re-runs the SAME receipt, so the retry keeps the receipt
+    // identity but the backend gives it a new preview id keyed by attempt.
+    const attemptTwo: ProjectMessage = {
+      ...message(1446),
+      id: 'preview-attempt-1',
+      content: 'A complete answer.',
+      idempotency_key: identity,
+      context: {
+        _conversation_streaming_preview: true,
+        _conversation_streaming_delta: true,
+        _conversation_streaming_seq: 0,
+      },
+    };
+
+    const merged = mergeStreamingConversationPreview([attemptOne], attemptTwo);
+
+    // Exactly one answer on screen — never the abandoned partial beside it,
+    // and never the retry's text welded onto the partial.
+    expect(merged.map(item => item.id)).toEqual(['preview-attempt-1']);
+    expect(merged[0].content).toBe('A complete answer.');
+  });
+
+  test('keeps the fabricated preview sequence out of the forward-gap recovery cursor', async () => {
+    const durable = message(1445);
+    // The relay stamps `max durable + 1` so the preview sorts last. It is not a
+    // real slot: admitting it into priorMax starts recovery AT the sequence the
+    // durable reply is about to take, so a missed `message_created` is never
+    // recovered and the answer is lost until a remount.
+    const preview: ProjectMessage = {
+      ...message(1446),
+      id: 'preview-1',
+      context: {
+        _conversation_streaming_preview: true,
+        _conversation_streaming_delta: true,
+        _conversation_streaming_seq: 0,
+      },
+    };
+    let messages: ProjectMessage[] = [durable, preview];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { items: [], has_more: false, next_before_sequence: null }, etag: null,
+    });
+    const incoming = { ...message(1500), id: 'needs-canonical-proof' };
+
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true, projectId: 'project-1', actorUserId: 'actor-1',
+        includeMessageId: null, realtimeMessage,
+        realtimeMessageRequiresCanonicalRefetch: true,
+        getMessages: () => messages, setMessages,
+        onLoadingChange: vi.fn(), onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+    rerender({ realtimeMessage: incoming });
+
+    await waitFor(() => expect(fetchStrategicConversation.mock.calls
+      .some(call => (call[1] as { afterSequence?: number })?.afterSequence === 1445)).toBe(true));
+    expect(fetchStrategicConversation.mock.calls
+      .some(call => (call[1] as { afterSequence?: number })?.afterSequence === 1446)).toBe(false);
   });
 
   test('drops and acknowledges explicitly dispositioned non-conversation events from realtime', () => {

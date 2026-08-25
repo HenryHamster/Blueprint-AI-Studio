@@ -1,6 +1,6 @@
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -8,11 +8,13 @@ from httpx import AsyncClient
 from sqlmodel import select
 
 from app.models import (
+    MessageHandlingState,
     MessageSurface,
     MessageType,
     Project,
     ProjectMember,
     ProjectMessage,
+    Task,
 )
 from app.project_message_projection import (
     MESSAGE_CONTEXT_PROJECTION_MAX_BYTES,
@@ -26,10 +28,63 @@ from app.project_message_projection import (
     message_event_payload,
     message_preview_dict,
 )
+from app.conversation_streaming import (
+    build_streaming_reply_message,
+    select_live_fast_claim,
+    select_max_conversation_sequence,
+    streaming_reply_event_payload,
+    streaming_reply_message_id,
+)
 from app.project_message_creation import reserve_project_message_sequences
 from testing.factories import make_task
 
 TEST_USER_ID = "test-user-123"
+
+
+def test_streaming_reply_projection_is_stable_and_uses_message_contract():
+    project_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    task_id = uuid.UUID("33333333-3333-4333-8333-333333333333")
+    claim_id = uuid.UUID("44444444-4444-4444-8444-444444444444")
+    key = "typed-fast:claim-1:reply-1"
+    now = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+
+    first = build_streaming_reply_message(
+        project_id=project_id, task_id=task_id, session_id="session-1",
+        claim_id=claim_id, idempotency_key=key, content="First", sequence=8, now=now,
+    )
+    second = build_streaming_reply_message(
+        project_id=project_id, task_id=task_id, session_id="session-1",
+        claim_id=claim_id, idempotency_key=key, content="First sentence.", sequence=9, now=now,
+    )
+    event = message_event_payload(second)
+
+    assert first.id == second.id == streaming_reply_message_id(project_id, key)
+    assert event["schema_version"] == 1
+    assert event["message"]["id"] == str(first.id)
+    assert event["message"]["content"] == "First sentence."
+    assert event["message"]["client_idempotency_key"] == key
+    assert event["message"]["context"]["_conversation_streaming_preview"] is True
+
+
+def test_streaming_reply_delta_projection_stays_bounded_without_refetch():
+    project_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    message = build_streaming_reply_message(
+        project_id=project_id,
+        task_id=uuid.UUID("33333333-3333-4333-8333-333333333333"),
+        session_id="session-1",
+        claim_id=uuid.UUID("44444444-4444-4444-8444-444444444444"),
+        idempotency_key="typed-fast:claim-1:long-reply",
+        content="x" * 1_200,
+        sequence=9,
+    )
+
+    event = streaming_reply_event_payload(message, stream_seq=4)
+    encoded = json.dumps(event, separators=(",", ":"), default=str).encode("utf-8")
+
+    assert len(encoded) <= MESSAGE_EVENT_MAX_BYTES
+    assert event.get("canonical_refetch_required") is not True
+    assert event["message"]["context"]["_conversation_streaming_delta"] is True
+    assert event["message"]["context"]["_conversation_streaming_seq"] == 4
 
 
 def _message(**overrides) -> ProjectMessage:
@@ -952,3 +1007,154 @@ async def test_admin_messages_list_strips_large_context_keys(
     # strategic_session is a large key excluded from the compact set
     assert "strategic_session" not in items[0]["context"]
     assert items[0]["content"] == "Message with large context"
+
+
+async def _claimed_fast_turn(db_session):
+    """A project whose one operator message is under a live FAST claim."""
+    from app.conversation_coordinator import (
+        ConversationPublicReplyOwner,
+        claim_operator_messages,
+    )
+
+    project = await _make_project(db_session)
+    message = ProjectMessage(
+        project_id=project.id,
+        # A BEFORE-INSERT trigger reallocates any conversation sequence that is
+        # not already the project allocator's current value, so the number a
+        # test hands in here is advisory. Read the persisted value back rather
+        # than asserting on this literal.
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="Can you look into this?",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+    )
+    task = Task(project_id=project.id, title="typed fast worker", payloads=[])
+    db_session.add_all([message, task])
+    await db_session.commit()
+    claim = await claim_operator_messages(
+        db_session,
+        project_id=project.id,
+        session_id="session-1",
+        task_id=task.id,
+        worker_generation=1,
+        incarnation_id=uuid.uuid4(),
+        message_ids=[message.id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+    )
+    assert claim is not None
+    await db_session.commit()
+    return project, message, task, claim
+
+
+@pytest.mark.asyncio
+async def test_streaming_relay_fence_runs_as_real_sql_against_the_claim_row(db_session):
+    """The typed Fast relay's liveness fence must EXECUTE, not be mocked away.
+
+    The websocket tests in ``test_agent.py`` stub the DB session, so every
+    predicate in this query is invisible to them: a wrong JSON path, a wrong
+    column, or a wrong enum comparison would leave streaming permanently dead in
+    production with those tests green. This runs the exact query the relay
+    issues against the real database and proves each predicate discriminates.
+    """
+    project, message, task, claim = await _claimed_fast_turn(db_session)
+    now = datetime.now(timezone.utc)
+
+    async def fence(**overrides):
+        params = {
+            "project_id": project.id,
+            "claim_id": claim.claim_id,
+            "task_id": task.id,
+            "now": now,
+        }
+        params.update(overrides)
+        return (
+            await db_session.execute(select_live_fast_claim(**params))
+        ).scalar_one_or_none()
+
+    # A live Fast claim admits the relay. This alone exercises the JSON owner
+    # path, the CLAIMED enum comparison and the expiry column as real SQL.
+    live = await fence()
+    assert live is not None
+    assert live.id == message.id
+
+    assert await fence(project_id=uuid.uuid4()) is None
+    assert await fence(claim_id=uuid.uuid4()) is None
+    assert await fence(task_id=uuid.uuid4()) is None
+    # An expired lease is not a live claim: another worker is free to take the
+    # turn, so this one must stop projecting into the operator's conversation.
+    assert await fence(now=now + timedelta(hours=1)) is None
+
+
+@pytest.mark.asyncio
+async def test_streaming_relay_fence_rejects_standard_owner_and_settled_turn(db_session):
+    """Only a live FAST-owned, still-CLAIMED turn may stream a public preview."""
+    project, message, task, claim = await _claimed_fast_turn(db_session)
+    now = datetime.now(timezone.utc)
+
+    def query():
+        return select_live_fast_claim(
+            project_id=project.id, claim_id=claim.claim_id, task_id=task.id, now=now,
+        )
+
+    assert (await db_session.execute(query())).scalar_one_or_none() is not None
+
+    # The Standard lane owning the public answer must fence the Fast relay out,
+    # or two lanes paint the same turn.
+    row = await db_session.get(ProjectMessage, message.id)
+    row.context = {**(row.context or {}), "_conversation_public_reply_owner": "standard"}
+    db_session.add(row)
+    await db_session.commit()
+    assert (await db_session.execute(query())).scalar_one_or_none() is None
+
+    row = await db_session.get(ProjectMessage, message.id)
+    row.context = {**(row.context or {}), "_conversation_public_reply_owner": "fast"}
+    row.handling_state = MessageHandlingState.RESPONDED
+    db_session.add(row)
+    await db_session.commit()
+    # Once the turn is answered the fence closes again, so a late frame cannot
+    # reopen a settled conversation.
+    assert (await db_session.execute(query())).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_streaming_preview_sequence_reads_only_the_conversation_surface(db_session):
+    """The preview is placed after the last CONVERSATION message.
+
+    Reading the whole message table instead would let a busy activity feed push
+    the live preview to a sequence the conversation pane never reaches, so the
+    operator watches a reply arrive nowhere. The activity row here sits far
+    above the conversation row precisely so a missing surface filter changes
+    the answer.
+    """
+    project, message, _task, _claim = await _claimed_fast_turn(db_session)
+    activity = ProjectMessage(
+        project_id=project.id,
+        sequence=99,
+        surface=MessageSurface.ACTIVITY,
+        from_type="system",
+        content="activity noise",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+    )
+    db_session.add(activity)
+    await db_session.commit()
+
+    async def persisted_sequence(message_id):
+        return await db_session.scalar(
+            select(ProjectMessage.sequence).where(ProjectMessage.id == message_id)
+        )
+
+    operator_sequence = await persisted_sequence(message.id)
+    activity_sequence = await persisted_sequence(activity.id)
+    max_sequence = await db_session.scalar(select_max_conversation_sequence(project.id))
+
+    # The activity row keeps its own far-ahead slot; only conversation rows are
+    # renumbered onto the project allocator.
+    assert activity_sequence == 99
+    assert operator_sequence is not None
+    assert operator_sequence < activity_sequence
+    # Dropping the surface predicate would return 99 here.
+    assert max_sequence == operator_sequence

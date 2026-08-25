@@ -48,6 +48,10 @@ DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     "_workday_consultation_requested",
     "_workday_consultation_atomic_reply_id",
     "_resident_activation_prompt",
+    "_conversation_streaming_preview",
+    "_conversation_streaming_delta",
+    "_conversation_streaming_seq",
+    "_conversation_streaming_terminal",
 )
 
 # Compact set of context keys rendered by the list UI (grouping, severity badges,
@@ -611,6 +615,7 @@ def message_preview_dict(
         if key in {
             "_resident_activation_prompt",
             "_workday_consultation_requested",
+            "_conversation_streaming_preview",
         }:
             # This is a typed server marker, not display text. Stringifying it
             # would defeat the UI's strict boolean suppression guard.

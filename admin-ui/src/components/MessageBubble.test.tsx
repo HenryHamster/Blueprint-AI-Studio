@@ -682,4 +682,30 @@ describe('MessageBubble', () => {
     expect(within(dialog).getByText('Download')).toBeTruthy();
     expect(within(dialog).getByText(/No preview available/)).toBeTruthy();
   });
+
+  test('marks a live streaming preview so it cannot be read as a delivered reply', () => {
+    // The preview is ephemeral: it is never persisted, it vanishes on remount,
+    // and a turn that dies mid-stream leaves a PARTIAL answer behind. Rendering
+    // it byte-identically to a durable reply makes a half answer
+    // indistinguishable from the strategist's real one.
+    const { rerender } = render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        content: 'The answer so far',
+        context: { message_role: 'operator_reply', _conversation_streaming_preview: true },
+      }),
+    })} />);
+
+    expect(screen.getByTestId('message-streaming-indicator').textContent).toContain('Writing');
+    expect(screen.getByTestId('message-bubble').getAttribute('data-streaming-preview')).toBe('true');
+
+    // The durable reply that replaces it carries no live affordance.
+    rerender(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        content: 'The answer so far',
+        context: { message_role: 'operator_reply' },
+      }),
+    })} />);
+    expect(screen.queryByTestId('message-streaming-indicator')).toBeNull();
+    expect(screen.getByTestId('message-bubble').getAttribute('data-streaming-preview')).toBeNull();
+  });
 });

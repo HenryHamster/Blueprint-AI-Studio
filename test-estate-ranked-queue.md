@@ -11,10 +11,10 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 631 | 990,906 | 26,407 | 8,543.525s (379 files) | 252 |
-| admin-ui | 254 | 101,304 | 4,529 | 209.625s (254 files) | 0 |
+| backend | 631 | 991,512 | 26,418 | 8,543.525s (379 files) | 252 |
+| admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
-| agent | 125 | 111,914 | 6,121 | 72.033s (125 files) | 0 |
+| agent | 126 | 112,206 | 6,131 | 72.062s (126 files) | 0 |
 
 The queue includes every currently collected backend, admin-ui unit, admin-ui viewport, and agent test file. Backend duration coverage is partial: an `unknown` cost is intentionally not treated as zero or ranked as cheap. Admin-ui and agent costs are complete directional signals from their committed artifacts. Protected Workday counts are copied verbatim from the manifest for reporting only; this generator never edits that manifest.
 
@@ -36,7 +36,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 12 | P2 | backend | `backend/testing/test_directions.py` | 11,762 | 339 | critical (>5000 LOC) | 79.334s measured | — |
 | 13 | P2 | backend | `backend/testing/test_acceptance_criteria.py` | 13,369 | 283 | critical (>5000 LOC) | 74.580s measured | — |
 | 14 | P2 | backend | `backend/testing/test_release_qualifier__ci_unresolved_blocker.py` | 6,463 | 162 | critical (>5000 LOC) | 67.628s measured | — |
-| 15 | P2 | backend | `backend/testing/test_agent.py` | 28,983 | 508 | critical (>5000 LOC) | 65.904s measured | — |
+| 15 | P2 | backend | `backend/testing/test_agent.py` | 29,383 | 514 | critical (>5000 LOC) | 65.904s measured | — |
 | 16 | P2 | backend | `backend/testing/test_metrics_integrity_sweep.py` | 8,110 | 215 | critical (>5000 LOC) | 65.620s measured | — |
 | 17 | P2 | backend | `backend/testing/test_compute.py` | 9,201 | 187 | critical (>5000 LOC) | 57.415s measured | — |
 | 18 | P2 | backend | `backend/testing/test_orchestrator.py` | 18,423 | 361 | critical (>5000 LOC) | 57.238s measured | — |
@@ -56,7 +56,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 32 | P2 | backend | `backend/testing/test_salvage_bundle_standalone.py` | 7,737 | 239 | critical (>5000 LOC) | 8.485s measured | — |
 | 33 | P2 | backend | `backend/testing/test_digest_metrics.py` | 8,216 | 251 | critical (>5000 LOC) | 8.434s measured | — |
 | 34 | P2 | backend | `backend/testing/test_agent_strategic_fetch.py` | 7,041 | 139 | critical (>5000 LOC) | 7.724s measured | protected; declared floor 139 |
-| 35 | P2 | agent | `agent/src/handlers/strategic-resident.test.ts` | 9,153 | 135 | critical (>5000 LOC) | 7.566s measured | protected; declared floor 135 |
+| 35 | P2 | agent | `agent/src/handlers/strategic-resident.test.ts` | 9,165 | 135 | critical (>5000 LOC) | 7.566s measured | protected; declared floor 135 |
 | 36 | P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification_2.py` | 6,954 | 112 | critical (>5000 LOC) | 5.220s measured | — |
 | 37 | P2 | backend | `backend/testing/test_strategic_state.py` | 10,632 | 174 | critical (>5000 LOC) | 4.542s measured | protected; declared floor 174 |
 | 38 | P2 | backend | `backend/testing/test_release_qualifier__sweep_stuck_qualifications.py` | 6,242 | 124 | critical (>5000 LOC) | 3.776s measured | — |
@@ -268,7 +268,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 244 | G | backend | `backend/testing/test_retry_hint_parser.py` | 65 | 5 | under 1500 LOC | 8.208s measured | — |
 | 245 | G | backend | `backend/testing/test_migration_0608_projectmessage_foundation.py` | 697 | 10 | under 1500 LOC | 7.721s measured | — |
 | 246 | G | backend | `backend/testing/test_playbook_lifecycle.py` | 388 | 11 | under 1500 LOC | 7.700s measured | — |
-| 247 | G | backend | `backend/testing/test_project_message_projection.py` | 954 | 24 | under 1500 LOC | 7.374s measured | protected; declared floor 24 |
+| 247 | G | backend | `backend/testing/test_project_message_projection.py` | 1,160 | 29 | under 1500 LOC | 7.374s measured | protected; declared floor 29 |
 | 248 | G | backend | `backend/testing/test_compute_watchdog.py` | 1,490 | 58 | under 1500 LOC | 7.328s measured | — |
 | 249 | G | backend | `backend/testing/test_gate_revalidation.py` | 700 | 39 | under 1500 LOC | 6.930s measured | — |
 | 250 | G | backend | `backend/testing/test_compute__experiments.py` | 1,375 | 35 | under 1500 LOC | 6.879s measured | — |
@@ -391,7 +391,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 367 | G | backend | `backend/testing/test_no_ci_merge_gate_setup_retry.py` | 500 | 5 | under 1500 LOC | 1.110s measured | — |
 | 368 | G | backend | `backend/testing/test_findings_index.py` | 416 | 11 | under 1500 LOC | 1.097s measured | — |
 | 369 | G | admin-ui | `admin-ui/src/components/NotesTool.test.tsx` | 424 | 15 | under 1500 LOC | 1.087s measured | protected; declared floor 15 |
-| 370 | G | agent | `agent/src/handlers/strategic-resident-cold-fast.stream.test.ts` | 243 | 4 | under 1500 LOC | 1.051s measured | — |
+| 370 | G | agent | `agent/src/handlers/strategic-resident-cold-fast.stream.test.ts` | 340 | 8 | under 1500 LOC | 1.051s measured | — |
 | 371 | G | backend | `backend/testing/test_security.py` | 716 | 68 | under 1500 LOC | 0.981s measured | — |
 | 372 | G | backend | `backend/testing/test_optimistic_version.py` | 199 | 3 | under 1500 LOC | 0.904s measured | — |
 | 373 | G | backend | `backend/testing/test_c5_approval_gate_invariant.py` | 309 | 3 | under 1500 LOC | 0.894s measured | — |
@@ -456,7 +456,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 432 | G | admin-ui | `admin-ui/src/components/MessageTypeDropdown.test.tsx` | 115 | 7 | under 1500 LOC | 0.309s measured | — |
 | 433 | G | admin-ui | `admin-ui/src/components/SettingsAccountsSection.test.tsx` | 362 | 10 | under 1500 LOC | 0.303s measured | — |
 | 434 | G | backend | `backend/testing/test_spawn_calibration.py` | 581 | 31 | under 1500 LOC | 0.302s measured | — |
-| 435 | G | admin-ui | `admin-ui/src/components/MessageBubble.test.tsx` | 685 | 40 | under 1500 LOC | 0.296s measured | protected; declared floor 40 |
+| 435 | G | admin-ui | `admin-ui/src/components/MessageBubble.test.tsx` | 711 | 41 | under 1500 LOC | 0.296s measured | protected; declared floor 41 |
 | 436 | G | admin-ui | `admin-ui/src/components/TaskDetailDrawerSideboardContext.test.tsx` | 325 | 7 | under 1500 LOC | 0.276s measured | — |
 | 437 | G | admin-ui | `admin-ui/src/components/WarmStartOriginRow.test.tsx` | 33 | 3 | under 1500 LOC | 0.276s measured | — |
 | 438 | G | admin-ui | `admin-ui/src/components/WhiteboardTool.test.tsx` | 687 | 14 | under 1500 LOC | 0.263s measured | protected; declared floor 14 |
@@ -483,7 +483,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 459 | G | backend | `backend/testing/test_vitest_durations_freshness.py` | 742 | 29 | under 1500 LOC | 0.186s measured | — |
 | 460 | G | admin-ui | `admin-ui/src/components/ProblemModelViewer.test.tsx` | 418 | 13 | under 1500 LOC | 0.180s measured | — |
 | 461 | G | agent | `agent/src/viewport-snapshot-script.test.ts` | 337 | 18 | under 1500 LOC | 0.178s measured | — |
-| 462 | G | admin-ui | `admin-ui/src/hooks/useConversation.test.tsx` | 941 | 29 | under 1500 LOC | 0.174s measured | protected; declared floor 29 |
+| 462 | G | admin-ui | `admin-ui/src/hooks/useConversation.test.tsx` | 1,218 | 36 | under 1500 LOC | 0.174s measured | protected; declared floor 36 |
 | 463 | G | backend | `backend/testing/test_chain_continuity_funnel.py` | 135 | 5 | under 1500 LOC | 0.173s measured | — |
 | 464 | G | admin-ui | `admin-ui/src/components/ConsultationProgressRow.test.tsx` | 156 | 5 | under 1500 LOC | 0.171s measured | — |
 | 465 | G | admin-ui | `admin-ui/src/components/ProjectManagementModal.test.tsx` | 227 | 16 | under 1500 LOC | 0.170s measured | — |
@@ -617,583 +617,584 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 593 | G | admin-ui | `admin-ui/src/hooks/dashboardAccessGating.test.tsx` | 97 | 2 | under 1500 LOC | 0.030s measured | — |
 | 594 | G | admin-ui | `admin-ui/src/components/PipelineEfficiencyPanel.test.tsx` | 81 | 4 | under 1500 LOC | 0.030s measured | — |
 | 595 | G | admin-ui | `admin-ui/src/components/useMessageList.test.ts` | 223 | 14 | under 1500 LOC | 0.029s measured | — |
-| 596 | G | admin-ui | `admin-ui/src/utils/taskCsv.test.ts` | 125 | 6 | under 1500 LOC | 0.029s measured | — |
-| 597 | G | backend | `backend/testing/test_merge_size_limits.py` | 166 | 13 | under 1500 LOC | 0.029s measured | — |
-| 598 | G | admin-ui | `admin-ui/src/test/viewport-diff.test.ts` | 98 | 4 | under 1500 LOC | 0.028s measured | — |
-| 599 | G | admin-ui | `admin-ui/src/hooks/usePersistedState.test.ts` | 87 | 9 | under 1500 LOC | 0.028s measured | — |
-| 600 | G | admin-ui | `admin-ui/src/components/SearchFilterBar.test.tsx` | 23 | 1 | under 1500 LOC | 0.027s measured | — |
-| 601 | G | admin-ui | `admin-ui/src/components/AnomalyThrottleBanner.test.tsx` | 54 | 3 | under 1500 LOC | 0.026s measured | — |
-| 602 | G | agent | `agent/src/prompt-helper-refs.test.ts` | 326 | 5 | under 1500 LOC | 0.025s measured | — |
-| 603 | G | admin-ui | `admin-ui/src/utils/strategicWorkSessionMetrics.test.ts` | 40 | 2 | under 1500 LOC | 0.025s measured | — |
-| 604 | G | admin-ui | `admin-ui/src/hooks/useVersionLifecycle.test.tsx` | 33 | 1 | under 1500 LOC | 0.025s measured | — |
-| 605 | G | backend | `backend/testing/test_notification.py` | 134 | 5 | under 1500 LOC | 0.025s measured | — |
-| 606 | G | backend | `backend/testing/test_c18_check_runs_cache_error_bypass.py` | 330 | 8 | under 1500 LOC | 0.025s measured | — |
-| 607 | G | backend | `backend/testing/test_branch_resolution.py` | 196 | 15 | under 1500 LOC | 0.024s measured | — |
-| 608 | G | backend | `backend/testing/test_github_checks.py` | 670 | 24 | under 1500 LOC | 0.023s measured | — |
-| 609 | G | backend | `backend/testing/test_pr_is_not_behind_counter.py` | 224 | 13 | under 1500 LOC | 0.023s measured | — |
-| 610 | G | agent | `agent/src/handlers/typed-fast-resident.test.ts` | 481 | 16 | under 1500 LOC | 0.023s measured | protected; declared floor 16 |
-| 611 | G | admin-ui | `admin-ui/src/__tests__/strategicReconnect.test.tsx` | 160 | 2 | under 1500 LOC | 0.023s measured | — |
-| 612 | G | admin-ui | `admin-ui/src/hooks/useConversationSend.test.tsx` | 85 | 5 | under 1500 LOC | 0.023s measured | — |
-| 613 | G | backend | `backend/testing/test_migration_0273_normalise_indexes.py` | 158 | 5 | under 1500 LOC | 0.022s measured | — |
-| 614 | G | admin-ui | `admin-ui/src/hooks/useStrategicContextNavigation.test.tsx` | 253 | 7 | under 1500 LOC | 0.022s measured | — |
-| 615 | G | backend | `backend/testing/test_migration_0531_backfill_encryption.py` | 203 | 2 | under 1500 LOC | 0.022s measured | — |
-| 616 | G | backend | `backend/testing/test_direction_mode.py` | 126 | 12 | under 1500 LOC | 0.021s measured | — |
-| 617 | G | backend | `backend/testing/test_migration_0141_reconcile.py` | 121 | 3 | under 1500 LOC | 0.021s measured | — |
-| 618 | G | backend | `backend/testing/test_migration_path.py` | 72 | 10 | under 1500 LOC | 0.021s measured | — |
-| 619 | G | agent | `agent/src/handlers/artifacts-helper.test.ts` | 151 | 4 | under 1500 LOC | 0.021s measured | — |
-| 620 | G | backend | `backend/testing/test_migration_reconciliation.py` | 111 | 7 | under 1500 LOC | 0.021s measured | — |
-| 621 | G | admin-ui | `admin-ui/src/hooks/useStrategistStatus.test.ts` | 120 | 10 | under 1500 LOC | 0.020s measured | — |
-| 622 | G | admin-ui | `admin-ui/src/hooks/useProjectConfig.test.tsx` | 68 | 2 | under 1500 LOC | 0.020s measured | — |
-| 623 | G | agent | `agent/src/utils/test-fix-loop.test.ts` | 1,376 | 56 | under 1500 LOC | 0.019s measured | — |
-| 624 | G | admin-ui | `admin-ui/src/strategicStateApi.test.ts` | 562 | 28 | under 1500 LOC | 0.019s measured | — |
-| 625 | G | agent | `agent/src/handlers/artifact-consume.test.ts` | 436 | 19 | under 1500 LOC | 0.019s measured | — |
-| 626 | G | admin-ui | `admin-ui/src/utils/residentToolHandoff.test.ts` | 129 | 7 | under 1500 LOC | 0.019s measured | protected; declared floor 7 |
-| 627 | G | admin-ui | `admin-ui/src/hooks/useViewPreferences.test.ts` | 40 | 5 | under 1500 LOC | 0.019s measured | — |
-| 628 | G | backend | `backend/testing/test_account_model_regression_stats.py` | 148 | 12 | under 1500 LOC | 0.019s measured | — |
-| 629 | G | backend | `backend/testing/test_migration_0532_message_backlog.py` | 190 | 3 | under 1500 LOC | 0.018s measured | — |
-| 630 | G | backend | `backend/testing/test_message_audience_routing.py` | 165 | 10 | under 1500 LOC | 0.018s measured | — |
-| 631 | G | backend | `backend/testing/test_ci_infra_rerun.py` | 104 | 10 | under 1500 LOC | 0.017s measured | — |
-| 632 | G | agent | `agent/src/handlers/index.test.ts` | 635 | 102 | under 1500 LOC | 0.017s measured | protected; declared floor 102 |
-| 633 | G | admin-ui | `admin-ui/src/utils/strategicContextDescriptor.test.ts` | 343 | 10 | under 1500 LOC | 0.017s measured | — |
-| 634 | G | admin-ui | `admin-ui/src/components/SrBadges.test.tsx` | 43 | 1 | under 1500 LOC | 0.017s measured | — |
-| 635 | G | backend | `backend/testing/test_classifier_fixtures.py` | 255 | 10 | under 1500 LOC | 0.016s measured | — |
-| 636 | G | backend | `backend/testing/test_research_actionability.py` | 204 | 5 | under 1500 LOC | 0.016s measured | — |
-| 637 | G | backend | `backend/testing/test_migration_0151_reconcile.py` | 98 | 5 | under 1500 LOC | 0.015s measured | — |
-| 638 | G | agent | `agent/src/handlers/design.test.ts` | 864 | 36 | under 1500 LOC | 0.015s measured | — |
-| 639 | G | admin-ui | `admin-ui/src/utils/directionHelpers.test.ts` | 140 | 17 | under 1500 LOC | 0.015s measured | — |
-| 640 | G | backend | `backend/testing/test_leader_lock_keepalive.py` | 149 | 6 | under 1500 LOC | 0.015s measured | — |
-| 641 | G | agent | `agent/src/prompt.context.test.ts` | 1,434 | 116 | under 1500 LOC | 0.014s measured | — |
-| 642 | G | admin-ui | `admin-ui/src/utils/mergeTestVerdict.test.ts` | 374 | 36 | under 1500 LOC | 0.014s measured | — |
-| 643 | G | admin-ui | `admin-ui/src/components/ComputeJobsPanel.utils.test.ts` | 217 | 19 | under 1500 LOC | 0.014s measured | — |
-| 644 | G | admin-ui | `admin-ui/src/utils/citationLinks.test.ts` | 77 | 13 | under 1500 LOC | 0.014s measured | — |
-| 645 | G | backend | `backend/testing/test_event_type_invariants.py` | 320 | 7 | under 1500 LOC | 0.013s measured | — |
-| 646 | G | agent | `agent/src/handlers/code-change.test.ts` | 941 | 37 | under 1500 LOC | 0.013s measured | — |
-| 647 | G | agent | `agent/src/reset.test.ts` | 722 | 32 | under 1500 LOC | 0.013s measured | — |
-| 648 | G | admin-ui | `admin-ui/src/operatorWorkbenchContracts.test.ts` | 551 | 3 | under 1500 LOC | 0.013s measured | — |
-| 649 | G | backend | `backend/testing/test_migration_0472_no_double_encrypt.py` | 147 | 3 | under 1500 LOC | 0.012s measured | — |
-| 650 | G | agent | `agent/src/moduleSize.contract.test.ts` | 156 | 4 | under 1500 LOC | 0.012s measured | — |
-| 651 | G | admin-ui | `admin-ui/src/utils/taskStatus.test.ts` | 102 | 24 | under 1500 LOC | 0.012s measured | — |
-| 652 | G | admin-ui | `admin-ui/src/utils/mathContent.test.ts` | 59 | 12 | under 1500 LOC | 0.012s measured | — |
-| 653 | G | agent | `agent/src/handlers/walkthrough-e2e.test.ts` | 746 | 30 | under 1500 LOC | 0.011s measured | — |
-| 654 | G | admin-ui | `admin-ui/src/utils/strategicSessionLive.test.ts` | 686 | 44 | under 1500 LOC | 0.011s measured | protected; declared floor 44 |
-| 655 | G | agent | `agent/src/handlers/design-doc.test.ts` | 325 | 19 | under 1500 LOC | 0.011s measured | — |
-| 656 | G | admin-ui | `admin-ui/src/components/boardSavedViews.test.ts` | 131 | 11 | under 1500 LOC | 0.011s measured | — |
-| 657 | G | agent | `agent/src/prompts/context-prefix.test.ts` | 1,205 | 69 | under 1500 LOC | 0.010s measured | — |
-| 658 | G | agent | `agent/src/prompts/discovery.test.ts` | 668 | 45 | under 1500 LOC | 0.010s measured | — |
-| 659 | G | agent | `agent/src/handlers/audits-reopen.test.ts` | 390 | 15 | under 1500 LOC | 0.010s measured | — |
-| 660 | G | agent | `agent/src/call-speech/call-speech.test.ts` | 309 | 13 | under 1500 LOC | 0.010s measured | — |
-| 661 | G | admin-ui | `admin-ui/src/utils/pendingWhiteboardArtifactRef.test.ts` | 222 | 6 | under 1500 LOC | 0.010s measured | protected; declared floor 6 |
-| 662 | G | admin-ui | `admin-ui/src/accountManager.test.ts` | 191 | 9 | under 1500 LOC | 0.010s measured | — |
-| 663 | G | admin-ui | `admin-ui/src/utils/parseTimestamp-guard.test.ts` | 155 | 15 | under 1500 LOC | 0.010s measured | — |
-| 664 | G | backend | `backend/testing/test_compute_cloud_run.py` | 968 | 13 | under 1500 LOC | 0.009s measured | — |
-| 665 | G | agent | `agent/src/handlers/memo.test.ts` | 850 | 40 | under 1500 LOC | 0.009s measured | — |
-| 666 | G | agent | `agent/src/handlers/web-research.test.ts` | 653 | 28 | under 1500 LOC | 0.009s measured | — |
-| 667 | G | agent | `agent/src/handlers/capability-proof-trial.test.ts` | 404 | 27 | under 1500 LOC | 0.009s measured | — |
-| 668 | G | agent | `agent/src/media/livekit-call-media.test.ts` | 382 | 13 | under 1500 LOC | 0.009s measured | — |
-| 669 | G | admin-ui | `admin-ui/src/components/MessagesPanel.invariant.test.ts` | 212 | 9 | under 1500 LOC | 0.009s measured | — |
-| 670 | G | admin-ui | `admin-ui/src/App.wiring.test.ts` | 124 | 14 | under 1500 LOC | 0.009s measured | protected; declared floor 14 |
-| 671 | G | admin-ui | `admin-ui/src/utils/pendingAttachmentStore.test.ts` | 77 | 3 | under 1500 LOC | 0.009s measured | protected; declared floor 3 |
-| 672 | G | admin-ui | `admin-ui/src/utils/strategicWorkbenchSession.test.ts` | 66 | 4 | under 1500 LOC | 0.009s measured | — |
-| 673 | G | backend | `backend/testing/test_migration_0457_encrypt_github_pat.py` | 82 | 2 | under 1500 LOC | 0.009s measured | — |
-| 674 | G | agent | `agent/src/telemetry.test.ts` | 773 | 74 | under 1500 LOC | 0.008s measured | — |
-| 675 | G | agent | `agent/src/prompts/self-review.test.ts` | 610 | 76 | under 1500 LOC | 0.008s measured | — |
-| 676 | G | agent | `agent/src/utils/provisioning.test.ts` | 402 | 40 | under 1500 LOC | 0.008s measured | — |
-| 677 | G | agent | `agent/src/handlers/criterion-named-test-trial.test.ts` | 376 | 17 | under 1500 LOC | 0.008s measured | — |
-| 678 | G | admin-ui | `admin-ui/src/components/eventPrefs.test.ts` | 320 | 40 | under 1500 LOC | 0.008s measured | — |
-| 679 | G | agent | `agent/src/utils/agent-token.test.ts` | 312 | 21 | under 1500 LOC | 0.008s measured | — |
-| 680 | G | agent | `agent/src/handlers/live-conversation-resident.test.ts` | 257 | 13 | under 1500 LOC | 0.008s measured | — |
-| 681 | G | admin-ui | `admin-ui/src/utils/conversationDraftState.test.ts` | 111 | 6 | under 1500 LOC | 0.008s measured | — |
-| 682 | G | agent | `agent/src/providers/resident-stream.test.ts` | 380 | 45 | under 1500 LOC | 0.007s measured | protected; declared floor 45 |
-| 683 | G | agent | `agent/src/handlers/strategic-ops-registry.test.ts` | 199 | 13 | under 1500 LOC | 0.007s measured | — |
-| 684 | G | admin-ui | `admin-ui/src/utils/outcomeKinds.test.ts` | 185 | 19 | under 1500 LOC | 0.007s measured | — |
-| 685 | G | admin-ui | `admin-ui/src/utils/sidecarTasks.test.ts` | 173 | 15 | under 1500 LOC | 0.007s measured | — |
-| 686 | G | backend | `backend/testing/test_migration_0639_align_projectcomputeimagebuild_timestamptz.py` | 105 | 1 | under 1500 LOC | 0.007s measured | — |
-| 687 | G | backend | `backend/testing/test_shared_state_facade.py` | 191 | 4 | under 1500 LOC | 0.007s measured | — |
-| 688 | G | backend | `backend/testing/test_branch_cleanup.py` | 50 | 3 | under 1500 LOC | 0.006s measured | — |
-| 689 | G | agent | `agent/src/handlers/structured-output-repair.test.ts` | 732 | 32 | under 1500 LOC | 0.006s measured | — |
-| 690 | G | agent | `agent/src/handlers/discovery-review.test.ts` | 529 | 17 | under 1500 LOC | 0.006s measured | — |
-| 691 | G | agent | `agent/src/handlers/walkthrough-criterion-gates.test.ts` | 463 | 40 | under 1500 LOC | 0.006s measured | — |
-| 692 | G | agent | `agent/src/handlers/verify-tests.gate-bound.test.ts` | 249 | 5 | under 1500 LOC | 0.006s measured | — |
-| 693 | G | admin-ui | `admin-ui/src/taskCapabilities.test.ts` | 136 | 11 | under 1500 LOC | 0.006s measured | — |
-| 694 | G | admin-ui | `admin-ui/src/utils/statusFilter.test.ts` | 49 | 7 | under 1500 LOC | 0.006s measured | — |
-| 695 | G | backend | `backend/testing/test_compute_provision_slots.py` | 49 | 2 | under 1500 LOC | 0.006s measured | — |
-| 696 | G | agent | `agent/src/prompts/review-prompt.test.ts` | 367 | 42 | under 1500 LOC | 0.005s measured | — |
-| 697 | G | agent | `agent/src/utils/design-doc-presence.test.ts` | 330 | 25 | under 1500 LOC | 0.005s measured | — |
-| 698 | G | agent | `agent/src/handlers/prior-knowledge.test.ts` | 313 | 27 | under 1500 LOC | 0.005s measured | — |
-| 699 | G | agent | `agent/src/token-file.test.ts` | 280 | 25 | under 1500 LOC | 0.005s measured | — |
-| 700 | G | agent | `agent/src/handlers/compute-experiment.test.ts` | 253 | 12 | under 1500 LOC | 0.005s measured | — |
-| 701 | G | agent | `agent/src/oauth-rotation.test.ts` | 205 | 10 | under 1500 LOC | 0.005s measured | — |
-| 702 | G | agent | `agent/src/handlers/verify-tests.setup-retry.test.ts` | 175 | 5 | under 1500 LOC | 0.005s measured | — |
-| 703 | G | agent | `agent/src/git-credential.test.ts` | 170 | 11 | under 1500 LOC | 0.005s measured | — |
-| 704 | G | admin-ui | `admin-ui/src/test/composition-root-wiring.test.ts` | 168 | 5 | under 1500 LOC | 0.005s measured | — |
-| 705 | G | agent | `agent/src/handlers/verify-tests.provision.test.ts` | 159 | 4 | under 1500 LOC | 0.005s measured | — |
-| 706 | G | agent | `agent/src/utils/viewport-shot-download.test.ts` | 140 | 11 | under 1500 LOC | 0.005s measured | — |
-| 707 | G | admin-ui | `admin-ui/src/api/projectTools.residentArtifact.test.ts` | 135 | 5 | under 1500 LOC | 0.005s measured | protected; declared floor 5 |
-| 708 | G | admin-ui | `admin-ui/src/test/orphan-component-guard.test.ts` | 129 | 2 | under 1500 LOC | 0.005s measured | — |
-| 709 | G | admin-ui | `admin-ui/src/utils/unverifiedReasonLabels.test.ts` | 100 | 13 | under 1500 LOC | 0.005s measured | — |
-| 710 | G | admin-ui | `admin-ui/src/utils/newProjectOAuthResume.test.ts` | 84 | 5 | under 1500 LOC | 0.005s measured | — |
-| 711 | G | admin-ui | `admin-ui/src/utils/verdictFormatting.test.ts` | 63 | 9 | under 1500 LOC | 0.005s measured | — |
-| 712 | G | admin-ui | `admin-ui/src/utils/externalUrl.test.ts` | 57 | 12 | under 1500 LOC | 0.005s measured | — |
-| 713 | G | backend | `backend/testing/test_admin_auth_invariant.py` | 100 | 1 | under 1500 LOC | 0.005s measured | — |
-| 714 | G | agent | `agent/src/build-config.test.ts` | 546 | 46 | under 1500 LOC | 0.004s measured | — |
-| 715 | G | agent | `agent/src/prompts/project-context.test.ts` | 409 | 23 | under 1500 LOC | 0.004s measured | — |
-| 716 | G | agent | `agent/src/handlers/research-direction-context.test.ts` | 392 | 36 | under 1500 LOC | 0.004s measured | — |
-| 717 | G | agent | `agent/src/handlers/review-fix-migration.test.ts` | 272 | 20 | under 1500 LOC | 0.004s measured | — |
-| 718 | G | agent | `agent/src/fix-loop-events.test.ts` | 258 | 20 | under 1500 LOC | 0.004s measured | — |
-| 719 | G | agent | `agent/src/providers/foreground-resident.test.ts` | 175 | 9 | under 1500 LOC | 0.004s measured | — |
-| 720 | G | agent | `agent/src/utils/classifier-fixtures.test.ts` | 110 | 6 | under 1500 LOC | 0.004s measured | — |
-| 721 | G | admin-ui | `admin-ui/src/App.test.tsx` | 83 | 4 | under 1500 LOC | 0.004s measured | — |
-| 722 | G | admin-ui | `admin-ui/src/types/workbenchEvents.test.ts` | 77 | 4 | under 1500 LOC | 0.004s measured | — |
-| 723 | G | admin-ui | `admin-ui/src/components/FleetRunnersPanel.utils.test.ts` | 58 | 5 | under 1500 LOC | 0.004s measured | — |
-| 724 | G | admin-ui | `admin-ui/src/utils/idempotencyKey.test.ts` | 56 | 5 | under 1500 LOC | 0.004s measured | — |
-| 725 | G | admin-ui | `admin-ui/src/utils/fixLoopLayers.test.ts` | 40 | 6 | under 1500 LOC | 0.004s measured | — |
-| 726 | G | admin-ui | `admin-ui/src/test/workbench-theme-tokens.test.ts` | 32 | 1 | under 1500 LOC | 0.004s measured | — |
-| 727 | G | admin-ui | `admin-ui/src/utils/time.test.ts` | 30 | 5 | under 1500 LOC | 0.004s measured | — |
-| 728 | G | admin-ui | `admin-ui/src/appWorkbenchConstants.test.ts` | 27 | 3 | under 1500 LOC | 0.004s measured | — |
-| 729 | G | admin-ui | `admin-ui/src/utils/projectSelection.test.ts` | 27 | 2 | under 1500 LOC | 0.004s measured | — |
-| 730 | G | backend | `backend/testing/test_claim_analytics.py` | 40 | 2 | under 1500 LOC | 0.004s measured | — |
-| 731 | G | backend | `backend/testing/test_docs_runbook_drift.py` | 263 | 8 | under 1500 LOC | 0.004s measured | — |
-| 732 | G | agent | `agent/src/handlers/strategic-context-envelope.test.ts` | 224 | 7 | under 1500 LOC | 0.003s measured | — |
-| 733 | G | agent | `agent/src/handlers/review-fix-history.test.ts` | 184 | 21 | under 1500 LOC | 0.003s measured | — |
-| 734 | G | agent | `agent/src/json-extract.test.ts` | 176 | 29 | under 1500 LOC | 0.003s measured | — |
-| 735 | G | agent | `agent/src/providers/usage.test.ts` | 147 | 10 | under 1500 LOC | 0.003s measured | — |
-| 736 | G | agent | `agent/src/branch-literal-regression.test.ts` | 122 | 3 | under 1500 LOC | 0.003s measured | — |
-| 737 | G | agent | `agent/src/taskCapabilities.test.ts` | 114 | 10 | under 1500 LOC | 0.003s measured | — |
-| 738 | G | admin-ui | `admin-ui/src/utils/computeAnalysisLabels.test.ts` | 96 | 12 | under 1500 LOC | 0.003s measured | — |
-| 739 | G | admin-ui | `admin-ui/src/utils/taskGraph.test.ts` | 94 | 11 | under 1500 LOC | 0.003s measured | — |
-| 740 | G | admin-ui | `admin-ui/src/accessControl.test.ts` | 91 | 4 | under 1500 LOC | 0.003s measured | — |
-| 741 | G | admin-ui | `admin-ui/src/utils/mergeGateSummary.test.ts` | 82 | 7 | under 1500 LOC | 0.003s measured | — |
-| 742 | G | admin-ui | `admin-ui/src/utils/imageEdits.test.ts` | 72 | 10 | under 1500 LOC | 0.003s measured | — |
-| 743 | G | admin-ui | `admin-ui/src/types/workbenchTargets.test.ts` | 71 | 4 | under 1500 LOC | 0.003s measured | — |
-| 744 | G | admin-ui | `admin-ui/src/components/projectToolHidden.test.ts` | 47 | 6 | under 1500 LOC | 0.003s measured | — |
-| 745 | G | admin-ui | `admin-ui/src/utils/conversationAttachmentDraftFinalization.test.ts` | 42 | 1 | under 1500 LOC | 0.003s measured | — |
-| 746 | G | admin-ui | `admin-ui/src/utils/conversationMessageIdentity.test.ts` | 24 | 2 | under 1500 LOC | 0.003s measured | — |
-| 747 | G | backend | `backend/testing/test_local_runner_terminal_log.py` | 140 | 1 | under 1500 LOC | 0.002s measured | — |
-| 748 | G | agent | `agent/src/handlers/direction-renderer.test.ts` | 252 | 20 | under 1500 LOC | 0.002s measured | — |
-| 749 | G | agent | `agent/src/reset-invariant.test.ts` | 152 | 9 | under 1500 LOC | 0.002s measured | — |
-| 750 | G | agent | `agent/src/processTracking.test.ts` | 144 | 4 | under 1500 LOC | 0.002s measured | — |
-| 751 | G | agent | `agent/src/node-preflight.test.ts` | 125 | 19 | under 1500 LOC | 0.002s measured | — |
-| 752 | G | agent | `agent/src/handlers/verify-tests.setup-probe.test.ts` | 115 | 2 | under 1500 LOC | 0.002s measured | — |
-| 753 | G | agent | `agent/src/heartbeat-classify.test.ts` | 104 | 13 | under 1500 LOC | 0.002s measured | — |
-| 754 | G | agent | `agent/src/handlers/research-plan-prompt-blocks.test.ts` | 96 | 10 | under 1500 LOC | 0.002s measured | — |
-| 755 | G | admin-ui | `admin-ui/src/qualificationStateVocab.contract.test.ts` | 77 | 4 | under 1500 LOC | 0.002s measured | — |
-| 756 | G | agent | `agent/src/telemetry.prompt_size.test.ts` | 77 | 3 | under 1500 LOC | 0.002s measured | — |
-| 757 | G | admin-ui | `admin-ui/src/test/viewport-capture-config.test.ts` | 57 | 5 | under 1500 LOC | 0.002s measured | — |
-| 758 | G | admin-ui | `admin-ui/src/hooks/useUIState.test.ts` | 41 | 3 | under 1500 LOC | 0.002s measured | — |
-| 759 | G | admin-ui | `admin-ui/src/utils/strategicAttention.test.ts` | 39 | 3 | under 1500 LOC | 0.002s measured | — |
-| 760 | G | admin-ui | `admin-ui/src/utils/convergenceVerdict.test.ts` | 35 | 4 | under 1500 LOC | 0.002s measured | — |
-| 761 | G | admin-ui | `admin-ui/src/utils/conversationSendState.test.ts` | 30 | 1 | under 1500 LOC | 0.002s measured | — |
-| 762 | G | agent | `agent/src/utils/sanitize.test.ts` | 17 | 3 | under 1500 LOC | 0.002s measured | — |
-| 763 | G | admin-ui | `admin-ui/src/useAppState.selection.test.ts` | 15 | 2 | under 1500 LOC | 0.002s measured | — |
-| 764 | G | agent | `agent/src/handlers/research-plan-contract.test.ts` | 198 | 11 | under 1500 LOC | 0.001s measured | — |
-| 765 | G | agent | `agent/src/handlers/strategic-resident-wake.test.ts` | 173 | 9 | under 1500 LOC | 0.001s measured | — |
-| 766 | G | agent | `agent/src/workspaceDisk.test.ts` | 111 | 6 | under 1500 LOC | 0.001s measured | — |
-| 767 | G | admin-ui | `admin-ui/src/branch-literal-regression.test.ts` | 93 | 3 | under 1500 LOC | 0.001s measured | — |
-| 768 | G | agent | `agent/src/handlers/structured-repair.test.ts` | 88 | 3 | under 1500 LOC | 0.001s measured | — |
-| 769 | G | agent | `agent/src/handlers/strategic-stall-advisory.test.ts` | 48 | 3 | under 1500 LOC | 0.001s measured | — |
-| 770 | G | agent | `agent/src/handlers/discovery-review-workspace.test.ts` | 44 | 2 | under 1500 LOC | 0.001s measured | — |
-| 771 | G | admin-ui | `admin-ui/src/utils/failureClass.test.ts` | 43 | 4 | under 1500 LOC | 0.001s measured | — |
-| 772 | G | agent | `agent/src/qualificationStateVocab.contract.test.ts` | 41 | 2 | under 1500 LOC | 0.001s measured | — |
-| 773 | G | agent | `agent/src/handlers/strategic-resident-prompt.test.ts` | 39 | 3 | under 1500 LOC | 0.001s measured | protected; declared floor 3 |
-| 774 | G | agent | `agent/src/_agent_scripts/materialize_manifest.parity.test.ts` | 34 | 1 | under 1500 LOC | 0.001s measured | — |
-| 775 | G | agent | `agent/src/_agent_scripts/fixgate_attribution.parity.test.ts` | 31 | 1 | under 1500 LOC | 0.001s measured | — |
-| 776 | G | admin-ui | `admin-ui/src/utils/composerRequestOwnership.test.ts` | 28 | 2 | under 1500 LOC | 0.001s measured | — |
-| 777 | G | admin-ui | `admin-ui/src/test/environment.test.ts` | 15 | 1 | under 1500 LOC | 0.001s measured | — |
-| 778 | G | admin-ui | `admin-ui/src/components/AdversarialQualityPanel.test.tsx` | 9 | 1 | under 1500 LOC | 0.001s measured | — |
-| 779 | G | backend | `backend/testing/test_runner_heartbeat.py` | 1,411 | 34 | under 1500 LOC | 0.000s measured | — |
-| 780 | G | backend | `backend/testing/test_check_gate_fail_closed.py` | 1,481 | 35 | under 1500 LOC | unknown (no committed measurement) | — |
-| 781 | G | backend | `backend/testing/test_conversation_coordinator_two_speed.py` | 1,445 | 17 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 17 |
-| 782 | G | backend | `backend/testing/test_discovery_review_packet_budget.py` | 1,417 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
-| 783 | G | backend | `backend/testing/test_admin_routers__runners.py` | 1,317 | 33 | under 1500 LOC | unknown (no committed measurement) | — |
-| 784 | G | backend | `backend/testing/test_approval_exact_target_publication.py` | 1,275 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 785 | G | backend | `backend/testing/test_admin_approval_merge_submission_recovery.py` | 1,272 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 786 | G | backend | `backend/testing/test_admin_routers__problem_model.py` | 1,230 | 39 | under 1500 LOC | unknown (no committed measurement) | — |
-| 787 | G | backend | `backend/testing/test_resource_envelope_enforcement.py` | 1,189 | 27 | under 1500 LOC | unknown (no committed measurement) | — |
-| 788 | G | backend | `backend/testing/test_mode_knob_graduation.py` | 1,188 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
-| 789 | G | backend | `backend/testing/test_agent_tasks.py` | 1,186 | 35 | under 1500 LOC | unknown (no committed measurement) | — |
-| 790 | G | backend | `backend/testing/test_workday_resident_invariants.py` | 1,180 | 28 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 28 |
-| 791 | G | backend | `backend/testing/test_admin_routers__autonomous.py` | 1,171 | 27 | under 1500 LOC | unknown (no committed measurement) | — |
-| 792 | G | backend | `backend/testing/test_release_qualifier_audit.py` | 1,145 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
-| 793 | G | backend | `backend/testing/test_strategic_cycle_cost_projection.py` | 1,143 | 46 | under 1500 LOC | unknown (no committed measurement) | — |
-| 794 | G | backend | `backend/testing/test_module_finding_chain.py` | 1,142 | 25 | under 1500 LOC | unknown (no committed measurement) | — |
-| 795 | G | backend | `backend/testing/test_strategic_memory_envelope.py` | 1,113 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
-| 796 | G | backend | `backend/testing/test_migration_0681_0694_preservation.py` | 1,093 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 797 | G | backend | `backend/testing/test_rollup_lineage_fence.py` | 1,089 | 30 | under 1500 LOC | unknown (no committed measurement) | — |
-| 798 | G | backend | `backend/testing/test_strategic_spawn_requests.py` | 1,089 | 20 | under 1500 LOC | unknown (no committed measurement) | — |
-| 799 | G | backend | `backend/testing/test_acceptance_gate__test_corroboration.py` | 1,058 | 26 | under 1500 LOC | unknown (no committed measurement) | — |
-| 800 | G | backend | `backend/testing/test_strategic_lane_linearization.py` | 1,050 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 801 | G | admin-ui-viewport | `admin-ui/src/components/VersionSummaryPanel.viewport.test.tsx` | 1,049 | 43 | under 1500 LOC | unknown (no committed measurement) | — |
-| 802 | G | backend | `backend/testing/test_release_stall_alerts.py` | 1,027 | 28 | under 1500 LOC | unknown (no committed measurement) | — |
-| 803 | G | backend | `backend/testing/test_workday_artifact_materialization.py` | 1,011 | 17 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 17 |
-| 804 | G | backend | `backend/testing/test_rollup_size_preflight.py` | 1,008 | 33 | under 1500 LOC | unknown (no committed measurement) | — |
-| 805 | G | backend | `backend/testing/test_review_park_disposition.py` | 994 | 26 | under 1500 LOC | unknown (no committed measurement) | — |
-| 806 | G | backend | `backend/testing/test_issue_ledger.py` | 989 | 36 | under 1500 LOC | unknown (no committed measurement) | — |
-| 807 | G | backend | `backend/testing/test_release_prepromotion_rehearsal.py` | 987 | 26 | under 1500 LOC | unknown (no committed measurement) | — |
-| 808 | G | backend | `backend/testing/test_llm_cost_attribution.py` | 981 | 19 | under 1500 LOC | unknown (no committed measurement) | — |
-| 809 | G | backend | `backend/testing/test_release_qualifier_walkthrough_evidence.py` | 968 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 810 | G | backend | `backend/testing/test_project_operator_access.py` | 962 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
-| 811 | G | backend | `backend/testing/test_admin_pipeline_observability.py` | 953 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
-| 812 | G | backend | `backend/testing/test_cost_reconciliation.py` | 952 | 24 | under 1500 LOC | unknown (no committed measurement) | — |
-| 813 | G | backend | `backend/testing/test_compute_image_environment.py` | 937 | 23 | under 1500 LOC | unknown (no committed measurement) | — |
-| 814 | G | admin-ui-viewport | `admin-ui/src/components/SrUnhandledEdgesRetrospectivesPanel.viewport.test.tsx` | 927 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
-| 815 | G | backend | `backend/testing/test_strategic_conversation_query.py` | 923 | 15 | under 1500 LOC | unknown (no committed measurement) | — |
-| 816 | G | backend | `backend/testing/test_review_wait_terminal_boundaries.py` | 910 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 817 | G | backend | `backend/testing/test_admin_agent_ops.py` | 895 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 818 | G | backend | `backend/testing/test_release_qualifier__trigger_and_dispatch_regressions.py` | 890 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 819 | G | backend | `backend/testing/test_unactionable_approval_holds.py` | 890 | 33 | under 1500 LOC | unknown (no committed measurement) | — |
-| 820 | G | backend | `backend/testing/test_blind_merge_grade.py` | 882 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
-| 821 | G | backend | `backend/testing/test_admin_routers__users.py` | 876 | 34 | under 1500 LOC | unknown (no committed measurement) | — |
-| 822 | G | admin-ui-viewport | `admin-ui/src/components/ComputeJobsPanel.viewport.test.tsx` | 875 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 823 | G | backend | `backend/testing/test_admin_warm_pool.py` | 865 | 28 | under 1500 LOC | unknown (no committed measurement) | — |
-| 824 | G | backend | `backend/testing/test_schema_invariants.py` | 831 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
-| 825 | G | backend | `backend/testing/test_cost_attribution.py` | 812 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
-| 826 | G | admin-ui-viewport | `admin-ui/src/components/MessagesPanel.viewport.test.tsx` | 786 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
-| 827 | G | backend | `backend/testing/test_strategic_effort_tier_evidence.py` | 780 | 26 | under 1500 LOC | unknown (no committed measurement) | — |
-| 828 | G | admin-ui-viewport | `admin-ui/src/components/VersionLifecyclePanel.viewport.test.tsx` | 763 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
-| 829 | G | backend | `backend/testing/test_admin_project_roles.py` | 741 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 830 | G | backend | `backend/testing/test_pipeline_alert_scan.py` | 736 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
-| 831 | G | admin-ui-viewport | `admin-ui/src/components/ProblemModelViewer.viewport.test.tsx` | 728 | 19 | under 1500 LOC | unknown (no committed measurement) | — |
-| 832 | G | backend | `backend/testing/test_stranded_conversation_message_sweep.py` | 727 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
-| 833 | G | backend | `backend/testing/test_agent__claim_core_auth.py` | 725 | 15 | under 1500 LOC | unknown (no committed measurement) | — |
-| 834 | G | admin-ui-viewport | `admin-ui/src/components/DashboardHome.viewport.test.tsx` | 718 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 835 | G | backend | `backend/testing/test_attempt24_release_safety.py` | 717 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 836 | G | backend | `backend/testing/test_sr_compute_wiring.py` | 710 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 837 | G | backend | `backend/testing/test_acceptance_criteria__walkthrough.py` | 700 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
-| 838 | G | admin-ui-viewport | `admin-ui/src/components/ProjectToolHost.viewport.test.tsx` | 689 | 20 | under 1500 LOC | unknown (no committed measurement) | — |
-| 839 | G | admin-ui-viewport | `admin-ui/src/components/NewTaskModal.viewport.test.tsx` | 688 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 840 | G | backend | `backend/testing/test_compute_quota.py` | 679 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
-| 841 | G | backend | `backend/testing/test_review_claim_fence.py` | 678 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
-| 842 | G | backend | `backend/testing/test_sequenced_dependent_spawn.py` | 672 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
-| 843 | G | backend | `backend/testing/test_acceptance_gate__rule_version.py` | 670 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 844 | G | backend | `backend/testing/test_strategic_consultation_detail.py` | 654 | 15 | under 1500 LOC | unknown (no committed measurement) | — |
-| 845 | G | admin-ui-viewport | `admin-ui/src/components/MessagesListView.viewport.test.tsx` | 648 | 33 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 33 |
-| 846 | G | backend | `backend/testing/test_admin_request_changes_authority.py` | 642 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 847 | G | backend | `backend/testing/test_evaluating_handmerge_latch.py` | 642 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 848 | G | backend | `backend/testing/test_lifecycle_integration.py` | 634 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 849 | G | backend | `backend/testing/test_publication_gate_receipt.py` | 632 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
-| 850 | G | backend | `backend/testing/test_release_qualification_pause_deferral.py` | 628 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 851 | G | backend | `backend/testing/test_strategic_consultation_status.py` | 620 | 3 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 3 |
-| 852 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 608 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 853 | G | backend | `backend/testing/test_reaper_post_orphan_sweep.py` | 608 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 854 | G | backend | `backend/testing/test_blocked_retry_authority.py` | 605 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 855 | G | backend | `backend/testing/test_migration_0682_workday_repair.py` | 600 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 856 | G | backend | `backend/testing/test_runner_enroll_docs_accuracy.py` | 599 | 19 | under 1500 LOC | unknown (no committed measurement) | — |
-| 857 | G | backend | `backend/testing/test_github_onboarding_access.py` | 596 | 15 | under 1500 LOC | unknown (no committed measurement) | — |
-| 858 | G | admin-ui-viewport | `admin-ui/src/components/WorkbenchComposition.viewport.test.tsx` | 590 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 859 | G | backend | `backend/testing/test_acceptance_criteria__trials.py` | 586 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
-| 860 | G | backend | `backend/testing/test_direction_saturation.py` | 579 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 861 | G | backend | `backend/testing/test_strategic_cycle_gating.py` | 578 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 862 | G | backend | `backend/testing/test_wire_timestamp_zone.py` | 577 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
-| 863 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextRail.viewport.test.tsx` | 570 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 864 | G | backend | `backend/testing/test_strategic_fast_live_work.py` | 567 | 5 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 5 |
-| 865 | G | admin-ui-viewport | `admin-ui/src/components/SettingsDeploySection.viewport.test.tsx` | 563 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 866 | G | backend | `backend/testing/test_review_loop_operator_park.py` | 563 | 25 | under 1500 LOC | unknown (no committed measurement) | — |
-| 867 | G | backend | `backend/testing/test_admin_playbook.py` | 559 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
-| 868 | G | backend | `backend/testing/test_direction_lineage_spend.py` | 556 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
-| 869 | G | backend | `backend/testing/test_strategic_payload_size.py` | 547 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 870 | G | backend | `backend/testing/test_test_estate_ranked_queue.py` | 538 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 871 | G | backend | `backend/testing/test_release_qualifier__retry_episode_cap.py` | 533 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
-| 872 | G | backend | `backend/testing/test_strategic_memory_corrections.py` | 532 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
-| 873 | G | backend | `backend/testing/test_anomaly_proposals.py` | 527 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
-| 874 | G | backend | `backend/testing/test_work_session_command_execution.py` | 520 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 875 | G | backend | `backend/testing/test_research_spawn_pending_recovery.py` | 518 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 876 | G | backend | `backend/testing/test_admin_approval_comment_recovery.py` | 514 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 877 | G | admin-ui-viewport | `admin-ui/src/components/DirectionCard.viewport.test.tsx` | 503 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
-| 878 | G | backend | `backend/testing/test_release_qualifier_walkthrough_request.py` | 495 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 879 | G | backend | `backend/testing/test_strategic_resident_continuous_liveness.py` | 495 | 8 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 8 |
-| 880 | G | backend | `backend/testing/test_project_cascade.py` | 494 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 881 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerMeta.viewport.test.tsx` | 483 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
-| 882 | G | backend | `backend/testing/test_admin_warm_vm.py` | 483 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 883 | G | backend | `backend/testing/test_review_pending_requeue.py` | 480 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 884 | G | admin-ui-viewport | `admin-ui/src/components/HeaderBar.viewport.test.tsx` | 479 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
-| 885 | G | backend | `backend/testing/test_project_message_delivery.py` | 475 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 886 | G | backend | `backend/testing/test_strategic_watches.py` | 475 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
-| 887 | G | backend | `backend/testing/test_runner_rate_limiter.py` | 456 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
-| 888 | G | backend | `backend/testing/test_operator_failure_messages.py` | 444 | 27 | under 1500 LOC | unknown (no committed measurement) | — |
-| 889 | G | admin-ui-viewport | `admin-ui/src/components/KnowledgeBrowser.viewport.test.tsx` | 443 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 890 | G | backend | `backend/testing/test_ci_review_wait_dedup_windows.py` | 434 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 891 | G | backend | `backend/testing/test_migration_0697_retained_telemetry_history.py` | 431 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 892 | G | backend | `backend/testing/test_release_qualifier_walkthrough_site.py` | 431 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 893 | G | backend | `backend/testing/test_migration_0679_backlog_clear.py` | 423 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 894 | G | admin-ui-viewport | `admin-ui/src/components/ActivityFeed.viewport.test.tsx` | 422 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 895 | G | backend | `backend/testing/test_attempt24_operator_flows.py` | 422 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 896 | G | backend | `backend/testing/test_release_qualifier_infra_continuation.py` | 422 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 897 | G | backend | `backend/testing/test_runner_decline_epoch.py` | 419 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 898 | G | backend | `backend/testing/test_strategic_autonomous_handoff.py` | 416 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 899 | G | backend | `backend/testing/test_migration_0714_strategic_conversation_correctness.py` | 414 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 900 | G | backend | `backend/testing/test_strategic_memory_claim_redaction_repair.py` | 414 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 901 | G | backend | `backend/testing/test_strategic_memory_service.py` | 403 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 902 | G | backend | `backend/testing/test_warm_pool_readiness.py` | 402 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 903 | G | backend | `backend/testing/test_provider_cost_summary.py` | 401 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 904 | G | backend | `backend/testing/test_hotfix_narrow_candidate.py` | 390 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
-| 905 | G | backend | `backend/testing/test_strategic_payload.py` | 389 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 906 | G | admin-ui-viewport | `admin-ui/src/components/MessagesComposer.viewport.test.tsx` | 386 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 907 | G | backend | `backend/testing/test_admin_approval_dedup_authority.py` | 382 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 908 | G | backend | `backend/testing/test_discovery_models.py` | 382 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 909 | G | backend | `backend/testing/test_approval_gate_config.py` | 377 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
-| 910 | G | backend | `backend/testing/test_staging_base_refresh.py` | 377 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 911 | G | backend | `backend/testing/test_task_constructor_authority_manifest.py` | 370 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 912 | G | backend | `backend/testing/test_research_lock_order.py` | 368 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 913 | G | backend | `backend/testing/test_project_tool_context.py` | 361 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
-| 914 | G | backend | `backend/testing/test_discovery_admission.py` | 356 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 915 | G | backend | `backend/testing/test_strategic_memory_runtime.py` | 355 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 916 | G | backend | `backend/testing/test_evaluating_fence_hold.py` | 354 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 917 | G | backend | `backend/testing/test_admin_serial_console.py` | 353 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 918 | G | backend | `backend/testing/test_scripts_test_lane.py` | 349 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 919 | G | admin-ui-viewport | `admin-ui/src/components/PipelineWorkspace.viewport.test.tsx` | 348 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 920 | G | backend | `backend/testing/test_process_role_lifecycle.py` | 347 | 25 | under 1500 LOC | unknown (no committed measurement) | — |
-| 921 | G | admin-ui-viewport | `admin-ui/src/components/WarmVmPanel.viewport.test.tsx` | 342 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 922 | G | backend | `backend/testing/test_discovery_authority_reconciliation.py` | 342 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 923 | G | backend | `backend/testing/test_compute_gpu.py` | 341 | 20 | under 1500 LOC | unknown (no committed measurement) | — |
-| 924 | G | backend | `backend/testing/test_strategic_memory_retrieval.py` | 339 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 925 | G | backend | `backend/testing/test_project_resource_summary.py` | 338 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 926 | G | backend | `backend/testing/test_migration_0640_0682_workday_chain.py` | 334 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 927 | G | admin-ui-viewport | `admin-ui/src/components/NewProjectModal.viewport.test.tsx` | 325 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 928 | G | backend | `backend/testing/test_strategic_resident_pipeline_projection.py` | 324 | 3 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 3 |
-| 929 | G | admin-ui-viewport | `admin-ui/src/components/SrTrendBreakdown.viewport.test.tsx` | 323 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 930 | G | backend | `backend/testing/test_agent_github.py` | 323 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 931 | G | backend | `backend/testing/test_strategic_memory_control.py` | 319 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 932 | G | backend | `backend/testing/test_strategic_workday_handoff_recovery.py` | 307 | 4 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 4 |
-| 933 | G | backend | `backend/testing/test_admin_discovery_cycles.py` | 306 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 934 | G | backend | `backend/testing/test_completion_automatic_task_authority.py` | 306 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 935 | G | admin-ui-viewport | `admin-ui/src/components/LlmCostBreakdownPanel.viewport.test.tsx` | 305 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 936 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextArtifactSlot.viewport.test.tsx` | 305 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 937 | G | backend | `backend/testing/test_concurrency_overlap.py` | 303 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 938 | G | backend | `backend/testing/test_review_admission_ownership.py` | 298 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 939 | G | backend | `backend/testing/test_stall_advisory.py` | 298 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 940 | G | admin-ui-viewport | `admin-ui/src/components/ProjectBuildConfigSection.viewport.test.tsx` | 297 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 941 | G | backend | `backend/testing/test_release_qualifier_contracts.py` | 297 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 942 | G | admin-ui-viewport | `admin-ui/src/components/SettingsSectionRouter.viewport.test.tsx` | 294 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 943 | G | backend | `backend/testing/test_agent_access_projections.py` | 294 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 944 | G | admin-ui-viewport | `admin-ui/src/components/MetricsDashboard.viewport.test.tsx` | 291 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 945 | G | admin-ui-viewport | `admin-ui/src/components/DirectionsPanel.viewport.test.tsx` | 290 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 946 | G | backend | `backend/testing/test_migration_0724_name_reuse_after_revocation.py` | 287 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 947 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawer.viewport.test.tsx` | 285 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 948 | G | backend | `backend/testing/test_admin_orchestrator_errors.py` | 282 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 949 | G | backend | `backend/testing/test_admin_approval_gate_release_authority.py` | 281 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 950 | G | backend | `backend/testing/test_automatic_task_creation_authority.py` | 280 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 951 | G | backend | `backend/testing/test_strategic_memory_source_schema.py` | 280 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 952 | G | admin-ui-viewport | `admin-ui/src/components/RunningUpdatePanel.viewport.test.tsx` | 277 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 953 | G | backend | `backend/testing/test_project_outcome_projection.py` | 277 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 954 | G | backend | `backend/testing/test_rollup_premerge_tip.py` | 276 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 955 | G | backend | `backend/testing/test_warm_claim_account_attribution.py` | 274 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 956 | G | admin-ui-viewport | `admin-ui/src/components/MessageBubble.viewport.test.tsx` | 272 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 957 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerFailureDetail.viewport.test.tsx` | 272 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
-| 958 | G | backend | `backend/testing/test_discovery_review_sequencing.py` | 271 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 959 | G | backend | `backend/testing/test_migration_0669_backfill_direction_fa_telemetry.py` | 271 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 960 | G | backend | `backend/testing/test_migration_0696_project_sr_analytics.py` | 269 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 961 | G | backend | `backend/testing/test_migration_0720_direction_index_repair.py` | 255 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 962 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextWorkspace.viewport.test.tsx` | 254 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 963 | G | admin-ui-viewport | `admin-ui/src/components/NotesTool.viewport.test.tsx` | 253 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 964 | G | backend | `backend/testing/test_compute_secret_manifest.py` | 252 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 965 | G | backend | `backend/testing/test_strategic_memory_claim_redaction_repair_retry.py` | 252 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 966 | G | backend | `backend/testing/test_strategic_resident_work_state.py` | 248 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 967 | G | admin-ui-viewport | `admin-ui/src/components/RemediationFunnelSection.viewport.test.tsx` | 246 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 968 | G | backend | `backend/testing/test_admin_bulk_cancellation_fencing.py` | 246 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 969 | G | backend | `backend/testing/test_strategic_memory_governance.py` | 245 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 970 | G | backend | `backend/testing/test_strategic_memory_knowledge.py` | 245 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 971 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnersPanel.viewport.test.tsx` | 243 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 972 | G | admin-ui-viewport | `admin-ui/src/components/WhiteboardTool.viewport.test.tsx` | 237 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 973 | G | backend | `backend/testing/test_completion_topic_overlap.py` | 237 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
-| 974 | G | admin-ui-viewport | `admin-ui/src/components/AutonomousStatus.viewport.test.tsx` | 234 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 975 | G | admin-ui-viewport | `admin-ui/src/components/ResearchBrowser.viewport.test.tsx` | 234 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 976 | G | backend | `backend/testing/test_automatic_task_creation_producers.py` | 233 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 977 | G | backend | `backend/testing/test_migration_0657_0671_resident_session_id.py` | 228 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 978 | G | backend | `backend/testing/test_discovery_runtime_integration.py` | 227 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 979 | G | backend | `backend/testing/test_release_qualifier_candidate_sha_stamp.py` | 225 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 980 | G | admin-ui-viewport | `admin-ui/src/components/ViewportDebtPanel.viewport.test.tsx` | 223 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 981 | G | admin-ui-viewport | `admin-ui/src/components/LaneDiagPanel.viewport.test.tsx` | 222 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 982 | G | admin-ui-viewport | `admin-ui/src/components/PRMonitorSection.viewport.test.tsx` | 219 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 983 | G | backend | `backend/testing/test_terminal_rollup_pr_sweep.py` | 219 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 984 | G | backend | `backend/testing/test_migration_0668_drop_projectcomputeimagebuild.py` | 218 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 985 | G | backend | `backend/testing/test_migration_0698_cochange_state.py` | 217 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 986 | G | backend | `backend/testing/test_migration_0717_strategic_memory_semantic_ledger.py` | 217 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 987 | G | admin-ui-viewport | `admin-ui/src/components/TaskCard.viewport.test.tsx` | 214 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 988 | G | admin-ui-viewport | `admin-ui/src/components/OrchestratorHealthBar.viewport.test.tsx` | 212 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 989 | G | backend | `backend/testing/test_runner_binding_capacity_reason.py` | 212 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 990 | G | admin-ui-viewport | `admin-ui/src/components/KanbanBoard.viewport.test.tsx` | 211 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 991 | G | admin-ui-viewport | `admin-ui/src/components/SettingsNotificationsSection.viewport.test.tsx` | 210 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 992 | G | backend | `backend/testing/test_review_wait_monitor_owned_gate.py` | 206 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 993 | G | backend | `backend/testing/test_compute_artifact_iam.py` | 204 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 994 | G | backend | `backend/testing/test_rollup_handoff_ci_gate.py` | 204 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 995 | G | backend | `backend/testing/test_anomaly_persistence.py` | 203 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 996 | G | backend | `backend/testing/test_verification_toolchain.py` | 203 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 997 | G | admin-ui-viewport | `admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx` | 202 | 8 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 8 |
-| 998 | G | admin-ui-viewport | `admin-ui/src/components/PipelineView.viewport.test.tsx` | 197 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 999 | G | backend | `backend/testing/test_vm_lifecycle_forensics.py` | 196 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1000 | G | backend | `backend/testing/test_release_ownership.py` | 195 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1001 | G | backend | `backend/testing/test_migration_0656_projectmessage_context_audience_index.py` | 194 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1002 | G | admin-ui-viewport | `admin-ui/src/components/ProviderModelBreakdownPanel.viewport.test.tsx` | 192 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1003 | G | admin-ui-viewport | `admin-ui/src/components/SearchFilterBar.viewport.test.tsx` | 192 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1004 | G | admin-ui-viewport | `admin-ui/src/components/BulkActionBar.viewport.test.tsx` | 191 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1005 | G | backend | `backend/testing/test_projects.py` | 186 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1006 | G | backend | `backend/testing/test_user_management.py` | 186 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1007 | G | admin-ui-viewport | `admin-ui/src/components/KanbanColumn.viewport.test.tsx` | 183 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1008 | G | backend | `backend/testing/test_strategic_memory_invariants.py` | 182 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1009 | G | backend | `backend/testing/test_release_operator_commit_gate.py` | 181 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1010 | G | backend | `backend/testing/test_admin_task_requeue_terminal.py` | 180 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1011 | G | backend | `backend/testing/test_strategic_op_contracts.py` | 179 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1012 | G | admin-ui-viewport | `admin-ui/src/components/ProblemModelEditor.viewport.test.tsx` | 178 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1013 | G | backend | `backend/testing/test_voice_credentials.py` | 178 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1014 | G | admin-ui-viewport | `admin-ui/src/components/ConfirmDialog.viewport.test.tsx` | 175 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1015 | G | backend | `backend/testing/test_task_list_pagination.py` | 175 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1016 | G | backend | `backend/testing/test_strategic_memory_sources.py` | 174 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1017 | G | admin-ui-viewport | `admin-ui/src/components/EffortEfficiencyPanel.viewport.test.tsx` | 173 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1018 | G | backend | `backend/testing/test_research_mem_eval.py` | 172 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1019 | G | admin-ui-viewport | `admin-ui/src/components/MergeVerificationBanner.viewport.test.tsx` | 167 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1020 | G | admin-ui-viewport | `admin-ui/src/components/TaskComputeJobsSection.viewport.test.tsx` | 165 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1021 | G | admin-ui-viewport | `admin-ui/src/components/SettingsAccountsSection.viewport.test.tsx` | 163 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1022 | G | backend | `backend/testing/test_task_lifecycle_modularity.py` | 162 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1023 | G | admin-ui-viewport | `admin-ui/src/test/kanban-composed.viewport.test.tsx` | 158 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1024 | G | admin-ui-viewport | `admin-ui/src/components/VersionMismatchBanner.viewport.test.tsx` | 155 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1025 | G | backend | `backend/testing/test_frontend_static.py` | 155 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1026 | G | backend | `backend/testing/test_recovery_sidecar.py` | 155 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1027 | G | admin-ui-viewport | `admin-ui/src/components/RuntimeWorkspace.viewport.test.tsx` | 154 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1028 | G | admin-ui-viewport | `admin-ui/src/components/ArchiveView.viewport.test.tsx` | 153 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1029 | G | admin-ui-viewport | `admin-ui/src/components/OuterReviewLoopConvergenceWidget.viewport.test.tsx` | 153 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1030 | G | backend | `backend/testing/test_failure_reason.py` | 152 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1031 | G | admin-ui-viewport | `admin-ui/src/components/RecentErrorsWidget.viewport.test.tsx` | 151 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1032 | G | backend | `backend/testing/test_github_commit_resolution.py` | 150 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1033 | G | backend | `backend/testing/test_release_artifact_freshness.py` | 150 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1034 | G | backend | `backend/testing/test_strategic_correctness_preflight.py` | 150 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1035 | G | admin-ui-viewport | `admin-ui/src/components/AlertsBanner.viewport.test.tsx` | 149 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1036 | G | backend | `backend/testing/test_sr_analytics_store.py` | 148 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1037 | G | backend | `backend/testing/test_strategic_workday_mutation_rebind.py` | 148 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
-| 1038 | G | admin-ui-viewport | `admin-ui/src/components/ConsoleHome.viewport.test.tsx` | 147 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1039 | G | backend | `backend/testing/test_migration_0722_discovery_controller.py` | 147 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1040 | G | admin-ui-viewport | `admin-ui/src/components/DriftSignalsCard.viewport.test.tsx` | 146 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1041 | G | admin-ui-viewport | `admin-ui/src/components/WorkbenchLayout.viewport.test.tsx` | 144 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1042 | G | backend | `backend/testing/test_livekit_tokens.py` | 143 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1043 | G | backend | `backend/testing/test_release_activation_after_timeout.py` | 143 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1044 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerLogs.viewport.test.tsx` | 142 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1045 | G | admin-ui-viewport | `admin-ui/src/components/FleetHealthCard.viewport.test.tsx` | 140 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1046 | G | admin-ui-viewport | `admin-ui/src/components/FixLoopConvergenceWidget.viewport.test.tsx` | 136 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1047 | G | admin-ui-viewport | `admin-ui/src/components/ReleaseQualificationFindings.viewport.test.tsx` | 133 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1048 | G | backend | `backend/testing/test_compute_execution_documents.py` | 130 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1049 | G | admin-ui-viewport | `admin-ui/src/components/DirectionPortfolioSection.viewport.test.tsx` | 129 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1050 | G | admin-ui-viewport | `admin-ui/src/components/MediumScopeWidget.viewport.test.tsx` | 127 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1051 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerDiagnostics.viewport.test.tsx` | 126 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1052 | G | admin-ui-viewport | `admin-ui/src/components/TaskStreamPanel.viewport.test.tsx` | 126 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1053 | G | backend | `backend/testing/test_execution_capability_requirements.py` | 126 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1054 | G | admin-ui-viewport | `admin-ui/src/components/ProjectIntegrationBranchSection.viewport.test.tsx` | 125 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1055 | G | backend | `backend/testing/test_release_qualifier_retained_scoring.py` | 125 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1056 | G | backend | `backend/testing/test_migration_0713_hot_sweep_indexes.py` | 124 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1057 | G | backend | `backend/testing/test_release_promotion_compute_image_refresh.py` | 124 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1058 | G | backend | `backend/testing/test_release_qualifier.py` | 124 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1059 | G | admin-ui-viewport | `admin-ui/src/components/ImprovementLanesPanel.viewport.test.tsx` | 123 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1060 | G | admin-ui-viewport | `admin-ui/src/components/CompactJobsTable.viewport.test.tsx` | 121 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1061 | G | backend | `backend/testing/test_post_commit_recovery_claim.py` | 120 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1062 | G | admin-ui-viewport | `admin-ui/src/test/pipeline-composed.viewport.test.tsx` | 119 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1063 | G | backend | `backend/testing/test_local_app_release.py` | 118 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1064 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerSelfReview.viewport.test.tsx` | 117 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1065 | G | admin-ui-viewport | `admin-ui/src/components/Pagination.viewport.test.tsx` | 116 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1066 | G | admin-ui-viewport | `admin-ui/src/components/ProjectManagementModal.viewport.test.tsx` | 116 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1067 | G | admin-ui-viewport | `admin-ui/src/components/StrategicAuditPanel.viewport.test.tsx` | 115 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1068 | G | admin-ui-viewport | `admin-ui/src/components/ProviderSettingsPanel.viewport.test.tsx` | 114 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1069 | G | backend | `backend/testing/test_admin_promotion_enablement.py` | 114 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1070 | G | admin-ui-viewport | `admin-ui/src/components/ProjectBranchesSection.viewport.test.tsx` | 113 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1071 | G | backend | `backend/testing/test_migration_0716_strategic_memory_source_control_plane.py` | 112 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1072 | G | admin-ui-viewport | `admin-ui/src/components/ProjectMembers.viewport.test.tsx` | 108 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1073 | G | admin-ui-viewport | `admin-ui/src/components/RuntimeAccountsPanel.viewport.test.tsx` | 108 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1074 | G | admin-ui-viewport | `admin-ui/src/test/messages-composed.viewport.test.tsx` | 108 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1075 | G | backend | `backend/testing/test_release_serving_reason_attribution.py` | 108 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1076 | G | admin-ui-viewport | `admin-ui/src/components/MessageTypeDropdown.viewport.test.tsx` | 106 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1077 | G | admin-ui-viewport | `admin-ui/src/components/ProjectToolIframe.viewport.test.tsx` | 106 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1078 | G | admin-ui-viewport | `admin-ui/src/components/ComputeArtifactGallery.viewport.test.tsx` | 105 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1079 | G | admin-ui-viewport | `admin-ui/src/components/MessageAttachments.viewport.test.tsx` | 105 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1080 | G | admin-ui-viewport | `admin-ui/src/components/PendingConfirmationsSection.viewport.test.tsx` | 105 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1081 | G | admin-ui-viewport | `admin-ui/src/components/ProjectPromotionTargetSection.viewport.test.tsx` | 105 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1082 | G | admin-ui-viewport | `admin-ui/src/components/ScopeConversionRatesSection.viewport.test.tsx` | 104 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1083 | G | backend | `backend/testing/test_websocket_server_integration.py` | 104 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1084 | G | admin-ui-viewport | `admin-ui/src/components/TaskContextRail.viewport.test.tsx` | 102 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1085 | G | admin-ui-viewport | `admin-ui/src/components/CapabilityTrialsPanel.viewport.test.tsx` | 101 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1086 | G | admin-ui-viewport | `admin-ui/src/components/SystemMaturityCard.viewport.test.tsx` | 101 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1087 | G | admin-ui-viewport | `admin-ui/src/components/ScopeTrendsSection.viewport.test.tsx` | 100 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1088 | G | backend | `backend/testing/test_task_counts_endpoint.py` | 100 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1089 | G | backend | `backend/testing/test_admin_strategic_memory.py` | 99 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1090 | G | backend | `backend/testing/test_release_prepromotion_rehearsal_contracts.py` | 99 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1091 | G | admin-ui-viewport | `admin-ui/src/components/ReviewQualitySection.viewport.test.tsx` | 98 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1092 | G | admin-ui-viewport | `admin-ui/src/components/ParkWakeHealthCard.viewport.test.tsx` | 97 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1093 | G | admin-ui-viewport | `admin-ui/src/components/CriterionVerdictBadge.viewport.test.tsx` | 96 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1094 | G | admin-ui-viewport | `admin-ui/src/components/MetricsIntegrityObservabilityPanel.viewport.test.tsx` | 95 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1095 | G | admin-ui-viewport | `admin-ui/src/components/WarmReuseVsCostTrend.viewport.test.tsx` | 95 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1096 | G | admin-ui-viewport | `admin-ui/src/components/OperatorWorkspaces.viewport.test.tsx` | 94 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1097 | G | backend | `backend/testing/test_rollup_open_pr_reconciliation.py` | 94 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1098 | G | admin-ui-viewport | `admin-ui/src/components/FleetDetailDrawer.viewport.test.tsx` | 92 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1099 | G | admin-ui-viewport | `admin-ui/src/components/SettingsOrchestratorSection.viewport.test.tsx` | 91 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1100 | G | backend | `backend/testing/test_runbook_drift.py` | 91 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1101 | G | admin-ui-viewport | `admin-ui/src/components/SrRetrospectiveShared.viewport.test.tsx` | 90 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1102 | G | admin-ui-viewport | `admin-ui/src/components/UserManagement.viewport.test.tsx` | 90 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1103 | G | backend | `backend/testing/test_vm_lifecycle_runner_doomed_marker.py` | 89 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1104 | G | admin-ui-viewport | `admin-ui/src/components/ProjectResourceEnvelopeSection.viewport.test.tsx` | 88 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1105 | G | admin-ui-viewport | `admin-ui/src/components/SystemStatusCard.viewport.test.tsx` | 88 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1106 | G | admin-ui-viewport | `admin-ui/src/components/WhiteboardRailSection.viewport.test.tsx` | 88 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1107 | G | backend | `backend/testing/test_agent_task_capabilities.py` | 88 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1108 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnerConfigPanel.viewport.test.tsx` | 87 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1109 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAutoRemediationSection.viewport.test.tsx` | 87 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1110 | G | admin-ui-viewport | `admin-ui/src/components/SettingsGeneralSection.viewport.test.tsx` | 87 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1111 | G | backend | `backend/testing/test_qualifier_smoketest_retired.py` | 86 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1112 | G | admin-ui-viewport | `admin-ui/src/components/CommandPalette.viewport.test.tsx` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1113 | G | admin-ui-viewport | `admin-ui/src/components/DirectionAutoPauseWidget.viewport.test.tsx` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1114 | G | admin-ui-viewport | `admin-ui/src/components/SrBadges.viewport.test.tsx` | 85 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1115 | G | backend | `backend/testing/test_admin_task_mutations_import.py` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1116 | G | backend | `backend/testing/test_strategic_resident_activity.py` | 85 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1117 | G | admin-ui-viewport | `admin-ui/src/components/CompletionDebtPanel.viewport.test.tsx` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1118 | G | admin-ui-viewport | `admin-ui/src/components/EvergreenBacklogPanel.viewport.test.tsx` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1119 | G | backend | `backend/testing/test_migration_0718_strategic_memory_timezone_columns.py` | 84 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1120 | G | backend | `backend/testing/test_release_activation.py` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1121 | G | admin-ui-viewport | `admin-ui/src/components/ErrorBoundary.viewport.test.tsx` | 82 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1122 | G | admin-ui-viewport | `admin-ui/src/components/SettingsAdvancedSection.viewport.test.tsx` | 81 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1123 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAlertDomainsSection.viewport.test.tsx` | 80 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1124 | G | admin-ui-viewport | `admin-ui/src/components/ProviderCategoriesPanel.viewport.test.tsx` | 80 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1125 | G | backend | `backend/testing/test_direction_terminal_guard.py` | 80 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1126 | G | admin-ui-viewport | `admin-ui/src/components/DependencyHealthCard.viewport.test.tsx` | 79 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1127 | G | backend | `backend/testing/test_blocked_recheck_autonomy.py` | 79 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1128 | G | admin-ui-viewport | `admin-ui/src/components/ReleaseEvidence.viewport.test.tsx` | 76 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1129 | G | admin-ui-viewport | `admin-ui/src/components/ProjectIssueImplementationSection.viewport.test.tsx` | 75 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1130 | G | admin-ui-viewport | `admin-ui/src/components/ProjectResourceAvailabilityCard.viewport.test.tsx` | 75 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1131 | G | admin-ui-viewport | `admin-ui/src/components/ProviderCostPanel.viewport.test.tsx` | 74 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1132 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAutoReviewSection.viewport.test.tsx` | 73 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1133 | G | admin-ui-viewport | `admin-ui/src/components/StrategicSessionControl.viewport.test.tsx` | 73 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
-| 1134 | G | admin-ui-viewport | `admin-ui/src/components/UILoadTimingPanel.viewport.test.tsx` | 73 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1135 | G | backend | `backend/testing/test_strategic_stall_visibility.py` | 71 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1136 | G | admin-ui-viewport | `admin-ui/src/components/AutonomousConfigSection.viewport.test.tsx` | 70 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1137 | G | admin-ui-viewport | `admin-ui/src/components/DesignDocViewer.viewport.test.tsx` | 70 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1138 | G | admin-ui-viewport | `admin-ui/src/components/EventVisibilityMenu.viewport.test.tsx` | 70 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1139 | G | admin-ui-viewport | `admin-ui/src/components/MuteWindowMenu.viewport.test.tsx` | 69 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1140 | G | admin-ui-viewport | `admin-ui/src/components/TaskDurationWidget.viewport.test.tsx` | 69 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1141 | G | admin-ui-viewport | `admin-ui/src/components/DashboardMetricCards.viewport.test.tsx` | 68 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1142 | G | admin-ui-viewport | `admin-ui/src/components/StrategicStreamingPreview.viewport.test.tsx` | 68 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1143 | G | admin-ui-viewport | `admin-ui/src/components/StructuralHealthObservabilityPanel.viewport.test.tsx` | 68 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1144 | G | admin-ui-viewport | `admin-ui/src/components/ConsultationProgressRow.viewport.test.tsx` | 67 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1145 | G | admin-ui-viewport | `admin-ui/src/components/MarkdownContent.viewport.test.tsx` | 67 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1146 | G | admin-ui-viewport | `admin-ui/src/components/ProjectSwitcherDropdown.viewport.test.tsx` | 66 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1147 | G | admin-ui-viewport | `admin-ui/src/components/FailureStageWidget.viewport.test.tsx` | 65 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1148 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnersDashboard.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1149 | G | admin-ui-viewport | `admin-ui/src/components/RecurringPatternsSection.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1150 | G | admin-ui-viewport | `admin-ui/src/components/SavedViewsTabStrip.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1151 | G | admin-ui-viewport | `admin-ui/src/components/AcceptanceGradeBadge.viewport.test.tsx` | 64 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1152 | G | admin-ui-viewport | `admin-ui/src/components/EvergreenFillObservabilityPanel.viewport.test.tsx` | 63 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1153 | G | admin-ui-viewport | `admin-ui/src/components/SaveViewDialog.viewport.test.tsx` | 63 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1154 | G | admin-ui-viewport | `admin-ui/src/components/NullBranchDiagnosticsPanel.viewport.test.tsx` | 62 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1155 | G | backend | `backend/testing/test_research_deferred_carry.py` | 62 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1156 | G | admin-ui-viewport | `admin-ui/src/components/MergeGateFleetHealthCard.viewport.test.tsx` | 61 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1157 | G | admin-ui-viewport | `admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx` | 61 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
-| 1158 | G | admin-ui-viewport | `admin-ui/src/components/PoolAccountHealthPanel.viewport.test.tsx` | 60 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1159 | G | admin-ui-viewport | `admin-ui/src/components/StrategistStatusChip.viewport.test.tsx` | 58 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1160 | G | backend | `backend/testing/test_migration_0719_validate_task_context_size_constraint.py` | 57 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1161 | G | backend | `backend/testing/test_migration_0715_strategic_context_envelopes.py` | 53 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1162 | G | backend | `backend/testing/test_github_oauth_origins.py` | 52 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1163 | G | backend | `backend/testing/test_agent_task_contract.py` | 50 | 0 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1164 | G | admin-ui-viewport | `admin-ui/src/components/WarmStartOriginRow.viewport.test.tsx` | 49 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1165 | G | admin-ui-viewport | `admin-ui/src/components/AccountMenu.viewport.test.tsx` | 45 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1166 | G | backend | `backend/testing/test_agent_memory_consolidation.py` | 43 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1167 | G | admin-ui-viewport | `admin-ui/src/components/MessagesSummaryCard.viewport.test.tsx` | 41 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1168 | G | admin-ui-viewport | `admin-ui/src/components/EvidenceTierBadge.viewport.test.tsx` | 39 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1169 | G | admin-ui-viewport | `admin-ui/src/components/KeyboardShortcutsOverlay.viewport.test.tsx` | 36 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1170 | G | backend | `backend/testing/test_compute_outcome_status.py` | 34 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1171 | G | admin-ui-viewport | `admin-ui/src/components/TaskFixLoopPanel.viewport.test.tsx` | 32 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1172 | G | backend | `backend/testing/test_orchestrator_health_authority.py` | 32 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1173 | G | admin-ui-viewport | `admin-ui/src/components/AdversarialQualityPanel.viewport.test.tsx` | 28 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1174 | G | admin-ui-viewport | `admin-ui/src/components/WelcomeScreen.viewport.test.tsx` | 28 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1175 | G | backend | `backend/testing/test_failure_classification_retained.py` | 11 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 596 | G | agent | `agent/src/handlers/conversation-message-streamer.test.ts` | 183 | 6 | under 1500 LOC | 0.029s measured | — |
+| 597 | G | admin-ui | `admin-ui/src/utils/taskCsv.test.ts` | 125 | 6 | under 1500 LOC | 0.029s measured | — |
+| 598 | G | backend | `backend/testing/test_merge_size_limits.py` | 166 | 13 | under 1500 LOC | 0.029s measured | — |
+| 599 | G | admin-ui | `admin-ui/src/test/viewport-diff.test.ts` | 98 | 4 | under 1500 LOC | 0.028s measured | — |
+| 600 | G | admin-ui | `admin-ui/src/hooks/usePersistedState.test.ts` | 87 | 9 | under 1500 LOC | 0.028s measured | — |
+| 601 | G | admin-ui | `admin-ui/src/components/SearchFilterBar.test.tsx` | 23 | 1 | under 1500 LOC | 0.027s measured | — |
+| 602 | G | admin-ui | `admin-ui/src/components/AnomalyThrottleBanner.test.tsx` | 54 | 3 | under 1500 LOC | 0.026s measured | — |
+| 603 | G | agent | `agent/src/prompt-helper-refs.test.ts` | 326 | 5 | under 1500 LOC | 0.025s measured | — |
+| 604 | G | admin-ui | `admin-ui/src/utils/strategicWorkSessionMetrics.test.ts` | 40 | 2 | under 1500 LOC | 0.025s measured | — |
+| 605 | G | admin-ui | `admin-ui/src/hooks/useVersionLifecycle.test.tsx` | 33 | 1 | under 1500 LOC | 0.025s measured | — |
+| 606 | G | backend | `backend/testing/test_notification.py` | 134 | 5 | under 1500 LOC | 0.025s measured | — |
+| 607 | G | backend | `backend/testing/test_c18_check_runs_cache_error_bypass.py` | 330 | 8 | under 1500 LOC | 0.025s measured | — |
+| 608 | G | backend | `backend/testing/test_branch_resolution.py` | 196 | 15 | under 1500 LOC | 0.024s measured | — |
+| 609 | G | backend | `backend/testing/test_github_checks.py` | 670 | 24 | under 1500 LOC | 0.023s measured | — |
+| 610 | G | backend | `backend/testing/test_pr_is_not_behind_counter.py` | 224 | 13 | under 1500 LOC | 0.023s measured | — |
+| 611 | G | agent | `agent/src/handlers/typed-fast-resident.test.ts` | 481 | 16 | under 1500 LOC | 0.023s measured | protected; declared floor 16 |
+| 612 | G | admin-ui | `admin-ui/src/__tests__/strategicReconnect.test.tsx` | 160 | 2 | under 1500 LOC | 0.023s measured | — |
+| 613 | G | admin-ui | `admin-ui/src/hooks/useConversationSend.test.tsx` | 85 | 5 | under 1500 LOC | 0.023s measured | — |
+| 614 | G | backend | `backend/testing/test_migration_0273_normalise_indexes.py` | 158 | 5 | under 1500 LOC | 0.022s measured | — |
+| 615 | G | admin-ui | `admin-ui/src/hooks/useStrategicContextNavigation.test.tsx` | 253 | 7 | under 1500 LOC | 0.022s measured | — |
+| 616 | G | backend | `backend/testing/test_migration_0531_backfill_encryption.py` | 203 | 2 | under 1500 LOC | 0.022s measured | — |
+| 617 | G | backend | `backend/testing/test_direction_mode.py` | 126 | 12 | under 1500 LOC | 0.021s measured | — |
+| 618 | G | backend | `backend/testing/test_migration_0141_reconcile.py` | 121 | 3 | under 1500 LOC | 0.021s measured | — |
+| 619 | G | backend | `backend/testing/test_migration_path.py` | 72 | 10 | under 1500 LOC | 0.021s measured | — |
+| 620 | G | agent | `agent/src/handlers/artifacts-helper.test.ts` | 151 | 4 | under 1500 LOC | 0.021s measured | — |
+| 621 | G | backend | `backend/testing/test_migration_reconciliation.py` | 111 | 7 | under 1500 LOC | 0.021s measured | — |
+| 622 | G | admin-ui | `admin-ui/src/hooks/useStrategistStatus.test.ts` | 120 | 10 | under 1500 LOC | 0.020s measured | — |
+| 623 | G | admin-ui | `admin-ui/src/hooks/useProjectConfig.test.tsx` | 68 | 2 | under 1500 LOC | 0.020s measured | — |
+| 624 | G | agent | `agent/src/utils/test-fix-loop.test.ts` | 1,376 | 56 | under 1500 LOC | 0.019s measured | — |
+| 625 | G | admin-ui | `admin-ui/src/strategicStateApi.test.ts` | 562 | 28 | under 1500 LOC | 0.019s measured | — |
+| 626 | G | agent | `agent/src/handlers/artifact-consume.test.ts` | 436 | 19 | under 1500 LOC | 0.019s measured | — |
+| 627 | G | admin-ui | `admin-ui/src/utils/residentToolHandoff.test.ts` | 129 | 7 | under 1500 LOC | 0.019s measured | protected; declared floor 7 |
+| 628 | G | admin-ui | `admin-ui/src/hooks/useViewPreferences.test.ts` | 40 | 5 | under 1500 LOC | 0.019s measured | — |
+| 629 | G | backend | `backend/testing/test_account_model_regression_stats.py` | 148 | 12 | under 1500 LOC | 0.019s measured | — |
+| 630 | G | backend | `backend/testing/test_migration_0532_message_backlog.py` | 190 | 3 | under 1500 LOC | 0.018s measured | — |
+| 631 | G | backend | `backend/testing/test_message_audience_routing.py` | 165 | 10 | under 1500 LOC | 0.018s measured | — |
+| 632 | G | backend | `backend/testing/test_ci_infra_rerun.py` | 104 | 10 | under 1500 LOC | 0.017s measured | — |
+| 633 | G | agent | `agent/src/handlers/index.test.ts` | 635 | 102 | under 1500 LOC | 0.017s measured | protected; declared floor 102 |
+| 634 | G | admin-ui | `admin-ui/src/utils/strategicContextDescriptor.test.ts` | 343 | 10 | under 1500 LOC | 0.017s measured | — |
+| 635 | G | admin-ui | `admin-ui/src/components/SrBadges.test.tsx` | 43 | 1 | under 1500 LOC | 0.017s measured | — |
+| 636 | G | backend | `backend/testing/test_classifier_fixtures.py` | 255 | 10 | under 1500 LOC | 0.016s measured | — |
+| 637 | G | backend | `backend/testing/test_research_actionability.py` | 204 | 5 | under 1500 LOC | 0.016s measured | — |
+| 638 | G | backend | `backend/testing/test_migration_0151_reconcile.py` | 98 | 5 | under 1500 LOC | 0.015s measured | — |
+| 639 | G | agent | `agent/src/handlers/design.test.ts` | 864 | 36 | under 1500 LOC | 0.015s measured | — |
+| 640 | G | admin-ui | `admin-ui/src/utils/directionHelpers.test.ts` | 140 | 17 | under 1500 LOC | 0.015s measured | — |
+| 641 | G | backend | `backend/testing/test_leader_lock_keepalive.py` | 149 | 6 | under 1500 LOC | 0.015s measured | — |
+| 642 | G | agent | `agent/src/prompt.context.test.ts` | 1,434 | 116 | under 1500 LOC | 0.014s measured | — |
+| 643 | G | admin-ui | `admin-ui/src/utils/mergeTestVerdict.test.ts` | 374 | 36 | under 1500 LOC | 0.014s measured | — |
+| 644 | G | admin-ui | `admin-ui/src/components/ComputeJobsPanel.utils.test.ts` | 217 | 19 | under 1500 LOC | 0.014s measured | — |
+| 645 | G | admin-ui | `admin-ui/src/utils/citationLinks.test.ts` | 77 | 13 | under 1500 LOC | 0.014s measured | — |
+| 646 | G | backend | `backend/testing/test_event_type_invariants.py` | 320 | 7 | under 1500 LOC | 0.013s measured | — |
+| 647 | G | agent | `agent/src/handlers/code-change.test.ts` | 941 | 37 | under 1500 LOC | 0.013s measured | — |
+| 648 | G | agent | `agent/src/reset.test.ts` | 722 | 32 | under 1500 LOC | 0.013s measured | — |
+| 649 | G | admin-ui | `admin-ui/src/operatorWorkbenchContracts.test.ts` | 551 | 3 | under 1500 LOC | 0.013s measured | — |
+| 650 | G | backend | `backend/testing/test_migration_0472_no_double_encrypt.py` | 147 | 3 | under 1500 LOC | 0.012s measured | — |
+| 651 | G | agent | `agent/src/moduleSize.contract.test.ts` | 156 | 4 | under 1500 LOC | 0.012s measured | — |
+| 652 | G | admin-ui | `admin-ui/src/utils/taskStatus.test.ts` | 102 | 24 | under 1500 LOC | 0.012s measured | — |
+| 653 | G | admin-ui | `admin-ui/src/utils/mathContent.test.ts` | 59 | 12 | under 1500 LOC | 0.012s measured | — |
+| 654 | G | agent | `agent/src/handlers/walkthrough-e2e.test.ts` | 746 | 30 | under 1500 LOC | 0.011s measured | — |
+| 655 | G | admin-ui | `admin-ui/src/utils/strategicSessionLive.test.ts` | 686 | 44 | under 1500 LOC | 0.011s measured | protected; declared floor 44 |
+| 656 | G | agent | `agent/src/handlers/design-doc.test.ts` | 325 | 19 | under 1500 LOC | 0.011s measured | — |
+| 657 | G | admin-ui | `admin-ui/src/components/boardSavedViews.test.ts` | 131 | 11 | under 1500 LOC | 0.011s measured | — |
+| 658 | G | agent | `agent/src/prompts/context-prefix.test.ts` | 1,205 | 69 | under 1500 LOC | 0.010s measured | — |
+| 659 | G | agent | `agent/src/prompts/discovery.test.ts` | 668 | 45 | under 1500 LOC | 0.010s measured | — |
+| 660 | G | agent | `agent/src/handlers/audits-reopen.test.ts` | 390 | 15 | under 1500 LOC | 0.010s measured | — |
+| 661 | G | agent | `agent/src/call-speech/call-speech.test.ts` | 309 | 13 | under 1500 LOC | 0.010s measured | — |
+| 662 | G | admin-ui | `admin-ui/src/utils/pendingWhiteboardArtifactRef.test.ts` | 222 | 6 | under 1500 LOC | 0.010s measured | protected; declared floor 6 |
+| 663 | G | admin-ui | `admin-ui/src/accountManager.test.ts` | 191 | 9 | under 1500 LOC | 0.010s measured | — |
+| 664 | G | admin-ui | `admin-ui/src/utils/parseTimestamp-guard.test.ts` | 155 | 15 | under 1500 LOC | 0.010s measured | — |
+| 665 | G | backend | `backend/testing/test_compute_cloud_run.py` | 968 | 13 | under 1500 LOC | 0.009s measured | — |
+| 666 | G | agent | `agent/src/handlers/memo.test.ts` | 850 | 40 | under 1500 LOC | 0.009s measured | — |
+| 667 | G | agent | `agent/src/handlers/web-research.test.ts` | 653 | 28 | under 1500 LOC | 0.009s measured | — |
+| 668 | G | agent | `agent/src/handlers/capability-proof-trial.test.ts` | 404 | 27 | under 1500 LOC | 0.009s measured | — |
+| 669 | G | agent | `agent/src/media/livekit-call-media.test.ts` | 382 | 13 | under 1500 LOC | 0.009s measured | — |
+| 670 | G | admin-ui | `admin-ui/src/components/MessagesPanel.invariant.test.ts` | 212 | 9 | under 1500 LOC | 0.009s measured | — |
+| 671 | G | admin-ui | `admin-ui/src/App.wiring.test.ts` | 124 | 14 | under 1500 LOC | 0.009s measured | protected; declared floor 14 |
+| 672 | G | admin-ui | `admin-ui/src/utils/pendingAttachmentStore.test.ts` | 77 | 3 | under 1500 LOC | 0.009s measured | protected; declared floor 3 |
+| 673 | G | admin-ui | `admin-ui/src/utils/strategicWorkbenchSession.test.ts` | 66 | 4 | under 1500 LOC | 0.009s measured | — |
+| 674 | G | backend | `backend/testing/test_migration_0457_encrypt_github_pat.py` | 82 | 2 | under 1500 LOC | 0.009s measured | — |
+| 675 | G | agent | `agent/src/telemetry.test.ts` | 773 | 74 | under 1500 LOC | 0.008s measured | — |
+| 676 | G | agent | `agent/src/prompts/self-review.test.ts` | 610 | 76 | under 1500 LOC | 0.008s measured | — |
+| 677 | G | agent | `agent/src/utils/provisioning.test.ts` | 402 | 40 | under 1500 LOC | 0.008s measured | — |
+| 678 | G | agent | `agent/src/handlers/criterion-named-test-trial.test.ts` | 376 | 17 | under 1500 LOC | 0.008s measured | — |
+| 679 | G | admin-ui | `admin-ui/src/components/eventPrefs.test.ts` | 320 | 40 | under 1500 LOC | 0.008s measured | — |
+| 680 | G | agent | `agent/src/utils/agent-token.test.ts` | 312 | 21 | under 1500 LOC | 0.008s measured | — |
+| 681 | G | agent | `agent/src/handlers/live-conversation-resident.test.ts` | 257 | 13 | under 1500 LOC | 0.008s measured | — |
+| 682 | G | admin-ui | `admin-ui/src/utils/conversationDraftState.test.ts` | 111 | 6 | under 1500 LOC | 0.008s measured | — |
+| 683 | G | agent | `agent/src/providers/resident-stream.test.ts` | 380 | 45 | under 1500 LOC | 0.007s measured | protected; declared floor 45 |
+| 684 | G | agent | `agent/src/handlers/strategic-ops-registry.test.ts` | 199 | 13 | under 1500 LOC | 0.007s measured | — |
+| 685 | G | admin-ui | `admin-ui/src/utils/outcomeKinds.test.ts` | 185 | 19 | under 1500 LOC | 0.007s measured | — |
+| 686 | G | admin-ui | `admin-ui/src/utils/sidecarTasks.test.ts` | 173 | 15 | under 1500 LOC | 0.007s measured | — |
+| 687 | G | backend | `backend/testing/test_migration_0639_align_projectcomputeimagebuild_timestamptz.py` | 105 | 1 | under 1500 LOC | 0.007s measured | — |
+| 688 | G | backend | `backend/testing/test_shared_state_facade.py` | 191 | 4 | under 1500 LOC | 0.007s measured | — |
+| 689 | G | backend | `backend/testing/test_branch_cleanup.py` | 50 | 3 | under 1500 LOC | 0.006s measured | — |
+| 690 | G | agent | `agent/src/handlers/structured-output-repair.test.ts` | 732 | 32 | under 1500 LOC | 0.006s measured | — |
+| 691 | G | agent | `agent/src/handlers/discovery-review.test.ts` | 529 | 17 | under 1500 LOC | 0.006s measured | — |
+| 692 | G | agent | `agent/src/handlers/walkthrough-criterion-gates.test.ts` | 463 | 40 | under 1500 LOC | 0.006s measured | — |
+| 693 | G | agent | `agent/src/handlers/verify-tests.gate-bound.test.ts` | 249 | 5 | under 1500 LOC | 0.006s measured | — |
+| 694 | G | admin-ui | `admin-ui/src/taskCapabilities.test.ts` | 136 | 11 | under 1500 LOC | 0.006s measured | — |
+| 695 | G | admin-ui | `admin-ui/src/utils/statusFilter.test.ts` | 49 | 7 | under 1500 LOC | 0.006s measured | — |
+| 696 | G | backend | `backend/testing/test_compute_provision_slots.py` | 49 | 2 | under 1500 LOC | 0.006s measured | — |
+| 697 | G | agent | `agent/src/prompts/review-prompt.test.ts` | 367 | 42 | under 1500 LOC | 0.005s measured | — |
+| 698 | G | agent | `agent/src/utils/design-doc-presence.test.ts` | 330 | 25 | under 1500 LOC | 0.005s measured | — |
+| 699 | G | agent | `agent/src/handlers/prior-knowledge.test.ts` | 313 | 27 | under 1500 LOC | 0.005s measured | — |
+| 700 | G | agent | `agent/src/token-file.test.ts` | 280 | 25 | under 1500 LOC | 0.005s measured | — |
+| 701 | G | agent | `agent/src/handlers/compute-experiment.test.ts` | 253 | 12 | under 1500 LOC | 0.005s measured | — |
+| 702 | G | agent | `agent/src/oauth-rotation.test.ts` | 205 | 10 | under 1500 LOC | 0.005s measured | — |
+| 703 | G | agent | `agent/src/handlers/verify-tests.setup-retry.test.ts` | 175 | 5 | under 1500 LOC | 0.005s measured | — |
+| 704 | G | agent | `agent/src/git-credential.test.ts` | 170 | 11 | under 1500 LOC | 0.005s measured | — |
+| 705 | G | admin-ui | `admin-ui/src/test/composition-root-wiring.test.ts` | 168 | 5 | under 1500 LOC | 0.005s measured | — |
+| 706 | G | agent | `agent/src/handlers/verify-tests.provision.test.ts` | 159 | 4 | under 1500 LOC | 0.005s measured | — |
+| 707 | G | agent | `agent/src/utils/viewport-shot-download.test.ts` | 140 | 11 | under 1500 LOC | 0.005s measured | — |
+| 708 | G | admin-ui | `admin-ui/src/api/projectTools.residentArtifact.test.ts` | 135 | 5 | under 1500 LOC | 0.005s measured | protected; declared floor 5 |
+| 709 | G | admin-ui | `admin-ui/src/test/orphan-component-guard.test.ts` | 129 | 2 | under 1500 LOC | 0.005s measured | — |
+| 710 | G | admin-ui | `admin-ui/src/utils/unverifiedReasonLabels.test.ts` | 100 | 13 | under 1500 LOC | 0.005s measured | — |
+| 711 | G | admin-ui | `admin-ui/src/utils/newProjectOAuthResume.test.ts` | 84 | 5 | under 1500 LOC | 0.005s measured | — |
+| 712 | G | admin-ui | `admin-ui/src/utils/verdictFormatting.test.ts` | 63 | 9 | under 1500 LOC | 0.005s measured | — |
+| 713 | G | admin-ui | `admin-ui/src/utils/externalUrl.test.ts` | 57 | 12 | under 1500 LOC | 0.005s measured | — |
+| 714 | G | backend | `backend/testing/test_admin_auth_invariant.py` | 100 | 1 | under 1500 LOC | 0.005s measured | — |
+| 715 | G | agent | `agent/src/build-config.test.ts` | 546 | 46 | under 1500 LOC | 0.004s measured | — |
+| 716 | G | agent | `agent/src/prompts/project-context.test.ts` | 409 | 23 | under 1500 LOC | 0.004s measured | — |
+| 717 | G | agent | `agent/src/handlers/research-direction-context.test.ts` | 392 | 36 | under 1500 LOC | 0.004s measured | — |
+| 718 | G | agent | `agent/src/handlers/review-fix-migration.test.ts` | 272 | 20 | under 1500 LOC | 0.004s measured | — |
+| 719 | G | agent | `agent/src/fix-loop-events.test.ts` | 258 | 20 | under 1500 LOC | 0.004s measured | — |
+| 720 | G | agent | `agent/src/providers/foreground-resident.test.ts` | 175 | 9 | under 1500 LOC | 0.004s measured | — |
+| 721 | G | agent | `agent/src/utils/classifier-fixtures.test.ts` | 110 | 6 | under 1500 LOC | 0.004s measured | — |
+| 722 | G | admin-ui | `admin-ui/src/App.test.tsx` | 83 | 4 | under 1500 LOC | 0.004s measured | — |
+| 723 | G | admin-ui | `admin-ui/src/types/workbenchEvents.test.ts` | 77 | 4 | under 1500 LOC | 0.004s measured | — |
+| 724 | G | admin-ui | `admin-ui/src/components/FleetRunnersPanel.utils.test.ts` | 58 | 5 | under 1500 LOC | 0.004s measured | — |
+| 725 | G | admin-ui | `admin-ui/src/utils/idempotencyKey.test.ts` | 56 | 5 | under 1500 LOC | 0.004s measured | — |
+| 726 | G | admin-ui | `admin-ui/src/utils/fixLoopLayers.test.ts` | 40 | 6 | under 1500 LOC | 0.004s measured | — |
+| 727 | G | admin-ui | `admin-ui/src/test/workbench-theme-tokens.test.ts` | 32 | 1 | under 1500 LOC | 0.004s measured | — |
+| 728 | G | admin-ui | `admin-ui/src/utils/time.test.ts` | 30 | 5 | under 1500 LOC | 0.004s measured | — |
+| 729 | G | admin-ui | `admin-ui/src/appWorkbenchConstants.test.ts` | 27 | 3 | under 1500 LOC | 0.004s measured | — |
+| 730 | G | admin-ui | `admin-ui/src/utils/projectSelection.test.ts` | 27 | 2 | under 1500 LOC | 0.004s measured | — |
+| 731 | G | backend | `backend/testing/test_claim_analytics.py` | 40 | 2 | under 1500 LOC | 0.004s measured | — |
+| 732 | G | backend | `backend/testing/test_docs_runbook_drift.py` | 263 | 8 | under 1500 LOC | 0.004s measured | — |
+| 733 | G | agent | `agent/src/handlers/strategic-context-envelope.test.ts` | 224 | 7 | under 1500 LOC | 0.003s measured | — |
+| 734 | G | agent | `agent/src/handlers/review-fix-history.test.ts` | 184 | 21 | under 1500 LOC | 0.003s measured | — |
+| 735 | G | agent | `agent/src/json-extract.test.ts` | 176 | 29 | under 1500 LOC | 0.003s measured | — |
+| 736 | G | agent | `agent/src/providers/usage.test.ts` | 147 | 10 | under 1500 LOC | 0.003s measured | — |
+| 737 | G | agent | `agent/src/branch-literal-regression.test.ts` | 122 | 3 | under 1500 LOC | 0.003s measured | — |
+| 738 | G | agent | `agent/src/taskCapabilities.test.ts` | 114 | 10 | under 1500 LOC | 0.003s measured | — |
+| 739 | G | admin-ui | `admin-ui/src/utils/computeAnalysisLabels.test.ts` | 96 | 12 | under 1500 LOC | 0.003s measured | — |
+| 740 | G | admin-ui | `admin-ui/src/utils/taskGraph.test.ts` | 94 | 11 | under 1500 LOC | 0.003s measured | — |
+| 741 | G | admin-ui | `admin-ui/src/accessControl.test.ts` | 91 | 4 | under 1500 LOC | 0.003s measured | — |
+| 742 | G | admin-ui | `admin-ui/src/utils/mergeGateSummary.test.ts` | 82 | 7 | under 1500 LOC | 0.003s measured | — |
+| 743 | G | admin-ui | `admin-ui/src/utils/imageEdits.test.ts` | 72 | 10 | under 1500 LOC | 0.003s measured | — |
+| 744 | G | admin-ui | `admin-ui/src/types/workbenchTargets.test.ts` | 71 | 4 | under 1500 LOC | 0.003s measured | — |
+| 745 | G | admin-ui | `admin-ui/src/components/projectToolHidden.test.ts` | 47 | 6 | under 1500 LOC | 0.003s measured | — |
+| 746 | G | admin-ui | `admin-ui/src/utils/conversationAttachmentDraftFinalization.test.ts` | 42 | 1 | under 1500 LOC | 0.003s measured | — |
+| 747 | G | admin-ui | `admin-ui/src/utils/conversationMessageIdentity.test.ts` | 24 | 2 | under 1500 LOC | 0.003s measured | — |
+| 748 | G | backend | `backend/testing/test_local_runner_terminal_log.py` | 140 | 1 | under 1500 LOC | 0.002s measured | — |
+| 749 | G | agent | `agent/src/handlers/direction-renderer.test.ts` | 252 | 20 | under 1500 LOC | 0.002s measured | — |
+| 750 | G | agent | `agent/src/reset-invariant.test.ts` | 152 | 9 | under 1500 LOC | 0.002s measured | — |
+| 751 | G | agent | `agent/src/processTracking.test.ts` | 144 | 4 | under 1500 LOC | 0.002s measured | — |
+| 752 | G | agent | `agent/src/node-preflight.test.ts` | 125 | 19 | under 1500 LOC | 0.002s measured | — |
+| 753 | G | agent | `agent/src/handlers/verify-tests.setup-probe.test.ts` | 115 | 2 | under 1500 LOC | 0.002s measured | — |
+| 754 | G | agent | `agent/src/heartbeat-classify.test.ts` | 104 | 13 | under 1500 LOC | 0.002s measured | — |
+| 755 | G | agent | `agent/src/handlers/research-plan-prompt-blocks.test.ts` | 96 | 10 | under 1500 LOC | 0.002s measured | — |
+| 756 | G | admin-ui | `admin-ui/src/qualificationStateVocab.contract.test.ts` | 77 | 4 | under 1500 LOC | 0.002s measured | — |
+| 757 | G | agent | `agent/src/telemetry.prompt_size.test.ts` | 77 | 3 | under 1500 LOC | 0.002s measured | — |
+| 758 | G | admin-ui | `admin-ui/src/test/viewport-capture-config.test.ts` | 57 | 5 | under 1500 LOC | 0.002s measured | — |
+| 759 | G | admin-ui | `admin-ui/src/hooks/useUIState.test.ts` | 41 | 3 | under 1500 LOC | 0.002s measured | — |
+| 760 | G | admin-ui | `admin-ui/src/utils/strategicAttention.test.ts` | 39 | 3 | under 1500 LOC | 0.002s measured | — |
+| 761 | G | admin-ui | `admin-ui/src/utils/convergenceVerdict.test.ts` | 35 | 4 | under 1500 LOC | 0.002s measured | — |
+| 762 | G | admin-ui | `admin-ui/src/utils/conversationSendState.test.ts` | 30 | 1 | under 1500 LOC | 0.002s measured | — |
+| 763 | G | agent | `agent/src/utils/sanitize.test.ts` | 17 | 3 | under 1500 LOC | 0.002s measured | — |
+| 764 | G | admin-ui | `admin-ui/src/useAppState.selection.test.ts` | 15 | 2 | under 1500 LOC | 0.002s measured | — |
+| 765 | G | agent | `agent/src/handlers/research-plan-contract.test.ts` | 198 | 11 | under 1500 LOC | 0.001s measured | — |
+| 766 | G | agent | `agent/src/handlers/strategic-resident-wake.test.ts` | 173 | 9 | under 1500 LOC | 0.001s measured | — |
+| 767 | G | agent | `agent/src/workspaceDisk.test.ts` | 111 | 6 | under 1500 LOC | 0.001s measured | — |
+| 768 | G | admin-ui | `admin-ui/src/branch-literal-regression.test.ts` | 93 | 3 | under 1500 LOC | 0.001s measured | — |
+| 769 | G | agent | `agent/src/handlers/structured-repair.test.ts` | 88 | 3 | under 1500 LOC | 0.001s measured | — |
+| 770 | G | agent | `agent/src/handlers/strategic-stall-advisory.test.ts` | 48 | 3 | under 1500 LOC | 0.001s measured | — |
+| 771 | G | agent | `agent/src/handlers/discovery-review-workspace.test.ts` | 44 | 2 | under 1500 LOC | 0.001s measured | — |
+| 772 | G | admin-ui | `admin-ui/src/utils/failureClass.test.ts` | 43 | 4 | under 1500 LOC | 0.001s measured | — |
+| 773 | G | agent | `agent/src/qualificationStateVocab.contract.test.ts` | 41 | 2 | under 1500 LOC | 0.001s measured | — |
+| 774 | G | agent | `agent/src/handlers/strategic-resident-prompt.test.ts` | 39 | 3 | under 1500 LOC | 0.001s measured | protected; declared floor 3 |
+| 775 | G | agent | `agent/src/_agent_scripts/materialize_manifest.parity.test.ts` | 34 | 1 | under 1500 LOC | 0.001s measured | — |
+| 776 | G | agent | `agent/src/_agent_scripts/fixgate_attribution.parity.test.ts` | 31 | 1 | under 1500 LOC | 0.001s measured | — |
+| 777 | G | admin-ui | `admin-ui/src/utils/composerRequestOwnership.test.ts` | 28 | 2 | under 1500 LOC | 0.001s measured | — |
+| 778 | G | admin-ui | `admin-ui/src/test/environment.test.ts` | 15 | 1 | under 1500 LOC | 0.001s measured | — |
+| 779 | G | admin-ui | `admin-ui/src/components/AdversarialQualityPanel.test.tsx` | 9 | 1 | under 1500 LOC | 0.001s measured | — |
+| 780 | G | backend | `backend/testing/test_runner_heartbeat.py` | 1,411 | 34 | under 1500 LOC | 0.000s measured | — |
+| 781 | G | backend | `backend/testing/test_check_gate_fail_closed.py` | 1,481 | 35 | under 1500 LOC | unknown (no committed measurement) | — |
+| 782 | G | backend | `backend/testing/test_conversation_coordinator_two_speed.py` | 1,445 | 17 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 17 |
+| 783 | G | backend | `backend/testing/test_discovery_review_packet_budget.py` | 1,417 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
+| 784 | G | backend | `backend/testing/test_admin_routers__runners.py` | 1,317 | 33 | under 1500 LOC | unknown (no committed measurement) | — |
+| 785 | G | backend | `backend/testing/test_approval_exact_target_publication.py` | 1,275 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 786 | G | backend | `backend/testing/test_admin_approval_merge_submission_recovery.py` | 1,272 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 787 | G | backend | `backend/testing/test_admin_routers__problem_model.py` | 1,230 | 39 | under 1500 LOC | unknown (no committed measurement) | — |
+| 788 | G | backend | `backend/testing/test_resource_envelope_enforcement.py` | 1,189 | 27 | under 1500 LOC | unknown (no committed measurement) | — |
+| 789 | G | backend | `backend/testing/test_mode_knob_graduation.py` | 1,188 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
+| 790 | G | backend | `backend/testing/test_agent_tasks.py` | 1,186 | 35 | under 1500 LOC | unknown (no committed measurement) | — |
+| 791 | G | backend | `backend/testing/test_workday_resident_invariants.py` | 1,180 | 28 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 28 |
+| 792 | G | backend | `backend/testing/test_admin_routers__autonomous.py` | 1,171 | 27 | under 1500 LOC | unknown (no committed measurement) | — |
+| 793 | G | backend | `backend/testing/test_release_qualifier_audit.py` | 1,145 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
+| 794 | G | backend | `backend/testing/test_strategic_cycle_cost_projection.py` | 1,143 | 46 | under 1500 LOC | unknown (no committed measurement) | — |
+| 795 | G | backend | `backend/testing/test_module_finding_chain.py` | 1,142 | 25 | under 1500 LOC | unknown (no committed measurement) | — |
+| 796 | G | backend | `backend/testing/test_strategic_memory_envelope.py` | 1,113 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
+| 797 | G | backend | `backend/testing/test_migration_0681_0694_preservation.py` | 1,093 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 798 | G | backend | `backend/testing/test_rollup_lineage_fence.py` | 1,089 | 30 | under 1500 LOC | unknown (no committed measurement) | — |
+| 799 | G | backend | `backend/testing/test_strategic_spawn_requests.py` | 1,089 | 20 | under 1500 LOC | unknown (no committed measurement) | — |
+| 800 | G | backend | `backend/testing/test_acceptance_gate__test_corroboration.py` | 1,058 | 26 | under 1500 LOC | unknown (no committed measurement) | — |
+| 801 | G | backend | `backend/testing/test_strategic_lane_linearization.py` | 1,050 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 802 | G | admin-ui-viewport | `admin-ui/src/components/VersionSummaryPanel.viewport.test.tsx` | 1,049 | 43 | under 1500 LOC | unknown (no committed measurement) | — |
+| 803 | G | backend | `backend/testing/test_release_stall_alerts.py` | 1,027 | 28 | under 1500 LOC | unknown (no committed measurement) | — |
+| 804 | G | backend | `backend/testing/test_workday_artifact_materialization.py` | 1,011 | 17 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 17 |
+| 805 | G | backend | `backend/testing/test_rollup_size_preflight.py` | 1,008 | 33 | under 1500 LOC | unknown (no committed measurement) | — |
+| 806 | G | backend | `backend/testing/test_review_park_disposition.py` | 994 | 26 | under 1500 LOC | unknown (no committed measurement) | — |
+| 807 | G | backend | `backend/testing/test_issue_ledger.py` | 989 | 36 | under 1500 LOC | unknown (no committed measurement) | — |
+| 808 | G | backend | `backend/testing/test_release_prepromotion_rehearsal.py` | 987 | 26 | under 1500 LOC | unknown (no committed measurement) | — |
+| 809 | G | backend | `backend/testing/test_llm_cost_attribution.py` | 981 | 19 | under 1500 LOC | unknown (no committed measurement) | — |
+| 810 | G | backend | `backend/testing/test_release_qualifier_walkthrough_evidence.py` | 968 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 811 | G | backend | `backend/testing/test_project_operator_access.py` | 962 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
+| 812 | G | backend | `backend/testing/test_admin_pipeline_observability.py` | 953 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
+| 813 | G | backend | `backend/testing/test_cost_reconciliation.py` | 952 | 24 | under 1500 LOC | unknown (no committed measurement) | — |
+| 814 | G | backend | `backend/testing/test_compute_image_environment.py` | 937 | 23 | under 1500 LOC | unknown (no committed measurement) | — |
+| 815 | G | admin-ui-viewport | `admin-ui/src/components/SrUnhandledEdgesRetrospectivesPanel.viewport.test.tsx` | 927 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
+| 816 | G | backend | `backend/testing/test_strategic_conversation_query.py` | 923 | 15 | under 1500 LOC | unknown (no committed measurement) | — |
+| 817 | G | backend | `backend/testing/test_review_wait_terminal_boundaries.py` | 910 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 818 | G | backend | `backend/testing/test_admin_agent_ops.py` | 895 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 819 | G | backend | `backend/testing/test_release_qualifier__trigger_and_dispatch_regressions.py` | 890 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 820 | G | backend | `backend/testing/test_unactionable_approval_holds.py` | 890 | 33 | under 1500 LOC | unknown (no committed measurement) | — |
+| 821 | G | backend | `backend/testing/test_blind_merge_grade.py` | 882 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
+| 822 | G | backend | `backend/testing/test_admin_routers__users.py` | 876 | 34 | under 1500 LOC | unknown (no committed measurement) | — |
+| 823 | G | admin-ui-viewport | `admin-ui/src/components/ComputeJobsPanel.viewport.test.tsx` | 875 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 824 | G | backend | `backend/testing/test_admin_warm_pool.py` | 865 | 28 | under 1500 LOC | unknown (no committed measurement) | — |
+| 825 | G | backend | `backend/testing/test_schema_invariants.py` | 831 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
+| 826 | G | backend | `backend/testing/test_cost_attribution.py` | 812 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
+| 827 | G | admin-ui-viewport | `admin-ui/src/components/MessagesPanel.viewport.test.tsx` | 786 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
+| 828 | G | backend | `backend/testing/test_strategic_effort_tier_evidence.py` | 780 | 26 | under 1500 LOC | unknown (no committed measurement) | — |
+| 829 | G | admin-ui-viewport | `admin-ui/src/components/VersionLifecyclePanel.viewport.test.tsx` | 763 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
+| 830 | G | backend | `backend/testing/test_admin_project_roles.py` | 741 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 831 | G | backend | `backend/testing/test_pipeline_alert_scan.py` | 736 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
+| 832 | G | admin-ui-viewport | `admin-ui/src/components/ProblemModelViewer.viewport.test.tsx` | 728 | 19 | under 1500 LOC | unknown (no committed measurement) | — |
+| 833 | G | backend | `backend/testing/test_stranded_conversation_message_sweep.py` | 727 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
+| 834 | G | backend | `backend/testing/test_agent__claim_core_auth.py` | 725 | 15 | under 1500 LOC | unknown (no committed measurement) | — |
+| 835 | G | admin-ui-viewport | `admin-ui/src/components/DashboardHome.viewport.test.tsx` | 718 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 836 | G | backend | `backend/testing/test_attempt24_release_safety.py` | 717 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 837 | G | backend | `backend/testing/test_sr_compute_wiring.py` | 710 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 838 | G | backend | `backend/testing/test_acceptance_criteria__walkthrough.py` | 700 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
+| 839 | G | admin-ui-viewport | `admin-ui/src/components/ProjectToolHost.viewport.test.tsx` | 689 | 20 | under 1500 LOC | unknown (no committed measurement) | — |
+| 840 | G | admin-ui-viewport | `admin-ui/src/components/NewTaskModal.viewport.test.tsx` | 688 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 841 | G | backend | `backend/testing/test_compute_quota.py` | 679 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
+| 842 | G | backend | `backend/testing/test_review_claim_fence.py` | 678 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
+| 843 | G | backend | `backend/testing/test_sequenced_dependent_spawn.py` | 672 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
+| 844 | G | backend | `backend/testing/test_acceptance_gate__rule_version.py` | 670 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 845 | G | backend | `backend/testing/test_strategic_consultation_detail.py` | 654 | 15 | under 1500 LOC | unknown (no committed measurement) | — |
+| 846 | G | admin-ui-viewport | `admin-ui/src/components/MessagesListView.viewport.test.tsx` | 648 | 33 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 33 |
+| 847 | G | backend | `backend/testing/test_admin_request_changes_authority.py` | 642 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 848 | G | backend | `backend/testing/test_evaluating_handmerge_latch.py` | 642 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 849 | G | backend | `backend/testing/test_lifecycle_integration.py` | 634 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 850 | G | backend | `backend/testing/test_publication_gate_receipt.py` | 632 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
+| 851 | G | backend | `backend/testing/test_release_qualification_pause_deferral.py` | 628 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 852 | G | backend | `backend/testing/test_strategic_consultation_status.py` | 620 | 3 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 3 |
+| 853 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 608 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 854 | G | backend | `backend/testing/test_reaper_post_orphan_sweep.py` | 608 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 855 | G | backend | `backend/testing/test_blocked_retry_authority.py` | 605 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 856 | G | backend | `backend/testing/test_migration_0682_workday_repair.py` | 600 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 857 | G | backend | `backend/testing/test_runner_enroll_docs_accuracy.py` | 599 | 19 | under 1500 LOC | unknown (no committed measurement) | — |
+| 858 | G | backend | `backend/testing/test_github_onboarding_access.py` | 596 | 15 | under 1500 LOC | unknown (no committed measurement) | — |
+| 859 | G | admin-ui-viewport | `admin-ui/src/components/WorkbenchComposition.viewport.test.tsx` | 590 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 860 | G | backend | `backend/testing/test_acceptance_criteria__trials.py` | 586 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
+| 861 | G | backend | `backend/testing/test_direction_saturation.py` | 579 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 862 | G | backend | `backend/testing/test_strategic_cycle_gating.py` | 578 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 863 | G | backend | `backend/testing/test_wire_timestamp_zone.py` | 577 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
+| 864 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextRail.viewport.test.tsx` | 570 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 865 | G | backend | `backend/testing/test_strategic_fast_live_work.py` | 567 | 5 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 5 |
+| 866 | G | admin-ui-viewport | `admin-ui/src/components/SettingsDeploySection.viewport.test.tsx` | 563 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 867 | G | backend | `backend/testing/test_review_loop_operator_park.py` | 563 | 25 | under 1500 LOC | unknown (no committed measurement) | — |
+| 868 | G | backend | `backend/testing/test_admin_playbook.py` | 559 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
+| 869 | G | backend | `backend/testing/test_direction_lineage_spend.py` | 556 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
+| 870 | G | backend | `backend/testing/test_strategic_payload_size.py` | 547 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 871 | G | backend | `backend/testing/test_test_estate_ranked_queue.py` | 538 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 872 | G | backend | `backend/testing/test_release_qualifier__retry_episode_cap.py` | 533 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
+| 873 | G | backend | `backend/testing/test_strategic_memory_corrections.py` | 532 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
+| 874 | G | backend | `backend/testing/test_anomaly_proposals.py` | 527 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
+| 875 | G | backend | `backend/testing/test_work_session_command_execution.py` | 520 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 876 | G | backend | `backend/testing/test_research_spawn_pending_recovery.py` | 518 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 877 | G | backend | `backend/testing/test_admin_approval_comment_recovery.py` | 514 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 878 | G | admin-ui-viewport | `admin-ui/src/components/DirectionCard.viewport.test.tsx` | 503 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
+| 879 | G | backend | `backend/testing/test_release_qualifier_walkthrough_request.py` | 495 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 880 | G | backend | `backend/testing/test_strategic_resident_continuous_liveness.py` | 495 | 8 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 8 |
+| 881 | G | backend | `backend/testing/test_project_cascade.py` | 494 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 882 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerMeta.viewport.test.tsx` | 483 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
+| 883 | G | backend | `backend/testing/test_admin_warm_vm.py` | 483 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 884 | G | backend | `backend/testing/test_review_pending_requeue.py` | 480 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 885 | G | admin-ui-viewport | `admin-ui/src/components/HeaderBar.viewport.test.tsx` | 479 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
+| 886 | G | backend | `backend/testing/test_project_message_delivery.py` | 475 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 887 | G | backend | `backend/testing/test_strategic_watches.py` | 475 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
+| 888 | G | backend | `backend/testing/test_runner_rate_limiter.py` | 456 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
+| 889 | G | backend | `backend/testing/test_operator_failure_messages.py` | 444 | 27 | under 1500 LOC | unknown (no committed measurement) | — |
+| 890 | G | admin-ui-viewport | `admin-ui/src/components/KnowledgeBrowser.viewport.test.tsx` | 443 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 891 | G | backend | `backend/testing/test_ci_review_wait_dedup_windows.py` | 434 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 892 | G | backend | `backend/testing/test_migration_0697_retained_telemetry_history.py` | 431 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 893 | G | backend | `backend/testing/test_release_qualifier_walkthrough_site.py` | 431 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 894 | G | backend | `backend/testing/test_migration_0679_backlog_clear.py` | 423 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 895 | G | admin-ui-viewport | `admin-ui/src/components/ActivityFeed.viewport.test.tsx` | 422 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 896 | G | backend | `backend/testing/test_attempt24_operator_flows.py` | 422 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 897 | G | backend | `backend/testing/test_release_qualifier_infra_continuation.py` | 422 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 898 | G | backend | `backend/testing/test_runner_decline_epoch.py` | 419 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 899 | G | backend | `backend/testing/test_strategic_autonomous_handoff.py` | 416 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 900 | G | backend | `backend/testing/test_migration_0714_strategic_conversation_correctness.py` | 414 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 901 | G | backend | `backend/testing/test_strategic_memory_claim_redaction_repair.py` | 414 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 902 | G | backend | `backend/testing/test_strategic_memory_service.py` | 403 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 903 | G | backend | `backend/testing/test_warm_pool_readiness.py` | 402 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 904 | G | backend | `backend/testing/test_provider_cost_summary.py` | 401 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 905 | G | backend | `backend/testing/test_hotfix_narrow_candidate.py` | 390 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
+| 906 | G | backend | `backend/testing/test_strategic_payload.py` | 389 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 907 | G | admin-ui-viewport | `admin-ui/src/components/MessagesComposer.viewport.test.tsx` | 386 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 908 | G | backend | `backend/testing/test_admin_approval_dedup_authority.py` | 382 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 909 | G | backend | `backend/testing/test_discovery_models.py` | 382 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 910 | G | backend | `backend/testing/test_approval_gate_config.py` | 377 | 13 | under 1500 LOC | unknown (no committed measurement) | — |
+| 911 | G | backend | `backend/testing/test_staging_base_refresh.py` | 377 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 912 | G | backend | `backend/testing/test_task_constructor_authority_manifest.py` | 370 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 913 | G | backend | `backend/testing/test_research_lock_order.py` | 368 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 914 | G | backend | `backend/testing/test_project_tool_context.py` | 361 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
+| 915 | G | backend | `backend/testing/test_discovery_admission.py` | 356 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 916 | G | backend | `backend/testing/test_strategic_memory_runtime.py` | 355 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 917 | G | backend | `backend/testing/test_evaluating_fence_hold.py` | 354 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 918 | G | backend | `backend/testing/test_admin_serial_console.py` | 353 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 919 | G | backend | `backend/testing/test_scripts_test_lane.py` | 349 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 920 | G | admin-ui-viewport | `admin-ui/src/components/PipelineWorkspace.viewport.test.tsx` | 348 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 921 | G | backend | `backend/testing/test_process_role_lifecycle.py` | 347 | 25 | under 1500 LOC | unknown (no committed measurement) | — |
+| 922 | G | admin-ui-viewport | `admin-ui/src/components/WarmVmPanel.viewport.test.tsx` | 342 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 923 | G | backend | `backend/testing/test_discovery_authority_reconciliation.py` | 342 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 924 | G | backend | `backend/testing/test_compute_gpu.py` | 341 | 20 | under 1500 LOC | unknown (no committed measurement) | — |
+| 925 | G | backend | `backend/testing/test_strategic_memory_retrieval.py` | 339 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 926 | G | backend | `backend/testing/test_project_resource_summary.py` | 338 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 927 | G | backend | `backend/testing/test_migration_0640_0682_workday_chain.py` | 334 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 928 | G | admin-ui-viewport | `admin-ui/src/components/NewProjectModal.viewport.test.tsx` | 325 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 929 | G | backend | `backend/testing/test_strategic_resident_pipeline_projection.py` | 324 | 3 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 3 |
+| 930 | G | admin-ui-viewport | `admin-ui/src/components/SrTrendBreakdown.viewport.test.tsx` | 323 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 931 | G | backend | `backend/testing/test_agent_github.py` | 323 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 932 | G | backend | `backend/testing/test_strategic_memory_control.py` | 319 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 933 | G | backend | `backend/testing/test_strategic_workday_handoff_recovery.py` | 307 | 4 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 4 |
+| 934 | G | backend | `backend/testing/test_admin_discovery_cycles.py` | 306 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 935 | G | backend | `backend/testing/test_completion_automatic_task_authority.py` | 306 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 936 | G | admin-ui-viewport | `admin-ui/src/components/LlmCostBreakdownPanel.viewport.test.tsx` | 305 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 937 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextArtifactSlot.viewport.test.tsx` | 305 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 938 | G | backend | `backend/testing/test_concurrency_overlap.py` | 303 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 939 | G | backend | `backend/testing/test_review_admission_ownership.py` | 298 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 940 | G | backend | `backend/testing/test_stall_advisory.py` | 298 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 941 | G | admin-ui-viewport | `admin-ui/src/components/ProjectBuildConfigSection.viewport.test.tsx` | 297 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 942 | G | backend | `backend/testing/test_release_qualifier_contracts.py` | 297 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 943 | G | admin-ui-viewport | `admin-ui/src/components/SettingsSectionRouter.viewport.test.tsx` | 294 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 944 | G | backend | `backend/testing/test_agent_access_projections.py` | 294 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 945 | G | admin-ui-viewport | `admin-ui/src/components/MetricsDashboard.viewport.test.tsx` | 291 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 946 | G | admin-ui-viewport | `admin-ui/src/components/DirectionsPanel.viewport.test.tsx` | 290 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 947 | G | backend | `backend/testing/test_migration_0724_name_reuse_after_revocation.py` | 287 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 948 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawer.viewport.test.tsx` | 285 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 949 | G | backend | `backend/testing/test_admin_orchestrator_errors.py` | 282 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 950 | G | backend | `backend/testing/test_admin_approval_gate_release_authority.py` | 281 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 951 | G | backend | `backend/testing/test_automatic_task_creation_authority.py` | 280 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 952 | G | backend | `backend/testing/test_strategic_memory_source_schema.py` | 280 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 953 | G | admin-ui-viewport | `admin-ui/src/components/RunningUpdatePanel.viewport.test.tsx` | 277 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 954 | G | backend | `backend/testing/test_project_outcome_projection.py` | 277 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 955 | G | backend | `backend/testing/test_rollup_premerge_tip.py` | 276 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 956 | G | backend | `backend/testing/test_warm_claim_account_attribution.py` | 274 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 957 | G | admin-ui-viewport | `admin-ui/src/components/MessageBubble.viewport.test.tsx` | 272 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 958 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerFailureDetail.viewport.test.tsx` | 272 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
+| 959 | G | backend | `backend/testing/test_discovery_review_sequencing.py` | 271 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 960 | G | backend | `backend/testing/test_migration_0669_backfill_direction_fa_telemetry.py` | 271 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 961 | G | backend | `backend/testing/test_migration_0696_project_sr_analytics.py` | 269 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 962 | G | backend | `backend/testing/test_migration_0720_direction_index_repair.py` | 255 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 963 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextWorkspace.viewport.test.tsx` | 254 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 964 | G | admin-ui-viewport | `admin-ui/src/components/NotesTool.viewport.test.tsx` | 253 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 965 | G | backend | `backend/testing/test_compute_secret_manifest.py` | 252 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 966 | G | backend | `backend/testing/test_strategic_memory_claim_redaction_repair_retry.py` | 252 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 967 | G | backend | `backend/testing/test_strategic_resident_work_state.py` | 248 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 968 | G | admin-ui-viewport | `admin-ui/src/components/RemediationFunnelSection.viewport.test.tsx` | 246 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 969 | G | backend | `backend/testing/test_admin_bulk_cancellation_fencing.py` | 246 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 970 | G | backend | `backend/testing/test_strategic_memory_governance.py` | 245 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 971 | G | backend | `backend/testing/test_strategic_memory_knowledge.py` | 245 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 972 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnersPanel.viewport.test.tsx` | 243 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 973 | G | admin-ui-viewport | `admin-ui/src/components/WhiteboardTool.viewport.test.tsx` | 237 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 974 | G | backend | `backend/testing/test_completion_topic_overlap.py` | 237 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
+| 975 | G | admin-ui-viewport | `admin-ui/src/components/AutonomousStatus.viewport.test.tsx` | 234 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 976 | G | admin-ui-viewport | `admin-ui/src/components/ResearchBrowser.viewport.test.tsx` | 234 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 977 | G | backend | `backend/testing/test_automatic_task_creation_producers.py` | 233 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 978 | G | backend | `backend/testing/test_migration_0657_0671_resident_session_id.py` | 228 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 979 | G | backend | `backend/testing/test_discovery_runtime_integration.py` | 227 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 980 | G | backend | `backend/testing/test_release_qualifier_candidate_sha_stamp.py` | 225 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 981 | G | admin-ui-viewport | `admin-ui/src/components/ViewportDebtPanel.viewport.test.tsx` | 223 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 982 | G | admin-ui-viewport | `admin-ui/src/components/LaneDiagPanel.viewport.test.tsx` | 222 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 983 | G | admin-ui-viewport | `admin-ui/src/components/PRMonitorSection.viewport.test.tsx` | 219 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 984 | G | backend | `backend/testing/test_terminal_rollup_pr_sweep.py` | 219 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 985 | G | backend | `backend/testing/test_migration_0668_drop_projectcomputeimagebuild.py` | 218 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 986 | G | backend | `backend/testing/test_migration_0698_cochange_state.py` | 217 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 987 | G | backend | `backend/testing/test_migration_0717_strategic_memory_semantic_ledger.py` | 217 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 988 | G | admin-ui-viewport | `admin-ui/src/components/TaskCard.viewport.test.tsx` | 214 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 989 | G | admin-ui-viewport | `admin-ui/src/components/OrchestratorHealthBar.viewport.test.tsx` | 212 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 990 | G | backend | `backend/testing/test_runner_binding_capacity_reason.py` | 212 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 991 | G | admin-ui-viewport | `admin-ui/src/components/KanbanBoard.viewport.test.tsx` | 211 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 992 | G | admin-ui-viewport | `admin-ui/src/components/SettingsNotificationsSection.viewport.test.tsx` | 210 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 993 | G | backend | `backend/testing/test_review_wait_monitor_owned_gate.py` | 206 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 994 | G | backend | `backend/testing/test_compute_artifact_iam.py` | 204 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 995 | G | backend | `backend/testing/test_rollup_handoff_ci_gate.py` | 204 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 996 | G | backend | `backend/testing/test_anomaly_persistence.py` | 203 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 997 | G | backend | `backend/testing/test_verification_toolchain.py` | 203 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 998 | G | admin-ui-viewport | `admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx` | 202 | 8 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 8 |
+| 999 | G | admin-ui-viewport | `admin-ui/src/components/PipelineView.viewport.test.tsx` | 197 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1000 | G | backend | `backend/testing/test_vm_lifecycle_forensics.py` | 196 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1001 | G | backend | `backend/testing/test_release_ownership.py` | 195 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1002 | G | backend | `backend/testing/test_migration_0656_projectmessage_context_audience_index.py` | 194 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1003 | G | admin-ui-viewport | `admin-ui/src/components/ProviderModelBreakdownPanel.viewport.test.tsx` | 192 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1004 | G | admin-ui-viewport | `admin-ui/src/components/SearchFilterBar.viewport.test.tsx` | 192 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1005 | G | admin-ui-viewport | `admin-ui/src/components/BulkActionBar.viewport.test.tsx` | 191 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1006 | G | backend | `backend/testing/test_projects.py` | 186 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1007 | G | backend | `backend/testing/test_user_management.py` | 186 | 17 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1008 | G | admin-ui-viewport | `admin-ui/src/components/KanbanColumn.viewport.test.tsx` | 183 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1009 | G | backend | `backend/testing/test_strategic_memory_invariants.py` | 182 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1010 | G | backend | `backend/testing/test_release_operator_commit_gate.py` | 181 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1011 | G | backend | `backend/testing/test_admin_task_requeue_terminal.py` | 180 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1012 | G | backend | `backend/testing/test_strategic_op_contracts.py` | 179 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1013 | G | admin-ui-viewport | `admin-ui/src/components/ProblemModelEditor.viewport.test.tsx` | 178 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1014 | G | backend | `backend/testing/test_voice_credentials.py` | 178 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1015 | G | admin-ui-viewport | `admin-ui/src/components/ConfirmDialog.viewport.test.tsx` | 175 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1016 | G | backend | `backend/testing/test_task_list_pagination.py` | 175 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1017 | G | backend | `backend/testing/test_strategic_memory_sources.py` | 174 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1018 | G | admin-ui-viewport | `admin-ui/src/components/EffortEfficiencyPanel.viewport.test.tsx` | 173 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1019 | G | backend | `backend/testing/test_research_mem_eval.py` | 172 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1020 | G | admin-ui-viewport | `admin-ui/src/components/MergeVerificationBanner.viewport.test.tsx` | 167 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1021 | G | admin-ui-viewport | `admin-ui/src/components/TaskComputeJobsSection.viewport.test.tsx` | 165 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1022 | G | admin-ui-viewport | `admin-ui/src/components/SettingsAccountsSection.viewport.test.tsx` | 163 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1023 | G | backend | `backend/testing/test_task_lifecycle_modularity.py` | 162 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1024 | G | admin-ui-viewport | `admin-ui/src/test/kanban-composed.viewport.test.tsx` | 158 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1025 | G | admin-ui-viewport | `admin-ui/src/components/VersionMismatchBanner.viewport.test.tsx` | 155 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1026 | G | backend | `backend/testing/test_frontend_static.py` | 155 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1027 | G | backend | `backend/testing/test_recovery_sidecar.py` | 155 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1028 | G | admin-ui-viewport | `admin-ui/src/components/RuntimeWorkspace.viewport.test.tsx` | 154 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1029 | G | admin-ui-viewport | `admin-ui/src/components/ArchiveView.viewport.test.tsx` | 153 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1030 | G | admin-ui-viewport | `admin-ui/src/components/OuterReviewLoopConvergenceWidget.viewport.test.tsx` | 153 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1031 | G | backend | `backend/testing/test_failure_reason.py` | 152 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1032 | G | admin-ui-viewport | `admin-ui/src/components/RecentErrorsWidget.viewport.test.tsx` | 151 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1033 | G | backend | `backend/testing/test_github_commit_resolution.py` | 150 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1034 | G | backend | `backend/testing/test_release_artifact_freshness.py` | 150 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1035 | G | backend | `backend/testing/test_strategic_correctness_preflight.py` | 150 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1036 | G | admin-ui-viewport | `admin-ui/src/components/AlertsBanner.viewport.test.tsx` | 149 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1037 | G | backend | `backend/testing/test_sr_analytics_store.py` | 148 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1038 | G | backend | `backend/testing/test_strategic_workday_mutation_rebind.py` | 148 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
+| 1039 | G | admin-ui-viewport | `admin-ui/src/components/ConsoleHome.viewport.test.tsx` | 147 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1040 | G | backend | `backend/testing/test_migration_0722_discovery_controller.py` | 147 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1041 | G | admin-ui-viewport | `admin-ui/src/components/DriftSignalsCard.viewport.test.tsx` | 146 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1042 | G | admin-ui-viewport | `admin-ui/src/components/WorkbenchLayout.viewport.test.tsx` | 144 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1043 | G | backend | `backend/testing/test_livekit_tokens.py` | 143 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1044 | G | backend | `backend/testing/test_release_activation_after_timeout.py` | 143 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1045 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerLogs.viewport.test.tsx` | 142 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1046 | G | admin-ui-viewport | `admin-ui/src/components/FleetHealthCard.viewport.test.tsx` | 140 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1047 | G | admin-ui-viewport | `admin-ui/src/components/FixLoopConvergenceWidget.viewport.test.tsx` | 136 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1048 | G | admin-ui-viewport | `admin-ui/src/components/ReleaseQualificationFindings.viewport.test.tsx` | 133 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1049 | G | backend | `backend/testing/test_compute_execution_documents.py` | 130 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1050 | G | admin-ui-viewport | `admin-ui/src/components/DirectionPortfolioSection.viewport.test.tsx` | 129 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1051 | G | admin-ui-viewport | `admin-ui/src/components/MediumScopeWidget.viewport.test.tsx` | 127 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1052 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerDiagnostics.viewport.test.tsx` | 126 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1053 | G | admin-ui-viewport | `admin-ui/src/components/TaskStreamPanel.viewport.test.tsx` | 126 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1054 | G | backend | `backend/testing/test_execution_capability_requirements.py` | 126 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1055 | G | admin-ui-viewport | `admin-ui/src/components/ProjectIntegrationBranchSection.viewport.test.tsx` | 125 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1056 | G | backend | `backend/testing/test_release_qualifier_retained_scoring.py` | 125 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1057 | G | backend | `backend/testing/test_migration_0713_hot_sweep_indexes.py` | 124 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1058 | G | backend | `backend/testing/test_release_promotion_compute_image_refresh.py` | 124 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1059 | G | backend | `backend/testing/test_release_qualifier.py` | 124 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1060 | G | admin-ui-viewport | `admin-ui/src/components/ImprovementLanesPanel.viewport.test.tsx` | 123 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1061 | G | admin-ui-viewport | `admin-ui/src/components/CompactJobsTable.viewport.test.tsx` | 121 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1062 | G | backend | `backend/testing/test_post_commit_recovery_claim.py` | 120 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1063 | G | admin-ui-viewport | `admin-ui/src/test/pipeline-composed.viewport.test.tsx` | 119 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1064 | G | backend | `backend/testing/test_local_app_release.py` | 118 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1065 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerSelfReview.viewport.test.tsx` | 117 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1066 | G | admin-ui-viewport | `admin-ui/src/components/Pagination.viewport.test.tsx` | 116 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1067 | G | admin-ui-viewport | `admin-ui/src/components/ProjectManagementModal.viewport.test.tsx` | 116 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1068 | G | admin-ui-viewport | `admin-ui/src/components/StrategicAuditPanel.viewport.test.tsx` | 115 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1069 | G | admin-ui-viewport | `admin-ui/src/components/ProviderSettingsPanel.viewport.test.tsx` | 114 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1070 | G | backend | `backend/testing/test_admin_promotion_enablement.py` | 114 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1071 | G | admin-ui-viewport | `admin-ui/src/components/ProjectBranchesSection.viewport.test.tsx` | 113 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1072 | G | backend | `backend/testing/test_migration_0716_strategic_memory_source_control_plane.py` | 112 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1073 | G | admin-ui-viewport | `admin-ui/src/components/ProjectMembers.viewport.test.tsx` | 108 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1074 | G | admin-ui-viewport | `admin-ui/src/components/RuntimeAccountsPanel.viewport.test.tsx` | 108 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1075 | G | admin-ui-viewport | `admin-ui/src/test/messages-composed.viewport.test.tsx` | 108 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1076 | G | backend | `backend/testing/test_release_serving_reason_attribution.py` | 108 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1077 | G | admin-ui-viewport | `admin-ui/src/components/MessageTypeDropdown.viewport.test.tsx` | 106 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1078 | G | admin-ui-viewport | `admin-ui/src/components/ProjectToolIframe.viewport.test.tsx` | 106 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1079 | G | admin-ui-viewport | `admin-ui/src/components/ComputeArtifactGallery.viewport.test.tsx` | 105 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1080 | G | admin-ui-viewport | `admin-ui/src/components/MessageAttachments.viewport.test.tsx` | 105 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1081 | G | admin-ui-viewport | `admin-ui/src/components/PendingConfirmationsSection.viewport.test.tsx` | 105 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1082 | G | admin-ui-viewport | `admin-ui/src/components/ProjectPromotionTargetSection.viewport.test.tsx` | 105 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1083 | G | admin-ui-viewport | `admin-ui/src/components/ScopeConversionRatesSection.viewport.test.tsx` | 104 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1084 | G | backend | `backend/testing/test_websocket_server_integration.py` | 104 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1085 | G | admin-ui-viewport | `admin-ui/src/components/TaskContextRail.viewport.test.tsx` | 102 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1086 | G | admin-ui-viewport | `admin-ui/src/components/CapabilityTrialsPanel.viewport.test.tsx` | 101 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1087 | G | admin-ui-viewport | `admin-ui/src/components/SystemMaturityCard.viewport.test.tsx` | 101 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1088 | G | admin-ui-viewport | `admin-ui/src/components/ScopeTrendsSection.viewport.test.tsx` | 100 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1089 | G | backend | `backend/testing/test_task_counts_endpoint.py` | 100 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1090 | G | backend | `backend/testing/test_admin_strategic_memory.py` | 99 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1091 | G | backend | `backend/testing/test_release_prepromotion_rehearsal_contracts.py` | 99 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1092 | G | admin-ui-viewport | `admin-ui/src/components/ReviewQualitySection.viewport.test.tsx` | 98 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1093 | G | admin-ui-viewport | `admin-ui/src/components/ParkWakeHealthCard.viewport.test.tsx` | 97 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1094 | G | admin-ui-viewport | `admin-ui/src/components/CriterionVerdictBadge.viewport.test.tsx` | 96 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1095 | G | admin-ui-viewport | `admin-ui/src/components/MetricsIntegrityObservabilityPanel.viewport.test.tsx` | 95 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1096 | G | admin-ui-viewport | `admin-ui/src/components/WarmReuseVsCostTrend.viewport.test.tsx` | 95 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1097 | G | admin-ui-viewport | `admin-ui/src/components/OperatorWorkspaces.viewport.test.tsx` | 94 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1098 | G | backend | `backend/testing/test_rollup_open_pr_reconciliation.py` | 94 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1099 | G | admin-ui-viewport | `admin-ui/src/components/FleetDetailDrawer.viewport.test.tsx` | 92 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1100 | G | admin-ui-viewport | `admin-ui/src/components/SettingsOrchestratorSection.viewport.test.tsx` | 91 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1101 | G | backend | `backend/testing/test_runbook_drift.py` | 91 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1102 | G | admin-ui-viewport | `admin-ui/src/components/SrRetrospectiveShared.viewport.test.tsx` | 90 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1103 | G | admin-ui-viewport | `admin-ui/src/components/UserManagement.viewport.test.tsx` | 90 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1104 | G | backend | `backend/testing/test_vm_lifecycle_runner_doomed_marker.py` | 89 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1105 | G | admin-ui-viewport | `admin-ui/src/components/ProjectResourceEnvelopeSection.viewport.test.tsx` | 88 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1106 | G | admin-ui-viewport | `admin-ui/src/components/SystemStatusCard.viewport.test.tsx` | 88 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1107 | G | admin-ui-viewport | `admin-ui/src/components/WhiteboardRailSection.viewport.test.tsx` | 88 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1108 | G | backend | `backend/testing/test_agent_task_capabilities.py` | 88 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1109 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnerConfigPanel.viewport.test.tsx` | 87 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1110 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAutoRemediationSection.viewport.test.tsx` | 87 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1111 | G | admin-ui-viewport | `admin-ui/src/components/SettingsGeneralSection.viewport.test.tsx` | 87 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1112 | G | backend | `backend/testing/test_qualifier_smoketest_retired.py` | 86 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1113 | G | admin-ui-viewport | `admin-ui/src/components/CommandPalette.viewport.test.tsx` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1114 | G | admin-ui-viewport | `admin-ui/src/components/DirectionAutoPauseWidget.viewport.test.tsx` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1115 | G | admin-ui-viewport | `admin-ui/src/components/SrBadges.viewport.test.tsx` | 85 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1116 | G | backend | `backend/testing/test_admin_task_mutations_import.py` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1117 | G | backend | `backend/testing/test_strategic_resident_activity.py` | 85 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1118 | G | admin-ui-viewport | `admin-ui/src/components/CompletionDebtPanel.viewport.test.tsx` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1119 | G | admin-ui-viewport | `admin-ui/src/components/EvergreenBacklogPanel.viewport.test.tsx` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1120 | G | backend | `backend/testing/test_migration_0718_strategic_memory_timezone_columns.py` | 84 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1121 | G | backend | `backend/testing/test_release_activation.py` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1122 | G | admin-ui-viewport | `admin-ui/src/components/ErrorBoundary.viewport.test.tsx` | 82 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1123 | G | admin-ui-viewport | `admin-ui/src/components/SettingsAdvancedSection.viewport.test.tsx` | 81 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1124 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAlertDomainsSection.viewport.test.tsx` | 80 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1125 | G | admin-ui-viewport | `admin-ui/src/components/ProviderCategoriesPanel.viewport.test.tsx` | 80 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1126 | G | backend | `backend/testing/test_direction_terminal_guard.py` | 80 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1127 | G | admin-ui-viewport | `admin-ui/src/components/DependencyHealthCard.viewport.test.tsx` | 79 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1128 | G | backend | `backend/testing/test_blocked_recheck_autonomy.py` | 79 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1129 | G | admin-ui-viewport | `admin-ui/src/components/ReleaseEvidence.viewport.test.tsx` | 76 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1130 | G | admin-ui-viewport | `admin-ui/src/components/ProjectIssueImplementationSection.viewport.test.tsx` | 75 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1131 | G | admin-ui-viewport | `admin-ui/src/components/ProjectResourceAvailabilityCard.viewport.test.tsx` | 75 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1132 | G | admin-ui-viewport | `admin-ui/src/components/ProviderCostPanel.viewport.test.tsx` | 74 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1133 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAutoReviewSection.viewport.test.tsx` | 73 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1134 | G | admin-ui-viewport | `admin-ui/src/components/StrategicSessionControl.viewport.test.tsx` | 73 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
+| 1135 | G | admin-ui-viewport | `admin-ui/src/components/UILoadTimingPanel.viewport.test.tsx` | 73 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1136 | G | backend | `backend/testing/test_strategic_stall_visibility.py` | 71 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1137 | G | admin-ui-viewport | `admin-ui/src/components/AutonomousConfigSection.viewport.test.tsx` | 70 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1138 | G | admin-ui-viewport | `admin-ui/src/components/DesignDocViewer.viewport.test.tsx` | 70 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1139 | G | admin-ui-viewport | `admin-ui/src/components/EventVisibilityMenu.viewport.test.tsx` | 70 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1140 | G | admin-ui-viewport | `admin-ui/src/components/MuteWindowMenu.viewport.test.tsx` | 69 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1141 | G | admin-ui-viewport | `admin-ui/src/components/TaskDurationWidget.viewport.test.tsx` | 69 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1142 | G | admin-ui-viewport | `admin-ui/src/components/DashboardMetricCards.viewport.test.tsx` | 68 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1143 | G | admin-ui-viewport | `admin-ui/src/components/StrategicStreamingPreview.viewport.test.tsx` | 68 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1144 | G | admin-ui-viewport | `admin-ui/src/components/StructuralHealthObservabilityPanel.viewport.test.tsx` | 68 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1145 | G | admin-ui-viewport | `admin-ui/src/components/ConsultationProgressRow.viewport.test.tsx` | 67 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1146 | G | admin-ui-viewport | `admin-ui/src/components/MarkdownContent.viewport.test.tsx` | 67 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1147 | G | admin-ui-viewport | `admin-ui/src/components/ProjectSwitcherDropdown.viewport.test.tsx` | 66 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1148 | G | admin-ui-viewport | `admin-ui/src/components/FailureStageWidget.viewport.test.tsx` | 65 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1149 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnersDashboard.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1150 | G | admin-ui-viewport | `admin-ui/src/components/RecurringPatternsSection.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1151 | G | admin-ui-viewport | `admin-ui/src/components/SavedViewsTabStrip.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1152 | G | admin-ui-viewport | `admin-ui/src/components/AcceptanceGradeBadge.viewport.test.tsx` | 64 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1153 | G | admin-ui-viewport | `admin-ui/src/components/EvergreenFillObservabilityPanel.viewport.test.tsx` | 63 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1154 | G | admin-ui-viewport | `admin-ui/src/components/SaveViewDialog.viewport.test.tsx` | 63 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1155 | G | admin-ui-viewport | `admin-ui/src/components/NullBranchDiagnosticsPanel.viewport.test.tsx` | 62 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1156 | G | backend | `backend/testing/test_research_deferred_carry.py` | 62 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1157 | G | admin-ui-viewport | `admin-ui/src/components/MergeGateFleetHealthCard.viewport.test.tsx` | 61 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1158 | G | admin-ui-viewport | `admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx` | 61 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
+| 1159 | G | admin-ui-viewport | `admin-ui/src/components/PoolAccountHealthPanel.viewport.test.tsx` | 60 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1160 | G | admin-ui-viewport | `admin-ui/src/components/StrategistStatusChip.viewport.test.tsx` | 58 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1161 | G | backend | `backend/testing/test_migration_0719_validate_task_context_size_constraint.py` | 57 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1162 | G | backend | `backend/testing/test_migration_0715_strategic_context_envelopes.py` | 53 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1163 | G | backend | `backend/testing/test_github_oauth_origins.py` | 52 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1164 | G | backend | `backend/testing/test_agent_task_contract.py` | 50 | 0 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1165 | G | admin-ui-viewport | `admin-ui/src/components/WarmStartOriginRow.viewport.test.tsx` | 49 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1166 | G | admin-ui-viewport | `admin-ui/src/components/AccountMenu.viewport.test.tsx` | 45 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1167 | G | backend | `backend/testing/test_agent_memory_consolidation.py` | 43 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1168 | G | admin-ui-viewport | `admin-ui/src/components/MessagesSummaryCard.viewport.test.tsx` | 41 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1169 | G | admin-ui-viewport | `admin-ui/src/components/EvidenceTierBadge.viewport.test.tsx` | 39 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1170 | G | admin-ui-viewport | `admin-ui/src/components/KeyboardShortcutsOverlay.viewport.test.tsx` | 36 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1171 | G | backend | `backend/testing/test_compute_outcome_status.py` | 34 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1172 | G | admin-ui-viewport | `admin-ui/src/components/TaskFixLoopPanel.viewport.test.tsx` | 32 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1173 | G | backend | `backend/testing/test_orchestrator_health_authority.py` | 32 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1174 | G | admin-ui-viewport | `admin-ui/src/components/AdversarialQualityPanel.viewport.test.tsx` | 28 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1175 | G | admin-ui-viewport | `admin-ui/src/components/WelcomeScreen.viewport.test.tsx` | 28 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1176 | G | backend | `backend/testing/test_failure_classification_retained.py` | 11 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
