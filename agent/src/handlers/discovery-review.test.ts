@@ -236,7 +236,7 @@ describe('research outcome decision contract', () => {
     };
     const rejected = validateDiscoveryReviewShape(askOperator, bindingContext);
     expect(rejected.ok).toBe(false);
-    expect(rejected.detail).toContain('ask_operator is not');
+    if (!rejected.ok) expect(rejected.detail).toContain('ask_operator is not');
     // The same packet still accepts every disposition the reviewer can execute.
     expect(
       validateDiscoveryReviewShape(validAdvance(), bindingContext),
