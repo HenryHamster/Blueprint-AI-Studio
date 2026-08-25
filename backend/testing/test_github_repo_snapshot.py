@@ -195,6 +195,83 @@ async def test_authoritative_archive_fetch_is_single_flight_per_exact_sha(mocker
 
 
 @pytest.mark.asyncio
+async def test_authoritative_archive_failure_shares_one_flight_and_never_caches(mocker):
+    """Concurrent failed archive reads share one failed request and retry later."""
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        return _FakeResponse(503)
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    tasks = [
+        asyncio.create_task(
+            authoritative_texts_at_commit(
+                {"backend/app/x.py"},
+                token="ghs_test",
+                owner="acme",
+                repo="widget",
+                commit_sha=COMMIT_SHA,
+            )
+        )
+        for _ in range(3)
+    ]
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(*tasks) == [None, None, None]
+    assert len(calls) == 1
+    assert snapshot._archive_cache == {}
+    assert snapshot._archive_cache_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_authoritative_oversize_archive_shares_one_flight_without_caching(mocker):
+    """Concurrent oversized archives share one fetch but remain outside the cache."""
+    archive = _tarball(**{"backend/app/x.py": "x\n"})
+    mocker.patch.object(snapshot, "_ARCHIVE_CACHE_MAX_BYTES", len(archive) - 1)
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+    response = _FakeResponse(200, content=archive)
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        return response
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    tasks = [
+        asyncio.create_task(
+            authoritative_texts_at_commit(
+                {"backend/app/x.py"},
+                token="ghs_test",
+                owner="acme",
+                repo="widget",
+                commit_sha=COMMIT_SHA,
+            )
+        )
+        for _ in range(3)
+    ]
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(*tasks) == [
+        {"backend/app/x.py": "x\n"}
+    ] * 3
+    assert len(calls) == 1
+    assert snapshot._archive_cache == {}
+    assert snapshot._archive_cache_bytes == 0
+
+
+@pytest.mark.asyncio
 async def test_authoritative_archive_cache_is_scoped_to_repository_and_sha(mocker):
     """Different immutable repositories or commits never share archive bytes."""
     archive = _tarball(**{"backend/app/x.py": "x\n"})
@@ -234,7 +311,7 @@ def _reset_snapshot_state():
     snapshot._archive_cache.clear()
     snapshot._archive_cache_bytes = 0
     snapshot._tree_fetch_locks.clear()
-    snapshot._archive_fetch_locks.clear()
+    snapshot._archive_fetch_tasks.clear()
     saved = dict(shared_state.github_quota)
     shared_state.github_quota.update(
         {"remaining": 4000, "limit": 5000, "reset_at": int(time.time()) + 1800}

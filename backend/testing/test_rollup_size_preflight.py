@@ -1021,7 +1021,7 @@ async def test_preflight_mixed_chronic_and_routine_holds_without_commit():
         patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
         patch(
             "app.size_limit_policy.parse_bump_history",
-            side_effect=lambda key, section="backend": (
+            side_effect=lambda key, section="backend", repo_root=None: (
                 _chronic_history() if key == "models.py" else []
             ),
         ),

@@ -961,6 +961,193 @@ esac
     (shape) => assertSuppressedBaselineReceipt(shape, true),
   );
 
+  it('projects a pre-guard abort diagnosis into the gate receipt without the shared writer', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const taskId = 'task-pre-guard-abort-lane-1';
+    const receiptPath = `/tmp/project_verification_receipt_${taskId}.json`;
+    const gatePayloadPath = `/tmp/pr_gate_payload_${taskId}.json`;
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+
+    const receipt = {
+      version: 1,
+      lanes: {
+        'backend-pytest': {
+          lane: 'backend-pytest',
+          state: 'route_helper_unavailable',
+          blocking: true,
+          current_exit_code: 1,
+          error: 'route helper unavailable or invalid',
+          new_failures: {},
+          suppressed_failures: {},
+          disappeared_failures: {},
+          skipped_failures: {},
+        },
+      },
+    };
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(receiptPath, JSON.stringify(receipt));
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat > ${gatePayloadPath}; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    }, { TASK_ID: taskId });
+
+    expect(result.status).toBe(0);
+    const gatePayload = JSON.parse(realFs.readFileSync(gatePayloadPath, 'utf8')) as {
+      publication_gate_receipt: Record<string, unknown>;
+    };
+    expect(gatePayload.publication_gate_receipt).toMatchObject({
+      attribution_state: 'backend-pytest=route_helper_unavailable',
+      new_failures: {},
+      suppressed_failures: {},
+      disappeared_failures: {},
+      skipped_failures: {},
+    });
+
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+    realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
+  });
+
+  // The multi-lane core of the same fallback: attribution_state must name EVERY
+  // lane's own state (sorted, '; '-joined) and every folded failure identity must
+  // stay namespaced to the lane that produced it. Without this a single lane's
+  // verdict silently reads as the whole gate's verdict.
+  it('folds every lane state and namespaces each failure identity in the inline fallback', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const taskId = 'task-pre-guard-abort-lane-2';
+    const receiptPath = `/tmp/project_verification_receipt_${taskId}.json`;
+    const gatePayloadPath = `/tmp/pr_gate_payload_${taskId}.json`;
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+
+    // Deliberately declared out of sorted order: the fold must sort by lane key.
+    const receipt = {
+      version: 1,
+      lanes: {
+        'static-corpus': {
+          lane: 'static-corpus',
+          state: 'new_failures_present',
+          blocking: true,
+          new_failures: { 'testing/test_static.py::test_corpus_shape': 'assert 1 == 2' },
+          suppressed_failures: {},
+          disappeared_failures: {},
+          skipped_failures: {},
+        },
+        'backend-pytest': {
+          lane: 'backend-pytest',
+          state: 'baseline_attributed',
+          blocking: false,
+          new_failures: {},
+          suppressed_failures: { 'testing/test_api.py::test_legacy': 'known baseline failure' },
+          disappeared_failures: {},
+          skipped_failures: { 'testing/test_api.py::test_skipped': 'requires postgres' },
+        },
+      },
+    };
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(receiptPath, JSON.stringify(receipt));
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) cat > ${gatePayloadPath}; [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/8"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/8"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    }, { TASK_ID: taskId });
+
+    expect(result.status).toBe(0);
+    const gatePayload = JSON.parse(realFs.readFileSync(gatePayloadPath, 'utf8')) as {
+      publication_gate_receipt: Record<string, unknown>;
+    };
+    // Sorted by lane key, '; '-joined — not a single lane's state standing in
+    // for the whole gate.
+    expect(gatePayload.publication_gate_receipt.attribution_state).toBe(
+      'backend-pytest=baseline_attributed; static-corpus=new_failures_present',
+    );
+    expect(gatePayload.publication_gate_receipt).toMatchObject({
+      new_failures: { '[static-corpus] testing/test_static.py::test_corpus_shape': 'assert 1 == 2' },
+      suppressed_failures: { '[backend-pytest] testing/test_api.py::test_legacy': 'known baseline failure' },
+      disappeared_failures: {},
+      skipped_failures: { '[backend-pytest] testing/test_api.py::test_skipped': 'requires postgres' },
+    });
+    // Each folded map carries only the identities of the lane that produced them.
+    expect(Object.keys(gatePayload.publication_gate_receipt.new_failures as object)).toEqual([
+      '[static-corpus] testing/test_static.py::test_corpus_shape',
+    ]);
+    expect(Object.keys(gatePayload.publication_gate_receipt.suppressed_failures as object)).toEqual([
+      '[backend-pytest] testing/test_api.py::test_legacy',
+    ]);
+
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(gatePayloadPath, { force: true });
+    realFs.rmSync(`/tmp/pr_url_${taskId}`, { force: true });
+  });
+
   // The defect this closes: only the targeted backend lane's suppressions ever
   // reached the PR body and the durable receipt, so a publication forgiven by
   // the static-corpus / Vitest / typecheck lanes read as fully clean.

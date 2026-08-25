@@ -10,6 +10,7 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -2120,3 +2121,55 @@ def test_unresolvable_cap_says_so_instead_of_printing_none() -> None:
 
     assert "no cap resolved" in message
     assert "None" not in message
+
+
+# Literal pins. Never replace these with the constants they check.
+_SAFE_DIRECTORY_OPTION = "safe.directory="
+_GIT_INVOCATIONS_FLOOR = 16
+
+
+def test_every_literal_git_argv_in_the_size_guard_is_safe_directory_hardened():
+    """Every literal ``git`` argv in the size-guard modules carries ``-c safe.directory=``.
+
+    The CI backend shards bind the checkout read-only at /repo into a ROOT
+    container while the runner user owns the files (``-v "$PWD:/repo:ro"``, no
+    ``--user``), so an unhardened git call exits 128 with "dubious ownership".
+
+    Promotion PR #17914 went red on exactly that: ``_read_git_bump_history``
+    lacked the option its own ref probe in ``_mainline_git_ref`` already
+    carried, so the probe resolved a mainline ref and the read then died --
+    read as genuine evidence loss, refusing every cap bump in the shard.  A
+    SECOND read, in ``rebuild_cap_bump_history_ledger``, lacked it too but
+    fails OPEN: it would have gone on silently reconciling the ledger from zero
+    git evidence and never reddened anything.
+
+    So pin the whole module surface rather than those two call sites.  A
+    partially hardened module is the defect; "hardened the probe but not the
+    read it gates" is the class.
+    """
+    unhardened: list[tuple[str, int, str]] = []
+    scanned = 0
+    for module in (slp, csl):
+        path = Path(module.__file__)
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            if ast.unparse(node.func) not in ("subprocess.run", "subprocess.check_output"):
+                continue
+            argv = node.args[0] if node.args else None
+            parts = [ast.unparse(elt) for elt in getattr(argv, "elts", None) or []]
+            if not parts or "git" not in parts[0]:
+                continue
+            scanned += 1
+            if not any(_SAFE_DIRECTORY_OPTION in part for part in parts):
+                unhardened.append((path.name, node.lineno, " ".join(parts[:6])))
+
+    # Guard the guard: a scan that silently matched nothing would pass vacuously.
+    assert scanned >= _GIT_INVOCATIONS_FLOOR, (
+        f"only {scanned} literal git invocations found across "
+        f"{[Path(m.__file__).name for m in (slp, csl)]}; the scan itself is broken"
+    )
+    assert not unhardened, (
+        "git invocations missing -c safe.directory= (they exit 128 under CI's "
+        f"root-container /repo bind mount): {unhardened}"
+    )
