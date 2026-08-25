@@ -64,12 +64,13 @@ from app.release_qualifier_redrive import (
     _MAX_DEFERRED_UNSYNCED_WAIT_SECONDS,  # noqa: F401 — re-exported for tests
     _PROMOTION_MECHANICS_FAILURES,  # noqa: F401 — re-exported for tests
     _TRANSIENT_ERROR_CODES,  # noqa: F401 — re-exported for tests
-    _redrive_deferred_unsynced_qualification,
+    _redrive_deferred_unsynced_qualification,  # noqa: F401 - re-exported for tests
     _redrive_error_qualification,
     _redrive_infra_failure_qualification,
-    _redrive_promotion_failed_qualification,
+    _redrive_promotion_failed_qualification,  # noqa: F401 - re-exported for tests
     _redrive_rubric_changed_qualification,
     _redrive_walkthrough_contract_qualification,
+    run_redrive_legs,
 )
 from app.release_qualifier_hotfix_audit import (
     _hotfix_audit_recovery_candidate_ids,
@@ -91,7 +92,7 @@ logger = logging.getLogger(__name__)
 # Matches the design-pinned JSON cap.  Raised 2150 -> 2250 to seat the
 # promotion_failed / deferred_unsynced re-driver loops (the executors the
 # trigger resolver's T5/T5b decisions had been dead-ending without).
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2250
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2150
 
 
 # Audit H2: hard wall-clock bound on a single qualification.  A qualification
@@ -2099,42 +2100,16 @@ async def sweep_stuck_qualifications(
 
     # Re-drive the two statuses whose resolver decisions the auto-trigger
     # executor below discards as re-driver-owned: ``promotion_failed`` (T5,
-    # trigger ``blockers_cleared``) and ``deferred_unsynced`` (T5b).  Until
-    # these re-drivers existed both dead-ended — a version whose promotion PR
-    # went red stayed parked even after the harvested remediation fix landed on
-    # the integration branch.  Each re-driver is condition-gated (readiness +
-    # candidate identity, or the live sync gate), bounded by its own cap with an
-    # operator Alert at the ceiling, and records a structured reason for every
-    # outcome on ``last_qualification``.  Runs AFTER the reconcile legs (so a
-    # candidate that actually landed is recorded as promoted first) and BEFORE
-    # the auto-trigger executor, which keeps only the coverage/candidate
-    # triggers.  ``pre_sweep_status`` defers a state an earlier leg of THIS
-    # cycle produced to the next cycle.
-    for _redrive, _label in (
-        (_redrive_promotion_failed_qualification, "promotion_failed"),
-        (_redrive_deferred_unsynced_qualification, "deferred_unsynced"),
-    ):
-        for version_id in version_ids:
-            try:
-                redriven = await _redrive(
-                    version_id,
-                    session_factory=session_factory,
-                    pre_sweep_status=pre_sweep_statuses.get(version_id),
-                )
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] sweep: %s re-drive failed for version %s",
-                    _label,
-                    version_id,
-                )
-                continue
-            if redriven:
-                logger.info(
-                    "[RELEASE_QUALIFIER] sweep re-drove %s version %s "
-                    "(blocking condition cleared — qualifier re-entered)",
-                    _label,
-                    version_id,
-                )
+    # trigger ``blockers_cleared``) and ``deferred_unsynced`` (T5b).  Runs AFTER
+    # the reconcile legs (so a candidate that actually landed is recorded as
+    # promoted first) and BEFORE the auto-trigger executor, which keeps only the
+    # coverage/candidate triggers.  The dispatch itself lives beside the
+    # re-drivers it dispatches — see ``run_redrive_legs``.
+    await run_redrive_legs(
+        version_ids,
+        session_factory=session_factory,
+        pre_sweep_statuses=pre_sweep_statuses,
+    )
 
     # Qualification trigger auto-fire.  The resolver
     # (``qualification_triggers.resolve_qualification_trigger``) decides fire/hold
