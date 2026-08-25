@@ -1085,18 +1085,17 @@ def _real_repo_checkout() -> str | None:
 # lands first and this guard reds as an unreproducible flake (CI run
 # 32805982004, backend shard 8).
 #
-# 900s, not 120s, and the gap is deliberate. The `git log -p` above is NOT
-# where the time goes -- measured, it is ~1s. The cost is `phantom_ledger_records`
-# forking git FOUR TIMES PER LEDGER RECORD for every SHA the (shallow, on CI)
-# log cannot serve: ~2,660 spawns, measured at ~340s warm and ~600s cold. A
-# 120s marker would still be a budget inversion, just a wider one.
-#
-# This marker turns a guaranteed red into a slow green; the real fix is
-# batching those probes into a constant number of forks (measured 2,660 -> 20,
-# ~3.3s), which lands separately in `backend/app/size_limit_policy.py`. Drop
-# this marker back to 120 once that batching is on automain -- it is oversized
-# on purpose and should not stay that way.
-@pytest.mark.timeout(900)
+# 120s, down from a deliberately oversized 900s. The `git log -p` above is
+# NOT where the time went -- measured, it is ~1s. The cost was
+# `phantom_ledger_records` forking git FOUR TIMES PER LEDGER RECORD for every
+# SHA the (shallow, on CI) log cannot serve: ~2,660 spawns, measured at
+# 683.69s on a truncated clone. #17888 batched those probes into a constant
+# number of forks -- measured 5.37s over the same 714 records with an
+# element-wise identical phantom list -- so the whole file now runs in 15.49s
+# under the lanes' --timeout=30. 120s is ~8x headroom over the file and ~22x
+# over this test; it stays a marker because the lane budget is 30s and a
+# shallow-clone cold cache is still slower than a warm one.
+@pytest.mark.timeout(120)
 def test_cap_bump_history_ledger_matches_git():
     """The committed cap-bump-history ledger must mirror the git-recorded bumps.
 

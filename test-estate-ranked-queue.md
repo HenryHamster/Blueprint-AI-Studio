@@ -9,7 +9,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 630 | 989,148 | 26,384 | 8,543.210s (378 files) | 252 |
+| backend | 630 | 989,147 | 26,384 | 8,543.210s (378 files) | 252 |
 | admin-ui | 254 | 101,304 | 4,529 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 125 | 111,823 | 6,142 | 72.033s (125 files) | 0 |
@@ -168,7 +168,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 146 | P5 | admin-ui | `admin-ui/src/hooks/useTaskModal.test.ts` | 1,698 | 79 | moderate (1500–2999 LOC) | 0.848s measured | — |
 | 147 | P5 | agent | `agent/src/prompts/code-change-helpers.test.ts` | 1,900 | 90 | moderate (1500–2999 LOC) | 0.730s measured | — |
 | 148 | P5 | backend | `backend/testing/test_migration_chain.py` | 1,679 | 80 | moderate (1500–2999 LOC) | 0.714s measured | — |
-| 149 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,060 | 67 | moderate (1500–2999 LOC) | 0.565s measured | — |
+| 149 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,059 | 67 | moderate (1500–2999 LOC) | 0.565s measured | — |
 | 150 | P5 | backend | `backend/testing/test_dependency_contracts.py` | 1,804 | 44 | moderate (1500–2999 LOC) | 0.551s measured | — |
 | 151 | P5 | agent | `agent/src/handlers/strategic.test.ts` | 2,923 | 89 | moderate (1500–2999 LOC) | 0.532s measured | — |
 | 152 | P5 | agent | `agent/src/prompt.guidance.test.ts` | 2,127 | 176 | moderate (1500–2999 LOC) | 0.438s measured | — |
@@ -808,7 +808,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 786 | G | backend | `backend/testing/test_resource_envelope_enforcement.py` | 1,189 | 27 | under 1500 LOC | unknown (no committed measurement) | — |
 | 787 | G | backend | `backend/testing/test_mode_knob_graduation.py` | 1,188 | 22 | under 1500 LOC | unknown (no committed measurement) | — |
 | 788 | G | backend | `backend/testing/test_agent_tasks.py` | 1,186 | 35 | under 1500 LOC | unknown (no committed measurement) | — |
-| 789 | G | backend | `backend/testing/test_workday_resident_invariants.py` | 1,180 | 28 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 25 |
+| 789 | G | backend | `backend/testing/test_workday_resident_invariants.py` | 1,180 | 28 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 28 |
 | 790 | G | backend | `backend/testing/test_admin_routers__autonomous.py` | 1,171 | 27 | under 1500 LOC | unknown (no committed measurement) | — |
 | 791 | G | backend | `backend/testing/test_release_qualifier_audit.py` | 1,145 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
 | 792 | G | backend | `backend/testing/test_strategic_cycle_cost_projection.py` | 1,143 | 46 | under 1500 LOC | unknown (no committed measurement) | — |

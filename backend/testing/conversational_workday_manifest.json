@@ -399,9 +399,12 @@
         "test_resident_retry_does_not_restore_task_declined_runner",
         "test_workbench_and_work_session_arming_suppressed_during_resident_session",
         "test_operator_message_default_surface_is_the_serviced_lane",
-        "test_operator_message_default_arms_the_active_resident"
+        "test_operator_message_default_arms_the_active_resident",
+        "test_completion_retry_still_suppressed_by_healthy_resident_worker",
+        "test_completion_retry_not_suppressed_by_active_blob_with_dead_worker",
+        "test_completion_retry_suppressed_when_worker_generation_superseded"
       ],
-      "test_count": 25
+      "test_count": 28
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
