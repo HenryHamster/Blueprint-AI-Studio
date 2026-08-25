@@ -4759,7 +4759,7 @@ def _render_health_activity(data: dict) -> None:
 # ── analytics ────────────────────────────────────────────────────────────────
 
 def cmd_analytics(args: argparse.Namespace) -> None:
-    """Dispatch analytics subcommands: cost / duration / pause-stats / failing-types."""
+    """Dispatch analytics subcommands: cost / duration / pause-stats / failing-types / platform-kills."""
     sub = getattr(args, "analytics_cmd", None) or "cost"
     pid = get_project_id(getattr(args, "project_id", None))
 
@@ -4794,6 +4794,16 @@ def cmd_analytics(args: argparse.Namespace) -> None:
             print(f"ERROR: {err}", file=sys.stderr)
             return
         _emit(args, data, _render_analytics_failing_types)
+
+    elif sub == "platform-kills":
+        days = getattr(args, "days", 7)
+        data, err = _safe_read(
+            f"/api/admin/platform-kill-metrics?project_id={pid}&days={days}"
+        )
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_platform_kills)
 
     else:
         print(
@@ -4865,6 +4875,67 @@ def _render_analytics_failing_types(data: dict) -> None:
         rate = g.get("failure_rate", 0)
         n = g.get("sample_size", 0)
         print(f"  {tt:20}  failure_rate={rate:.1%}  n={n}")
+
+
+def _render_analytics_platform_kills(data: dict) -> None:
+    """Render the platform-kill rate, its class breakdown, and its unknowns.
+
+    The unclassified share is printed next to the headline rate on purpose: a
+    zero rate with a low classified fraction means "not measured", not "no
+    defects", and an operator must not be able to read one without the other.
+    """
+    days = data.get("window_days", "?")
+    kills = data.get("platform_kill_count", 0)
+    per_day = data.get("platform_kills_per_day", 0.0)
+    recovered = data.get("platform_kills_recovered", 0)
+    terminal = data.get("terminal_task_count", 0)
+    unclassified = data.get("unclassified_count", 0)
+    frac = data.get("classified_fraction")
+
+    print(f"=== PLATFORM KILLS (last {days}d, since {data.get('window_start','?')}) ===")
+    print(f"  platform kills/day : {per_day}   ({kills} kills over {days}d)")
+    print(f"    of which retried : {recovered}  (work continued under a replacement)")
+    print(f"  terminal tasks     : {terminal}")
+    print(f"  work outcomes      : {data.get('work_outcome_count', 0)}")
+    print(f"  not-a-death        : {data.get('not_a_death_count', 0)}")
+
+    if frac is None:
+        print("  classified         : n/a (no terminal tasks in window)")
+    else:
+        print(f"  classified         : {frac:.1%}   ({unclassified} unclassified)")
+        if frac < 0.9:
+            print(
+                f"  !! {1 - frac:.0%} of terminal tasks could not be classified — "
+                "read the rate above as a FLOOR, not a measurement."
+            )
+
+    by_class = data.get("by_class") or []
+    if by_class:
+        print("  --- by class (WHY it counted as a platform kill) ---")
+        for row in by_class:
+            cls = row.get("kill_class", "?")
+            n = row.get("count", 0)
+            rec = row.get("recovered_count", 0)
+            suffix = f", {rec} retried" if rec else ""
+            print(f"  {cls:38} {n:4d}{suffix}")
+            print(f"      why: {row.get('reason','')}")
+    else:
+        print("  (no platform kills classified in this window)")
+
+    daily = data.get("daily") or []
+    if daily:
+        print("  --- per day (kills / terminal) ---")
+        for row in daily:
+            print(
+                f"  {row.get('date','?')}  {row.get('platform_kills',0):4d}"
+                f" / {row.get('terminal_tasks',0):4d}"
+            )
+
+    reasons = data.get("unclassified_reasons") or []
+    if reasons:
+        print("  --- unclassified: WHY we could not tell ---")
+        for row in reasons:
+            print(f"  {row.get('count',0):5d}x  {row.get('reason','')}")
 
 
 # ── vision ────────────────────────────────────────────────────────────────────
@@ -8692,6 +8763,12 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="Lookback window in hours (default 24).")
     analytics_sub.add_parser("failing-types", parents=[common],
                              help="Task types currently gated by high failure rate.")
+
+    p_analytics_kills = analytics_sub.add_parser(
+        "platform-kills", parents=[common],
+        help="Platform-killed tasks per day, by class, with the unclassified share.")
+    p_analytics_kills.add_argument("--days", type=int, default=7,
+                                   help="Window in days (default 7).")
 
     # vision
     p_vision = sub.add_parser("vision", parents=[common],
