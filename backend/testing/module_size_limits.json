@@ -338,7 +338,7 @@
     "test_project_tools.py": 4200,
     "test_release_version.py": 4150,
     "test_pipeline_reliability.py": 4850,
-    "test_pipeline_integration.py": 3850,
+    "test_pipeline_integration.py": 4450,
     "test_plan_completion_atomic.py": 3750,
     "test_notification_dispatch.py": 3700,
     "test_admin_compute_jobs.py": 3700,

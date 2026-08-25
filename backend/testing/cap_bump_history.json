@@ -4703,10 +4703,26 @@
       ],
       "test_orchestrator_liveness.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-25T05:52:45.443259+00:00",
+          "commit_sha": "03aa2ef27ae009110c771ca38f78ca9845cac99f",
+          "commit_date": "2026-08-25T01:32:02-07:00",
           "old_cap": 1800,
           "new_cap": 2250
+        }
+      ],
+      "test_pipeline_integration.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T08:42:11.851595+00:00",
+          "old_cap": 3850,
+          "new_cap": 4450
+        }
+      ],
+      "test_local_runner.py": [
+        {
+          "commit_sha": "75e34e945c018d89a4564a4b123b841c070ac108",
+          "commit_date": "2026-08-25T00:43:40-07:00",
+          "old_cap": 14250,
+          "new_cap": 16650
         }
       ]
     },
@@ -4761,8 +4777,8 @@
       ],
       "test_local_runner.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-25T07:06:31.222798+00:00",
+          "commit_sha": "75e34e945c018d89a4564a4b123b841c070ac108",
+          "commit_date": "2026-08-25T00:43:40-07:00",
           "old_cap": 14250,
           "new_cap": 16650
         }

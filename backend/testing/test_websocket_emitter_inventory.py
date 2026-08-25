@@ -189,7 +189,8 @@ def test_build_from_sources_matches_disk_walk():
         assert not drift, (
             "backend/app changed on disk while this test ran, so the two reads saw "
             "different trees. This is NOT a builder divergence -- re-run against a "
-            f"quiescent checkout. Paths that changed: {drift[:20]}"
+            f"quiescent checkout. Paths that changed: {drift[:20]}\n"
+            + format_offender_marker(drift)
         )
         assert disk == baseline, (
             "build_websocket_event_inventory diverged from build_from_sources over "
