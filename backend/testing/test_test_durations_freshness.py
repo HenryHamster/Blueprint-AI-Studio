@@ -26,10 +26,12 @@ BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
 # Key format: "testing/<filename>.py::<test_function_or_class>"
 KEY_PATTERN = re.compile(r"^testing/test_[^/]+\.py::.+$")
-# At least 60% of test_*.py files should appear in the durations map. This is
-# advisory because regenerating the baseline requires the full DB-backed suite,
-# which is unavailable on agent VMs. The structural and quality checks below
-# remain blocking.
+# At least 60% of test_*.py files must appear in the durations map. This is the
+# absolute fallback used only when no origin/automain baseline can be resolved;
+# when a baseline IS available the stricter ratchet below (no NEWLY uncovered
+# file relative to automain) applies instead. Both are blocking -- the absolute
+# check is fail-closed, so a baseline that sits exactly on the floor leaves zero
+# headroom and the next added test file reds the standalone lane.
 MIN_COVERAGE_FRACTION = 0.60
 _BASELINE_UNLOADED = object()
 _baseline_cache: object = _BASELINE_UNLOADED
@@ -1176,11 +1178,30 @@ def test_setup_misattribution_band_is_derived_from_the_observed_plateau() -> Non
 
     Loads scripts/durations_quality.py::derive_in_band_setup_gap_max (via
     importlib, same pattern test_shard_balance.py uses for
-    impute_missing_mean) and computes the smallest duration actually observed
-    at or above IN_BAND_SETUP_MAX in the committed data. The committed
-    27.430318s value must remain outside the 27.4s diagnostic
-    gap, so regenerating the baseline with a new in-gap observation surfaces a
-    failing assertion here instead of silently changing sanitizer behavior.
+    impute_missing_mean) and asserts whichever branch the committed data is
+    actually in:
+
+    - Plateau present (>= IN_BAND_SETUP_MIN_COUNT entries in the band): the
+      sanitizer's misattribution claim is only justified by a diagnostic gap
+      after it, so the derived first-post-plateau observation must be beyond
+      IN_BAND_SETUP_GAP_MAX and the sanitizer must strip exactly that band. A
+      plateau that reappears WITHOUT a gap still fails here.
+    - No plateau: the sanitizer must be inert (strip nothing).
+
+    Branching on the data rather than pinning "the derived value is beyond the
+    gap" unconditionally is deliberate. That unconditional pin required the
+    committed file to contain no observation at all between IN_BAND_SETUP_MAX
+    and IN_BAND_SETUP_GAP_MAX, which was never a property of the sanitizer --
+    it was an artifact of a baseline that covered only 60% of test files and
+    therefore had measured none of the genuinely slow DB-backed tests that live
+    in that range. Regenerating to full file coverage populates 15-27s with
+    real measurements, so the unconditional pin would force every future
+    regeneration to either re-open a coverage hole or delete real timings.
+
+    The synthetic proof below keeps its post-gap anchor data-derived by taking
+    the smallest observation strictly beyond IN_BAND_SETUP_GAP_MAX, which is
+    well-formed by construction and so cannot be invalidated by newly measured
+    in-range durations.
     """
     quality_path = _resolve_quality_path()
     assert quality_path is not None, (
@@ -1199,25 +1220,58 @@ def test_setup_misattribution_band_is_derived_from_the_observed_plateau() -> Non
     data = _load_durations()
     derived_gap_max = module.derive_in_band_setup_gap_max(data)
 
-    assert derived_gap_max > _IN_BAND_SETUP_GAP_MAX, (
-        f"The first post-plateau observation derived from backend/.test_durations "
-        f"({derived_gap_max}) is not beyond the {_IN_BAND_SETUP_GAP_MAX}s "
-        "diagnostic gap. Re-check the setup-misattribution band and its data."
-    )
-
     band = {
         key
         for key, value in data.items()
         if _IN_BAND_SETUP_MIN <= value < _IN_BAND_SETUP_MAX
     }
     module_band = module.in_band_setup_artifacts(data)
-    assert module_band == band
+
+    if len(band) >= _IN_BAND_SETUP_MIN_COUNT:
+        assert derived_gap_max > _IN_BAND_SETUP_GAP_MAX, (
+            f"backend/.test_durations shows a {len(band)}-entry "
+            f"{_IN_BAND_SETUP_MIN:g}-{_IN_BAND_SETUP_MAX:g}s plateau, but its first "
+            f"post-plateau observation ({derived_gap_max}) is not beyond the "
+            f"{_IN_BAND_SETUP_GAP_MAX}s diagnostic gap. Re-check the "
+            "setup-misattribution band and its data."
+            + "\n"
+            + format_offender_marker(sorted(band))
+        )
+        assert module_band == band, (
+            "The sanitizer must strip exactly the observed plateau when the "
+            "plateau-and-gap pattern is present."
+            + "\n"
+            + format_offender_marker(sorted(band ^ module_band))
+        )
+    else:
+        assert module_band == set(), (
+            f"backend/.test_durations has only {len(band)} entries in the "
+            f"{_IN_BAND_SETUP_MIN:g}-{_IN_BAND_SETUP_MAX:g}s band (below the "
+            f"{_IN_BAND_SETUP_MIN_COUNT}-entry plateau threshold), so the sanitizer "
+            f"must be inert -- but it stripped {len(module_band)} entry(ies)."
+            + "\n"
+            + format_offender_marker(sorted(module_band))
+        )
+
+    # Data-derived post-gap anchor: the smallest observation strictly beyond the
+    # diagnostic gap. Still a real measured value (currently 27.430318s), but
+    # well-formed by construction, so newly measured 15-27s durations cannot
+    # make the synthetic proof below vacuous.
+    post_gap_observations = [
+        value for value in data.values() if value > _IN_BAND_SETUP_GAP_MAX
+    ]
+    assert post_gap_observations, (
+        f"backend/.test_durations has no observation beyond the "
+        f"{_IN_BAND_SETUP_GAP_MAX}s diagnostic gap, so the sanitizer proof below "
+        "has no real post-gap anchor to use. Re-check the durations baseline."
+    )
+    post_gap_anchor = min(post_gap_observations)
 
     synthetic_band = {
         f"plateau-{index}": _IN_BAND_SETUP_MIN + index / 1000
         for index in range(_IN_BAND_SETUP_MIN_COUNT)
     }
-    synthetic_band["first-post-gap"] = derived_gap_max
+    synthetic_band["first-post-gap"] = post_gap_anchor
     assert module.in_band_setup_artifacts(synthetic_band) == set(
         synthetic_band
     ) - {"first-post-gap"}
