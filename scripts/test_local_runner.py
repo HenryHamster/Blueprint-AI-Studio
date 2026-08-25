@@ -9412,7 +9412,27 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
                 agent_teardown: dict = {}
                 fake_proc = MagicMock()
                 fake_proc.pid = 7777
-                fake_proc.stdout = _io.BytesIO(
+
+                # _spawn_agent_task tees the output on a BACKGROUND thread and
+                # returns once that thread has STARTED, not once it has drained
+                # the pipe, so reading the log straight after the call races the
+                # writer and legitimately sees b"" -- the observed CI flake.
+                # Signal EOF instead: the tee writes AND flushes each chunk
+                # before issuing its next read, so a read returning b"" proves
+                # every byte is already on disk. Exact barrier, correct whether
+                # the writer is slower than the test or faster. Signalling from
+                # the fake beats joining the tee thread, which is anonymous and
+                # short-lived and routinely exits before enumerate() sees it.
+                drained = threading.Event()
+
+                class _EofSignallingStdout(_io.BytesIO):
+                    def read(self, *args, **kwargs):
+                        chunk = super().read(*args, **kwargs)
+                        if not chunk:
+                            drained.set()
+                        return chunk
+
+                fake_proc.stdout = _EofSignallingStdout(
                     b"task output line 1\ntask output line 2\n"
                 )
 
@@ -9447,6 +9467,12 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
                     )
 
                 self.assertTrue(spawned)
+
+                self.assertTrue(
+                    drained.wait(timeout=30.0),
+                    "the tee thread never read the agent's stdout to EOF "
+                    "within 30s, so the per-task log file cannot be checked",
+                )
 
                 log_path = local_runner._task_log_path("task-log-test")
                 self.assertTrue(
