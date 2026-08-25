@@ -600,6 +600,28 @@ if [ -n "${BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS:-}" ]; then
   ENV_VARS="$ENV_VARS BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS=$BLUEPRINT_MANDATORY_VERIFICATION_SELECTORS"
 fi
 
+# Hermetic Blueprint credentials for the scripts test lane.
+#
+# Several scripts/test_*.py drive `blueprint.main()` for real, and blueprint.py's
+# `from blueprint_api import (...)` re-binding means a double installed on
+# `blueprint` never intercepts the copy resolved inside blueprint_api. The real
+# load_config() then runs, and its search path ends at the repo-root and
+# ~/.blueprint-config.json -- so on a credentialed machine this harness issued
+# live authenticated requests to the PRODUCTION orchestrator. CI containers hold
+# no config file, which is exactly why CI cannot catch it. Every pytest call
+# below passes --noconftest, so scripts/conftest.py is skipped by construction
+# and the guarantee must arrive through the environment. See scripts/conftest.py
+# for the full rationale and the tier ordering this relies on;
+# backend/testing/test_scripts_lane_hermetic_credentials.py pins these values.
+BLUEPRINT_HERMETIC_API_URL="https://scripts-lane.blueprint.invalid"
+BLUEPRINT_HERMETIC_API_KEY="hermetic-scripts-lane-not-a-credential"
+ENV_VARS="$ENV_VARS BLUEPRINT_CONFIG= BLUEPRINT_API_URL=$BLUEPRINT_HERMETIC_API_URL BLUEPRINT_API_KEY=$BLUEPRINT_HERMETIC_API_KEY"
+DOCKER_ARGS+=(
+  -e "BLUEPRINT_CONFIG="
+  -e "BLUEPRINT_API_URL=$BLUEPRINT_HERMETIC_API_URL"
+  -e "BLUEPRINT_API_KEY=$BLUEPRINT_HERMETIC_API_KEY"
+)
+
 _run() {
   # _run <cmd...> — runs inside Docker or directly, with env vars set
   if [ "$USE_DOCKER" = "1" ]; then
@@ -793,6 +815,7 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_conversational_workday_protection.py
     testing/test_vitest_durations_freshness.py
     testing/test_test_imports_checker.py
+    testing/test_scripts_lane_hermetic_credentials.py
     )
     # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
     # The scripts roster is explicitly maintained above and checked by

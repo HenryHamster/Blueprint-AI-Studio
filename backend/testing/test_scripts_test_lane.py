@@ -18,10 +18,12 @@ no capability exemption, since they read only checked-in text.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -52,6 +54,68 @@ INFRA_TEST_ROOTS = (
     REPOSITORY_ROOT / "infra" / "db_recovery",
     REPOSITORY_ROOT / "infra" / "livekit" / "tests",
 )
+
+# -- hermetic credentials for every lane subprocess --------------------------
+# Several scripts tests drive ``blueprint.main()`` for real. ``blueprint.py``
+# does ``from blueprint_api import (...)``, so a double installed on the
+# ``blueprint`` module does not intercept the copy of the same name that
+# ``blueprint_api`` resolves internally: ``validate_project_id`` ->
+# ``list_projects`` -> ``load_config`` -> ``api`` all run for real. The real
+# ``load_config()`` search order ends at the repo-root and
+# ``~/.blueprint-config.json`` files, so on a credentialed host this lane made
+# live authenticated requests to the production orchestrator carrying the
+# operator's admin key. CI containers hold no config file anywhere in that
+# search order, which is exactly why CI could never catch it.
+#
+# ``scripts/conftest.py`` closes the same hole for direct ``pytest scripts/...``
+# runs, but the subprocess below passes ``--noconftest``, so the guarantee has
+# to travel through the environment instead. ``BLUEPRINT_CONFIG`` is tier 1 of
+# ``load_config()`` and short-circuits the ambient files and the gcloud
+# bootstrap; the URL/key pair is tier 2, for tests that deliberately clear
+# tier 1. ``.invalid`` is reserved by RFC 6761 as guaranteed non-resolvable, so
+# a request that escapes every mock still cannot reach a real host.
+#
+# backend/testing/test_scripts_lane_hermetic_credentials.py proves this
+# environment defeats an ambient config and fails if it stops being applied.
+HERMETIC_API_URL = "https://scripts-lane.blueprint.invalid"
+HERMETIC_API_KEY = "hermetic-scripts-lane-not-a-credential"
+
+_HERMETIC_CONFIG_PATH = (
+    Path(tempfile.mkdtemp(prefix="blueprint-scripts-lane-hermetic-"))
+    / "hermetic-blueprint-config.json"
+)
+_HERMETIC_CONFIG_PATH.write_text(
+    json.dumps(
+        {
+            "api_url": HERMETIC_API_URL,
+            "api_key": HERMETIC_API_KEY,
+            "default_repo": "hermetic/scripts-lane",
+            "default_base_branch": "main",
+        }
+    ),
+    encoding="utf-8",
+)
+
+
+def hermetic_credential_environment() -> dict[str, str]:
+    """Env overrides that stop a lane subprocess resolving a real credential."""
+    return {
+        "BLUEPRINT_CONFIG": str(_HERMETIC_CONFIG_PATH),
+        "BLUEPRINT_API_URL": HERMETIC_API_URL,
+        "BLUEPRINT_API_KEY": HERMETIC_API_KEY,
+    }
+
+
+def lane_subprocess_environment() -> dict[str, str]:
+    """The exact environment every scripts-lane subprocess runs under."""
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    pythonpath = [str(SCRIPT_ROOT), str(REPOSITORY_ROOT / "backend")]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    environment.update(hermetic_credential_environment())
+    return environment
 
 
 def _script_test_exemptions() -> dict[str, str]:
@@ -201,12 +265,7 @@ def test_script_test_module_executes(script_test: Path) -> None:
     budget = _FILE_BUDGET_SECONDS_OVERRIDES.get(
         script_test.name, _FILE_BUDGET_SECONDS_DEFAULT
     )
-    environment = os.environ.copy()
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    pythonpath = [str(SCRIPT_ROOT), str(REPOSITORY_ROOT / "backend")]
-    if environment.get("PYTHONPATH"):
-        pythonpath.append(environment["PYTHONPATH"])
-    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    environment = lane_subprocess_environment()
 
     command = [
         sys.executable,
