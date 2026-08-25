@@ -2251,7 +2251,11 @@ async def test_account_health_summary_annotates_fresh_freshness(
     short_cache = DigestCache(default_ttl=60.0)
     app.dependency_overrides[get_digest_cache] = lambda: short_cache
 
-    generated = _admin_pool_accounts._utcnow().isoformat()
+    # Zone-carrying, matching what utc_iso() actually puts on the wire. A bare
+    # .isoformat() here would feed the annotate path a format the real endpoint
+    # no longer produces, so this test would stay green while the endpoint
+    # returned a null precompute_age_seconds.
+    generated = _admin_pool_accounts._utcnow().isoformat() + "+00:00"
     payload: Dict[str, Any] = {"accounts": [], "generated_at": generated}
     spy = AsyncMock(return_value=payload)
     mocker.patch.object(_admin_pool_accounts, "_compute_account_health_summary", spy)
