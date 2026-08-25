@@ -796,6 +796,43 @@ async def test_stale_marked_source_spawns_delta_scoped_retarget(db_session, mock
     assert spawned.context["review_loop"]["retarget_scope"] == "delta"
 
 
+@pytest.mark.asyncio
+async def test_retargeted_fix_source_spawns_scoped_rereview(db_session, mocker):
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    retargeted_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "pr_number": 705, "branch": "feat/x"}],
+        context={
+            "review_loop": {
+                "iteration": 2,
+                "head_drift_retargeted_from": {
+                    "pr_number": 704,
+                    "head_sha": "a" * 40,
+                },
+            }
+        },
+    )
+    await _persist(db_session, retargeted_fix)
+
+    spawned, created = await _spawn_pipeline_task(
+        retargeted_fix,
+        "review",
+        db_session,
+        705,
+        "feat/x",
+        "main",
+        original_task_id=str(retargeted_fix.id),
+        review_target=_review_target(project.id, 705, "base-705", "head-705"),
+        delta_base_sha="reviewed-head-705",
+    )
+
+    assert created is True and spawned is not None
+    assert spawned.first_payload["retarget_scope"] == "delta"
+    assert spawned.context["review_loop"]["retarget_scope"] == "delta"
+
+
 def test_stale_respawn_scope_marks_only_stale_full_reviews():
     assert (
         _stale_respawn_scope(
@@ -829,10 +866,46 @@ def test_stale_respawn_scope_marks_only_stale_full_reviews():
         )
         is None
     )
+    # A rollup fix retarget is an admission-path replacement rather than a
+    # stale discard. Its backend-issued receipt is the authoritative signal.
+    retargeted_fix = {
+        "review_loop": {
+            "head_drift_retargeted_from": {
+                "pr_number": 700,
+                "head_sha": "a" * 40,
+            }
+        }
+    }
     assert (
         _stale_respawn_scope(
-            source_context={"_review_stale_target": True},
+            source_context=retargeted_fix,
+            task_type="review",
+            delta_base_sha="reviewed-head",
+        )
+        == "delta"
+    )
+    assert (
+        _stale_respawn_scope(
+            source_context=retargeted_fix,
+            task_type="review",
+            delta_base_sha="",
+        )
+        == "full"
+    )
+    # The receipt belongs to the fix source; it must not classify a fix spawn
+    # itself as a review or weaken the task-type fence.
+    assert (
+        _stale_respawn_scope(
+            source_context=retargeted_fix,
             task_type="fix",
+            delta_base_sha="prior-head",
+        )
+        is None
+    )
+    assert (
+        _stale_respawn_scope(
+            source_context={"review_loop": {"head_drift_retargeted_from": {}}},
+            task_type="review",
             delta_base_sha="prior-head",
         )
         is None

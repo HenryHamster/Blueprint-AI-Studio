@@ -130,6 +130,13 @@ const mockBaselinesResponse: LaneBaselinesResponse = {
       convergence_rate: { latest: 1, prior: 0.5, delta: 0.5, classification: 'improving' },
       cap_exhausted_chain_count: { latest: 0, prior: 1, delta: -1, classification: 'improving' },
       cap_exhausted_direction_count: { latest: 1, prior: 3, delta: -2, classification: 'improving' },
+      cap_exhausted_directions: {
+        latest: [
+          { direction_id: 'd-latest', direction_text: 'Latest cap loss' },
+          { direction_id: 'd-id-only', direction_text: null },
+        ],
+        prior: [{ direction_id: 'd-prior', direction_text: 'Prior cap loss' }],
+      },
       supersede_affected_reviews_to_converge_median: {
         latest: 6, prior: 4, delta: 2, classification: 'declining',
       },
@@ -262,6 +269,10 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('Outer-Loop Convergence')).toBeInTheDocument();
     expect(screen.getByText('Median cycles')).toBeInTheDocument();
     expect(screen.getByText('Cap-exhausted chains')).toBeInTheDocument();
+    expect(screen.getByTestId('cap-loss-direction-trend')).toBeInTheDocument();
+    expect(screen.getByText('Prior cap loss')).toBeInTheDocument();
+    expect(screen.getByText('Latest cap loss')).toBeInTheDocument();
+    expect(screen.getByText('d-id-only')).toBeInTheDocument();
     expect(screen.getAllByText('Retarget Convergence')).not.toHaveLength(0);
     expect(screen.getByText('Reviews to converge (median)')).toBeInTheDocument();
     expect(screen.getAllByText('Delta-scope retargets')).not.toHaveLength(0);
@@ -332,6 +343,24 @@ describe('LaneDiagPanel', () => {
     const sampleRow = screen.getByText('Converged chains (sample size)').closest('tr');
     if (!sampleRow) throw new Error('sample-size trend row was not rendered');
     expect(sampleRow.textContent).not.toContain('improving');
+  });
+
+  it('renders None for versions without persisted cap-loss directions', async () => {
+    fetchLaneBaselines.mockResolvedValueOnce({
+      ...mockBaselinesResponse,
+      trend: {
+        ...mockBaselinesResponse.trend,
+        outer_loop_convergence: {
+          ...mockBaselinesResponse.trend.outer_loop_convergence,
+          cap_exhausted_directions: { latest: [], prior: [] },
+        },
+      },
+    });
+    render(<LaneDiagPanel projectId="project-1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByTestId('cap-loss-direction-trend')).toHaveTextContent('None');
+    expect(screen.getAllByText('None')).toHaveLength(2);
   });
 
   it('renders per-PR phase breakdown sorted by total_seconds desc', async () => {

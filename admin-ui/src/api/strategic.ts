@@ -931,6 +931,11 @@ export interface LaneBaselineTrendBlock {
   classification: 'improving' | 'declining' | 'stable' | null;
 }
 
+export interface LaneBaselineDirectionRecord {
+  direction_id: string;
+  direction_text: string | null;
+}
+
 export interface LaneBaselineTrend {
   latest_version: number | null;
   prior_version: number | null;
@@ -953,6 +958,10 @@ export interface LaneBaselineTrend {
     convergence_rate: LaneBaselineTrendBlock;
     cap_exhausted_chain_count: LaneBaselineTrendBlock;
     cap_exhausted_direction_count: LaneBaselineTrendBlock;
+    cap_exhausted_directions?: {
+      latest: LaneBaselineDirectionRecord[];
+      prior: LaneBaselineDirectionRecord[];
+    };
     supersede_affected_reviews_to_converge_median: LaneBaselineTrendBlock;
     supersede_affected_reviews_to_converge_p95: LaneBaselineTrendBlock;
     rollup_supersede_affected_reviews_to_converge_median?: LaneBaselineTrendBlock;

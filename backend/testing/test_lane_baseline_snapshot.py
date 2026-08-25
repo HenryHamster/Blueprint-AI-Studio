@@ -443,7 +443,7 @@ class TestPersistVersionLaneBaseline:
                 terminal_status="promoted",
             )
             assert result is not None
-            assert result["baseline_def_version"] == "v3"
+            assert result["baseline_def_version"] == "v4"
             assert result["outer_loop_convergence"]["iteration_median"] is not None
             assert "chains" not in result["lane_waste"]
 
@@ -779,9 +779,9 @@ class TestBackfillMissingLaneBaselines:
         assert "relay_medians" in stored
 
     @pytest.mark.asyncio
-    async def test_backfill_skips_already_stored_version(self, db_session):
-        """backfill_missing_lane_baselines is a no-op for versions already present
-        in the dedicated project_lane_baseline table."""
+    @pytest.mark.parametrize("definition", ["v4", "v5"])
+    async def test_backfill_skips_already_stored_version(self, db_session, definition):
+        """Current table definitions remain first-write-wins during backfill."""
         from testing.conftest import USE_POSTGRES
 
         if not USE_POSTGRES:
@@ -798,7 +798,7 @@ class TestBackfillMissingLaneBaselines:
             project.id,
             9,
             now,
-            "v1",
+            definition,
             {"version_number": 9, "captured_at": "2026-01-01T00:00:00"},
         )
         version = ReleaseVersion(
@@ -820,7 +820,7 @@ class TestBackfillMissingLaneBaselines:
 
     @pytest.mark.asyncio
     async def test_backfill_preserves_legacy_design_doc_version(self, db_session):
-        """A retained historical fallback is data, not a recomputation gap."""
+        """A refresh leaves the retained legacy fallback untouched."""
         legacy = {
             "version_number": 9,
             "captured_at": "2026-01-01T00:00:00",
@@ -844,10 +844,116 @@ class TestBackfillMissingLaneBaselines:
 
         backfilled = await backfill_missing_lane_baselines(project_id=project.id)
 
-        assert backfilled == []
-        assert await _read_lane_baseline_row(db_session, project.id, 9) is None
+        assert backfilled == [9]
+        refreshed = await _read_lane_baseline_row(db_session, project.id, 9)
+        assert refreshed is not None
+        assert refreshed["baseline_def_version"] == "v4"
         await db_session.refresh(project)
         assert project.design_doc[DESIGN_DOC_KEY]["9"] == legacy
+
+    @pytest.mark.asyncio
+    async def test_backfill_refreshes_stale_definition_for_rollup_arms(self, db_session):
+        """Stale retained rows gain rollup arms and produce a usable trend."""
+        from testing.conftest import USE_POSTGRES
+        from app.digest_metrics import compute_lane_baseline_trend
+
+        if not USE_POSTGRES:
+            pytest.skip("project_lane_baseline refresh uses Postgres row metadata")
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        windows = [
+            (9, now - timedelta(days=30), now - timedelta(days=20), 1),
+            (10, now - timedelta(days=19), now - timedelta(days=10), 2),
+        ]
+        for version_number, opened, closed, review_count in windows:
+            original = make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                created_at=opened - timedelta(hours=1),
+            )
+            db_session.add(original)
+            await db_session.flush()
+            db_session.add_all(
+                [
+                    make_task(
+                        project_id=project.id,
+                        status=TaskStatus.COMPLETED,
+                        payloads=[
+                            {"type": "review", "pr_number": str(version_number)}
+                        ],
+                        context={
+                            "rollup_pr_number": version_number,
+                            "review_loop": {
+                                "original_task_id": str(original.id),
+                                "pr_number": version_number,
+                                "iteration": iteration,
+                                "superseded_pr_numbers": [version_number - 1],
+                            },
+                        },
+                        created_at=opened + timedelta(hours=iteration),
+                    )
+                    for iteration in range(1, review_count + 1)
+                ]
+            )
+            db_session.add(
+                ReleaseVersion(
+                    project_id=project.id,
+                    version_number=version_number,
+                    status="promoted",
+                    opened_at=opened,
+                    promoted_at=closed,
+                )
+            )
+            await _upsert_lane_baseline_row(
+                db_session,
+                project.id,
+                version_number,
+                now,
+                "v3",
+                {
+                    "version_number": version_number,
+                    "captured_at": "2026-01-01T00:00:00",
+                    "baseline_def_version": "v3",
+                },
+            )
+        await db_session.commit()
+
+        backfilled = await backfill_missing_lane_baselines(project_id=project.id)
+
+        assert backfilled == [10, 9]
+        latest = await _read_lane_baseline_row(db_session, project.id, 10)
+        prior = await _read_lane_baseline_row(db_session, project.id, 9)
+        assert latest is not None and prior is not None
+        assert latest["baseline_def_version"] == "v4"
+        assert prior["baseline_def_version"] == "v4"
+        assert (
+            latest["outer_loop_convergence"]
+            ["rollup_supersede_affected_reviews_to_converge_median"]
+            == 2
+        )
+        assert (
+            prior["outer_loop_convergence"]
+            ["rollup_supersede_affected_reviews_to_converge_median"]
+            == 1
+        )
+
+        trend = compute_lane_baseline_trend([latest, prior])
+        assert trend is not None
+        assert (
+            trend["outer_loop_convergence"]
+            ["rollup_supersede_affected_reviews_to_converge_median"]["delta"]
+            == 1
+        )
+        assert (
+            trend["outer_loop_convergence"]
+            ["rollup_supersede_affected_reviews_to_converge_p95"]["classification"]
+            == "declining"
+        )
 
     @pytest.mark.asyncio
     async def test_backfill_respects_max_versions_cap(self, db_session):

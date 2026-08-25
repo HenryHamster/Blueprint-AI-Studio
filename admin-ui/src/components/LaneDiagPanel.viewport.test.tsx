@@ -107,6 +107,11 @@ const mockBaselinesResponse = {
       iteration_p95: { latest: 3, prior: 5, delta: -2, classification: 'improving' },
       convergence_rate: { latest: 1, prior: 0.5, delta: 0.5, classification: 'improving' },
       cap_exhausted_chain_count: { latest: 0, prior: 1, delta: -1, classification: 'improving' },
+      cap_exhausted_direction_count: { latest: 0, prior: 1, delta: -1, classification: 'improving' },
+      cap_exhausted_directions: {
+        latest: [{ direction_id: 'd-latest', direction_text: 'Latest cap-loss direction' }],
+        prior: [{ direction_id: 'd-prior', direction_text: 'Prior cap-loss direction' }],
+      },
     },
   },
 };

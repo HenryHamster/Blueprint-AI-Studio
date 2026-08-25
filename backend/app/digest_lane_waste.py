@@ -469,6 +469,30 @@ def compute_lane_baseline_trend(
 
     convergence_curr = latest.get("outer_loop_convergence") or {}
     convergence_prev = prior.get("outer_loop_convergence") or {}
+
+    def _direction_records(convergence: Dict[str, Any]) -> List[Dict[str, Optional[str]]]:
+        """Normalize persisted cap-loss records for the trend contract."""
+        records = convergence.get("cap_exhausted_directions")
+        if not isinstance(records, list):
+            return []
+        normalized: List[Dict[str, Optional[str]]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            direction_id = record.get("direction_id")
+            if not isinstance(direction_id, str) or not direction_id:
+                continue
+            direction_text = record.get("direction_text")
+            normalized.append(
+                {
+                    "direction_id": direction_id,
+                    "direction_text": (
+                        direction_text if isinstance(direction_text, str) else None
+                    ),
+                }
+            )
+        return normalized
+
     convergence_trend = {
         "iteration_median": _block(
             convergence_curr.get("iteration_median"),
@@ -500,6 +524,10 @@ def compute_lane_baseline_trend(
             threshold_abs=0.5,
             lower_is_better=True,
         ),
+        "cap_exhausted_directions": {
+            "latest": _direction_records(convergence_curr),
+            "prior": _direction_records(convergence_prev),
+        },
         "supersede_affected_reviews_to_converge_median": _block(
             convergence_curr.get("supersede_affected_reviews_to_converge_median"),
             convergence_prev.get("supersede_affected_reviews_to_converge_median"),

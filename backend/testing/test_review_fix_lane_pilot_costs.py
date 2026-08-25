@@ -948,6 +948,7 @@ def _make_baseline(
     iteration_p95: float | None = None,
     convergence_rate: float | None = None,
     cap_exhausted_chain_count: int | None = None,
+    cap_exhausted_directions: list[dict] | None = None,
     reviews_to_converge_count: int = 0,
     reviews_to_converge_median: float | None = None,
     reviews_to_converge_p95: float | None = None,
@@ -1007,6 +1008,7 @@ def _make_baseline(
             "iteration_p95": iteration_p95,
             "convergence_rate": convergence_rate,
             "cap_exhausted_chain_count": cap_exhausted_chain_count,
+            "cap_exhausted_directions": cap_exhausted_directions,
         },
     }
 
@@ -1042,6 +1044,12 @@ def test_lane_baseline_trend_uses_producer_lane_keys():
         iteration_p95=3.0,
         convergence_rate=0.8,
         cap_exhausted_chain_count=0,
+        cap_exhausted_directions=[
+            {"direction_id": "d-latest", "direction_text": "Latest cap loss"},
+            {"direction_id": "d-id-only", "direction_text": None},
+            {"direction_id": "", "direction_text": "invalid"},
+            "invalid-record",
+        ],
     )
     prior = _make_baseline(
         version_number=4,
@@ -1069,6 +1077,7 @@ def test_lane_baseline_trend_uses_producer_lane_keys():
         iteration_p95=4.0,
         convergence_rate=0.6,
         cap_exhausted_chain_count=2,
+        cap_exhausted_directions=[],
     )
 
     trend = compute_lane_baseline_trend([latest, prior])
@@ -1103,6 +1112,13 @@ def test_lane_baseline_trend_uses_producer_lane_keys():
     assert convergence["iteration_p95"]["classification"] == "improving"
     assert convergence["convergence_rate"]["classification"] == "improving"
     assert convergence["cap_exhausted_chain_count"]["classification"] == "improving"
+    assert convergence["cap_exhausted_directions"] == {
+        "latest": [
+            {"direction_id": "d-latest", "direction_text": "Latest cap loss"},
+            {"direction_id": "d-id-only", "direction_text": None},
+        ],
+        "prior": [],
+    }
 
     # conflict p50 improved: delta = -1.0
     conflict_p50 = trend["lane_iterations"]["conflict"]["p50"]

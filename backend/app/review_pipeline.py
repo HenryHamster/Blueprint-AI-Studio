@@ -1941,19 +1941,25 @@ def _stale_respawn_scope(
 ) -> str | None:
     """Classify a stale-target replacement review for durable diagnostics.
 
-    Only a *retarget* respawn is classified. Every retarget site stamps the
-    discarded review with ``_review_stale_head``/``_review_stale_target``
+    Only a *retarget* respawn is classified. Stale-target replacement sites
+    stamp the discarded review with ``_review_stale_head``/``_review_stale_target``
     before spawning the replacement (review_request_changes.py,
-    task_lifecycle.py's approval and merge-path stale guards), so the marker
-    is the authoritative signal. ``delta_base_sha`` alone is NOT: the ordinary
-    post-fix re-review (task_lifecycle_fix_completion.py) always supplies a
-    delta base, and counting those as retarget-deltas would make
+    task_lifecycle.py's approval and merge-path stale guards). A rollup fix
+    retarget is an admission-path replacement instead, so its source carries
+    the backend-issued ``review_loop.head_drift_retargeted_from`` receipt.
+    ``delta_base_sha`` alone is NOT: the ordinary post-fix re-review
+    (task_lifecycle_fix_completion.py) always supplies a delta base, and
+    counting those as retarget-deltas would make
     ``retarget_review_scope_counts`` measure routine re-review volume instead
     of retarget scope.
     """
     if task_type != "review":
         return None
-    if not (
+    review_loop = source_context.get("review_loop")
+    has_rollup_retarget_receipt = isinstance(review_loop, dict) and bool(
+        review_loop.get("head_drift_retargeted_from")
+    )
+    if not has_rollup_retarget_receipt and not (
         source_context.get("_review_stale_head")
         or source_context.get("_review_stale_target")
     ):

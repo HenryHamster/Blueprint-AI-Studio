@@ -19,6 +19,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List
 
+from sqlalchemy.dialects.postgresql import insert as _pg_insert
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -26,11 +27,19 @@ from app.digest_metrics import (
     compute_lane_waste_diagnostics,
     compute_outer_loop_convergence,
 )
-from app.models import ImprovementLane, Project, Task, TaskStatus, _utcnow
+from app.models import (
+    ImprovementLane,
+    Project,
+    ProjectLaneBaseline,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
 from app.project_telemetry import (
     read_all_lane_baselines,
     upsert_lane_baseline,
 )
+from app.project_telemetry import _prune_lane_baselines
 from app.project_telemetry import (
     read_version_lane_baseline as _read_table_lane_baseline,
 )
@@ -47,7 +56,7 @@ from app.routers.admin_pipeline_observability import (
 logger = logging.getLogger(__name__)
 
 DESIGN_DOC_KEY = "lane_baselines"
-BASELINE_DEF_VERSION = "v3"
+BASELINE_DEF_VERSION = "v4"
 _SNAPSHOT_PR_BREAKDOWN_LIMIT = 100
 _MAX_TASKS_PER_SNAPSHOT = 5000
 _MAX_BASELINES_STORED = 20
@@ -63,6 +72,23 @@ _SLIM_OVERFLOW_DROPPABLE = (
     "lane_iteration_distribution",
     "checkpoint_recovery_waste",
 )
+
+
+def _baseline_definition_number(version: str | None) -> int:
+    """Return the numeric revision for a versioned snapshot definition."""
+    if isinstance(version, str) and version.startswith("v"):
+        try:
+            return int(version[1:])
+        except ValueError:
+            pass
+    return 0
+
+
+def _baseline_needs_refresh(row: ProjectLaneBaseline) -> bool:
+    """Whether *row* predates the arm-bearing snapshot definition."""
+    return _baseline_definition_number(row.baseline_def_version) < _baseline_definition_number(
+        BASELINE_DEF_VERSION
+    )
 
 
 def _slim_baseline(baseline: Dict[str, Any]) -> Dict[str, Any]:
@@ -220,6 +246,34 @@ async def persist_version_lane_baseline(
 
     t_opened = _strip_tz(opened_at)
     t_closed = _strip_tz(closed_at)
+
+    # Lock an obsolete row for the duration of the recomputation.  Terminal
+    # hooks and the periodic sweep can overlap, but only the first writer for
+    # the current definition may win; a current or recognized newer row is
+    # returned before doing the expensive diagnostic queries.
+    existing_row = (
+        (
+            await session.execute(
+                select(ProjectLaneBaseline)
+                .where(
+                    ProjectLaneBaseline.project_id == project_id,
+                    ProjectLaneBaseline.version_number == version_number,
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing_row is not None and not _baseline_needs_refresh(existing_row):
+        logger.info(
+            "[LANE_BASELINE] v%d baseline already stored for project=%s "
+            "(definition=%s, first-write-wins, skip)",
+            version_number,
+            project_id,
+            existing_row.baseline_def_version,
+        )
+        return dict(existing_row.blob)
 
     _opts = load_only(*_TASK_SNAPSHOT_COLUMNS, raiseload=True)
     _proj_filter = [Task.project_id == project_id]
@@ -392,22 +446,6 @@ async def persist_version_lane_baseline(
 
     slimmed = _slim_baseline(baseline)
 
-    # First-write-wins: if a baseline already exists for this version in the
-    # dedicated project_lane_baseline table, leave it untouched and return it.
-    # New writes use the table exclusively, while readers retain a legacy
-    # design_doc fallback for historical rows. Existence for this new write is
-    # checked in the table; no Project row lock is needed because the row-scoped
-    # upsert below is sufficient.
-    existing = await _read_table_lane_baseline(session, project_id, version_number)
-    if existing is not None:
-        logger.info(
-            "[LANE_BASELINE] v%d baseline already stored for project=%s "
-            "(first-write-wins, skip)",
-            version_number,
-            project_id,
-        )
-        return existing
-
     # Project-existence guard (non-locking): a missing project cannot own a
     # baseline row (FK), and the legacy path returned None in that case.
     _exists = (
@@ -421,17 +459,44 @@ async def persist_version_lane_baseline(
         )
         return None
 
-    # Row-scoped ON CONFLICT upsert into the dedicated table; the accessor
-    # enforces the _LANE_BASELINE_VERSIONS_MAX retention cap (matching the former
-    # _MAX_BASELINES_STORED design_doc cap).
-    await upsert_lane_baseline(
-        session,
-        project_id=project_id,
-        version_number=version_number,
-        captured_at=now,
-        baseline_def_version=BASELINE_DEF_VERSION,
-        blob=slimmed,
-    )
+    if existing_row is not None:
+        # The row is locked above, so this overwrite cannot downgrade a newer
+        # definition or race another stale refresh.
+        await upsert_lane_baseline(
+            session,
+            project_id=project_id,
+            version_number=version_number,
+            captured_at=now,
+            baseline_def_version=BASELINE_DEF_VERSION,
+            blob=slimmed,
+        )
+    else:
+        # A terminal hook and a backfill can both observe an absent row.  Use
+        # DO NOTHING so the losing writer cannot replace the winner's current
+        # definition, then retain the normal table retention behavior.
+        stmt = _pg_insert(ProjectLaneBaseline).values(
+            id=uuid.uuid4(),
+            project_id=project_id,
+            version_number=version_number,
+            captured_at=now,
+            baseline_def_version=BASELINE_DEF_VERSION,
+            blob=slimmed,
+        )
+        await session.execute(
+            stmt.on_conflict_do_nothing(
+                index_elements=[
+                    ProjectLaneBaseline.project_id,
+                    ProjectLaneBaseline.version_number,
+                ]
+            )
+        )
+        await _prune_lane_baselines(session, project_id)
+
+        # If another writer won the insert race, return its blob and preserve
+        # its first-write-wins timestamp/content contract.
+        stored = await _read_table_lane_baseline(session, project_id, version_number)
+        if stored is not None:
+            slimmed = stored
 
     logger.info(
         "[LANE_BASELINE] persisted v%d lane baseline for project=%s "
@@ -453,9 +518,10 @@ async def backfill_missing_lane_baselines(
     """Backfill lane baselines for recently-closed versions that lack a stored entry.
 
     Queries up to ``max_versions`` closed (promoted or abandoned) ReleaseVersions
-    for the project, skips any version whose key already exists in
-    ``design_doc["lane_baselines"]``, and calls ``persist_version_lane_baseline``
-    for each gap.
+    for the project, skips only table rows at the current or a newer definition,
+    and calls ``persist_version_lane_baseline`` for each missing or obsolete
+    snapshot. Legacy ``design_doc["lane_baselines"]`` entries remain intact and
+    do not suppress a table refresh.
 
     Uses its own ``AsyncSessionLocal`` sessions per version so each persist
     commits independently and the populate_existing lock does not overwrite
@@ -476,19 +542,14 @@ async def backfill_missing_lane_baselines(
         if project_row is None:
             return []
 
-        # The sweep fills missing recent versions in the dedicated table. It is
-        # not a migration of the retained historical design_doc fallback.
-        existing_keys = {
-            str(row.version_number)
+        # Legacy design_doc rows are intentionally not included: they are the
+        # fallback being repaired, and the refreshed table row takes precedence
+        # without mutating the retained document.
+        current_table_versions = {
+            row.version_number
             for row in await read_all_lane_baselines(session, project_id)
+            if not _baseline_needs_refresh(row)
         }
-        legacy_baselines = (project_row.design_doc or {}).get(DESIGN_DOC_KEY) or {}
-        if isinstance(legacy_baselines, dict):
-            existing_keys.update(
-                str(key)
-                for key, value in legacy_baselines.items()
-                if isinstance(value, dict)
-            )
 
         versions = list(
             (
@@ -511,7 +572,7 @@ async def backfill_missing_lane_baselines(
     # release_version).
     backfilled: List[int] = []
     for version in versions:
-        if str(version.version_number) in existing_keys:
+        if version.version_number in current_table_versions:
             continue
 
         if version.status == "promoted":

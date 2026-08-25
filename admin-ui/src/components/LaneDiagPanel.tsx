@@ -277,6 +277,43 @@ function TrendRow({
   );
 }
 
+function CapLossDirectionTrend({ trend }: { trend: LaneBaselineTrend }) {
+  const directions = trend.outer_loop_convergence?.cap_exhausted_directions;
+  const versions = [
+    { key: 'prior', label: `Prior (v${trend.prior_version})` },
+    { key: 'latest', label: `Latest (v${trend.latest_version})` },
+  ] as const;
+
+  return (
+    <div className="mt-2 rounded border border-neutral-800/70 p-2" data-testid="cap-loss-direction-trend">
+      <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+        Cap-loss directions by version
+      </p>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {versions.map(({ key, label }) => {
+          const records = directions?.[key] ?? [];
+          return (
+            <div key={key}>
+              <p className="text-xs text-neutral-500">{label}</p>
+              {records.length === 0 ? (
+                <p className="text-xs text-neutral-500">None</p>
+              ) : (
+                <ul className="text-xs text-neutral-300 list-disc list-inside">
+                  {records.map((direction) => (
+                    <li key={direction.direction_id}>
+                      {direction.direction_text || direction.direction_id}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function CrossVersionTrendPanel({ trend }: { trend: LaneBaselineTrend }) {
   return (
     <div className="space-y-4" data-testid="cross-version-trend">
@@ -429,6 +466,7 @@ function CrossVersionTrendPanel({ trend }: { trend: LaneBaselineTrend }) {
             />
           </tbody>
         </table>
+        <CapLossDirectionTrend trend={trend} />
       </div>
 
       <div>

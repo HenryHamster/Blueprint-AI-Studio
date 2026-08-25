@@ -3332,6 +3332,10 @@ def test_lane_waste_reports_retarget_scope_and_exact_convergence_stats():
                 "pr_number": 901,
                 "iteration": 3,
                 "retarget_scope": "full",
+                "head_drift_retargeted_from": {
+                    "pr_number": 900,
+                    "head_sha": "a" * 40,
+                },
             },
         },
     )
@@ -3363,6 +3367,9 @@ def test_lane_waste_reports_retarget_scope_and_exact_convergence_stats():
         window_start,
     )
 
+    # ``stale_head_discard_count`` is driven by the ``_review_stale_head``
+    # marker, independently of the ``retarget_scope`` field that feeds
+    # ``retarget_review_scope_counts`` — this task carries both.
     assert result["stale_head_discard_count"] == 1
     assert result["retarget_review_scope_counts"] == {"delta": 1, "full": 2}
     assert "converged_review_counts" not in result
