@@ -181,6 +181,43 @@ run() {
 
 source scripts/backend-test-route.sh
 
+# Derived-artifact freshness, and repair of what may be repaired.
+#
+# The size ledger below is ONE derived artifact whose guard happens to be a
+# standalone checker, so it was the only one this gate enforced
+# unconditionally; every OTHER derived artifact in this repo (the websocket
+# emitter inventory fixture, the hand-kept WEBSOCKET_EMITTER_INVENTORY dict, the
+# conversational-Workday per-file test counts, the ranked-queue and durations
+# artifacts) is guarded by a pytest drift sentinel. Stale guard data is
+# self-concealing — it is attributable on exactly the one PR that introduces it
+# and inherited-then-warn-passed on every PR after — so anything it slips past
+# lands on the automain->main promotion matrix, which is what killed promotion
+# PRs #17738 and #17764. This lane runs only the sentinels registered for the
+# surfaces THIS diff touches, attributed against base, so it never blocks on
+# inherited drift.
+#
+# `--fix` and the position matter, and both are load-bearing:
+#
+#  * `--fix` regenerates a drifted artifact that derived_artifact_repair
+#    registers as decision-free (today: test-estate-ranked-queue.md, a pure
+#    report with no consumer but its own guard) and then RE-RUNS the sentinel to
+#    prove the drift cleared. Ratchets, floors, snapshots, caps and measured
+#    durations are never regenerated. Reporting alone was not enough: three
+#    hand-written repair commits landed in three days, each after a promotion PR
+#    had already gone red.
+#  * It runs on BOTH paths, and BEFORE the static corpus rather than after.
+#    Under `./check test` the corpus runs the whole roster, so a repair that
+#    happened after it would be graded against the pre-repair tree and still
+#    fail the gate. Ordering it first costs one scoped harness run and makes the
+#    corpus see the tree the PR will actually carry.
+if [ -f scripts/sentinel_freshness.py ]; then
+  run "derived-artifact freshness (registered drift sentinels)" \
+    python3 scripts/sentinel_freshness.py --fix --base "$BASE" --repo-root "$PWD"
+else
+  echo "[check] derived-artifact freshness helper is missing — refusing to skip the gate"
+  FAILED+=("sentinel freshness helper missing")
+fi
+
 # The database-free size guard is part of every publication gate. The
 # baseline-aware size-only path covers all five governed sections and never
 # invokes --fix or changes the cap ledger. ./check test additionally runs the
@@ -196,29 +233,6 @@ else
   FAILED+=("static release guard helper missing")
 fi
 
-# Derived-artifact freshness. The size ledger above is ONE derived artifact
-# whose guard happens to be a standalone checker, so it is the only one this
-# gate enforced unconditionally; every OTHER derived artifact in this repo (the
-# websocket emitter inventory fixture, the hand-kept WEBSOCKET_EMITTER_INVENTORY
-# dict, the conversational-Workday per-file test counts, the ranked-queue and
-# durations artifacts) is guarded by a pytest drift sentinel that ran only under
-# `./check test`. Stale guard data is self-concealing — it is attributable on
-# exactly the one PR that introduces it and inherited-then-warn-passed on every
-# PR after — so anything it slips past lands on the automain->main promotion
-# matrix, which is what killed promotion PRs #17738 and #17764. This lane runs
-# only the sentinels registered for the surfaces THIS diff touches, attributed
-# against base, so it never blocks on inherited drift.
-# Skipped under `./check test`: the attributed static corpus above already runs
-# every sentinel in the roster, so running them twice would only cost time.
-if [ "$WITH_TESTS" != "1" ]; then
-  if [ -f scripts/sentinel_freshness.py ]; then
-    run "derived-artifact freshness (registered drift sentinels)" \
-      python3 scripts/sentinel_freshness.py --base "$BASE" --repo-root "$PWD"
-  else
-    echo "[check] derived-artifact freshness helper is missing — refusing to skip the gate"
-    FAILED+=("sentinel freshness helper missing")
-  fi
-fi
 
 # Idempotent npm install guarded by package-lock IDENTITY, not the mere
 # existence of node_modules. A warm/reused VM carries a populated
