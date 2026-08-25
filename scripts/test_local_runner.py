@@ -3,6 +3,7 @@
 import ast
 import contextlib
 import base64
+import errno
 import io
 import json
 import os
@@ -11292,6 +11293,242 @@ class TestTaskLogPersistence(unittest.TestCase):
                           return_value="/tmp/nonexistent-log-dir-xyz"):
             removed = local_runner._cleanup_stale_task_logs()
         self.assertEqual(removed, 0)
+
+
+# ── Agent stdout drain: a write failure must never wedge the child ────────────
+
+class _RecordingLog:
+    """Stand-in for the per-task log handle: buffered ``write`` + ``flush``."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.write_calls = 0
+        self.closed = False
+
+    def write(self, chunk):
+        self.write_calls += 1
+        self.buffer.extend(chunk)
+        return len(chunk)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _LogThatFillsUp(_RecordingLog):
+    """Accepts one write, then fails exactly like a volume that just filled."""
+
+    def write(self, chunk):
+        self.write_calls += 1
+        if self.write_calls > 1:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        self.buffer.extend(chunk)
+        return len(chunk)
+
+
+class _ConsoleThatBreaks:
+    """Stand-in for a runner stdout whose reader went away (dead journal pipe)."""
+
+    def __init__(self):
+        self.write_calls = 0
+
+    def write(self, _text):
+        self.write_calls += 1
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    def flush(self):
+        pass
+
+
+class TestAgentStdoutDrain(unittest.TestCase):
+    """A failure to PERSIST agent output must never stop the pipe being drained.
+
+    ``_drain_stream_to_log`` is the ONLY reader of a spawned agent's stdout pipe
+    (the agent runs with ``stdout=PIPE, stderr=STDOUT``, and the walkthrough
+    stack supervisor — the only other thread handed the ``Popen`` — merely polls
+    ``proc.poll()``).  The tee used to catch ``OSError`` from the LOG WRITE in
+    the same handler that guards the pipe READ, and then return.  So an
+    unwritable log silently stopped the only reader: the kernel pipe buffer
+    (64KB on Linux) filled, the agent blocked forever inside ``write()``, held
+    its capacity permit, and was eventually SIGKILLed by the reaper's wall-clock
+    deadline and recorded as a failure.  A full disk HUNG agents instead of
+    failing them, destroying valid work.
+
+    These tests drive a REAL child process writing REAL bytes through a REAL
+    pipe.  That is deliberate: a mocked stream cannot block, so a test built on
+    one would pass against the wedged code and prove nothing.  Against the
+    pre-fix tee, ``test_child_completes_when_the_log_fills_up`` fails at
+    ``proc.wait`` with ``TimeoutExpired`` — the child is genuinely stuck.
+
+    POSIX-only, like the rest of this file (``local_runner`` imports ``fcntl``
+    at module scope); the 64KB pipe-buffer behaviour is what the Docker test
+    lane runs on.
+    """
+
+    # 16x the 64KB Linux pipe buffer, so the child CANNOT finish writing unless
+    # something keeps reading the far end.
+    CHILD_BYTES = 1 << 20
+
+    def _spawn_writer(self):
+        """Start a child that floods its stdout with CHILD_BYTES and exits 0."""
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write("
+                f"b'x' * {self.CHILD_BYTES}); sys.stdout.buffer.flush()",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.addCleanup(self._release, proc)
+        return proc
+
+    def _release(self, proc):
+        """Never leave a wedged child (or its pipe fd) behind on failure."""
+        if proc.poll() is None:
+            proc.kill()
+        if proc.stdout is not None:
+            with contextlib.suppress(OSError, ValueError):
+                proc.stdout.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=10)
+
+    def _drain_in_thread(self, proc, log_handle, console):
+        """Run the real drain on its own thread, exactly as the runner does."""
+        result = {}
+
+        def _run():
+            result["drained"] = local_runner._drain_stream_to_log(
+                proc.stdout, log_handle, task_id="drain-task", console=console
+            )
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        return thread, result
+
+    def test_child_completes_when_the_log_fills_up(self):
+        """ENOSPC on the log must degrade logging, not block the agent."""
+        proc = self._spawn_writer()
+        log = _LogThatFillsUp()
+        console = io.StringIO()
+        thread, result = self._drain_in_thread(proc, log, console)
+
+        # THE assertion.  Pre-fix the drain returns on the first ENOSPC, nothing
+        # reads the pipe, and the child blocks in write() forever ->
+        # TimeoutExpired here.
+        self.assertEqual(
+            proc.wait(timeout=10),
+            0,
+            "the agent child never exited: its stdout pipe stopped being drained, "
+            "so it is blocked in write() on a full 64KB pipe buffer",
+        )
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "the drain thread never reached EOF")
+        self.assertEqual(
+            result.get("drained"),
+            self.CHILD_BYTES,
+            "the pipe was abandoned part-way instead of being read to EOF",
+        )
+
+    def test_log_sink_is_dropped_once_and_released(self):
+        """One loud warning, not one per 8KB chunk, and the handle is closed."""
+        proc = self._spawn_writer()
+        log = _LogThatFillsUp()
+        console = io.StringIO()
+        thread, result = self._drain_in_thread(proc, log, console)
+        proc.wait(timeout=10)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "the drain thread never reached EOF")
+
+        self.assertEqual(
+            log.write_calls,
+            2,
+            "the tee kept writing to a sink it had already dropped "
+            f"({log.write_calls} calls for {self.CHILD_BYTES} bytes)",
+        )
+        self.assertTrue(log.closed, "the failed log handle was never released")
+        text = console.getvalue()
+        self.assertEqual(
+            text.count("log file became"),
+            1,
+            "expected exactly ONE warning about the unwritable log",
+        )
+        self.assertEqual(
+            text.count("x"),
+            self.CHILD_BYTES,
+            "console echo stopped when the log sink failed; the two sinks must "
+            "fail independently",
+        )
+
+    def test_child_completes_when_the_console_breaks(self):
+        """A dead runner stdout must not wedge the agent either."""
+        proc = self._spawn_writer()
+        console = _ConsoleThatBreaks()
+        captured_stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, "agent.log")
+            log_handle = open(log_path, "ab")
+            with patch.object(sys, "stderr", captured_stderr):
+                thread, result = self._drain_in_thread(proc, log_handle, console)
+                self.assertEqual(
+                    proc.wait(timeout=10),
+                    0,
+                    "the agent child never exited after the runner console broke",
+                )
+                thread.join(timeout=10)
+            self.assertFalse(thread.is_alive(), "the drain thread never reached EOF")
+            self.assertEqual(result.get("drained"), self.CHILD_BYTES)
+            self.assertEqual(
+                os.path.getsize(log_path),
+                self.CHILD_BYTES,
+                "the log lost output after the console broke; the two sinks must "
+                "fail independently",
+            )
+        self.assertEqual(
+            console.write_calls, 1, "the tee kept writing to a broken console"
+        )
+        self.assertEqual(
+            captured_stderr.getvalue().count("console output"),
+            1,
+            "the broken console must be reported exactly once, on stderr",
+        )
+
+    def test_read_failure_stops_the_drain_and_is_reported(self):
+        """The READ side stays fatal: a gone pipe must not become a spin loop.
+
+        The fix must not degrade into a blanket ``except: pass`` around the
+        whole loop — once the pipe itself is gone the child can no longer be
+        blocked on it, so the tee stops.  It now says so, because this thread is
+        never joined or inspected by the runner: a silent return made an
+        abnormal drain death completely unobservable.
+        """
+
+        class _StreamThatBreaks:
+            def __init__(self):
+                self.reads = 0
+
+            def read(self, _size):
+                self.reads += 1
+                if self.reads > 1:
+                    raise OSError(errno.EIO, "Input/output error")
+                return b"y" * 4096
+
+        stream = _StreamThatBreaks()
+        log = _RecordingLog()
+        console = io.StringIO()
+        drained = local_runner._drain_stream_to_log(
+            stream, log, task_id="drain-task", console=console
+        )
+
+        self.assertEqual(drained, 4096)
+        self.assertEqual(
+            stream.reads, 2, "the drain kept reading a stream that is already gone"
+        )
+        self.assertIn("stdout drain ended early", console.getvalue())
+        self.assertTrue(log.closed, "the log handle was not released on the read path")
 
 
 # ── Credential file path-traversal guard ──────────────────────────────────────

@@ -8828,6 +8828,118 @@ def _cleanup_stale_task_logs(
     return removed
 
 
+def _drain_stream_to_log(
+    stream: "typing.BinaryIO",
+    log_handle: "typing.BinaryIO | None",
+    *,
+    task_id: str,
+    console: "typing.TextIO | None" = None,
+    chunk_size: int = 8192,
+) -> int:
+    """Drain *stream* to EOF, teeing every chunk to *log_handle* and *console*.
+
+    Runs on a daemon thread as the ONLY reader of a spawned agent's stdout pipe
+    (the agent is started with ``stdout=PIPE, stderr=STDOUT``, so this single
+    pipe carries both streams and nothing else ever reads it). That makes the
+    drain load-bearing for the CHILD'S LIVENESS, not merely for logging, which
+    is why the two failure domains are handled separately:
+
+    * A READ failure is fatal to the tee. The pipe was closed underneath us
+      (teardown / fd-leak guard), so there is nothing left to drain and the
+      loop must stop.
+
+    * A WRITE failure is NOT fatal, and must never stop the drain. The tee used
+      to catch ``OSError`` from ``log_handle.write()``/``flush()`` in the SAME
+      handler that guards ``stream.read()`` and then return, which meant an
+      unwritable log (ENOSPC on a full disk, a quota trip, EIO, the handle
+      closed underneath us) silently stopped the only reader of the pipe. Once
+      the kernel pipe buffer filled — 64KB on Linux — the agent blocked forever
+      in ``write()``, held its capacity permit, and was eventually SIGKILLed by
+      the reaper's wall-clock deadline and recorded as a FAILURE. A full disk
+      therefore HUNG agents instead of failing them, destroying valid work with
+      no signal pointing at the disk. Now a failing sink is dropped (with ONE
+      warning, not one per chunk) and the drain continues to EOF: output is
+      degraded, the child is never blocked.
+
+    The same reasoning applies to the console sink: the runner's own stdout can
+    break (a closed terminal, a dead journal pipe → ``BrokenPipeError``, itself
+    an ``OSError``), and that must not wedge the agent either.
+
+    This function OWNS *log_handle* and closes it on the way out. Returns the
+    number of bytes drained from *stream*, so a caller (or a test) can prove the
+    pipe was actually read to EOF rather than abandoned part-way.
+    """
+    out = sys.stdout if console is None else console
+    drained = 0
+    console_broken = False
+
+    def _warn(message: str) -> None:
+        # Best-effort operator warning. One of these sinks may BE the thing that
+        # just failed, so skip a console already known broken, fall through to
+        # stderr, and never let the warning path raise back into the drain loop.
+        sinks = (sys.stderr,) if console_broken else (out, sys.stderr)
+        for sink in sinks:
+            try:
+                sink.write(message + "\n")
+                sink.flush()
+                return
+            except Exception:  # noqa: BLE001 — a warning must never stop the drain
+                continue
+
+    try:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break  # EOF: the child closed its end of the pipe.
+            drained += len(chunk)
+            if log_handle is not None:
+                try:
+                    log_handle.write(chunk)
+                    log_handle.flush()
+                except (OSError, ValueError) as exc:
+                    _warn(
+                        f"[runner] warning: task {task_id} log file became "
+                        f"unwritable ({type(exc).__name__}: {exc}); dropping "
+                        f"further file logging for this task. The agent's "
+                        f"stdout pipe is still being drained."
+                    )
+                    try:
+                        log_handle.close()
+                    except Exception:  # noqa: BLE001 — best-effort release
+                        pass
+                    # Dropping the reference is what makes the warning fire
+                    # exactly once instead of once per 8KB chunk.
+                    log_handle = None
+            if not console_broken:
+                try:
+                    out.write(chunk.decode("utf-8", "replace"))
+                    out.flush()
+                except (OSError, ValueError) as exc:
+                    console_broken = True
+                    _warn(
+                        f"[runner] warning: task {task_id} console output "
+                        f"became unwritable ({type(exc).__name__}: {exc}); "
+                        f"dropping further console echo for this task. The "
+                        f"agent's stdout pipe is still being drained."
+                    )
+    except (ValueError, OSError) as exc:
+        # READ side only. Reaching here means the pipe itself is gone, so the
+        # child can no longer be blocked on it. Say so: this thread is never
+        # joined or inspected by the runner, so a silent return made an
+        # abnormal drain death completely unobservable.
+        _warn(
+            f"[runner] warning: task {task_id} stdout drain ended early after "
+            f"{drained} byte(s) ({type(exc).__name__}: {exc})."
+        )
+    finally:
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except Exception:  # noqa: BLE001 — best-effort release
+                pass
+    return drained
+
+
 def _compute_backend_summary(caps: "iso.Capabilities") -> str:
     """Human summary of which compute backends this host can build."""
     parts: list[str] = []
@@ -9843,26 +9955,13 @@ def _spawn_agent_task(
     # Reader thread: tee the agent's stdout to both the per-task log file and
     # the runner's stdout (so output still appears in the terminal / systemd
     # journal, just as it did before with stdout=sys.stdout).
+    # This thread is the ONLY reader of the agent's pipe, so the drain is
+    # load-bearing for the child's liveness: a write failure must degrade the
+    # logging, never stop the reading. See _drain_stream_to_log.
     def _tee_agent_output() -> None:
-        try:
-            assert proc.stdout is not None
-            while True:
-                chunk = proc.stdout.read(8192)
-                if not chunk:
-                    break
-                if _log_file_handle is not None:
-                    _log_file_handle.write(chunk)
-                    _log_file_handle.flush()
-                sys.stdout.write(chunk.decode("utf-8", "replace"))
-                sys.stdout.flush()
-        except (ValueError, OSError):
-            return  # stdout closed underneath us (normal on teardown)
-        finally:
-            if _log_file_handle is not None:
-                try:
-                    _log_file_handle.close()
-                except Exception:
-                    pass
+        if proc.stdout is None:  # pragma: no cover - stdout=PIPE is set above
+            return
+        _drain_stream_to_log(proc.stdout, _log_file_handle, task_id=task_id)
 
     _log_reader = threading.Thread(target=_tee_agent_output, daemon=True)
     _log_reader.start()

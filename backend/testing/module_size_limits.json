@@ -438,7 +438,7 @@
     "test_lane_baseline_snapshot.py": 1750
   },
   "scripts": {
-    "test_local_runner.py": 14250,
+    "test_local_runner.py": 16650,
     "local_runner.py": 11450,
     "blueprint.py": 9900,
     "test_blueprint_cli.py": 8800,
