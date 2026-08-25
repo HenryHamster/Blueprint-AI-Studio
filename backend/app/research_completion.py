@@ -49,6 +49,10 @@ from app.research_execution_authority import (
     MAX_RESEARCH_DEPTH,
     authenticated_research_children,
     commit_or_handle_duplicate_research_spawn,
+    WITHHELD_DISPOSITION_DEDUP_FILTERED,
+    WITHHELD_FINDINGS_CONTEXT_KEY,
+    bounded_withheld_findings_carry,
+    build_withheld_finding_record,
     finalized_research_findings_for_survivors,
     is_authenticated_research_child,
     lock_research_spawn_boundary,
@@ -56,6 +60,7 @@ from app.research_execution_authority import (
     refresh_research_spawn_references,
     relock_research_spawn_retry,
 )
+from app.research_type_routing import route_non_spawning_finding
 from app.research_output_contract import (
     RESEARCH_FINDING_ORIGIN_CONTRACT_VERSION_KEY,
     RESEARCH_OUTPUT_CONTRACT_VERSION,
@@ -258,7 +263,6 @@ from app.task_locking import (
 )
 from app.project_telemetry import (
     get_project_telemetry as _get_project_telemetry,
-    set_project_telemetry as _set_project_telemetry,
 )
 from app.plan_completion import (
     _validate_plan_dependencies,
@@ -3767,6 +3771,20 @@ async def _handle_research_completion(
     type_filtered_by_dir: dict[str, int] = {}
     empty_prompt_count = 0
     _noop_metadata_finding_ids: set[int] = set()
+    # A routed finding whose side effect did NOT land (a duplicate design-doc
+    # observation, a direction_update whose target direction is gone). It is
+    # counted separately from ``type_filtered_count``, which means "routed AND
+    # applied" and drives the findings_documented outcome: nothing was
+    # documented here. Before this counter the no-op path incremented nothing
+    # at all and was invisible even in the parent's status string -- strictly
+    # worse than the applied case it sits beside.
+    type_routed_noop_count = 0
+    # Structured, content-carrying records of every finding that produced no
+    # child task. Rendered into the discovery decision packet so a reviewer
+    # can judge what was withheld instead of reading a manifest that claims
+    # nothing was omitted over an empty receipt. See
+    # ``research_execution_authority.WITHHELD_FINDINGS_CONTEXT_KEY``.
+    _withheld_records: list[dict] = []
 
     # Hashes of findings that survived parsing into `findings` but were dropped
     # from the SPAWN set by deduplicate_findings (duplicate of existing in-flight,
@@ -3972,6 +3990,25 @@ async def _handle_research_completion(
     # Also index by parent_direction_id in task context as fallback
     _parent_direction_id = (task.context or {}).get("direction_id")
 
+    # The dedup half of the withheld carry. A word/hash/file/evidence-overlap
+    # drop leaves no child task either, so it reaches the decision packet by
+    # exactly the same (absent) route as a type-routed finding -- both of the
+    # two filters observed live on 2026-08-25 produce the identical
+    # lying-manifest shape, and one research parent hit both in the same run.
+    _withheld_records.extend(
+        build_withheld_finding_record(
+            _entry.get("finding") or {"title": _entry.get("title")},
+            disposition=WITHHELD_DISPOSITION_DEDUP_FILTERED,
+            reason=str(_entry.get("reason") or "dedup_filtered"),
+            direction_id=(
+                (_entry.get("finding") or {}).get("direction_id")
+                or _parent_direction_id
+            ),
+        )
+        for _entry in (filtered_findings or [])
+        if isinstance(_entry, dict)
+    )
+
     _cochange_index_for_decomp = None
     if _scope_cal_project:
         from app.direction_outcomes import read_cochange_index as _read_cci
@@ -4150,113 +4187,27 @@ async def _handle_research_completion(
         # Determine task type early — some findings don't spawn tasks
         finding_type = finding.get("type", "improvement")
 
-        if finding_type == "design_doc_observation":
-            # Append to design doc proposals for Phase 1 to review
-            _obs_text = finding.get("description", "")[:500]
-            _obs_section = finding.get("section", "general")
-            _obs_entry = {
-                "id": f"pc-{uuid.uuid4().hex[:8]}",
-                "observation": _obs_text,
-                "section": _obs_section,
-                "proposed_by_task": str(task.id),
-                "proposed_at": _utcnow().isoformat(),
-                "status": "pending",
-            }
-
-            _captured_proposals: dict = {}
-            _obs_applied = {"value": False}
-
-            # Pre-read current proposals from telemetry so the lock callback
-            # sees the canonical data after strip_migrated_doc_keys removed
-            # this key from design_doc.
-            _existing_proposals = await _get_project_telemetry(
-                session, task.project_id, "proposed_changes",
-                design_doc_fallback=None,
-            )
-
-            def _add_obs_proposal(
-                doc: dict,
-                _existing=_existing_proposals,
-                _text=_obs_text,
-                _section=_obs_section,
-                _entry=_obs_entry,
-                _applied=_obs_applied,
-                _captured=_captured_proposals,
-            ) -> None:
-                # Hydrate from telemetry before mutation.
-                proposals = list(_existing or doc.get("proposed_changes", []))
-                # Dedup: skip if identical observation already exists
-                existing = next(
-                    (p for p in proposals
-                     if p.get("observation") == _text and p.get("section") == _section),
-                    None
-                )
-                if not existing:
-                    proposals.append(_entry)
-                    _applied["value"] = True
-                doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
-                _captured["value"] = doc["proposed_changes"]
-
-            await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
-            if _captured_proposals.get("value") is not None:
-                await _set_project_telemetry(
-                    session, task.project_id, "proposed_changes", _captured_proposals["value"]
-                )
-            if not _obs_applied["value"]:
+        _route = await route_non_spawning_finding(
+            session, task, finding, parent_direction_id=_parent_direction_id
+        )
+        if _route is not None:
+            # Routed into durable project state rather than into work. Either
+            # way no task is created, so the finding carries no finding_hash
+            # into the survivors join and would otherwise reach the discovery
+            # decision packet as nothing at all -- the omission this record
+            # closes. Applied and no-op routes are both recorded; only
+            # ``routing_applied`` and the reason distinguish them.
+            _withheld_records.append(_route.withheld_record)
+            if not _route.applied:
+                type_routed_noop_count += 1
                 _noop_metadata_finding_ids.add(id(finding))
                 continue
             type_filtered_count += 1
-            _tf_did = finding.get("direction_id") or _parent_direction_id
-            if _tf_did:
-                type_filtered_by_dir[_tf_did] = type_filtered_by_dir.get(_tf_did, 0) + 1
+            if _route.direction_id:
+                type_filtered_by_dir[_route.direction_id] = (
+                    type_filtered_by_dir.get(_route.direction_id, 0) + 1
+                )
             continue  # Don't create a task
-
-        if finding_type == "direction_update":
-            # Process as a direction modification proposal, not a task
-            target_id = finding.get("direction_id")
-            if not target_id:
-                _noop_metadata_finding_ids.add(id(finding))
-                continue  # direction_update requires a target direction_id
-            _du_finding = finding
-            _du_target_id = target_id
-            _du_task_id = str(task.id)
-            _du_applied = {"value": False}
-
-            def _set_pending_update(
-                dirs: list,
-                _target_id=_du_target_id,
-                _update=_du_finding,
-                _task_id=_du_task_id,
-                _applied=_du_applied,
-            ) -> None:
-                for d in dirs:
-                    if d.get("id") == _target_id:
-                        d["pending_update"] = {
-                            "suggested_text": _update.get(
-                                "suggested_text", d.get("text")
-                            ),
-                            "suggested_priority": _update.get(
-                                "suggested_priority", d.get("priority")
-                            ),
-                            "suggested_paths": _update.get(
-                                "suggested_paths", d.get("paths", [])
-                            ),
-                            "rationale": _update.get("description", "")[:300],
-                            "proposed_at": _utcnow().isoformat(),
-                            "proposed_by": _task_id,
-                        }
-                        _applied["value"] = True
-                        break
-
-            await with_directions_locked(session, task.project_id, _set_pending_update)
-            if not _du_applied["value"]:
-                _noop_metadata_finding_ids.add(id(finding))
-                continue
-            type_filtered_count += 1
-            _tf_did = finding.get("direction_id") or _parent_direction_id
-            if _tf_did:
-                type_filtered_by_dir[_tf_did] = type_filtered_by_dir.get(_tf_did, 0) + 1
-            continue  # Don't create a task for direction_update findings
 
         if not prompt:
             empty_prompt_count += 1
@@ -7031,6 +6982,7 @@ async def _handle_research_completion(
         file_overlap_count=file_overlap_count,
         evidence_overlap_count=evidence_overlap_count,
         type_filtered_count=type_filtered_count,
+        type_routed_noop_count=type_routed_noop_count,
         type_filtered_by_dir=type_filtered_by_dir,
         empty_prompt_count=empty_prompt_count,
         batch_cap_applied_count=batch_cap_applied_count,
@@ -7239,15 +7191,30 @@ async def _handle_research_completion(
         )
         await session.commit()
         return
+    _withheld_carry = None
     if _prior_finalized_findings is None:
         # Lock the authenticated delivery rows while the canonical Project ->
         # parent boundary is held, then join only non-cancelled survivors.
-        _finalized_findings = await finalized_research_findings_for_survivors(
-            session, task, _finalization_candidates
+        # The join also carries the withheld set through: those findings have
+        # no child task and so no surviving hash, which is exactly why they
+        # used to disappear from every downstream evidence surface.
+        _delivery = await finalized_research_findings_for_survivors(
+            session,
+            task,
+            _finalization_candidates,
+            withheld_records=_withheld_records,
         )
+        _finalized_findings = _delivery.findings
+        _withheld_carry = bounded_withheld_findings_carry(_delivery.withheld)
     _locked_final_ctx = dict(task.context or {})
     _locked_final_ctx.update(_final_ctx)
     _locked_final_ctx.pop("_research_spawn_pending", None)
+    if _withheld_carry is not None:
+        # Written under the same finalized marker as ``plan_output`` so the
+        # packet's read seam can trust both or neither. A replay that takes
+        # the ``_prior_finalized_findings`` path leaves the already-committed
+        # carry untouched rather than rebuilding it from re-parsed output.
+        _locked_final_ctx[WITHHELD_FINDINGS_CONTEXT_KEY] = _withheld_carry
     _final_ctx = _locked_final_ctx
     task.plan_output = _finalized_findings
     task.context = _final_ctx

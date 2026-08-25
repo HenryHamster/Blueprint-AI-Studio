@@ -9,8 +9,11 @@ module so every untrusted context ingress uses the same rule.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import logging
 from collections.abc import Iterable, Mapping, Sequence
+from typing import NamedTuple
 
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import IntegrityError
@@ -28,6 +31,13 @@ logger = logging.getLogger(__name__)
 
 MAX_RESEARCH_DEPTH = 3
 
+# Stamped on a research parent's context only once the completion handler has
+# durably finalized its survivor set and child topology.  Defined in this leaf
+# module -- ``app.findings_index`` re-exports it -- because ``app.task_blocked``
+# imports this module, so importing the findings index back into it is a real
+# cycle (it fails at ``app.main`` load, not in some rare path).
+FINALIZED_RESEARCH_FINDINGS_KEY = "research_findings_finalized"
+
 _IDEMPOTENCY_INDEX_ACTIVE_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
@@ -40,7 +50,7 @@ _IDEMPOTENCY_INDEX_ACTIVE_STATUSES = (
 RESEARCH_SERVER_OWNED_CONTEXT_KEYS: frozenset[str] = frozenset(
     {
         "research_output_contract_version",
-        "research_findings_finalized",
+        FINALIZED_RESEARCH_FINDINGS_KEY,
         "_research_spawn_pending",
         "_research_spawn_recovery",
         "prior_deferred_findings",
@@ -58,6 +68,11 @@ RESEARCH_SERVER_OWNED_CONTEXT_KEYS: frozenset[str] = frozenset(
         # hash on a genuine child would make a different, undelivered finding
         # appear to have survived merely because the row's lineage is valid.
         "finding_hash",
+        # The bounded record of findings that were routed or filtered instead
+        # of delivered.  The discovery decision packet surfaces it as evidence
+        # a reviewer binds advance/park/stop on, so a member or agent that
+        # could author it could fabricate the very content the review reads.
+        "withheld_findings",
     }
 )
 
@@ -68,7 +83,7 @@ RESEARCH_SERVER_OWNED_CONTEXT_KEYS: frozenset[str] = frozenset(
 RESEARCH_FRESH_ATTEMPT_CONTEXT_KEYS: frozenset[str] = frozenset(
     {
         "research_output_contract_version",
-        "research_findings_finalized",
+        FINALIZED_RESEARCH_FINDINGS_KEY,
         "_research_spawn_pending",
         "_research_spawn_recovery",
     }
@@ -162,12 +177,260 @@ async def authenticated_research_children(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Withheld-finding carry
+#
+# A research cycle can produce a finding that never becomes a child task, for
+# two structurally different reasons:
+#
+#   * TYPE ROUTING -- ``design_doc_observation`` and ``direction_update``
+#     findings are routed into durable project state (the design doc's
+#     ``proposed_changes``, or a direction's ``pending_update``) instead of
+#     spawning work. That routing is correct; spawning an implementation task
+#     for "the design doc should say X" would be wrong.
+#   * DEDUP FILTERING -- a finding that overlaps in-flight, shipped, or
+#     already-known work is dropped from the spawn set.
+#
+# In both cases the finding has no child task, so it carries no
+# ``finding_hash`` into ``finalized_research_findings_for_survivors`` and is
+# dropped from ``plan_output``. The discovery decision packet reads exactly
+# ``plan_output``, so the reviewer saw zero evidence coverage while the
+# packet's manifest -- which can only report on evidence it knows about --
+# reported ``required_evidence_omitted: false``. That is a completeness signal
+# reporting clean because it could not see: the same vacuous-guard shape this
+# codebase keeps paying for. Observed live on direction ``d-1210b978``
+# generations 5 and 9, and across six research parents in a single 60-row task
+# page on 2026-08-25.
+#
+# The invariant these records exist to hold: a finding is either turned into a
+# task, or it reaches the review packet as withheld-with-reason INCLUDING ITS
+# CONTENT. Never dropped-and-declared-complete.
+WITHHELD_FINDINGS_CONTEXT_KEY = "withheld_findings"
+# Bounded so one pathological cycle can neither grow ``task.context`` without
+# limit nor blow the discovery packet's fixed evidence budget (overflowing that
+# budget revokes binding authority and strands the direction, so the carry must
+# have a known worst case). Overflow past the cap is RECORDED on the envelope
+# -- ``omitted_count`` plus a checksum of the dropped set -- never silent.
+WITHHELD_FINDINGS_CAP = 12
+# Per-string excerpt bound. A cut is stamped on the record
+# (``content_truncated``) and the full finding's checksum is carried alongside,
+# so a bounded excerpt is provably an excerpt of that exact finding rather than
+# a silent rewrite.
+WITHHELD_FINDING_EXCERPT_CHARS = 700
+# Whole-record content bound, across every carried field. Per-field caps alone
+# are not enough: six fields at the per-field bound render past what the
+# discovery packet will serialize for one item, and that packet-side bound
+# collapses an over-long value into an excerpt blob -- which would lose the
+# per-field structure without the record ever saying so. Bounding the record
+# here keeps the cut where it can be named: fields that do not fit are listed
+# in ``content_omitted_keys`` rather than quietly disappearing.
+WITHHELD_FINDING_CONTENT_CHARS = 900
+
+WITHHELD_DISPOSITION_TYPE_ROUTED = "type_routed"
+WITHHELD_DISPOSITION_DEDUP_FILTERED = "dedup_filtered"
+
+WITHHELD_ROUTE_DESIGN_DOC = "project_design_doc.proposed_changes"
+WITHHELD_ROUTE_DIRECTION_PENDING_UPDATE = "direction.pending_update"
+
+# The decision-bearing prose of a withheld finding. Everything else on a raw
+# finding (scope hints, related_files, internal gate verdicts) is machinery the
+# reviewer does not judge, and carrying it would spend the bounded packet
+# budget on noise.
+_WITHHELD_CONTENT_KEYS: tuple[str, ...] = (
+    "title",
+    "description",
+    "section",
+    "suggested_text",
+    "suggested_priority",
+    "rationale",
+)
+
+
+def _withheld_checksum(value: object) -> str:
+    rendered = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def build_withheld_finding_record(
+    finding: Mapping | None,
+    *,
+    disposition: str,
+    reason: str,
+    finding_type: str | None = None,
+    routed_to: str | None = None,
+    destination_id: str | None = None,
+    direction_id: str | None = None,
+    routing_applied: bool = False,
+) -> dict:
+    """Build one bounded, structured record of a finding that spawned no task.
+
+    ``reason`` is the human-readable *why*; ``routing_applied`` is the machine
+    answer to "did the side effect actually land?".  A routed finding whose
+    side effect no-opped (a duplicate design-doc observation, a
+    ``direction_update`` whose target direction is gone) is the strictly worse
+    case -- before this record existed it incremented no counter at all and did
+    not even reach the parent's status string -- so it is recorded exactly like
+    an applied one, distinguished only by this flag and its reason.
+    """
+
+    source = finding if isinstance(finding, Mapping) else {}
+    content: dict[str, object] = {}
+    content_omitted_keys: list[str] = []
+    content_truncated = False
+    remaining = WITHHELD_FINDING_CONTENT_CHARS
+    # ``_WITHHELD_CONTENT_KEYS`` is in decision-value order, so the record
+    # spends its budget on the prose a reviewer judges first and names what it
+    # could not afford last.
+    for key in _WITHHELD_CONTENT_KEYS:
+        raw = source.get(key)
+        if raw is None or raw == "":
+            continue
+        text = raw if isinstance(raw, str) else str(raw)
+        limit = min(WITHHELD_FINDING_EXCERPT_CHARS, remaining)
+        if limit <= 0:
+            content_omitted_keys.append(key)
+            content_truncated = True
+            continue
+        if len(text) > limit:
+            text = text[:limit]
+            content_truncated = True
+        remaining -= len(text)
+        content[key] = text
+    return {
+        "disposition": str(disposition),
+        "reason": str(reason)[:240],
+        "finding_type": str(finding_type or source.get("type") or "improvement"),
+        "routed_to": routed_to,
+        "destination_id": str(destination_id) if destination_id else None,
+        "direction_id": str(direction_id) if direction_id else None,
+        "routing_applied": bool(routing_applied),
+        "content": content,
+        "content_truncated": content_truncated,
+        "content_omitted_keys": content_omitted_keys,
+        "finding_checksum": _withheld_checksum(source),
+    }
+
+
+def bounded_withheld_findings_carry(records: Sequence[Mapping]) -> dict | None:
+    """Cap the carry and state the overflow outright.
+
+    Type-routed records sort ahead of dedup-filtered ones: a dedup-filtered
+    finding already has other durable surfaces (the direction's
+    ``research_history`` filter breakdown and filtered-title list, and the
+    salvage bundle), while a type-routed one has none, so it is the record the
+    reviewer would otherwise lose entirely.
+    """
+
+    usable = [dict(record) for record in records if isinstance(record, Mapping)]
+    if not usable:
+        return None
+    ordered = sorted(
+        usable,
+        key=lambda record: 0
+        if record.get("disposition") == WITHHELD_DISPOSITION_TYPE_ROUTED
+        else 1,
+    )
+    kept = ordered[:WITHHELD_FINDINGS_CAP]
+    omitted = ordered[WITHHELD_FINDINGS_CAP:]
+    return {
+        "total_count": len(ordered),
+        "records": kept,
+        "omitted_count": len(omitted),
+        "omitted_checksum": _withheld_checksum(omitted) if omitted else None,
+    }
+
+
+def withheld_findings_carry_from_state(
+    context: object,
+    *,
+    status: object,
+    task_type: object,
+) -> dict | None:
+    """Return the finalized withheld-finding carry, or ``None``.
+
+    Gated exactly like ``finalized_research_findings``: the carry is authority
+    only once research completion stamped its finalized marker inside the
+    Project -> parent -> children lock boundary.  A pre-gate copy could still
+    be rewritten by a retry, and evidence a reviewer binds on must not move
+    under it.
+    """
+
+    if not isinstance(context, dict):
+        return None
+    if context.get(FINALIZED_RESEARCH_FINDINGS_KEY) is not True:
+        return None
+    if status not in (TaskStatus.COMPLETED, TaskStatus.EVALUATING):
+        return None
+    if str(task_type or "").strip().lower() != "research":
+        return None
+    carry = context.get(WITHHELD_FINDINGS_CONTEXT_KEY)
+    if not isinstance(carry, dict):
+        return None
+    if not isinstance(carry.get("records"), list):
+        return None
+    records = [
+        record for record in carry["records"] if isinstance(record, dict)
+    ]
+    return {
+        "total_count": int(carry.get("total_count") or len(records)),
+        "records": records,
+        "omitted_count": int(carry.get("omitted_count") or 0),
+        "omitted_checksum": carry.get("omitted_checksum"),
+    }
+
+
+def withheld_findings_carry(task: Task) -> dict | None:
+    """Read one research task's finalized withheld-finding carry."""
+
+    return withheld_findings_carry_from_state(
+        getattr(task, "context", None),
+        status=getattr(task, "status", None),
+        task_type=(getattr(task, "first_payload", None) or {}).get("type"),
+    )
+
+
+class ResearchFinalizationDelivery(NamedTuple):
+    """What survived finalization, and what was withheld with its content.
+
+    Two disjoint streams, deliberately not merged: ``findings`` is the
+    authoritative surviving set that becomes ``plan_output`` (and so the
+    findings index, the survival signal, and every actionable-evidence
+    surface), while ``withheld`` carries findings that were routed or filtered
+    rather than delivered.  Folding the second into the first would make a
+    design-doc observation look like shipped work; dropping it -- what this
+    join did before -- is what made the decision packet's completeness
+    manifest lie.
+    """
+
+    findings: list[dict]
+    withheld: list[dict]
+
+
 async def finalized_research_findings_for_survivors(
     session,
     parent_task: Task,
     candidates: Sequence[tuple[int, dict, str]],
-) -> list[dict]:
-    """Join candidate findings to the locked, non-cancelled delivery set."""
+    *,
+    withheld_records: Sequence[Mapping] = (),
+) -> ResearchFinalizationDelivery:
+    """Join candidates to the locked delivery set, carrying the withheld set.
+
+    The hash join answers exactly one question -- which candidate findings
+    have a surviving, non-cancelled child task -- and it must keep answering
+    only that: ``findings`` becomes ``plan_output``, the findings index, and
+    the survival signal, so a routed observation folded in there would read as
+    shipped work.
+
+    But "no surviving child" is not the same fact as "nothing happened".  A
+    ``design_doc_observation`` was routed into the design doc; a
+    ``direction_update`` was written onto a direction row; a dedup-filtered
+    finding was suppressed against known work.  Each of those has no child and
+    therefore no ``finding_hash``, so the join used to drop it on the floor --
+    and because the discovery decision packet reads ``plan_output`` and
+    nothing else, the reviewer got zero evidence coverage under a manifest
+    asserting nothing was omitted.  ``withheld`` is the second stream that
+    closes that hole: bounded, structured, content-carrying, and reported.
+    """
 
     children = await authenticated_research_children(
         session, parent_task, lock=True
@@ -184,7 +447,10 @@ async def finalized_research_findings_for_survivors(
         if finding_hash in surviving_hashes and finding_hash not in finalized_hashes:
             finalized.append(finding)
             finalized_hashes.add(finding_hash)
-    return finalized
+    withheld = [
+        dict(record) for record in withheld_records if isinstance(record, Mapping)
+    ]
+    return ResearchFinalizationDelivery(findings=finalized, withheld=withheld)
 
 
 def reconcile_replayed_salvage_delivery(
