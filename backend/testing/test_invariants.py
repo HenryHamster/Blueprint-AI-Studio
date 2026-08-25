@@ -4812,6 +4812,10 @@ class TestOperatorMessageArmingGateCoverage:
 
     _GATE_NAME = "maybe_arm_operator_refresh"
     _MESSAGE_CLASS = "ProjectMessage"
+    # The keyword the scan reads to decide a construction is operator-authored.
+    # Shared by _is_operator_message_call and the prefilter below so a rename
+    # cannot make one of them look for a spelling the other no longer matches.
+    _FROM_TYPE_KWARG = "from_type"
 
     # Allowlisted (file, function) sites that intentionally seed an operator
     # message without a wake decision. The onboarding goal setter writes a
@@ -4826,6 +4830,40 @@ class TestOperatorMessageArmingGateCoverage:
             "loop exists; intentionally does not wake the strategist"
         ),
     }
+
+    # Every backend/app/ file that carries a real operator-authored
+    # ``ProjectMessage`` construction today, exempt sites included. The textual
+    # prefilter below must admit all of them; see
+    # ``test_prefilter_admits_every_live_operator_message_file`` for why a
+    # prefilter that silently dropped one would make the whole-package scan
+    # report clean without ever parsing the file that holds the site.
+    _KNOWN_OPERATOR_MESSAGE_FILES = (
+        "project_message_creation.py",
+        "routers/admin_onboard.py",
+    )
+
+    @staticmethod
+    def _source_may_hold_operator_message(source: str) -> bool:
+        """Sound prefilter: can this source possibly hold a flagged site?
+
+        ``_is_operator_message_call`` matches only a call whose callee name
+        resolves to ``_MESSAGE_CLASS`` -- reached either as a bare ``Name``
+        (``ProjectMessage(...)``) or as an ``Attribute``
+        (``models.ProjectMessage(...)``, where ``_ast_called_name`` returns
+        ``.attr``) -- and which carries a keyword argument literally named
+        ``_FROM_TYPE_KWARG``. Both are *identifiers*, not string constants, so
+        neither can be assembled by concatenation or an f-string: a source that
+        does not contain both tokens cannot produce an offender, and skipping
+        its ``ast.parse`` cannot hide one.
+        """
+        cls = TestOperatorMessageArmingGateCoverage
+        # Identifier boundaries, so "from_types" or "MyProjectMessage" do
+        # not admit a file on a coincidental substring.
+        word = r"\b{}\b"
+        return bool(
+            re.search(word.format(re.escape(cls._MESSAGE_CLASS)), source)
+            and re.search(word.format(re.escape(cls._FROM_TYPE_KWARG)), source)
+        )
 
     @staticmethod
     def _collect_offenders(
@@ -4918,7 +4956,8 @@ class TestOperatorMessageArmingGateCoverage:
                 return False
             for kw in node.keywords:
                 if (
-                    kw.arg == "from_type"
+                    kw.arg
+                    == TestOperatorMessageArmingGateCoverage._FROM_TYPE_KWARG
                     and isinstance(kw.value, ast.Constant)
                     and kw.value.value == "user"
                 ):
@@ -5070,6 +5109,144 @@ class TestOperatorMessageArmingGateCoverage:
             "referencing the gate symbol is not the same as using its verdict."
         )
 
+    def test_operator_message_prefilter_cannot_skip_a_flagged_site(self):
+        """Vacuity ratchet: the whole-package prefilter must admit every source
+        the scanner would flag.
+
+        The prefilter exists for speed: it skips the ``ast.parse`` for the
+        ~92% of app files that cannot hold a match. That makes it a vacuity
+        risk — an unsound prefilter turns the whole-package scan green because
+        it never looked, which is indistinguishable from green because the
+        codebase is clean. Both directions are pinned here: every callee
+        spelling ``_ast_called_name`` resolves is admitted *and* flagged, and
+        each source the prefilter drops is proved offender-free by running the
+        scanner on it anyway.
+        """
+        from textwrap import dedent
+
+        for call in (self._MESSAGE_CLASS, f"models.{self._MESSAGE_CLASS}"):
+            source = dedent(
+                f"""
+                async def create_message(session, project_id, content):
+                    msg = {call}(
+                        project_id=project_id,
+                        {self._FROM_TYPE_KWARG}="user",
+                        content=content
+                    )
+                    await session.add(msg)
+                """
+            )
+            assert self._source_may_hold_operator_message(source), (
+                f"prefilter would skip a {call}(...) site the scanner flags — "
+                "the whole-package guard is vacuous for this spelling"
+            )
+            assert self._collect_offenders(
+                source,
+                filename="synthetic_operator_msg_fixture.py",
+                rel="synthetic_operator_msg_fixture.py",
+                gate_name=self._GATE_NAME,
+                message_class=self._MESSAGE_CLASS,
+            ), f"scanner failed to flag the {call}(...) spelling"
+
+        # The two ways a source can be dropped. Each is proved empty by the
+        # scanner itself, so the skip is never hiding an offender.
+        no_kwarg = dedent(
+            f"""
+            def build(project_id, content):
+                return {self._MESSAGE_CLASS}(
+                    project_id=project_id, content=content
+                )
+            """
+        )
+        no_message_class = dedent(
+            f"""
+            async def reply(session, project_id, answer):
+                return await post_question_answer(
+                    session, project_id, answer, {self._FROM_TYPE_KWARG}="user"
+                )
+            """
+        )
+        for source in (no_kwarg, no_message_class):
+            assert not self._source_may_hold_operator_message(source)
+            assert (
+                self._collect_offenders(
+                    source,
+                    filename="synthetic_operator_msg_fixture.py",
+                    rel="synthetic_operator_msg_fixture.py",
+                    gate_name=self._GATE_NAME,
+                    message_class=self._MESSAGE_CLASS,
+                )
+                == []
+            ), (
+                "prefilter dropped a source the scanner would have flagged — "
+                "the whole-package scan cannot see this file at all"
+            )
+
+    def test_prefilter_admits_every_live_operator_message_file(self):
+        """Literal pin against a vacuously green whole-package scan.
+
+        Soundness by construction (identifiers cannot be assembled at runtime)
+        is the argument; this is the evidence. Every app file that carries a
+        real operator-authored message today — the exempt onboarding seeder
+        included — must survive the prefilter, and must still actually carry
+        the site, so the pin cannot rot into an assertion about nothing.
+        """
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        for rel in self._KNOWN_OPERATOR_MESSAGE_FILES:
+            fpath = os.path.join(app_dir, *rel.split("/"))
+            with open(fpath, encoding="utf-8") as f:
+                source = f.read()
+
+            assert self._source_may_hold_operator_message(source), (
+                f"prefilter drops {rel}, which carries a live operator-authored "
+                f"{self._MESSAGE_CLASS} site — the whole-package scan would "
+                "report clean without ever parsing it"
+            )
+
+            tree = ast.parse(source, filename=fpath)
+            assert any(
+                isinstance(node, ast.Call)
+                and _ast_called_name(node) == self._MESSAGE_CLASS
+                and any(
+                    kw.arg == self._FROM_TYPE_KWARG
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "user"
+                    for kw in node.keywords
+                )
+                for node in ast.walk(tree)
+            ), (
+                f"{rel} no longer constructs an operator-authored "
+                f"{self._MESSAGE_CLASS}. Drop it from "
+                "_KNOWN_OPERATOR_MESSAGE_FILES — and first check where the "
+                "site moved, because the prefilter has not been proved against "
+                "its new home."
+            )
+
+    # Budget, not a default. This guard reads and parses all 572
+    # backend/app/*.py. The standalone lane runs it under --timeout=30, a
+    # budget sized on a native Linux filesystem; over the Docker-on-Windows
+    # bind mount it died as `Failed: Timeout (>30.0s) from pytest-timeout` at
+    # 29.96s while its three synthetic sibling tests passed -- which reads as
+    # an unguarded operator-message site, when the scan underneath had found
+    # zero offenders. A timeout, not an assertion, is the tell.
+    #
+    # Profiled in the lane's own container: read 20.67s, prefilter 2.11s,
+    # parse of the 46 surviving files 2.83s; parsing all 572 instead is
+    # 10.77s. So the prefilter below removes the reducible half (10.77s ->
+    # 2.83s), taking the guard from ~31.6s to 19.21s warm. What is left is one
+    # read of every app file, and the guard cannot skip it -- the prefilter
+    # needs the text. At 20.67s that read alone is two thirds of a 30s budget,
+    # before any contention from the 1842-test session it runs inside, and on
+    # a cold page cache the whole guard measured 46.87s. The prefilter is
+    # worth keeping, but it cannot move this guard off a 30s boundary; only a
+    # budget can.
+    #
+    # 120s is the house budget for corpus-scanning guards
+    # (test_string_patch_targets_resolve, test_mock_patch_targets_resolve;
+    # test_websocket_emitter_inventory at 90s). It clears the worst bind-mount
+    # figure by ~2.5x, and CI's native filesystem runs this in single-digit
+    # seconds.
+    @pytest.mark.timeout(120)
     def test_all_operator_message_sites_route_through_shared_gate(self):
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
         offenders: list[str] = []
@@ -5082,6 +5259,17 @@ class TestOperatorMessageArmingGateCoverage:
                 rel = os.path.relpath(fpath, app_dir).replace(os.sep, "/")
                 with open(fpath, encoding="utf-8") as f:
                     source = f.read()
+
+                # Sound prefilter, sound by construction and pinned by
+                # test_operator_message_prefilter_cannot_skip_a_flagged_site
+                # and test_prefilter_admits_every_live_operator_message_file:
+                # 46 of 572 app files carry both identifier tokens, so 526
+                # ast.parse calls are skipped. Same repair as
+                # test_no_deprecated_datetime_utcnow_calls below. See the
+                # budget note on this test for the measurements and for why
+                # the remaining read cost still needs an explicit budget.
+                if not self._source_may_hold_operator_message(source):
+                    continue
 
                 offenders.extend(
                     self._collect_offenders(
