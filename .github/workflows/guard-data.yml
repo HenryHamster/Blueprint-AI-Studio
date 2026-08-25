@@ -78,6 +78,41 @@ jobs:
     # all, so this workflow re-arms a kill switch dormant for them.
     timeout-minutes: 30
     steps:
+      # MUST run before checkout, and checkout is exactly why.
+      #
+      # scripts/test-backend.sh bind-mounts the repo READ-WRITE and the
+      # container runs as root, so pytest leaves root-owned __pycache__,
+      # .pytest_cache and .testmondata in the workspace. The runner user cannot
+      # delete those, so the NEXT actions/checkout on this runner fails:
+      #
+      #   warning: failed to remove backend/app/routers/__pycache__/...pyc: Permission denied
+      #   ##[warning]Unable to clean or reset the repository. The repository will be recreated instead.
+      #   ##[error]File was unable to be removed Error: EACCES: permission denied,
+      #     unlink '.../backend/.pytest_cache/.gitignore'
+      #
+      # That workspace is _work/<repo>/<repo> — SHARED with ci.yml on the same
+      # runner. So one guard-data run could red an unrelated ci.yml job at
+      # checkout, on a runner that stays broken until someone repairs it by
+      # hand. Observed for real on runner-3, run 32790783814.
+      #
+      # ci.yml never hits this because it mounts `-v "$PWD:/repo:ro"` with
+      # PYTHONDONTWRITEBYTECODE=1 and `-p no:cacheprovider`. test-backend.sh
+      # cannot simply do the same: it is the developer/agent-VM harness and
+      # needs a writable tree.
+      #
+      # This step reclaims ownership before checkout so a workspace poisoned by
+      # an EARLIER run heals itself, and the paired always() step below stops
+      # this run from poisoning the next one. Both are cheap and idempotent.
+      #
+      # STOPGAP, and the root fix is still owed: test-backend.sh should not
+      # leave root-owned droppings in a bind-mounted tree at all — that also
+      # bites agent VMs and local checkouts, where it shows up as a git clean
+      # that silently cannot clean. Track it before deleting these steps.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20             -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null             || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
         with:
           # The freshness guards compare against origin/automain to tell drift
@@ -214,3 +249,11 @@ jobs:
           If a test really was removed, regenerating the artifact drops its row
           for you.
           EOF
+
+      # Pair of the pre-checkout reclaim above. Runs even when the tests fail,
+      # so a red guard-data run does not additionally leave the runner unable to
+      # check out. Never fails the job.
+      - name: Hand the workspace back to the runner user
+        if: always()
+        run: |
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20             -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null             || echo "::warning::post-run reclaim failed; next checkout on this runner may fail"
