@@ -9,6 +9,8 @@ degradation.
 """
 
 import base64
+import io
+import tarfile
 import time
 
 import pytest
@@ -16,6 +18,7 @@ import pytest
 import app.github_repo_snapshot as snapshot
 import app.shared_state as shared_state
 from app.github_repo_snapshot import (
+    authoritative_texts_at_commit,
     file_text_on_branch,
     glob_exists_on_branch,
     path_exists_on_branch,
@@ -28,9 +31,10 @@ BLOB_B = "b" * 40
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, payload=None):
+    def __init__(self, status_code: int, payload=None, content: bytes = b""):
         self.status_code = status_code
         self._payload = payload or {}
+        self.content = content
 
     def json(self):
         return self._payload
@@ -58,6 +62,47 @@ def _blob_response(text="def real_symbol():\n    pass\n"):
     return _FakeResponse(
         200, {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
     )
+
+
+def _tarball(**texts: str) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path, text in texts.items():
+            data = text.encode()
+            member = tarfile.TarInfo(f"owner-repo-sha/{path}")
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_exact_sha_read_uses_one_archive_without_quota_gate(mocker):
+    """Merge reads are exact-SHA archive reads, independent of advisory quota reserve."""
+    shared_state.github_quota.update({"remaining": 0, "reset_at": int(time.time()) + 60})
+    calls = _patch_requests(
+        mocker,
+        [
+            _FakeResponse(
+                200,
+                content=_tarball(
+                    **{"backend/app/x.py": "x\n", "caps.json": "{}\n"}
+                ),
+            )
+        ],
+    )
+
+    texts = await authoritative_texts_at_commit(
+        {"backend/app/x.py", "caps.json"},
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=COMMIT_SHA,
+    )
+
+    assert texts == {"backend/app/x.py": "x\n", "caps.json": "{}\n"}
+    assert calls == [
+        ("GET", f"https://api.github.com/repos/acme/widget/tarball/{COMMIT_SHA}")
+    ]
 
 
 @pytest.fixture(autouse=True)

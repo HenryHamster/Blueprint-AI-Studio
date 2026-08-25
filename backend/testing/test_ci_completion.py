@@ -55,10 +55,10 @@ def _default_size_cap_ok(mocker):
     ``app.rollup_size_preflight.preflight_rollup_size_caps`` to override this.
     """
     async def _bound_ok(
-        *_args, expected_head_sha=None, target_branch=None, **_kwargs
+        *_args, expected_head_sha=None, target_branch=None, expected_base_sha=None, **_kwargs
     ):
         return SizeCapPreflightResult(
-            "ok", None, expected_head_sha, target_branch
+            "ok", None, expected_head_sha, target_branch, expected_base_sha
         )
 
     mocker.patch(
@@ -6997,6 +6997,7 @@ async def test_size_cap_old_precomputed_head_is_rechecked_before_direct_merge(
         AsyncMock(
             return_value=SizeCapPreflightResult(
                 "ok", None, "test-head-42", "main"
+                , "test-base-42"
             )
         ),
     )
@@ -7059,6 +7060,7 @@ async def test_precomputed_size_cap_without_merge_target_is_not_adopted(
         AsyncMock(
             return_value=SizeCapPreflightResult(
                 "ok", None, "test-head-42", "automain"
+                , "test-base-42"
             )
         ),
     )
@@ -7116,6 +7118,7 @@ async def test_size_cap_matching_precomputed_target_is_reused(db_session, mocker
         source="review_approval",
         precomputed_size_cap=SizeCapPreflightResult(
             "ok", None, "test-head-42", "main"
+            , "test-base-42"
         ),
         checked_head_sha="test-head-42",
         checked_base_sha="test-base-42",
@@ -7123,6 +7126,48 @@ async def test_size_cap_matching_precomputed_target_is_reused(db_session, mocker
 
     assert result is True
     preflight_mock.assert_not_awaited()
+    merge_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_size_cap_precomputed_base_mismatch_is_rechecked(db_session, mocker):
+    """A verdict for the right head/target but prior base cannot authorize a merge."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    preflight_mock = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(
+            return_value=SizeCapPreflightResult(
+                "ok", None, "test-head-42", "main", "test-base-42"
+            )
+        ),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", AsyncMock(return_value={"merged": True})
+    )
+    project = Project(name="Mismatched size base test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    task = _make_task(db_session, project)
+    await db_session.commit()
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="review_approval",
+        precomputed_size_cap=SizeCapPreflightResult(
+            "ok", None, "test-head-42", "main", "old-base"
+        ),
+        checked_head_sha="test-head-42",
+        checked_base_sha="test-base-42",
+    )
+
+    assert result is True
+    preflight_mock.assert_awaited_once()
+    assert preflight_mock.await_args.kwargs["expected_base_sha"] == "test-base-42"
     merge_mock.assert_awaited_once()
 
 
@@ -7201,6 +7246,7 @@ async def test_rollup_precomputed_size_clearance_does_not_repeat_or_bump_at_merg
         source="poll",
         precomputed_size_cap=SizeCapPreflightResult(
             "ok", None, "test-head-42", "main"
+            , "test-base-42"
         ),
     )
 

@@ -4164,6 +4164,11 @@ async def _process_post_commit(
                                                 else None,
                                                 expected_head_sha=_peek_head,
                                                 target_branch=_peek_base,
+                                                expected_base_sha=str(
+                                                    _orig_peek_loop.get("ci_checked_base_sha")
+                                                    or _orig_peek_loop.get("base_sha")
+                                                    or ""
+                                                ),
                                             )
                                     except Exception as _pre_exc:
                                         logger.debug(

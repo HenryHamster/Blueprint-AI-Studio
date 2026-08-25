@@ -3930,10 +3930,13 @@ async def _check_and_trigger_rollup(
                     _rollup_candidate_head = str(
                         (pr_detail.get("head") or {}).get("sha") or ""
                     )
-                    if not _rollup_candidate_head:
+                    _rollup_base_sha = str(
+                        (pr_detail.get("base") or {}).get("sha") or ""
+                    )
+                    if not _rollup_candidate_head or not _rollup_base_sha:
                         size_cap_result = SizeCapPreflightResult(
                             "defer",
-                            "rollup PR head unavailable for size-cap evaluation",
+                            "rollup PR identity unavailable for size-cap evaluation",
                         )
                     else:
                         size_cap_result = await preflight_rollup_size_caps(
@@ -3946,6 +3949,7 @@ async def _check_and_trigger_rollup(
                             commit_bump=_sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP,
                             expected_head_sha=_rollup_candidate_head,
                             target_branch=target_branch,
+                            expected_base_sha=_rollup_base_sha,
                         )
                     if not isinstance(size_cap_result, SizeCapPreflightResult):
                         size_cap_result = SizeCapPreflightResult(
@@ -4569,11 +4573,12 @@ async def _check_and_trigger_rollup(
                     if (
                         not _rollup_checked_head
                         or _rollup_checked_head != _rollup_candidate_head
+                        or size_cap_result.base_sha != _rollup_checked_base
                         or not _rollup_checked_base
                     ):
                         parent.latest_status_message = (
                             f"Rollup PR #{rollup_pr_number} merge held — could not "
-                            "bind the size-cap verdict to the immutable merge head"
+                            "bind the size-cap verdict to the immutable merge head and base"
                         )[:500]
                         session.add(parent)
                         await session.commit()

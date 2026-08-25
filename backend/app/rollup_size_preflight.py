@@ -36,14 +36,18 @@ from app.github import (
     get_file_text_at_ref,
     get_pr_files,
 )
+from app.github_repo_snapshot import authoritative_texts_at_commit
 from app.json_extract import async_json_loads
 from app.size_limit_policy import (
     SECTION_PATH_PREFIXES,
     classify_breach,
+    governance_caps_from_source_text,
+    governance_source_relpath,
     is_breach,
     governing_cap_source_path,
     ledger_with_pending_bumps,
     prune_ledger_for_current_caps,
+    resolve_effective_cap,
     rewrite_governing_cap_constant,
 )
 
@@ -120,21 +124,34 @@ class SizeCapPreflightResult:
     reason: str | None
     head_sha: str | None = None
     target_branch: str | None = None
+    base_sha: str | None = None
 
     def __iter__(self):
         """Retain the two-value read-only unpacking used by diagnostic callers."""
         yield self.status
         yield self.reason
 
-    def is_bound_to(self, expected_head_sha: str) -> bool:
-        """Whether this verdict was evaluated against one exact merge candidate."""
-        return bool(expected_head_sha) and self.head_sha == expected_head_sha
+    def is_bound_to(
+        self, expected_head_sha: str, expected_base_sha: str | None = None
+    ) -> bool:
+        """Whether this verdict was evaluated against exact candidate/base SHAs."""
+        return (
+            bool(expected_head_sha)
+            and self.head_sha == expected_head_sha
+            and (expected_base_sha is None or self.base_sha == expected_base_sha)
+        )
 
 
 def _result(
-    status: str, reason: str | None = None, *, head_sha: str | None = None
+    status: str,
+    reason: str | None = None,
+    *,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> SizeCapPreflightResult:
-    return SizeCapPreflightResult(status=status, reason=reason, head_sha=head_sha)
+    return SizeCapPreflightResult(
+        status=status, reason=reason, head_sha=head_sha, base_sha=base_sha
+    )
 
 
 async def preflight_rollup_size_caps(
@@ -148,11 +165,12 @@ async def preflight_rollup_size_caps(
     commit_bump: bool = True,
     expected_head_sha: str | None = None,
     target_branch: str | None = None,
+    expected_base_sha: str | None = None,
 ) -> SizeCapPreflightResult:
     """Check assembled-tree module sizes against caps; auto-bump on breach.
 
-    The returned result carries the merge target and exact immutable SHA that
-    were examined.
+    The returned result carries the merge target and exact immutable candidate
+    and base SHAs that were examined.
     Callers may merge only an ``"ok"`` result whose ``head_sha`` equals both
     their already-checked PR head and the merge API's expected head, and whose
     ``target_branch`` equals the merge target.
@@ -165,6 +183,13 @@ async def preflight_rollup_size_caps(
             reason=reason,
             head_sha=head_sha,
             target_branch=target_branch,
+            base_sha=expected_base_sha,
+        )
+
+    if target_branch and not expected_base_sha:
+        return _result(
+            "defer",
+            "size-cap preflight lacks immutable merge-base SHA",
         )
 
     # Pin every read to one immutable branch tip. Branch-name content reads are
@@ -267,32 +292,79 @@ async def preflight_rollup_size_caps(
             if pr_file_status.get(prefix + key) == "removed"
         )
 
-    # 3. For each capped file that appears in the rollup, fetch content at the
-    #    staging-branch tip and check against its cap.
-    breaches: list[tuple[str, str, int, int, int]] = []  # (section, key, count, cap, new_cap)
-    # Chronic offenders: (section, key, bump_count) — must hold without bumping.
-    chronic_holders: list[tuple[str, str, int]] = []
+    # 3. Fetch every changed, capped source from the immutable candidate and
+    #    base in two bounded archive reads.  A baseline is usable only if its
+    #    own tree breached its own effective (JSON + source-governance) cap;
+    #    this prevents a candidate cap edit from laundering new debt as old.
+    capped_paths: list[tuple[str, str, int, str]] = []
     for section, prefix in _SECTION_PREFIXES.items():
         section_caps = caps_data.get(section)
         if not isinstance(section_caps, dict):
             continue
         for key, cap in section_caps.items():
-            if not isinstance(cap, int):
-                continue
             full_path = prefix + key
-            if full_path not in changed_paths:
-                continue
-            # The removal is repaired below by pruning both cap and ledger.
-            if pr_file_status.get(full_path) == "removed":
-                continue
+            if (
+                isinstance(cap, int)
+                and full_path in changed_paths
+                and pr_file_status.get(full_path) != "removed"
+            ):
+                capped_paths.append((section, key, cap, full_path))
+
+    candidate_texts: dict[str, str] | None = None
+    base_texts: dict[str, str] | None = None
+    base_caps_data: dict | None = None
+    if expected_base_sha and capped_paths:
+        source_paths = {full_path for _section, _key, _cap, full_path in capped_paths}
+        source_paths.update(
+            source_path
+            for section, key, _cap, _full_path in capped_paths
+            if (source_path := governance_source_relpath(section, key)) is not None
+        )
+        candidate_texts, base_texts = await asyncio.gather(
+            authoritative_texts_at_commit(
+                source_paths,
+                token=gh_token,
+                owner=owner,
+                repo=repo,
+                commit_sha=observed_head_sha,
+                project_id=project_id,
+            ),
+            authoritative_texts_at_commit(
+                source_paths | {_CAPS_JSON_PATH},
+                token=gh_token,
+                owner=owner,
+                repo=repo,
+                commit_sha=expected_base_sha,
+                project_id=project_id,
+                allow_missing_paths=True,
+            ),
+        )
+        if candidate_texts is None or base_texts is None:
+            return _result("defer", "could not fetch immutable size-cap baseline evidence")
+        try:
+            base_caps_data = await async_json_loads(base_texts[_CAPS_JSON_PATH])
+        except Exception as exc:
+            return _result("defer", f"could not parse baseline module_size_limits.json: {exc}")
+
+    # 4. For each capped file that appears in the rollup, compare its candidate
+    #    count to an eligible baseline before considering repair.
+    breaches: list[tuple[str, str, int, int, int]] = []  # (section, key, count, cap, new_cap)
+    inherited_breaches: list[tuple[str, int, int]] = []
+    # Chronic offenders: (section, key, bump_count) — must hold without bumping.
+    chronic_holders: list[tuple[str, str, int]] = []
+    for section, key, cap, full_path in capped_paths:
             try:
-                content = await get_file_text_at_ref(
-                    full_path,
-                    token=gh_token,
-                    owner=owner,
-                    repo=repo,
-                    ref=observed_head_sha,
-                    project_id=project_id,
+                content = (
+                    candidate_texts[full_path]
+                    if candidate_texts is not None
+                    else await get_file_text_at_ref(
+                        full_path,
+                        token=gh_token,
+                        owner=owner,
+                        repo=repo,
+                        ref=observed_head_sha,
+                        project_id=project_id,
+                    )
                 )
             except Exception as exc:
                 logger.warning(
@@ -314,7 +386,58 @@ async def preflight_rollup_size_caps(
                 )
                 return _result("defer", f"no content returned for {full_path} at {staging_branch}")
             line_count = len(content.splitlines())
-            if is_breach(line_count, cap):
+            governance_path = governance_source_relpath(section, key)
+            candidate_governance_caps = (
+                governance_caps_from_source_text(candidate_texts[governance_path])
+                if candidate_texts is not None and governance_path is not None
+                else None
+            )
+            effective_cap = resolve_effective_cap(
+                key, section, cap, governance_caps=candidate_governance_caps
+            )
+            base_count: int | None = None
+            if base_texts is not None and base_caps_data is not None:
+                base_section_caps = base_caps_data.get(section)
+                base_json_cap = (
+                    base_section_caps.get(key)
+                    if isinstance(base_section_caps, dict)
+                    and isinstance(base_section_caps.get(key), int)
+                    else None
+                )
+                base_governance_caps = (
+                    governance_caps_from_source_text(
+                        base_texts.get(governance_path, "")
+                    )
+                    if governance_path is not None
+                    else []
+                )
+                base_effective_cap = resolve_effective_cap(
+                    key,
+                    section,
+                    base_json_cap,
+                    governance_caps=base_governance_caps,
+                )
+                baseline_source = base_texts.get(full_path)
+                if baseline_source is not None:
+                    candidate_base_count = len(baseline_source.splitlines())
+                    if is_breach(candidate_base_count, base_effective_cap):
+                        base_count = candidate_base_count
+            if (
+                base_count is not None
+                and line_count > (effective_cap or line_count)
+                and line_count <= base_count
+            ):
+                inherited_breaches.append((full_path, line_count, effective_cap or cap))
+                logger.warning(
+                    "[ROLLUP-SIZE] PR #%s: inherited breach %s has %d lines "
+                    "(cap %d; base %d) — reporting without repair",
+                    rollup_pr_number,
+                    full_path,
+                    line_count,
+                    effective_cap or cap,
+                    base_count,
+                )
+            elif is_breach(line_count, effective_cap, base_count=base_count):
                 verdict = await asyncio.to_thread(
                     classify_breach,
                     module_key=key, current_size=line_count, section=section
@@ -375,7 +498,11 @@ async def preflight_rollup_size_caps(
         return _result("hold", f"chronic offender(s) require decomposition: {names}", head_sha=observed_head_sha)
 
     if not breaches and not removed_caps:
-        return _result("ok", head_sha=observed_head_sha)
+        inherited_summary = "; ".join(
+            f"inherited breach {path}: {count} lines (cap {cap})"
+            for path, count, cap in inherited_breaches
+        )
+        return _result("ok", inherited_summary or None, head_sha=observed_head_sha)
 
     summary_parts = [
         f"{key}: {old_cap} -> {new_cap}"

@@ -154,7 +154,9 @@ def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=SizeCapPreflightResult("ok", None, "reviewed-rollup-head"),
+        return_value=SizeCapPreflightResult(
+            "ok", None, "reviewed-rollup-head", base_sha="base-sha"
+        ),
     )
     return mock_merge, mock_spawn
 
@@ -624,6 +626,7 @@ async def test_assembled_rollup_size_breach_cannot_merge(cleanup_db, mocker):
     preflight.assert_awaited_once()
     assert preflight.await_args.kwargs["expected_head_sha"] == "reviewed-rollup-head"
     assert preflight.await_args.kwargs["target_branch"] == "research/conflict-base"
+    assert preflight.await_args.kwargs["expected_base_sha"] == "base-sha"
     mock_merge.assert_not_awaited()
     await cleanup_db.refresh(parent)
     assert parent.requires_approval is True
@@ -871,7 +874,9 @@ async def test_clean_pr_sha_mismatch_skips_update_branch(cleanup_db, mocker):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=SizeCapPreflightResult("ok", None, "head-sha-111"),
+        return_value=SizeCapPreflightResult(
+            "ok", None, "head-sha-111", base_sha="base-sha"
+        ),
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -3230,7 +3235,7 @@ def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=SizeCapPreflightResult("ok", None, "deadbeef"),
+        return_value=SizeCapPreflightResult("ok", None, "deadbeef", base_sha="base-sha"),
     )
 
 
@@ -3378,7 +3383,7 @@ def _mock_repoll_or_escalation_landing_deps(mocker, *, get_pr_side_effect, merge
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=SizeCapPreflightResult("ok", None, "deadbeef"),
+        return_value=SizeCapPreflightResult("ok", None, "deadbeef", base_sha="base-sha"),
     )
     return merge
 

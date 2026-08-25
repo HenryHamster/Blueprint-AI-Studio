@@ -38,7 +38,9 @@ minutes; the pipeline keeps merging.
 import asyncio
 import base64
 import fnmatch
+import io
 import logging
+import tarfile
 import time
 from collections import OrderedDict
 from typing import Dict, Tuple
@@ -339,6 +341,76 @@ async def _fetch_blob_text(
             repo,
             blob_sha[:12],
             e,
+        )
+        return None
+
+
+async def authoritative_texts_at_commit(
+    paths: set[str],
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    project_id: str | None = None,
+    allow_missing_paths: bool = False,
+) -> dict[str, str] | None:
+    """Read several paths from one exact-SHA archive for a merge decision.
+
+    This is deliberately separate from the advisory grounding snapshot APIs
+    above: merge authority must not yield to ``GROUNDING_QUOTA_RESERVE`` or a
+    branch-tip cache.  GitHub's tarball endpoint accepts an immutable commit
+    SHA, so one request supplies a coherent tree without a Contents-API fanout.
+    ``None`` means the archive or a member's text could not be read and callers
+    must fail closed. ``allow_missing_paths`` preserves an exact tree's known
+    absences for baseline comparison; it never turns an archive failure into an
+    absence.
+    """
+    if not paths or any(not path or path.startswith("/") or ".." in path.split("/") for path in paths):
+        return None
+    from urllib.parse import quote
+
+    from app.github import _github_request
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{quote(commit_sha, safe='')}"
+    try:
+        response = await _github_request(
+            "GET",
+            url,
+            _headers(token),
+            max_retries=2,
+            project_id=project_id,
+            follow_redirects=True,
+        )
+        if response.status_code != 200:
+            return None
+
+        def _extract() -> dict[str, str] | None:
+            try:
+                with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:*") as archive:
+                    texts: dict[str, str] = {}
+                    for member in archive:
+                        if not member.isfile():
+                            continue
+                        member_path = member.name.split("/", 1)
+                        if len(member_path) != 2 or member_path[1] not in paths:
+                            continue
+                        handle = archive.extractfile(member)
+                        if handle is None:
+                            return None
+                        texts[member_path[1]] = handle.read().decode("utf-8", errors="replace")
+                    return texts if allow_missing_paths or set(texts) == paths else None
+            except (tarfile.TarError, OSError, UnicodeError):
+                return None
+
+        return await asyncio.to_thread(_extract)
+    except Exception:  # noqa: BLE001 — merge callers turn unavailable evidence into defer
+        logger.warning(
+            "[REPO_SNAPSHOT] authoritative archive read failed for %s/%s@%s",
+            owner,
+            repo,
+            commit_sha[:12],
+            exc_info=True,
         )
         return None
 
