@@ -81,7 +81,7 @@ import {
   RateLimitError,
   NoProgressTimeoutError,
   setupWorkspace,
-  registerSizeCapMergeDriver,
+  registerDerivedArtifactMergeDrivers,
   matchesRateLimit,
   matchesAuthFailure,
   matchesVmConfigMissing,
@@ -1853,15 +1853,15 @@ describe('setupWorkspace reference-cache reuse', () => {
   });
 });
 
-// ── registerSizeCapMergeDriver ───────────────────────────────────────────────
-describe('registerSizeCapMergeDriver', () => {
+// ── registerDerivedArtifactMergeDrivers ───────────────────────────────────────────────
+describe('registerDerivedArtifactMergeDrivers', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync).mockReturnValue('');
   });
 
   it('configures both merge.sizecap.name and merge.sizecap.driver in the given workspace', () => {
-    registerSizeCapMergeDriver('/custom/ws');
+    registerDerivedArtifactMergeDrivers('/custom/ws');
 
     const calls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'git');
     const argLists = calls.map(c => (c[1] as string[]).join(' '));
@@ -1873,7 +1873,7 @@ describe('registerSizeCapMergeDriver', () => {
     vi.mocked(execFileSync).mockImplementation(() => { throw new Error('git config boom'); });
     // Must not throw — a failed registration only means the JSON falls back to
     // the normal conflict path.
-    expect(() => { registerSizeCapMergeDriver('/ws'); }).not.toThrow();
+    expect(() => { registerDerivedArtifactMergeDrivers('/ws'); }).not.toThrow();
   });
 });
 

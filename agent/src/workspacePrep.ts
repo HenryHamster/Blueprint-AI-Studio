@@ -21,7 +21,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT, registerSizeCapMergeDriver } from './index.js';
+import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT, registerDerivedArtifactMergeDrivers } from './index.js';
 import type { FailureCategory } from './index.js';
 import { DEFAULT_CLONE_DEPTH } from './constants.js';
 import { fetchRemoteTrackingRef, fetchSelfRepoIntegrationRef } from './gitRefs.js';
@@ -395,7 +395,7 @@ async function _prepareWorkspaceForRoleImpl(opts: PrepareWorkspaceOptions): Prom
       // Re-register the size-cap merge driver: git config lives in .git/config,
       // which the warm reuse keeps, but registering is idempotent and cheap so we
       // always assert it (a prior role on a different repo could have left it unset).
-      registerSizeCapMergeDriver(workspace);
+      registerDerivedArtifactMergeDrivers(workspace);
       log(`prepareWorkspaceForRole: warm-handoff reuse OK (branch=${branch})`);
       _lastWorkspacePrepOutcome = {
         path: 'warm',
@@ -469,7 +469,7 @@ async function _prepareWorkspaceForRoleImpl(opts: PrepareWorkspaceOptions): Prom
   }
   // A fresh clone does NOT carry .git/config, so the .gitattributes sizecap
   // mapping is inert until the driver command is registered here.
-  registerSizeCapMergeDriver(workspace);
+  registerDerivedArtifactMergeDrivers(workspace);
   // A cold clone only carries the branch it was cloned with. The ./check gate
   // derives its scope from a git diff against the base branch and FAILS CLOSED
   // when that ref is absent — fetch it here so a cold-started role can compute
