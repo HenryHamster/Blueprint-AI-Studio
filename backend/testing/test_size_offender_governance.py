@@ -1063,16 +1063,44 @@ def test_restored_cap_bumps_keep_strategic_resident_session_chronic():
 
 
 def _real_repo_checkout() -> str | None:
-    """Return a path to a real git checkout of this repo, or None."""
-    # os.path.exists, not isdir: in a LINKED WORKTREE `.git` is a FILE holding
-    # `gitdir: ...`, so an isdir check silently returned None and skipped this
-    # guard in every agent worktree and dev worktree -- it only ever ran in a
-    # real clone. A green local run of this file proved nothing about it.
+    """Return a path to a repo git can actually READ from here, or None.
+
+    Presence of ``.git`` is not the predicate, in either direction:
+
+    * ``os.path.isdir`` was the original check, and in a LINKED WORKTREE
+      ``.git`` is a FILE holding ``gitdir: <path>`` -- so it silently returned
+      None and skipped this guard in every agent and dev worktree. It only ever
+      ran in a real clone, and a green local run proved nothing about it.
+    * ``os.path.exists`` fixes that but overshoots: the standalone lane mounts
+      the checkout at ``/repo`` inside a container, and a worktree's ``gitdir:``
+      line names a HOST path that does not exist there. git then dies with
+      ``fatal: not a git repository: /repo/D:/.../.git/worktrees/<name>`` and
+      the guard errors instead of skipping.
+
+    So ask git, with the cheapest question that fails exactly when the later
+    ``git log`` would: reachable gitdir, readable object store, resolvable HEAD.
+    """
     candidates = [slp._REPO_ROOT]
     if os.path.exists("/repo/.git"):
         candidates.append("/repo")
     for root in candidates:
-        if os.path.exists(os.path.join(root, ".git")):
+        if not os.path.exists(os.path.join(root, ".git")):
+            continue
+        try:
+            probe = subprocess.run(
+                ["git", "-c", f"safe.directory={root}", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                # Two orders of magnitude under the lanes' --timeout=30: this
+                # reads one ref. A budget that could not fire is the bug class
+                # backend/testing/test_harness_timeout_budgets.py guards.
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and probe.stdout.strip():
             return root
     return None
 
@@ -1131,7 +1159,13 @@ def test_cap_bump_history_ledger_matches_git():
     """
     repo_root = _real_repo_checkout()
     if repo_root is None:
-        pytest.skip("no git checkout of this repo available for the ledger guard")
+        pytest.skip(
+            "no git-readable checkout of this repo is reachable from here, so the "
+            "ledger guard has nothing to compare against. Most often a LINKED "
+            "WORKTREE mounted into the standalone lane's container: its .git file "
+            "names a host gitdir that does not exist inside the container. CI runs "
+            "this guard in a real clone, where it executes rather than skipping."
+        )
     # The CI backend shards bind the checkout read-only at /repo into a root
     # container while the runner user owns the files, so git inside the
     # container refuses every command with "detected dubious ownership" (exit
