@@ -616,12 +616,16 @@ LEDGER_BUMP_ABSENT = "absent"
 LEDGER_BUMP_UNATTRIBUTED = "unattributed_placeholder"
 
 
-# Module-level TTL cache: (module_key, section) -> (outcome, monotonic_time)
-# where ``outcome`` is either a ``list[BumpRecord]`` (read succeeded) or a
-# ``BumpHistoryUnavailableError`` (read failed). Failures are cached too so a
-# broken-git reconcile cycle does not re-shell (and re-timeout) per call.
+# Module-level TTL cache: (module_key, section, repo_root) -> (outcome,
+# monotonic_time) where ``outcome`` is either a ``list[BumpRecord]`` (read
+# succeeded) or a ``BumpHistoryUnavailableError`` (read failed). Failures are
+# cached too so a broken-git reconcile cycle does not re-shell (and re-timeout)
+# per call.  The RESOLVED REPO ROOT is part of the key: two roots legitimately
+# answer the same ``(module_key, section)`` differently, so keying on the pair
+# alone let whichever root ran first within the TTL answer for the other — a
+# fixture read poisoning the ambient entry, or the reverse.
 _bump_history_cache: dict[
-    tuple[str, str], tuple[list[BumpRecord] | BumpHistoryUnavailableError, float]
+    tuple[str, str, str], tuple[list[BumpRecord] | BumpHistoryUnavailableError, float]
 ] = {}
 _CACHE_TTL_SECONDS: float = 60.0
 
@@ -824,8 +828,10 @@ def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     return False
 
 
-def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRecord]:
-    """Return the cap-bump history for ``module_key``.
+def parse_bump_history(
+    module_key: str, section: str = "backend", repo_root: str | None = None
+) -> list[BumpRecord]:
+    """Return the cap-bump history for ``module_key`` in ``repo_root``.
 
     Reads ``backend/testing/module_size_limits.json``'s git history, extracts
     diff hunks commit-by-commit, and returns records where the given key's
@@ -849,8 +855,14 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
     failing closed.  Callers that gate the chronic-offender verdict on this
     history must distinguish "no bumps on record" from "history could not be
     read" instead of treating both as empty.
+
+    ``repo_root`` selects WHICH checkout's history is read (default: ambient
+    ``_REPO_ROOT``); callers classifying a breach in a specific tree must pass
+    it.  Without it a ``--fix`` against a fixture root read the *ambient*
+    repository's history and the verdict tracked whatever checkout was on disk.
     """
-    cache_key = (module_key, section)
+    root = repo_root or _REPO_ROOT
+    cache_key = (module_key, section, root)
     now = time.monotonic()
     cached = _bump_history_cache.get(cache_key)
     if cached is not None and now - cached[1] < _CACHE_TTL_SECONDS:
@@ -860,12 +872,12 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
         return outcome
 
     records = None
-    if _git_reads_history_here() and not _git_history_is_truncated():
+    if _git_reads_history_here(root) and not _git_history_is_truncated(root):
         # Complete checkout: read the bump history from the mainline git
         # ancestry.  A real git failure here is genuine evidence loss and stays
         # fail-closed (raised, not degraded to "no bump history").
         try:
-            records = _read_git_bump_history(module_key)
+            records = _read_git_bump_history(module_key, root)
         except BumpHistoryUnavailableError as err:
             # Cache the failure too: a broken history read stays broken within
             # the TTL, so a reconcile cycle does not re-shell git per file.
@@ -887,12 +899,12 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
     return records
 
 
-def _read_git_bump_history(module_key: str) -> list[BumpRecord] | None:
+def _read_git_bump_history(module_key: str, repo_root: str | None = None) -> list[BumpRecord] | None:
     """Read bump history from git, or ``None`` when git is structurally absent.
 
     ``None`` (NOT an error) signals the deployed layout: no git binary on PATH
-    or ``_REPO_ROOT`` is not a git checkout.  The caller then falls back to the
-    committed ledger mirror.
+    or ``repo_root`` (default ``_REPO_ROOT``) is not a git checkout.  The caller
+    then falls back to the committed ledger mirror.
 
     The history is read from the MAINLINE branch's ancestry
     (:func:`_mainline_git_ref`), never ``--all`` — bumps on abandoned
@@ -907,21 +919,30 @@ def _read_git_bump_history(module_key: str) -> list[BumpRecord] | None:
     caller, but :func:`parse_bump_history` never reaches this function on a
     truncated checkout — it consults the committed ledger mirror first.)
     """
-    if not _git_reads_history_here():
+    root = repo_root or _REPO_ROOT
+    if not _git_reads_history_here(root):
         return None
-    if _git_history_is_truncated():
+    if _git_history_is_truncated(root):
         raise BumpHistoryUnavailableError(
-            f"git history is truncated (shallow checkout at {_REPO_ROOT}); "
+            f"git history is truncated (shallow checkout at {root}); "
             f"cannot read bump history for {module_key!r}"
         )
     try:
+        # ``-c safe.directory``: CI binds the checkout into a ROOT container
+        # the runner user owns (``-v "$PWD:/repo:ro"``, no ``--user``), so
+        # without it this read dies with "dubious ownership" (exit 128) while
+        # :func:`_mainline_git_ref`'s already-hardened probe still resolves a
+        # real mainline ref.  A non-zero ``git log`` is genuine evidence loss,
+        # so that asymmetry made every chronic-offender check in the container
+        # refuse its cap bump and ``--fix`` exit 1.  Probe and read must carry
+        # the SAME hardening; the argv tests pin them together.
         result = subprocess.run(
             [
                 "git",
                 "-c",
-                f"safe.directory={_REPO_ROOT}",
+                f"safe.directory={root}",
                 "log",
-                _mainline_git_ref(),
+                _mainline_git_ref(root),
                 "--format=COMMIT %H %aI",
                 "-p",
                 "--",
@@ -932,7 +953,7 @@ def _read_git_bump_history(module_key: str) -> list[BumpRecord] | None:
             encoding="utf-8",
             errors="replace",
             timeout=15,
-            cwd=_REPO_ROOT,
+            cwd=root,
         )
     except Exception as exc:  # noqa: BLE001 — surfaced as BumpHistoryUnavailableError
         err = BumpHistoryUnavailableError(
@@ -1069,6 +1090,7 @@ def rebuild_cap_bump_history_ledger(
         | tuple[str, str, int, int, str, str]
     ] | None = None,
     repair_targets: set[tuple[str, str]] | None = None,
+    repo_root: str | None = None,
 ) -> dict:
     """Regenerate the cap-bump-history ledger and write it; return the dict.
 
@@ -1113,14 +1135,22 @@ def rebuild_cap_bump_history_ledger(
     )
 
     git_output = None
-    git_available = _git_reads_history_here()
-    if git_available and not _git_history_is_truncated():
+    # ``repo_root``/``-c safe.directory``: this read FAILS OPEN (a git error
+    # falls through to "preserve the existing mirror"), so unhardened it would
+    # rebuild the ledger from ZERO evidence inside CI's root-container ``/repo``
+    # bind mount and never red anything.  Silent, unlike the fail-closed read in
+    # :func:`_read_git_bump_history` -- which is why it must be hardened too.
+    root = repo_root or _REPO_ROOT
+    git_available = _git_reads_history_here(root)
+    if git_available and not _git_history_is_truncated(root):
         try:
             result = subprocess.run(
                 [
                     "git",
+                    "-c",
+                    f"safe.directory={root}",
                     "log",
-                    _mainline_git_ref(),
+                    _mainline_git_ref(root),
                     "--format=COMMIT %H %aI",
                     "-p",
                     "--",
@@ -1131,7 +1161,7 @@ def rebuild_cap_bump_history_ledger(
                 encoding="utf-8",
                 errors="replace",
                 timeout=30,
-                cwd=_REPO_ROOT,
+                cwd=root,
             )
         except Exception as exc:  # noqa: BLE001 — fall back to append-only below
             result = None
@@ -2318,7 +2348,7 @@ def classify_breach(
     instead of treating both as empty.
     """
     try:
-        history = parse_bump_history(module_key, section)
+        history = parse_bump_history(module_key, section, repo_root)
     except BumpHistoryUnavailableError as exc:
         # Unreadable history is NOT "no bumps on record": refuse the automatic
         # bump and route to decomposition. An explicit operator override

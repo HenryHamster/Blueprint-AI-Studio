@@ -6240,3 +6240,669 @@ async def test_sweep_wires_walkthrough_contract_redriver(db_session, mocker):
     mock_redrive.assert_called_once()
     assert mock_redrive.call_args.args[0] == version.id
     assert mock_redrive.call_args.kwargs.get("session_factory") is not None
+
+
+# ===========================================================================
+# promotion_failed / deferred_unsynced re-drivers
+#
+# THE DEAD END THESE CLOSE.  A red promotion PR gets its PR closed and its
+# release-v{N} branch deleted, the version is returned to
+# phase=stabilize/status=open with last_qualification.status="promotion_failed",
+# and the CI failures are harvested into a remediation fix task.  The fix
+# merges, the integration branch advances -- and nothing re-fired
+# qualification.  The trigger resolver DID arm the version
+# (trigger="blockers_cleared"), but the sweep's auto-trigger executor keeps
+# only {coverage_complete, candidate_advanced, post_dry_run_advance} on the
+# stated grounds that a dedicated re-driver owns the rest; for
+# promotion_failed and deferred_unsynced no such re-driver existed.
+#
+# Every test below fails without the re-drivers: the direct-call tests cannot
+# import them, and the wiring tests find nothing in the sweep to patch.
+# ===========================================================================
+
+_ADVANCED_HEAD = "aaaa1111" * 5
+_FAILED_CANDIDATE = "bbbb2222" * 5
+
+
+async def _seed_promotion_failed(db_session, **overrides):
+    """Open a stabilize-phase version parked at promotion_failed."""
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    qual = {
+        "status": "promotion_failed",
+        "error": "required_check_failed",
+        "candidate_sha": _FAILED_CANDIDATE,
+        "promotion_failure_count": 1,
+    }
+    qual.update(overrides)
+    version.last_qualification = qual
+    _flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+def _patch_promotion_redrive_inputs(
+    mocker,
+    *,
+    ready: bool = True,
+    readiness_reason: str = "all gating findings resolved",
+    gate_state: str = "no_signal",
+    head_sha: str = _ADVANCED_HEAD,
+    run_qualification_result=None,
+):
+    """Patch the four live reads the promotion_failed re-driver depends on.
+
+    Returns the run_qualification mock so a test can assert whether the
+    qualifier was re-entered at all.
+    """
+    mocker.patch(
+        "app.release_qualifier_sweep._current_integration_audited_surface",
+        new=AsyncMock(return_value={"backend/app/release_promotion.py": "s" * 40}),
+    )
+    mocker.patch(
+        "app.release_readiness.auto_mark_stale_audit_findings",
+        new=AsyncMock(return_value=0),
+    )
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(
+            return_value={
+                "requalification_ready": ready,
+                "reason": readiness_reason,
+                "gating_total": 2,
+                "gating_resolved": 2 if ready else 1,
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={"gate_state": gate_state, "head_sha": head_sha}
+        ),
+    )
+    return mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(
+            return_value=(
+                {"status": "spawned"}
+                if run_qualification_result is None
+                else run_qualification_result
+            )
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_fires_once_blockers_clear(db_session, mocker):
+    """(a) Remediation resolved + integration HEAD advanced -> re-qualify.
+
+    This is the whole defect: before the re-driver existed the version sat at
+    promotion_failed forever after its fix landed.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(mocker)
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True
+    mock_run_qual.assert_called_once()
+    # The reuse-promote fast path is re-driver-only: without this flag a
+    # promotion_failed re-entry whose audited surface is unchanged returns
+    # promotion_failed_reuse_deferred and parks again.
+    assert (
+        mock_run_qual.call_args.kwargs.get("allow_synchronous_reuse_promote") is True
+    )
+    assert mock_run_qual.call_args.kwargs.get("auto_trigger") is True
+
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "fired"
+    assert decision["reason"] == "blockers_cleared"
+    assert decision["at"]
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_holds_while_findings_unresolved(
+    db_session, mocker
+):
+    """(b) Remediation still open -> no re-fire, and the reason is RECORDED.
+
+    A sweep leg that silently returns False is how the dead end stayed
+    invisible; the hold has to be readable back off the version.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, ready=False, readiness_reason="1 of 2 gating findings unresolved"
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "held"
+    assert decision["reason"] == "findings_unresolved"
+    assert "unresolved" in decision["detail"]
+    assert decision["gating_total"] == 2
+    assert decision["gating_resolved"] == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_escalates_at_attempt_cap(db_session, mocker):
+    """(c) At the existing cap the re-driver ESCALATES instead of spinning.
+
+    The bound is the shipped circuit breaker
+    (_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS against promotion_failure_count),
+    not a parallel counter, and the escalation is raised exactly once no matter
+    how many sweep cycles pass over the capped version.
+    """
+    from app.release_qualifier_redrive import (
+        _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    project, version = await _seed_promotion_failed(
+        db_session,
+        promotion_failure_count=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    )
+    mock_run_qual = _patch_promotion_redrive_inputs(mocker)
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["promotion_loop_escalated"] is True
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "capped"
+    assert decision["reason"] == "promotion_failure_cap"
+    assert decision["cap"] == _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "promotion" in alerts[0].title.lower()
+
+    # A second sweep over the same capped version must not re-alert or fire.
+    again = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert again is False
+    mock_run_qual.assert_not_called()
+    alerts_again = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts_again) == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_holds_on_unchanged_candidate(
+    db_session, mocker
+):
+    """(e) Same candidate SHA + unchanged evidence -> no release branch re-cut.
+
+    Re-promoting the identical sha reproduces the identical red CI, at the cost
+    of a fresh release-branch cut and a fresh full-matrix run every cycle.  The
+    guard is asserted at BOTH layers: the qualifier is never re-entered, and
+    github.create_branch is never reached.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, head_sha=_FAILED_CANDIDATE
+    )
+    mock_create_branch = mocker.patch(
+        "app.github.create_branch", new=AsyncMock(return_value={})
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+    mock_create_branch.assert_not_called()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "held"
+    assert decision["reason"] == "candidate_unchanged"
+    assert decision["promotion_error"] == "required_check_failed"
+    # The circuit breaker must survive a hold — a reset would uncap the loop.
+    assert version.last_qualification["promotion_failure_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_retries_mechanics_failure_same_sha(
+    db_session, mocker
+):
+    """A promotion MECHANICS failure may retry the unchanged candidate.
+
+    pr_creation_failed and friends are verdicts on the promotion attempt, not
+    on the candidate: waiting for the integration HEAD to advance would strand
+    a version whose code was never the problem.
+    """
+    from app.release_qualifier_redrive import _redrive_promotion_failed_qualification
+
+    _project, version = await _seed_promotion_failed(
+        db_session, error="pr_creation_failed"
+    )
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, head_sha=_FAILED_CANDIDATE
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True
+    mock_run_qual.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_holds_while_integration_ci_red(
+    db_session, mocker
+):
+    """Red integration CI holds the re-drive: a genuine failure is not a flake.
+
+    The advanced HEAD alone is not evidence the remediation works — re-cutting
+    a release branch onto a red integration HEAD reproduces the same red.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(mocker, gate_state="red")
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "held"
+    assert decision["reason"] == "integration_ci_red"
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_holds_when_head_unresolvable(
+    db_session, mocker
+):
+    """GitHub unavailable -> fail CLOSED. An unresolved HEAD cannot prove a fix
+    landed, so the re-drive holds with a reason rather than re-promoting."""
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, gate_state="unavailable", head_sha=""
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    assert (
+        version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]["reason"]
+        == "integration_head_unresolved"
+    )
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_preserves_failure_count_on_no_progress(
+    db_session, mocker
+):
+    """A non-progress re-entry must NOT reset promotion_failure_count.
+
+    run_qualification rewrites last_qualification wholesale; committing a
+    non-progress outcome would zero the circuit breaker and hand the loop
+    unlimited attempts.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(
+        db_session, promotion_failure_count=2
+    )
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, run_qualification_result={"status": "sha_error"}
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["promotion_failure_count"] == 2
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "held"
+    assert decision["reason"] == "run_qualification_no_progress"
+    assert decision["result_status"] == "sha_error"
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_defers_same_cycle_transition(
+    db_session, mocker
+):
+    """A promotion failure recorded by an EARLIER leg of this same sweep cycle
+    is left to the next cycle — that leg has just spawned the CI-failure
+    harvest and the remediation cannot possibly have landed yet."""
+    from app.release_qualifier_redrive import _redrive_promotion_failed_qualification
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(mocker)
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        pre_sweep_status="promotion_pending",
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sweep_wires_promotion_failed_redriver(db_session, mocker):
+    """The sweep INVOKES the promotion_failed re-driver.
+
+    The regression guard for the dead end itself: the resolver arming a
+    version is worthless if no sweep leg executes the decision.
+    """
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mock_redrive = mocker.patch(
+        "app.release_qualifier_sweep._redrive_promotion_failed_qualification",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_deferred_unsynced_qualification",
+        new=AsyncMock(return_value=False),
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    mock_redrive.assert_called_once()
+    assert mock_redrive.call_args.args[0] == version.id
+    assert mock_redrive.call_args.kwargs.get("session_factory") is not None
+    assert "pre_sweep_status" in mock_redrive.call_args.kwargs
+
+
+# ---------------------------------------------------------------------------
+# deferred_unsynced
+# ---------------------------------------------------------------------------
+
+
+async def _seed_deferred_unsynced(db_session, *, first_deferred_ago_s, last_check_ago_s):
+    """Open a stabilize-phase version parked by the qualify-on-synced gate."""
+    from datetime import timedelta
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    now = _utcnow()
+    version.last_qualification = {
+        "status": "deferred_unsynced",
+        "promotion_target": "main",
+        "first_deferred_at": (
+            now - timedelta(seconds=first_deferred_ago_s)
+        ).isoformat(),
+        "deferred_at": (now - timedelta(seconds=last_check_ago_s)).isoformat(),
+    }
+    _flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+@pytest.mark.asyncio
+async def test_deferred_unsynced_redrive_fires_when_sync_clears(db_session, mocker):
+    """(d) Once the back-merge lands, the re-entry starts a fresh qualification.
+
+    The re-driver does not decide syncedness itself — it re-enters
+    run_qualification, whose sync gate re-reads the promotion-target HEAD live.
+    """
+    from app.release_qualifier_redrive import (
+        _DEFERRED_UNSYNCED_DECISION_KEY,
+        _redrive_deferred_unsynced_qualification,
+    )
+
+    _project, version = await _seed_deferred_unsynced(
+        db_session, first_deferred_ago_s=1200, last_check_ago_s=900
+    )
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await _redrive_deferred_unsynced_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True
+    mock_run_qual.assert_called_once()
+    # The reuse-promote fast path belongs to promotion_failed only.
+    assert (
+        mock_run_qual.call_args.kwargs.get("allow_synchronous_reuse_promote") is None
+    )
+    await db_session.refresh(version)
+    decision = version.last_qualification[_DEFERRED_UNSYNCED_DECISION_KEY]
+    assert decision["decision"] == "fired"
+    assert decision["reason"] == "sync_gate_cleared"
+
+
+@pytest.mark.asyncio
+async def test_deferred_unsynced_redrive_records_still_unsynced(db_session, mocker):
+    """A re-defer is recorded as a held decision with its reason, not silence."""
+    from app.release_qualifier_redrive import (
+        _DEFERRED_UNSYNCED_DECISION_KEY,
+        _redrive_deferred_unsynced_qualification,
+    )
+
+    _project, version = await _seed_deferred_unsynced(
+        db_session, first_deferred_ago_s=1200, last_check_ago_s=900
+    )
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "deferred_unsynced"}),
+    )
+
+    fired = await _redrive_deferred_unsynced_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    await db_session.refresh(version)
+    decision = version.last_qualification[_DEFERRED_UNSYNCED_DECISION_KEY]
+    assert decision["decision"] == "held"
+    assert decision["reason"] == "still_unsynced"
+
+
+@pytest.mark.asyncio
+async def test_deferred_unsynced_redrive_respects_recheck_interval(db_session, mocker):
+    """The sweep runs ~every 60s; the live sync re-check must not.
+
+    This bounds how OFTEN the gate is re-read, never WHETHER it fires — the
+    interval sits well under the sync gate's own bounded fall-through.
+    """
+    from app.release_qualifier_redrive import (
+        _DEFERRED_UNSYNCED_DECISION_KEY,
+        _DEFERRED_UNSYNCED_REDRIVE_MIN_INTERVAL_SECONDS,
+        _redrive_deferred_unsynced_qualification,
+    )
+
+    _project, version = await _seed_deferred_unsynced(
+        db_session,
+        first_deferred_ago_s=600,
+        last_check_ago_s=_DEFERRED_UNSYNCED_REDRIVE_MIN_INTERVAL_SECONDS - 60,
+    )
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await _redrive_deferred_unsynced_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_DEFERRED_UNSYNCED_DECISION_KEY]
+    assert decision["decision"] == "held"
+    assert decision["reason"] == "sync_recheck_interval"
+
+
+@pytest.mark.asyncio
+async def test_deferred_unsynced_redrive_caps_and_alerts_once(db_session, mocker):
+    """Past the wall-clock ceiling the re-driver alerts once and stops polling.
+
+    A per-attempt counter is impossible here: the sync gate rebuilds
+    last_qualification on every re-defer and carries only first_deferred_at
+    forward, so the bound is wall-clock against that preserved timestamp.
+    """
+    from app.release_qualifier_redrive import (
+        _DEFERRED_UNSYNCED_DECISION_KEY,
+        _MAX_DEFERRED_UNSYNCED_WAIT_SECONDS,
+        _redrive_deferred_unsynced_qualification,
+    )
+
+    project, version = await _seed_deferred_unsynced(
+        db_session,
+        first_deferred_ago_s=_MAX_DEFERRED_UNSYNCED_WAIT_SECONDS + 3600,
+        last_check_ago_s=3600,
+    )
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await _redrive_deferred_unsynced_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_DEFERRED_UNSYNCED_DECISION_KEY]
+    assert decision["decision"] == "capped"
+    assert decision["reason"] == "sync_wait_cap"
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "sync" in alerts[0].title.lower()
+
+    again = await _redrive_deferred_unsynced_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert again is False
+    alerts_again = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts_again) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_wires_deferred_unsynced_redriver(db_session, mocker):
+    """The sweep INVOKES the deferred_unsynced re-driver (T5b's missing half)."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_promotion_failed_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mock_redrive = mocker.patch(
+        "app.release_qualifier_sweep._redrive_deferred_unsynced_qualification",
+        new=AsyncMock(return_value=True),
+    )
+
+    _project, version = await _seed_deferred_unsynced(
+        db_session, first_deferred_ago_s=1200, last_check_ago_s=900
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    mock_redrive.assert_called_once()
+    assert mock_redrive.call_args.args[0] == version.id
+    assert mock_redrive.call_args.kwargs.get("session_factory") is not None
+
+
+def test_unknown_promotion_error_waits_for_a_new_candidate():
+    """Unknown failure codes fail CLOSED into the wait-for-new-code branch.
+
+    A new failure mode must not inherit permission to re-cut a release branch
+    against the unchanged candidate.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_MECHANICS_FAILURES,
+        _promotion_failure_needs_new_candidate,
+    )
+
+    assert _promotion_failure_needs_new_candidate("some_future_failure_code") is True
+    assert _promotion_failure_needs_new_candidate("required_check_failed") is True
+    assert _promotion_failure_needs_new_candidate("") is True
+    for mechanics in _PROMOTION_MECHANICS_FAILURES:
+        assert _promotion_failure_needs_new_candidate(mechanics) is False

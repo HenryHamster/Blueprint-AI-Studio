@@ -1,12 +1,40 @@
 """Scheduled re-drivers for stranded release qualifications.
+
 Extracted from ``release_qualifier_sweep`` (the sweep module's size cap left no
 headroom for routine edits).  These are the per-status re-entry helpers the
 sweep (``sweep_stuck_qualifications``) invokes once per cycle to re-drive a
-version stranded in a non-conclusive qualification state — ``deferred_unsynced``,
-transient ``error``, ``infra_failure``, ``not_promoted``, ``promotion_failed``,
-and standing ``dry_run`` — back into ``run_qualification`` when its blocking
-condition has cleared.  The force-finalize / reconcile machinery and the sweep
-orchestrator itself stay in ``release_qualifier_sweep``.
+version stranded in a non-conclusive qualification state back into
+``run_qualification`` once its blocking condition has actually cleared.
+
+This module implements EXACTLY these six re-drivers, and nothing else:
+
+    ``_redrive_error_qualification``               status=error (transient codes)
+    ``_redrive_infra_failure_qualification``       status=infra_failure
+    ``_redrive_rubric_changed_qualification``      status=rubric_changed /
+                                                   rubric_provenance_unknown
+    ``_redrive_walkthrough_contract_qualification`` status=not_promoted with
+                                                   blocker=walkthrough_e2e_
+                                                   contract_failed
+    ``_redrive_promotion_failed_qualification``    status=promotion_failed
+    ``_redrive_deferred_unsynced_qualification``   status=deferred_unsynced
+
+Each is bounded by its own attempt (or wall-clock) cap and escalates to an
+operator Alert at that cap rather than spinning.
+
+NOT here, and deliberately so: standing ``dry_run`` and candidate-advanced
+``not_promoted`` re-entry.  Those are the sweep executor's own triggers
+(``post_dry_run_advance`` and ``candidate_advanced`` in
+``_fire_auto_triggered_qualification``), and the force-finalize / reconcile
+machinery plus the sweep orchestrator stay in ``release_qualifier_sweep``.
+
+An earlier version of this docstring claimed re-drivers for ``deferred_unsynced``,
+``promotion_failed`` and ``not_promoted`` that had been deleted (commit
+a9ed8d6e) and never replaced.  That claim, plus the matching "owned by its
+dedicated re-driver" comment on the sweep executor's trigger filter, is why a
+version whose promotion PR went red stayed parked forever with nobody noticing:
+the resolver armed it, the executor discarded the decision as re-driver-owned,
+and no re-driver existed.  Two of those three are now implemented (the third,
+``not_promoted``, is genuinely executor-owned).  Keep this list literal.
 
 The public surface is UNCHANGED: ``release_qualifier_sweep`` re-imports every
 symbol defined here, so ``app.release_qualifier_sweep._redrive_*`` (and the
@@ -27,7 +55,14 @@ from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1105
+
+# First cap for this module: it crossed the 1500-line coverage threshold
+# when the two missing re-drivers were restored.  The value is the canonical
+# policy headroom for a newly tracked file of this size
+# (``check_size_limits.recommended_cap_for_line_count``), not a hand-picked
+# number -- a hand-tight cap would put the file straight into the
+# metrics-integrity ``near_cap_size_warning`` band on the day it landed.
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2050
 
 logger = logging.getLogger(__name__)
 
@@ -1103,3 +1138,620 @@ async def _redrive_walkthrough_contract_qualification(
                 flag_modified(version, "last_qualification")
                 await redrive_session.commit()
         return bool(result and result.get("status") == "spawned")
+
+
+# ---------------------------------------------------------------------------
+# promotion_failed / deferred_unsynced re-drivers
+# ---------------------------------------------------------------------------
+#
+# Both statuses had a resolver rule (``qualification_triggers`` T5 and T5b) and
+# NO executor: ``_fire_auto_triggered_qualification`` filters the resolver's
+# decision down to the three triggers the sweep executor owns and discards the
+# rest as "owned by its dedicated re-driver" -- but the promotion_failed and
+# deferred_unsynced re-drivers that claim named were deleted (commit a9ed8d6e,
+# 2026-08-03) and never replaced.  A version whose promotion PR went red
+# therefore stayed parked at ``promotion_failed`` forever: the reconcile leg
+# closed the PR, deleted the release branch, recorded the failure, and spawned a
+# CI-failure remediation fix -- and once that fix merged, nothing re-fired
+# qualification.  These two functions are the missing executors.
+
+
+# Promotion failures a re-attempt on the SAME candidate can clear.  These are
+# promotion MECHANICS failures -- credentials, release-branch/PR plumbing, a
+# transient merge refusal, a claim that expired waiting for CI to conclude.
+# Nothing about the candidate's CODE is implicated, so re-cutting the release
+# branch for the identical sha is the correct (and only) recovery.
+#
+# Every OTHER promotion failure -- ``required_check_failed``,
+# ``migration_guard_blocked``, ``protection_blocked_review``,
+# ``merge_refused_405_terminal``, and any code this list does not know -- is a
+# genuine verdict ON THE CANDIDATE: re-promoting the identical sha reproduces it
+# exactly, at the cost of a fresh release-branch cut and a fresh full-matrix CI
+# run.  Those wait for the integration HEAD to ADVANCE, i.e. for the harvested
+# remediation fix to actually land.  Unknown codes fail CLOSED into that branch
+# on purpose: a new failure mode must not inherit permission to spin.
+_PROMOTION_MECHANICS_FAILURES: frozenset[str] = frozenset(
+    {
+        "no_credentials",
+        "project_not_found",
+        "lock_release_failed",
+        "release_branch_failed",
+        "pr_creation_failed",
+        "pr_missing_number",
+        "pr_closed_without_merge",
+        "promotion_pending_malformed",
+        "promotion_pr_identity_mismatch",
+        "promotion_pending_timeout",
+        "promotion_claim_abandoned",
+        "merge_error",
+    }
+)
+
+# Minimum wait between two deferred_unsynced sync re-checks.  This is NOT a
+# "retry after N minutes" firing rule -- the DECISION is made by the qualify-on-
+# synced gate inside ``run_qualification``, which re-reads the promotion-target
+# HEAD live on every re-entry.  This only bounds how often that live re-check
+# runs, because the reaper sweeps roughly once a minute and each re-entry costs
+# several GitHub round-trips.  Well under the sync gate's own 30-minute
+# fall-through, so the fall-through still fires on schedule.
+_DEFERRED_UNSYNCED_REDRIVE_MIN_INTERVAL_SECONDS = 300
+
+# Hard wall-clock ceiling on how long a version may sit at deferred_unsynced
+# before the re-driver escalates instead of re-checking.  The sync gate's
+# bounded fall-through (``qualify_unsynced_fall_through_minutes``, default 30)
+# normally releases the deferral long before this; reaching it means the
+# fall-through is disabled or broken, which is an operator condition, not
+# something to keep polling GitHub about forever.
+_MAX_DEFERRED_UNSYNCED_WAIT_SECONDS = 6 * 60 * 60
+
+# Keys under which each re-driver stamps its decision on ``last_qualification``.
+_PROMOTION_REDRIVE_DECISION_KEY = "promotion_redrive_decision"
+_DEFERRED_UNSYNCED_DECISION_KEY = "deferred_unsynced_redrive_decision"
+
+
+def _parse_iso_timestamp(raw) -> datetime | None:
+    """Best-effort naive-UTC parse of a stored ISO timestamp (None on garbage)."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+async def _record_redrive_decision(
+    session,
+    version,
+    key: str,
+    decision: str,
+    reason: str,
+    **fields,
+) -> bool:
+    """Persist WHY a re-driver fired, held, capped, or escalated.
+
+    A sweep leg that silently returns ``False`` is how the promotion_failed
+    dead-end stayed invisible: the resolver armed the version every cycle, the
+    executor discarded the decision, and nothing anywhere recorded that a
+    decision had been discarded.  Every exit path of the two re-drivers below
+    stamps this record onto ``last_qualification`` so an operator reading the
+    version back sees the decision AND the inputs that produced it, without
+    reconstructing them from logs that have long since rotated.
+
+    Idempotent by CONTENT: when the decision and its fields match what is
+    already stored the write is skipped entirely (only the timestamp would
+    differ), so a steady-state hold does not rewrite the row on every ~60s
+    sweep.  Callers therefore must not pass volatile values (elapsed seconds,
+    a sha that changes every cycle) as fields.
+
+    Returns True when a write was actually made.
+    """
+    qual = version.last_qualification
+    if not isinstance(qual, dict):
+        return False
+    record: dict = {"decision": decision, "reason": reason}
+    record.update({k: v for k, v in fields.items() if v is not None})
+    prior = qual.get(key)
+    if isinstance(prior, dict) and {
+        k: v for k, v in prior.items() if k != "at"
+    } == record:
+        return False
+    version.last_qualification = {
+        **qual,
+        key: {**record, "at": _utcnow().isoformat()},
+    }
+    flag_modified(version, "last_qualification")
+    session.add(version)
+    await session.commit()
+    return True
+
+
+def _promotion_failure_needs_new_candidate(error: str) -> bool:
+    """True when only NEW code on the integration branch can clear this failure.
+
+    Pure helper.  ``error`` is ``last_qualification["error"]`` from a
+    ``promotion_failed`` record.  Fails CLOSED for unrecognised codes -- an
+    unknown failure mode is treated as a genuine verdict on the candidate, so
+    the re-driver waits for the integration HEAD to advance rather than
+    re-cutting a release branch against unchanged evidence.
+    """
+    return error not in _PROMOTION_MECHANICS_FAILURES
+
+
+async def _redrive_promotion_failed_qualification(
+    version_id,
+    *,
+    session_factory=None,
+    pre_sweep_status: str | None = None,
+) -> bool:
+    """Re-enter the qualifier for a version parked at ``promotion_failed``.
+
+    THE DEFECT THIS CLOSES.  When a promotion PR's CI goes red,
+    ``_reconcile_if_managed_check_wait`` closes the PR, deletes the
+    ``release-v{N}`` branch, calls ``_record_promotion_failure`` (which returns
+    the version to ``phase=stabilize`` / ``status=open`` and increments
+    ``last_qualification["promotion_failure_count"]``) and harvests the CI
+    failures into a remediation fix task.  That fix merges, the integration
+    branch advances -- and before this re-driver existed nothing re-fired
+    qualification.  ``qualification_triggers`` T5 DID arm the version
+    (``trigger="blockers_cleared"``), but the sweep's auto-trigger executor
+    discards every trigger outside its own three, on the stated grounds that a
+    dedicated re-driver owns them.  For ``promotion_failed`` no such re-driver
+    existed.  The version stayed stuck until a human re-fired qualification.
+
+    CONDITION-DRIVEN, NEVER TIMER-DRIVEN.  There is no "retry after N minutes"
+    path here; a blind retry against still-red CI would recreate and re-destroy
+    a release branch every cycle.  Four independent conditions must ALL hold:
+
+    1. ``compute_requalification_readiness`` reports ``requalification_ready``
+       -- every gating carried audit finding is ledger ``resolved``/``stale`` AND
+       the projected score clears the live promotion threshold.  Stale-marking
+       runs first against the live integration audited surface, which is how a
+       landed fix flips a finding to ``stale`` in the first place.  Readiness
+       also carries the in-flight ``promotion_ci_remediation`` deferral, so the
+       re-drive waits while the harvested fix is still being worked.
+    2. The promotion-CI gate for the integration HEAD is not ``red``.
+    3. The integration HEAD resolves at all (fail closed when GitHub is
+       unavailable -- an unresolved HEAD cannot prove the fix landed).
+    4. CANDIDATE IDENTITY.  For a genuine failure (``required_check_failed``,
+       ``migration_guard_blocked``, anything not in
+       ``_PROMOTION_MECHANICS_FAILURES``) the integration HEAD must have moved
+       PAST the failed candidate sha.  Re-promoting the identical sha against
+       unchanged evidence is the infinite-loop failure mode and it costs a full
+       release-branch cut plus a full-matrix CI run every single time.  Only a
+       promotion MECHANICS failure -- where the candidate was never the problem
+       -- may re-attempt on the unchanged sha.
+
+    BOUNDED.  The cap is the EXISTING circuit breaker,
+    ``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS`` against the existing
+    ``promotion_failure_count`` -- not a parallel counter.  At the cap this calls
+    ``_escalate_promotion_failure_loop`` (operator Alert, the
+    ``promotion_loop_escalated`` latch) and halts.  ``run_qualification``
+    enforces the same cap independently at its own pre-lock gate, so the
+    ceiling holds even for callers that never come through here.
+
+    NO ROW LOCK -- deliberately unlike the rubric/walkthrough re-drivers.  This
+    is the ONLY caller permitted to pass ``allow_synchronous_reuse_promote=True``
+    (see ``run_qualification``'s reuse gate), and that path re-attempts the
+    promotion in a DEDICATED session which must itself ``SELECT .. FOR UPDATE``
+    this same version row.  Holding the lock here would produce a two-connection
+    wait cycle Postgres cannot see, so its deadlock detector would never fire.
+    ``run_qualification`` is self-defending (it takes its own lock after the
+    reuse gate), so the unlocked read is safe.
+
+    COMMIT DISCIPLINE: commit on progress, ROLL BACK on non-progress --
+    deliberately unlike the error/infra/rubric/walkthrough re-drivers, which
+    commit unconditionally.  ``promotion_failure_count`` lives ONLY on
+    ``last_qualification``, and a non-progress outcome (``sha_error``,
+    ``no_credentials``, a fresh ``deferred_unsynced`` note) REPLACES that dict
+    wholesale -- committing one would silently reset the circuit breaker to zero
+    and hand the loop unlimited attempts.  Rolling back keeps the version at
+    ``promotion_failed`` with its count intact, to retry next cycle.
+
+    Returns True only when the re-entry actually progressed: a fresh
+    qualification spawned, or the passing-audit reuse-promote re-attempted the
+    promotion.  Every other path returns False with a recorded reason.
+    """
+    from app import release_qualifier
+    from app.release_readiness import (
+        auto_mark_stale_audit_findings,
+        compute_promotion_ci_green_gate,
+        compute_requalification_readiness,
+    )
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(
+            release_version.ReleaseVersion, version_id
+        )
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "promotion_failed"
+            or version.status != "open"
+            or version.phase != "stabilize"
+        ):
+            return False
+        # Do not re-drive a promotion failure an EARLIER LEG of this same sweep
+        # cycle recorded: those reconcile transitions spawn the CI-failure
+        # harvest and document an explicit "re-arm next cycle" intent.
+        if pre_sweep_status is not None and pre_sweep_status != "promotion_failed":
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: promotion_failed re-drive deferring "
+                "v%d -- status moved %r -> 'promotion_failed' during this cycle",
+                version.version_number,
+                pre_sweep_status,
+            )
+            return False
+
+        failure_count = int(qual.get("promotion_failure_count") or 0)
+        error = str(qual.get("error") or "")
+        candidate_sha = str(qual.get("candidate_sha") or "")
+
+        # (1) Circuit breaker -- escalate once, then halt.  Never spin.
+        if failure_count >= _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS:
+            await _escalate_promotion_failure_loop(redrive_session, version)
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _PROMOTION_REDRIVE_DECISION_KEY,
+                "capped",
+                "promotion_failure_cap",
+                promotion_failure_count=failure_count,
+                cap=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+                promotion_error=error or "unknown",
+            )
+            return False
+
+        # (2) Readiness -- the remediation must actually be RESOLVED, not merely
+        # attempted.  Stale-marking against the live integration surface runs
+        # first: that is what turns "a fix landed on the audited path" into a
+        # ledger state the readiness computation can see.
+        project = await redrive_session.get(Project, version.project_id)
+        if project is None:
+            return False
+        try:
+            from app.release_qualifier_sweep import (
+                _current_integration_audited_surface,
+            )
+
+            surface = await _current_integration_audited_surface(
+                redrive_session, project
+            )
+            if surface:
+                await auto_mark_stale_audit_findings(
+                    redrive_session, version.project_id, version.id, surface
+                )
+            readiness = await compute_requalification_readiness(
+                redrive_session,
+                version.project_id,
+                candidate_surface_paths=surface,
+            )
+        except Exception:  # best-effort leg; retry next cycle
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: promotion_failed re-drive readiness "
+                "resolution failed for version %s; deferring",
+                version_id,
+            )
+            await redrive_session.rollback()
+            return False
+        if not readiness.get("requalification_ready"):
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _PROMOTION_REDRIVE_DECISION_KEY,
+                "held",
+                "findings_unresolved",
+                detail=str(readiness.get("reason") or "")[:400],
+                gating_total=readiness.get("gating_total"),
+                gating_resolved=readiness.get("gating_resolved"),
+            )
+            return False
+
+        # (3) Live integration HEAD + CI state.  ``dispatch=False``: this is a
+        # READ of the gate, never a trigger for a full-matrix run.
+        try:
+            gate = await compute_promotion_ci_green_gate(
+                redrive_session, version.project_id, dispatch=False
+            )
+        except Exception:  # noqa: BLE001 -- degrade to unavailable, fail closed
+            logger.warning(
+                "[RELEASE_QUALIFIER] sweep: promotion_failed re-drive could not "
+                "resolve the integration HEAD for version %s; holding",
+                version_id,
+                exc_info=True,
+            )
+            gate = {}
+        gate_state = str(gate.get("gate_state") or "unavailable")
+        head_sha = str(gate.get("head_sha") or "")
+        if gate_state == "red":
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _PROMOTION_REDRIVE_DECISION_KEY,
+                "held",
+                "integration_ci_red",
+                gate_state=gate_state,
+            )
+            return False
+        if not head_sha:
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _PROMOTION_REDRIVE_DECISION_KEY,
+                "held",
+                "integration_head_unresolved",
+                gate_state=gate_state,
+            )
+            return False
+
+        # (4) Candidate identity -- the anti-infinite-loop guard.
+        if not candidate_sha:
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _PROMOTION_REDRIVE_DECISION_KEY,
+                "held",
+                "candidate_identity_unknown",
+            )
+            return False
+        needs_new_candidate = _promotion_failure_needs_new_candidate(error)
+        if needs_new_candidate and head_sha == candidate_sha:
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _PROMOTION_REDRIVE_DECISION_KEY,
+                "held",
+                "candidate_unchanged",
+                promotion_error=error or "unknown",
+                candidate_sha=candidate_sha[:12],
+            )
+            return False
+
+        logger.info(
+            "[RELEASE_QUALIFIER] sweep: re-driving promotion_failed v%d "
+            "(error=%s attempt=%d/%d candidate=%s head=%s gate=%s) -- %s",
+            version.version_number,
+            error or "unknown",
+            failure_count,
+            _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+            candidate_sha[:8],
+            head_sha[:8],
+            gate_state,
+            (
+                "remediation resolved and the integration HEAD advanced past "
+                "the failed candidate"
+                if needs_new_candidate
+                else "the failure was promotion mechanics, not the candidate"
+            ),
+        )
+        # End this session's read transaction BEFORE re-entering the qualifier:
+        # the reuse-promote path opens a dedicated session that locks this row.
+        await redrive_session.commit()
+        result = await release_qualifier.run_qualification(
+            redrive_session,
+            version.project_id,
+            version,
+            session_factory=session_factory,
+            allow_synchronous_reuse_promote=True,
+            requested_probes=qual.get("requested_probes"),
+            auto_trigger=True,
+        )
+        result = result or {}
+        result_status = str(result.get("status") or "none")
+        progressed = bool(result_status == "spawned" or result.get("reused_audit"))
+        if progressed:
+            await redrive_session.commit()
+            try:
+                await redrive_session.refresh(version)
+                await _record_redrive_decision(
+                    redrive_session,
+                    version,
+                    _PROMOTION_REDRIVE_DECISION_KEY,
+                    "fired",
+                    "blockers_cleared",
+                    result_status=result_status,
+                    promotion_failure_count=failure_count,
+                    candidate_sha=candidate_sha[:12],
+                )
+            except Exception:  # noqa: BLE001 -- provenance, never the verdict
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: promotion_failed re-drive fired "
+                    "for v%d but its provenance stamp failed",
+                    version.version_number,
+                    exc_info=True,
+                )
+            return True
+        # Non-progress: discard whatever run_qualification wrote.  See the
+        # COMMIT DISCIPLINE note above -- committing here would reset
+        # promotion_failure_count and uncap the loop.
+        await redrive_session.rollback()
+        version = await redrive_session.get(
+            release_version.ReleaseVersion, version_id
+        )
+        if version is not None:
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _PROMOTION_REDRIVE_DECISION_KEY,
+                "held",
+                "run_qualification_no_progress",
+                result_status=result_status,
+            )
+        return False
+
+
+async def _redrive_deferred_unsynced_qualification(
+    version_id,
+    *,
+    session_factory=None,
+    pre_sweep_status: str | None = None,
+) -> bool:
+    """Re-enter the qualifier for a version parked at ``deferred_unsynced``.
+
+    The qualify-on-synced gate inside ``run_qualification`` DEFERS a candidate
+    whose integration branch has not yet absorbed the promotion target (a
+    ``main -> automain`` back-merge is still pending), writing
+    ``last_qualification = {"status": "deferred_unsynced", ...}``.  That record
+    is retryable by design -- but, exactly like ``promotion_failed``, nothing
+    retried it: ``qualification_triggers`` T5b armed the version with
+    ``trigger="deferred_unsynced_redrive"`` and the sweep's auto-trigger
+    executor discarded the decision as re-driver-owned while no such re-driver
+    existed.  This is that re-driver.
+
+    CONDITION-DRIVEN.  The re-drive does not itself decide whether the branches
+    are synced -- it re-enters ``run_qualification``, whose sync gate re-reads
+    the promotion-target HEAD LIVE and either proceeds (synced, indeterminate,
+    or its own bounded fall-through fired) or re-defers.  The only thing this
+    function times is how OFTEN that live re-check runs
+    (``_DEFERRED_UNSYNCED_REDRIVE_MIN_INTERVAL_SECONDS``), because the sweep
+    cycles roughly once a minute and each re-entry costs several GitHub
+    round-trips.  The interval sits well under the sync gate's own 30-minute
+    fall-through, so the fall-through still releases the deferral on schedule.
+
+    BOUNDED.  A per-attempt counter is impossible here -- the sync gate REBUILDS
+    ``last_qualification`` from scratch on every re-defer and carries forward
+    only ``first_deferred_at`` -- so the bound is wall-clock against that
+    preserved timestamp: past ``_MAX_DEFERRED_UNSYNCED_WAIT_SECONDS`` the
+    re-driver raises an operator Alert (once) and halts instead of polling
+    GitHub forever.  Reaching it means the sync gate's fall-through is disabled
+    or broken, which is an operator condition.
+
+    COMMIT DISCIPLINE: commit on every outcome, like the error/infra/rubric
+    re-drivers.  A re-defer must persist -- it is what advances ``deferred_at``
+    (the re-check interval) while preserving ``first_deferred_at`` (the wait
+    cap).  There is no counter to protect here, so the promotion_failed
+    re-driver's rollback discipline does not apply.
+
+    Returns True only when the re-entry actually started a fresh qualification.
+    """
+    from app import release_qualifier
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = (
+            await redrive_session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "deferred_unsynced"
+            or version.status != "open"
+            or version.phase != "stabilize"
+        ):
+            return False
+        if pre_sweep_status is not None and pre_sweep_status != "deferred_unsynced":
+            return False
+
+        now = _utcnow()
+        first_deferred = _parse_iso_timestamp(qual.get("first_deferred_at"))
+        # Fail toward re-checking when the record is missing/garbage: an
+        # unparseable timestamp must not become a permanent hold.
+        waited = (now - first_deferred).total_seconds() if first_deferred else 0.0
+        target = str(qual.get("promotion_target") or "the promotion target")
+        if waited >= _MAX_DEFERRED_UNSYNCED_WAIT_SECONDS:
+            prior = qual.get(_DEFERRED_UNSYNCED_DECISION_KEY)
+            already = isinstance(prior, dict) and prior.get("decision") == "capped"
+            if not already:
+                redrive_session.add(
+                    Alert(
+                        project_id=version.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=(
+                            f"Release v{version.version_number} deploy-sync "
+                            f"deferral never released"
+                        ),
+                        message=(
+                            f"Release v{version.version_number} has been held at "
+                            f"deferred_unsynced for {waited / 3600:.1f}h waiting "
+                            f"for {target} to be back-merged into the integration "
+                            f"branch. The qualify-on-synced gate's bounded "
+                            f"fall-through should have released it long before "
+                            f"now; autonomous sync re-checks are halted pending "
+                            f"operator review of the back-merge."
+                        ),
+                        event_type="release.qualification_crash_loop",
+                    )
+                )
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: v%d deferred_unsynced for %.1fh "
+                    "(cap %.1fh) -- raised operator Alert and halted sync "
+                    "re-checks",
+                    version.version_number,
+                    waited / 3600,
+                    _MAX_DEFERRED_UNSYNCED_WAIT_SECONDS / 3600,
+                )
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _DEFERRED_UNSYNCED_DECISION_KEY,
+                "capped",
+                "sync_wait_cap",
+                cap_hours=round(_MAX_DEFERRED_UNSYNCED_WAIT_SECONDS / 3600, 1),
+                promotion_target=qual.get("promotion_target"),
+            )
+            return False
+
+        last_checked = _parse_iso_timestamp(qual.get("deferred_at"))
+        if (
+            last_checked is not None
+            and (now - last_checked).total_seconds()
+            < _DEFERRED_UNSYNCED_REDRIVE_MIN_INTERVAL_SECONDS
+        ):
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _DEFERRED_UNSYNCED_DECISION_KEY,
+                "held",
+                "sync_recheck_interval",
+                min_interval_seconds=_DEFERRED_UNSYNCED_REDRIVE_MIN_INTERVAL_SECONDS,
+            )
+            return False
+
+        logger.info(
+            "[RELEASE_QUALIFIER] sweep: re-checking the deploy-sync gate for v%d "
+            "(deferred %.0fmin, target=%s)",
+            version.version_number,
+            waited / 60,
+            target,
+        )
+        result = await release_qualifier.run_qualification(
+            redrive_session,
+            version.project_id,
+            version,
+            session_factory=session_factory,
+            requested_probes=qual.get("requested_probes"),
+            auto_trigger=True,
+        )
+        # COMMIT on every outcome: the re-defer record IS the progress here (it
+        # advances deferred_at and carries first_deferred_at forward).
+        await redrive_session.commit()
+        result = result or {}
+        result_status = str(result.get("status") or "none")
+        spawned = result_status == "spawned"
+        try:
+            await redrive_session.refresh(version)
+            await _record_redrive_decision(
+                redrive_session,
+                version,
+                _DEFERRED_UNSYNCED_DECISION_KEY,
+                "fired" if spawned else "held",
+                "sync_gate_cleared" if spawned else "still_unsynced",
+                result_status=result_status,
+            )
+        except Exception:  # noqa: BLE001 -- provenance, never the verdict
+            logger.warning(
+                "[RELEASE_QUALIFIER] sweep: deferred_unsynced re-drive for v%d "
+                "could not stamp its provenance",
+                version.version_number,
+                exc_info=True,
+            )
+        return spawned

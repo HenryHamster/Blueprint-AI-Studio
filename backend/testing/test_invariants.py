@@ -24,9 +24,10 @@ from pathlib import Path
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
-from testing.git_checkout_probe import (
-    git_readable_repo_root,
-    unreadable_repo_skip_reason,
+from testing.repo_checkout import (
+    git_command,
+    require_git_readable_repo_root,
+    require_repo_root,
 )
 from testing.identity_extraction import (
     extract_python_test_ids,
@@ -1142,54 +1143,26 @@ class TestSchemaRevisionSync:
     def test_agent_helper_exclusions_match_prompt_and_gitignore(self):
         """Agent helper exclusions must stay aligned with prompt.ts and gitignore.
 
-        Skipped when running in environments without the agent/ source tree
-        or repo root checkout (e.g. CI's backend-only Docker build context,
-        which excludes agent/, .gitignore, and .git). Locally and in any
-        environment that does see the repo root the check fires normally.
+        Resolves the checkout through ``testing.repo_checkout``. The previous
+        spelling walked up from ``__file__`` to find the repo root, which is
+        correct in a plain checkout and resolves to ``/`` inside every
+        containerised lane (backend/ is mounted at /app, the repo root at
+        /repo) -- so this guard reported SKIPPED on every CI run and had never
+        enforced anything in the gate it exists to protect. It now FAILS rather
+        than skips when no checkout is visible.
         """
-        helpers_path = os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "agent",
-            "src",
-            "prompts",
-            "code-change-helpers.ts",
+        repo_root = require_repo_root()
+        helpers_path = (
+            repo_root / "agent" / "src" / "prompts" / "code-change-helpers.ts"
         )
-        gitignore_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", ".gitignore"
+        gitignore_path = repo_root / ".gitignore"
+        assert helpers_path.is_file(), (
+            f"{helpers_path} is missing from the checkout at {repo_root}; the "
+            "agent helper exclusion list cannot be read, so this guard cannot "
+            "report clean."
         )
-        repo_root = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..")
-        )
-        if not (os.path.exists(helpers_path) and os.path.exists(gitignore_path)):
-            pytest.skip(
-                "agent/src/prompts/code-change-helpers.ts or .gitignore is not "
-                f"present at the repo root this guard resolves ({repo_root}), "
-                "so there is nothing to compare. CI coverage: neither backend "
-                "lane exercises this guard -- both run from a backend-only "
-                "context whose repo root resolves to `/`. It runs on a "
-                "developer or agent checkout."
-            )
-        # Presence of `.git` is NOT the predicate, in either spelling: isdir
-        # skips in every linked worktree (#17872/#17887) and exists overshoots
-        # into an ERROR when a worktree is mounted into a container (#17892).
-        # Ask git the cheapest question that fails exactly when the `git
-        # ls-files` below would.
-        readable_root = git_readable_repo_root(repo_root)
-        if readable_root is None:
-            pytest.skip(
-                unreadable_repo_skip_reason(
-                    "neither backend lane exercises this guard -- both run from "
-                    "a backend-only context whose repo root resolves to `/`, "
-                    "which carries no checkout. It runs on a developer or agent "
-                    "checkout, where a skip here means the local repo is "
-                    "unreadable, not that the invariant held."
-                )
-            )
 
-        with open(helpers_path) as f:
-            prompt = f.read()
+        prompt = helpers_path.read_text()
         match = re.search(r"export const AGENT_HELPER_NAMES = \[(.*?)\];", prompt, re.S)
         assert match, (
             "Could not find AGENT_HELPER_NAMES literal in agent/src/prompts/code-change-helpers.ts"
@@ -1199,20 +1172,30 @@ class TestSchemaRevisionSync:
             for name in match.group(1).split(",")
             if name.strip()
         ]
+        assert helpers, (
+            "AGENT_HELPER_NAMES parsed to an empty list -- the literal's shape "
+            "changed and every assertion below would be vacuous."
+        )
 
-        with open(gitignore_path) as f:
-            gitignore = f.read().splitlines()
+        gitignore = gitignore_path.read_text().splitlines()
         for helper in helpers:
             assert f"/{helper}" in gitignore, f".gitignore is missing /{helper}"
         assert "*.bak" in gitignore, ".gitignore is missing *.bak"
 
-        tracked = subprocess.run(
-            ["git", "-c", f"safe.directory={readable_root}", "ls-files"],
-            cwd=readable_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
+        # Reading git is a capability separate from seeing the checkout, so it
+        # is required separately -- and only after the file-content assertions
+        # above have already run.
+        git_root = require_git_readable_repo_root()
+        listing = git_command(git_root, "ls-files")
+        assert listing.returncode == 0, (
+            f"git ls-files failed in {git_root} (exit {listing.returncode}): "
+            f"{listing.stderr.strip()}"
+        )
+        tracked = listing.stdout.splitlines()
+        assert tracked, (
+            f"git ls-files reported no tracked files in {git_root} -- the leak "
+            "scan below would be vacuous."
+        )
         pattern = re.compile(rf"^(?:{'|'.join(map(re.escape, helpers))})$|\.bak$")
         # 'check' is the repo's own build-runner and is intentionally tracked in git.
         # It also appears in AGENT_HELPER_NAMES because agents overwrite it with a
@@ -1235,73 +1218,32 @@ class TestSchemaRevisionSync:
         ignore rule must be root-anchored so it does NOT swallow nested
         fixtures such as backend/testing/**/self_review_*.json.
 
-        Skipped when the repo root / .git checkout is unavailable (e.g. CI's
-        backend-only Docker build context), following the same repo-root
-        availability pattern as test_agent_helper_exclusions_match_prompt_and_gitignore.
+        Resolves the checkout through ``testing.repo_checkout`` for the same
+        reason as test_agent_helper_exclusions_match_prompt_and_gitignore: the
+        walk-up spelling lands on ``/`` inside every containerised lane, so
+        this guard used to report SKIPPED on every CI run. A missing checkout
+        is now a FAILURE, not a skip.
         """
-        gitignore_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", ".gitignore"
-        )
-        repo_root = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..")
-        )
-        if not os.path.exists(gitignore_path):
-            pytest.skip(
-                "'.gitignore' is not present at the repo root this guard "
-                f"resolves ({repo_root}), so there is nothing to check. CI "
-                "coverage: neither backend lane exercises this guard -- both "
-                "run from a backend-only context whose repo root resolves to "
-                "`/`. It runs on a developer or agent checkout."
-            )
-        # Presence of `.git` is NOT the predicate -- see the note on
-        # test_agent_helper_exclusions_match_prompt_and_gitignore above.
-        readable_root = git_readable_repo_root(repo_root)
-        if readable_root is None:
-            pytest.skip(
-                unreadable_repo_skip_reason(
-                    "neither backend lane exercises this guard -- both run from "
-                    "a backend-only context whose repo root resolves to `/`, "
-                    "which carries no checkout. It runs on a developer or agent "
-                    "checkout, where a skip here means the local repo is "
-                    "unreadable, not that the invariant held."
-                )
-            )
-
-        with open(gitignore_path) as f:
-            gitignore = f.read().splitlines()
+        repo_root = require_repo_root()
+        gitignore = (repo_root / ".gitignore").read_text().splitlines()
         assert "/self_review_*.json" in gitignore, (
             ".gitignore is missing the root-anchored '/self_review_*.json' rule "
             "— repo-root self-review output would become committable noise."
         )
 
+        git_root = require_git_readable_repo_root()
+
         # The rule must be root-anchored: git must ignore a root stray but must
         # NOT ignore a nested fixture of the same name.
-        root_ignored = subprocess.run(
-            [
-                "git",
-                "-c",
-                f"safe.directory={readable_root}",
-                "check-ignore",
-                "self_review_probe.json",
-            ],
-            cwd=readable_root,
-            capture_output=True,
-            text=True,
+        root_ignored = git_command(
+            git_root, "check-ignore", "self_review_probe.json"
         )
         assert root_ignored.returncode == 0, (
-            "repo-root self_review_probe.json is not ignored by .gitignore"
+            "repo-root self_review_probe.json is not ignored by .gitignore "
+            f"(git exit {root_ignored.returncode}: {root_ignored.stderr.strip()})"
         )
-        nested_ignored = subprocess.run(
-            [
-                "git",
-                "-c",
-                f"safe.directory={readable_root}",
-                "check-ignore",
-                "backend/testing/self_review_probe.json",
-            ],
-            cwd=readable_root,
-            capture_output=True,
-            text=True,
+        nested_ignored = git_command(
+            git_root, "check-ignore", "backend/testing/self_review_probe.json"
         )
         assert nested_ignored.returncode == 1, (
             "nested backend/testing/self_review_probe.json must NOT be ignored "
@@ -1309,13 +1251,16 @@ class TestSchemaRevisionSync:
         )
 
         # No root-level self_review_*.json file may be tracked.
-        tracked = subprocess.run(
-            ["git", "-c", f"safe.directory={readable_root}", "ls-files"],
-            cwd=readable_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
+        listing = git_command(git_root, "ls-files")
+        assert listing.returncode == 0, (
+            f"git ls-files failed in {git_root} (exit {listing.returncode}): "
+            f"{listing.stderr.strip()}"
+        )
+        tracked = listing.stdout.splitlines()
+        assert tracked, (
+            f"git ls-files reported no tracked files in {git_root} -- the leak "
+            "scan below would be vacuous."
+        )
         leaked_root = [
             path for path in tracked if re.match(r"^self_review_.*\.json$", path)
         ]

@@ -13,6 +13,7 @@ from app.qualification_triggers import (
     CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS,
     _MAX_ERROR_REDRIVE_ATTEMPTS,
     _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+    _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
     _MAX_RUBRIC_REDRIVE_ATTEMPTS,
     _TRANSIENT_ERROR_CODES,
     explain_qualification_trigger,
@@ -936,3 +937,116 @@ class TestExplainNewStates:
     def test_deferred_unsynced_next_expected_is_sweep_retry(self):
         out = self._explain(status="deferred_unsynced")
         assert out["next_expected_trigger"] == "sweep_retry"
+
+
+# ---------------------------------------------------------------------------
+# promotion_failed attempt cap (T5)
+#
+# The promotion-failure circuit breaker lives on the re-driver
+# (_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS against the existing
+# last_qualification["promotion_failure_count"]).  The resolver has to agree
+# with it: a version past the cap is NOT armed, so every read surface that
+# renders the trigger truth reports "capped / operator only" instead of
+# claiming an autonomous re-drive that the re-driver will refuse to perform.
+# ---------------------------------------------------------------------------
+
+
+class TestPromotionFailureCap:
+    def test_below_cap_still_fires(self):
+        d = _resolve(
+            status="promotion_failed",
+            requalification_ready=True,
+            promotion_failure_count=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS - 1,
+        )
+        assert d.fire
+        assert d.trigger == "blockers_cleared"
+
+    def test_at_cap_does_not_fire(self):
+        d = _resolve(
+            status="promotion_failed",
+            requalification_ready=True,
+            promotion_failure_count=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+        )
+        assert not d.fire
+        assert d.trigger == "none"
+        assert d.reason == "promotion_failure_cap"
+
+    def test_cap_dominates_readiness(self):
+        """Past the cap the answer is the same whether or not blockers cleared."""
+        d = _resolve(
+            status="promotion_failed",
+            requalification_ready=False,
+            promotion_failure_count=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS + 4,
+        )
+        assert not d.fire
+        assert d.reason == "promotion_failure_cap"
+
+    def test_default_count_is_uncapped(self):
+        """Callers that do not supply the count keep the pre-change behaviour."""
+        d = _resolve(status="promotion_failed", requalification_ready=True)
+        assert d.fire
+        assert d.trigger == "blockers_cleared"
+
+
+class TestExplainPromotionFailureCap:
+    def _explain(self, **kwargs):
+        defaults = {
+            "phase": "stabilize",
+            "status": None,
+            "error_code": None,
+            "qualification_attempts": 0,
+            "error_redrive_count": 0,
+            "is_candidate_fully_met": True,
+            "requalification_ready": None,
+            "candidate_sha": None,
+            "automain_sha": None,
+            "automain_ci_state": None,
+            "blocker": None,
+            "in_flight": False,
+            "promotion_check_wait": False,
+            "last_attempt": None,
+            "knob": "on",
+            "evaluated_at": "2026-07-16T00:00:00",
+        }
+        defaults.update(kwargs)
+        return explain_qualification_trigger(**defaults)
+
+    def test_promotion_failed_armed_below_cap(self):
+        out = self._explain(
+            status="promotion_failed",
+            requalification_ready=True,
+            promotion_failure_count=0,
+        )
+        assert out["auto_trigger"] == "armed"
+        assert out["decision"]["trigger"] == "blockers_cleared"
+
+    def test_promotion_failed_capped_reads_as_capped(self):
+        out = self._explain(
+            status="promotion_failed",
+            requalification_ready=True,
+            promotion_failure_count=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+        )
+        assert out["auto_trigger"] == "capped"
+        assert out["decision"]["reason"] == "promotion_failure_cap"
+
+    def test_promotion_failed_capped_next_expected_is_operator(self):
+        out = self._explain(
+            status="promotion_failed",
+            requalification_ready=True,
+            promotion_failure_count=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+        )
+        assert out["next_expected_trigger"] == "operator_or_strategist_only"
+
+
+def test_resolver_cap_mirrors_the_redriver_cap():
+    """The resolver's mirror constant must equal the re-driver's own cap.
+
+    Two modules cannot each hold a private ceiling: the sweep would arm a
+    version the re-driver refuses (or refuse one it would drive) and the
+    operator read surface would disagree with what actually happens.
+    """
+    from app.release_qualifier_redrive import (
+        _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS as _redrive_cap,
+    )
+
+    assert _redrive_cap == _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS == 3
