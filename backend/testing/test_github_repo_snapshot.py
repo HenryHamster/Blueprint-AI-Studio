@@ -8,6 +8,7 @@ These tests pin both the call-count economics and the conservative tri-state
 degradation.
 """
 
+import asyncio
 import base64
 import io
 import tarfile
@@ -105,6 +106,124 @@ async def test_authoritative_exact_sha_read_uses_one_archive_without_quota_gate(
     ]
 
 
+@pytest.mark.asyncio
+async def test_authoritative_archive_bytes_reused_for_different_path_sets(mocker):
+    """One immutable archive serves independent extraction contracts."""
+    calls = _patch_requests(
+        mocker,
+        [
+            _FakeResponse(
+                200,
+                content=_tarball(
+                    **{"backend/app/x.py": "x\n", "caps.json": "{}\n"}
+                ),
+            )
+        ],
+    )
+
+    first = await authoritative_texts_at_commit(
+        {"backend/app/x.py"},
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=COMMIT_SHA,
+    )
+    strict = await authoritative_texts_at_commit(
+        {"caps.json", "missing.py"},
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=COMMIT_SHA,
+    )
+    second = await authoritative_texts_at_commit(
+        {"caps.json", "missing.py"},
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=COMMIT_SHA,
+        allow_missing_paths=True,
+    )
+
+    assert first == {"backend/app/x.py": "x\n"}
+    assert strict is None
+    assert second == {"caps.json": "{}\n"}
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_authoritative_archive_fetch_is_single_flight_per_exact_sha(mocker):
+    """Concurrent callers for one archive share the in-flight download."""
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+    response = _FakeResponse(
+        200, content=_tarball(**{"backend/app/x.py": "x\n"})
+    )
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        return response
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    first_task = asyncio.create_task(
+        authoritative_texts_at_commit(
+            {"backend/app/x.py"},
+            token="ghs_test",
+            owner="acme",
+            repo="widget",
+            commit_sha=COMMIT_SHA,
+        )
+    )
+    await started.wait()
+    second_task = asyncio.create_task(
+        authoritative_texts_at_commit(
+            {"backend/app/x.py"},
+            token="ghs_test",
+            owner="acme",
+            repo="widget",
+            commit_sha=COMMIT_SHA,
+        )
+    )
+    await asyncio.sleep(0)
+    assert len(calls) == 1
+    release.set()
+
+    assert await first_task == {"backend/app/x.py": "x\n"}
+    assert await second_task == {"backend/app/x.py": "x\n"}
+
+
+@pytest.mark.asyncio
+async def test_authoritative_archive_cache_is_scoped_to_repository_and_sha(mocker):
+    """Different immutable repositories or commits never share archive bytes."""
+    archive = _tarball(**{"backend/app/x.py": "x\n"})
+    calls = _patch_requests(
+        mocker,
+        [
+            _FakeResponse(200, content=archive),
+            _FakeResponse(200, content=archive),
+            _FakeResponse(200, content=archive),
+        ],
+    )
+
+    for repo, sha in (
+        ("widget", COMMIT_SHA),
+        ("other", COMMIT_SHA),
+        ("widget", "d" * 40),
+    ):
+        texts = await authoritative_texts_at_commit(
+            {"backend/app/x.py"},
+            token="ghs_test",
+            owner="acme",
+            repo=repo,
+            commit_sha=sha,
+        )
+        assert texts == {"backend/app/x.py": "x\n"}
+
+    assert len(calls) == 3
+
+
 @pytest.fixture(autouse=True)
 def _reset_snapshot_state():
     """Each test starts with cold caches and a healthy quota observation."""
@@ -112,7 +231,10 @@ def _reset_snapshot_state():
     snapshot._tree_cache.clear()
     snapshot._blob_cache.clear()
     snapshot._blob_cache_bytes = 0
+    snapshot._archive_cache.clear()
+    snapshot._archive_cache_bytes = 0
     snapshot._tree_fetch_locks.clear()
+    snapshot._archive_fetch_locks.clear()
     saved = dict(shared_state.github_quota)
     shared_state.github_quota.update(
         {"remaining": 4000, "limit": 5000, "reset_at": int(time.time()) + 1800}

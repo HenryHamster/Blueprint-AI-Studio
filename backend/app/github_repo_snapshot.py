@@ -65,6 +65,15 @@ _TREE_CACHE_MAX_ENTRIES = 8
 _BLOB_CACHE_MAX_BYTES = 24 * 1024 * 1024
 _BLOB_CACHE_MAX_ENTRIES = 512
 
+# Authoritative merge reads download the same immutable repository archive for
+# every preflight that examines a given commit. Cache the compressed response
+# bytes, not extracted text: callers request different path sets and may use
+# different ``allow_missing_paths`` contracts, so extraction must remain
+# request-local. Keep this cache deliberately small because one archive is
+# commonly ~20 MiB compressed.
+_ARCHIVE_CACHE_MAX_BYTES = 96 * 1024 * 1024
+_ARCHIVE_CACHE_MAX_ENTRIES = 4
+
 _branch_sha_cache: Dict[Tuple[str, str, str], Tuple[str, float]] = {}
 # (owner, repo, commit_sha) → (paths {path → blob_sha}, truncated)
 _tree_cache: "OrderedDict[Tuple[str, str, str], Tuple[Dict[str, str], bool]]" = (
@@ -72,8 +81,11 @@ _tree_cache: "OrderedDict[Tuple[str, str, str], Tuple[Dict[str, str], bool]]" = 
 )
 _blob_cache: "OrderedDict[str, str]" = OrderedDict()
 _blob_cache_bytes = 0
+_archive_cache: "OrderedDict[Tuple[str, str, str], bytes]" = OrderedDict()
+_archive_cache_bytes = 0
 # Single-flight: concurrent grounding passes share one tree fetch per branch.
 _tree_fetch_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
+_archive_fetch_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
 
 
 def _bump_cache_stat(key: str) -> None:
@@ -306,6 +318,32 @@ def _blob_cache_put(blob_sha: str, text: str) -> None:
         _blob_cache_bytes -= len(evicted)
 
 
+def _archive_cache_get(key: Tuple[str, str, str]) -> bytes | None:
+    archive = _archive_cache.get(key)
+    if archive is not None:
+        _archive_cache.move_to_end(key)
+        _bump_cache_stat("authoritative_archive")
+    return archive
+
+
+def _archive_cache_put(key: Tuple[str, str, str], archive: bytes) -> None:
+    global _archive_cache_bytes
+    size = len(archive)
+    if size > _ARCHIVE_CACHE_MAX_BYTES:
+        return
+    existing = _archive_cache.pop(key, None)
+    if existing is not None:
+        _archive_cache_bytes -= len(existing)
+    _archive_cache[key] = archive
+    _archive_cache_bytes += size
+    while _archive_cache and (
+        _archive_cache_bytes > _ARCHIVE_CACHE_MAX_BYTES
+        or len(_archive_cache) > _ARCHIVE_CACHE_MAX_ENTRIES
+    ):
+        _, evicted = _archive_cache.popitem(last=False)
+        _archive_cache_bytes -= len(evicted)
+
+
 async def _fetch_blob_text(
     token: str,
     owner: str,
@@ -373,21 +411,38 @@ async def authoritative_texts_at_commit(
     from app.github import _github_request
 
     url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{quote(commit_sha, safe='')}"
+    cache_key = (owner, repo, commit_sha)
     try:
-        response = await _github_request(
-            "GET",
-            url,
-            _headers(token),
-            max_retries=2,
-            project_id=project_id,
-            follow_redirects=True,
-        )
-        if response.status_code != 200:
+        archive_bytes = _archive_cache_get(cache_key)
+        if archive_bytes is None:
+            lock = _archive_fetch_locks.setdefault(cache_key, asyncio.Lock())
+            try:
+                async with lock:
+                    # Re-check after waiting: a concurrent preflight may have
+                    # populated the immutable archive while this caller waited.
+                    archive_bytes = _archive_cache_get(cache_key)
+                    if archive_bytes is None:
+                        response = await _github_request(
+                            "GET",
+                            url,
+                            _headers(token),
+                            max_retries=2,
+                            project_id=project_id,
+                            follow_redirects=True,
+                        )
+                        if response.status_code != 200:
+                            return None
+                        archive_bytes = response.content
+                        _archive_cache_put(cache_key, archive_bytes)
+            finally:
+                _archive_fetch_locks.pop(cache_key, None)
+
+        if archive_bytes is None:
             return None
 
         def _extract() -> dict[str, str] | None:
             try:
-                with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:*") as archive:
+                with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
                     texts: dict[str, str] = {}
                     for member in archive:
                         if not member.isfile():
