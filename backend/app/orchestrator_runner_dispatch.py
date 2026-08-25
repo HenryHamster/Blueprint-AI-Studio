@@ -239,6 +239,7 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_has_project_verification,
     _runner_max_concurrent_compute,
     _runner_meets_min_compute_capability,
+    _runner_python_runtime_incapable,
     _task_is_authoring,
     _task_requires_project_verification,
 )

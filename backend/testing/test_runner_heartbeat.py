@@ -1231,3 +1231,181 @@ async def test_post_update_silent_sweep_alerts_and_resolves(db_session, monkeypa
         for call in create_mock.await_args_list
     )
     assert resolve_mock.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_daemon_heartbeat_persists_python_runtime_report(db_session):
+    """The runner has always SENT this; pydantic extra='ignore' ate it.
+
+    The transport, not the verdict, was the defect: ``scripts/local_runner.py``
+    puts ``python_runtime_usable`` and ``python_runtime`` in every heartbeat
+    body, ``HeartbeatRequest`` declared neither, and a plain ``BaseModel``
+    discards undeclared keys silently — so ``runner.capabilities`` never learned
+    that a host cannot build a compute interpreter.
+    """
+    _project, runner = await _make_runner(db_session, capabilities={"task_types": "all"})
+
+    await heartbeat(
+        payload=HeartbeatRequest(
+            active_work_report=True,
+            python_runtime_usable=False,
+            python_runtime={
+                "usable": False,
+                "reason": "python3 -m venv failed and uv is not installed",
+                "interpreter": None,
+                "python_version": None,
+                "pip_version": None,
+                "provisioner": None,
+                "probed_at": "2026-08-24T12:00:00+00:00",
+            },
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert "python_runtime" in runner.capabilities, (
+        "the runner's compute-interpreter report was dropped at the heartbeat "
+        "boundary (undeclared on HeartbeatRequest, so pydantic's default "
+        "extra='ignore' discards it silently) or was never persisted"
+    )
+    report = runner.capabilities["python_runtime"]
+    assert report["usable"] is False
+    assert report["reason"] == "python3 -m venv failed and uv is not installed"
+    assert runner.capabilities["python_runtime_usable"] is False
+
+    # And the capable direction, so the gate cannot be satisfied by "always False".
+    await heartbeat(
+        payload=HeartbeatRequest(
+            active_work_report=True,
+            python_runtime_usable=True,
+            python_runtime={
+                "usable": True,
+                "reason": None,
+                "interpreter": "/opt/blueprint/compute-runtime/venv/bin/python",
+                "python_version": "3.11.9",
+                "pip_version": "24.0",
+                "provisioner": "venv",
+                "probed_at": "2026-08-24T12:05:00+00:00",
+            },
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["python_runtime"]["usable"] is True
+    assert runner.capabilities["python_runtime_usable"] is True
+    assert (
+        runner.capabilities["python_runtime"]["interpreter"]
+        == "/opt/blueprint/compute-runtime/venv/bin/python"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_python_runtime_report_is_not_authoritative(db_session):
+    """A ``--check`` probe must never mark a healthy host unfit.
+
+    ``--check`` calls ``_bootstrap_compute_runtime(provision=False)`` by design
+    ("this probe does not provision"), so an unprovisioned host reports
+    ``usable: False`` there while being perfectly able to build the runtime on
+    its next real boot. Persisting that verdict would make the host permanently
+    ineligible for imageless compute — so a non-daemon report neither writes nor
+    clears the last genuine daemon evidence.
+    """
+    good = {
+        "usable": True,
+        "reason": None,
+        "interpreter": "/opt/blueprint/compute-runtime/venv/bin/python",
+        "python_version": "3.11.9",
+        "pip_version": "24.0",
+        "provisioner": "venv",
+        "probed_at": "2026-08-24T12:00:00+00:00",
+    }
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": "all",
+            "python_runtime": good,
+            "python_runtime_usable": True,
+        },
+    )
+
+    await heartbeat(
+        payload=HeartbeatRequest(
+            active_work_report=False,
+            python_runtime_usable=False,
+            python_runtime={
+                "usable": False,
+                "reason": "not provisioned (/opt/blueprint/compute-runtime is absent)",
+            },
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["python_runtime"] == good
+    assert runner.capabilities["python_runtime_usable"] is True
+
+
+@pytest.mark.asyncio
+async def test_daemon_omission_clears_stale_python_runtime_report(db_session):
+    """A daemon that proves nothing must drop back to UNKNOWN, not inherit.
+
+    Fail-open on both axes: a stale positive cannot authorize work the current
+    process has not proven it can do, and a stale negative cannot keep excluding
+    a host that has since been fixed.
+    """
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": "all",
+            "python_runtime": {"usable": False, "reason": "no python3 on PATH"},
+            "python_runtime_usable": False,
+        },
+    )
+
+    await heartbeat(
+        payload=HeartbeatRequest(active_work_report=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert "python_runtime" not in runner.capabilities
+    assert "python_runtime_usable" not in runner.capabilities
+
+
+@pytest.mark.asyncio
+async def test_python_runtime_report_is_sanitized_before_jsonb(db_session):
+    """Runner-supplied, attacker-adjacent input landing in a JSONB column."""
+    _project, runner = await _make_runner(db_session, capabilities={"task_types": "all"})
+
+    await heartbeat(
+        payload=HeartbeatRequest(
+            active_work_report=True,
+            # The wire bool disagrees with the evidence, an unknown key rides
+            # along, the verdict is a non-bool, and the reason is enormous.
+            python_runtime_usable=True,
+            python_runtime={
+                "usable": "yes",
+                "reason": "x" * 5000,
+                "smuggled": {"deeply": ["nested", "payload"]},
+            },
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert "python_runtime" in runner.capabilities, (
+        "the report never reached capabilities; see "
+        "test_daemon_heartbeat_persists_python_runtime_report"
+    )
+    report = runner.capabilities["python_runtime"]
+    assert "smuggled" not in report
+    # Literal pin, not the constant it guards: asserting against
+    # _MAX_PYTHON_RUNTIME_FIELD_CHARS would certify whatever value a later edit
+    # picked, including no bound at all.
+    assert len(report["reason"]) == 300
+    # A non-bool verdict is UNKNOWN, never coerced to a decision either way.
+    assert report["usable"] is None
+    # The flat bool is derived from the sanitized evidence, so a crafted
+    # heartbeat cannot make telemetry disagree with what placement reads.
+    assert runner.capabilities["python_runtime_usable"] is False

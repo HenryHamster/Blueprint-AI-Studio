@@ -11193,6 +11193,58 @@ class TestDirectComputeExperimentDispatch:
         assert await _compute_job_for_task(db_session, task.id) is None
 
     @pytest.mark.asyncio
+    async def test_strict_pin_holds_when_runner_has_no_python_runtime(
+        self, db_session
+    ):
+        """A pin to a host that proved it cannot build an interpreter must SAY so.
+
+        The generic ``not_eligible`` would leave the operator unable to tell a
+        host misconfiguration from a scheduling one — and this hold is fixable
+        in one command on the runner (install python3-venv or uv).
+        """
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "python_runtime": {
+                    "usable": False,
+                    "reason": "python3 -m venv failed and uv is not installed",
+                },
+                "python_runtime_usable": False,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(runner.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "missing_python_runtime", (
+            f"expected 'missing_python_runtime', got {hold['reason_code']}"
+        )
+        # The runner's OWN words, not a generic restatement: that string is what
+        # tells the operator which package is missing.
+        assert "uv is not installed" in hold["detail"]
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
     async def test_launch_pins_arch_compatible_runner(self, db_session):
         """Sanity: an image floor MET by the runner's GPU arch dispatches normally —
         the gate is a no-op when the hardware is compatible."""

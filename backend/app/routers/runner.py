@@ -182,6 +182,12 @@ _PROJECT_VERIFICATION_VERSION = 1
 _MAX_PROJECT_VERIFICATION_REASON_CHARS = 500
 _PROJECT_VERIFICATION_BACKENDS = frozenset({"bwrap", "declined"})
 _PROJECT_VERIFICATION_BOUNDARY_CLASS = "agent"
+# Per-field bound for the runner's compute-interpreter capability report
+# (HeartbeatRequest.python_runtime). Its real values are a path, two version
+# strings, a provisioner name and one failure sentence, so 300 chars is far
+# beyond any legitimate value while bounding what a crafted heartbeat can
+# write into the capabilities JSONB column.
+_MAX_PYTHON_RUNTIME_FIELD_CHARS = 300
 # An idle runner normally completes its self-update within one or two 60s
 # retry cycles; an idle drain older than this means the update is failing
 # repeatedly (e.g. version hint unreachable from the branch the runner
@@ -329,6 +335,38 @@ def _sanitize_resource_capacity(raw: Any) -> dict | None:
             lambda value: _int(value, _MAX_RESOURCE_CAPACITY_BYTES),
         ),
         "gpu": _section("gpu", ("total", "reserved", "free"), lambda value: _int(value, _MAX_RESOURCE_CAPACITY_COUNT)),
+    }
+
+
+def _sanitize_python_runtime(raw: Any) -> dict | None:
+    """Normalize the runner's compute-interpreter capability report.
+
+    Untrusted runner input landing in the capabilities JSONB, so only the known
+    keys survive and every string is bounded.
+
+    ``usable`` is kept STRICTLY tri-state - ``True`` / ``False`` / ``None``.
+    ``None`` means "the runner sent a report whose verdict we cannot read", and
+    placement must treat that as UNKNOWN rather than as incapable: coercing an
+    unreadable report to False is how a capability gate starves a healthy fleet.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _text(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        trimmed = value.strip()[:_MAX_PYTHON_RUNTIME_FIELD_CHARS]
+        return trimmed or None
+
+    usable = raw.get("usable")
+    return {
+        "usable": usable if isinstance(usable, bool) else None,
+        "reason": _text(raw.get("reason")),
+        "interpreter": _text(raw.get("interpreter")),
+        "python_version": _text(raw.get("python_version")),
+        "pip_version": _text(raw.get("pip_version")),
+        "provisioner": _text(raw.get("provisioner")),
+        "probed_at": _text(raw.get("probed_at")),
     }
 
 
@@ -741,6 +779,20 @@ class HeartbeatRequest(BaseModel):
     # {"docker": {"verified": true, "mode": "cdi", "reason": "verified"}}.
     # Old runners omit it and remain heartbeat-compatible.
     container_gpu_passthrough: dict | None = None
+    # Whether this host can give a bwrap compute job a Python interpreter with a
+    # WORKING pip, plus the evidence behind that verdict. scripts/local_runner.py
+    # has been sending BOTH keys on every heartbeat and every --check; pydantic's
+    # default extra="ignore" dropped them here, so they never reached
+    # runner.capabilities and placement stayed blind to a host that fails every
+    # imageless compute job at provisioning time.
+    #
+    # Route on the NESTED report, never on the flat bool: the runner derives the
+    # bool as bool((report or {}).get("usable")), so a host whose boot-time
+    # provisioner thread has not published yet reports False while being
+    # perfectly capable. Only the nested object separates "probed and failed" (a
+    # dict carrying usable=False and a reason) from "not probed yet" (absent).
+    python_runtime_usable: StrictBool | None = None
+    python_runtime: dict | None = None
     agent_backend: str | None = None
     compute_backend: str | None = None
     # Versioned functional evidence for project-authoring verification. Kept raw
@@ -1955,6 +2007,30 @@ async def heartbeat(
         # image work that this daemon cannot prove it can execute. Non-report
         # preflights leave the last genuine daemon inventory untouched.
         caps.pop("container_gpu_passthrough", None)
+    # Compute-interpreter capability, persisted from GENUINE daemon heartbeats
+    # only. --check runs the probe with provision=False by design ("this probe
+    # does not provision"), so an unprovisioned host reports usable=False there
+    # while being perfectly able to build the runtime on its next real boot;
+    # writing that preflight verdict would make a healthy host permanently
+    # ineligible for imageless compute. A preflight therefore neither writes nor
+    # clears the last genuine daemon report.
+    #
+    # A daemon that sends no report (an older runner, or one whose boot-time
+    # provisioner has not published yet) CLEARS the keys rather than inheriting
+    # the previous process's verdict. That drops the runner back to "unknown",
+    # which is the fail-open side of this gate - and it also stops a stale
+    # positive from authorizing work the current process cannot prove it can do.
+    if payload.active_work_report:
+        sanitized_runtime = _sanitize_python_runtime(payload.python_runtime)
+        if sanitized_runtime is None:
+            caps.pop("python_runtime", None)
+            caps.pop("python_runtime_usable", None)
+        else:
+            caps["python_runtime"] = sanitized_runtime
+            # Derived from the sanitized report, never trusted from the wire:
+            # the flat bool is fleet-panel telemetry and must not be able to
+            # disagree with the evidence placement actually reads.
+            caps["python_runtime_usable"] = sanitized_runtime["usable"] is True
     if payload.llm_clis is not None:
         caps["llm_clis"] = payload.llm_clis
     if payload.agent_backend is not None:

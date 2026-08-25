@@ -978,6 +978,112 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
     assert legacy is not None and legacy.id == incapable.id
 
 
+def test_select_eligible_runner_excludes_proven_python_runtime_failure():
+    """An imageless compute job must not re-pin to a host with no interpreter.
+
+    Compute placement is PRE-PINNED via ``runner_target_id`` with a stable
+    per-task ``dispatch_seed``, and a job that self-fails never records a
+    DECLINE — so without this gate every budget-exempt retry of a
+    provisioning-failed job lands on the same incapable box forever.
+    """
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+    proven_unfit = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "python_runtime": {
+                "usable": False,
+                "reason": "python3 -m venv failed and uv is not installed",
+            },
+            "python_runtime_usable": False,
+        },
+    )
+    capable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "python_runtime": {"usable": True, "provisioner": "venv"},
+            "python_runtime_usable": True,
+        },
+    )
+
+    selected = _select_eligible_runner(
+        {project_id: [proven_unfit, capable]},
+        project_id,
+        "compute_experiment",
+        None,
+        {},
+    )
+    assert selected is not None and selected.id == capable.id
+
+    # Alone, the proven-unfit runner is no candidate at all: the job holds for
+    # a host that can actually provision, or falls through to cloud dispatch.
+    assert (
+        _select_eligible_runner(
+            {project_id: [proven_unfit]},
+            project_id,
+            "compute_experiment",
+            None,
+            {},
+        )
+        is None
+    )
+
+
+def test_python_runtime_gate_excludes_only_on_proof():
+    """Fail-OPEN by construction: only proof excludes, nothing else.
+
+    The runner computes the flat ``python_runtime_usable`` bool as
+    ``bool((report or {}).get("usable"))``, so a host whose boot-time
+    provisioner thread has not published yet advertises ``False`` while being
+    perfectly capable. A gate that read that bit would empty the candidate pool
+    of a healthy fleet every time it restarted.
+    """
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+
+    def _pick(caps, task_type="compute_experiment", **kwargs):
+        runner = RunnerDispatchSnapshot(
+            id=uuid.uuid4(), project_id=project_id, capabilities=caps
+        )
+        return _select_eligible_runner(
+            {project_id: [runner]}, project_id, task_type, None, {}, **kwargs
+        )
+
+    # Older runner: no evidence at all -> unknown -> eligible.
+    assert _pick({"task_types": "all"}) is not None
+    # Boot window: flat bit False, nested report not published yet -> eligible.
+    assert _pick({"task_types": "all", "python_runtime_usable": False}) is not None
+    # Unreadable verdict -> unknown, never coerced into an exclusion.
+    assert _pick({"task_types": "all", "python_runtime": {"usable": None}}) is not None
+    assert _pick({"task_types": "all", "python_runtime": "broken"}) is not None
+
+    # And the gate is scoped: the interpreter guarantee in local_runner.py runs
+    # only on the bwrap path, so a container-image job (which ships its own
+    # Python) and non-compute work are not gated by it at all.
+    unfit = {
+        "task_types": "all",
+        "isolation_backends": {"docker_usable": True},
+        "container_images_present": ["repo/img:tag"],
+        "disk_free_bytes": 500 * 1024**3,
+        "workspace_free_bytes": 500 * 1024**3,
+        "python_runtime": {"usable": False, "reason": "no python3 on PATH"},
+    }
+    assert _pick(unfit, container_image="repo/img:tag") is not None
+    assert _pick(unfit, task_type="create") is not None
+
+
 @pytest.mark.asyncio
 async def test_strict_pin_diagnosis_names_missing_project_verification(db_session):
     from app.orchestrator_runner_dispatch import (

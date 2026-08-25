@@ -827,6 +827,8 @@ Refresh the runner's `last_seen_at` and report its current load. Re-arms an inac
   "hostname": "my-machine",
   "version": "1.2.3",
   "isolation_backends": {"bwrap_ok": true, "docker_usable": true},
+  "python_runtime_usable": true,
+  "python_runtime": {"usable": true, "reason": null, "interpreter": "/opt/blueprint/compute-runtime/venv/bin/python", "python_version": "3.11.9", "pip_version": "24.0", "provisioner": "venv", "probed_at": "2026-08-24T12:00:00Z"},
   "agent_backend": "bwrap",
   "compute_backend": "docker",
   "has_gpu": false,
@@ -844,6 +846,10 @@ Refresh the runner's `last_seen_at` and report its current load. Re-arms an inac
 All fields except `active_task_ids` and `active_compute_job_ids` are optional — older runners omit them and continue heartbeating without change.
 
 `supported_agent_task_types` is a runner-declared capability floor. The orchestrator intersects it with the operator-configured `task_types` ceiling when dispatching. This field is distinct from operator config and never overwrites `task_types`.
+
+`python_runtime` reports whether this host can give an **imageless (bwrap) compute job** a Python interpreter with a working pip, and is persisted into `capabilities` only from genuine daemon heartbeats (`active_work_report: true`). A `--check` preflight probes without provisioning, so its verdict is not authoritative and neither writes nor clears the stored report. String fields are trimmed to 300 characters.
+
+Placement reads the NESTED report, not the flat `python_runtime_usable` bool: the runner derives that bool as `bool((report or {}).get("usable"))`, so a runner whose boot-time provisioner has not finished yet sends `false` while being perfectly capable. A runner is dropped from imageless `compute_experiment` candidates **only** when the nested report proves it unfit (`"usable": false`); absent or unreadable evidence means unknown and does not exclude.
 
 **Response:**
 ```json

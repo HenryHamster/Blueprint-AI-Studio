@@ -334,6 +334,37 @@ def _runner_chromium_usable(runner: LocalRunner | RunnerDispatchSnapshot) -> boo
     )
 
 
+def _runner_python_runtime_incapable(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> bool:
+    """True only when the runner PROVED it cannot build a compute interpreter.
+
+    Deliberately an EXCLUSION predicate rather than a capability one, and the
+    asymmetry is the point. An imageless (bwrap) compute job gets its Python
+    from the RUNNER — ``scripts/local_runner.py`` guarantees an interpreter with
+    a working pip only on that path, because a container image ships its own —
+    and the runner publishes the outcome of its own provisioning attempt. Only
+    that proof excludes a host:
+
+      * nested report absent          -> unknown      -> NOT excluded
+      * report present, usable True   -> capable      -> NOT excluded
+      * report present, usable None   -> unreadable   -> NOT excluded
+      * report present, usable False  -> PROVEN unfit -> excluded
+
+    The flat ``python_runtime_usable`` bool is intentionally NOT read. The
+    runner derives it as ``bool((report or {}).get("usable"))``, so a host whose
+    boot-time provisioner thread has not published yet reports ``False`` while
+    being perfectly capable. Gating on that bit would empty the candidate pool
+    of a healthy fleet at exactly the moment it restarts — the failure mode a
+    capability gate must never have.
+    """
+    caps = runner.capabilities or {}
+    report = caps.get("python_runtime")
+    if not isinstance(report, dict):
+        return False
+    return report.get("usable") is False
+
+
 # A card's marketing size overstates what nvidia-smi reports: driver/ECC
 # reserves shave 1–2% off the visible total (a "16 GB" V100-SXM2 reports
 # 16145 MiB, not 16384). vram_gb requirements are authored in marketing GB,
