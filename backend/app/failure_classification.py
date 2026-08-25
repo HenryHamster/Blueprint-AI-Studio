@@ -389,6 +389,28 @@ DEAD_AUTH = "DEAD_AUTH"
 # treated as CODE_ERROR, PR_REJECTED, or direction-health damage.
 APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
 
+# A rollup PR merged (or was about to merge) while a constituent child PR's
+# ENTIRE verified deliverable had been erased from the rollup branch by a
+# conflict-fix intervention. This is a PLATFORM defect, not a work defect: the
+# child did the work, its PR was reviewed and merged into the staging branch,
+# and the pipeline's own conflict resolution discarded it (the rollup
+# conflict-fix prompt tells the agent the target branch is the source of truth
+# and to keep only "changes that serve the rollup goal" — a 500-char blurb that
+# names none of the children's files). Charging this to CODE_ERROR burns the
+# retry budget, spawns a pointless diagnosis task, and penalises the direction's
+# health for damage the engine inflicted on itself. Production case 2026-08-24:
+# rollup PR #17804 dropped 12/12 files of child PR #17707 and research task
+# 78ad7812 was FAILED as CODE_ERROR.
+#
+# Deliberately in INFRA_ANALYTICS_CLASSES (analytics/erosion bucket) but NOT in
+# INFRA_CLASSES — same reasoning as UNPLACEABLE_EXECUTION_SITE: the
+# reaper_infra_recovery Step 5 resurrection sweep flips INFRA_CLASSES members
+# back to QUEUED, and a blind requeue of a rollup parent whose PR already merged
+# would re-drive rollup creation without the dropped work being restored. The
+# targeted recovery is the pre-merge hold + restore fix in
+# ``app.rollup_deliverable_guard``, not a generic resurrection.
+ROLLUP_DELIVERABLE_DROPPED = "ROLLUP_DELIVERABLE_DROPPED"
+
 # A compute_experiment declared a kind=metric success_criterion but produced NO
 # numeric value for that metric (the experiment ran, yet the hypothesis was never
 # measured). Written by ``task_completion._handle_compute_experiment_completion``
@@ -939,6 +961,10 @@ INFRA_CLASSES: frozenset[str] = frozenset(
 # transient-retry semantics must keep using INFRA_CLASSES.
 INFRA_ANALYTICS_CLASSES: frozenset[str] = INFRA_CLASSES | {
     UNPLACEABLE_EXECUTION_SITE,
+    # Conflict resolution destroyed a landed child deliverable — a platform
+    # defect, so it must not depress direction health / erosion scoring.  Kept
+    # OUT of INFRA_CLASSES for the same resurrection reason as the entry above.
+    ROLLUP_DELIVERABLE_DROPPED,
 }
 
 # ── Infra-resurrection eligibility: ONE predicate, two call sites ────────────
@@ -1076,6 +1102,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     APPROVED_CAP_PR_CLOSED,
     ADMIN_CANCEL,
     UNPLACEABLE_EXECUTION_SITE,
+    ROLLUP_DELIVERABLE_DROPPED,
 )
 
 

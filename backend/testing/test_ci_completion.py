@@ -8987,7 +8987,11 @@ async def test_rollup_dropped_child_deliverable_blocks_ghost_success(
     assert dropped[0]["pr_number"] == 555
     assert "backend/app/dropped_feature.py" in dropped[0]["missing_files"]
     assert "PR #555" in ctx.get("rollup_dropped_deliverables_reason", "")
-    assert ctx.get("failure_category") == "CODE_ERROR"
+    # NOT ``CODE_ERROR``. The rollup parent's own agent wrote no defective code:
+    # the pipeline's conflict resolution destroyed a merged child's deliverable.
+    # Filing it as an agent code defect sends the whole incident to the wrong
+    # queue and hides a platform-defect class in the agent-quality numbers.
+    assert ctx.get("failure_category") == "ROLLUP_DELIVERABLE_DROPPED"
     alert_mock.assert_awaited()
 
 

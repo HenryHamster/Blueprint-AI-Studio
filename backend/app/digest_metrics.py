@@ -122,6 +122,7 @@ from app.failure_classification import (
     AGENT_STALLED,
     AGENT_TIMEOUT,
     APPROVED_CAP_PR_CLOSED,
+    ROLLUP_DELIVERABLE_DROPPED,
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
     REPO_UNINITIALIZED,
@@ -181,6 +182,10 @@ _FAILURE_CLASS_LABELS = {
     APPROVED_CAP_PR_CLOSED: "Approved Cap PR Closed — fix-loop cap hit post-approval",
     ADMIN_CANCEL: "Admin Cancel",
     UNPLACEABLE_EXECUTION_SITE: "Unplaceable — declared execution site has no dispatch path",
+    ROLLUP_DELIVERABLE_DROPPED: (
+        "Rollup deliverable dropped — conflict resolution erased a merged "
+        "child PR's work"
+    ),
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5

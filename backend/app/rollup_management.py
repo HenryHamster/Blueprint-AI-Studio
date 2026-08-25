@@ -5878,6 +5878,20 @@ async def _check_and_trigger_rollup(
                                 f"4. Otherwise resolve conflicts and git push --force-with-lease."
                             )
                         else:
+                            # A rollup's payload IS the union of its children's
+                            # already-reviewed, already-merged deliverables, and
+                            # `parent_goal` is a <=500-char blurb naming none of
+                            # their files. The old step 3 said "{target} is the
+                            # source of truth; re-apply only the changes that
+                            # serve the rollup goal" — under which every
+                            # unexplained child file is deletable. That is what
+                            # erased 12/12 files of child PR #17707 from rollup
+                            # PR #17804 (2026-08-24). Structure vs content are
+                            # now split, and a self-check names the failure.
+                            from app.rollup_deliverable_guard import (
+                                build_must_preserve_prompt_block,
+                            )
+
                             fix_prompt = (
                                 f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
                                 f"Error: {merge_msg}\n\n"
@@ -5886,10 +5900,17 @@ async def _check_and_trigger_rollup(
                                 f"Steps to resolve:\n"
                                 f"1. Run: git fetch origin {target_branch}\n"
                                 f"2. Run: git rebase origin/{target_branch}\n"
-                                f"3. Resolve any conflicts — {target_branch} is the source of truth. Keep its refactors and restructuring.\n"
-                                f"   Re-apply only the changes that serve the rollup goal (described above) on top of {target_branch}'s current state.\n"
-                                f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
-                                f"4. Run: git rebase --continue after resolving each file"
+                                f"3. Resolve conflicts by COMBINING both sides. {target_branch} is authoritative for\n"
+                                f"   STRUCTURE (refactors, moves, renames) — adapt this branch's changes to it.\n"
+                                f"   This rollup branch is authoritative for CONTENT: it carries several child PRs\n"
+                                f"   that were each reviewed and merged, and the one-line rollup goal above does not\n"
+                                f"   name their files. NEVER delete a change just because the goal does not explain\n"
+                                f"   it, and never resolve a file to {target_branch}'s version wholesale.\n"
+                                f"4. Run: git rebase --continue after resolving each file\n"
+                                f"5. Before pushing, run: git diff --name-only origin/{target_branch}...HEAD\n"
+                                f"   Every file listed above must still appear. One that vanished means your\n"
+                                f"   resolution reverted a child's work — restore it before you push."
+                                f"{build_must_preserve_prompt_block(parent)}"
                                 f"{migration_guidance}"
                             )
                         fix_task, _ = await _spawn_pipeline_task(
