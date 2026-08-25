@@ -276,6 +276,64 @@ def test_merge_keeps_plateau_when_an_observation_is_inside_diagnostic_gap(
     assert json.loads(output.read_text(encoding="utf-8")) == plateau
 
 
+def _fresh_setup_plateau() -> dict[str, float]:
+    """A freshly observed setup-attribution plateau, sized to the detector.
+
+    Exactly IN_BAND_SETUP_MIN_COUNT entries inside the 12-15s band, plus the
+    real first post-gap measurement so the fresh observations carry their own
+    evidence that the diagnostic gap is empty.
+    """
+    plateau = {
+        f"testing/test_live.py::test_{index}": 12.0 + index / 1000
+        for index in range(100)
+    }
+    plateau["testing/test_live.py::test_post_gap"] = 27.43031809399872
+    return plateau
+
+
+def test_merge_drops_a_fresh_plateau_a_baseline_gap_sample_would_have_vouched_for(
+    tmp_path: Path,
+) -> None:
+    """Fresh observations are judged on their own evidence, not the baseline's.
+
+    The baseline holds a 22.0s measurement, which sits inside the diagnostic
+    gap. Swept over baseline-and-fresh together that historical sample makes
+    the freshly recorded plateau look legitimate, and the merge persists 100
+    setup artifacts as the new baseline, where nothing can tell them from real
+    measurements afterwards.
+    """
+    _write_test_file(tmp_path)
+    output = tmp_path / ".test_durations"
+    _write_json(output, {"testing/test_live.py::test_untouched": 22.0})
+    _write_json(
+        tmp_path / "partials" / "worker-1" / "durations.json", _fresh_setup_plateau()
+    )
+
+    assert merge_durations.merge(str(tmp_path / "partials"), str(output)) == 2
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "testing/test_live.py::test_untouched": 22.0,
+        "testing/test_live.py::test_post_gap": 27.43031809399872,
+    }
+
+
+def test_merge_keeps_a_fresh_plateau_when_the_fresh_data_fills_the_gap(
+    tmp_path: Path,
+) -> None:
+    """Judging fresh data alone must stay as conservative as the merged sweep."""
+    _write_test_file(tmp_path)
+    output = tmp_path / ".test_durations"
+    _write_json(output, {"testing/test_live.py::test_untouched": 22.0})
+    partial = _fresh_setup_plateau()
+    partial["testing/test_live.py::test_post_gap"] = 20.0
+    _write_json(tmp_path / "partials" / "worker-1" / "durations.json", partial)
+
+    assert merge_durations.merge(str(tmp_path / "partials"), str(output)) == 102
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "testing/test_live.py::test_untouched": 22.0,
+        **partial,
+    }
+
+
 def test_merge_drops_entries_from_an_unparseable_test_module(tmp_path: Path) -> None:
     """Unreadable identities fail closed rather than preserving stale durations."""
     test_file = tmp_path / "testing" / "test_broken.py"
@@ -315,6 +373,25 @@ def test_regenerate_write_merged_preserves_baseline_and_filters_outliers(
         "testing/test_live.py::test_new": 3.5,
         "testing/test_live.py::test_remeasured": 2.5,
         "testing/test_live.py::test_untouched": 1.25,
+    }
+
+
+def test_regenerate_write_merged_drops_a_fresh_plateau_the_baseline_would_vouch_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch regenerator must reject a fresh plateau on the same evidence."""
+    _write_test_file(tmp_path)
+    _write_json(
+        tmp_path / ".test_durations", {"testing/test_live.py::test_untouched": 22.0}
+    )
+    _write_json(tmp_path / ".durations_partial_1.json", _fresh_setup_plateau())
+    regenerate = _load_regenerate_module()
+    monkeypatch.chdir(tmp_path)
+
+    assert regenerate.write_merged() == 2
+    assert json.loads((tmp_path / ".test_durations").read_text(encoding="utf-8")) == {
+        "testing/test_live.py::test_untouched": 22.0,
+        "testing/test_live.py::test_post_gap": 27.43031809399872,
     }
 
 

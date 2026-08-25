@@ -19,7 +19,11 @@ from durations_quality import (
     in_band_setup_artifacts,
     quality_ok,
 )
-from merge_durations import filter_current_entries, load_duration_baseline
+from merge_durations import (
+    filter_current_entries,
+    load_duration_baseline,
+    sanitize_fresh_entries,
+)
 from utf8_io import force_utf8_streams
 
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
@@ -111,6 +115,11 @@ def write_merged():
             outlier_count += 1
             del merged[k]
 
+    # Fresh partial observations accumulate separately: the setup-plateau
+    # sanitizer must judge them on their own evidence, because a historical
+    # in-gap observation in the baseline would otherwise vouch for a freshly
+    # recorded plateau and persist it as the new baseline.
+    fresh: dict = {}
     for p in sorted(glob.glob(".durations_partial_*.json")):
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
@@ -119,7 +128,15 @@ def write_merged():
             if v > OUTLIER_CAP:
                 outlier_count += 1
             else:
-                merged[k] = v
+                fresh[k] = v
+
+    fresh, fresh_band_artifacts = sanitize_fresh_entries(fresh)
+    if fresh_band_artifacts:
+        print(
+            f"  Dropped {len(fresh_band_artifacts)} in-band setup artifacts from the "
+            "fresh observations (fixture-setup misattribution)"
+        )
+    merged.update(fresh)
 
     if not merged:
         print("  No partial data to merge")

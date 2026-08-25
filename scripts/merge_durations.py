@@ -68,6 +68,24 @@ def load_duration_baseline(path: str) -> dict:
     return filter_current_entries(data, os.path.dirname(os.path.abspath(path)))
 
 
+def sanitize_fresh_entries(fresh: dict) -> tuple[dict, set[str]]:
+    """Return the fresh observations with their own setup plateau removed.
+
+    The baseline is deliberately kept out of this decision. Sweeping
+    baseline-and-fresh together lets a historical observation inside the
+    diagnostic gap vouch for a freshly recorded plateau, and the artifacts are
+    then persisted as the new baseline -- where they are indistinguishable from
+    real measurements. The fresh entries are the only ones a merge can still
+    reject, so they are judged on their own evidence first. Callers still sweep
+    the merged view afterwards, which is what strips a plateau that is already
+    sitting in the baseline.
+    """
+    band_artifacts = in_band_setup_artifacts(fresh)
+    return {
+        key: value for key, value in fresh.items() if key not in band_artifacts
+    }, band_artifacts
+
+
 def merge(src_dir: str, output_path: str) -> int:
     """Merge all *.json files from src_dir into output_path; return entry count."""
     root = os.path.dirname(os.path.abspath(output_path))
@@ -80,19 +98,32 @@ def merge(src_dir: str, output_path: str) -> int:
         else:
             merged[k] = v
 
+    # Fresh partial observations accumulate separately so the setup-plateau
+    # sanitizer can judge them without the baseline vouching for them; `added`
+    # still counts entries that are new to the baseline-and-partials view.
+    fresh: dict = {}
     for path in sorted(glob.glob(os.path.join(src_dir, "*/*.json"))):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         data = filter_current_entries(data, root)
-        pre = len(merged)
+        pre = len(merged.keys() | fresh.keys())
         for k, v in data.items():
             if v > OUTLIER_CAP:
                 outlier_count += 1
                 print(f"  SKIP outlier {v:.1f}s: {k}")
             else:
-                merged[k] = v
-        added = len(merged) - pre
+                fresh[k] = v
+        added = len(merged.keys() | fresh.keys()) - pre
         print(f"  {os.path.relpath(path, src_dir)}: {len(data)} entries ({added} new)")
+
+    fresh, fresh_band_artifacts = sanitize_fresh_entries(fresh)
+    if fresh_band_artifacts:
+        print(
+            f"  Dropped {len(fresh_band_artifacts)} in-band setup artifacts from the "
+            f"fresh observations ({IN_BAND_SETUP_MIN:g}-{IN_BAND_SETUP_MAX:g}s plateau; "
+            f"no observations through {IN_BAND_SETUP_GAP_MAX:g}s)"
+        )
+    merged.update(fresh)
 
     band_artifacts = in_band_setup_artifacts(merged)
     for key in band_artifacts:
