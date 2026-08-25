@@ -45,12 +45,33 @@ Contract
   and surface-glob drift sentinels last. This is what lets the merge gate's
   ``--limit``-style cap keep the tests most likely to catch a contract break.
   Empty set -> no output, exit 0. Optional ``--limit N`` truncates to the first
-  N (most relevant); the overflow is reported to STDERR as
-  ``deferred-unverified:`` lines (never silently dropped).
+  N (most relevant); the overflow is reported to STDERR as ``deferred-rank:``
+  lines (never silently dropped).
 * ``--mandatory-output PATH`` writes the matched surface sentinels to a
   separate newline-delimited file while ``--limit`` applies only to ordinary
   selectors. This is the merge-gate protocol: mandatory sentinels are carried
   past the ordinary cap, and the output file is written fail-closed.
+* ``--budget-seconds N`` additionally caps the ordinary set by SUMMED MEASURED
+  COST, read from ``backend/.test_durations`` (override with ``--durations``).
+  A count cap alone cannot bound runtime: the eight heaviest files in the
+  committed estate sum to ~42 minutes, so an eight-selector gate can exceed any
+  timeout it is given and be cascade-killed while perfectly healthy. Selection
+  walks in relevance order, SKIPPING (not stopping at) an entry that does not
+  fit, so one expensive high-rank file cannot starve the cheaper files behind
+  it. Mandatory sentinels are charged against the budget but never dropped. The
+  most relevant entry is kept even when it alone exceeds the budget — selecting
+  nothing is the one outcome a merge gate must never produce — so the true
+  bound is ``budget + cost of the single heaviest selected file``. Budgeting is
+  fail-open: with no usable measurements it does not apply and says so on
+  STDERR, because "requested and skipped" and "applied and dropped nothing"
+  are otherwise indistinguishable on STDOUT. Its overflow is reported as
+  ``deferred-budget:`` — a DIFFERENT token from the rank cap's on purpose. The
+  two classes read alike and matter very differently: a ``deferred-rank:``
+  entry is the long tail the protocol deliberately does not run (hundreds of
+  files for a core module), while a ``deferred-budget:`` entry was ranked in
+  as relevant and dropped only for time. Conflating them buries the handful
+  that deserve attention under the tail that never did. Anything matching
+  ``deferred-`` was not run here.
 * Robust on partial trees: any listed path absent on disk is skipped (deletions),
   and the reverse-dep scan is skipped gracefully when ``backend/testing`` is
   absent.
@@ -596,6 +617,87 @@ def resolve_impacted_partition(
     return ordinary, mandatory
 
 
+def load_test_file_costs(durations_path: str) -> "dict[str, float]":
+    """Return ``{repo-relative test file: measured seconds}``.
+
+    Reads a pytest-split ``.test_durations`` file, whose keys are node ids
+    relative to the pytest rootdir (``backend/``) — ``testing/test_x.py::test_y``
+    — and sums each file's nodes.
+
+    FAIL-OPEN, deliberately. A missing, unreadable or malformed durations file
+    yields ``{}``, and ``apply_cost_budget`` then declines to budget at all. The
+    alternative — treating "no measurements" as "everything is free" or
+    "everything costs the maximum" — would either not bound the gate or select
+    nothing, and selecting nothing is the vacuous-guard failure this module
+    exists to avoid.
+    """
+    try:
+        with open(durations_path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    costs: "dict[str, float]" = {}
+    for node_id, seconds in raw.items():
+        if not isinstance(node_id, str):
+            continue
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError):
+            continue
+        rel = "backend/" + node_id.split("::", 1)[0]
+        costs[rel] = costs.get(rel, 0.0) + value
+    return costs
+
+
+def apply_cost_budget(
+    ordinary,
+    costs: "dict[str, float]",
+    budget_seconds,
+    reserved_seconds: float = 0.0,
+) -> "tuple[list[str], list[str], float]":
+    """Return ``(kept, deferred, kept_seconds)`` for a wall-clock budget.
+
+    Why this exists at all: a selector-COUNT cap cannot bound runtime. Measured
+    against the committed estate, the eight heaviest test files sum to ~42
+    minutes — above any budget a merge gate can be given. The gate's own
+    timeout would then fire on healthy work and the surrounding task would be
+    cascade-killed by the CI backstop. That is the harness-budget-inversion
+    class, and a count cap walks straight into it.
+
+    Items are taken in relevance order while budget remains, and one that does
+    not fit is SKIPPED rather than terminating the walk, so a single expensive
+    high-rank file cannot starve every cheaper file behind it.
+
+    A file with no measurement is charged the mean of the measured files rather
+    than zero: an unmeasured file is usually a NEW one, and charging it nothing
+    would let an unbounded number of them past the budget.
+    """
+    ordinary = list(ordinary)
+    if not costs or not budget_seconds or budget_seconds <= 0:
+        return ordinary, [], 0.0
+
+    unknown_cost = sum(costs.values()) / len(costs)
+    remaining = float(budget_seconds) - reserved_seconds
+    kept: "list[str]" = []
+    deferred: "list[str]" = []
+    spent = 0.0
+    for rel in ordinary:
+        cost = costs.get(rel, unknown_cost)
+        if kept and cost > remaining:
+            deferred.append(rel)
+            continue
+        # The first selector is kept even if it alone exceeds the budget:
+        # running the single most relevant test slowly beats running no test at
+        # all, and a gate that can select nothing is exactly the failure mode
+        # this module is built to prevent.
+        kept.append(rel)
+        remaining -= cost
+        spent += cost
+    return kept, deferred, spent
+
+
 def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
     """Return sorted, deduplicated first-party mock.patch() string targets from tests.
 
@@ -792,10 +894,32 @@ def main(argv=None) -> int:
         default=None,
         help="repo root used to resolve on-disk paths (default: inferred)",
     )
+    parser.add_argument(
+        "--budget-seconds",
+        dest="budget_seconds",
+        type=float,
+        default=None,
+        help=(
+            "cap the emitted set by SUMMED MEASURED COST as well as by count; "
+            "overflow is logged to STDERR (never dropped). A count cap alone "
+            "cannot bound runtime -- the eight heaviest files in the estate "
+            "are ~42 minutes"
+        ),
+    )
+    parser.add_argument(
+        "--durations",
+        dest="durations",
+        default=None,
+        help=(
+            "pytest-split durations file backing --budget-seconds "
+            "(default: <repo-root>/backend/.test_durations)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     repo_root = args.repo_root if args.repo_root is not None else _DEFAULT_REPO_ROOT
     changed = _read_changed(args.paths, sys.stdin)
+    mandatory: "list[str]" = []
     if args.mandatory_output is not None:
         ordinary, mandatory = resolve_impacted_partition(changed, repo_root)
         try:
@@ -818,7 +942,49 @@ def main(argv=None) -> int:
         overflow = impacted[args.limit :]
         impacted = impacted[: args.limit]
         for rel in overflow:
-            print(f"deferred-unverified: {rel}", file=sys.stderr)
+            print(f"deferred-rank: {rel}", file=sys.stderr)
+        # A count for consumers that summarise rather than list. A change to a
+        # core module puts HUNDREDS of files in this tail, so a reader needs the
+        # magnitude without the roll.
+        print(
+            f"rank-cap: {len(overflow)} impacted file(s) beyond --limit "
+            f"{args.limit} deferred",
+            file=sys.stderr,
+        )
+
+    if args.budget_seconds is not None:
+        durations_path = args.durations or os.path.join(
+            repo_root, "backend", ".test_durations"
+        )
+        costs = load_test_file_costs(durations_path)
+        if not costs:
+            # Say so. "Budgeting was requested and did not happen" and
+            # "budgeting happened and nothing was dropped" produce identical
+            # STDOUT, and a caller that sized its timeout around the budget
+            # needs to know which one it got.
+            print(
+                "budget: no usable measurements in "
+                f"{durations_path} — cost budget NOT applied",
+                file=sys.stderr,
+            )
+        else:
+            # Mandatory sentinels are never dropped (they are the surface-drift
+            # contract, and they are cheap -- ~6s for a typical match), but
+            # they do consume wall clock, so charge them against the budget
+            # rather than pretending the gate is only as slow as its ordinary
+            # selectors.
+            reserved = sum(costs.get(rel, 0.0) for rel in mandatory)
+            impacted, budget_overflow, spent = apply_cost_budget(
+                impacted, costs, args.budget_seconds, reserved
+            )
+            for rel in budget_overflow:
+                print(f"deferred-budget: {rel}", file=sys.stderr)
+            print(
+                f"budget: {spent + reserved:.0f}s of {args.budget_seconds:.0f}s "
+                f"({len(impacted)} ordinary + {len(mandatory)} mandatory, "
+                f"{len(budget_overflow)} deferred)",
+                file=sys.stderr,
+            )
 
     for rel in impacted:
         print(rel)

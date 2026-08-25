@@ -656,7 +656,10 @@ def test_main_limit_defers_overflow_to_stderr(tmp_path, capsys):
         "backend/testing/test_mod0.py",
         "backend/testing/test_mod1.py",
     ]
-    assert stderr == ["deferred-unverified: backend/testing/test_mod2.py"]
+    assert stderr == [
+        "deferred-rank: backend/testing/test_mod2.py",
+        "rank-cap: 1 impacted file(s) beyond --limit 2 deferred",
+    ]
 
 
 def test_capped_impacted_selection_retains_surface_sentinels(tmp_path, capsys):
@@ -710,8 +713,8 @@ def test_capped_impacted_selection_retains_surface_sentinels(tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out.splitlines() == ordinary[:8]
     assert captured.err.splitlines() == [
-        f"deferred-unverified: {path}" for path in ordinary[8:]
-    ]
+        f"deferred-rank: {path}" for path in ordinary[8:]
+    ] + [f"rank-cap: {len(ordinary) - 8} impacted file(s) beyond --limit 8 deferred"]
     with open(mandatory_output, encoding="utf-8") as fh:
         assert fh.read().splitlines() == mandatory
 
@@ -1168,3 +1171,261 @@ def test_create_true_prefilter_does_not_backtrack_on_adversarial_input():
         f"prefilter took {elapsed_seconds}s on a 40KB non-matching input; the "
         "token gap has lost its atomic group and is backtracking."
     )
+
+
+# ---------------------------------------------------------------------------
+# Cost budgeting.
+#
+# A selector COUNT cap cannot bound this gate's wall time, and that is measured
+# rather than assumed: costed against the committed backend/.test_durations,
+# the eight heaviest backend test files sum to ~42.6 minutes, so an eight-file
+# selection can outlast any timeout it is given and be cascade-killed while
+# perfectly healthy -- the harness-budget-inversion class. These cover the
+# duration budget that actually bounds it.
+# ---------------------------------------------------------------------------
+
+
+def _write_durations(root, mapping):
+    path = os.path.join(root, "durations.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(mapping, fh)
+    return path
+
+
+def test_load_test_file_costs_sums_node_ids_into_repo_relative_files(tmp_path):
+    path = _write_durations(
+        str(tmp_path),
+        {
+            "testing/test_a.py::test_one": 1.5,
+            "testing/test_a.py::test_two": 2.5,
+            "testing/test_b.py::test_only": 4.0,
+        },
+    )
+    costs = impacted_tests.load_test_file_costs(path)
+    # Per-node measurements roll up per FILE, because selection is per file.
+    assert costs == {
+        "backend/testing/test_a.py": 4.0,
+        "backend/testing/test_b.py": 4.0,
+    }
+
+
+def test_load_test_file_costs_is_fail_open_on_unusable_input(tmp_path):
+    missing = os.path.join(str(tmp_path), "nope.json")
+    assert impacted_tests.load_test_file_costs(missing) == {}
+
+    not_a_mapping = os.path.join(str(tmp_path), "list.json")
+    with open(not_a_mapping, "w", encoding="utf-8") as fh:
+        json.dump(["testing/test_a.py::test_one"], fh)
+    assert impacted_tests.load_test_file_costs(not_a_mapping) == {}
+
+    malformed = os.path.join(str(tmp_path), "bad.json")
+    with open(malformed, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    assert impacted_tests.load_test_file_costs(malformed) == {}
+
+    # A single unusable VALUE is skipped without discarding the usable rows.
+    mixed = _write_durations(
+        str(tmp_path),
+        {"testing/test_a.py::test_one": "slow", "testing/test_b.py::test_x": 3.0},
+    )
+    assert impacted_tests.load_test_file_costs(mixed) == {
+        "backend/testing/test_b.py": 3.0
+    }
+
+
+def test_apply_cost_budget_skips_rather_than_stops_at_an_oversized_entry():
+    ordinary = ["a", "big", "b", "c"]
+    costs = {"a": 10.0, "big": 500.0, "b": 10.0, "c": 10.0}
+    kept, deferred, spent = impacted_tests.apply_cost_budget(ordinary, costs, 100.0)
+    # Walking must CONTINUE past an entry that does not fit: one expensive
+    # high-rank file must not starve every cheaper file ranked behind it.
+    assert kept == ["a", "b", "c"]
+    assert deferred == ["big"]
+    assert spent == 30.0
+
+
+def test_apply_cost_budget_keeps_the_top_entry_even_when_it_alone_overruns():
+    kept, deferred, spent = impacted_tests.apply_cost_budget(
+        ["heaviest", "cheap"], {"heaviest": 900.0, "cheap": 1.0}, 600.0
+    )
+    # Selecting NOTHING is the one outcome a merge gate must never produce, so
+    # the most relevant entry is exempt. This is why the honest bound is
+    # `budget + cost of the single heaviest selected file`, not `budget`.
+    assert kept == ["heaviest"]
+    assert deferred == ["cheap"]
+    assert spent == 900.0
+
+
+def test_apply_cost_budget_charges_mandatory_sentinels_against_the_budget():
+    ordinary = ["a", "b"]
+    costs = {"a": 60.0, "b": 60.0}
+    unreserved, _, _ = impacted_tests.apply_cost_budget(ordinary, costs, 100.0)
+    assert unreserved == ["a"]
+    kept, deferred, _ = impacted_tests.apply_cost_budget(
+        ordinary, costs, 100.0, reserved_seconds=90.0
+    )
+    # Mandatory sentinels are never dropped, but they do burn wall clock; a
+    # budget that ignored them would understate the gate's real runtime.
+    assert kept == ["a"]
+    assert deferred == ["b"]
+
+
+def test_apply_cost_budget_declines_when_it_cannot_measure():
+    ordinary = ["a", "b", "c"]
+    # No measurements, and a zero/absent budget: fail OPEN in both cases.
+    # Dropping coverage because a data file was missing would be the vacuous
+    # -guard shape this module exists to avoid.
+    assert impacted_tests.apply_cost_budget(ordinary, {}, 1.0) == (ordinary, [], 0.0)
+    assert impacted_tests.apply_cost_budget(ordinary, {"a": 1.0}, 0) == (
+        ordinary,
+        [],
+        0.0,
+    )
+    assert impacted_tests.apply_cost_budget(ordinary, {"a": 1.0}, None) == (
+        ordinary,
+        [],
+        0.0,
+    )
+
+
+def test_main_budget_defers_under_a_distinct_token_from_the_rank_cap(tmp_path, capsys):
+    root = str(tmp_path)
+    _make_tree(root)
+    for index in range(4):
+        _write(
+            root,
+            f"backend/testing/test_mod{index}.py",
+            "from app.foo import bar\n",
+        )
+    durations = _write_durations(
+        root,
+        {
+            "testing/test_mod0.py::t": 10.0,
+            "testing/test_mod1.py::t": 10.0,
+            "testing/test_mod2.py::t": 500.0,
+            "testing/test_mod3.py::t": 10.0,
+        },
+    )
+    rc = impacted_tests.main(
+        [
+            "backend/app/foo.py",
+            "--limit",
+            "3",
+            "--budget-seconds",
+            "100",
+            "--durations",
+            durations,
+            "--repo-root",
+            root,
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "backend/testing/test_mod0.py",
+        "backend/testing/test_mod1.py",
+    ]
+    # The two deferral classes carry DIFFERENT tokens on purpose. A rank
+    # deferral is the long tail the protocol deliberately declines to run (for
+    # a core module that is hundreds of files); a budget deferral was ranked in
+    # as relevant and dropped only for wall clock. Reported alike, the handful
+    # that deserve attention are buried under the tail that never did.
+    assert captured.err.splitlines() == [
+        "deferred-rank: backend/testing/test_mod3.py",
+        "rank-cap: 1 impacted file(s) beyond --limit 3 deferred",
+        "deferred-budget: backend/testing/test_mod2.py",
+        "budget: 20s of 100s (2 ordinary + 0 mandatory, 1 deferred)",
+    ]
+
+
+def test_main_budget_says_so_when_it_could_not_measure(tmp_path, capsys):
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(root, "backend/testing/test_mod0.py", "from app.foo import bar\n")
+    absent = os.path.join(root, "absent.json")
+    rc = impacted_tests.main(
+        [
+            "backend/app/foo.py",
+            "--budget-seconds",
+            "100",
+            "--durations",
+            absent,
+            "--repo-root",
+            root,
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["backend/testing/test_mod0.py"]
+    # "Budgeting was requested and did not happen" and "budgeting happened and
+    # dropped nothing" are identical on STDOUT. A caller that sized its timeout
+    # around the budget has to be able to tell them apart, so the fail-open
+    # path announces that it fell open.
+    assert captured.err.splitlines() == [
+        f"budget: no usable measurements in {absent} — cost budget NOT applied"
+    ]
+
+
+def test_main_budget_charges_mandatory_sentinels_and_never_defers_them(
+    tmp_path, capsys
+):
+    root = str(tmp_path)
+    _make_tree(root)
+    for index in range(3):
+        _write(
+            root,
+            f"backend/testing/test_mod{index}.py",
+            "from app.foo import bar\n",
+        )
+    _write(root, "backend/testing/test_tree_sentinel.py", "def test_i(): pass\n")
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/**/*.py",
+                "sentinels": ["backend/testing/test_tree_sentinel.py"],
+            }
+        ],
+    )
+    durations = _write_durations(
+        root,
+        {
+            "testing/test_tree_sentinel.py::t": 80.0,
+            "testing/test_mod0.py::t": 10.0,
+            "testing/test_mod1.py::t": 30.0,
+            "testing/test_mod2.py::t": 30.0,
+        },
+    )
+    mandatory_output = os.path.join(root, "mandatory.txt")
+    rc = impacted_tests.main(
+        [
+            "backend/app/foo.py",
+            "--limit",
+            "8",
+            "--budget-seconds",
+            "100",
+            "--durations",
+            durations,
+            "--mandatory-output",
+            mandatory_output,
+            "--repo-root",
+            root,
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    # 80s of the 100s budget is spent before an ordinary selector is
+    # considered, so only the 10s file fits -- but the sentinel itself is
+    # carried regardless, because surface drift is the contract this gate
+    # cannot trade away for speed.
+    assert captured.out.splitlines() == ["backend/testing/test_mod0.py"]
+    with open(mandatory_output, encoding="utf-8") as fh:
+        assert fh.read().splitlines() == ["backend/testing/test_tree_sentinel.py"]
+    err = captured.err.splitlines()
+    assert "deferred-budget: backend/testing/test_mod1.py" in err
+    assert "deferred-budget: backend/testing/test_mod2.py" in err
+    assert not any(
+        line.startswith("deferred") and line.endswith("test_tree_sentinel.py")
+        for line in err
+    )
+    assert err[-1] == "budget: 90s of 100s (1 ordinary + 1 mandatory, 2 deferred)"
