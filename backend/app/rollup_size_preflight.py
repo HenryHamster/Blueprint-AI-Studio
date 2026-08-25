@@ -195,6 +195,11 @@ async def preflight_rollup_size_caps(
             "defer",
             "size-cap preflight lacks immutable merge-base SHA",
         )
+    if not target_branch:
+        return _result(
+            "defer",
+            "size-cap preflight lacks merge target branch",
+        )
 
     # Pin every read to one immutable branch tip. Branch-name content reads are
     # cached for ten minutes and were the direct cause of repeated stale bumps:
@@ -296,10 +301,13 @@ async def preflight_rollup_size_caps(
             if pr_file_status.get(prefix + key) == "removed"
         )
 
-    # 3. Fetch every changed, capped source from the immutable candidate and
-    #    base in two bounded archive reads.  A baseline is usable only if its
-    #    own tree breached its own effective (JSON + source-governance) cap;
-    #    this prevents a candidate cap edit from laundering new debt as old.
+    # 3. Fetch every capped source from the immutable candidate and base in two
+    #    bounded archive reads.  The full cap set is intentional: inherited
+    #    over-cap files outside the PR diff still need to be visible in the
+    #    merge verdict, even though they do not block. A baseline is usable
+    #    only if its own tree breached its own effective (JSON +
+    #    source-governance) cap; this prevents a candidate cap edit from
+    #    laundering new debt as old.
     capped_paths: list[tuple[str, str, int, str]] = []
     for section, prefix in _SECTION_PREFIXES.items():
         section_caps = caps_data.get(section)
@@ -307,11 +315,7 @@ async def preflight_rollup_size_caps(
             continue
         for key, cap in section_caps.items():
             full_path = prefix + key
-            if (
-                isinstance(cap, int)
-                and full_path in changed_paths
-                and pr_file_status.get(full_path) != "removed"
-            ):
+            if isinstance(cap, int) and pr_file_status.get(full_path) != "removed":
                 capped_paths.append((section, key, cap, full_path))
 
     candidate_texts: dict[str, str] | None = None
@@ -333,6 +337,7 @@ async def preflight_rollup_size_caps(
                     repo=repo,
                     commit_sha=observed_head_sha,
                     project_id=project_id,
+                    allow_missing_paths=True,
                 ),
                 authoritative_texts_at_commit(
                     source_paths | {_CAPS_JSON_PATH},
@@ -357,13 +362,27 @@ async def preflight_rollup_size_caps(
         except Exception as exc:
             return _result("defer", f"could not parse baseline module_size_limits.json: {exc}")
 
-    # 4. For each capped file that appears in the rollup, compare its candidate
-    #    count to an eligible baseline before considering repair.
+    # 4. For each capped file present in the candidate, compare its count to an
+    #    eligible baseline before considering repair. A stale cap whose file is
+    #    absent from the candidate is harmless; a changed file missing from the
+    #    exact candidate archive is unavailable evidence and must defer.
     breaches: list[tuple[str, str, int, int, int]] = []  # (section, key, count, cap, new_cap)
     inherited_breaches: list[tuple[str, int, int]] = []
     # Chronic offenders: (section, key, bump_count) — must hold without bumping.
     chronic_holders: list[tuple[str, str, int]] = []
     for section, key, cap, full_path in capped_paths:
+            if candidate_texts is not None and full_path not in candidate_texts:
+                if full_path in changed_paths and pr_file_status.get(full_path) != "removed":
+                    return _result(
+                        "defer",
+                        f"could not fetch {full_path} at {staging_branch}",
+                    )
+                logger.info(
+                    "[ROLLUP-SIZE] PR #%s: stale cap %s is absent from candidate; skipping",
+                    rollup_pr_number,
+                    full_path,
+                )
+                continue
             try:
                 content = (
                     candidate_texts[full_path]
@@ -400,7 +419,9 @@ async def preflight_rollup_size_caps(
             governance_path = governance_source_relpath(section, key)
             candidate_governance_caps = (
                 governance_caps_from_source_text(candidate_texts[governance_path])
-                if candidate_texts is not None and governance_path is not None
+                if candidate_texts is not None
+                and governance_path is not None
+                and governance_path in candidate_texts
                 else None
             )
             effective_cap = resolve_effective_cap(
