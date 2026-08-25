@@ -24,6 +24,10 @@ from pathlib import Path
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.git_checkout_probe import (
+    git_readable_repo_root,
+    unreadable_repo_skip_reason,
+)
 from testing.identity_extraction import (
     extract_python_test_ids,
     extract_python_test_ids_from_file,
@@ -1145,15 +1149,30 @@ class TestSchemaRevisionSync:
         repo_root = os.path.normpath(
             os.path.join(os.path.dirname(__file__), "..", "..")
         )
-        if not (
-            os.path.exists(helpers_path)
-            and os.path.exists(gitignore_path)
-            and os.path.isdir(os.path.join(repo_root, ".git"))
-        ):
+        if not (os.path.exists(helpers_path) and os.path.exists(gitignore_path)):
             pytest.skip(
-                "repo root sources not available in this test environment "
-                "(CI docker context is ./backend; run locally or via "
-                "scripts/test-backend.sh from a checkout for enforcement)"
+                "agent/src/prompts/code-change-helpers.ts or .gitignore is not "
+                f"present at the repo root this guard resolves ({repo_root}), "
+                "so there is nothing to compare. CI coverage: neither backend "
+                "lane exercises this guard -- both run from a backend-only "
+                "context whose repo root resolves to `/`. It runs on a "
+                "developer or agent checkout."
+            )
+        # Presence of `.git` is NOT the predicate, in either spelling: isdir
+        # skips in every linked worktree (#17872/#17887) and exists overshoots
+        # into an ERROR when a worktree is mounted into a container (#17892).
+        # Ask git the cheapest question that fails exactly when the `git
+        # ls-files` below would.
+        readable_root = git_readable_repo_root(repo_root)
+        if readable_root is None:
+            pytest.skip(
+                unreadable_repo_skip_reason(
+                    "neither backend lane exercises this guard -- both run from "
+                    "a backend-only context whose repo root resolves to `/`, "
+                    "which carries no checkout. It runs on a developer or agent "
+                    "checkout, where a skip here means the local repo is "
+                    "unreadable, not that the invariant held."
+                )
             )
 
         with open(helpers_path) as f:
@@ -1175,8 +1194,8 @@ class TestSchemaRevisionSync:
         assert "*.bak" in gitignore, ".gitignore is missing *.bak"
 
         tracked = subprocess.run(
-            ["git", "ls-files"],
-            cwd=repo_root,
+            ["git", "-c", f"safe.directory={readable_root}", "ls-files"],
+            cwd=readable_root,
             check=True,
             capture_output=True,
             text=True,
@@ -1213,14 +1232,26 @@ class TestSchemaRevisionSync:
         repo_root = os.path.normpath(
             os.path.join(os.path.dirname(__file__), "..", "..")
         )
-        if not (
-            os.path.exists(gitignore_path)
-            and os.path.isdir(os.path.join(repo_root, ".git"))
-        ):
+        if not os.path.exists(gitignore_path):
             pytest.skip(
-                "repo root sources not available in this test environment "
-                "(CI docker context is ./backend; run locally or via "
-                "scripts/test-backend.sh from a checkout for enforcement)"
+                "'.gitignore' is not present at the repo root this guard "
+                f"resolves ({repo_root}), so there is nothing to check. CI "
+                "coverage: neither backend lane exercises this guard -- both "
+                "run from a backend-only context whose repo root resolves to "
+                "`/`. It runs on a developer or agent checkout."
+            )
+        # Presence of `.git` is NOT the predicate -- see the note on
+        # test_agent_helper_exclusions_match_prompt_and_gitignore above.
+        readable_root = git_readable_repo_root(repo_root)
+        if readable_root is None:
+            pytest.skip(
+                unreadable_repo_skip_reason(
+                    "neither backend lane exercises this guard -- both run from "
+                    "a backend-only context whose repo root resolves to `/`, "
+                    "which carries no checkout. It runs on a developer or agent "
+                    "checkout, where a skip here means the local repo is "
+                    "unreadable, not that the invariant held."
+                )
             )
 
         with open(gitignore_path) as f:
@@ -1233,8 +1264,14 @@ class TestSchemaRevisionSync:
         # The rule must be root-anchored: git must ignore a root stray but must
         # NOT ignore a nested fixture of the same name.
         root_ignored = subprocess.run(
-            ["git", "check-ignore", "self_review_probe.json"],
-            cwd=repo_root,
+            [
+                "git",
+                "-c",
+                f"safe.directory={readable_root}",
+                "check-ignore",
+                "self_review_probe.json",
+            ],
+            cwd=readable_root,
             capture_output=True,
             text=True,
         )
@@ -1242,8 +1279,14 @@ class TestSchemaRevisionSync:
             "repo-root self_review_probe.json is not ignored by .gitignore"
         )
         nested_ignored = subprocess.run(
-            ["git", "check-ignore", "backend/testing/self_review_probe.json"],
-            cwd=repo_root,
+            [
+                "git",
+                "-c",
+                f"safe.directory={readable_root}",
+                "check-ignore",
+                "backend/testing/self_review_probe.json",
+            ],
+            cwd=readable_root,
             capture_output=True,
             text=True,
         )
@@ -1254,8 +1297,8 @@ class TestSchemaRevisionSync:
 
         # No root-level self_review_*.json file may be tracked.
         tracked = subprocess.run(
-            ["git", "ls-files"],
-            cwd=repo_root,
+            ["git", "-c", f"safe.directory={readable_root}", "ls-files"],
+            cwd=readable_root,
             check=True,
             capture_output=True,
             text=True,

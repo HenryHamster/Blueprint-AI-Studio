@@ -56,6 +56,10 @@ from pathlib import Path
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.git_checkout_probe import (
+    git_readable_repo_root,
+    unreadable_repo_skip_reason,
+)
 from testing.identity_extraction import extract_python_test_nodes
 
 # Canonical registry for the MissingGreenlet fidelity growth ratchet lives in
@@ -85,10 +89,19 @@ _VERSIONS_DIR = _BACKEND_ROOT / "alembic" / "versions"
 _RECONCILIATION_PATH = _BACKEND_ROOT / "app" / "migration_reconciliation.py"
 
 
-def _repo_root_available() -> bool:
-    """True when the repo root .git checkout is accessible (not the CI
-    backend-only Docker context)."""
-    return (_REPO_ROOT / ".git").is_dir()
+def _readable_repo_root() -> str | None:
+    """Return the repo root if git can READ it from here, else None.
+
+    Presence of ``.git`` is not the predicate, in either spelling. ``is_dir``
+    was the original check and skipped in every LINKED WORKTREE, where ``.git``
+    is a FILE holding ``gitdir: ...`` -- so this guard only ever ran in a real
+    clone and a green local run proved nothing about it (#17872/#17887).
+    ``exists`` overshoots: a worktree mounted into a container names a HOST
+    gitdir that does not exist there, git dies, and the guard ERRORS instead of
+    skipping (#17892). So ask git, with the cheapest question that fails
+    exactly when the ``git ls-files`` below would.
+    """
+    return git_readable_repo_root(_REPO_ROOT)
 
 
 # ---------------------------------------------------------------------------
@@ -581,11 +594,16 @@ class TestTestDurationsCommittedAndFresh:
         gitignore_path = _REPO_ROOT / ".gitignore"
         durations_path = _BACKEND_ROOT / ".test_durations"
 
-        if not _repo_root_available():
+        readable_root = _readable_repo_root()
+        if readable_root is None:
             pytest.skip(
-                "repo root .git not available in this test environment "
-                "(CI docker context is ./backend; run locally or via "
-                "scripts/test-backend.sh from a checkout for enforcement)"
+                unreadable_repo_skip_reason(
+                    "neither backend lane exercises this guard -- both run from "
+                    "a backend-only context whose repo root resolves to `/`, "
+                    "which carries no checkout. It runs on a developer or agent "
+                    "checkout, where a skip here means the local repo is "
+                    "unreadable, not that .test_durations was verified."
+                )
             )
 
         # (a) .gitignore must NOT contain the pattern
@@ -599,8 +617,14 @@ class TestTestDurationsCommittedAndFresh:
 
         # (b) File must be tracked by git
         result = subprocess.run(
-            ["git", "ls-files", "backend/.test_durations"],
-            cwd=str(_REPO_ROOT),
+            [
+                "git",
+                "-c",
+                f"safe.directory={readable_root}",
+                "ls-files",
+                "backend/.test_durations",
+            ],
+            cwd=readable_root,
             capture_output=True,
             text=True,
         )

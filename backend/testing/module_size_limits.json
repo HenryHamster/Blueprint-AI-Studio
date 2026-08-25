@@ -369,7 +369,7 @@
     "test_admin_project_config.py": 2100,
     "test_llm_runtime.py": 2100,
     "test_release_scoring.py": 2500,
-    "test_audit_finding_class_guards.py": 2100,
+    "test_audit_finding_class_guards.py": 2600,
     "test_payload_schemas.py": 2500,
     "test_warm_backlog_reuse.py": 2100,
     "test_completion_debt.py": 2450,
