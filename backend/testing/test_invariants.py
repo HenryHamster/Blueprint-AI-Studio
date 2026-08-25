@@ -15046,6 +15046,14 @@ def test_standalone_corpus_set_guards_emit_offender_identity():
     )
 
 
+# This shells out to scripts/test-backend.sh for a roster read. Measured
+# at 17.8s on an idle Windows host, and the CI lanes run pytest with
+# --timeout=30 -- so under an eight-shard load this lands on the wrong
+# side of its budget and fails as a TIMEOUT, reporting a slow harness
+# boot as a roster defect. 180s leaves ~10x headroom over the measured
+# figure and stays above the 120s inner subprocess timeout below, which
+# is what must be allowed to fire first.
+@pytest.mark.timeout(180)
 def test_standalone_offender_roster_covers_the_harness_inventory():
     """The scanned roster is never narrower than the lane the harness runs.
 

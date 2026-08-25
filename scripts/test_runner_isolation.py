@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 import runner_isolation as iso
 
@@ -1928,6 +1930,9 @@ class TestProjectVerificationProbe(unittest.TestCase):
             self.assertNotIn("/var/run/docker.sock", argv)
             self.assertNotIn("/run/docker.sock", argv)
 
+    # Boots a live sandbox PostgreSQL, which the lanes' --timeout=30 cannot
+    # cover; the inner 90s budget could never fire without this marker.
+    @pytest.mark.timeout(180)
     def test_real_probe_runs_live_sandbox_postgres_when_installed(self):
         pg_config = shutil.which("pg_config")
         ruff_available = subprocess.run(

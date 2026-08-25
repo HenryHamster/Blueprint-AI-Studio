@@ -133,7 +133,10 @@ def _run_gate(repo: Path, sandbox: Path) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         env=env,
-        timeout=120,
+        # Under the lane's --timeout=30: the gate under test is designed to
+        # fail closed immediately against the stubbed sandbox PATH, so a run
+        # that reaches 20s is a real defect worth reporting as itself.
+        timeout=20,
     )
 
 

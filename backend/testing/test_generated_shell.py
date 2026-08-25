@@ -803,7 +803,7 @@ def test_shellcheck_no_errors(
         f"--exclude={','.join(_SHELLCHECK_EXCLUDES)}",
         str(path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, (
         f"shellcheck errors in {gen.name}:\n{result.stdout}\n{result.stderr}"
     )
@@ -1886,7 +1886,7 @@ def test_static_script_shellcheck(path: Path, shellcheck_available: bool):
         f"--exclude={','.join(_SHELLCHECK_EXCLUDES)}",
         str(path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, (
         f"shellcheck errors in {path}:\n{result.stdout}\n{result.stderr}"
     )
@@ -2048,7 +2048,9 @@ class TestProjectVerificationRuntimeContract:
             [bash_executable, str(_PROJECT_VERIFICATION_PROBE), "docker-postgres"],
             capture_output=True,
             text=True,
-            timeout=60,
+            # 20s, not 60: a 60s budget under the 30s lane --timeout could
+            # never fire. The probe short-circuits on the stub interpreter.
+            timeout=20,
             env=env,
         )
         assert result.returncode == 0, (
@@ -2475,7 +2477,9 @@ def _eval_in_helper_shell(
         [bash, "-c", script],
         capture_output=True,
         text=True,
-        timeout=30,
+        # Well under the 30s lane budget: this sources one small helper and
+        # echoes a single expansion.
+        timeout=10,
         env=env,
     )
     assert result.returncode == 0, (

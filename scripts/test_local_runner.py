@@ -1864,9 +1864,11 @@ class TestCheckModePreflightEndToEnd(_LocalRunnerTestCase):
                 env=env,
                 capture_output=True,
                 text=True,
-                # Generous: this competes for CPU with the rest of the shard.
-                # The budget this protects is the whole file's, not this call's.
-                timeout=120,
+                # Under the lane's --timeout=30 so a genuine hang reports
+                # here rather than as a pytest-timeout flake. This call's old
+                # 120s budget is the shape that killed promotion PR #17674;
+                # #17681 took --check to 0.44s, so 25s is ~55x headroom.
+                timeout=25,
             )
             cls._toolchain_root_created = os.path.exists(toolchain_root)
         cls._combined = cls._result.stdout + cls._result.stderr
@@ -9469,9 +9471,12 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
                 self.assertTrue(spawned)
 
                 self.assertTrue(
-                    drained.wait(timeout=30.0),
+                    # 20s, not 30: the lanes run pytest with --timeout=30, so
+                    # a 30s wait can only ever be killed by the harness and
+                    # reported as an unreproducible flake, never as itself.
+                    drained.wait(timeout=20.0),
                     "the tee thread never read the agent's stdout to EOF "
-                    "within 30s, so the per-task log file cannot be checked",
+                    "within 20s, so the per-task log file cannot be checked",
                 )
 
                 log_path = local_runner._task_log_path("task-log-test")

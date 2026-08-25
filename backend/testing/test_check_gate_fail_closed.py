@@ -141,7 +141,11 @@ def _run_check(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         env=env,
-        timeout=60,
+        # 20s, not 60: the CI lanes run pytest with --timeout=30, so a 60s
+        # inner budget could never fire -- the harness would kill this call
+        # first and report a healthy `check` run as an unreproducible flake.
+        # Measured worst case across this file's callers is 1.57s (~13x head).
+        timeout=20,
     )
 
 
@@ -456,7 +460,11 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
         capture_output=True,
         text=True,
         env=env,
-        timeout=60,
+        # 20s, not 60: the CI lanes run pytest with --timeout=30, so a 60s
+        # inner budget could never fire -- the harness would kill this call
+        # first and report a healthy `check` run as an unreproducible flake.
+        # Measured worst case across this file's callers is 1.57s (~13x head).
+        timeout=20,
     )
 
     combined = f"{result.stdout}\n{result.stderr}"

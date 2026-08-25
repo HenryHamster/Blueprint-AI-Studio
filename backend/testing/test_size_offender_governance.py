@@ -1064,15 +1064,39 @@ def test_restored_cap_bumps_keep_strategic_resident_session_chronic():
 
 def _real_repo_checkout() -> str | None:
     """Return a path to a real git checkout of this repo, or None."""
+    # os.path.exists, not isdir: in a LINKED WORKTREE `.git` is a FILE holding
+    # `gitdir: ...`, so an isdir check silently returned None and skipped this
+    # guard in every agent worktree and dev worktree -- it only ever ran in a
+    # real clone. A green local run of this file proved nothing about it.
     candidates = [slp._REPO_ROOT]
-    if os.path.isdir("/repo/.git"):
+    if os.path.exists("/repo/.git"):
         candidates.append("/repo")
     for root in candidates:
-        if os.path.isdir(os.path.join(root, ".git")):
+        if os.path.exists(os.path.join(root, ".git")):
             return root
     return None
 
 
+# `git log -p -- backend/testing/module_size_limits.json` materialises a diff
+# for every commit that ever touched a large, constantly-churned file, on a
+# runner already carrying eight parallel shards. The inner subprocess budget
+# below is 30s and the CI lanes run pytest with --timeout=30 -- identical
+# numbers, so any work before or after the call guarantees the harness kill
+# lands first and this guard reds as an unreproducible flake (CI run
+# 32805982004, backend shard 8).
+#
+# 900s, not 120s, and the gap is deliberate. The `git log -p` above is NOT
+# where the time goes -- measured, it is ~1s. The cost is `phantom_ledger_records`
+# forking git FOUR TIMES PER LEDGER RECORD for every SHA the (shallow, on CI)
+# log cannot serve: ~2,660 spawns, measured at ~340s warm and ~600s cold. A
+# 120s marker would still be a budget inversion, just a wider one.
+#
+# This marker turns a guaranteed red into a slow green; the real fix is
+# batching those probes into a constant number of forks (measured 2,660 -> 20,
+# ~3.3s), which lands separately in `backend/app/size_limit_policy.py`. Drop
+# this marker back to 120 once that batching is on automain -- it is oversized
+# on purpose and should not stay that way.
+@pytest.mark.timeout(900)
 def test_cap_bump_history_ledger_matches_git():
     """The committed cap-bump-history ledger must mirror the git-recorded bumps.
 
