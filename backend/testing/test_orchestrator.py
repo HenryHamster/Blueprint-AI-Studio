@@ -16170,7 +16170,13 @@ async def test_forced_runner_gpu_in_container_hold_names_probe_blocker(
 
 
 async def _dispatched_container_image(
-    db_session, mocker, *, payload, pinned_image, image_error=None
+    db_session,
+    mocker,
+    *,
+    payload,
+    pinned_image,
+    image_error=None,
+    initial_context=None,
 ):
     """Dispatch one compute_experiment and return the ComputeJob's container_image.
 
@@ -16205,6 +16211,7 @@ async def _dispatched_container_image(
         project_id=project.id,
         status=TaskStatus.QUEUED,
         payloads=[payload],
+        context=dict(initial_context or {}),
     )
     db_session.add(task)
     await db_session.commit()
@@ -16222,6 +16229,14 @@ async def _dispatched_container_image(
     await _dispatch_compute_experiment_directly(
         db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
     )
+    # Re-read the row before any caller asserts on `task.context`. `Task.context`
+    # is a plain JSONB column, NOT `MutableDict.as_mutable`, so an in-place
+    # mutation is invisible to the unit of work and never reaches the database.
+    # Asserting against the in-memory dict would therefore pass identically
+    # whether the stamp was PERSISTED or merely assigned to an attribute
+    # SQLAlchemy never flushed — the two outcomes the fallback-stamp tests below
+    # exist to tell apart. Same idiom as the forced-runner hold test above.
+    await db_session.refresh(task)
 
     jobs = (
         (await db_session.execute(select(ComputeJob).where(ComputeJob.task_id == task.id)))
@@ -16296,7 +16311,7 @@ async def test_project_with_no_image_still_dispatches_image_less(db_session, moc
     normal dispatch — not a new failure mode for every project that has not
     adopted a compute image.
     """
-    _task, jobs, images = await _dispatched_container_image(
+    task, jobs, images = await _dispatched_container_image(
         db_session,
         mocker,
         payload={
@@ -16312,6 +16327,25 @@ async def test_project_with_no_image_still_dispatches_image_less(db_session, moc
         f"expected no image, got {images[0]!r} — a project that declared nothing "
         "must not acquire an image at dispatch"
     )
+    # ...but "keeps dispatching" must not mean "keeps doing it silently". This
+    # was the ONE fully silent branch: no failure, no warning, no record — and
+    # the branch essentially every job takes in a project with no
+    # `.blueprint/tools.json` compute.image. The launch is now attributable.
+    #
+    # The key and reason code are pinned as LITERALS on purpose: the operator
+    # query (`context->'compute_host_toolchain_fallback'`) IS the contract, so
+    # asserting against the constants that define it would certify itself.
+    stamp = (task.context or {}).get("compute_host_toolchain_fallback")
+    assert stamp is not None, (
+        "an image-less launch must be attributable on the task, not only a log "
+        f"line nobody reads; task.context was {task.context!r}"
+    )
+    assert stamp["reason_code"] == "no_project_compute_image", (
+        "a project that declares no compute.image must be distinguishable from "
+        f"one whose declared image failed to resolve; got {stamp['reason_code']!r}"
+    )
+    assert stamp["accelerator_declared"] is False
+    assert stamp["detail"], "the stamp must say WHY, not just that it happened"
 
 
 @pytest.mark.asyncio
@@ -16356,6 +16390,126 @@ async def test_cpu_only_experiment_degrades_when_the_image_is_unresolvable(
     assert images[0] is None, (
         "an unresolvable image must degrade to image-less, not attach a "
         f"half-resolved reference; got {images[0]!r}"
+    )
+    # Degrading is the right CALL; degrading invisibly is not. A project that
+    # HAS a contract and is not applying it is strictly more alarming than one
+    # with no contract, so the two must not collapse into a single reason code.
+    stamp = (task.context or {}).get("compute_host_toolchain_fallback")
+    assert stamp is not None, (
+        "a degraded launch must be attributable on the task; task.context was "
+        f"{task.context!r}"
+    )
+    assert stamp["reason_code"] == "project_compute_image_unresolvable", (
+        "a declared-but-unresolvable image must not be reported as 'no image "
+        f"declared'; got {stamp['reason_code']!r}"
+    )
+    assert "digest-pinned build record" in stamp["detail"], (
+        "the resolver's own reason must survive onto the task so an operator "
+        f"can act on it; got {stamp['detail']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_contracted_launch_records_no_host_toolchain_fallback(
+    db_session, mocker
+):
+    """A job that DID launch under the project image carries no fallback stamp.
+
+    The stamp is only worth querying if its presence means something.
+    """
+    task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image="registry.example.com/proj@sha256:" + "c" * 64,
+    )
+    assert len(jobs) == 1
+    assert images[0] is not None
+    assert "compute_host_toolchain_fallback" not in (task.context or {}), (
+        "a job that launched inside the project's image must not be reported as "
+        f"a host-toolchain fallback; task.context was {task.context!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_toolchain_stamp_is_cleared_once_an_image_resolves(
+    db_session, mocker
+):
+    """A retry that now resolves an image clears the earlier fallback stamp.
+
+    Without this the stamp is a one-way latch: a project that adopts a compute
+    image (or whose pending build finally lands) would keep answering an
+    operator query with a claim that stopped being true, and the degrade census
+    could only ever grow.
+    """
+    stale = {
+        "reason_code": "no_project_compute_image",
+        "detail": "project declares no compute.image",
+        "accelerator_declared": False,
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+    }
+    task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image="registry.example.com/proj@sha256:" + "d" * 64,
+        initial_context={"compute_host_toolchain_fallback": stale},
+    )
+    assert len(jobs) == 1
+    assert images[0] is not None
+    assert "compute_host_toolchain_fallback" not in (task.context or {}), (
+        "a launch that DID get an image must clear the earlier fallback stamp; "
+        f"task.context was {task.context!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_toolchain_stamp_is_not_rewritten_when_unchanged(
+    db_session, mocker
+):
+    """Re-dispatching an unchanged degrade does not churn the task row.
+
+    ``recorded_at`` is volatile, so a naive full-record comparison would rewrite
+    task.context every cycle a job re-dispatches under the same condition — the
+    churn `_pin_hold_stable_key` already avoids for the strict-pin hold. Only
+    the reason code and detail decide whether the stamp is rewritten.
+    """
+    prior = {
+        "reason_code": "no_project_compute_image",
+        "detail": (
+            "project declares no compute.image in .blueprint/tools.json; the "
+            "command runs against whatever toolchain the claiming host has"
+        ),
+        "accelerator_declared": False,
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+    }
+    task, jobs, _images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image=None,
+        initial_context={"compute_host_toolchain_fallback": dict(prior)},
+    )
+    assert len(jobs) == 1
+    stamp = (task.context or {}).get("compute_host_toolchain_fallback")
+    assert stamp == prior, (
+        "an unchanged fallback condition must leave the existing stamp alone, "
+        f"including its original recorded_at; got {stamp!r}"
     )
 
 

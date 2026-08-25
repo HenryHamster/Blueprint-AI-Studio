@@ -12,6 +12,7 @@
     "task_lifecycle_wakes.py": 1000,
     "orchestrator.py": 5900,
     "orchestrator_ci_monitor.py": 4150,
+    "orchestrator_compute_experiment_dispatch.py": 1620,
     "orchestrator_health.py": 1400,
     "orchestrator_runner_dispatch.py": 3152,
     "orchestrator_runtime_env.py": 400,

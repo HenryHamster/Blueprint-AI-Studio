@@ -1406,9 +1406,12 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       natively, else the command runs BARE and dies
 #                       ModuleNotFoundError), container_registry_auth
 #                       {server,username,password} (private/gated registries only),
-#                       setup_step (host-level prep run as bare bash -lc OUTSIDE the
-#                       container; container-dependent installs go in command, NOT
-#                       here). WHEN YOU DECLARE A METRIC the command MUST write it as
+#                       setup_step (WHERE it runs is BACKEND-DEPENDENT and not
+#                       selectable: inside the sandbox, same shell as command,
+#                       on the local-runner fleet; outside the container on the
+#                       cloud/docker backends — so never put anything command
+#                       depends on here; installs go in command).
+#                       WHEN YOU DECLARE A METRIC the command MUST write it as
 #                       JSON to $BLUEPRINT_RESULT_FILE (or print it as the last stdout
 #                       line) — a run that exits 0 without it loses the metric and
 #                       the criterion fails unmeasured (compute_unmeasured_criterion).
@@ -1505,7 +1508,9 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # you need a DIFFERENT stack the baked image does not cover, or for projects with no
 # baked image where the runtime is not pip-installable (else the command runs bare
 # and dies ModuleNotFoundError). Add container_registry_auth only for a private
-# registry; setup_step is host-level prep run OUTSIDE the container.
+# registry. setup_step placement is BACKEND-DEPENDENT and not selectable: inside the
+# sandbox (same shell as command) on the local-runner fleet, outside the container on
+# the cloud/docker backends — so never put anything command depends on there.
 ./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<GPU claim the measurement settles>", "command": "<command — installs+run go HERE, inside the image; must write the metric JSON to $BLUEPRINT_RESULT_FILE>", "accelerator": "T4", "container_image": "nvcr.io/nvidia/tensorflow:25.01", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": <the number that decides it>}, "direction_id": "d-xxx"}'
 # Multi-arm variant: use "arms" + "declared_metric" instead of a single "command".
 # Each arm writes its declared_metric key to $BLUEPRINT_RESULT_FILE as usual; the
