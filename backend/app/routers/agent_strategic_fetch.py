@@ -1918,6 +1918,7 @@ async def agent_fetch_qualification(
             promotion_check_wait=bool(_lq.get("promotion_pending")),
             consecutive_infra_errors=_infra_streak,
             rubric_redrive_count=int(_lq.get("rubric_redrive_count") or 0),
+            promotion_failure_count=int(_lq.get("promotion_failure_count") or 0),
             last_attempt=_lq if _lq else None,
             knob=get_auto_qualification_triggers_mode(),
             evaluated_at=utc_iso(_utcnow()),

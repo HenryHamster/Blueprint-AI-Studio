@@ -905,8 +905,8 @@ def detect_unjustified_cap_raises(
     return raises
 
 
-def _cap_bump_history_for(section: str, rel: str) -> list:
-    """Return the cap-bump history ledger records for ``(section, rel)``.
+def _cap_bump_history_for(section: str, rel: str, repo_root: str | None = None) -> list:
+    """Return the cap-bump history ledger records for ``(section, rel)`` in ``repo_root``.
 
     Delegates to ``app.size_limit_policy.parse_bump_history`` — the same source
     the chronic-offender verdict and the --fix regenerator use — so a raise is
@@ -918,7 +918,7 @@ def _cap_bump_history_for(section: str, rel: str) -> list:
     from app.size_limit_policy import BumpHistoryUnavailableError, parse_bump_history
 
     try:
-        return parse_bump_history(rel, section)
+        return parse_bump_history(rel, section, repo_root)
     except BumpHistoryUnavailableError:
         return []
 
@@ -1139,6 +1139,9 @@ def main(argv: list[str] | None = None) -> int:
     repo_root_explicit = args.repo_root is not None
     if args.repo_root is None:
         args.repo_root = _DEFAULT_REPO_ROOT
+    # Explicit roots only: _DEFAULT_REPO_ROOT is "/" inside the backend image,
+    # while size_limit_policy._REPO_ROOT knows CI's /repo bind mount.
+    policy_repo_root = args.repo_root if repo_root_explicit else None
 
     data = load_limits(args.json_path)
     # The environment-specific frontend escape hatches (ADMIN_UI_SRC /
@@ -1384,6 +1387,7 @@ def main(argv: list[str] | None = None) -> int:
                 rebuild_cap_bump_history_ledger(
                     caps_json_path=args.json_path,
                     ledger_path=ledger_path,
+                    repo_root=policy_repo_root,
                     pending=[
                         (section, rec["rel"], rec["cap"], new_cap)
                         for section, rec, new_cap in bumped
@@ -1665,7 +1669,7 @@ def main(argv: list[str] | None = None) -> int:
             data,
             mainline_data,
             args.sections,
-            history_for=_cap_bump_history_for,
+            history_for=lambda sec, rel: _cap_bump_history_for(sec, rel, policy_repo_root),
         )
         if unjustified_raises:
             for section, rel, old_cap, new_cap in unjustified_raises:

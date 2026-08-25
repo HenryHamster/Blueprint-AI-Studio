@@ -2811,6 +2811,12 @@
           "commit_date": "2026-08-06T11:08:45Z",
           "old_cap": 1500,
           "new_cap": 2150
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T19:52:59.689832+00:00",
+          "old_cap": 2150,
+          "new_cap": 2250
         }
       ],
       "operator_attention.py": [
@@ -4677,6 +4683,12 @@
           "commit_date": "2026-08-20T01:34:52-07:00",
           "old_cap": 1750,
           "new_cap": 2100
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T15:29:54.080099+00:00",
+          "old_cap": 2100,
+          "new_cap": 2700
         }
       ],
       "test_alert_dispatch.py": [

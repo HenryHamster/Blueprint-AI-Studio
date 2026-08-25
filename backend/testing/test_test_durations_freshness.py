@@ -16,6 +16,11 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from testing.fixgate_attribution import format_offender_marker
+from testing.durations_measurability import (
+    ZERO_TEST_MARKER,
+    deselected_markers,
+    unmeasurable_reason,
+)
 from testing.estate_inventory import iter_backend_test_files
 from testing.identity_extraction import (
     extract_python_test_ids,
@@ -85,6 +90,25 @@ def _current_test_files() -> dict[str, Path]:
         path.relative_to(BACKEND_ROOT).as_posix(): path
         for path in paths
     }
+
+
+def _unmeasurable_modules(current_files: dict[str, Path]) -> dict[str, str]:
+    """Return roster modules a timed run cannot measure, mapped to why.
+
+    ``--store-durations`` writes one entry per EXECUTED test, so a module
+    that executes none can never appear in the artifact. Demanding coverage
+    from those modules asks for evidence that cannot exist, and an
+    unsatisfiable clause in a promotion gate is debt no candidate can ever
+    discharge. See ``testing/durations_measurability.py`` for why every
+    exclusion is derived from the tree rather than listed by name.
+    """
+    deselected = deselected_markers(BACKEND_ROOT / 'pyproject.toml')
+    reasons: dict[str, str] = {}
+    for file_key, path in current_files.items():
+        reason = unmeasurable_reason(path, deselected)
+        if reason is not None:
+            reasons[file_key] = reason
+    return reasons
 
 
 def _git_output(repo_root: Path, *args: str) -> str | None:
@@ -406,7 +430,8 @@ def test_durations_coverage_fraction_within_threshold() -> None:
     files_in_durations = {k.split("::")[0] for k in data}
 
     current_files = _current_test_files()
-    all_test_files = set(current_files)
+    unmeasurable = _unmeasurable_modules(current_files)
+    all_test_files = set(current_files) - set(unmeasurable)
 
     if not all_test_files:
         return  # Nothing to check (shouldn't happen in a real repo)
@@ -1278,3 +1303,89 @@ def test_setup_misattribution_band_is_derived_from_the_observed_plateau() -> Non
 
     synthetic_band["in-gap"] = _IN_BAND_SETUP_GAP_MAX
     assert module.in_band_setup_artifacts(synthetic_band) == set()
+
+
+# ---------------------------------------------------------------------------
+# Measurability of the roster.
+#
+# The coverage ratchet asks every roster module for a durations entry.
+# ``--store-durations`` writes one entry per EXECUTED test, so a module pytest
+# never executes can never answer -- and an unsatisfiable clause in a promotion
+# gate is debt no candidate can discharge. The derivation itself is covered by
+# testing/test_durations_measurability.py; these two pin what it means for THIS
+# guard: still blocking for a module pytest runs, silent for one it never does.
+# ---------------------------------------------------------------------------
+
+
+def test_coverage_guard_still_blocks_an_uncovered_module_pytest_does_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The exemption must not become a way for any new module to skip the gate."""
+    module = sys.modules[__name__]
+    runnable = tmp_path / "test_runnable.py"
+    runnable.write_text("def test_x():\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "_current_test_files",
+        lambda: {"testing/test_runnable.py": runnable},
+    )
+    monkeypatch.setattr(module, "_load_durations", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "_load_duration_baseline",
+        lambda: _DurationBaseline(
+            ref="origin/automain",
+            test_files=frozenset(),
+            durations={},
+            stale_entries=frozenset(),
+        ),
+    )
+
+    import pytest
+
+    with pytest.raises(AssertionError, match="introduced 1 uncovered"):
+        test_durations_coverage_fraction_within_threshold()
+
+
+def test_coverage_guard_excuses_a_module_pytest_never_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Both structurally unmeasurable shapes pass without a durations entry."""
+    module = sys.modules[__name__]
+    helper = tmp_path / "test_helper.py"
+    helper.write_text(
+        f'"""Shared assertions."""\n\n{ZERO_TEST_MARKER} -- imported helpers\n\n'
+        "def assert_thing(value):\n    assert value\n",
+        encoding="utf-8",
+    )
+    deselected_module = tmp_path / "test_deselected.py"
+    deselected_module.write_text(
+        "import pytest\n\npytestmark = pytest.mark.integration\n\n"
+        "def test_x():\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        module,
+        "_current_test_files",
+        lambda: {
+            "testing/test_helper.py": helper,
+            "testing/test_deselected.py": deselected_module,
+        },
+    )
+    monkeypatch.setattr(module, "_load_durations", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "_load_duration_baseline",
+        lambda: _DurationBaseline(
+            ref="origin/automain",
+            test_files=frozenset(),
+            durations={},
+            stale_entries=frozenset(),
+        ),
+    )
+
+    # No assertion, and no inherited-debt warning either: these are not debt,
+    # they are modules the suite is never going to run.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        test_durations_coverage_fraction_within_threshold()

@@ -2778,3 +2778,165 @@ def test_failed_verify_artifact_keeps_plain_setup_failure_on_crash_path():
     )
     assert ci_resolution.verdict_from_failed_verify_artifact(None) is None
     assert ci_resolution.verdict_from_failed_verify_artifact("not a dict") is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# classify_bypass_merge_ci — the review-BYPASS merge gate (PRs #17933/#17936/#17942)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def _classify(mocker, check_runs, *, prs=None):
+    mocker.patch(
+        "app.github.get_check_runs_cached", new=AsyncMock(return_value=check_runs)
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=prs or []),
+    )
+    return await ci_resolution.classify_bypass_merge_ci(
+        77, "head-sha", token="t", owner="o", repo="r"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bypass_gate_blocks_completed_leaf_failure(mocker):
+    """A present, completed, genuinely-failing LEAF check blocks the merge."""
+    verdict, detail = await _classify(
+        mocker,
+        {
+            "status": "completed",
+            "conclusion": "failure",
+            "details": [
+                {
+                    "name": "Derived artifacts",
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            ],
+        },
+    )
+    assert verdict == ci_resolution.BYPASS_CI_BLOCKED_RED
+    assert detail["state"] == "red"
+
+
+@pytest.mark.asyncio
+async def test_bypass_gate_does_not_inherit_the_aggregate_launder_discount(mocker):
+    """A leaf red is NOT discounted just because matrix aggregates are present.
+
+    ``github_checks._details_have_genuine_failure`` treats a check ``X`` as an
+    aggregate parent when another check is named ``X (``... and discounts the
+    parent's failure — the PR #16885 fix for a ``CI / Backend`` failure that
+    merely laundered a cancelled shard. That discount must NOT extend to a leaf
+    like ``Derived artifacts``, which has no ``Derived artifacts (`` children.
+
+    Here a laundered aggregate (``CI / Backend`` failing over green shards) and
+    a genuine leaf red co-exist. The gate must still block.
+    """
+    verdict, _ = await _classify(
+        mocker,
+        {
+            "status": "completed",
+            "conclusion": "failure",
+            "details": [
+                {"name": "CI / Backend", "status": "completed", "conclusion": "failure"},
+                {
+                    "name": "CI / Backend (shard 1)",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "Derived artifacts",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+            ],
+        },
+    )
+    assert verdict == ci_resolution.BYPASS_CI_BLOCKED_RED
+
+
+@pytest.mark.asyncio
+async def test_bypass_gate_proceeds_on_definitive_no_checks(mocker):
+    """Zero check-runs keeps the pre-gate behaviour: merge proceeds.
+
+    Deliberately NOT gated on ``proceed_on_no_checks`` — that returns False for
+    a default-configured project on a non-staging branch, which would strand
+    every zero-check PR (conflicted, path-filtered, or opened during an Actions
+    outage) until the CI backstop FAILs it and cancels its children.
+    """
+    verdict, _ = await _classify(
+        mocker,
+        {"status": "no_checks", "conclusion": None, "details": []},
+    )
+    assert verdict == ci_resolution.BYPASS_CI_PROCEED
+    # Pin the rationale: the strict policy helper would have refused here.
+    assert ci_resolution.proceed_on_no_checks(_proj(), "automain") is False
+
+
+@pytest.mark.asyncio
+async def test_bypass_gate_waits_on_started_but_incomplete_check(mocker):
+    """A check that has STARTED is not a check that has PASSED (#17933)."""
+    verdict, detail = await _classify(
+        mocker,
+        {
+            "status": "in_progress",
+            "conclusion": None,
+            "details": [
+                {
+                    "name": "Derived artifacts",
+                    "status": "in_progress",
+                    "conclusion": None,
+                }
+            ],
+        },
+    )
+    assert verdict == ci_resolution.BYPASS_CI_WAIT_PENDING
+    assert detail["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_bypass_gate_proceeds_when_check_lookup_errors(mocker):
+    """An API error reports ``pending`` with EMPTY details — that is not a
+    present check, so the merge proceeds rather than stalling the pipeline."""
+    verdict, _ = await _classify(
+        mocker,
+        {
+            "status": "pending",
+            "conclusion": None,
+            "details": [],
+            "_from_api_error": True,
+        },
+    )
+    assert verdict == ci_resolution.BYPASS_CI_PROCEED
+
+
+@pytest.mark.asyncio
+async def test_bypass_gate_proceeds_on_green(mocker):
+    verdict, _ = await _classify(
+        mocker,
+        {
+            "status": "completed",
+            "conclusion": "success",
+            "details": [
+                {
+                    "name": "Derived artifacts",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ],
+        },
+    )
+    assert verdict == ci_resolution.BYPASS_CI_PROCEED
+
+
+@pytest.mark.asyncio
+async def test_bypass_gate_fails_open_when_resolution_raises(mocker):
+    """A bug in resolution can only ever restore the old behaviour, never wedge."""
+    mocker.patch(
+        "app.ci_resolution.resolve_pr_ci_status",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    verdict, _ = await ci_resolution.classify_bypass_merge_ci(
+        77, "head-sha", token="t", owner="o", repo="r"
+    )
+    assert verdict == ci_resolution.BYPASS_CI_PROCEED
