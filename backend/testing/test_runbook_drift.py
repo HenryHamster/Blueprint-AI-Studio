@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
+
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _REPO_ROOT = _BACKEND_ROOT.parent
 if not (_REPO_ROOT / "docs").is_dir() and (Path("/repo") / "docs").is_dir():
     _REPO_ROOT = Path("/repo")
-_SCRIPTS_ROOT = _REPO_ROOT / "scripts"
-if str(_SCRIPTS_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_ROOT))
+# The repo root above is resolved by a ``docs/`` probe, which says nothing
+# about where ``scripts/`` is. Resolve that separately through the shared
+# resolver -- and FAIL with its named reason rather than inserting a path that
+# may not exist and letting the import below die as a bare ModuleNotFoundError.
+_SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(
+    os.fspath(_BACKEND_ROOT)
+)
+if _SCRIPTS_DIR is None:
+    raise RuntimeError(_SCRIPTS_DIR_UNAVAILABLE)
+_SCRIPTS_ROOT = Path(_SCRIPTS_DIR)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 import release_runbook_contract as contract  # noqa: E402
 

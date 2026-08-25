@@ -66,8 +66,35 @@ from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
     WORKBENCH_STATE_KEY,
 )
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
 TEST_USER_ID = "test-user-123"
+
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _runner_scripts_dir() -> str:
+    """Put the repo ``scripts/`` dir on ``sys.path``, or FAIL with the reason.
+
+    The runner-side modules under test (``local_runner``, ``runner_isolation``)
+    ship in the repo's ``scripts/`` dir, which is NOT
+    ``<this file>/../../scripts`` in every layout: the Docker test image carries
+    the backend tree as /app with no scripts/ sibling and reaches the repo only
+    through the /repo bind mount. Six call sites below used the fixed relative
+    walk ALONE and imported successfully in that image only because an
+    earlier-collected module had already pushed /repo/scripts onto sys.path --
+    a collection-order accident, and pytest-split rebalancing across the CI
+    shards is what turns that into a red promotion PR.
+
+    A miss ASSERTS with the resolver's named reason rather than skipping: these
+    are the runner protocol's regression tests, and a lane that silently stops
+    running them reports coverage it does not have.
+    """
+    scripts_dir, unavailable = resolve_scripts_dir_from_env(_BACKEND_DIR)
+    assert scripts_dir is not None, unavailable
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    return scripts_dir
 
 
 async def _make_project(session, owner_id=TEST_USER_ID, name="Runner Project"):
@@ -13161,14 +13188,7 @@ async def test_capability_proof_trial_flag_off_records_nothing(db_session):
 
 
 def test_local_runner_receipt_requires_bootstrapped_toolchain_and_probe_legs():
-    from pathlib import Path
-
-    script_candidates = (
-        Path(__file__).parents[2] / "scripts",
-        Path("/repo/scripts"),
-    )
-    scripts_dir = next(path for path in script_candidates if path.is_dir())
-    sys.path.insert(0, str(scripts_dir))
+    _runner_scripts_dir()
     import local_runner as runner
 
     # Patch on the exact module object local_runner consults (runner.iso), not a
@@ -13562,15 +13582,8 @@ def test_large_checkpoint_round_trip_upload_bundle_resume(tmp_path, monkeypatch)
     import os
     import random
     import shutil
-    import sys
-    from pathlib import Path
 
-    script_candidates = (
-        Path(__file__).parents[2] / "scripts",
-        Path("/repo/scripts"),
-    )
-    scripts_dir = next(path for path in script_candidates if path.is_dir())
-    sys.path.insert(0, str(scripts_dir))
+    _runner_scripts_dir()
     import local_runner
 
     source = tmp_path / "source"
@@ -13721,9 +13734,7 @@ class TestRunnerResumeFail_Closed:
 
     @staticmethod
     def _bwrap_caps():
-        import sys
-        import pathlib
-        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        _runner_scripts_dir()
         import runner_isolation as iso
         return iso.Capabilities(bwrap_path="/usr/bin/bwrap", userns_ok=True)
 
@@ -13745,10 +13756,8 @@ class TestRunnerResumeFail_Closed:
 
     def test_runner_resume_fails_closed_when_bundle_unavailable(self):
         """A missing predecessor bundle aborts the job — command never starts."""
-        import sys
-        import pathlib
         import threading
-        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        _runner_scripts_dir()
         import local_runner
         from unittest.mock import patch
 
@@ -13807,10 +13816,8 @@ class TestRunnerResumeFail_Closed:
 
     def test_runner_resume_fails_closed_on_extract_error(self):
         """An extraction error also aborts the job — command never starts."""
-        import sys
-        import pathlib
         import threading
-        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        _runner_scripts_dir()
         import local_runner
         from unittest.mock import patch
 
@@ -13840,10 +13847,8 @@ class TestRunnerResumeFail_Closed:
 
     def test_runner_resume_proceeds_when_bundle_available(self):
         """Successful proof is repeated on a later durable terminal report."""
-        import sys
-        import pathlib
         import threading
-        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        _runner_scripts_dir()
         import local_runner
         from unittest.mock import patch
 
@@ -13894,10 +13899,7 @@ class TestScanViewableFilesCap:
 
     @staticmethod
     def _import_local_runner():
-        import sys
-        import pathlib
-        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
-        sys.path.insert(0, str(scripts_dir))
+        _runner_scripts_dir()
         import local_runner
         return local_runner
 
@@ -13975,10 +13977,7 @@ class TestStreamViewableAccountingReset:
 
     @staticmethod
     def _import_local_runner():
-        import sys
-        import pathlib
-        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
-        sys.path.insert(0, str(scripts_dir))
+        _runner_scripts_dir()
         import local_runner
         return local_runner
 
