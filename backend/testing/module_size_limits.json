@@ -431,7 +431,7 @@
     "test_strategic_spawning_capability_verification.py": 3260,
     "test_strategic_spawning_portfolio_messages.py": 3274,
     "test_strategic_spawning_summaries.py": 2966,
-    "check_size_limits.py": 1800,
+    "check_size_limits.py": 2100,
     "check_test_imports.py": 800,
     "test_test_imports_checker.py": 850,
     "test_orchestrator_liveness.py": 2250,

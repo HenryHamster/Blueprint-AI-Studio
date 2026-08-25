@@ -2,6 +2,7 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 import { POSIX_SHIM_SANDBOX_SUPPORTED } from '../test-python.js';
 import type { DirectoryConfig } from '../utils/test-runners.js';
+import { FIXTURE_SHARED_FILES, testingImportClosure } from './check-helper.fixture-deps.js';
 
 describe('tracked root check delegation contract', () => {
   it('prefers a generated gate and reserves the tracked default for true developer checkouts', async () => {
@@ -1181,13 +1182,12 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       const productionRoot = realPath.resolve(process.cwd(), '..');
       // Keep the isolated fixture's shared size-guard imports identical to a
       // real checkout; the Python shim below only intercepts direct test calls.
+      // The closure walk covers intra-``testing`` imports so a new one cannot
+      // reach CI as a bare ModuleNotFoundError inside a captured guard log.
+      const closureEntries = FIXTURE_SHARED_FILES.filter(f => f.endsWith('.py'));
       for (const relative of [
-        'scripts/backend_verification_guard.py', 'scripts/verification_receipt.py',
-        'scripts/guard_suppression_receipt.py', 'scripts/static_release_guard.py',
-        'backend/testing/fixgate_attribution.py', 'backend/testing/impacted_tests.py',
-        'backend/testing/drift_sentinel_surfaces.json', 'backend/testing/check_size_limits.py',
-        'backend/testing/module_size_limits.json', 'backend/testing/cap_bump_history.json',
-        'backend/app/__init__.py', 'backend/app/size_limit_policy.py',
+        ...FIXTURE_SHARED_FILES,
+        ...testingImportClosure(realFs, realPath, productionRoot, closureEntries),
       ]) {
         realFs.copyFileSync(realPath.join(productionRoot, relative), realPath.join(dir, relative));
       }
