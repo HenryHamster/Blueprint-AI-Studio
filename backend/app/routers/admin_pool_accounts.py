@@ -23,7 +23,10 @@ from app.auth import get_current_user, require_admin
 from app.database import get_session, resolve_dialect_name
 from app.field_encryption import decrypt_field, encrypt_field
 from app.digest_cache import DigestCache, get_digest_cache
-from app.digest_precompute import annotate_precompute_metadata
+from app.digest_precompute import (
+    annotate_precompute_metadata,
+    payload_age_seconds,
+)
 from app.models import (
     Alert,
     AlertSeverity,
@@ -247,15 +250,7 @@ def _annotate_response_freshness(
     additive; the existing ``accounts`` / ``rows`` payload is untouched.
     """
     generated_at = result.get("generated_at") if isinstance(result, dict) else None
-    age_seconds: float | None = None
-    if generated_at:
-        try:
-            age_seconds = max(
-                0.0,
-                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
-            )
-        except (ValueError, TypeError):
-            age_seconds = None
+    age_seconds = payload_age_seconds(generated_at)
     annotated = annotate_precompute_metadata(
         result,
         precomputed=False,

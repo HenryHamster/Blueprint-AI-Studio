@@ -21,6 +21,7 @@ from app.digest_precompute import (
     PRECOMPUTE_STALE_FALLBACK_SECONDS,
     annotate_precompute_metadata,
     get_health_precompute_cache,
+    payload_age_seconds,
     read_shared,
     shared_cache_key,
 )
@@ -150,15 +151,7 @@ async def get_health_overview(
         ),
     )
     generated_at = result.get("generated_at") if isinstance(result, dict) else None
-    age_seconds: float | None = None
-    if generated_at:
-        try:
-            age_seconds = max(
-                0.0,
-                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
-            )
-        except (ValueError, TypeError):
-            age_seconds = None
+    age_seconds = payload_age_seconds(generated_at)
     annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
@@ -820,15 +813,7 @@ async def get_warm_vm_state(
         lambda: _compute_warm_vm_state(session=session),
     )
     generated_at = result.get("generated_at") if isinstance(result, dict) else None
-    age_seconds: float | None = None
-    if generated_at:
-        try:
-            age_seconds = max(
-                0.0,
-                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
-            )
-        except (ValueError, TypeError):
-            age_seconds = None
+    age_seconds = payload_age_seconds(generated_at)
     annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
@@ -1399,15 +1384,7 @@ async def get_fleet_utilization(
         lambda: _compute_fleet_utilization(session=session),
     )
     generated_at = result.get("generated_at") if isinstance(result, dict) else None
-    age_seconds: float | None = None
-    if generated_at:
-        try:
-            age_seconds = max(
-                0.0,
-                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
-            )
-        except (ValueError, TypeError):
-            age_seconds = None
+    age_seconds = payload_age_seconds(generated_at)
     annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
