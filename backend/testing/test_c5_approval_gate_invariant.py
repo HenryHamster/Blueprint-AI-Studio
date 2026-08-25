@@ -68,8 +68,24 @@ def _default_size_cap_ok(mocker):
     unmocked call issues a real network request and returns 'defer', causing
     the merge to return False and failing 'assert result is True'.
     """
-    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
-        return SizeCapPreflightResult("ok", None, expected_head_sha)
+    async def _bound_ok(
+        *_args,
+        expected_head_sha=None,
+        target_branch=None,
+        expected_base_sha=None,
+        **_kwargs,
+    ):
+        # Mirror preflight_rollup_size_caps: a real verdict is stamped with
+        # the exact head, base, and target it evaluated. A double that binds
+        # only the head models a retired one-sided contract and is refused
+        # by the merge chokepoint's is_bound_to() check.
+        return SizeCapPreflightResult(
+            "ok",
+            None,
+            expected_head_sha,
+            target_branch=target_branch,
+            base_sha=expected_base_sha,
+        )
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
