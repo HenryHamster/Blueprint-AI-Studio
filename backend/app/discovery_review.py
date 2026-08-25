@@ -1081,6 +1081,102 @@ def _normalize_next_bet(value: Any) -> dict[str, Any]:
     return next_bet
 
 
+def _convert_escalation_to_evidence_bet(
+    result: Mapping[str, Any],
+    *,
+    cycle: DiscoveryCycle,
+    decision_receipt_ids: set[str],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Dispatch a reviewer's unanswered evidence question instead of escalating.
+
+    ``ask_operator`` exists for the questions only the operator can answer --
+    preference, authority, scope, priority.  It is not an evidence-acquisition
+    channel.  When the decision packet grants binding authority the reviewer
+    already holds the power to commission the measurement it says is missing,
+    so handing that question back parks a live direction behind a human for no
+    reason: direction ``d-1210b978`` cycle ``81ba8010`` sat at
+    ``discovery_ask_operator_awaiting_resolution`` for ~16 hours on 2026-08-24
+    asking permission to re-dispatch a verification task it was already
+    authorised to dispatch.
+
+    The reviewer's epistemic caution is preserved exactly -- no pass/fail grade
+    is fabricated for the bet it could not verify.  Its own question becomes
+    the ``decision_question`` of one bounded ``measure`` successor, verbatim,
+    and its own summary is kept and annotated rather than rewritten.
+
+    Returns ``(result, conversion_record)``.  When the packet carries no parent
+    outcome receipt to cite -- a shape the packet builder never emits -- there
+    is no valid binding successor to author, so the escalation is returned
+    untouched rather than fabricated into one.
+    """
+
+    if not decision_receipt_ids:
+        return dict(result), None
+    question = str(result.get("operator_question") or "").strip()
+    if not question:
+        return dict(result), None
+
+    citations = [
+        str(value) for value in result.get("evidence_citations") or []
+    ]
+    for receipt_id in sorted(decision_receipt_ids):
+        if receipt_id not in citations:
+            citations.append(receipt_id)
+    citations = citations[:_MAX_PACKET_ITEMS]
+
+    next_bet = _normalize_next_bet(
+        {
+            "mode": "measure",
+            "claim": (
+                "The evidence this decision packet lacks can be obtained by one "
+                "bounded measurement run by this engine, without an operator "
+                f"decision, on direction {cycle.direction_key}."
+            ),
+            "decision_question": question[:2_000],
+            "success_evidence": (
+                "A recorded measurement result -- command/test output, file "
+                "contents, or an existing receipt -- that answers the decision "
+                "question directly and is citable in the next decision packet."
+            ),
+            "retirement_condition": (
+                "Retire this bet once the measurement is recorded, or if one "
+                "bounded task cannot produce it, in which case park or stop the "
+                "direction on that finding rather than escalating again."
+            ),
+        }
+    )
+    disposition = (
+        "Engine disposition: this decision packet granted binding authority, so "
+        "the unanswered evidence question was dispatched as a bounded measure "
+        "bet instead of escalated to the operator. No pass/fail grade was "
+        "recorded for the prior bet."
+    )
+    # Trim the reviewer's own words, never the disposition note: an audit that
+    # cannot see why the verdict changed is worse than a shortened summary.
+    reviewer_summary = str(result.get("summary") or "").strip()
+    summary = (
+        f"{reviewer_summary[: max(4_000 - len(disposition) - 2, 0)]}\n\n"
+        f"{disposition}"
+    ).strip()[:4_000]
+    converted = {
+        **dict(result),
+        "action": "advance",
+        "summary": summary,
+        "evidence_citations": citations,
+        "next_bet": next_bet,
+        "park_reason": None,
+        "resume_condition": None,
+        "operator_question": None,
+    }
+    conversion_record = {
+        "reason": "binding_decision_allowed",
+        "original_action": "ask_operator",
+        "original_operator_question": question[:2_000],
+        "dispatched_bet_mode": "measure",
+    }
+    return converted, conversion_record
+
+
 def parse_discovery_review_result(raw: str | Mapping[str, Any]) -> dict[str, Any]:
     """Validate one total action without coercing ambiguous model output."""
 
@@ -1637,6 +1733,7 @@ async def complete_discovery_review(
     payload = task.first_payload
     expected_revision = payload.get("expected_revision")
     now = _utcnow()
+    escalation_conversion: dict[str, Any] | None = None
     try:
         if cycle.state != "reviewing":
             raise DiscoveryReviewResultError(
@@ -1724,6 +1821,19 @@ async def complete_discovery_review(
             raise DiscoveryReviewResultError(
                 "incomplete packet semantics permit only ask_operator"
             )
+        if result["action"] == "ask_operator" and binding_decision_allowed:
+            # The reviewer had the authority to commission exactly the work it
+            # asked permission for, so convert the escalation into the bounded
+            # measurement bet that acquires the missing evidence. See
+            # _convert_escalation_to_evidence_bet for the incident this closes.
+            result, escalation_conversion = _convert_escalation_to_evidence_bet(
+                result,
+                cycle=cycle,
+                decision_receipt_ids=decision_receipt_ids,
+            )
+            cited_ids = {
+                str(uuid.UUID(value)) for value in result["evidence_citations"]
+            }
         if (
             result["action"] != "ask_operator"
             and not cited_ids.intersection(decision_receipt_ids)
@@ -1771,8 +1881,13 @@ async def complete_discovery_review(
         raise
 
     action = str(result["action"])
+    conversion_record = (
+        {"converted_from_ask_operator": escalation_conversion}
+        if escalation_conversion is not None
+        else {}
+    )
     cycle.verdict = action
-    cycle.review_result = dict(result)
+    cycle.review_result = {**dict(result), **conversion_record}
     cycle.reviewed_at = now
     cycle.updated_at = now
     cycle.revision = int(cycle.revision or 0) + 1
@@ -1795,6 +1910,7 @@ async def complete_discovery_review(
         )
         cycle.review_result = {
             **dict(result),
+            **conversion_record,
             "next_cycle_id": str(successor.id),
             "successor_spawn_request_id": str(request.id),
         }

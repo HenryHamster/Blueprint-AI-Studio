@@ -159,7 +159,14 @@ not gate execution, and there is no shadow admission path.
 Once every cohort task and its post-commit processing have settled, exactly one
 packet-only `discovery_review` runs at `medium` effort. It returns one of
 `advance`, `park`, `stop`, or `ask_operator`; there is no independent
-confirmation fan-out. The packet contains a bounded parent outcome receipt with
+confirmation fan-out. `ask_operator` is reserved for questions only the operator
+can answer -- preference, authority, scope, or priority -- and is reachable only
+from a packet that withholds binding authority. When the manifest grants binding
+authority the engine already holds the power to acquire whatever evidence is
+missing, so an `ask_operator` verdict is converted into an `advance` whose
+bounded `measure` next bet carries the reviewer's own question as its decision
+question; no pass/fail grade is fabricated for the bet it could not verify.
+The packet contains a bounded parent outcome receipt with
 compact semantic coverage and checksums for detailed bodies omitted from the
 packet. Binding decisions must cite that exact receipt and are revalidated
 against current cycle, cohort, and the frozen active-direction authority before

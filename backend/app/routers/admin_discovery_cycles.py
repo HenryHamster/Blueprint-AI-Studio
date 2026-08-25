@@ -104,6 +104,8 @@ def _binding_decision_allowed_for_cycle(
     decision time (see ``discovery_review.py``): a receipt whose packet
     manifest marks either ``binding_decision_allowed`` false or
     ``required_evidence_omitted`` true only ever permits ``ask_operator``.
+    The converse holds too -- when this reads true, ``ask_operator`` is *not*
+    available and an escalation is converted into a bounded measure bet.
     It isn't persisted on the cycle itself, so this is derived here purely
     for operator visibility -- it is not re-validated or enforced.
     """

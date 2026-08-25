@@ -145,6 +145,26 @@ def _result(cycle: DiscoveryCycle, review: Task, *, action: str = "advance"):
     return result
 
 
+def _withhold_binding_authority(db_session, review: Task) -> None:
+    """Rewrite this decision packet's manifest as an incomplete-evidence one.
+
+    ``ask_operator`` is only reachable through a packet that withholds binding
+    authority, so coverage of the operator-resolution path builds that packet
+    shape explicitly. Only the manifest field is rewritten; ``evidence_packet``
+    and ``packet_checksum`` stay exactly as the server froze them, so the
+    stale-packet guard still sees the same packet.
+    """
+
+    payload = dict(review.first_payload)
+    payload["evidence_packet_manifest"] = {
+        **dict(payload.get("evidence_packet_manifest") or {}),
+        "binding_decision_allowed": False,
+        "required_evidence_omitted": True,
+    }
+    review.payloads = [payload, *list(review.payloads or [])[1:]]
+    db_session.add(review)
+
+
 @pytest.mark.asyncio
 async def test_semantic_receipt_excludes_unfinalized_research_findings(db_session):
     _, cycle, source = await _cycle_with_source(db_session)
@@ -1364,6 +1384,10 @@ async def test_ask_operator_wakes_resident_and_does_not_spawn_more_review(db_ses
     _, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
+    # ask_operator survives only for a packet that withholds binding authority;
+    # a complete packet converts it into a bounded evidence bet instead.
+    _withhold_binding_authority(db_session, review)
+    await db_session.flush()
 
     await complete_discovery_review(
         db_session,
@@ -1392,6 +1416,123 @@ async def test_ask_operator_wakes_resident_and_does_not_spawn_more_review(db_ses
     assert operator_message.context["resident_wake_barrier"] is True
     assert operator_message.context["policy_status"] == "ask_operator"
     assert operator_message.context["audience"] == "operator-action-needed"
+
+
+@pytest.mark.asyncio
+async def test_evidence_question_is_dispatched_not_escalated(db_session):
+    """A packet that grants authority never hands its question back.
+
+    Verbatim from direction d-1210b978 cycle 81ba8010 on 2026-08-24: the
+    reviewer correctly refused to grade a claim it had not verified, correctly
+    named the remedy -- re-dispatch a verification task -- and then asked the
+    operator for permission to do the thing it was already authorised to do.
+    The direction sat at discovery_ask_operator_awaiting_resolution for ~16
+    hours. ask_operator is for preference, authority, scope, and priority
+    calls only.
+    """
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["binding_decision_allowed"] is True
+    assert manifest["required_evidence_omitted"] is False
+
+    question = (
+        "The research task for this bet auto-completed with 0 actionable "
+        "findings, so nothing in the packet actually checked whether the named "
+        "liveness tests exist and pass at fad98a14. Should we re-dispatch a "
+        "direct verification task before this bet can be graded?"
+    )
+    reviewer_summary = (
+        "The manifest formally marks binding_decision_allowed true, but that "
+        "reflects packet completeness, not substantive verification."
+    )
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = question
+    escalation["summary"] = reviewer_summary
+
+    completed = await complete_discovery_review(
+        db_session, task=review, raw_result=escalation
+    )
+    await db_session.flush()
+
+    assert completed.id == cycle.id
+    assert cycle.state == "reviewed"
+    # Literal pin: the escalation vocabulary is unreachable for this packet.
+    assert cycle.verdict == "advance"
+    assert cycle.verdict != "ask_operator"
+    assert cycle.review_result["operator_question"] is None
+
+    # It continues with a bounded bet that goes and gets the missing evidence,
+    # and does not fabricate a grade for the bet it could not verify.
+    next_bet = cycle.review_result["next_bet"]
+    assert next_bet["mode"] == "measure"
+    assert question in next_bet["decision_question"]
+    assert reviewer_summary in cycle.review_result["summary"]
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["original_action"] == "ask_operator"
+    assert conversion["original_operator_question"] == question
+
+    # The successor is really dispatched, not merely recorded.
+    successor = await db_session.get(
+        DiscoveryCycle, uuid.UUID(cycle.review_result["next_cycle_id"])
+    )
+    assert successor is not None
+    assert successor.generation == cycle.generation + 1
+    assert successor.bet_snapshot["mode"] == "measure"
+    request = await db_session.get(
+        StrategicSpawnRequest,
+        uuid.UUID(cycle.review_result["successor_spawn_request_id"]),
+    )
+    assert request is not None
+    assert request.discovery_cycle_id == successor.id
+
+    # Nothing woke the operator and the direction stays live.
+    messages = list(
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(
+        message.context["event_type"] != "discovery.operator_question"
+        for message in messages
+    )
+    await db_session.refresh(project)
+    direction = next(
+        item for item in project.directions if item["id"] == cycle.direction_key
+    )
+    assert direction["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_dispatched_evidence_bet_does_not_block_the_direction(db_session):
+    """The converted verdict must clear direction admission, not just look right."""
+    from app.discovery_admission import direction_discovery_admission_decision
+
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = (
+        "Should we re-run the two named tests at that head before grading?"
+    )
+    await complete_discovery_review(
+        db_session, task=review, raw_result=escalation
+    )
+    await db_session.flush()
+
+    await db_session.refresh(project)
+    direction = next(
+        item for item in project.directions if item["id"] == cycle.direction_key
+    )
+    decision = direction_discovery_admission_decision(direction, cycle)
+    # Literal pin on the reason code that stranded d-1210b978 for ~16 hours.
+    assert decision.reason_code != "discovery_ask_operator_awaiting_resolution"
+    assert "ask_operator" not in decision.reason_code
 
 
 @pytest.mark.asyncio
@@ -1605,6 +1746,8 @@ async def test_operator_continue_uses_same_atomic_successor_contract(db_session)
     project, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority(db_session, review)
+    await db_session.flush()
     await complete_discovery_review(
         db_session,
         task=review,
@@ -1682,6 +1825,8 @@ async def test_resident_can_resolve_discovery_through_strategic_op(
     project, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority(db_session, review)
+    await db_session.flush()
     await complete_discovery_review(
         db_session,
         task=review,
