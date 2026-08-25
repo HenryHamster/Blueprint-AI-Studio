@@ -1147,6 +1147,64 @@ class TestStrategicLoopLiveness:
             )
         ).scalars().all()
 
+    @pytest.mark.parametrize("strategic_failures", [3, 4, 5, 6])
+    async def test_idle_sweep_driver_reaches_starvation_bypass_for_direction_less_project_at_four_failures(
+        self, db_session, mocker, strategic_failures
+    ):
+        """The idle caller must not shadow the spawner's recovery ceiling.
+
+        The legacy vision purpose is a schema placeholder, while the current
+        problem model has a real purpose. A direction-less project in this
+        state must reach the spawner even after the old three-failure park;
+        the spawner then owns the bounded starvation-bypass decision.
+        """
+        from app.autonomous_research import _run_idle_research_for_project
+
+        inner_spawn = mocker.patch(
+            "app.autonomous_research._spawn_research_task_inner",
+            new=AsyncMock(return_value=1),
+        )
+        mocker.patch(
+            "app.autonomous_research._project_spend_ceiling_spawn_defer_reason",
+            new=AsyncMock(return_value="test defer"),
+        )
+        mocker.patch(
+            "app.autonomous_research.commit_legacy_authorized",
+            new=AsyncMock(),
+        )
+        project = make_project(
+            autonomous_enabled=True,
+            directions=[],
+            vision={
+                "purpose": "<from analysis>",
+                "_strategic_failures": strategic_failures,
+            },
+            problem_model={"intent": {"purpose": "Build the reliable thing"}},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        from app.problem_model import project_has_purpose
+
+        assert project_has_purpose(project) is True
+        assert _ss.monthly_budget_gate_engaged is False
+        assert _ss.daily_budget_gate_engaged is False
+
+        spawned = await _run_idle_research_for_project(
+            project,
+            db_session,
+            headroom_budget=1,
+            expected_legacy_generation=None,
+            fleet_has_capacity=False,
+        )
+        assert inner_spawn.await_count == 1
+        assert spawned == 1
+        inner_spawn.assert_awaited_once_with(
+            project,
+            db_session,
+            expected_legacy_generation=None,
+            headroom_budget=1,
+        )
+
     async def test_starvation_bypass_does_not_admit_tactical_research_through_open_breaker(
         self, db_session, mocker
     ):

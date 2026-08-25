@@ -4175,20 +4175,12 @@ async def _run_idle_research_for_project(
             f"[DIRECTIONS] Project {project.name} has {len(pending_proposals)} pending direction proposals awaiting review"
         )
 
-    active_directions = [
-        d for d in (project.directions or []) if d.get("status") == "active"
-    ]
-    # Allow projects with no directions through if vision needs bootstrapping
-    vision_needs_bootstrap = not (project.vision or {}).get("purpose")
-    strategic_recovery_needed = not active_directions and (
-        (project.vision or {}).get("_strategic_failures", 0) < 3
-    )
-    if (
-        not active_directions
-        and not vision_needs_bootstrap
-        and not strategic_recovery_needed
-    ):
-        return 0
+    # There is deliberately NO direction-count gate here. The spawner owns
+    # bootstrap, failure-breaker decay, the wall-clock backstop and bounded
+    # starvation recovery, so every direction-less project must reach it; a
+    # second failure ceiling at this level made those self-heals unreachable
+    # for a halted, direction-less project. Do not reintroduce one — raise the
+    # ceiling in `_spawn_research_task` instead, where the decision is bounded.
 
     # Monthly budget gate: skip idle-research spawning when the fleet-wide
     # monthly budget is exhausted. Since this runs for every project in the
