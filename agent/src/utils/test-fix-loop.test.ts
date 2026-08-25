@@ -77,6 +77,7 @@ import {
 import { runClaudeCode } from '../providers/runners.js';
 import { apiPost } from '../index.js';
 import { expectCalledWith } from './typed-mock-call.js';
+import { SKIP_NEEDS_PYTHON3_BINARY } from '../test-python.js';
 import type { TestRunner } from './test-runners.js';
 
 // Default fs.existsSync behavior matching the module-level mock factory:
@@ -122,8 +123,14 @@ function configureStructuredVitestFailure(records: Array<{ testcase: string; det
 
 describe('canonicalComparatorPath', () => {
   it('resolves the packaged comparator in the deployed /opt/agent layout', () => {
-    expect(canonicalComparatorPath('/opt/agent/src/utils'))
-      .toBe('/opt/agent/src/_agent_scripts/fixgate_attribution.py');
+    // canonicalComparatorPath uses path.resolve, so on a Windows dev host the
+    // SAME resolution renders as 'D:\opt\agent\src\_agent_scripts\...' — the
+    // current drive is prepended and separators flip. Normalising separators and
+    // pinning the full literal suffix keeps the meaningful assertion intact (the
+    // sibling-directory hop out of src/utils into src/_agent_scripts, and the
+    // exact script filename) without pinning the host's path flavour.
+    expect(canonicalComparatorPath('/opt/agent/src/utils').replace(/\\/g, '/'))
+      .toMatch(/(^|:)\/opt\/agent\/src\/_agent_scripts\/fixgate_attribution\.py$/);
   });
 });
 
@@ -742,7 +749,21 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     vi.mocked(fs.existsSync).mockImplementation(defaultExistsSync);
   });
 
-  it('auto-bumps only the comparator-attributed cap via a scoped repair target and re-verifies — no LLM call', async () => {
+// The cases below exercise the branch AFTER compareStructuredFailures returns a
+// real attribution, and that comparator is PRODUCTION code which execs a literal
+// `python3` (see compareStructuredFailures in ./test-fix-loop.ts). The agent only
+// ever runs on Linux, so hardcoding `python3` there is correct and must not change
+// for a dev host's benefit — but it does mean no test-side interpreter choice can
+// rescue these on a Windows box with no `python3` on PATH: the comparator returns
+// null, testFixLoop routes to `verificationUnverified`, and the assertions fail for
+// a reason that has nothing to do with the size-breach logic under test.
+//
+// SKIP_NEEDS_PYTHON3_BINARY is true ONLY on win32 AND only when no real `python3`
+// executable exists, so Linux CI always runs every case here and a python3 that
+// vanishes from a CI image still reds the build instead of silently skipping.
+const itNeedsPython3 = it.skipIf(SKIP_NEEDS_PYTHON3_BINARY);
+
+  itNeedsPython3('auto-bumps only the comparator-attributed cap via a scoped repair target and re-verifies — no LLM call', async () => {
     const newSizeDetail =
       '[breach] agent/prompt.ts: 1700 lines (cap: 1650)\n' +
       '1 size breach(es) in module_size_limits.json.';
@@ -778,7 +799,7 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
-  it('auto-adds an attributed missing cap through its scoped repair target — no LLM call', async () => {
+  itNeedsPython3('auto-adds an attributed missing cap through its scoped repair target — no LLM call', async () => {
     const COVERAGE_FAILURE =
       '[uncapped] agent/prompts/huge.ts: 1700 lines (threshold: 1500) — NO cap entry\n' +
       'module_size_limits.json size guardrail';
@@ -812,7 +833,7 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
-  it('auto-adds caps for EVERY offender in the byte-exact aggregated missing-cap failure — no LLM call', async () => {
+  itNeedsPython3('auto-adds caps for EVERY offender in the byte-exact aggregated missing-cap failure — no LLM call', async () => {
     // Restores the regression the synthetic '[uncapped] …' fixture could not
     // catch: this is the message test_invariants._missing_cap_message and
     // agent/src/moduleSize.contract.test.ts actually emit, and it lists every
@@ -865,7 +886,7 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     expect(bumpCall).toBeUndefined();
   });
 
-  it('testFixLoop — deterministic size-breach remediation does not run deterministic cap bump for an inherited-only breach', async () => {
+  itNeedsPython3('testFixLoop — deterministic size-breach remediation does not run deterministic cap bump for an inherited-only breach', async () => {
     const inheritedSizeDetail =
       '[breach] backend/chronic.py: 1720 lines (cap: 1600)\n' +
       'module_size_limits.json size guardrail';
@@ -885,7 +906,7 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
-  it('keeps an inherited size breach out of the LLM prompt when a new non-size failure remains', async () => {
+  itNeedsPython3('keeps an inherited size breach out of the LLM prompt when a new non-size failure remains', async () => {
     const inheritedSizeDetail =
       '[breach] backend/chronic.py: 1720 lines (cap: 1600)\nmodule_size_limits.json size guardrail';
     const newFailure = 'AssertionError: expected enabled to be true';
@@ -909,7 +930,7 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     expect(vi.mocked(runClaudeCode).mock.calls[0][0]).not.toContain('backend/chronic.py');
   });
 
-  it('repairs a new size target without including a concurrent inherited size offender', async () => {
+  itNeedsPython3('repairs a new size target without including a concurrent inherited size offender', async () => {
     const inheritedSizeDetail =
       '[breach] backend/chronic.py: 1720 lines (cap: 1600)\nmodule_size_limits.json size guardrail';
     const newSizeDetail =

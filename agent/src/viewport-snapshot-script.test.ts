@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { requireTestPython } from './test-python.js';
 
 // Capability probes: some tests spawn python3/jq or assert a Unix executable bit.
 // Those skip when the capability is absent (e.g. local Windows dev box without
@@ -15,7 +16,11 @@ const hasBin = (b: string): boolean => {
     return false;
   }
 };
-const HAS_PYTHON3 = hasBin('python3');
+// The Python-spawning tests below only USE Python as a tool to run a committed
+// script, so any CPython 3 executes them identically. They resolve the
+// interpreter through requireTestPython (see ./test-python.ts), which keeps the
+// coverage live on a Windows dev host — CPython installs as `python` there,
+// never `python3` — while Linux CI resolves the same `python3` it always did.
 const HAS_JQ = hasBin('jq');
 const SUPPORTS_EXEC_BIT = process.platform !== 'win32';
 
@@ -52,8 +57,8 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
 
   // Requires python3 on PATH (spawns py_compile).
   it('manifest helper is valid python (py_compile)', () => {
-    if (!HAS_PYTHON3) throw new Error('python3 is required for this test but was not found on PATH. Install python3 (Linux CI always has it).');
-    expect(() => execFileSync('python3', ['-m', 'py_compile', MANIFEST_PY])).not.toThrow();
+    const python = requireTestPython('the viewport manifest py_compile check');
+    expect(() => execFileSync(python, ['-m', 'py_compile', MANIFEST_PY])).not.toThrow();
   });
 
   it('exits 1 when --upload is passed without --task-id', () => {
@@ -111,7 +116,10 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
     } finally {
       rmSync(manifestPath, { force: true });
     }
-    const rows = out.split('\n').filter((r) => r.length > 0).map((r) => r.split('\t'));
+    // Split on /\r?\n/: jq.exe on a Windows dev host opens stdout in text mode
+    // and emits CRLF, which would otherwise leave a stray \r on the LAST column
+    // of every row and break the exact-value assertions below.
+    const rows = out.split(/\r?\n/).filter((r) => r.length > 0).map((r) => r.split('\t'));
 
     // 5th column (index 4) is the magnitude. before/diff rows always carry an empty
     // magnitude; the "after" row carries change_pct/100 (or empty when absent).
@@ -232,7 +240,7 @@ describe('scripts/viewport-live-capture.js — Playwright capture helper', () =>
 
   // Requires python3 on PATH (runs viewport_manifest.py).
   it('writes PNGs with the px suffix required by viewport_manifest.py width regex', () => {
-    if (!HAS_PYTHON3) throw new Error('python3 is required for this test but was not found on PATH. Install python3 (Linux CI always has it).');
+    const python = requireTestPython('the viewport_manifest.py width-regex check');
     // viewport_manifest.py uses _WIDTH_RE = re.compile(r"-(\d+)px\.png$").
     // If the capture helper omits "px", the manifest emits width: null and every
     // upload returns 422 from the backend (width: int = Field(ge=1, le=4096)).
@@ -249,7 +257,7 @@ describe('scripts/viewport-live-capture.js — Playwright capture helper', () =>
       // viewport_manifest.py argv: before_dir after_dir base run_id out_manifest
       // (mirrors how viewport-live.sh calls it: before_dir="" after_dir="$OUT_DIR" …)
       execFileSync(
-        'python3',
+        python,
         [MANIFEST_PY, '', tmpDir, 'live', 'test-run', outManifest],
         { encoding: 'utf-8' },
       );

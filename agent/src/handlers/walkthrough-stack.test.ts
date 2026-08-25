@@ -204,10 +204,22 @@ describe('runner-side supervisor protocol', () => {
       expect(req.pg_password).toMatch(/^wt-pg-[0-9a-f]{16}$/);
       expect(req.agent_jwt_secret).toMatch(/^[0-9a-f]{48}$/);
       // The request carries stack secrets — owner-only, per runner convention.
-      // Asserted unconditionally: a mode leak is exactly the regression this
-      // test exists to catch, and POSIX modes are meaningful on every platform
-      // the agent suite runs on (Linux/macOS CI).
-      expect(statSync(requestPath).mode & 0o777).toBe(0o600);
+      // Asserted on every POSIX platform: a mode leak is exactly the regression
+      // this test exists to catch, and the 0o600 literal is the pin.
+      //
+      // Gated off on win32 because the behaviour under test cannot exist there,
+      // not as a convenience: Windows has no POSIX mode bits. Node's fs.chmod on
+      // win32 can only toggle the read-only attribute, and statSync().mode & 0o777
+      // reports 0o666 no matter what the code did — so the check can neither pass
+      // nor ever detect a real leak. (Owner-only access is an NTFS ACL question
+      // there, which this file protocol does not model.) Throwing inside this
+      // responder also strands the promise, which is why the phantom failure used
+      // to cascade into an unhandled rejection and a misleading boot() message.
+      // Every platform the agent actually runs on — Linux runners, Linux/macOS
+      // CI — keeps the assertion.
+      if (process.platform !== 'win32') {
+        expect(statSync(requestPath).mode & 0o777).toBe(0o600);
+      }
       writeFileSync(
         path.join(proto, 'response.json'),
         JSON.stringify({ status: 'ok', backend_port: 18123, db_port: 15123 }),

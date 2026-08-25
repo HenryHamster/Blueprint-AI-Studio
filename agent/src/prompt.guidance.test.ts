@@ -1,5 +1,30 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
+import { requireTestPython } from './test-python.js';
+
+// Wall-clock budget for the end-to-end tests below that spawn a real `bash` and
+// run a generated helper script through it.
+//
+// These are not latency assertions — the budget only exists so a genuinely hung
+// script fails instead of wedging the run. On Linux CI a full send takes tens of
+// milliseconds. On a Windows dev host the same script costs 2–3.5s because MSYS
+// emulates fork/exec for bash and every coreutil the script invokes, and under
+// parallel vitest load that reliably crosses 5s — turning a healthy script into
+// `status: null` / SIGTERM. Keep the strict budget on POSIX; give Windows enough
+// headroom that only a real hang trips it.
+const SHELL_SPAWN_TIMEOUT_MS = process.platform === 'win32' ? 30_000 : 5_000;
+
+// Per-test budget for those same tests, handed to `it(..., SHELL_TEST_TIMEOUT_MS)`.
+//
+// INVARIANT: SHELL_TEST_TIMEOUT_MS > SHELL_SPAWN_TIMEOUT_MS, on every platform.
+// vitest's per-test timeout is the OUTER budget and the spawnSync timeout is the
+// INNER one. agent/vitest.config.ts sets no testTimeout, so the default is 5000ms
+// — below the win32 spawn budget above. An inner timeout at or above its outer
+// harness budget can never fire: vitest kills the test first, so the headroom
+// would not really exist and a hang would surface as an opaque "test timed out"
+// instead of the spawn timeout that actually describes it. Derived from the spawn
+// budget rather than written out, so editing one cannot silently re-invert them.
+const SHELL_TEST_TIMEOUT_MS = SHELL_SPAWN_TIMEOUT_MS + 10_000;
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('./index.js', async (importOriginal) => {
@@ -1093,7 +1118,8 @@ describe('writeDesignDocHelper', () => {
         ? ['task-xyz', args[1], args[2]]   // task, key, value
         : ['task-xyz', args[1]];           // task, key
       const out = realCp.execFileSync(
-        'python3', ['-c', oneliner, ...pyArgs],
+        requireTestPython('the design-doc python3 payload-builder parity check'),
+        ['-c', oneliner, ...pyArgs],
         { encoding: 'utf8' },
       );
       return JSON.parse(out);
@@ -1424,7 +1450,7 @@ describe('writeMessagesHelper stdin-based send', () => {
           AGENT_API_TOKEN: 'tok',
           PATH: `${mockCurlDir}:${process.env.PATH}`,
         },
-        timeout: 5000,
+        timeout: SHELL_SPAWN_TIMEOUT_MS,
       });
       expect(result.status).toBe(0);
       const captured = realFs.readFileSync(captureFile, 'utf8').trim();
@@ -1436,7 +1462,7 @@ describe('writeMessagesHelper stdin-based send', () => {
       try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
       try { realFs.unlinkSync(mockCurlPath); realFs.rmdirSync(mockCurlDir); } catch { /* ignore */ }
     }
-  });
+  }, SHELL_TEST_TIMEOUT_MS);
 
   it('sends content with newlines end-to-end via stdin', async () => {
     writeMessagesHelper('task-nl-test');
@@ -1470,7 +1496,7 @@ describe('writeMessagesHelper stdin-based send', () => {
           AGENT_API_TOKEN: 'tok',
           PATH: `${mockCurlDir}:${process.env.PATH}`,
         },
-        timeout: 5000,
+        timeout: SHELL_SPAWN_TIMEOUT_MS,
       });
       expect(result.status).toBe(0);
       const captured = realFs.readFileSync(captureFile, 'utf8').trim();
@@ -1482,7 +1508,7 @@ describe('writeMessagesHelper stdin-based send', () => {
       try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
       try { realFs.unlinkSync(mockCurlPath); realFs.rmdirSync(mockCurlDir); } catch { /* ignore */ }
     }
-  });
+  }, SHELL_TEST_TIMEOUT_MS);
 
   it('fails loud (non-zero exit + stderr message) when stdin is empty', async () => {
     writeMessagesHelper('task-empty-test');
@@ -1499,14 +1525,14 @@ describe('writeMessagesHelper stdin-based send', () => {
         input: '',
         encoding: 'utf8',
         env: { ...process.env, ORCHESTRATOR_URL: 'http://mock', AGENT_API_TOKEN: 'tok' },
-        timeout: 5000,
+        timeout: SHELL_SPAWN_TIMEOUT_MS,
       });
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain('Error: send requires message content');
     } finally {
       try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
     }
-  });
+  }, SHELL_TEST_TIMEOUT_MS);
 
   it('generated script passes bash -n syntax check', async () => {
     writeMessagesHelper('task-syntax-test');
@@ -1567,7 +1593,7 @@ describe('writeMessagesHelper stdin-based send', () => {
           // through the poison binDir falling back to the system path we append.
           PATH: `${binDir}:${process.env.PATH}`,
         },
-        timeout: 5000,
+        timeout: SHELL_SPAWN_TIMEOUT_MS,
       });
       expect(result.status).toBe(0);
       // jq was never invoked — the write path is genuinely jq-free.
@@ -1591,7 +1617,7 @@ describe('writeMessagesHelper stdin-based send', () => {
         realFs.rmdirSync(binDir);
       } catch { /* ignore */ }
     }
-  });
+  }, SHELL_TEST_TIMEOUT_MS);
 
   it('resolve builds valid JSON with jq REMOVED from PATH', async () => {
     writeMessagesHelper('task-nojq-resolve');
@@ -1627,7 +1653,7 @@ describe('writeMessagesHelper stdin-based send', () => {
           AGENT_API_TOKEN: 'tok',
           PATH: `${binDir}:${process.env.PATH}`,
         },
-        timeout: 5000,
+        timeout: SHELL_SPAWN_TIMEOUT_MS,
       });
       expect(result.status).toBe(0);
       expect(realFs.existsSync(jqMarker)).toBe(false);
@@ -1648,7 +1674,7 @@ describe('writeMessagesHelper stdin-based send', () => {
         realFs.rmdirSync(binDir);
       } catch { /* ignore */ }
     }
-  });
+  }, SHELL_TEST_TIMEOUT_MS);
 });
 
 // ── writePlaybookHelper (live token resolution) ──────────────────────────────
@@ -1734,7 +1760,7 @@ describe('writePlaybookHelper live token resolution', () => {
           AGENT_API_TOKEN: 'tok',
           PATH: `${binDir}:${process.env.PATH}`,
         },
-        timeout: 5000,
+        timeout: SHELL_SPAWN_TIMEOUT_MS,
       });
       const jqCalled = realFs.existsSync(jqMarker);
       const body = realFs.existsSync(captureFile) ? realFs.readFileSync(captureFile, 'utf8').trim() : '';
@@ -1765,7 +1791,7 @@ describe('writePlaybookHelper live token resolution', () => {
     expect(parsed.value).toBe("val with 'apos' and \"quote\"\nand newline");
     expect(parsed.branch).toBe('feature/xyz');
     expect(parsed.head_sha).toBe('abc1234');
-  });
+  }, SHELL_TEST_TIMEOUT_MS);
 
   it('set omits branch/head_sha (non-git workspace) with jq REMOVED from PATH', async () => {
     const { status, jqCalled, body } = await runPlaybookSetNoJq(false);
@@ -1777,7 +1803,7 @@ describe('writePlaybookHelper live token resolution', () => {
     // Conditional keys omitted exactly as the old jq `if $br == "" then {}` did.
     expect('branch' in parsed).toBe(false);
     expect('head_sha' in parsed).toBe(false);
-  });
+  }, SHELL_TEST_TIMEOUT_MS);
 });
 
 // ── SHARED_LIFECYCLE_REMAINDER — byte size and category coverage ──────────────

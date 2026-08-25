@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
+import { TEST_PYTHON, requireTestPython } from './test-python.js';
 
 // Regression guard: production agent code must NOT hardcode branch decisions
 // against the literal 'main', 'automain', or a hardcoded 'blueprint' branch
@@ -33,17 +34,16 @@ interface ScanResult {
   stale_allowlist: Array<{ path: string; line: number; pattern: string; found: string }>;
 }
 
+// The scanner is a plain Python script, so ANY CPython 3 runs it identically.
+// Resolving through TEST_PYTHON keeps this guard live on a Windows dev host
+// (where CPython is installed as `python`, never `python3`) instead of dropping
+// the coverage; Linux CI still resolves the very same `python3` as before.
 function pythonAvailable(): boolean {
-  try {
-    const probe = spawnSync('python3', ['--version'], { encoding: 'utf-8' });
-    return !probe.error && probe.status === 0;
-  } catch {
-    return false;
-  }
+  return TEST_PYTHON !== null;
 }
 
 function runScanner(): ScanResult {
-  const result = spawnSync('python3', [SCANNER, '--surface', 'agent', '--root', SRC_DIR, '--json'], {
+  const result = spawnSync(requireTestPython('the branch-literal regression guard'), [SCANNER, '--surface', 'agent', '--root', SRC_DIR, '--json'], {
     encoding: 'utf-8',
   });
   if (result.status !== 0) {
@@ -63,12 +63,7 @@ const DEPS_PRESENT = fs.existsSync(SCANNER) && pythonAvailable();
 const scan: ScanResult | null = DEPS_PRESENT ? runScanner() : null;
 
 function requireDeps(): void {
-  if (!pythonAvailable()) {
-    throw new Error(
-      'python3 is required for the branch-literal regression guard but was not found on PATH.\n' +
-      'Install python3 (Linux CI always has it). Missing python3 silently drops critical coverage.',
-    );
-  }
+  requireTestPython('the branch-literal regression guard');
   if (!fs.existsSync(SCANNER)) {
     throw new Error(
       `branch_literal_compliance.py scanner not found at:\n  ${SCANNER}\n` +

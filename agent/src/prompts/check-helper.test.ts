@@ -1,5 +1,6 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
+import { POSIX_SHIM_SANDBOX_SUPPORTED } from '../test-python.js';
 import type { DirectoryConfig } from '../utils/test-runners.js';
 
 describe('tracked root check delegation contract', () => {
@@ -814,6 +815,8 @@ describe('writeCheckHelper — configured test commands', () => {
   });
 });
 
+// `runtime:` cases run the real ./check in a POSIX-shim sandbox — see test-python.ts.
+const itRuntime = POSIX_SHIM_SANDBOX_SUPPORTED ? it : it.skip;
 
 describe('writeCheckHelper — required backend-authoring verification', () => {
   let capturedScripts: Record<string, string> = {};
@@ -1307,7 +1310,7 @@ exit ${scenario.harnessExit}
       realFs.rmSync(dir, { recursive: true, force: true });
     }
   };
-  it('runtime: mints a receipt only after real-shaped Ruff and targeted Postgres evidence', async () => {
+  itRuntime('runtime: mints a receipt only after real-shaped Ruff and targeted Postgres evidence', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0, docker: true, harnessExit: 0, seedCapabilityReceipt: true,
     });
@@ -1328,7 +1331,7 @@ exit ${scenario.harnessExit}
     });
     expect(result.capabilityReceipt).toBeUndefined();
   });
-  it('runtime: combines changed tests with resolver output, filters deletions, and deduplicates', async () => {
+  itRuntime('runtime: combines changed tests with resolver output, filters deletions, and deduplicates', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: true,
@@ -1350,7 +1353,7 @@ exit ${scenario.harnessExit}
       pytest: { selectors: ['testing/test_bar.py', 'testing/test_x.py'] },
     });
   });
-  it('runtime: a nested opted-in project ignores non-Python-only changes', async () => {
+  itRuntime('runtime: a nested opted-in project ignores non-Python-only changes', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: false,
@@ -1362,7 +1365,7 @@ exit ${scenario.harnessExit}
     expect(result.stdout).not.toContain('no Python target');
     expect(result.receipt).toBeUndefined();
   });
-  it('runtime: an opted-in root project executes for repo-relative Python changes and fails closed', async () => {
+  itRuntime('runtime: an opted-in root project executes for repo-relative Python changes and fails closed', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'verify-authoring-1',
@@ -1397,7 +1400,7 @@ exit ${scenario.harnessExit}
       `backend_verification:runtime_unavailable:v1:${result.taskId}\n`,
     );
   });
-  it('runtime: an opted-in ./backend project executes for repo-relative Python changes and fails closed', async () => {
+  itRuntime('runtime: an opted-in ./backend project executes for repo-relative Python changes and fails closed', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'verify-authoring-1',
@@ -1428,7 +1431,7 @@ exit ${scenario.harnessExit}
       `backend_verification:runtime_unavailable:v1:${result.taskId}\n`,
     );
   });
-  it.each([
+  itRuntime.each([
     ['missing Ruff', { ruffExit: 1, docker: true, harnessExit: 0 }],
     ['daemonless Docker', { ruffExit: 0, docker: false, harnessExit: 0 }],
     ['Postgres harness failure', { ruffExit: 0, docker: true, harnessExit: 1 }],
@@ -1446,7 +1449,7 @@ exit ${scenario.harnessExit}
     }
     expect(result.stdout).toContain('FAIL');
   });
-  it('runtime: a blocking backend attribution receipt is retained with all buckets', async () => {
+  itRuntime('runtime: a blocking backend attribution receipt is retained with all buckets', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: true,
@@ -1472,7 +1475,7 @@ exit ${scenario.harnessExit}
       },
     });
   });
-  it.each(['missing', 'syntax-invalid'] as const)(
+  itRuntime.each(['missing', 'syntax-invalid'] as const)(
     'runtime: %s route helper cannot mint backend capability authority', async (routeHelper) => {
       const result = await runRequiredCheck(await render(), {
         ruffExit: 0, docker: true, harnessExit: 0, routeHelper, seedCapabilityReceipt: true,
@@ -1487,7 +1490,7 @@ exit ${scenario.harnessExit}
       expect(result.log).not.toContain('harness USE_TEST_POSTGRES=true');
     },
   );
-  it('runtime: baked sandbox venv + PG bindir select --sandbox-postgres without Docker', async () => {
+  itRuntime('runtime: baked sandbox venv + PG bindir select --sandbox-postgres without Docker', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: false,
@@ -1510,7 +1513,7 @@ exit ${scenario.harnessExit}
       },
     });
   });
-  it('runtime: PG bindir present but baked venv missing falls back to the Docker --postgres sidecar', async () => {
+  itRuntime('runtime: PG bindir present but baked venv missing falls back to the Docker --postgres sidecar', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: true,
@@ -1534,7 +1537,7 @@ exit ${scenario.harnessExit}
       },
     });
   });
-  it('runtime: PG bindir present but baked venv missing and no Docker fails closed', async () => {
+  itRuntime('runtime: PG bindir present but baked venv missing and no Docker fails closed', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: false,
