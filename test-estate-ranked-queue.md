@@ -11,10 +11,10 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 636 | 995,506 | 26,492 | 11,015.478s (630 files) | 6 |
+| backend | 636 | 995,901 | 26,493 | 11,015.478s (630 files) | 6 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
-| agent | 128 | 112,507 | 6,149 | 466.638s (128 files) | 0 |
+| agent | 128 | 112,694 | 6,151 | 466.638s (128 files) | 0 |
 
 The queue includes every currently collected backend, admin-ui unit, admin-ui viewport, and agent test file. Backend duration coverage is partial: an `unknown` cost is intentionally not treated as zero or ranked as cheap. Admin-ui and agent costs are complete directional signals from their committed artifacts. Protected Workday counts are copied verbatim from the manifest for reporting only; this generator never edits that manifest.
 
@@ -41,7 +41,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 17 | P2 | backend | `backend/testing/test_metrics_integrity_sweep.py` | 8,110 | 215 | critical (>5000 LOC) | 65.620s measured | — |
 | 18 | P2 | backend | `backend/testing/test_admin_routers__version_lifecycle.py` | 5,056 | 103 | critical (>5000 LOC) | 58.078s measured | — |
 | 19 | P2 | backend | `backend/testing/test_compute.py` | 9,201 | 187 | critical (>5000 LOC) | 57.415s measured | — |
-| 20 | P2 | backend | `backend/testing/test_orchestrator.py` | 18,423 | 361 | critical (>5000 LOC) | 57.238s measured | — |
+| 20 | P2 | backend | `backend/testing/test_orchestrator.py` | 18,818 | 362 | critical (>5000 LOC) | 57.238s measured | — |
 | 21 | P2 | backend | `backend/testing/test_compute_experiment_completion.py` | 7,103 | 132 | critical (>5000 LOC) | 55.582s measured | — |
 | 22 | P2 | backend | `backend/testing/test_knowledge_documents.py` | 6,801 | 164 | critical (>5000 LOC) | 48.488s measured | — |
 | 23 | P2 | backend | `backend/testing/test_release_reconciliation.py` | 8,324 | 141 | critical (>5000 LOC) | 43.934s measured | — |
@@ -209,7 +209,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 185 | P5 | agent | `agent/src/workspacePrep.test.ts` | 1,887 | 74 | moderate (1500–2999 LOC) | 0.122s measured | protected; declared floor 74 |
 | 186 | P5 | backend | `backend/testing/test_llm_runtime.py` | 1,885 | 47 | moderate (1500–2999 LOC) | 0.100s measured | — |
 | 187 | P5 | backend | `backend/testing/test_max_plan_pool_usage.py` | 2,499 | 96 | moderate (1500–2999 LOC) | 0.087s measured | — |
-| 188 | P5 | agent | `agent/src/prompts/pr-helper.test.ts` | 2,166 | 39 | moderate (1500–2999 LOC) | 0.081s measured | — |
+| 188 | P5 | agent | `agent/src/prompts/pr-helper.test.ts` | 2,353 | 41 | moderate (1500–2999 LOC) | 0.081s measured | — |
 | 189 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.utils.test.ts` | 1,622 | 168 | moderate (1500–2999 LOC) | 0.063s measured | — |
 | 190 | P5 | backend | `backend/testing/test_artifact_refs.py` | 1,546 | 29 | moderate (1500–2999 LOC) | 0.036s measured | — |
 | 191 | P5 | agent | `agent/src/prompt.format.test.ts` | 1,512 | 102 | moderate (1500–2999 LOC) | 0.032s measured | — |
