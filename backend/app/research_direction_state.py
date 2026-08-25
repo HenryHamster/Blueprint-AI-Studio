@@ -409,6 +409,7 @@ async def apply_post_spawn_state(
     parent_research_task_id: str | None,
     batch_cap_applied_count: int = 0,
     filtered_findings: List[Dict[str, Any]] | None = None,
+    type_routed_noop_count: int = 0,
     type_filtered_by_dir: dict | None = None,
     salvage_count: int = 0,
     adversarial_gate_deferred: List[Dict[str, Any]] | None = None,
@@ -472,6 +473,15 @@ async def apply_post_spawn_state(
         _filter_parts.append(f"{evidence_overlap_count} evidence-overlap")
     if type_filtered_count:
         _filter_parts.append(f"{type_filtered_count} type-filtered")
+    if type_routed_noop_count:
+        # A routed finding whose side effect did not land. Reported separately
+        # from ``type-filtered`` (which means routed AND applied) because the
+        # two are opposite outcomes: one documented something, the other threw
+        # a finding away. Before this part existed the no-op case incremented
+        # no counter at all, so a cycle that produced a finding and discarded
+        # it rendered character-for-character identical to one that genuinely
+        # found nothing.
+        _filter_parts.append(f"{type_routed_noop_count} type-routed no-op")
     if empty_prompt_count:
         _filter_parts.append(f"{empty_prompt_count} empty-prompt")
     _filter_str = f" ({', '.join(_filter_parts)} skipped)" if _filter_parts else ""
@@ -753,6 +763,7 @@ async def apply_post_spawn_state(
                                 did, 0
                             ),
                             "type_filtered": (type_filtered_by_dir or {}).get(did, 0),
+                            "type_routed_noop": type_routed_noop_count,
                             "empty_prompt": empty_prompt_count,
                             "salvage_count": salvage_count,
                             "adversarial_gate": adversarial_gate_by_dir.get(did, 0),

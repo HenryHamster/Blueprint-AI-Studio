@@ -3268,6 +3268,14 @@
           "old_cap": 2200,
           "new_cap": 2550
         }
+      ],
+      "discovery_review_packet.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T17:25:24.008230+00:00",
+          "old_cap": 1800,
+          "new_cap": 2200
+        }
       ]
     },
     "agent": {

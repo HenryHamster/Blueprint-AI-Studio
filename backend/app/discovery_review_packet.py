@@ -29,6 +29,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.research_execution_authority import withheld_findings_carry
 from app.task_capabilities import WRITE_TASK_TYPES
 from app.time_utils import _utcnow
 
@@ -134,6 +135,13 @@ DISCOVERY_REVIEW_KNOWLEDGE_DETAILS = 6
 DISCOVERY_REVIEW_LANDED_OUTCOMES = 4
 DISCOVERY_REVIEW_EXPERIMENT_DETAILS = 6
 DISCOVERY_REVIEW_VERIFICATION_DETAILS = 6
+DISCOVERY_REVIEW_WITHHELD_FINDING_DETAILS = 6
+# Serialization bound for one withheld finding's content. Sized above
+# ``research_execution_authority.WITHHELD_FINDING_CONTENT_CHARS`` plus key
+# overhead so a record the producer already bounded is never collapsed a second
+# time here -- a collapse would replace the per-field structure with an excerpt
+# blob. If one ever does collapse, it is reported, never absorbed.
+DISCOVERY_REVIEW_WITHHELD_CONTENT_CHARS = 1100
 # Budget-pressure degradation must never render a category that truly has
 # evidence as fully empty -- that is indistinguishable from "nothing
 # happened" to the reviewer and is exactly the defect this floor guards
@@ -1005,6 +1013,14 @@ _COLLECTION_DETAIL_CONFIG: dict[str, tuple[Any, str]] = {
         _slice_included_from_end,
         "latest_{count}_in_stable_task_order",
     ),
+    # Sliced from the START, like research_findings and unlike the "latest N"
+    # outcome collections: research completion already ordered these
+    # type-routed-before-dedup-filtered, so the front of the list is the part
+    # with no other durable surface at all.
+    "withheld_findings": (
+        _slice_included_from_start,
+        "first_{count}_in_stable_task_order",
+    ),
 }
 
 _COLLECTION_BASE_DETAIL_COUNTS: dict[str, int] = {
@@ -1013,6 +1029,7 @@ _COLLECTION_BASE_DETAIL_COUNTS: dict[str, int] = {
     "landed_outcomes": DISCOVERY_REVIEW_LANDED_OUTCOMES,
     "experiment_outcomes": DISCOVERY_REVIEW_EXPERIMENT_DETAILS,
     "verification_summaries": DISCOVERY_REVIEW_VERIFICATION_DETAILS,
+    "withheld_findings": DISCOVERY_REVIEW_WITHHELD_FINDING_DETAILS,
 }
 
 
@@ -1120,6 +1137,12 @@ def _assemble_receipt(
         "stranded_deliveries": stranded_deliveries[:DISCOVERY_REVIEW_LANDED_OUTCOMES],
         "experiment_outcomes": included["experiment_outcomes"],
         "verification_summaries": included["verification_summaries"],
+        # Findings the research cycle produced but did not turn into work --
+        # type-routed into the design doc / a direction row, or dedup-filtered
+        # against known work -- carried with their content and their reason.
+        # Before this collection existed they reached the reviewer as nothing
+        # at all, under a manifest reporting that nothing had been omitted.
+        "withheld_findings": included["withheld_findings"],
         "evidence_coverage": dict(evidence_coverage),
         "execution": execution,
         "missing_required_evidence": missing_reasons,
@@ -1142,6 +1165,15 @@ def _assemble_receipt(
         if evidence_truncated:
             receipt["evidence_truncated"] = evidence_truncated
     return receipt, binding_action_blockers
+
+
+# Coverage collections that are real, judgeable content about the COHORT but
+# not evidence about the BET. ``substantive_emptiness_reason_code`` skips them
+# when deciding whether the packet has anything to score the hypothesis
+# against; the manifest reports their counts separately so nothing is hidden.
+_NON_SUBSTANTIVE_COVERAGE_COLLECTIONS: frozenset[str] = frozenset(
+    {"withheld_findings"}
+)
 
 
 def substantive_emptiness_reason_code(
@@ -1181,9 +1213,21 @@ def substantive_emptiness_reason_code(
         # (work landed on a branch whose parent died before rollup), so the
         # packet is not empty even when every other collection is.
         return None
+    # ``withheld_findings`` is deliberately NOT counted as substance. It is the
+    # honest record of what the cycle threw away, which is precisely the
+    # material a recommission needs and precisely not an outcome to score the
+    # bet against: a design-doc observation does not tell the reviewer whether
+    # the hypothesis held. Counting it would silently undo the 2026-08-25
+    # recommission path (PR #17932) the moment this carry started arriving --
+    # the packet would look substantive, binding would be granted over content
+    # that answers no decision question, and the reviewer would be back at
+    # ask_operator. The manifest states the count outright instead, so "found
+    # nothing" and "found something and discarded it" are finally different
+    # readings rather than the same empty receipt.
     if any(
         int((coverage or {}).get("total_count") or 0) > 0
-        for coverage in evidence_coverage.values()
+        for name, coverage in evidence_coverage.items()
+        if name not in _NON_SUBSTANTIVE_COVERAGE_COLLECTIONS
     ):
         return None
     normalized_status = str(source_status or "").strip().upper()
@@ -1409,6 +1453,60 @@ async def build_discovery_review_packet(
         else []
     )
 
+    # Findings this cohort's research parents produced but did NOT turn into
+    # work. Built here, before the authority blockers, because a carry that
+    # overflowed its own bound is itself an authority blocker.
+    withheld_findings: list[dict[str, Any]] = []
+    withheld_total_count = 0
+    withheld_carry_omitted_count = 0
+    withheld_carry_omitted_checksums: list[str] = []
+    withheld_content_truncated = False
+    for task in tasks:
+        carry = withheld_findings_carry(task)
+        if not carry:
+            continue
+        withheld_total_count += int(carry["total_count"])
+        if carry["omitted_count"]:
+            withheld_carry_omitted_count += int(carry["omitted_count"])
+            withheld_carry_omitted_checksums.append(
+                f"{task.id}:{carry['omitted_checksum']}"
+            )
+        for record in carry["records"]:
+            bounded_content = _bounded_json_value(
+                record.get("content") or {},
+                max_chars=DISCOVERY_REVIEW_WITHHELD_CONTENT_CHARS,
+            )
+            # A second, packet-side cut should be unreachable given the
+            # producer's own bound, but if it happens it is folded into the
+            # record's own truncation flag rather than silently changing the
+            # shape of ``content`` under a manifest that says nothing was cut.
+            content_truncated = bool(record.get("content_truncated")) or (
+                isinstance(bounded_content, dict)
+                and bounded_content.get("truncated") is True
+            )
+            withheld_content_truncated = withheld_content_truncated or content_truncated
+            omitted_keys = [
+                str(key) for key in (record.get("content_omitted_keys") or [])
+            ]
+            withheld_findings.append(
+                {
+                    "source_task_id": str(task.id),
+                    "task_type": _task_type(task),
+                    "disposition": record.get("disposition"),
+                    "reason": record.get("reason"),
+                    "finding_type": record.get("finding_type"),
+                    "routed_to": record.get("routed_to"),
+                    "destination_id": record.get("destination_id"),
+                    "direction_id": record.get("direction_id"),
+                    "routing_applied": bool(record.get("routing_applied")),
+                    "content": bounded_content,
+                    "content_truncated": content_truncated,
+                    "content_omitted_keys": omitted_keys,
+                    "finding_checksum": record.get("finding_checksum"),
+                    "semantic_summary": _canonical_semantic_value(record),
+                }
+            )
+
     landed: list[dict[str, Any]] = []
     stranded_deliveries: list[dict[str, Any]] = []
     missing: list[str] = []
@@ -1436,6 +1534,22 @@ async def build_discovery_review_packet(
     # blocker so an operator reading the manifest can see which part of the
     # authority was actually lost, instead of only that some part was.
     authority_blockers: list[str] = []
+    if withheld_carry_omitted_count:
+        # Whole withheld records the research parent could not fit in its
+        # bounded carry. Unlike a shortened excerpt (reported, but not
+        # authority-bearing -- gating on prose fidelity is what stranded five
+        # directions at ask_operator on 2026-08-23), a dropped record is an
+        # item genuinely unaccounted for, which is the exact condition this
+        # packet already forbids binding on. It is NOT recorded as
+        # missing_required_evidence: that holds the cycle in EVIDENCE_PENDING
+        # with no review spawned at all, and no retry can shrink a finding, so
+        # the direction would starve forever waiting on evidence that cannot
+        # arrive.
+        authority_blockers.append(
+            f"{withheld_carry_omitted_count} withheld finding record(s) exceeded "
+            "the bounded research carry: "
+            + ", ".join(sorted(withheld_carry_omitted_checksums))[:240]
+        )
     if intent_authority_lost:
         authority_blockers.append(
             "intent authority exceeds the bounded decision contract: "
@@ -1595,6 +1709,7 @@ async def build_discovery_review_packet(
         "landed_outcomes": landed,
         "experiment_outcomes": experiments,
         "verification_summaries": verification_summaries,
+        "withheld_findings": withheld_findings,
     }
     included, evidence_coverage = _evidence_coverage_for_level(
         collections, _COLLECTION_BASE_DETAIL_COUNTS, level=0
@@ -1737,6 +1852,16 @@ async def build_discovery_review_packet(
         "required_evidence_omitted": bool(missing_reasons or binding_action_blockers),
         "intent_snapshot_truncated": intent_truncated,
         "bet_snapshot_truncated": bet_truncated,
+        # What the cycle produced but did not turn into work. A non-zero count
+        # under an otherwise empty receipt is the signature of the live defect
+        # this reports on: the parent DID find something, a filter routed or
+        # suppressed it, and every other collection reads zero. The reviewer
+        # now sees the count, the reason, and the content -- not a clean
+        # completeness signal over a void.
+        "withheld_finding_count": withheld_total_count,
+        "withheld_findings_carried_count": len(withheld_findings),
+        "withheld_findings_omitted_count": withheld_carry_omitted_count,
+        "withheld_finding_content_truncated": withheld_content_truncated,
         # Structural completeness and substantive content are different
         # questions. These two answer the second one so the decision boundary
         # can recommission an empty research bet instead of escalating it.

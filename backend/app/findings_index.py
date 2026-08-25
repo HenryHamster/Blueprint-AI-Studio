@@ -26,6 +26,9 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.research_execution_authority import (
+    FINALIZED_RESEARCH_FINDINGS_KEY as _FINALIZED_RESEARCH_FINDINGS_KEY,
+)
 from app.source_ref_validation import _parse_ref
 from app.time_utils import _utcnow
 
@@ -36,7 +39,11 @@ from app.time_utils import _utcnow
 # The completion path rewrites ``plan_output`` to the final surviving set and
 # stamps this marker only after spawn wiring is durable.  Index readers fail
 # closed for legacy/unfinalized tasks instead of reviving raw agent output.
-FINALIZED_RESEARCH_FINDINGS_KEY = "research_findings_finalized"
+#
+# Canonically defined in ``app.research_execution_authority`` (a leaf that
+# ``app.task_blocked`` imports, so the dependency only goes that way) and
+# re-exported here, where most readers already import it from.
+FINALIZED_RESEARCH_FINDINGS_KEY = _FINALIZED_RESEARCH_FINDINGS_KEY
 ACCEPTED_RESEARCH_FINDING_STATUSES = (
     TaskStatus.COMPLETED,
     TaskStatus.EVALUATING,
