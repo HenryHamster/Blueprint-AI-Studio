@@ -539,6 +539,12 @@
           "commit_date": "2026-08-24T22:38:49-07:00",
           "old_cap": 2050,
           "new_cap": 2500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T13:40:11.877642+00:00",
+          "old_cap": 2500,
+          "new_cap": 2900
         }
       ],
       "routers/admin_settings.py": [
@@ -4541,6 +4547,12 @@
           "commit_date": "2026-08-24T22:38:49-07:00",
           "old_cap": 2100,
           "new_cap": 2500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T13:40:11.877642+00:00",
+          "old_cap": 2500,
+          "new_cap": 2950
         }
       ],
       "test_dependency_contracts.py": [

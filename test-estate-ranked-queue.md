@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 632 | 992,252 | 26,433 | 11,015.490s (630 files) | 2 |
+| backend | 632 | 992,722 | 26,442 | 11,015.490s (630 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 126 | 112,206 | 6,131 | 72.062s (126 files) | 0 |
@@ -132,7 +132,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 108 | P5 | backend | `backend/testing/test_generated_shell.py` | 2,722 | 111 | moderate (1500–2999 LOC) | 23.466s measured | — |
 | 109 | P5 | backend | `backend/testing/test_admin_routers__notifications.py` | 1,595 | 54 | moderate (1500–2999 LOC) | 23.459s measured | — |
 | 110 | P5 | backend | `backend/testing/test_review_merge_authority.py` | 1,540 | 18 | moderate (1500–2999 LOC) | 23.223s measured | — |
-| 111 | P5 | backend | `backend/testing/test_discovery_review.py` | 2,173 | 47 | moderate (1500–2999 LOC) | 21.216s measured | — |
+| 111 | P5 | backend | `backend/testing/test_discovery_review.py` | 2,624 | 55 | moderate (1500–2999 LOC) | 21.216s measured | — |
 | 112 | P5 | backend | `backend/testing/test_admin_routers__strategic_directions.py` | 2,071 | 29 | moderate (1500–2999 LOC) | 20.878s measured | protected; declared floor 29 |
 | 113 | P5 | backend | `backend/testing/test_audit_finding_class_guards.py` | 2,064 | 35 | moderate (1500–2999 LOC) | 20.635s measured | — |
 | 114 | P5 | backend | `backend/testing/test_approved_pr_stranding.py` | 1,687 | 34 | moderate (1500–2999 LOC) | 20.351s measured | — |
@@ -186,7 +186,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 162 | P5 | admin-ui | `admin-ui/src/hooks/useTaskModal.test.ts` | 1,698 | 79 | moderate (1500–2999 LOC) | 0.848s measured | — |
 | 163 | P5 | agent | `agent/src/prompts/code-change-helpers.test.ts` | 1,900 | 90 | moderate (1500–2999 LOC) | 0.730s measured | — |
 | 164 | P5 | backend | `backend/testing/test_migration_chain.py` | 1,679 | 80 | moderate (1500–2999 LOC) | 0.714s measured | — |
-| 165 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,103 | 67 | moderate (1500–2999 LOC) | 0.565s measured | — |
+| 165 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,122 | 68 | moderate (1500–2999 LOC) | 0.565s measured | — |
 | 166 | P5 | backend | `backend/testing/test_dependency_contracts.py` | 1,804 | 44 | moderate (1500–2999 LOC) | 0.551s measured | — |
 | 167 | P5 | agent | `agent/src/handlers/strategic.test.ts` | 2,923 | 89 | moderate (1500–2999 LOC) | 0.532s measured | — |
 | 168 | P5 | agent | `agent/src/prompt.guidance.test.ts` | 2,153 | 176 | moderate (1500–2999 LOC) | 0.438s measured | — |

@@ -72,6 +72,14 @@ RETIRED_DIRECTION_STATUSES = frozenset(
     {"expired", "retired", "superseded", "completed"}
 )
 
+# Exact suffix a research parent stamps on its status when it settled COMPLETED
+# without producing a single actionable child. The discovery decision packet
+# reads this marker to classify a structurally complete but substantively empty
+# outcome receipt (see ``app.discovery_review_packet``), so the two sites must
+# not drift -- keep it a shared constant rather than two literals.
+RESEARCH_AUTO_COMPLETED_NO_ACTIONABLE_TASKS_SUFFIX = (
+    " — auto-completed (no actionable tasks)"
+)
 _EVICTED_FINDINGS_CAP = 50
 _ARCHIVED_DIAGNOSES_CAP = 50
 _DIAGNOSIS_MAX_CHARS = 500
@@ -1629,7 +1637,7 @@ async def _apply_terminal_transition(
 
         task.status = TaskStatus.COMPLETED
         task.latest_status_message = (
-            status_msg + " — auto-completed (no actionable tasks)"
+            status_msg + RESEARCH_AUTO_COMPLETED_NO_ACTIONABLE_TASKS_SUFFIX
         )
         task.context = {
             **(task.context or {}),

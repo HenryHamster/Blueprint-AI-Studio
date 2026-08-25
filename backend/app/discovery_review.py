@@ -39,10 +39,12 @@ from app.discovery_authority_reconciliation import (
 from app.discovery_review_packet import (
     DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS as _DECISION_SNAPSHOT_CHARS,
     DISCOVERY_REVIEW_MAX_PACKET_ITEMS as _MAX_PACKET_ITEMS,
+    DISCOVERY_SUBSTANTIVE_EMPTINESS_REASON_CODES,
     _canonical_json,
     _checksum,
     _enum_value,
     build_discovery_review_packet as _build_review_packet,
+    substantive_emptiness_reason_code,
 )
 from app.direction_priority import direction_task_priority
 from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
@@ -81,6 +83,24 @@ DISCOVERY_EVIDENCE_ESCALATION_GRACE = timedelta(hours=2)
 # (terminal discovery_review tasks on the cycle), not from mutable cycle
 # state, so a respawn wiping review_result cannot reset the budget.
 DISCOVERY_REVIEW_MAX_DECISION_ATTEMPTS = 3
+# Hard ceiling on how many times in a row the decision boundary may replace an
+# escalation with engine-authored successor work for one direction, counted
+# from the durable cycle lineage (``review_result.converted_from_ask_operator``
+# on consecutive prior generations) rather than a parallel counter column.
+#
+# Two: one re-run with the reviewer's own question sharpening the framing, one
+# more with a different framing. A third consecutive settle that still produces
+# nothing citable is evidence about the *bet*, not about the run, and the
+# bounded legible outcome is to park the direction with a terminal reason --
+# never to loop, and never to quietly hand the question back to a human.
+DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS = 2
+# Reason code stamped on the park that the ceiling produces. Same vocabulary
+# convention as ``app.discovery_admission`` reason codes.
+DISCOVERY_RECOMMISSION_CEILING_REACHED = "discovery_recommission_ceiling_reached"
+# Reason code for the pre-existing conversion: the packet carried evidence the
+# reviewer simply had not checked, so the engine commissioned the bounded
+# measurement it was already authorised to run.
+DISCOVERY_ESCALATION_WAS_ANSWERABLE = "discovery_escalation_was_answerable"
 
 _ACTIVE_COHORT_STATUSES = frozenset(
     {
@@ -1081,6 +1101,37 @@ def _normalize_next_bet(value: Any) -> dict[str, Any]:
     return next_bet
 
 
+def _binding_citations(
+    result: Mapping[str, Any],
+    decision_receipt_ids: set[str],
+) -> list[str]:
+    """Citations for an engine-authored binding verdict.
+
+    Every non-``ask_operator`` verdict must cite the current parent outcome
+    receipt, so any conversion has to add it to whatever the reviewer cited.
+    """
+
+    citations = [str(value) for value in result.get("evidence_citations") or []]
+    for receipt_id in sorted(decision_receipt_ids):
+        if receipt_id not in citations:
+            citations.append(receipt_id)
+    return citations[:_MAX_PACKET_ITEMS]
+
+
+def _annotated_summary(result: Mapping[str, Any], disposition: str) -> str:
+    """Keep the reviewer's own words and append why the engine overrode them.
+
+    Trims the reviewer's summary, never the disposition note: an audit that
+    cannot see why the verdict changed is worse than a shortened summary.
+    """
+
+    reviewer_summary = str(result.get("summary") or "").strip()
+    return (
+        f"{reviewer_summary[: max(4_000 - len(disposition) - 2, 0)]}\n\n"
+        f"{disposition}"
+    ).strip()[:4_000]
+
+
 def _convert_escalation_to_evidence_bet(
     result: Mapping[str, Any],
     *,
@@ -1116,13 +1167,7 @@ def _convert_escalation_to_evidence_bet(
     if not question:
         return dict(result), None
 
-    citations = [
-        str(value) for value in result.get("evidence_citations") or []
-    ]
-    for receipt_id in sorted(decision_receipt_ids):
-        if receipt_id not in citations:
-            citations.append(receipt_id)
-    citations = citations[:_MAX_PACKET_ITEMS]
+    citations = _binding_citations(result, decision_receipt_ids)
 
     next_bet = _normalize_next_bet(
         {
@@ -1151,17 +1196,10 @@ def _convert_escalation_to_evidence_bet(
         "bet instead of escalated to the operator. No pass/fail grade was "
         "recorded for the prior bet."
     )
-    # Trim the reviewer's own words, never the disposition note: an audit that
-    # cannot see why the verdict changed is worse than a shortened summary.
-    reviewer_summary = str(result.get("summary") or "").strip()
-    summary = (
-        f"{reviewer_summary[: max(4_000 - len(disposition) - 2, 0)]}\n\n"
-        f"{disposition}"
-    ).strip()[:4_000]
     converted = {
         **dict(result),
         "action": "advance",
-        "summary": summary,
+        "summary": _annotated_summary(result, disposition),
         "evidence_citations": citations,
         "next_bet": next_bet,
         "park_reason": None,
@@ -1170,11 +1208,313 @@ def _convert_escalation_to_evidence_bet(
     }
     conversion_record = {
         "reason": "binding_decision_allowed",
+        "reason_code": DISCOVERY_ESCALATION_WAS_ANSWERABLE,
+        "disposition": "evidence_bet",
         "original_action": "ask_operator",
         "original_operator_question": question[:2_000],
         "dispatched_bet_mode": "measure",
     }
     return converted, conversion_record
+
+
+def _prior_bet_framing(cycle: DiscoveryCycle) -> str:
+    """Best available one-line statement of the bet that produced nothing."""
+
+    snapshot = cycle.bet_snapshot or {}
+    for key in ("claim", "hypothesis", "decision_question"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:1_000]
+    direction = snapshot.get("direction")
+    if isinstance(direction, Mapping):
+        text = direction.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()[:1_000]
+    return f"the open research bet on direction {cycle.direction_key}"
+
+
+def packet_substantive_emptiness_reason_code(
+    payload: Mapping[str, Any],
+) -> str | None:
+    """Read why this decision packet has nothing to judge, or ``None``.
+
+    The manifest is authoritative: the packet builder classified emptiness at
+    build time with the whole cohort in hand. Decision tasks frozen before that
+    field existed are handled by re-deriving the answer from the parent-outcome
+    receipt already inside the packet, so an in-flight review degrades
+    gracefully instead of escalating.
+    """
+
+    manifest = payload.get("evidence_packet_manifest")
+    if isinstance(manifest, Mapping) and (
+        "substantive_emptiness_reason_code" in manifest
+    ):
+        code = manifest.get("substantive_emptiness_reason_code")
+        if isinstance(code, str) and code in DISCOVERY_SUBSTANTIVE_EMPTINESS_REASON_CODES:
+            return code
+        # Present and not a known code: the builder said "has substance".
+        return None
+    receipt = next(
+        (
+            item["evidence_metadata"].get("snapshot")
+            for item in payload.get("evidence_packet", [])
+            if isinstance(item, Mapping)
+            and item.get("semantic_role") == "parent_outcome"
+            and isinstance(item.get("evidence_metadata"), Mapping)
+        ),
+        None,
+    )
+    if not isinstance(receipt, Mapping):
+        return None
+    coverage = receipt.get("evidence_coverage")
+    source_parent = receipt.get("source_parent")
+    execution = receipt.get("execution")
+    if not isinstance(coverage, Mapping) or not isinstance(source_parent, Mapping):
+        return None
+    return substantive_emptiness_reason_code(
+        coverage,
+        source_status=source_parent.get("status"),
+        cohort_task_count=int(
+            (execution.get("task_count") or 0) if isinstance(execution, Mapping) else 0
+        ),
+        source_latest_status=source_parent.get("latest_status"),
+        stranded_delivery_count=len(receipt.get("stranded_deliveries") or []),
+    )
+
+
+async def _consecutive_recommissions(session, *, cycle: DiscoveryCycle) -> int:
+    """Count engine-authored escalation replacements ending at this cycle.
+
+    Walks the direction's own cycle lineage backwards from the generation
+    immediately before ``cycle`` and counts the unbroken run of prior cycles
+    whose verdict the engine authored in place of an escalation. A cycle the
+    reviewer decided on its own merits -- or an operator resolved -- breaks the
+    run, so a direction that is genuinely progressing never accumulates a
+    ceiling.
+
+    Uses the existing ``generation`` ordering plus the durable
+    ``review_result.converted_from_ask_operator`` record rather than adding a
+    counter column: that state already exists and cannot drift from the
+    decisions it counts.
+    """
+
+    prior = list(
+        (
+            await session.execute(
+                select(DiscoveryCycle)
+                .where(
+                    DiscoveryCycle.project_id == cycle.project_id,
+                    DiscoveryCycle.direction_key == cycle.direction_key,
+                    DiscoveryCycle.generation < cycle.generation,
+                )
+                .order_by(DiscoveryCycle.generation.desc())
+                .limit(DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS + 1)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    run = 0
+    for candidate in prior:
+        record = (candidate.review_result or {}).get("converted_from_ask_operator")
+        if not isinstance(record, Mapping):
+            break
+        run += 1
+    return run
+
+
+def _convert_escalation_to_recommission(
+    result: Mapping[str, Any],
+    *,
+    cycle: DiscoveryCycle,
+    decision_receipt_ids: set[str],
+    reason_code: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Re-run an empty research bet instead of asking a human about the void.
+
+    Reached when the packet granted binding authority *and* carried nothing to
+    judge -- every ``evidence_coverage`` count zero because the research parent
+    auto-completed with zero actionable tasks, or was killed by a platform
+    defect that carries no verdict about the work at all. On 2026-08-25 three
+    directions sat ineligible at once behind
+    ``discovery_ask_operator_awaiting_resolution`` in exactly this shape, every
+    one of them answerable from data the engine already held.
+
+    The reviewer is not overruled on the merits -- there were no merits to
+    judge. Its question is carried verbatim into the successor's
+    ``decision_question`` so the re-run is sharper than the run that produced
+    nothing, and the summary records why the verdict changed.
+
+    Distinct from ``_convert_escalation_to_evidence_bet``: that one dispatches a
+    bounded ``measure`` against evidence that exists but was not checked. There
+    is nothing here to measure, so the bet itself is re-commissioned.
+    """
+
+    if not decision_receipt_ids:
+        return dict(result), None
+    question = str(result.get("operator_question") or "").strip()
+    if not question:
+        return dict(result), None
+
+    framing = _prior_bet_framing(cycle)
+    next_bet = _normalize_next_bet(
+        {
+            "mode": "research",
+            "claim": (
+                "The prior research bet produced no citable outcome "
+                f"({reason_code}), so it is re-commissioned with the decision "
+                f"boundary's own unanswered question sharpening it: {framing}"
+            )[:2_000],
+            "decision_question": question[:2_000],
+            "success_evidence": (
+                "At least one citable outcome for this bet -- a recorded "
+                "research finding, knowledge document, landed change, "
+                "experiment receipt, or verification result -- that answers the "
+                "decision question in the next decision packet."
+            ),
+            "retirement_condition": (
+                "Retire this bet if a re-commissioned research root again "
+                "settles with no citable outcome; the decision boundary parks "
+                "the direction after "
+                f"{DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS} consecutive empty "
+                "re-commissions rather than re-commissioning again."
+            ),
+        }
+    )
+    disposition = (
+        "Engine disposition: this decision packet granted binding authority but "
+        f"carried no evidence to judge ({reason_code}), so the research bet was "
+        "re-commissioned rather than escalated to the operator. An empty "
+        "research result is a pipeline outcome, not an operator decision. No "
+        "pass/fail grade was recorded for the prior bet."
+    )
+    return (
+        {
+            **dict(result),
+            "action": "advance",
+            "summary": _annotated_summary(result, disposition),
+            "evidence_citations": _binding_citations(result, decision_receipt_ids),
+            "next_bet": next_bet,
+            "park_reason": None,
+            "resume_condition": None,
+            "operator_question": None,
+        },
+        {
+            "reason": "binding_decision_allowed",
+            "reason_code": reason_code,
+            "disposition": "recommission",
+            "original_action": "ask_operator",
+            "original_operator_question": question[:2_000],
+            "dispatched_bet_mode": "research",
+        },
+    )
+
+
+def _park_at_recommission_ceiling(
+    result: Mapping[str, Any],
+    *,
+    cycle: DiscoveryCycle,
+    decision_receipt_ids: set[str],
+    reason_code: str,
+    consecutive_recommissions: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Degrade to a bounded, legible park once re-commissioning is exhausted.
+
+    A recommission that can re-fire forever is a worse defect than the
+    escalation it replaces, so the ceiling has to land somewhere terminal. It
+    lands on ``park``, never back on ``ask_operator``: the direction stops
+    consuming research capacity, the reason code says exactly why, and an
+    operator who wants it back resumes it -- but nothing blocks on a human
+    answering a question the engine itself could not frame.
+    """
+
+    if not decision_receipt_ids:
+        return dict(result), None
+    question = str(result.get("operator_question") or "").strip()
+    park_reason = (
+        f"Discovery re-commission ceiling reached for {cycle.direction_key}: "
+        f"{consecutive_recommissions} consecutive engine re-commissions each "
+        f"settled with no citable outcome ({reason_code}). Parked rather than "
+        "re-commissioned again or escalated."
+        + (f" Reviewer's unanswered question: {question}" if question else "")
+    )[:2_000]
+    disposition = (
+        "Engine disposition: the re-commission ceiling "
+        f"({DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS}) was reached, so the "
+        "direction was parked with a terminal reason instead of looping or "
+        "escalating."
+    )
+    return (
+        {
+            **dict(result),
+            "action": "park",
+            "summary": _annotated_summary(result, disposition),
+            "evidence_citations": _binding_citations(result, decision_receipt_ids),
+            "next_bet": None,
+            "park_reason": park_reason,
+            "resume_condition": (
+                "Resume once the bet is re-framed by hand, or once the platform "
+                "defect that starved its research parent is fixed and the "
+                "direction is worth re-running."
+            ),
+            "operator_question": None,
+        },
+        {
+            "reason": "binding_decision_allowed",
+            "reason_code": DISCOVERY_RECOMMISSION_CEILING_REACHED,
+            "emptiness_reason_code": reason_code,
+            "disposition": "recommission_ceiling_park",
+            "original_action": "ask_operator",
+            "original_operator_question": question[:2_000],
+            "consecutive_recommissions": consecutive_recommissions,
+            "dispatched_bet_mode": None,
+        },
+    )
+
+
+async def _replace_authorised_escalation(
+    session,
+    result: Mapping[str, Any],
+    *,
+    cycle: DiscoveryCycle,
+    payload: Mapping[str, Any],
+    decision_receipt_ids: set[str],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Route one authorised ``ask_operator`` to the disposition it deserves.
+
+    Three outcomes, in priority order:
+
+    * the re-commission ceiling is spent -> park with a terminal reason;
+    * the packet carries nothing to judge -> re-commission the research bet;
+    * the packet carries evidence the reviewer did not check -> dispatch the
+      bounded measurement (the pre-existing conversion).
+
+    Genuine judgement calls never reach here. They arrive on packets that
+    withhold binding authority, and ``ask_operator`` stays reachable for them.
+    """
+
+    emptiness_reason_code = packet_substantive_emptiness_reason_code(payload)
+    consecutive = await _consecutive_recommissions(session, cycle=cycle)
+    if consecutive >= DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS:
+        return _park_at_recommission_ceiling(
+            result,
+            cycle=cycle,
+            decision_receipt_ids=decision_receipt_ids,
+            reason_code=emptiness_reason_code or DISCOVERY_ESCALATION_WAS_ANSWERABLE,
+            consecutive_recommissions=consecutive,
+        )
+    if emptiness_reason_code is not None:
+        return _convert_escalation_to_recommission(
+            result,
+            cycle=cycle,
+            decision_receipt_ids=decision_receipt_ids,
+            reason_code=emptiness_reason_code,
+        )
+    return _convert_escalation_to_evidence_bet(
+        result,
+        cycle=cycle,
+        decision_receipt_ids=decision_receipt_ids,
+    )
 
 
 def parse_discovery_review_result(raw: str | Mapping[str, Any]) -> dict[str, Any]:
@@ -1822,13 +2162,16 @@ async def complete_discovery_review(
                 "incomplete packet semantics permit only ask_operator"
             )
         if result["action"] == "ask_operator" and binding_decision_allowed:
-            # The reviewer had the authority to commission exactly the work it
-            # asked permission for, so convert the escalation into the bounded
-            # measurement bet that acquires the missing evidence. See
-            # _convert_escalation_to_evidence_bet for the incident this closes.
-            result, escalation_conversion = _convert_escalation_to_evidence_bet(
+            # The reviewer held the authority to commission exactly the work it
+            # asked permission for, so the escalation is replaced by the
+            # disposition the packet actually warrants -- a bounded measurement,
+            # a re-commissioned research bet, or a terminal park at the ceiling.
+            # See _replace_authorised_escalation for the incidents this closes.
+            result, escalation_conversion = await _replace_authorised_escalation(
+                session,
                 result,
                 cycle=cycle,
+                payload=payload,
                 decision_receipt_ids=decision_receipt_ids,
             )
             cited_ids = {
@@ -1935,6 +2278,21 @@ async def complete_discovery_review(
             "successor_spawn_request_id": str(request.id) if request else None,
             "policy_status": (
                 "successor_requested" if action == "advance" else action
+            ),
+            # Surface the reason, not just the state: an operator reading the
+            # feed must be able to tell an advance the reviewer chose from one
+            # the engine authored in place of an escalation, and why.
+            **(
+                {
+                    "escalation_replacement_reason_code": escalation_conversion[
+                        "reason_code"
+                    ],
+                    "escalation_replacement_disposition": escalation_conversion[
+                        "disposition"
+                    ],
+                }
+                if escalation_conversion is not None
+                else {}
             ),
         },
         wake_resident=False,

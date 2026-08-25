@@ -47,6 +47,29 @@ DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS = 2_000
 # than this; only a cohort so numerous that even this floor cannot be paid
 # for every item leaves an item genuinely unaccounted for.
 DISCOVERY_REVIEW_SEMANTIC_DIGEST_MIN_ITEM_CHARS = 40
+# Machine-readable reason codes for a decision packet that is structurally
+# complete -- binding authority granted, nothing omitted, every required
+# evidence slot accounted for -- and yet carries nothing for the reviewer to
+# judge. They deliberately follow the ``reason_code`` vocabulary convention of
+# ``app.discovery_admission`` so an operator reading ``tasks autonomy-debug``
+# sees the same shape of code for "why did this direction not move" whether the
+# answer came from admission or from the decision packet.
+#
+# An empty research result is a pipeline outcome, not an operator decision, so
+# these codes exist to route the verdict to a bounded recommission instead of
+# ``ask_operator`` -- see ``app.discovery_review``.
+DISCOVERY_EMPTY_EVIDENCE_COVERAGE = "discovery_empty_evidence_coverage"
+DISCOVERY_PARENT_AUTO_COMPLETED_ZERO_TASKS = (
+    "discovery_parent_auto_completed_zero_tasks"
+)
+DISCOVERY_PARENT_PLATFORM_FAILED = "discovery_parent_platform_failed"
+DISCOVERY_SUBSTANTIVE_EMPTINESS_REASON_CODES = frozenset(
+    {
+        DISCOVERY_EMPTY_EVIDENCE_COVERAGE,
+        DISCOVERY_PARENT_AUTO_COMPLETED_ZERO_TASKS,
+        DISCOVERY_PARENT_PLATFORM_FAILED,
+    }
+)
 # Which top-level snapshot keys carry decision authority -- the content the
 # reviewer must hold whole to bind advance/park/stop instead of handing the
 # question back to a human. Everything outside these sets is framing the
@@ -1121,6 +1144,69 @@ def _assemble_receipt(
     return receipt, binding_action_blockers
 
 
+def substantive_emptiness_reason_code(
+    evidence_coverage: Mapping[str, Mapping[str, Any]],
+    *,
+    source_status: str | None,
+    cohort_task_count: int,
+    source_latest_status: str | None = None,
+    stranded_delivery_count: int = 0,
+) -> str | None:
+    """Classify a structurally complete packet that carries nothing to judge.
+
+    ``binding_decision_allowed`` answers "was the evidence carried whole?",
+    never "is there any evidence?". A research parent that auto-completed with
+    zero actionable tasks, or that was killed by a platform defect, yields a
+    receipt whose every collection is empty: nothing was omitted, so the
+    manifest correctly reports ``missing_required_evidence: []`` and grants
+    binding authority over a void. The reviewer then escalates -- and on
+    2026-08-25 three directions at once sat ineligible behind
+    ``discovery_ask_operator_awaiting_resolution`` with ``binding_allowed=yes``,
+    each answerable in under a minute from data the engine already had.
+
+    Returns ``None`` when the packet carries substance (the overwhelmingly
+    common case), otherwise the reason code naming *why* it is empty. The
+    caller uses that code to recommission the research bet rather than hand the
+    question to a human: an empty research result is a pipeline outcome, not an
+    operator decision.
+
+    Deliberately distinct from the packet-truncation class. Truncation revokes
+    binding authority (``binding_decision_allowed`` false) and is not this
+    function's business; this only ever fires on a packet that was carried
+    whole.
+    """
+
+    if stranded_delivery_count:
+        # A stranded delivery is a real, judgeable finding about the cohort
+        # (work landed on a branch whose parent died before rollup), so the
+        # packet is not empty even when every other collection is.
+        return None
+    if any(
+        int((coverage or {}).get("total_count") or 0) > 0
+        for coverage in evidence_coverage.values()
+    ):
+        return None
+    normalized_status = str(source_status or "").strip().upper()
+    if source_status is None or normalized_status in {
+        str(_enum_value(TaskStatus.FAILED)).upper(),
+        str(_enum_value(TaskStatus.CANCELLED)).upper(),
+    }:
+        # A platform/infrastructure kill carries no verdict about the work --
+        # "Re-evaluation limit reached (2 attempts)", an AGENT_TIMEOUT, or the
+        # approval-gate timeout. There is nothing here for an operator to
+        # decide either.
+        return DISCOVERY_PARENT_PLATFORM_FAILED
+    from app.research_direction_state import (
+        RESEARCH_AUTO_COMPLETED_NO_ACTIONABLE_TASKS_SUFFIX,
+    )
+
+    if cohort_task_count <= 1 or str(source_latest_status or "").endswith(
+        RESEARCH_AUTO_COMPLETED_NO_ACTIONABLE_TASKS_SUFFIX
+    ):
+        return DISCOVERY_PARENT_AUTO_COMPLETED_ZERO_TASKS
+    return DISCOVERY_EMPTY_EVIDENCE_COVERAGE
+
+
 def _truncate_prose(value: Any, *, max_chars: int) -> Any:
     """Recursively cap every string leaf of an already-built item.
 
@@ -1624,6 +1710,13 @@ async def build_discovery_review_packet(
         head_sha=landed_sha,
         snapshot=receipt,
     )
+    emptiness_reason_code = substantive_emptiness_reason_code(
+        evidence_coverage,
+        source_status=source_parent["status"],
+        cohort_task_count=len(tasks),
+        source_latest_status=source_parent["latest_status"],
+        stranded_delivery_count=len(stranded_deliveries),
+    )
     manifest = {
         "version": DISCOVERY_REVIEW_PACKET_VERSION,
         "source_research_task_id": str(cycle.source_research_task_id),
@@ -1644,6 +1737,11 @@ async def build_discovery_review_packet(
         "required_evidence_omitted": bool(missing_reasons or binding_action_blockers),
         "intent_snapshot_truncated": intent_truncated,
         "bet_snapshot_truncated": bet_truncated,
+        # Structural completeness and substantive content are different
+        # questions. These two answer the second one so the decision boundary
+        # can recommission an empty research bet instead of escalating it.
+        "evidence_substantively_empty": emptiness_reason_code is not None,
+        "substantive_emptiness_reason_code": emptiness_reason_code,
     }
     manifest_item = await _get_or_add_evidence(
         session,
