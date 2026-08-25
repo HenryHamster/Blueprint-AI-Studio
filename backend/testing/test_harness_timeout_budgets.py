@@ -40,6 +40,7 @@ Runs under --noconftest (no DB, no conftest fixtures).
 """
 
 import ast
+import os
 import re
 from pathlib import Path
 
@@ -100,11 +101,44 @@ def _repo_root() -> Path:
     return here.parents[1]
 
 
+def _repo_root_is_checkout() -> bool:
+    """True when _repo_root() found a real checkout rather than falling back."""
+    here = Path(__file__).resolve()
+    return any((c / "backend" / "testing").is_dir() for c in here.parents)
+
+
 REPO_ROOT = _repo_root()
 BACKEND_TESTING = REPO_ROOT / "backend" / "testing"
 if not BACKEND_TESTING.is_dir():
     BACKEND_TESTING = Path(__file__).resolve().parent
-SCRIPTS_DIR = REPO_ROOT / "scripts"
+def _scripts_dir() -> Path:
+    """Locate the scripts/ TEST corpus -- not merely a directory named scripts.
+
+    ``.is_dir()`` cannot tell these three layouts apart, and picking the wrong
+    one is how this guard went half-blind:
+
+    * developer checkout -- ``<root>/scripts`` holds the corpus.
+    * containerised lanes -- ``_repo_root()`` falls back to ``/app``, which is
+      the bind-mounted ``backend/``. ``/app/scripts`` therefore resolves to
+      ``backend/scripts``: seven analysis helpers and ZERO ``test_*.py``. The
+      directory exists, so an ``.is_dir()`` skip never fires and the corpus
+      floor asserts ``0 >= 25``. Same shape as ``.git`` being a FILE in a
+      linked worktree (#17872) -- the existence check succeeds while the thing
+      the guard actually needs is absent.
+    * both Docker lanes mount the real checkout read-only at ``/repo``
+      (scripts/test-backend.sh, "Mount the repo root read-only"), so the corpus
+      IS reachable there. Skipping would have silenced a guard that can run.
+
+    Select by the corpus itself, then. Fall back to the canonical path so the
+    failure messages still name where we looked.
+    """
+    for candidate in (REPO_ROOT / "scripts", Path("/repo") / "scripts"):
+        if any(candidate.glob("test_*.py")):
+            return candidate
+    return REPO_ROOT / "scripts"
+
+
+SCRIPTS_DIR = _scripts_dir()
 
 
 def _iter_test_files() -> list[tuple[str, Path]]:
@@ -271,8 +305,19 @@ def test_no_subprocess_timeout_exceeds_its_lane_budget() -> None:
     for root_label, floors in _ROOT_FLOORS.items():
         counts = coverage.get(root_label)
         if counts is None:
-            # scripts/ is genuinely absent inside the backend Docker image; the
-            # standalone lane covers it from the checkout.
+            # Both Docker lanes mount the real checkout read-only at /repo, and
+            # the CI shards pass CI=true, so a missing root there means a broken
+            # mount -- not a layout without that corpus. Refusing to skip in CI
+            # is the house convention (test_local_runner_terminal_log.py::
+            # _require_local_runner_path). Outside CI, an ad-hoc environment
+            # without the checkout may legitimately lack a root.
+            if os.getenv("CI"):
+                pytest.fail(
+                    f"corpus root {root_label!r} was not scanned at all under "
+                    f"CI. Looked for backend/testing under {BACKEND_TESTING} "
+                    f"and scripts under {SCRIPTS_DIR}. Mount the repo root at "
+                    f"/repo so this invariant enforces instead of vanishing."
+                )
             continue
         assert counts["files"] >= floors["files"], (
             f"only {counts['files']} test files scanned under {root_label}; "
@@ -468,11 +513,31 @@ def test_scripts_lane_file_budgets_clear_their_own_timeout_markers() -> None:
     smaller number. Either the per-file budget clears the marker with grace, or
     the marker comes down.
     """
-    if not SCRIPTS_DIR.is_dir():
-        pytest.skip(
-            "scripts/ absent in this layout: the Docker test image carries "
-            "backend/ as /app only, so the scripts lane does not run here"
+    corpus = sorted(SCRIPTS_DIR.glob("test_*.py"))
+    if not corpus:
+        # Gate on the CORPUS, never on `.is_dir()`: see _scripts_dir(). A
+        # layout with no scripts/test_*.py anywhere genuinely has no scripts
+        # lane to police -- but only say so when we are not in a checkout,
+        # because in a checkout an empty corpus means the glob broke and that
+        # must fail loudly instead of skipping.
+        assert not _repo_root_is_checkout(), (
+            f"no scripts/test_*.py under {SCRIPTS_DIR} despite running from a "
+            f"real checkout rooted at {REPO_ROOT}: the corpus glob is broken, "
+            f"not absent."
         )
+        missing = (
+            f"no scripts/ test corpus in this layout (looked under "
+            f"{SCRIPTS_DIR} and /repo/scripts)"
+        )
+        if os.getenv("CI"):
+            # House convention: never skip a corpus guard in CI. Every CI lane
+            # that runs this file mounts the checkout at /repo, so a miss here
+            # is a broken mount, and skipping would retire the guard silently.
+            pytest.fail(
+                missing + " -- refusing to skip in CI: mount the repo root at "
+                "/repo so the scripts lane budgets enforce in the merge gate."
+            )
+        pytest.skip(missing + ", so the scripts lane does not run here")
     if not _SCRIPTS_LANE.is_file():
         pytest.skip(f"{_SCRIPTS_LANE.name} absent in this layout")
 
@@ -481,7 +546,7 @@ def test_scripts_lane_file_budgets_clear_their_own_timeout_markers() -> None:
 
     scanned = 0
     offenders: list[str] = []
-    for path in sorted(SCRIPTS_DIR.glob("test_*.py")):
+    for path in corpus:
         scanned += 1
         if path.name in exempt:
             continue
