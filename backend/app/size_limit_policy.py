@@ -904,6 +904,8 @@ def _read_git_bump_history(module_key: str) -> list[BumpRecord] | None:
         result = subprocess.run(
             [
                 "git",
+                "-c",
+                f"safe.directory={_REPO_ROOT}",
                 "log",
                 _mainline_git_ref(),
                 "--format=COMMIT %H %aI",

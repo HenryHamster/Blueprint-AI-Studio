@@ -1821,9 +1821,19 @@ def test_mainline_ref_scope_excludes_non_ancestor_bumps(tmp_path, mocker):
         "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
     ):
         assert slp._mainline_git_ref() == "main"
+        real_run = subprocess.run
+        git_calls = []
+
+        def record_git_call(args, *call_args, **call_kwargs):
+            if args and args[0] == "git":
+                git_calls.append(args)
+            return real_run(args, *call_args, **call_kwargs)
+
+        mocker.patch.object(slp.subprocess, "run", side_effect=record_git_call)
         records = slp._read_git_bump_history("m.py")
         assert records is not None
         assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
+        assert ["-c", f"safe.directory={repo}"] == git_calls[-1][1:3]
 
         # Prove the test would have caught the old --all behavior: the abandoned
         # branch bump is visible under --all but must stay out of the

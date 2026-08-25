@@ -4559,14 +4559,6 @@
           "new_cap": 5600
         }
       ],
-      "test_size_offender_governance.py": [
-        {
-          "commit_sha": "0de0797342187e6fb036cb0537ec16270c311d63",
-          "commit_date": "2026-08-10T21:01:55+00:00",
-          "old_cap": 1800,
-          "new_cap": 2100
-        }
-      ],
       "test_review_loop_convergence.py": [
         {
           "commit_sha": "57d795162573a600b2aecc14b16cc095763026f2",
@@ -4723,6 +4715,20 @@
           "commit_date": "2026-08-25T00:43:40-07:00",
           "old_cap": 14250,
           "new_cap": 16650
+        }
+      ],
+      "test_size_offender_governance.py": [
+        {
+          "commit_sha": "0de0797342187e6fb036cb0537ec16270c311d63",
+          "commit_date": "2026-08-10T21:01:55+00:00",
+          "old_cap": 1800,
+          "new_cap": 2100
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-25T11:33:04.861601+00:00",
+          "old_cap": 2100,
+          "new_cap": 2450
         }
       ]
     },
