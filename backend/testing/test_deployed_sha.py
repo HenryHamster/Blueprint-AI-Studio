@@ -15,32 +15,46 @@ from typing import ClassVar
 import pytest
 
 from app import deployed_sha
+from testing.repo_scripts_path import (
+    SCRIPTS_DIR_ENV,
+    SCRIPTS_DIR_SENTINEL,
+    resolve_scripts_dir,
+)
+
+
+# Back-compat alias for this module's original override name. The canonical
+# resolver's own variable (BLUEPRINT_SCRIPTS_DIR) is preferred; this one is
+# still honoured because it is the spelling this file has always documented and
+# the one its override test pins.
+_LEGACY_SCRIPTS_DIR_ENV = "BLUEPRINT_REPO_SCRIPTS_DIR"
+
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _resolve_scripts_dir() -> Path:
-    """Locate the repo ``scripts/`` dir across local + Docker test environments.
+    """Locate the repo ``scripts/`` dir via the shared resolver, or fail loudly.
 
-    Candidates, in order: an explicit env override, the ``/repo`` bind-mount,
-    then the repo root two levels above ``backend/testing/``. The CI backend
-    shards and ``scripts/test-backend.sh`` build the image from ``backend/``
-    alone (``COPY . .`` → ``/app``) and mount the repo root read-only at
-    ``/repo`` — so inside that image ``parents[2]`` is the filesystem root and
-    ``/scripts`` does not exist; the repo ``scripts/`` is reachable only via
-    ``/repo/scripts``. Local/plain checkouts resolve via ``parents[2]``.
-    Mirrors ``test_local_runner_terminal_log._resolve_local_runner_path``.
+    Delegates to :func:`testing.repo_scripts_path.resolve_scripts_dir` so this
+    module probes exactly the candidates (and applies exactly the sentinel
+    predicate) that every other scripts-importing site does, rather than
+    keeping a private copy that can drift. The only local addition is the
+    legacy ``BLUEPRINT_REPO_SCRIPTS_DIR`` override spelling.
+
+    A miss RAISES with the resolver's named reason. It must not degrade to a
+    "plausible" path: the module-level ``_load_blueprint_script()`` below and
+    the ``_REPO_ROOT``-rooted corpus walks would then either die with a bare
+    ``FileNotFoundError`` naming nothing, or -- worse -- walk a nonexistent
+    tree, find zero files, and pass vacuously.
     """
-    candidates = []
-    env_override = os.getenv("BLUEPRINT_REPO_SCRIPTS_DIR")
-    if env_override:
-        candidates.append(Path(env_override))
-    candidates.append(Path("/repo/scripts"))
-    candidates.append(Path(__file__).resolve().parents[2] / "scripts")
-    for path in candidates:
-        if (path / "blueprint_api.py").is_file():
-            return path
-    # Fall back to the plain-checkout path so a genuine miss surfaces a clear
-    # FileNotFoundError naming the expected location rather than a bare None.
-    return candidates[-1]
+    scripts_dir, unavailable = resolve_scripts_dir(
+        _BACKEND_DIR,
+        env_override=os.getenv(SCRIPTS_DIR_ENV) or os.getenv(_LEGACY_SCRIPTS_DIR_ENV),
+    )
+    if scripts_dir is None:
+        raise RuntimeError(
+            f"{unavailable} (this module also accepts {_LEGACY_SCRIPTS_DIR_ENV})"
+        )
+    return Path(scripts_dir)
 
 
 _SCRIPTS_DIR = _resolve_scripts_dir()
@@ -55,6 +69,13 @@ _REPO_ROOT = _SCRIPTS_DIR.parent
 _NON_SOURCE_DIR_NAMES = frozenset(
     {".git", "node_modules", "__pycache__", "dist", "build", "coverage"}
 )
+
+# Non-vacuity floor for the operator-docs corpus, as a literal well below the
+# real count (docs/ alone carries hundreds of .md files) so ordinary churn
+# never trips it but a mis-resolved root always does. Deliberately NOT derived
+# from the scan it polices -- that is the self-certification this floor exists
+# to prevent.
+_OPERATOR_CORPUS_FLOOR = 50
 
 
 def _iter_source_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
@@ -78,14 +99,43 @@ def _iter_source_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
     return found
 
 
-def test_scripts_dir_honors_explicit_override(tmp_path, monkeypatch):
+def test_scripts_dir_honors_both_override_spellings(tmp_path, monkeypatch):
+    """Either override name points this module at an explicit scripts tree.
+
+    The fixture plants ``SCRIPTS_DIR_SENTINEL`` because that is the predicate
+    the SHARED resolver applies -- a directory is the repo's ``scripts/`` only
+    when it carries the sentinel, never merely because it exists. Both env
+    spellings are pinned: the canonical one every other site uses, and the
+    legacy one this module has always documented.
+    """
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
+    (scripts_dir / SCRIPTS_DIR_SENTINEL).touch()
     (scripts_dir / "blueprint_api.py").touch()
     (scripts_dir / "blueprint.py").touch()
-    monkeypatch.setenv("BLUEPRINT_REPO_SCRIPTS_DIR", str(scripts_dir))
 
-    assert _resolve_scripts_dir() == scripts_dir
+    for env_name in (SCRIPTS_DIR_ENV, _LEGACY_SCRIPTS_DIR_ENV):
+        monkeypatch.delenv(SCRIPTS_DIR_ENV, raising=False)
+        monkeypatch.delenv(_LEGACY_SCRIPTS_DIR_ENV, raising=False)
+        monkeypatch.setenv(env_name, str(scripts_dir))
+        assert _resolve_scripts_dir() == scripts_dir, (
+            f"{env_name} did not win over the ambient layout"
+        )
+
+
+def test_scripts_dir_rejects_an_override_without_the_sentinel(tmp_path, monkeypatch):
+    """A bogus override must NOT be accepted just because the directory exists.
+
+    This is the vacuous-resolution direction: if mere existence sufficed, an
+    override pointing anywhere would resolve, ``_REPO_ROOT`` would become that
+    directory's parent, and the corpus walks below would scan an empty tree and
+    pass while enforcing nothing.
+    """
+    bogus = tmp_path / "not-scripts"
+    bogus.mkdir()
+    monkeypatch.setenv(SCRIPTS_DIR_ENV, str(bogus))
+
+    assert _resolve_scripts_dir() != bogus
 
 
 def test_source_walk_skips_node_modules_but_keeps_root_configs(tmp_path):
@@ -178,6 +228,16 @@ def test_operator_docs_do_not_revoke_bootstrap_removed_sudoers_grant():
         *_iter_source_files(_REPO_ROOT / "docs", (".md",)),
         *_iter_source_files(_REPO_ROOT / "admin-ui", (".ts", ".tsx")),
     ]
+    # Never pass vacuously (#17872). ``os.walk`` over a directory that does not
+    # exist yields NOTHING and raises nothing, so a mis-resolved ``_REPO_ROOT``
+    # would leave this list empty and the ``stale_lines == []`` assertion below
+    # would hold no matter what the docs actually say.
+    assert len(operator_files) >= _OPERATOR_CORPUS_FLOOR, (
+        f"scanned only {len(operator_files)} operator files under {_REPO_ROOT} "
+        f"against a floor of {_OPERATOR_CORPUS_FLOOR}: this guard read almost "
+        f"nothing and would have passed regardless of the docs. Check that "
+        f"{_REPO_ROOT}/docs and {_REPO_ROOT}/admin-ui are the real trees."
+    )
     stale_instruction = re.compile(
         rf"\brevoke\b[^.\n]*{re.escape(legacy_path)}", re.IGNORECASE
     )

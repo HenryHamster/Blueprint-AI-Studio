@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 636 | 995,506 | 26,492 | 11,015.478s (630 files) | 6 |
+| backend | 637 | 996,611 | 26,505 | 11,015.478s (630 files) | 7 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 128 | 112,507 | 6,149 | 466.638s (128 files) | 0 |
@@ -30,8 +30,8 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 6 | P2 | backend | `backend/testing/test_reaper.py` | 21,152 | 492 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 492 |
 | 7 | P2 | backend | `backend/testing/test_research_completion.py` | 23,914 | 531 | critical (>5000 LOC) | 137.469s measured | — |
 | 8 | P2 | backend | `backend/testing/test_autonomous_research.py` | 20,226 | 393 | critical (>5000 LOC) | 125.162s measured | — |
-| 9 | P2 | backend | `backend/testing/test_invariants.py` | 15,802 | 278 | critical (>5000 LOC) | 120.389s measured | — |
-| 10 | P2 | backend | `backend/testing/test_local_runner.py` | 14,057 | 348 | critical (>5000 LOC) | 111.153s measured | — |
+| 9 | P2 | backend | `backend/testing/test_invariants.py` | 15,806 | 278 | critical (>5000 LOC) | 120.389s measured | — |
+| 10 | P2 | backend | `backend/testing/test_local_runner.py` | 14,056 | 348 | critical (>5000 LOC) | 111.153s measured | — |
 | 11 | P2 | backend | `backend/testing/test_digest.py` | 11,003 | 231 | critical (>5000 LOC) | 86.555s measured | — |
 | 12 | P2 | backend | `backend/testing/test_directions.py` | 11,762 | 339 | critical (>5000 LOC) | 79.334s measured | — |
 | 13 | P2 | backend | `backend/testing/test_strategic_resident_session.py` | 5,475 | 85 | critical (>5000 LOC) | 77.770s measured | protected; declared floor 85 |
@@ -41,7 +41,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 17 | P2 | backend | `backend/testing/test_metrics_integrity_sweep.py` | 8,110 | 215 | critical (>5000 LOC) | 65.620s measured | — |
 | 18 | P2 | backend | `backend/testing/test_admin_routers__version_lifecycle.py` | 5,056 | 103 | critical (>5000 LOC) | 58.078s measured | — |
 | 19 | P2 | backend | `backend/testing/test_compute.py` | 9,201 | 187 | critical (>5000 LOC) | 57.415s measured | — |
-| 20 | P2 | backend | `backend/testing/test_orchestrator.py` | 18,423 | 361 | critical (>5000 LOC) | 57.238s measured | — |
+| 20 | P2 | backend | `backend/testing/test_orchestrator.py` | 18,818 | 362 | critical (>5000 LOC) | 57.238s measured | — |
 | 21 | P2 | backend | `backend/testing/test_compute_experiment_completion.py` | 7,103 | 132 | critical (>5000 LOC) | 55.582s measured | — |
 | 22 | P2 | backend | `backend/testing/test_knowledge_documents.py` | 6,801 | 164 | critical (>5000 LOC) | 48.488s measured | — |
 | 23 | P2 | backend | `backend/testing/test_release_reconciliation.py` | 8,324 | 141 | critical (>5000 LOC) | 43.934s measured | — |
@@ -232,13 +232,13 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 208 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 608 | 5 | under 1500 LOC | 57.849s measured | — |
 | 209 | G | backend | `backend/testing/test_scope_complexity.py` | 380 | 32 | under 1500 LOC | 52.778s measured | — |
 | 210 | G | backend | `backend/testing/test_migration_0640_0682_workday_chain.py` | 334 | 1 | under 1500 LOC | 50.136s measured | — |
-| 211 | G | backend | `backend/testing/test_local_runner_viewable_selection.py` | 1,036 | 43 | under 1500 LOC | 47.838s measured | — |
+| 211 | G | backend | `backend/testing/test_local_runner_viewable_selection.py` | 1,039 | 43 | under 1500 LOC | 47.838s measured | — |
 | 212 | G | backend | `backend/testing/test_review_policy_parity.py` | 372 | 22 | under 1500 LOC | 47.704s measured | — |
 | 213 | G | backend | `backend/testing/test_playbook_storage.py` | 723 | 24 | under 1500 LOC | 46.644s measured | — |
 | 214 | G | backend | `backend/testing/test_release_audit_contract.py` | 785 | 22 | under 1500 LOC | 45.066s measured | — |
 | 215 | G | agent | `agent/src/handlers/bake-smoke-run.test.ts` | 144 | 6 | under 1500 LOC | 36.986s measured | — |
 | 216 | G | backend | `backend/testing/test_qualification_dimensions.py` | 180 | 12 | under 1500 LOC | 36.808s measured | — |
-| 217 | G | backend | `backend/testing/test_runner_progress_protocol.py` | 489 | 19 | under 1500 LOC | 35.190s measured | — |
+| 217 | G | backend | `backend/testing/test_runner_progress_protocol.py` | 467 | 19 | under 1500 LOC | 35.190s measured | — |
 | 218 | G | backend | `backend/testing/test_strategic_trigger.py` | 750 | 50 | under 1500 LOC | 33.716s measured | — |
 | 219 | G | backend | `backend/testing/test_migration_0722_discovery_controller.py` | 147 | 1 | under 1500 LOC | 32.526s measured | — |
 | 220 | G | backend | `backend/testing/test_strategic_cycle.py` | 1,472 | 60 | under 1500 LOC | 31.970s measured | — |
@@ -328,11 +328,11 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 304 | G | backend | `backend/testing/test_migration_0608_projectmessage_foundation.py` | 717 | 10 | under 1500 LOC | 7.721s measured | — |
 | 305 | G | backend | `backend/testing/test_strategic_cycle_gating.py` | 578 | 12 | under 1500 LOC | 7.701s measured | — |
 | 306 | G | backend | `backend/testing/test_playbook_lifecycle.py` | 388 | 11 | under 1500 LOC | 7.700s measured | — |
-| 307 | G | backend | `backend/testing/test_check_gate_fail_closed.py` | 1,481 | 35 | under 1500 LOC | 7.637s measured | — |
+| 307 | G | backend | `backend/testing/test_check_gate_fail_closed.py` | 1,497 | 35 | under 1500 LOC | 7.637s measured | — |
 | 308 | G | backend | `backend/testing/test_github_onboarding_access.py` | 596 | 15 | under 1500 LOC | 7.441s measured | — |
 | 309 | G | backend | `backend/testing/test_project_message_projection.py` | 1,160 | 29 | under 1500 LOC | 7.374s measured | protected; declared floor 29 |
 | 310 | G | backend | `backend/testing/test_blocked_retry_authority.py` | 605 | 12 | under 1500 LOC | 7.347s measured | — |
-| 311 | G | backend | `backend/testing/test_compute_watchdog.py` | 1,490 | 58 | under 1500 LOC | 7.328s measured | — |
+| 311 | G | backend | `backend/testing/test_compute_watchdog.py` | 1,476 | 58 | under 1500 LOC | 7.328s measured | — |
 | 312 | G | agent | `agent/src/viewport-snapshot-script.test.ts` | 337 | 18 | under 1500 LOC | 7.248s measured | — |
 | 313 | G | backend | `backend/testing/test_rollup_handoff_ci_gate.py` | 204 | 6 | under 1500 LOC | 7.164s measured | — |
 | 314 | G | agent | `agent/src/sr-pr-section.test.ts` | 206 | 15 | under 1500 LOC | 7.122s measured | — |
@@ -363,7 +363,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 339 | G | backend | `backend/testing/test_strategic_autonomous_handoff.py` | 416 | 3 | under 1500 LOC | 5.800s measured | — |
 | 340 | G | backend | `backend/testing/test_admin_create_task.py` | 873 | 22 | under 1500 LOC | 5.675s measured | — |
 | 341 | G | backend | `backend/testing/test_strategic_memory_envelope.py` | 1,113 | 21 | under 1500 LOC | 5.674s measured | — |
-| 342 | G | backend | `backend/testing/test_publication_gate_receipt.py` | 632 | 17 | under 1500 LOC | 5.652s measured | — |
+| 342 | G | backend | `backend/testing/test_publication_gate_receipt.py` | 618 | 17 | under 1500 LOC | 5.652s measured | — |
 | 343 | G | admin-ui | `admin-ui/src/test/mock-factory-export-coverage.test.ts` | 1,173 | 17 | under 1500 LOC | 5.549s measured | — |
 | 344 | G | backend | `backend/testing/test_user_management.py` | 186 | 17 | under 1500 LOC | 5.533s measured | — |
 | 345 | G | backend | `backend/testing/test_local_runner_holds.py` | 811 | 20 | under 1500 LOC | 5.507s measured | — |
@@ -515,7 +515,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 491 | G | backend | `backend/testing/test_landed_signal.py` | 1,009 | 28 | under 1500 LOC | 1.653s measured | — |
 | 492 | G | admin-ui | `admin-ui/src/components/StrategicContextArtifactSlot.test.tsx` | 981 | 34 | under 1500 LOC | 1.635s measured | — |
 | 493 | G | backend | `backend/testing/test_admin_scope_measurement.py` | 180 | 7 | under 1500 LOC | 1.592s measured | — |
-| 494 | G | backend | `backend/testing/test_runner_isolation_gpu_markers.py` | 135 | 2 | under 1500 LOC | 1.580s measured | — |
+| 494 | G | backend | `backend/testing/test_runner_isolation_gpu_markers.py` | 146 | 2 | under 1500 LOC | 1.580s measured | — |
 | 495 | G | backend | `backend/testing/test_agent_task_capabilities.py` | 88 | 4 | under 1500 LOC | 1.578s measured | — |
 | 496 | G | backend | `backend/testing/test_compute_lane_arm_time_medians.py` | 287 | 7 | under 1500 LOC | 1.576s measured | — |
 | 497 | G | admin-ui | `admin-ui/src/components/DirectionCard.test.tsx` | 907 | 72 | under 1500 LOC | 1.575s measured | — |
@@ -677,7 +677,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 653 | G | backend | `backend/testing/test_vitest_durations_freshness.py` | 742 | 29 | under 1500 LOC | 0.186s measured | — |
 | 654 | G | admin-ui | `admin-ui/src/components/ProblemModelViewer.test.tsx` | 418 | 13 | under 1500 LOC | 0.180s measured | — |
 | 655 | G | backend | `backend/testing/test_verification_toolchain.py` | 203 | 5 | under 1500 LOC | 0.179s measured | — |
-| 656 | G | backend | `backend/testing/test_runbook_drift.py` | 91 | 5 | under 1500 LOC | 0.177s measured | — |
+| 656 | G | backend | `backend/testing/test_runbook_drift.py` | 103 | 5 | under 1500 LOC | 0.177s measured | — |
 | 657 | G | backend | `backend/testing/test_migration_0716_strategic_memory_source_control_plane.py` | 112 | 2 | under 1500 LOC | 0.176s measured | — |
 | 658 | G | admin-ui | `admin-ui/src/hooks/useConversation.test.tsx` | 1,218 | 36 | under 1500 LOC | 0.174s measured | protected; declared floor 36 |
 | 659 | G | backend | `backend/testing/test_chain_continuity_funnel.py` | 135 | 5 | under 1500 LOC | 0.173s measured | — |
@@ -782,7 +782,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 758 | G | backend | `backend/testing/test_direction_event_trail.py` | 285 | 20 | under 1500 LOC | 0.062s measured | — |
 | 759 | G | admin-ui | `admin-ui/src/components/LlmCostBreakdownPanel.test.tsx` | 136 | 6 | under 1500 LOC | 0.061s measured | — |
 | 760 | G | backend | `backend/testing/test_broadcast.py` | 300 | 36 | under 1500 LOC | 0.060s measured | — |
-| 761 | G | backend | `backend/testing/test_deployed_sha.py` | 721 | 30 | under 1500 LOC | 0.059s measured | — |
+| 761 | G | backend | `backend/testing/test_deployed_sha.py` | 781 | 31 | under 1500 LOC | 0.059s measured | — |
 | 762 | G | backend | `backend/testing/test_digest_payload_metric_manifest.py` | 256 | 6 | under 1500 LOC | 0.058s measured | — |
 | 763 | G | admin-ui | `admin-ui/src/components/SavedViewsTabStrip.test.tsx` | 88 | 8 | under 1500 LOC | 0.056s measured | — |
 | 764 | G | admin-ui | `admin-ui/src/hooks/useCommandPaletteShortcut.test.tsx` | 205 | 10 | under 1500 LOC | 0.054s measured | — |
@@ -858,7 +858,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 834 | G | agent | `agent/src/handlers/verify-tests.setup-retry.test.ts` | 175 | 5 | under 1500 LOC | 0.027s measured | — |
 | 835 | G | admin-ui | `admin-ui/src/components/SearchFilterBar.test.tsx` | 23 | 1 | under 1500 LOC | 0.027s measured | — |
 | 836 | G | backend | `backend/testing/test_strategic_correctness_preflight.py` | 150 | 2 | under 1500 LOC | 0.027s measured | — |
-| 837 | G | backend | `backend/testing/test_local_app_release.py` | 118 | 3 | under 1500 LOC | 0.026s measured | — |
+| 837 | G | backend | `backend/testing/test_local_app_release.py` | 134 | 3 | under 1500 LOC | 0.026s measured | — |
 | 838 | G | admin-ui | `admin-ui/src/components/AnomalyThrottleBanner.test.tsx` | 54 | 3 | under 1500 LOC | 0.026s measured | — |
 | 839 | G | agent | `agent/src/handlers/verify-tests.gate-bound.test.ts` | 249 | 5 | under 1500 LOC | 0.025s measured | — |
 | 840 | G | agent | `agent/src/prompts/check-helper.fixture-deps.test.ts` | 77 | 4 | under 1500 LOC | 0.025s measured | — |
@@ -1002,7 +1002,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 978 | G | admin-ui | `admin-ui/src/appWorkbenchConstants.test.ts` | 27 | 3 | under 1500 LOC | 0.004s measured | — |
 | 979 | G | admin-ui | `admin-ui/src/utils/projectSelection.test.ts` | 27 | 2 | under 1500 LOC | 0.004s measured | — |
 | 980 | G | backend | `backend/testing/test_claim_analytics.py` | 40 | 2 | under 1500 LOC | 0.004s measured | — |
-| 981 | G | backend | `backend/testing/test_docs_runbook_drift.py` | 263 | 8 | under 1500 LOC | 0.004s measured | — |
+| 981 | G | backend | `backend/testing/test_docs_runbook_drift.py` | 274 | 8 | under 1500 LOC | 0.004s measured | — |
 | 982 | G | admin-ui | `admin-ui/src/utils/computeAnalysisLabels.test.ts` | 96 | 12 | under 1500 LOC | 0.003s measured | — |
 | 983 | G | admin-ui | `admin-ui/src/utils/taskGraph.test.ts` | 94 | 11 | under 1500 LOC | 0.003s measured | — |
 | 984 | G | admin-ui | `admin-ui/src/accessControl.test.ts` | 91 | 4 | under 1500 LOC | 0.003s measured | — |
@@ -1014,7 +1014,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 990 | G | agent | `agent/src/_agent_scripts/materialize_manifest.parity.test.ts` | 34 | 1 | under 1500 LOC | 0.003s measured | — |
 | 991 | G | admin-ui | `admin-ui/src/utils/conversationMessageIdentity.test.ts` | 24 | 2 | under 1500 LOC | 0.003s measured | — |
 | 992 | G | backend | `backend/testing/test_failure_classification_retained.py` | 11 | 1 | under 1500 LOC | 0.003s measured | — |
-| 993 | G | backend | `backend/testing/test_local_runner_terminal_log.py` | 140 | 1 | under 1500 LOC | 0.002s measured | — |
+| 993 | G | backend | `backend/testing/test_local_runner_terminal_log.py` | 151 | 1 | under 1500 LOC | 0.002s measured | — |
 | 994 | G | agent | `agent/src/branch-literal-regression.test.ts` | 122 | 3 | under 1500 LOC | 0.002s measured | — |
 | 995 | G | admin-ui | `admin-ui/src/qualificationStateVocab.contract.test.ts` | 77 | 4 | under 1500 LOC | 0.002s measured | — |
 | 996 | G | admin-ui | `admin-ui/src/test/viewport-capture-config.test.ts` | 57 | 5 | under 1500 LOC | 0.002s measured | — |
@@ -1046,162 +1046,163 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 1022 | G | admin-ui-viewport | `admin-ui/src/components/NewTaskModal.viewport.test.tsx` | 688 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
 | 1023 | G | admin-ui-viewport | `admin-ui/src/components/MessagesListView.viewport.test.tsx` | 648 | 33 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 33 |
 | 1024 | G | backend | `backend/testing/test_lifecycle_integration.py` | 634 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1025 | G | admin-ui-viewport | `admin-ui/src/components/WorkbenchComposition.viewport.test.tsx` | 590 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1026 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextRail.viewport.test.tsx` | 570 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1027 | G | admin-ui-viewport | `admin-ui/src/components/SettingsDeploySection.viewport.test.tsx` | 563 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1028 | G | backend | `backend/testing/test_rollup_deliverable_premerge_guard.py` | 548 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1029 | G | admin-ui-viewport | `admin-ui/src/components/DirectionCard.viewport.test.tsx` | 503 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1030 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerMeta.viewport.test.tsx` | 483 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1031 | G | admin-ui-viewport | `admin-ui/src/components/HeaderBar.viewport.test.tsx` | 479 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1032 | G | admin-ui-viewport | `admin-ui/src/components/KnowledgeBrowser.viewport.test.tsx` | 443 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1033 | G | admin-ui-viewport | `admin-ui/src/components/ActivityFeed.viewport.test.tsx` | 422 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1034 | G | backend | `backend/testing/test_evaluating_parent_convergence.py` | 392 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1035 | G | admin-ui-viewport | `admin-ui/src/components/MessagesComposer.viewport.test.tsx` | 386 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1036 | G | admin-ui-viewport | `admin-ui/src/components/PipelineWorkspace.viewport.test.tsx` | 348 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1037 | G | admin-ui-viewport | `admin-ui/src/components/WarmVmPanel.viewport.test.tsx` | 342 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1038 | G | admin-ui-viewport | `admin-ui/src/components/NewProjectModal.viewport.test.tsx` | 325 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1039 | G | admin-ui-viewport | `admin-ui/src/components/SrTrendBreakdown.viewport.test.tsx` | 323 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1040 | G | admin-ui-viewport | `admin-ui/src/components/LlmCostBreakdownPanel.viewport.test.tsx` | 305 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1041 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextArtifactSlot.viewport.test.tsx` | 305 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1042 | G | admin-ui-viewport | `admin-ui/src/components/ProjectBuildConfigSection.viewport.test.tsx` | 297 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1043 | G | admin-ui-viewport | `admin-ui/src/components/SettingsSectionRouter.viewport.test.tsx` | 294 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1044 | G | admin-ui-viewport | `admin-ui/src/components/MetricsDashboard.viewport.test.tsx` | 291 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1045 | G | admin-ui-viewport | `admin-ui/src/components/DirectionsPanel.viewport.test.tsx` | 290 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1046 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawer.viewport.test.tsx` | 285 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1047 | G | admin-ui-viewport | `admin-ui/src/components/RunningUpdatePanel.viewport.test.tsx` | 277 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1048 | G | admin-ui-viewport | `admin-ui/src/components/MessageBubble.viewport.test.tsx` | 272 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1049 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerFailureDetail.viewport.test.tsx` | 272 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1050 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextWorkspace.viewport.test.tsx` | 254 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1051 | G | admin-ui-viewport | `admin-ui/src/components/NotesTool.viewport.test.tsx` | 253 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1052 | G | admin-ui-viewport | `admin-ui/src/components/RemediationFunnelSection.viewport.test.tsx` | 246 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1053 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnersPanel.viewport.test.tsx` | 243 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1054 | G | admin-ui-viewport | `admin-ui/src/components/WhiteboardTool.viewport.test.tsx` | 237 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1055 | G | admin-ui-viewport | `admin-ui/src/components/AutonomousStatus.viewport.test.tsx` | 234 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1056 | G | admin-ui-viewport | `admin-ui/src/components/ResearchBrowser.viewport.test.tsx` | 234 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1057 | G | admin-ui-viewport | `admin-ui/src/components/ViewportDebtPanel.viewport.test.tsx` | 223 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1058 | G | admin-ui-viewport | `admin-ui/src/components/LaneDiagPanel.viewport.test.tsx` | 222 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1059 | G | admin-ui-viewport | `admin-ui/src/components/PRMonitorSection.viewport.test.tsx` | 219 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1060 | G | admin-ui-viewport | `admin-ui/src/components/TaskCard.viewport.test.tsx` | 214 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1061 | G | admin-ui-viewport | `admin-ui/src/components/OrchestratorHealthBar.viewport.test.tsx` | 212 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1062 | G | admin-ui-viewport | `admin-ui/src/components/KanbanBoard.viewport.test.tsx` | 211 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1063 | G | admin-ui-viewport | `admin-ui/src/components/SettingsNotificationsSection.viewport.test.tsx` | 210 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1064 | G | admin-ui-viewport | `admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx` | 202 | 8 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 8 |
-| 1065 | G | admin-ui-viewport | `admin-ui/src/components/PipelineView.viewport.test.tsx` | 197 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1066 | G | admin-ui-viewport | `admin-ui/src/components/ProviderModelBreakdownPanel.viewport.test.tsx` | 192 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1067 | G | admin-ui-viewport | `admin-ui/src/components/SearchFilterBar.viewport.test.tsx` | 192 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1068 | G | admin-ui-viewport | `admin-ui/src/components/BulkActionBar.viewport.test.tsx` | 191 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1069 | G | admin-ui-viewport | `admin-ui/src/components/KanbanColumn.viewport.test.tsx` | 183 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1070 | G | admin-ui-viewport | `admin-ui/src/components/ProblemModelEditor.viewport.test.tsx` | 178 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1071 | G | admin-ui-viewport | `admin-ui/src/components/ConfirmDialog.viewport.test.tsx` | 175 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1072 | G | admin-ui-viewport | `admin-ui/src/components/EffortEfficiencyPanel.viewport.test.tsx` | 173 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1073 | G | admin-ui-viewport | `admin-ui/src/components/MergeVerificationBanner.viewport.test.tsx` | 167 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1074 | G | admin-ui-viewport | `admin-ui/src/components/TaskComputeJobsSection.viewport.test.tsx` | 165 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1075 | G | admin-ui-viewport | `admin-ui/src/components/SettingsAccountsSection.viewport.test.tsx` | 163 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1076 | G | backend | `backend/testing/test_filter_malformed_payload.py` | 159 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1077 | G | admin-ui-viewport | `admin-ui/src/test/kanban-composed.viewport.test.tsx` | 158 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1078 | G | admin-ui-viewport | `admin-ui/src/components/VersionMismatchBanner.viewport.test.tsx` | 155 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1079 | G | admin-ui-viewport | `admin-ui/src/components/RuntimeWorkspace.viewport.test.tsx` | 154 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1080 | G | admin-ui-viewport | `admin-ui/src/components/ArchiveView.viewport.test.tsx` | 153 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1081 | G | admin-ui-viewport | `admin-ui/src/components/OuterReviewLoopConvergenceWidget.viewport.test.tsx` | 153 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1082 | G | admin-ui-viewport | `admin-ui/src/components/RecentErrorsWidget.viewport.test.tsx` | 151 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1083 | G | admin-ui-viewport | `admin-ui/src/components/AlertsBanner.viewport.test.tsx` | 149 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1084 | G | admin-ui-viewport | `admin-ui/src/components/ConsoleHome.viewport.test.tsx` | 147 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1085 | G | admin-ui-viewport | `admin-ui/src/components/DriftSignalsCard.viewport.test.tsx` | 146 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1086 | G | admin-ui-viewport | `admin-ui/src/components/WorkbenchLayout.viewport.test.tsx` | 144 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1087 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerLogs.viewport.test.tsx` | 142 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1088 | G | admin-ui-viewport | `admin-ui/src/components/FleetHealthCard.viewport.test.tsx` | 140 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1089 | G | admin-ui-viewport | `admin-ui/src/components/FixLoopConvergenceWidget.viewport.test.tsx` | 136 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1090 | G | admin-ui-viewport | `admin-ui/src/components/ReleaseQualificationFindings.viewport.test.tsx` | 133 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1091 | G | admin-ui-viewport | `admin-ui/src/components/DirectionPortfolioSection.viewport.test.tsx` | 129 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1092 | G | admin-ui-viewport | `admin-ui/src/components/MediumScopeWidget.viewport.test.tsx` | 127 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1093 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerDiagnostics.viewport.test.tsx` | 126 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1094 | G | admin-ui-viewport | `admin-ui/src/components/TaskStreamPanel.viewport.test.tsx` | 126 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1095 | G | admin-ui-viewport | `admin-ui/src/components/ProjectIntegrationBranchSection.viewport.test.tsx` | 125 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1096 | G | admin-ui-viewport | `admin-ui/src/components/ImprovementLanesPanel.viewport.test.tsx` | 123 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1097 | G | admin-ui-viewport | `admin-ui/src/components/CompactJobsTable.viewport.test.tsx` | 121 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1098 | G | admin-ui-viewport | `admin-ui/src/test/pipeline-composed.viewport.test.tsx` | 119 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1099 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerSelfReview.viewport.test.tsx` | 117 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1100 | G | admin-ui-viewport | `admin-ui/src/components/Pagination.viewport.test.tsx` | 116 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1101 | G | admin-ui-viewport | `admin-ui/src/components/ProjectManagementModal.viewport.test.tsx` | 116 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1102 | G | admin-ui-viewport | `admin-ui/src/components/StrategicAuditPanel.viewport.test.tsx` | 115 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1103 | G | admin-ui-viewport | `admin-ui/src/components/ProviderSettingsPanel.viewport.test.tsx` | 114 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1104 | G | admin-ui-viewport | `admin-ui/src/components/ProjectBranchesSection.viewport.test.tsx` | 113 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1105 | G | admin-ui-viewport | `admin-ui/src/components/ProjectMembers.viewport.test.tsx` | 108 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1106 | G | admin-ui-viewport | `admin-ui/src/components/RuntimeAccountsPanel.viewport.test.tsx` | 108 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1107 | G | admin-ui-viewport | `admin-ui/src/test/messages-composed.viewport.test.tsx` | 108 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1108 | G | admin-ui-viewport | `admin-ui/src/components/MessageTypeDropdown.viewport.test.tsx` | 106 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1109 | G | admin-ui-viewport | `admin-ui/src/components/ProjectToolIframe.viewport.test.tsx` | 106 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1110 | G | admin-ui-viewport | `admin-ui/src/components/ComputeArtifactGallery.viewport.test.tsx` | 105 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1111 | G | admin-ui-viewport | `admin-ui/src/components/MessageAttachments.viewport.test.tsx` | 105 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1112 | G | admin-ui-viewport | `admin-ui/src/components/PendingConfirmationsSection.viewport.test.tsx` | 105 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1113 | G | admin-ui-viewport | `admin-ui/src/components/ProjectPromotionTargetSection.viewport.test.tsx` | 105 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1114 | G | admin-ui-viewport | `admin-ui/src/components/ScopeConversionRatesSection.viewport.test.tsx` | 104 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1115 | G | admin-ui-viewport | `admin-ui/src/components/TaskContextRail.viewport.test.tsx` | 102 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1116 | G | admin-ui-viewport | `admin-ui/src/components/CapabilityTrialsPanel.viewport.test.tsx` | 101 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1117 | G | admin-ui-viewport | `admin-ui/src/components/SystemMaturityCard.viewport.test.tsx` | 101 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1118 | G | admin-ui-viewport | `admin-ui/src/components/ScopeTrendsSection.viewport.test.tsx` | 100 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1119 | G | admin-ui-viewport | `admin-ui/src/components/ReviewQualitySection.viewport.test.tsx` | 98 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1120 | G | admin-ui-viewport | `admin-ui/src/components/ParkWakeHealthCard.viewport.test.tsx` | 97 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1121 | G | admin-ui-viewport | `admin-ui/src/components/CriterionVerdictBadge.viewport.test.tsx` | 96 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1122 | G | admin-ui-viewport | `admin-ui/src/components/MetricsIntegrityObservabilityPanel.viewport.test.tsx` | 95 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1123 | G | admin-ui-viewport | `admin-ui/src/components/WarmReuseVsCostTrend.viewport.test.tsx` | 95 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1124 | G | admin-ui-viewport | `admin-ui/src/components/OperatorWorkspaces.viewport.test.tsx` | 94 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1125 | G | admin-ui-viewport | `admin-ui/src/components/FleetDetailDrawer.viewport.test.tsx` | 92 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1126 | G | admin-ui-viewport | `admin-ui/src/components/SettingsOrchestratorSection.viewport.test.tsx` | 91 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1127 | G | admin-ui-viewport | `admin-ui/src/components/SrRetrospectiveShared.viewport.test.tsx` | 90 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1128 | G | admin-ui-viewport | `admin-ui/src/components/UserManagement.viewport.test.tsx` | 90 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1129 | G | admin-ui-viewport | `admin-ui/src/components/ProjectResourceEnvelopeSection.viewport.test.tsx` | 88 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1130 | G | admin-ui-viewport | `admin-ui/src/components/SystemStatusCard.viewport.test.tsx` | 88 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1131 | G | admin-ui-viewport | `admin-ui/src/components/WhiteboardRailSection.viewport.test.tsx` | 88 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1132 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnerConfigPanel.viewport.test.tsx` | 87 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1133 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAutoRemediationSection.viewport.test.tsx` | 87 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1134 | G | admin-ui-viewport | `admin-ui/src/components/SettingsGeneralSection.viewport.test.tsx` | 87 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1135 | G | admin-ui-viewport | `admin-ui/src/components/CommandPalette.viewport.test.tsx` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1136 | G | admin-ui-viewport | `admin-ui/src/components/DirectionAutoPauseWidget.viewport.test.tsx` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1137 | G | admin-ui-viewport | `admin-ui/src/components/SrBadges.viewport.test.tsx` | 85 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1138 | G | admin-ui-viewport | `admin-ui/src/components/CompletionDebtPanel.viewport.test.tsx` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1139 | G | admin-ui-viewport | `admin-ui/src/components/EvergreenBacklogPanel.viewport.test.tsx` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1140 | G | admin-ui-viewport | `admin-ui/src/components/ErrorBoundary.viewport.test.tsx` | 82 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1141 | G | admin-ui-viewport | `admin-ui/src/components/SettingsAdvancedSection.viewport.test.tsx` | 81 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1142 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAlertDomainsSection.viewport.test.tsx` | 80 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1143 | G | admin-ui-viewport | `admin-ui/src/components/ProviderCategoriesPanel.viewport.test.tsx` | 80 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1144 | G | admin-ui-viewport | `admin-ui/src/components/DependencyHealthCard.viewport.test.tsx` | 79 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1145 | G | admin-ui-viewport | `admin-ui/src/components/ReleaseEvidence.viewport.test.tsx` | 76 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1146 | G | admin-ui-viewport | `admin-ui/src/components/ProjectIssueImplementationSection.viewport.test.tsx` | 75 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1147 | G | admin-ui-viewport | `admin-ui/src/components/ProjectResourceAvailabilityCard.viewport.test.tsx` | 75 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1148 | G | admin-ui-viewport | `admin-ui/src/components/ProviderCostPanel.viewport.test.tsx` | 74 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1149 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAutoReviewSection.viewport.test.tsx` | 73 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1150 | G | admin-ui-viewport | `admin-ui/src/components/StrategicSessionControl.viewport.test.tsx` | 73 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
-| 1151 | G | admin-ui-viewport | `admin-ui/src/components/UILoadTimingPanel.viewport.test.tsx` | 73 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1152 | G | admin-ui-viewport | `admin-ui/src/components/AutonomousConfigSection.viewport.test.tsx` | 70 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1153 | G | admin-ui-viewport | `admin-ui/src/components/DesignDocViewer.viewport.test.tsx` | 70 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1154 | G | admin-ui-viewport | `admin-ui/src/components/EventVisibilityMenu.viewport.test.tsx` | 70 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1155 | G | admin-ui-viewport | `admin-ui/src/components/MuteWindowMenu.viewport.test.tsx` | 69 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1156 | G | admin-ui-viewport | `admin-ui/src/components/TaskDurationWidget.viewport.test.tsx` | 69 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1157 | G | admin-ui-viewport | `admin-ui/src/components/DashboardMetricCards.viewport.test.tsx` | 68 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1158 | G | admin-ui-viewport | `admin-ui/src/components/StrategicStreamingPreview.viewport.test.tsx` | 68 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1159 | G | admin-ui-viewport | `admin-ui/src/components/StructuralHealthObservabilityPanel.viewport.test.tsx` | 68 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1160 | G | admin-ui-viewport | `admin-ui/src/components/ConsultationProgressRow.viewport.test.tsx` | 67 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1161 | G | admin-ui-viewport | `admin-ui/src/components/MarkdownContent.viewport.test.tsx` | 67 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1162 | G | admin-ui-viewport | `admin-ui/src/components/ProjectSwitcherDropdown.viewport.test.tsx` | 66 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1163 | G | admin-ui-viewport | `admin-ui/src/components/FailureStageWidget.viewport.test.tsx` | 65 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1164 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnersDashboard.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1165 | G | admin-ui-viewport | `admin-ui/src/components/RecurringPatternsSection.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1166 | G | admin-ui-viewport | `admin-ui/src/components/SavedViewsTabStrip.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1167 | G | admin-ui-viewport | `admin-ui/src/components/AcceptanceGradeBadge.viewport.test.tsx` | 64 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1168 | G | admin-ui-viewport | `admin-ui/src/components/EvergreenFillObservabilityPanel.viewport.test.tsx` | 63 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1169 | G | admin-ui-viewport | `admin-ui/src/components/SaveViewDialog.viewport.test.tsx` | 63 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1170 | G | admin-ui-viewport | `admin-ui/src/components/NullBranchDiagnosticsPanel.viewport.test.tsx` | 62 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1171 | G | admin-ui-viewport | `admin-ui/src/components/MergeGateFleetHealthCard.viewport.test.tsx` | 61 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1172 | G | admin-ui-viewport | `admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx` | 61 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
-| 1173 | G | admin-ui-viewport | `admin-ui/src/components/PoolAccountHealthPanel.viewport.test.tsx` | 60 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1174 | G | admin-ui-viewport | `admin-ui/src/components/StrategistStatusChip.viewport.test.tsx` | 58 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1175 | G | backend | `backend/testing/test_agent_task_contract.py` | 50 | 0 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1176 | G | admin-ui-viewport | `admin-ui/src/components/WarmStartOriginRow.viewport.test.tsx` | 49 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1177 | G | admin-ui-viewport | `admin-ui/src/components/AccountMenu.viewport.test.tsx` | 45 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1178 | G | admin-ui-viewport | `admin-ui/src/components/MessagesSummaryCard.viewport.test.tsx` | 41 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1179 | G | admin-ui-viewport | `admin-ui/src/components/EvidenceTierBadge.viewport.test.tsx` | 39 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1180 | G | admin-ui-viewport | `admin-ui/src/components/KeyboardShortcutsOverlay.viewport.test.tsx` | 36 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1181 | G | admin-ui-viewport | `admin-ui/src/components/TaskFixLoopPanel.viewport.test.tsx` | 32 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1182 | G | admin-ui-viewport | `admin-ui/src/components/AdversarialQualityPanel.viewport.test.tsx` | 28 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
-| 1183 | G | admin-ui-viewport | `admin-ui/src/components/WelcomeScreen.viewport.test.tsx` | 28 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1025 | G | backend | `backend/testing/test_scripts_dir_resolution_guard.py` | 617 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1026 | G | admin-ui-viewport | `admin-ui/src/components/WorkbenchComposition.viewport.test.tsx` | 590 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1027 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextRail.viewport.test.tsx` | 570 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1028 | G | admin-ui-viewport | `admin-ui/src/components/SettingsDeploySection.viewport.test.tsx` | 563 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1029 | G | backend | `backend/testing/test_rollup_deliverable_premerge_guard.py` | 548 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1030 | G | admin-ui-viewport | `admin-ui/src/components/DirectionCard.viewport.test.tsx` | 503 | 18 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1031 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerMeta.viewport.test.tsx` | 483 | 14 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1032 | G | admin-ui-viewport | `admin-ui/src/components/HeaderBar.viewport.test.tsx` | 479 | 21 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1033 | G | admin-ui-viewport | `admin-ui/src/components/KnowledgeBrowser.viewport.test.tsx` | 443 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1034 | G | admin-ui-viewport | `admin-ui/src/components/ActivityFeed.viewport.test.tsx` | 422 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1035 | G | backend | `backend/testing/test_evaluating_parent_convergence.py` | 392 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1036 | G | admin-ui-viewport | `admin-ui/src/components/MessagesComposer.viewport.test.tsx` | 386 | 16 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1037 | G | admin-ui-viewport | `admin-ui/src/components/PipelineWorkspace.viewport.test.tsx` | 348 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1038 | G | admin-ui-viewport | `admin-ui/src/components/WarmVmPanel.viewport.test.tsx` | 342 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1039 | G | admin-ui-viewport | `admin-ui/src/components/NewProjectModal.viewport.test.tsx` | 325 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1040 | G | admin-ui-viewport | `admin-ui/src/components/SrTrendBreakdown.viewport.test.tsx` | 323 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1041 | G | admin-ui-viewport | `admin-ui/src/components/LlmCostBreakdownPanel.viewport.test.tsx` | 305 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1042 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextArtifactSlot.viewport.test.tsx` | 305 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1043 | G | admin-ui-viewport | `admin-ui/src/components/ProjectBuildConfigSection.viewport.test.tsx` | 297 | 12 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1044 | G | admin-ui-viewport | `admin-ui/src/components/SettingsSectionRouter.viewport.test.tsx` | 294 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1045 | G | admin-ui-viewport | `admin-ui/src/components/MetricsDashboard.viewport.test.tsx` | 291 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1046 | G | admin-ui-viewport | `admin-ui/src/components/DirectionsPanel.viewport.test.tsx` | 290 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1047 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawer.viewport.test.tsx` | 285 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1048 | G | admin-ui-viewport | `admin-ui/src/components/RunningUpdatePanel.viewport.test.tsx` | 277 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1049 | G | admin-ui-viewport | `admin-ui/src/components/MessageBubble.viewport.test.tsx` | 272 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1050 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerFailureDetail.viewport.test.tsx` | 272 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1051 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextWorkspace.viewport.test.tsx` | 254 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1052 | G | admin-ui-viewport | `admin-ui/src/components/NotesTool.viewport.test.tsx` | 253 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1053 | G | admin-ui-viewport | `admin-ui/src/components/RemediationFunnelSection.viewport.test.tsx` | 246 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1054 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnersPanel.viewport.test.tsx` | 243 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1055 | G | admin-ui-viewport | `admin-ui/src/components/WhiteboardTool.viewport.test.tsx` | 237 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1056 | G | admin-ui-viewport | `admin-ui/src/components/AutonomousStatus.viewport.test.tsx` | 234 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1057 | G | admin-ui-viewport | `admin-ui/src/components/ResearchBrowser.viewport.test.tsx` | 234 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1058 | G | admin-ui-viewport | `admin-ui/src/components/ViewportDebtPanel.viewport.test.tsx` | 223 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1059 | G | admin-ui-viewport | `admin-ui/src/components/LaneDiagPanel.viewport.test.tsx` | 222 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1060 | G | admin-ui-viewport | `admin-ui/src/components/PRMonitorSection.viewport.test.tsx` | 219 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1061 | G | admin-ui-viewport | `admin-ui/src/components/TaskCard.viewport.test.tsx` | 214 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1062 | G | admin-ui-viewport | `admin-ui/src/components/OrchestratorHealthBar.viewport.test.tsx` | 212 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1063 | G | admin-ui-viewport | `admin-ui/src/components/KanbanBoard.viewport.test.tsx` | 211 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1064 | G | admin-ui-viewport | `admin-ui/src/components/SettingsNotificationsSection.viewport.test.tsx` | 210 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1065 | G | admin-ui-viewport | `admin-ui/src/components/ConversationUtilityBar.viewport.test.tsx` | 202 | 8 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 8 |
+| 1066 | G | admin-ui-viewport | `admin-ui/src/components/PipelineView.viewport.test.tsx` | 197 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1067 | G | admin-ui-viewport | `admin-ui/src/components/ProviderModelBreakdownPanel.viewport.test.tsx` | 192 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1068 | G | admin-ui-viewport | `admin-ui/src/components/SearchFilterBar.viewport.test.tsx` | 192 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1069 | G | admin-ui-viewport | `admin-ui/src/components/BulkActionBar.viewport.test.tsx` | 191 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1070 | G | admin-ui-viewport | `admin-ui/src/components/KanbanColumn.viewport.test.tsx` | 183 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1071 | G | admin-ui-viewport | `admin-ui/src/components/ProblemModelEditor.viewport.test.tsx` | 178 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1072 | G | admin-ui-viewport | `admin-ui/src/components/ConfirmDialog.viewport.test.tsx` | 175 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1073 | G | admin-ui-viewport | `admin-ui/src/components/EffortEfficiencyPanel.viewport.test.tsx` | 173 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1074 | G | admin-ui-viewport | `admin-ui/src/components/MergeVerificationBanner.viewport.test.tsx` | 167 | 10 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1075 | G | admin-ui-viewport | `admin-ui/src/components/TaskComputeJobsSection.viewport.test.tsx` | 165 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1076 | G | admin-ui-viewport | `admin-ui/src/components/SettingsAccountsSection.viewport.test.tsx` | 163 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1077 | G | backend | `backend/testing/test_filter_malformed_payload.py` | 159 | 8 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1078 | G | admin-ui-viewport | `admin-ui/src/test/kanban-composed.viewport.test.tsx` | 158 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1079 | G | admin-ui-viewport | `admin-ui/src/components/VersionMismatchBanner.viewport.test.tsx` | 155 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1080 | G | admin-ui-viewport | `admin-ui/src/components/RuntimeWorkspace.viewport.test.tsx` | 154 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1081 | G | admin-ui-viewport | `admin-ui/src/components/ArchiveView.viewport.test.tsx` | 153 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1082 | G | admin-ui-viewport | `admin-ui/src/components/OuterReviewLoopConvergenceWidget.viewport.test.tsx` | 153 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1083 | G | admin-ui-viewport | `admin-ui/src/components/RecentErrorsWidget.viewport.test.tsx` | 151 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1084 | G | admin-ui-viewport | `admin-ui/src/components/AlertsBanner.viewport.test.tsx` | 149 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1085 | G | admin-ui-viewport | `admin-ui/src/components/ConsoleHome.viewport.test.tsx` | 147 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1086 | G | admin-ui-viewport | `admin-ui/src/components/DriftSignalsCard.viewport.test.tsx` | 146 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1087 | G | admin-ui-viewport | `admin-ui/src/components/WorkbenchLayout.viewport.test.tsx` | 144 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1088 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerLogs.viewport.test.tsx` | 142 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1089 | G | admin-ui-viewport | `admin-ui/src/components/FleetHealthCard.viewport.test.tsx` | 140 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1090 | G | admin-ui-viewport | `admin-ui/src/components/FixLoopConvergenceWidget.viewport.test.tsx` | 136 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1091 | G | admin-ui-viewport | `admin-ui/src/components/ReleaseQualificationFindings.viewport.test.tsx` | 133 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1092 | G | admin-ui-viewport | `admin-ui/src/components/DirectionPortfolioSection.viewport.test.tsx` | 129 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1093 | G | admin-ui-viewport | `admin-ui/src/components/MediumScopeWidget.viewport.test.tsx` | 127 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1094 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerDiagnostics.viewport.test.tsx` | 126 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1095 | G | admin-ui-viewport | `admin-ui/src/components/TaskStreamPanel.viewport.test.tsx` | 126 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1096 | G | admin-ui-viewport | `admin-ui/src/components/ProjectIntegrationBranchSection.viewport.test.tsx` | 125 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1097 | G | admin-ui-viewport | `admin-ui/src/components/ImprovementLanesPanel.viewport.test.tsx` | 123 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1098 | G | admin-ui-viewport | `admin-ui/src/components/CompactJobsTable.viewport.test.tsx` | 121 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1099 | G | admin-ui-viewport | `admin-ui/src/test/pipeline-composed.viewport.test.tsx` | 119 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1100 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerSelfReview.viewport.test.tsx` | 117 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1101 | G | admin-ui-viewport | `admin-ui/src/components/Pagination.viewport.test.tsx` | 116 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1102 | G | admin-ui-viewport | `admin-ui/src/components/ProjectManagementModal.viewport.test.tsx` | 116 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1103 | G | admin-ui-viewport | `admin-ui/src/components/StrategicAuditPanel.viewport.test.tsx` | 115 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1104 | G | admin-ui-viewport | `admin-ui/src/components/ProviderSettingsPanel.viewport.test.tsx` | 114 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1105 | G | admin-ui-viewport | `admin-ui/src/components/ProjectBranchesSection.viewport.test.tsx` | 113 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1106 | G | admin-ui-viewport | `admin-ui/src/components/ProjectMembers.viewport.test.tsx` | 108 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1107 | G | admin-ui-viewport | `admin-ui/src/components/RuntimeAccountsPanel.viewport.test.tsx` | 108 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1108 | G | admin-ui-viewport | `admin-ui/src/test/messages-composed.viewport.test.tsx` | 108 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1109 | G | admin-ui-viewport | `admin-ui/src/components/MessageTypeDropdown.viewport.test.tsx` | 106 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1110 | G | admin-ui-viewport | `admin-ui/src/components/ProjectToolIframe.viewport.test.tsx` | 106 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1111 | G | admin-ui-viewport | `admin-ui/src/components/ComputeArtifactGallery.viewport.test.tsx` | 105 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1112 | G | admin-ui-viewport | `admin-ui/src/components/MessageAttachments.viewport.test.tsx` | 105 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1113 | G | admin-ui-viewport | `admin-ui/src/components/PendingConfirmationsSection.viewport.test.tsx` | 105 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1114 | G | admin-ui-viewport | `admin-ui/src/components/ProjectPromotionTargetSection.viewport.test.tsx` | 105 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1115 | G | admin-ui-viewport | `admin-ui/src/components/ScopeConversionRatesSection.viewport.test.tsx` | 104 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1116 | G | admin-ui-viewport | `admin-ui/src/components/TaskContextRail.viewport.test.tsx` | 102 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1117 | G | admin-ui-viewport | `admin-ui/src/components/CapabilityTrialsPanel.viewport.test.tsx` | 101 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1118 | G | admin-ui-viewport | `admin-ui/src/components/SystemMaturityCard.viewport.test.tsx` | 101 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1119 | G | admin-ui-viewport | `admin-ui/src/components/ScopeTrendsSection.viewport.test.tsx` | 100 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1120 | G | admin-ui-viewport | `admin-ui/src/components/ReviewQualitySection.viewport.test.tsx` | 98 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1121 | G | admin-ui-viewport | `admin-ui/src/components/ParkWakeHealthCard.viewport.test.tsx` | 97 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1122 | G | admin-ui-viewport | `admin-ui/src/components/CriterionVerdictBadge.viewport.test.tsx` | 96 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1123 | G | admin-ui-viewport | `admin-ui/src/components/MetricsIntegrityObservabilityPanel.viewport.test.tsx` | 95 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1124 | G | admin-ui-viewport | `admin-ui/src/components/WarmReuseVsCostTrend.viewport.test.tsx` | 95 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1125 | G | admin-ui-viewport | `admin-ui/src/components/OperatorWorkspaces.viewport.test.tsx` | 94 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1126 | G | admin-ui-viewport | `admin-ui/src/components/FleetDetailDrawer.viewport.test.tsx` | 92 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1127 | G | admin-ui-viewport | `admin-ui/src/components/SettingsOrchestratorSection.viewport.test.tsx` | 91 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1128 | G | admin-ui-viewport | `admin-ui/src/components/SrRetrospectiveShared.viewport.test.tsx` | 90 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1129 | G | admin-ui-viewport | `admin-ui/src/components/UserManagement.viewport.test.tsx` | 90 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1130 | G | admin-ui-viewport | `admin-ui/src/components/ProjectResourceEnvelopeSection.viewport.test.tsx` | 88 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1131 | G | admin-ui-viewport | `admin-ui/src/components/SystemStatusCard.viewport.test.tsx` | 88 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1132 | G | admin-ui-viewport | `admin-ui/src/components/WhiteboardRailSection.viewport.test.tsx` | 88 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1133 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnerConfigPanel.viewport.test.tsx` | 87 | 5 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1134 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAutoRemediationSection.viewport.test.tsx` | 87 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1135 | G | admin-ui-viewport | `admin-ui/src/components/SettingsGeneralSection.viewport.test.tsx` | 87 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1136 | G | admin-ui-viewport | `admin-ui/src/components/CommandPalette.viewport.test.tsx` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1137 | G | admin-ui-viewport | `admin-ui/src/components/DirectionAutoPauseWidget.viewport.test.tsx` | 85 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1138 | G | admin-ui-viewport | `admin-ui/src/components/SrBadges.viewport.test.tsx` | 85 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1139 | G | admin-ui-viewport | `admin-ui/src/components/CompletionDebtPanel.viewport.test.tsx` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1140 | G | admin-ui-viewport | `admin-ui/src/components/EvergreenBacklogPanel.viewport.test.tsx` | 84 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1141 | G | admin-ui-viewport | `admin-ui/src/components/ErrorBoundary.viewport.test.tsx` | 82 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1142 | G | admin-ui-viewport | `admin-ui/src/components/SettingsAdvancedSection.viewport.test.tsx` | 81 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1143 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAlertDomainsSection.viewport.test.tsx` | 80 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1144 | G | admin-ui-viewport | `admin-ui/src/components/ProviderCategoriesPanel.viewport.test.tsx` | 80 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1145 | G | admin-ui-viewport | `admin-ui/src/components/DependencyHealthCard.viewport.test.tsx` | 79 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1146 | G | admin-ui-viewport | `admin-ui/src/components/ReleaseEvidence.viewport.test.tsx` | 76 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1147 | G | admin-ui-viewport | `admin-ui/src/components/ProjectIssueImplementationSection.viewport.test.tsx` | 75 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1148 | G | admin-ui-viewport | `admin-ui/src/components/ProjectResourceAvailabilityCard.viewport.test.tsx` | 75 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1149 | G | admin-ui-viewport | `admin-ui/src/components/ProviderCostPanel.viewport.test.tsx` | 74 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1150 | G | admin-ui-viewport | `admin-ui/src/components/ProjectAutoReviewSection.viewport.test.tsx` | 73 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1151 | G | admin-ui-viewport | `admin-ui/src/components/StrategicSessionControl.viewport.test.tsx` | 73 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
+| 1152 | G | admin-ui-viewport | `admin-ui/src/components/UILoadTimingPanel.viewport.test.tsx` | 73 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1153 | G | admin-ui-viewport | `admin-ui/src/components/AutonomousConfigSection.viewport.test.tsx` | 70 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1154 | G | admin-ui-viewport | `admin-ui/src/components/DesignDocViewer.viewport.test.tsx` | 70 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1155 | G | admin-ui-viewport | `admin-ui/src/components/EventVisibilityMenu.viewport.test.tsx` | 70 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1156 | G | admin-ui-viewport | `admin-ui/src/components/MuteWindowMenu.viewport.test.tsx` | 69 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1157 | G | admin-ui-viewport | `admin-ui/src/components/TaskDurationWidget.viewport.test.tsx` | 69 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1158 | G | admin-ui-viewport | `admin-ui/src/components/DashboardMetricCards.viewport.test.tsx` | 68 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1159 | G | admin-ui-viewport | `admin-ui/src/components/StrategicStreamingPreview.viewport.test.tsx` | 68 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1160 | G | admin-ui-viewport | `admin-ui/src/components/StructuralHealthObservabilityPanel.viewport.test.tsx` | 68 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1161 | G | admin-ui-viewport | `admin-ui/src/components/ConsultationProgressRow.viewport.test.tsx` | 67 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1162 | G | admin-ui-viewport | `admin-ui/src/components/MarkdownContent.viewport.test.tsx` | 67 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1163 | G | admin-ui-viewport | `admin-ui/src/components/ProjectSwitcherDropdown.viewport.test.tsx` | 66 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1164 | G | admin-ui-viewport | `admin-ui/src/components/FailureStageWidget.viewport.test.tsx` | 65 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1165 | G | admin-ui-viewport | `admin-ui/src/components/FleetRunnersDashboard.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1166 | G | admin-ui-viewport | `admin-ui/src/components/RecurringPatternsSection.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1167 | G | admin-ui-viewport | `admin-ui/src/components/SavedViewsTabStrip.viewport.test.tsx` | 65 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1168 | G | admin-ui-viewport | `admin-ui/src/components/AcceptanceGradeBadge.viewport.test.tsx` | 64 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1169 | G | admin-ui-viewport | `admin-ui/src/components/EvergreenFillObservabilityPanel.viewport.test.tsx` | 63 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1170 | G | admin-ui-viewport | `admin-ui/src/components/SaveViewDialog.viewport.test.tsx` | 63 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1171 | G | admin-ui-viewport | `admin-ui/src/components/NullBranchDiagnosticsPanel.viewport.test.tsx` | 62 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1172 | G | admin-ui-viewport | `admin-ui/src/components/MergeGateFleetHealthCard.viewport.test.tsx` | 61 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1173 | G | admin-ui-viewport | `admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx` | 61 | 2 | under 1500 LOC | unknown (no committed measurement) | protected; declared floor 2 |
+| 1174 | G | admin-ui-viewport | `admin-ui/src/components/PoolAccountHealthPanel.viewport.test.tsx` | 60 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1175 | G | admin-ui-viewport | `admin-ui/src/components/StrategistStatusChip.viewport.test.tsx` | 58 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1176 | G | backend | `backend/testing/test_agent_task_contract.py` | 50 | 0 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1177 | G | admin-ui-viewport | `admin-ui/src/components/WarmStartOriginRow.viewport.test.tsx` | 49 | 2 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1178 | G | admin-ui-viewport | `admin-ui/src/components/AccountMenu.viewport.test.tsx` | 45 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1179 | G | admin-ui-viewport | `admin-ui/src/components/MessagesSummaryCard.viewport.test.tsx` | 41 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1180 | G | admin-ui-viewport | `admin-ui/src/components/EvidenceTierBadge.viewport.test.tsx` | 39 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1181 | G | admin-ui-viewport | `admin-ui/src/components/KeyboardShortcutsOverlay.viewport.test.tsx` | 36 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1182 | G | admin-ui-viewport | `admin-ui/src/components/TaskFixLoopPanel.viewport.test.tsx` | 32 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1183 | G | admin-ui-viewport | `admin-ui/src/components/AdversarialQualityPanel.viewport.test.tsx` | 28 | 1 | under 1500 LOC | unknown (no committed measurement) | — |
+| 1184 | G | admin-ui-viewport | `admin-ui/src/components/WelcomeScreen.viewport.test.tsx` | 28 | 1 | under 1500 LOC | unknown (no committed measurement) | — |

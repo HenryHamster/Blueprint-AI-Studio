@@ -4,7 +4,6 @@ import json
 import os
 import sys
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -23,44 +22,35 @@ from app.task_blocked import (
     record_publication_gate_receipt,
     sanitize_publication_gate_receipt,
 )
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
 
-def _resolve_scripts_dir() -> "Path | None":
-    """Locate the repo's ``scripts/`` dir across local + Docker test environments.
-
-    Candidates, in order: an explicit env override, the ``/repo`` bind-mount
-    (both ``scripts/test-backend.sh`` and the CI shard matrix mount the repo
-    root read-only at ``/repo`` while the *backend* dir is ``/app``), then the
-    repo root two levels above this file (plain checkouts / non-Docker runs).
-    Inside those containers ``parents[2]`` is the filesystem root, so the
-    relative candidate alone resolves to a nonexistent ``/scripts``.
-    """
-    candidates = []
-    env_override = os.getenv("BLUEPRINT_SCRIPTS_DIR")
-    if env_override:
-        candidates.append(Path(env_override))
-    candidates.append(Path("/repo/scripts"))
-    candidates.append(Path(__file__).resolve().parents[2] / "scripts")
-    for path in candidates:
-        if (path / "verification_receipt.py").is_file():
-            return path
-    return None
-
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 
 # The publication receipt's multi-lane projection is produced by the shared
 # receipt writer the local gate invokes (scripts/verification_receipt.py).
 # Import the real one so this suite exercises the projection that actually runs
 # on the VM rather than a hand-rolled restatement of its shape. The import is
 # tolerant: a missing scripts/ tree must not error the whole module and take
-# the DB-backed receipt tests down with it.
-_SCRIPTS_DIR = _resolve_scripts_dir()
-if _SCRIPTS_DIR is not None and str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
+# the DB-backed receipt tests down with it -- but the resolver's NAMED miss
+# reason is retained so the guard below reports why rather than reducing every
+# cause to the same "not available here".
+_SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(_BACKEND_DIR)
+if _SCRIPTS_DIR is not None and _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 try:
     import verification_receipt
-except ImportError:  # pragma: no cover - only when scripts/ is absent
+except ImportError as exc:  # pragma: no cover - only when scripts/ is absent
     verification_receipt = None
+    if not _SCRIPTS_DIR_UNAVAILABLE:
+        # The directory resolved (it carries the sentinel) and the module still
+        # would not import. That is a BROKEN checkout, not an absent one, and
+        # it must not read as the benign "no scripts/ in this layout" case.
+        _SCRIPTS_DIR_UNAVAILABLE = (
+            f"{_SCRIPTS_DIR} resolved but `import verification_receipt` failed: "
+            f"{exc!r} — the scripts tree is present and broken, not missing"
+        )
 
 
 def _require_verification_receipt():
@@ -68,16 +58,12 @@ def _require_verification_receipt():
 
     A silent skip in the promotion CI would mean the multi-lane projection
     invariants never enforce; only ad-hoc environments without the repo
-    checkout may skip.
+    checkout may skip. Either way the resolver's named reason is reported, so
+    the miss is diagnosable from the message alone.
     """
     if verification_receipt is not None:
         return verification_receipt
-    msg = (
-        "scripts/verification_receipt.py not available in this test "
-        "environment (checked BLUEPRINT_SCRIPTS_DIR, the /repo bind-mount "
-        "that scripts/test-backend.sh and the CI shards provide, and "
-        "../../scripts relative to this file)"
-    )
+    msg = f"scripts/verification_receipt.py unusable here: {_SCRIPTS_DIR_UNAVAILABLE}"
     if os.getenv("CI"):
         pytest.fail(
             msg + " — refusing to skip in CI: mount the repo root at /repo "

@@ -302,24 +302,27 @@ def test_dir_scan_source_invariants():
 # These are the regression tests for that runner-side path.
 # ───────────────────────────────────────────────────────────────────────────
 
+import os as _os  # noqa: E402
 import sys as _sys  # noqa: E402
-from pathlib import Path as _Path  # noqa: E402
 from unittest import mock  # noqa: E402
 
-_SCRIPTS_DIR = next(
-    (
-        candidate
-        for candidate in (
-            _Path(__file__).resolve().parents[2] / "scripts",
-            _Path("/repo/scripts"),  # backend test harness mounts the repo here
-        )
-        if candidate.is_dir()
-    ),
-    None,
+from testing.repo_scripts_path import (  # noqa: E402
+    resolve_scripts_dir_from_env as _resolve_scripts_dir_from_env,
 )
-assert _SCRIPTS_DIR is not None, "scripts/local_runner.py must be available to runner tests"
-if str(_SCRIPTS_DIR) not in _sys.path:
-    _sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# Resolve through the shared resolver rather than an ``.is_dir()`` probe. Mere
+# directory existence is the wrong predicate -- it is the same shape as ``.git``
+# being a FILE in a linked worktree (#17872): the check succeeds while the thing
+# the caller needs is absent. The resolver accepts a candidate only when it
+# actually carries the sentinel, and names every candidate it probed on a miss.
+_BACKEND_DIR = _os.path.normpath(_os.path.join(_os.path.dirname(__file__), ".."))
+_SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = _resolve_scripts_dir_from_env(_BACKEND_DIR)
+assert _SCRIPTS_DIR is not None, (
+    f"scripts/local_runner.py must be available to runner tests: "
+    f"{_SCRIPTS_DIR_UNAVAILABLE}"
+)
+if _SCRIPTS_DIR not in _sys.path:
+    _sys.path.insert(0, _SCRIPTS_DIR)
 
 import local_runner  # noqa: E402
 
