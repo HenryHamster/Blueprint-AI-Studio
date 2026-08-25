@@ -68,6 +68,88 @@ def test_provisioner_and_packer_consume_the_same_manifest():
     assert root_restore > provision
 
 
+def test_packer_system_pip_pins_derive_from_owning_source_files(tmp_path):
+    """The baked system pip3 install (pytest stack + ruff) must be pinned via
+    shell variables derived from backend/requirements.txt and
+    scripts/verification-toolchain.json, never hand-copied literals. Replays
+    the packer's own extraction commands against real copies of those source
+    files and asserts the resolved versions match — no version is restated
+    here as a literal."""
+    packer = PACKER.read_text()
+    requirements_path = ROOT / "backend" / "requirements.txt"
+    requirements_text = requirements_path.read_text()
+    manifest = json.loads(MANIFEST.read_text())
+
+    idx = packer.index('"sudo pip3 install ')
+    line_end = packer.index("\n", idx)
+    line = packer[idx:line_end].rstrip()
+    assert line.endswith('",'), f"unexpected system pip3 install line: {line!r}"
+    install_cmd = line[1:-2]
+
+    tokens = re.findall(r"(\S+)==\$(\w+)", install_cmd)
+    assert {name for name, _ in tokens} == {
+        "ruff",
+        "pytest",
+        "pytest-asyncio",
+        "pytest-mock",
+        "pytest-timeout",
+    }
+    assert not re.search(r"==[0-9]", install_cmd), (
+        "packer's baked system pip3 install must not hand-copy a literal "
+        "version — single-source each package from a shell variable instead"
+    )
+    var_of = dict(tokens)
+
+    def extract_var_command(var):
+        prefix = f'"{var}=$('
+        start = packer.index(prefix)
+        end = packer.index("\n", start)
+        raw_line = packer[start:end].rstrip()
+        assert raw_line.endswith('",'), (
+            f"unexpected derivation line for {var}: {raw_line!r}"
+        )
+        content = raw_line[1:-2].replace('\\"', '"')
+        body_prefix = f"{var}=$("
+        assert content.startswith(body_prefix) and content.endswith(")")
+        return content[len(body_prefix) : -1]
+
+    req_copy = tmp_path / "requirements.txt"
+    req_copy.write_text(requirements_text)
+    for pkg in ("pytest", "pytest-asyncio", "pytest-mock", "pytest-timeout"):
+        cmd = extract_var_command(var_of[pkg]).replace(
+            "/tmp/backend-deps-ctx/requirements.txt", str(req_copy)
+        )
+        assert str(req_copy) in cmd, (
+            f"{pkg}'s pin is not derived from backend/requirements.txt"
+        )
+        result = subprocess.run(
+            ["bash", "-c", cmd], capture_output=True, text=True, check=True
+        )
+        resolved = result.stdout.strip()
+        expected = next(
+            entry.split("==", 1)[1]
+            for entry in requirements_text.splitlines()
+            if entry.startswith(f"{pkg}==")
+        )
+        assert resolved == expected, (
+            f"packer's baked system {pkg} pin ({resolved!r}) != "
+            f"backend/requirements.txt ({expected!r})"
+        )
+
+    manifest_copy = tmp_path / "verification-toolchain.json"
+    manifest_copy.write_text(MANIFEST.read_text())
+    ruff_cmd = extract_var_command(var_of["ruff"]).replace(
+        "/tmp/verification-toolchain.json", str(manifest_copy)
+    )
+    assert str(manifest_copy) in ruff_cmd, (
+        "ruff's pin is not derived from scripts/verification-toolchain.json"
+    )
+    result = subprocess.run(
+        ["bash", "-c", ruff_cmd], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == manifest["python_packages"]["ruff"]
+
+
 def test_provisioner_rejects_an_incomplete_manifest_loudly(tmp_path):
     invalid = tmp_path / "verification-toolchain.json"
     invalid.write_text(
