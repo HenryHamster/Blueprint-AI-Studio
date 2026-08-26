@@ -715,6 +715,121 @@ SPAWN_REASON_PERSISTENT_CONFLICT = "persistent_conflict"
 # surfaced for an explicit abandon/continue decision.
 SPAWN_REASON_ABANDON_CANDIDATE = "abandon_candidate"
 
+
+# ── Transient spawn-deferral classification + bookkeeping (shared) ────────────
+# Every ``SPAWN_REASON_DEFERRED`` site in this module is transient BY
+# CONSTRUCTION — closed project admission, the per-PR spawn lock, an in-flight
+# peer task, the mid-retry infra grace window, and the spawn-commit lock all
+# clear on their own, and each site says exactly that in the
+# ``latest_status_message`` it writes ("retrying next sweep", "waiting on active
+# {type} task {id}", ...). A caller that reads DEFERRED as a terminal stall
+# converts "not right now" into "a human must look at this".
+#
+# These predicates exist so every ``_spawn_pipeline_task`` caller classifies a
+# refusal identically. ``app.review_request_changes`` and
+# ``app.task_lifecycle_fix_completion`` drifted apart precisely because each
+# open-coded the comparison; route new callers through here.
+SPAWN_DEFERRAL_KEY = "_pipeline_spawn_deferral"
+
+# Bounded retry budget for a transient deferral, expressed BOTH as an attempt
+# count and an elapsed window — whichever trips first ends the retry. Both
+# numbers are inherited from existing production bounds, not invented:
+#
+# 5 attempts — ``_sweep_post_commit_pending`` (recovery_post_commit_pending.py)
+#   grants a pending marker exactly ``MAX_ATTEMPTS = 5`` executions before it
+#   terminalizes the row as ``post_commit_abandoned``. The 5th deferral is
+#   therefore the LAST moment a caller can still emit a specific, truthful
+#   escalation instead of that generic abandon. A larger budget would not buy
+#   more retries — it would only forfeit the accurate message.
+# 5 minutes — ``_REVIEW_WAIT_DEFER_GRACE_S = 5 * 60`` in ci_completion.py
+#   already bounds the mirror-image case (a deferred REVIEW spawn) in
+#   production. Matching it keeps both halves of the pipeline on one number and
+#   binds when sweeps run slower than their nominal 60s cadence.
+SPAWN_DEFER_MAX_ATTEMPTS = 5
+SPAWN_DEFER_GRACE_S = 5 * 60
+
+
+def spawn_refusal_reason(task: Task) -> str:
+    """Reason code ``_spawn_pipeline_task`` recorded for its last refusal."""
+    return (task.context or {}).get(SPAWN_REASON_KEY) or "unknown"
+
+
+def spawn_refusal_is_transient(task: Task) -> bool:
+    """True when the refusal means "not right now", never "never".
+
+    Only ``SPAWN_REASON_DEFERRED`` qualifies. ``SPAWN_REASON_DEDUP`` is
+    deliberately NOT transient — see ``spawn_refusal_is_already_satisfied``.
+    """
+    return spawn_refusal_reason(task) == SPAWN_REASON_DEFERRED
+
+
+def spawn_refusal_is_already_satisfied(task: Task) -> bool:
+    """True when the refusal means the caller's goal already holds.
+
+    ``SPAWN_REASON_DEDUP`` is neither a deferral nor a stall: an equivalent
+    same-type task is already active on this PR. Retrying cannot change
+    anything, so DEDUP must stay OUT of the bounded-retry path — it would burn
+    the whole budget and then escalate a false "deferred repeatedly". It must
+    equally stay out of the terminal path, which would demand operator
+    attention for a chain that is already progressing.
+
+    All three DEDUP sites in ``_spawn_pipeline_task`` currently return that
+    existing task rather than ``None``, so a refusal-branch caller cannot
+    observe DEDUP today. This predicate keeps the disposition correct if one
+    ever does, rather than letting it default into the terminal branch.
+    """
+    return spawn_refusal_reason(task) == SPAWN_REASON_DEDUP
+
+
+def record_spawn_deferral(
+    task: Task, *, detail: str | None = None, now: datetime | None = None
+) -> dict[str, Any]:
+    """Count one transient deferral against the bounded budget.
+
+    Returns ``{"attempts", "elapsed_s", "exhausted", "detail"}``. The counter
+    lives in ``task.context[SPAWN_DEFERRAL_KEY]`` so it survives the commit and
+    the post-commit-sweep replay that actually performs the retry — the caller
+    MUST commit the task, or every attempt looks like the first one and the
+    bound can never fire.
+    """
+    _now = now or _utcnow()
+    ctx = dict(task.context or {})
+    state = dict(ctx.get(SPAWN_DEFERRAL_KEY) or {})
+    attempts = int(state.get("attempts") or 0) + 1
+    first_at: datetime | None = None
+    _raw_first = state.get("first_at")
+    if isinstance(_raw_first, str):
+        try:
+            first_at = datetime.fromisoformat(_raw_first)
+        except ValueError:
+            first_at = None
+    if first_at is None:
+        first_at = _now
+    elapsed_s = max(0.0, (_now - first_at).total_seconds())
+    if detail:
+        state["detail"] = str(detail)[:500]
+    state["attempts"] = attempts
+    state["first_at"] = first_at.isoformat()
+    state["last_at"] = _now.isoformat()
+    ctx[SPAWN_DEFERRAL_KEY] = state
+    task.context = ctx
+    return {
+        "attempts": attempts,
+        "elapsed_s": elapsed_s,
+        "exhausted": (
+            attempts >= SPAWN_DEFER_MAX_ATTEMPTS or elapsed_s >= SPAWN_DEFER_GRACE_S
+        ),
+        "detail": state.get("detail") or "",
+    }
+
+
+def clear_spawn_deferral(task: Task) -> None:
+    """Drop the deferral counter once a spawn finally succeeds."""
+    ctx = dict(task.context or {})
+    if ctx.pop(SPAWN_DEFERRAL_KEY, None) is not None:
+        task.context = ctx
+
+
 # Grace window for the mid-retry defer: when a same-PR fix is FAILED/CANCELLED
 # with an infra failure_category and the failure is younger than this many minutes,
 # a review spawn is deferred so the fix can be requeued (rather than producing a
