@@ -185,8 +185,11 @@ NEVER_AUTOREPAIR: dict[str, str] = {
     ),
     "backend/testing/test_conversational_workday_protection.py": (
         "The per-file test_count entries in conversational_workday_manifest.json "
-        "are protection FLOORS. Rewriting a floor to whatever the tree currently "
-        "has is exactly the erosion the floor exists to catch."
+        "are EXACT pins on a protected surface, not floors -- declaring fewer "
+        "than the tree has fails too. Rewriting a pin to whatever the tree "
+        "currently has satisfies the guard in BOTH directions, which is exactly "
+        "the erosion the pin exists to catch when the tree shrank, and an "
+        "unratified coverage change when it grew."
     ),
     "backend/testing/test_event_type_invariants.py": (
         "event_type_snapshot.json is a pinned literal set -- a RATCHET. "
