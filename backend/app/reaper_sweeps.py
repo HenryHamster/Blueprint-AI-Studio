@@ -2505,6 +2505,57 @@ async def _retire_quiet_project_liveness_alerts(session, project_ids: list) -> i
     return retired
 
 
+async def _sync_strategic_lane_disabled_signals(
+    session,
+    project_candidates: list,
+    lane_admissions: dict,
+) -> int:
+    """Hold the deliberate-disable signal in step with the lane flag.
+
+    Returns the number of rows created.  Never raises into the sweep: a
+    visibility signal must not be able to break the liveness detector it
+    accompanies.
+    """
+    from app.alert_dispatch import (
+        _maybe_create_strategic_lane_disabled_alert,
+        _resolve_strategic_lane_disabled_alerts,
+    )
+
+    created = 0
+    live_lane_ids = [
+        project_id
+        for project_id, _vision, automatic_allowed, _blob in project_candidates
+        if automatic_allowed
+    ]
+    try:
+        await _resolve_strategic_lane_disabled_alerts(session, live_lane_ids)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "[STRATEGIC] Failed to retire lane-disabled signals for %d project(s)",
+            len(live_lane_ids),
+        )
+        await session.rollback()
+
+    for project_id, _vision, automatic_allowed, _blob in project_candidates:
+        if automatic_allowed:
+            continue
+        admission = lane_admissions.get(project_id)
+        if admission is None:
+            continue
+        try:
+            if await _maybe_create_strategic_lane_disabled_alert(
+                project_id, session, admission=admission
+            ):
+                created += 1
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[STRATEGIC] Failed to sync the lane-disabled signal for project %s",
+                project_id,
+            )
+            await session.rollback()
+    return created
+
+
 async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     """Detect a halted strategic loop and route one operator-visible alert.
 
@@ -2523,7 +2574,9 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         Project,
         StrategicCycle,
     )
-    from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+    from app.strategic_cycle_admission import (
+        describe_automatic_strategic_cycles,
+    )
     from app.shared_state import runtime_config as _runtime_config
     from app.strategic_cycle import OUTCOME_COMPLETED
     from app.strategic_resident_session import (
@@ -2571,6 +2624,9 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     automatic_cycles_allowed: dict = {}
     resident_blobs: dict[Any, dict[str, Any]] = {}
     project_candidates: list[tuple[Any, Any, bool, dict[str, Any] | None]] = []
+    # The decoded lane record per project, so the downgrade signal below can
+    # name the reason / actor / expiry instead of only the boolean state.
+    lane_admissions: dict = {}
     for (
         project_id,
         project_created_at,
@@ -2583,9 +2639,11 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
                 pc = pc.replace(tzinfo=None)
             if pc > cutoff:
                 continue
-        automatic_allowed = automatic_strategic_cycles_enabled(
-            SimpleNamespace(build_config=project_build_config)
+        lane_admission = describe_automatic_strategic_cycles(
+            SimpleNamespace(build_config=project_build_config), now=now
         )
+        lane_admissions[project_id] = lane_admission
+        automatic_allowed = lane_admission.enabled
         resident_blob = read_resident_session(project_vision)
         if resident_blob is not None:
             resident_blobs[project_id] = resident_blob
@@ -2649,6 +2707,21 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             await _reset_resident_liveness_suppression(session, project_id)
         await session.commit()
         await _retire_quiet_project_liveness_alerts(session, quiet_project_ids)
+
+    # DOWNGRADE, not drop.  Retiring the halt WARNING above is right -- no cycle
+    # receipt can be expected from a lane that is off -- but on its own it made a
+    # wedged project and a deliberately quiet one produce byte-identical alert
+    # feeds, which is how a "bounded tactical canary" halted a whole strategic
+    # engine for ten days with zero operator signal.  Keep a low-severity,
+    # non-paging row for as long as the lane is off, and dismiss it the moment
+    # the lane is live again.  This runs over EVERY project the sweep looked at,
+    # not just the quiet ones, so a Resident-owned project with the automatic
+    # lane off is visible too.  The producer is dedupe-keyed and no-ops when the
+    # description is unchanged, so a short sweep cadence cannot turn this into
+    # the alert spam it exists to replace.
+    await _sync_strategic_lane_disabled_signals(
+        session, project_candidates, lane_admissions
+    )
 
     if not candidate_ids:
         return 0
