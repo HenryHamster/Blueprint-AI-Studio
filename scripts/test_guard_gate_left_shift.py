@@ -1623,11 +1623,11 @@ def test_changed_harness_invocation_cannot_hide_base_corpus_failure(
     harness = repo / "scripts" / "test-backend.sh"
     original = harness.read_text(encoding="utf-8")
     invocation = (
-        '  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest \\\n'
+        '  _run_pytest "${STANDALONE_ARGS[@]}" -v --noconftest \\\n'
     )
     weakened = (
         "  # WEAKENED_HARNESS: invocation-only selection change\n"
-        '  _run python3 -m pytest "${STANDALONE_ARGS[0]}" -v --noconftest \\\n'
+        '  _run_pytest "${STANDALONE_ARGS[0]}" -v --noconftest \\\n'
     )
     assert invocation in original
     harness.write_text(original.replace(invocation, weakened, 1), encoding="utf-8")
@@ -1672,11 +1672,11 @@ def test_changed_harness_partial_invocation_cannot_hide_base_corpus_failure(
     harness = repo / "scripts" / "test-backend.sh"
     original = harness.read_text(encoding="utf-8")
     invocation = (
-        '  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest \\\n'
+        '  _run_pytest "${STANDALONE_ARGS[@]}" -v --noconftest \\\n'
     )
     weakened = (
         "  # PARTIAL_SELECTION_CHANGE: invocation-only weakening\n"
-        '  _run python3 -m pytest "${STANDALONE_ARGS[@]:0:1}" -v --noconftest \\\n'
+        '  _run_pytest "${STANDALONE_ARGS[@]:0:1}" -v --noconftest \\\n'
     )
     assert invocation in original
     harness.write_text(original.replace(invocation, weakened, 1), encoding="utf-8")
