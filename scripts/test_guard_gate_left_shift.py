@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import backend_verification_guard  # noqa: E402
 import guard_suppression_receipt  # noqa: E402
 import static_release_guard  # noqa: E402
+from testing import impacted_tests  # noqa: E402
 import typecheck_verification_guard  # noqa: E402
 import vitest_verification_guard  # noqa: E402
 from testing.fixgate_attribution import (  # noqa: E402
@@ -115,19 +116,19 @@ def test_live_manifest_sentinels_are_all_carried_by_the_standalone_roster() -> N
     registered: set[str] = set()
     for _regex, sentinels in static_release_guard.load_surface_manifest(str(REPO_ROOT)):
         registered.update(sentinels)
-    # Sentinels reachable through the backend-authoring lane are exempt: that
-    # lane resolves selectors whenever the diff holds a changed backend/*.py.
-    corpus_only = {
-        sentinel
-        for sentinel in registered
-        if sentinel
-        not in {
-            "backend/testing/test_direction_referential_guard.py",
-            "backend/testing/test_size_limits_checker.py",
-            "backend/testing/test_migration_0621_safe_encrypt_backfill.py",
-            "backend/testing/test_migration_0626_safe_encrypt_backfill.py",
-        }
-    }
+    # Non-vacuity: an unreadable manifest compiles to nothing, and an assertion
+    # over an empty required set passes while proving nothing at all.
+    assert registered, "live drift_sentinel_surfaces.json registered no sentinels"
+
+    # Which sentinels the corpus lane must carry is DERIVED from the manifest,
+    # not listed here: a sentinel whose every registered surface lies under
+    # backend/ is only ever selected by a backend diff, and a backend diff
+    # already resolves selectors through the backend-authoring lane. This used
+    # to be a hand-maintained name set in this file, and it went stale the first
+    # time a backend-only sentinel was registered without someone extending it.
+    corpus_only = set(impacted_tests.corpus_lane_required_sentinels(str(REPO_ROOT)))
+    assert corpus_only, "no corpus-lane sentinel derived -- the rule read nothing"
+    assert corpus_only <= registered
     assert static_release_guard._uncovered_sentinels(sorted(corpus_only), roster) == []
 
 
