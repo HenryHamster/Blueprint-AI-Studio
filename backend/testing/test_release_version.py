@@ -3835,3 +3835,207 @@ def test_backend_has_no_outbound_deploy_capability():
         "grant itself the right to deploy itself. Found: "
         + ", ".join(f"{path} ({label})" for path, label in offenders)
     )
+
+
+# ===========================================================================
+# Goal-authoring compliance ledger
+#   goal_omission_cycles / goal_omission_last_cycle + the SOURCE_CONDITION
+#   resolver every goal-authoring path must funnel through.
+# ===========================================================================
+
+
+def _goal_omission_alert(project_id, version_number, **overrides):
+    """Build an open goal-omission Alert row for the given condition."""
+    from app.models import Alert, AlertSeverity
+
+    fields = {
+        "project_id": project_id,
+        "severity": AlertSeverity.WARNING,
+        "domain": "release_lifecycle",
+        "event_type": rv.VERSION_GOAL_OMISSION_EVENT_TYPE,
+        "title": f"Version goal not authored - v{version_number}",
+        "message": "asked and not delivered",
+        "source": "version_goal_omission",
+        "dedupe_key": rv.version_goal_omission_dedupe_key(project_id, version_number),
+    }
+    fields.update(overrides)
+    return Alert(**fields)
+
+
+def test_version_goal_omission_alert_identity_is_pinned():
+    """Literal pin on the governance-relevant alert identity.
+
+    ``should_emit_project_alert`` is FAIL-CLOSED on the audience registry: an
+    event_type absent from ``message_audience`` resolves to a non-operator
+    audience and the durable alert is silently dropped -- the exact silence this
+    ledger exists to end.  Pinning the literal (rather than asserting against
+    the constant itself) means a rename that moves the constant and its two
+    registry entries together still has to be reviewed here.
+    """
+    from app.alert_policy import ALERT_EVENT_POLICIES, AlertRetirementMode
+    from app.message_audience import route_event
+
+    assert rv.VERSION_GOAL_OMISSION_EVENT_TYPE == "release.version_goal_not_authored"
+    assert "release.version_goal_not_authored" in ALERT_EVENT_POLICIES
+    assert route_event("release.version_goal_not_authored") == "operator-action-needed"
+    policy = ALERT_EVENT_POLICIES["release.version_goal_not_authored"]
+    assert policy.domain == "release_lifecycle"
+    assert policy.route == "alert"
+    # SOURCE_CONDITION means the PRODUCER owns the resolver: the reaper backstop
+    # (alert_dispatch.sweep_resolve_policy_retirement_alerts) reconciles only
+    # TASK_TERMINAL and TIMELINE_ONLY rows and will never dismiss this one. If
+    # this mode ever changes, resolve_version_goal_omission_alert is no longer
+    # what ends the condition and its callers become dead code.
+    assert policy.retirement == AlertRetirementMode.SOURCE_CONDITION
+
+
+def test_version_goal_omission_dedupe_key_names_the_condition():
+    """The key is (event, project, version) -- never the occurrence.
+
+    An occurrence-keyed alert would mint a fresh row per cycle, resetting
+    ``created_at`` every time, so the condition could never age into the
+    severity escalation the raise site applies.
+    """
+    key = rv.version_goal_omission_dedupe_key("proj-1", 12)
+    assert key == "release.version_goal_not_authored:proj-1:12"
+    # Stable for the same condition, distinct across versions and projects.
+    assert key == rv.version_goal_omission_dedupe_key("proj-1", 12)
+    assert key != rv.version_goal_omission_dedupe_key("proj-1", 13)
+    assert key != rv.version_goal_omission_dedupe_key("proj-2", 12)
+
+
+@pytest.mark.asyncio
+async def test_set_version_goal_clears_the_omission_ledger(db_session):
+    """Authoring a goal retires the ask -- through the shared write funnel.
+
+    ``set_version_goal`` is the single funnel the strategist path AND the
+    operator ``version-goal`` endpoint both use, so the escape hatch named in
+    the alert's own "TO RESOLVE" line really does end the condition.
+    """
+    project = await _make_project(db_session, "GoalLedgerClear")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.goal_omission_cycles = 4
+    version.goal_omission_last_cycle = "cycle-abc"
+    db_session.add(version)
+    await db_session.commit()
+
+    rv.set_version_goal(
+        version,
+        "Make the goal-authoring ask auditable end to end.",
+        editor_id="op@example.com",
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal_omission_cycles == 0
+    assert version.goal_omission_last_cycle is None
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_goal_does_not_clear_the_omission_ledger(db_session):
+    """Setting the goal back to NULL RE-OPENS the ask, so the streak stands.
+
+    ``version_phase.goal_needed`` is emitted whenever the goal is null; wiping
+    the streak here would restart the bounded re-ask budget every time a goal
+    was blanked, so the escalation could be deferred forever.
+    """
+    project = await _make_project(db_session, "GoalLedgerReopen")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_goal(
+        version, "A goal that is about to be withdrawn.", editor_id="op"
+    )
+    version.goal_omission_cycles = 2
+    version.goal_omission_last_cycle = "cycle-xyz"
+    db_session.add(version)
+    await db_session.commit()
+
+    rv.set_version_goal(version, None, editor_id="op")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal is None
+    assert version.goal_omission_cycles == 2, (
+        "A goal cleared back to NULL re-opens the ask; the omission streak must "
+        "survive so the bounded re-ask budget is not silently reset."
+    )
+    assert version.goal_omission_last_cycle == "cycle-xyz"
+
+
+@pytest.mark.asyncio
+async def test_resolve_version_goal_omission_alert_dismisses_only_its_condition(
+    db_session,
+):
+    """The producer-owned resolver ends the condition, and nothing else."""
+    project = await _make_project(db_session, "GoalOmissionResolve")
+    version = await rv.open_version(db_session, project.id, version_number=7)
+    await db_session.commit()
+
+    mine = _goal_omission_alert(project.id, version.version_number)
+    other_version = _goal_omission_alert(project.id, 8)
+    other_event = _goal_omission_alert(
+        project.id,
+        version.version_number,
+        event_type="release.build_stalled",
+        dedupe_key=f"release.build_stalled:{project.id}:{version.version_number}",
+    )
+    db_session.add_all([mine, other_version, other_event])
+    await db_session.commit()
+
+    # Goal is still NULL: the condition holds, so nothing may be dismissed.
+    assert await rv.resolve_version_goal_omission_alert(db_session, version) == 0
+    await db_session.refresh(mine)
+    assert mine.dismissed_at is None
+
+    rv.set_version_goal(
+        version, "A real, substantive version objective.", editor_id="op"
+    )
+    db_session.add(version)
+    assert await rv.resolve_version_goal_omission_alert(db_session, version) == 1
+    await db_session.commit()
+
+    for row in (mine, other_version, other_event):
+        await db_session.refresh(row)
+    assert mine.dismissed_at is not None, (
+        "The goal-omission alert must be dismissed once the goal exists -- its "
+        "SOURCE_CONDITION retirement mode means no sweep will ever do it."
+    )
+    assert other_version.dismissed_at is None, (
+        "Another version's condition must be untouched"
+    )
+    assert other_event.dismissed_at is None, "Another event type must be untouched"
+
+    # Idempotent: a second resolve finds nothing left to dismiss.
+    assert await rv.resolve_version_goal_omission_alert(db_session, version) == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_derived_goal_refresh_retires_the_ask(db_session):
+    """The third goal-authoring path clears the ledger and the alert too.
+
+    ``refresh_open_version_goal_if_auto_derived`` assigns ``goal`` directly
+    rather than through ``set_version_goal``, so it has to retire the ask
+    itself or the counter keeps climbing against a version that has a goal.
+    """
+    project = await _make_project(db_session, "GoalAutoRefresh")
+    version = await rv.open_version(db_session, project.id, version_number=2)
+    version.goal_omission_cycles = 3
+    version.goal_omission_last_cycle = "cycle-123"
+    db_session.add(version)
+    alert = _goal_omission_alert(project.id, version.version_number)
+    db_session.add(alert)
+    await db_session.commit()
+
+    refreshed = await rv.refresh_open_version_goal_if_auto_derived(
+        db_session, project.id, "Autonomous coordination across three projects."
+    )
+    await db_session.commit()
+    assert refreshed is not None
+    await db_session.refresh(version)
+    await db_session.refresh(alert)
+
+    assert version.goal == "Autonomous coordination across three projects."
+    assert version.goal_omission_cycles == 0
+    assert version.goal_omission_last_cycle is None
+    assert alert.dismissed_at is not None

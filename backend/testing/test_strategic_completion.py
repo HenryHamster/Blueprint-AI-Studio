@@ -19599,6 +19599,14 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
     assert body["new_version_goal_received"] is True, (
         "Response must confirm new_version_goal was received"
     )
+    # "received" only proves the field survived the strip; "applied" is the
+    # verdict _apply_new_version_goal returns and is the only signal that the
+    # goal actually reached the open version. Without it a goal that was
+    # extracted and then dropped (no open version, stale row, write conflict)
+    # is indistinguishable from one that landed.
+    assert body["new_version_goal_applied"] is True, (
+        "Response must report whether the goal actually reached the open version"
+    )
 
     # The transient signal must NOT linger in the stored problem_model.
     await db_session.refresh(project)
@@ -19650,6 +19658,78 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
     await db_session.refresh(version)
     assert version.goal == corrected_goal, (
         f"Strategist must be able to correct its own goal; got {version.goal!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_reports_a_received_goal_that_was_not_applied(
+    client, db_session, mocker
+):
+    """``received`` and ``applied`` must be able to disagree.
+
+    ``new_version_goal_received`` only says the field survived the
+    ``extra="forbid"`` strip. With no open ReleaseVersion the goal is dropped on
+    the floor -- correctly, nothing asked for it -- and the strategist's own
+    telemetry would report a successful authorship it never performed if the
+    response echoed ``received`` alone. This is the case that makes the
+    ``applied`` verdict non-vacuous.
+    """
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NVG-NoOpenVersion",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Deliberately NO ReleaseVersion row for this project.
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-nvg-noopen",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-nvg-noopen", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
+                "capabilities": [],
+                "gaps": [],
+                "new_version_goal": "A goal with nowhere to land.",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["new_version_goal_received"] is True
+    assert body["new_version_goal_applied"] is False, (
+        "A goal that never reached an open version must not be reported applied"
     )
 
 
@@ -21424,3 +21504,411 @@ async def test_strategic_contract_ownership_and_active_direction_mapping(
     assert await get_criterion_by_text(
         db_session, task.project_id, version.id, strategist_row.text
     ) == strategist_row
+
+
+# ===========================================================================
+# _apply_new_version_goal — the goal-authoring compliance ledger
+#
+# DEFECT: ``version_phase.goal_needed`` is emitted on every strategic cycle
+# while the open version's goal is NULL, so every completed cycle is one ask.
+# When the agent simply omitted ``new_version_goal``, _apply_new_version_goal
+# returned on its first guard and NOTHING recorded that a required output had
+# been requested and had not arrived — an omitted output was indistinguishable
+# from one never asked for.  These tests cover the ledger that now owns that
+# outcome: count the misses, dedupe per cycle, alert once the bounded re-ask
+# budget is spent, and RETIRE the condition when a goal finally lands.
+# ===========================================================================
+
+
+async def _goal_ledger_project(db_session, name):
+    """A project whose release_lifecycle alert domain is explicitly enabled.
+
+    Explicit beats ``is_self_repo``: ``project_alert_domain_enabled`` otherwise
+    falls back to the deploy-identity classifier, which depends on ambient env.
+    """
+    project = Project(
+        name=name,
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+        build_config={"alert_domains": {"release_lifecycle": True}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+async def _goal_cycle_task(db_session, project, cycle_id):
+    """One strategic cycle: the unit the omission counter is keyed to."""
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+        strategic_cycle_id=cycle_id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+async def _goal_omission_alerts(db_session, project_id):
+    from sqlmodel import select as _select
+
+    from app.models import Alert
+
+    return (
+        (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.event_type == "release.version_goal_not_authored",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _miss_cycles(db_session, project, count, *, start=1):
+    """Drive ``count`` distinct completed cycles that were asked and delivered nothing."""
+    from app.strategic_completion import _apply_new_version_goal
+
+    for n in range(start, start + count):
+        task = await _goal_cycle_task(db_session, project, f"cycle-{n}")
+        await _apply_new_version_goal(None, task, project, db_session, path="api")
+        await db_session.commit()
+
+
+def test_version_goal_omission_budget_constants_are_pinned():
+    """Literal pins on the bounded-then-loud budget.
+
+    These two numbers are the whole escalation policy: how many asks may go
+    unanswered before an operator is told, and how long an unanswered signal
+    may sit before it is re-graded.  Asserting them against the constants they
+    define would be self-certifying, so pin the literals.
+    """
+    from datetime import timedelta as _timedelta
+
+    from app.strategic_completion import (
+        _VERSION_GOAL_OMISSION_ALERT_AFTER,
+        _VERSION_GOAL_OMISSION_ESCALATE_AFTER,
+    )
+
+    assert _VERSION_GOAL_OMISSION_ALERT_AFTER == 3
+    assert _VERSION_GOAL_OMISSION_ESCALATE_AFTER == _timedelta(hours=24)
+
+
+@pytest.mark.asyncio
+async def test_omitted_new_version_goal_is_recorded_on_the_ledger(db_session):
+    """The ask was made this cycle and nothing came back — that must leave a trace."""
+    from app import release_version as rv
+    from app.strategic_completion import _apply_new_version_goal
+
+    project = await _goal_ledger_project(db_session, "GoalOmission1")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    task = await _goal_cycle_task(db_session, project, "cycle-1")
+
+    applied = await _apply_new_version_goal(
+        None, task, project, db_session, path="api"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert applied is False
+    assert version.goal is None
+    assert version.goal_omission_cycles == 1, (
+        "An omitted `new_version_goal` on an open version with a NULL goal must "
+        "be counted — this is the ask that had no owner."
+    )
+    assert version.goal_omission_last_cycle == "cycle-1"
+
+
+@pytest.mark.asyncio
+async def test_version_goal_omission_is_deduped_within_one_cycle(db_session):
+    """One cycle reaching the apply path twice counts once.
+
+    ``set_problem_model`` applies the field inline (``api_inline``) AND stows it
+    on ``task.context`` for the completion handler (``api``), so a single cycle
+    lands here more than once.  Counting per call would inflate the streak and
+    fire the escalation a cycle or two early.
+    """
+    from app import release_version as rv
+    from app.strategic_completion import _apply_new_version_goal
+
+    project = await _goal_ledger_project(db_session, "GoalOmissionDedupe")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    task = await _goal_cycle_task(db_session, project, "cycle-1")
+
+    await _apply_new_version_goal(
+        None, task, project, db_session, path="api_inline"
+    )
+    await _apply_new_version_goal(None, task, project, db_session, path="api")
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version.goal_omission_cycles == 1, (
+        "The inline and completion apply paths are the SAME cycle; the counter "
+        "is keyed to the cycle, not to the call."
+    )
+
+
+@pytest.mark.asyncio
+async def test_version_goal_omission_counts_distinct_cycles(db_session):
+    """Consecutive cycles that each miss accumulate."""
+    from app import release_version as rv
+
+    project = await _goal_ledger_project(db_session, "GoalOmissionStreak")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await _miss_cycles(db_session, project, 2)
+    await db_session.refresh(version)
+
+    assert version.goal_omission_cycles == 2
+    assert version.goal_omission_last_cycle == "cycle-2"
+
+
+@pytest.mark.asyncio
+async def test_no_alert_before_the_bounded_reask_budget_is_spent(db_session):
+    """Bounded FIRST: the re-ask is given a real budget before anyone is paged."""
+    from app import release_version as rv
+
+    project = await _goal_ledger_project(db_session, "GoalOmissionQuiet")
+    await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await _miss_cycles(db_session, project, 2)
+
+    assert await _goal_omission_alerts(db_session, project.id) == [], (
+        "Two missed cycles is inside the re-ask budget; alerting here would "
+        "make the signal noise."
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_omission_alerts_once_the_budget_is_spent_and_stays_one_row(
+    db_session,
+):
+    """Then LOUD — as exactly one condition-keyed row that refreshes in place."""
+    from app import release_version as rv
+    from app.models import AlertSeverity
+
+    project = await _goal_ledger_project(db_session, "GoalOmissionAlert")
+    version = await rv.open_version(db_session, project.id, version_number=4)
+    await db_session.commit()
+
+    await _miss_cycles(db_session, project, 3)
+    alerts = await _goal_omission_alerts(db_session, project.id)
+
+    assert len(alerts) == 1, (
+        f"Exactly one condition-scoped alert expected at the budget; got {len(alerts)}"
+    )
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert alert.domain == "release_lifecycle"
+    assert alert.source == "version_goal_omission"
+    assert alert.dedupe_key == rv.version_goal_omission_dedupe_key(project.id, 4)
+    assert alert.dismissed_at is None
+    # The message must name what was asked for, what came back, and how to end
+    # it — a bare "goal missing" is the silence this replaces, not a fix for it.
+    assert "ASKED FOR" in alert.message
+    assert "CAME BACK" in alert.message
+    assert "TO RESOLVE" in alert.message
+    assert "v4" in alert.title
+
+    # A fourth miss refreshes the SAME row rather than minting another; an
+    # occurrence-keyed alert would reset created_at and could never age into
+    # the escalation ladder.
+    created_at = alert.created_at
+    await _miss_cycles(db_session, project, 1, start=4)
+    alerts_after = await _goal_omission_alerts(db_session, project.id)
+    assert len(alerts_after) == 1
+    await db_session.refresh(alert)
+    assert alert.occurrence_count == 2
+    assert alert.created_at == created_at
+    await db_session.refresh(version)
+    assert version.goal_omission_cycles == 4
+
+
+@pytest.mark.asyncio
+async def test_authoring_the_goal_clears_the_ledger_and_dismisses_the_alert(
+    db_session,
+):
+    """The condition ends when the goal lands — ledger AND alert.
+
+    ``release.version_goal_not_authored`` carries the default
+    ``AlertRetirementMode.SOURCE_CONDITION``, which means the producer owns the
+    resolver: ``alert_dispatch.sweep_resolve_policy_retirement_alerts``
+    reconciles only TASK_TERMINAL and TIMELINE_ONLY rows.  Without an explicit
+    resolve the alert would outlive its condition forever.
+    """
+    from app import release_version as rv
+    from app.strategic_completion import _apply_new_version_goal
+
+    project = await _goal_ledger_project(db_session, "GoalOmissionResolved")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await _miss_cycles(db_session, project, 3)
+    alerts = await _goal_omission_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    answering_task = await _goal_cycle_task(db_session, project, "cycle-answer")
+    applied = await _apply_new_version_goal(
+        "Deliver autonomous coordination so Blueprint runs 3+ projects unattended.",
+        answering_task,
+        project,
+        db_session,
+        path="api",
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    await db_session.refresh(alerts[0])
+
+    assert applied is True
+    assert version.goal is not None
+    assert version.goal_omission_cycles == 0
+    assert version.goal_omission_last_cycle is None
+    assert alerts[0].dismissed_at is not None, (
+        "The goal-omission alert must be dismissed when the goal is authored — "
+        "nothing else in the system will ever retire a SOURCE_CONDITION row."
+    )
+
+
+@pytest.mark.asyncio
+async def test_contentless_goal_counts_as_an_omission(db_session):
+    """A placeholder is a non-answer, not an answer.
+
+    ``is_contentless_goal`` rejects single-word placeholders; before this the
+    rejection was a bare ``return`` and the ask went back to having no owner.
+    """
+    from app import release_version as rv
+    from app.strategic_completion import _apply_new_version_goal
+
+    project = await _goal_ledger_project(db_session, "GoalOmissionContentless")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    task = await _goal_cycle_task(db_session, project, "cycle-1")
+
+    applied = await _apply_new_version_goal(
+        "n/a", task, project, db_session, path="fallback"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert applied is False
+    assert version.goal is None
+    assert version.goal_omission_cycles == 1
+
+
+@pytest.mark.asyncio
+async def test_no_omission_recorded_when_the_version_already_has_a_goal(db_session):
+    """No ask was made, so nothing was omitted.
+
+    ``goal_needed`` is emitted only while the goal is NULL; counting a miss for
+    a version that already has one would make every ordinary cycle look like a
+    compliance failure.
+    """
+    from app import release_version as rv
+    from app.strategic_completion import _apply_new_version_goal
+
+    project = await _goal_ledger_project(db_session, "GoalAlreadySet")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_goal(version, "An objective authored earlier.", editor_id="op")
+    db_session.add(version)
+    await db_session.commit()
+    task = await _goal_cycle_task(db_session, project, "cycle-1")
+
+    applied = await _apply_new_version_goal(
+        None, task, project, db_session, path="api"
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert applied is False
+    assert version.goal_omission_cycles == 0
+    assert version.goal_omission_last_cycle is None
+    assert await _goal_omission_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_no_omission_recorded_when_there_is_no_open_version(db_session):
+    """Nothing to ask about: no open version means no goal was ever requested."""
+    from app.strategic_completion import _apply_new_version_goal
+
+    project = await _goal_ledger_project(db_session, "GoalNoOpenVersion")
+    task = await _goal_cycle_task(db_session, project, "cycle-1")
+
+    applied = await _apply_new_version_goal(
+        None, task, project, db_session, path="api"
+    )
+    await db_session.commit()
+
+    assert applied is False
+    assert await _goal_omission_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_goal_omission_alert_escalates_on_condition_age(db_session):
+    """Severity grades on the age of the CONDITION, not of the latest occurrence."""
+    from datetime import timedelta as _timedelta
+
+    from app import release_version as rv
+    from app.models import AlertSeverity
+    from app.time_utils import _utcnow as _now
+
+    project = await _goal_ledger_project(db_session, "GoalOmissionEscalate")
+    await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await _miss_cycles(db_session, project, 3)
+    alerts = await _goal_omission_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+    alerts[0].created_at = _now() - _timedelta(hours=25)
+    db_session.add(alerts[0])
+    await db_session.commit()
+
+    await _miss_cycles(db_session, project, 1, start=4)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].severity == AlertSeverity.ERROR, (
+        "An unanswered goal-omission condition older than the escalation window "
+        "must be re-graded to ERROR."
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_omission_alert_does_not_escalate_under_operator_ack(db_session):
+    """An operator who has acknowledged the condition owns it — never re-page."""
+    from datetime import timedelta as _timedelta
+
+    from app import release_version as rv
+    from app.models import AlertSeverity
+    from app.time_utils import _utcnow as _now
+
+    project = await _goal_ledger_project(db_session, "GoalOmissionAcked")
+    await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await _miss_cycles(db_session, project, 3)
+    alerts = await _goal_omission_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    alerts[0].created_at = _now() - _timedelta(hours=48)
+    alerts[0].acknowledged_at = _now()
+    db_session.add(alerts[0])
+    await db_session.commit()
+
+    await _miss_cycles(db_session, project, 1, start=4)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].severity == AlertSeverity.WARNING, (
+        "Escalating underneath an operator who already acknowledged the "
+        "condition is a re-page they explicitly suppressed."
+    )
+    assert alerts[0].occurrence_count == 2
