@@ -6768,6 +6768,22 @@ async def _spawn_strategic_review(
                         if _open_version.goal is None
                         else {}
                     ),
+                    # How many consecutive completed cycles have already been
+                    # asked for this goal and did not deliver it. Emitted only
+                    # while the ask is still open and at least one cycle has
+                    # missed, so the re-ask can name what was asked and what
+                    # came back instead of repeating an identical request that
+                    # has already been ignored N times.
+                    **(
+                        {
+                            "goal_omission_cycles": int(
+                                _open_version.goal_omission_cycles or 0
+                            )
+                        }
+                        if _open_version.goal is None
+                        and int(_open_version.goal_omission_cycles or 0) > 0
+                        else {}
+                    ),
                 }
             # Enrich with cross-version promotion-readiness trend.  Best-effort:
             # absent when no QualificationVerdict rows exist yet.

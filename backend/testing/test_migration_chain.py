@@ -1441,6 +1441,7 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     - 0761 adds the candidate SHA column
     - 0762 adds module finding-chain lifecycle fields
     - 0763 removes untouched implicit authorship contracts
+    - 0764 adds the version goal-authoring compliance ledger
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1571,6 +1572,9 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     disarm_authorship_contract = (
         versions_dir / "0763_disarm_implicit_operator_authorship_contract.py"
     ).read_text()
+    goal_omission_ledger = (
+        versions_dir / "0764_release_version_goal_omission_ledger.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1670,10 +1674,16 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     assert "evidence_contract_updated_by = 'system:release_default'" in (
         disarm_authorship_contract
     )
+    assert parse_revision_identifiers(goal_omission_ledger) == ("0764", "0763")
+    # Additive-only, and the NOT NULL column carries a server_default so the
+    # backfill of pre-existing releaseversion rows cannot fail.
+    assert "goal_omission_cycles" in goal_omission_ledger
+    assert "goal_omission_last_cycle" in goal_omission_ledger
+    assert "server_default=sa.text(\"0\")" in goal_omission_ledger
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0763", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0763', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0764", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0764', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

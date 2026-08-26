@@ -2691,3 +2691,110 @@ async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(
 # ── outcome_evaluation read path for success_evidence/retirement_condition ────
 
 
+
+
+# ── goal-authoring compliance ledger in the version_phase block ──────────────
+
+
+async def _spawn_and_get_version_phase(project, db_session):
+    """Spawn one strategic_review and return its version_phase payload block."""
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(_select_agent_tasks(project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    return tasks[0].payloads[0].get("version_phase")
+
+
+async def _make_open_version_with_omissions(
+    db_session, project, *, goal, cycles, last_cycle=None
+):
+    from app.models import ReleaseVersion
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        goal=goal,
+        goal_omission_cycles=cycles,
+        goal_omission_last_cycle=last_cycle,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    return version
+
+
+@pytest.mark.asyncio
+async def test_version_phase_names_the_unanswered_goal_streak(
+    db_session, mocker, _lts_split_active
+):
+    """A re-ask that has already been ignored N times must SAY so.
+
+    ``goal_needed`` alone is an identical request every cycle. Carrying the
+    streak lets the strategist see that this exact output was requested and not
+    delivered N times, instead of reading a first-time ask forever.
+    """
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _make_open_version_with_omissions(
+        db_session, project, goal=None, cycles=2, last_cycle="cycle-2"
+    )
+
+    _patch_spawning_deps(mocker)
+    vp = await _spawn_and_get_version_phase(project, db_session)
+
+    assert vp is not None
+    assert vp.get("goal_needed") is True
+    assert vp.get("goal_omission_cycles") == 2, (
+        "The open ask must carry how many completed cycles have already missed "
+        f"it; got version_phase={vp!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_version_phase_omits_goal_streak_when_there_is_nothing_to_report(
+    db_session, mocker, _lts_split_active
+):
+    """No streak and no open ask both mean: do not spend payload budget on it."""
+    await _ensure_releaseversion_table(db_session)
+
+    first_ask = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(first_ask)
+    await db_session.commit()
+    await db_session.refresh(first_ask)
+    await _make_open_version_with_omissions(
+        db_session, first_ask, goal=None, cycles=0
+    )
+
+    _patch_spawning_deps(mocker)
+    vp = await _spawn_and_get_version_phase(first_ask, db_session)
+    assert vp is not None
+    assert vp.get("goal_needed") is True
+    assert "goal_omission_cycles" not in vp, (
+        "A first-time ask has no history to report; emitting a zero would be noise."
+    )
+
+    answered = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(answered)
+    await db_session.commit()
+    await db_session.refresh(answered)
+    await _make_open_version_with_omissions(
+        db_session, answered, goal="An objective already authored.", cycles=3
+    )
+
+    vp_answered = await _spawn_and_get_version_phase(answered, db_session)
+    assert vp_answered is not None
+    assert "goal_needed" not in vp_answered
+    assert "goal_omission_cycles" not in vp_answered, (
+        "The ask is closed; a stale streak must not keep being re-reported."
+    )
