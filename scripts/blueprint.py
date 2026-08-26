@@ -1435,6 +1435,36 @@ def _tasks_autonomy_debug(args: argparse.Namespace) -> None:
     _emit(args, data, _render_autonomy_debug)
 
 
+def _render_strategic_lane(data: dict) -> None:
+    """Print the automatic-Strategic-lane admission state and its reason.
+
+    This flag has NO operator write verb anywhere in the CLI (deliberately --
+    changing it stays an explicit admin PATCH), and until this render existed it
+    had no read path either: the only way to learn that a project's entire
+    automatic Strategic authoring lane was off was a raw API call. A disabled
+    lane keeps tactical research spawning, so every other line in this view
+    looks healthy while no Strategic cycle is ever authored.
+    """
+    enabled = data.get("automatic_strategic_cycles_enabled")
+    if enabled is None:
+        return
+    if enabled:
+        print("  strategic_lane: ENABLED (automatic Strategic cycles may spawn)")
+        return
+    detail = data.get("automatic_strategic_cycles_disable") or {}
+    print("  strategic_lane: DISABLED — no automatic Strategic cycle will spawn")
+    print(f"    reason:      {detail.get('reason') or '<none recorded>'}")
+    print(f"    disabled_by: {detail.get('disabled_by') or '<unknown>'}")
+    if detail.get("until"):
+        print(f"    expires:     {detail['until']}")
+    elif detail.get("malformed_until"):
+        print("    expires:     <unparseable `until`> — treated as UNBOUNDED")
+    else:
+        print("    expires:     never (no `until` bound)")
+    if detail.get("legacy_bare_boolean"):
+        print("    form:        legacy bare boolean (no bound, no expiry, no actor)")
+
+
 def _render_autonomy_debug(data: dict) -> None:
     print("=== AUTONOMY DEBUG ===")
     blocked = data.get("spawn_blocked")
@@ -1444,6 +1474,7 @@ def _render_autonomy_debug(data: dict) -> None:
         print("  can_spawn: YES — no guards; next tick will spawn")
     else:
         print("  can_spawn: ?")
+    _render_strategic_lane(data)
     guards = data.get("blocking_guards") or []
     if guards:
         print(f"\n--- Blocking Guards ({len(guards)}) ---")

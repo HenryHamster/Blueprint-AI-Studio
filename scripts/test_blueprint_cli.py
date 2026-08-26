@@ -9091,3 +9091,74 @@ def test_fleet_runners_lists_hostname_status_and_bindings(fleet_binding_api, cap
     assert row["enrollment_project_id"] == ENROLLMENT_PID
     bound_ids = {p["project_id"] for p in row["projects"]}
     assert bound_ids == {ENROLLMENT_PID, TARGET_PID}
+
+
+# ---------------------------------------------------------------------------
+# `tasks autonomy-debug` -> strategic lane read path
+#
+# `build_config.automatic_strategic_cycles_enabled` has NO operator CLI write
+# verb (deliberately: changing it stays an explicit admin PATCH) and until this
+# render existed it had no CLI READ path either.  A disabled lane keeps tactical
+# research spawning, so every other line of this view looks healthy while no
+# automatic Strategic cycle is ever authored.
+# ---------------------------------------------------------------------------
+
+
+def test_autonomy_debug_renders_a_disabled_strategic_lane(capsys):
+    """The render must name the flag state, the reason, the actor and the bound."""
+    blueprint._render_autonomy_debug(
+        {
+            "spawn_blocked": False,
+            "automatic_strategic_cycles_enabled": False,
+            "automatic_strategic_cycles_disable": {
+                "enabled": False,
+                "reason": "bounded tactical canary",
+                "disabled_by": "operator-patch",
+                "until": "2099-01-01T00:00:00",
+                "legacy_bare_boolean": False,
+                "malformed_until": False,
+            },
+        }
+    )
+    out = capsys.readouterr().out
+    assert "strategic_lane: DISABLED" in out
+    assert "bounded tactical canary" in out
+    assert "operator-patch" in out
+    assert "expires:     2099-01-01T00:00:00" in out
+
+
+def test_autonomy_debug_names_an_unbounded_legacy_disable(capsys):
+    """A bare stored ``false`` must read as permanent, not merely 'off'."""
+    blueprint._render_autonomy_debug(
+        {
+            "spawn_blocked": False,
+            "automatic_strategic_cycles_enabled": False,
+            "automatic_strategic_cycles_disable": {
+                "enabled": False,
+                "reason": None,
+                "disabled_by": None,
+                "until": None,
+                "legacy_bare_boolean": True,
+                "malformed_until": False,
+            },
+        }
+    )
+    out = capsys.readouterr().out
+    assert "strategic_lane: DISABLED" in out
+    assert "<none recorded>" in out
+    assert "<unknown>" in out
+    assert "expires:     never" in out
+    assert "legacy bare boolean" in out
+
+
+def test_autonomy_debug_lane_render_is_quiet_when_enabled_or_absent(capsys):
+    """An enabled lane gets one line; a payload without the key gets none."""
+    blueprint._render_autonomy_debug(
+        {"spawn_blocked": False, "automatic_strategic_cycles_enabled": True}
+    )
+    out = capsys.readouterr().out
+    assert "strategic_lane: ENABLED" in out
+    assert "DISABLED" not in out
+
+    blueprint._render_autonomy_debug({"spawn_blocked": False})
+    assert "strategic_lane" not in capsys.readouterr().out

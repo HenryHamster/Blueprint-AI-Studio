@@ -1,4 +1,4 @@
-"""Helpers for surfacing operator-visible warnings on `build_config.directories[*].lint_cmd`.
+"""Helpers for surfacing operator-visible warnings on `build_config`.
 
 The agent (`agent/src/prompt.ts::detectLinterKind`) recognizes a small set of
 lint command prefixes for scoped, changed-file-only execution. Anything else
@@ -33,11 +33,87 @@ def detect_linter_kind(lint_cmd: str) -> str | None:
     return match.group(1) if match else None
 
 
-def build_config_lint_warnings(build_config: dict | None) -> list[str]:
-    """Return one warning string per directory whose `lint_cmd` is unrecognized.
+class _BuildConfigCarrier:
+    """Minimal attribute carrier for the admission decoder."""
 
-    Empty / missing `lint_cmd` is treated as no-op (no warning). The returned
-    list preserves directory order so warnings line up with the config UI.
+    __slots__ = ("build_config",)
+
+    def __init__(self, build_config: dict) -> None:
+        self.build_config = build_config
+
+
+def strategic_lane_warnings(
+    build_config: dict | None, autonomous_enabled: bool | None
+) -> list[str]:
+    """Warn when the Strategic lane is off on a project that is autonomous.
+
+    ``autonomous_enabled=True`` with ``automatic_strategic_cycles_enabled``
+    disabled is ALWAYS an operator-intent mismatch: the tactical loop keeps
+    spawning research (so every liveness surface looks healthy) while the whole
+    automatic Strategic authoring lane is off. Nothing in the codebase ever
+    writes that flag back to ``True``, so a "bounded tactical canary" stored as
+    a bare ``false`` is permanent by construction. Passing ``None`` for
+    ``autonomous_enabled`` means "unknown" and suppresses the check.
+    """
+    if not build_config or autonomous_enabled is not True:
+        return []
+
+    # Local import: this module is a dependency-light leaf that the project
+    # routers import at module scope, while the admission module pulls in the
+    # ORM and the locking helpers.
+    from app.strategic_cycle_admission import (
+        AUTOMATIC_STRATEGIC_CYCLES_ENABLED_BUILD_CONFIG_KEY as _KEY,
+        describe_automatic_strategic_cycles,
+    )
+
+    admission = describe_automatic_strategic_cycles(
+        _BuildConfigCarrier(build_config)
+    )
+    warnings: list[str] = []
+    if not admission.enabled:
+        bound = (
+            f"expires {admission.until.isoformat()}Z"
+            if admission.until is not None
+            else "NO expiry — it will never re-enable itself"
+        )
+        detail = (
+            f"reason {admission.reason!r}"
+            if admission.reason
+            else "no reason recorded"
+        )
+        actor = (
+            f"disabled by {admission.disabled_by!r}"
+            if admission.disabled_by
+            else "no actor recorded"
+        )
+        warnings.append(
+            f"{_KEY} is disabled while autonomous_enabled is true: tactical "
+            "research keeps spawning but NO automatic Strategic cycle will ever "
+            f"be authored ({bound}; {detail}; {actor}). If this is a bounded "
+            'canary, store the bounded form {"enabled": false, "until": '
+            '"<iso8601>", "reason": "...", "disabled_by": "..."} so it expires '
+            "on its own; otherwise turn autonomous_enabled off too."
+        )
+    if admission.malformed_until:
+        warnings.append(
+            f"{_KEY}.until is not a parseable ISO-8601 timestamp "
+            f"({admission.until_raw!r}); the disable is being treated as "
+            "UNBOUNDED and will never expire on its own."
+        )
+    return warnings
+
+
+def build_config_lint_warnings(
+    build_config: dict | None,
+    *,
+    autonomous_enabled: bool | None = None,
+) -> list[str]:
+    """Return operator-visible advisory warnings for a stored ``build_config``.
+
+    One warning per directory whose `lint_cmd` is unrecognized (empty / missing
+    `lint_cmd` is a no-op), preserving directory order so warnings line up with
+    the config UI, followed by the Strategic-lane intent-mismatch warnings when
+    the caller supplies ``autonomous_enabled``.
     """
     if not build_config:
         return []
@@ -57,7 +133,12 @@ def build_config_lint_warnings(build_config: dict | None) -> list[str]:
             "(ruff/eslint/mypy/flake8/pyright). It will run verbatim against the "
             "full tree on every PR rather than only changed files."
         )
+    warnings.extend(strategic_lane_warnings(build_config, autonomous_enabled))
     return warnings
 
 
-__all__ = ["build_config_lint_warnings", "detect_linter_kind"]
+__all__ = [
+    "build_config_lint_warnings",
+    "detect_linter_kind",
+    "strategic_lane_warnings",
+]

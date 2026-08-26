@@ -279,6 +279,21 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
         "research.strategic_cycle_liveness",
         retirement=AlertRetirementMode.SOURCE_CONDITION,
     ),
+    # The DOWNGRADE of the halt WARNING above.  A project whose automatic
+    # Strategic lane is deliberately off is excluded from the halt detector --
+    # correctly, since no cycle receipt can ever be expected -- and the sweep
+    # also RETIRES any open halt alert on it.  Before this event existed, that
+    # left a wedged project and a deliberately quiet one producing byte-identical
+    # alert feeds.  INFO + ``action_required=False`` keeps the lane visible in
+    # the feed without paging; the producer owns retirement and dismisses the row
+    # the moment the lane is re-enabled or its ``until`` bound lapses.
+    "research.strategic_lane_disabled": AlertEventPolicy(
+        "research.strategic_lane_disabled",
+        allow_info=True,
+        action_required=False,
+        audience=OPERATOR_FYI,
+        retirement=AlertRetirementMode.SOURCE_CONDITION,
+    ),
     "rollup.backmerge_blocked": AlertEventPolicy(
         "rollup.backmerge_blocked", domain=DOMAIN_ROLLUP_LTS
     ),
