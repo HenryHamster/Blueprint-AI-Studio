@@ -543,6 +543,194 @@ def test_continuation_marker_honors_renewal_reason():
     assert touched["updated_at"] != old  # liveness WAS recorded
 
 
+def _owned_continuation_vision(
+    *, last_seen: str, operator: str = "op-1", **extra: Any
+) -> dict:
+    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+    marker: dict[str, Any] = {
+        "version": 1,
+        "active": True,
+        "operator_user_id": operator,
+        "owner_session_started_at": "s-1",
+        "preferred_runner_id": "runner-9",
+        "updated_at": last_seen,
+        "last_seen_at": last_seen,
+    }
+    marker.update(extra)
+    return {STRATEGIC_LOCAL_CONTINUATION_KEY: marker}
+
+
+def test_resident_work_renewal_reanchors_a_stale_owned_marker_in_place():
+    """Resident WORK renews the continuation anchor without a human present.
+
+    The anchor governs the local-runner pin, not operator presence, so a live
+    identity-verified Resident that is actually mutating Strategic state must be
+    able to hold it by working. Every other marker field is preserved so the
+    ownership-protection predicates and the heartbeat's authority comparison
+    keep reading the same values.
+    """
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_CONTINUATION_KEY,
+        STRATEGIC_LOCAL_CONTINUATION_WORK_RENEWAL_REASON,
+        renew_strategic_local_continuation_from_resident_work,
+        strategic_local_continuation_status_from_vision,
+    )
+
+    old = "2020-01-01T00:00:00"
+    vision = _owned_continuation_vision(last_seen=old)
+    assert (
+        strategic_local_continuation_status_from_vision(
+            vision, operator_user_id="op-1"
+        )["fresh"]
+        is False
+    )
+
+    assert (
+        renew_strategic_local_continuation_from_resident_work(
+            vision, operator_user_id="op-1"
+        )
+        is True
+    )
+
+    marker = vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["last_seen_at"] != old
+    assert marker["updated_at"] != old
+    assert (
+        marker["last_renewal_reason"]
+        == STRATEGIC_LOCAL_CONTINUATION_WORK_RENEWAL_REASON
+    )
+    # Identity fields survive untouched.
+    assert marker["operator_user_id"] == "op-1"
+    assert marker["owner_session_started_at"] == "s-1"
+    assert marker["preferred_runner_id"] == "runner-9"
+    status = strategic_local_continuation_status_from_vision(
+        vision, operator_user_id="op-1"
+    )
+    assert status["fresh"] is True
+    assert status["owned_by_current_operator"] is True
+
+
+def test_resident_work_renewal_never_mints_resurrects_or_steals_a_marker():
+    """The dead-man's switch survives: work renews only an ALREADY-owned marker.
+
+    Stop and the Workday->Chat switch POP the marker. If work could mint one,
+    those would stop being terminal and an ended session could re-pin the
+    project locally forever. A foreign owner's still-live pin must likewise
+    never be taken over by another session's work.
+    """
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_CONTINUATION_KEY,
+        renew_strategic_local_continuation_from_resident_work,
+    )
+
+    old = "2020-01-01T00:00:00"
+
+    # Popped / never armed: nothing to renew, and nothing is created.
+    empty: dict[str, Any] = {}
+    assert (
+        renew_strategic_local_continuation_from_resident_work(
+            empty, operator_user_id="op-1"
+        )
+        is False
+    )
+    assert empty == {}
+
+    # Explicitly deactivated marker stays deactivated.
+    deactivated = _owned_continuation_vision(last_seen=old, active=False)
+    assert (
+        renew_strategic_local_continuation_from_resident_work(
+            deactivated, operator_user_id="op-1"
+        )
+        is False
+    )
+    assert deactivated[STRATEGIC_LOCAL_CONTINUATION_KEY]["last_seen_at"] == old
+
+    # Another operator's marker is never renewed or rewritten.
+    foreign = _owned_continuation_vision(last_seen=old, operator="op-2")
+    assert (
+        renew_strategic_local_continuation_from_resident_work(
+            foreign, operator_user_id="op-1"
+        )
+        is False
+    )
+    assert foreign[STRATEGIC_LOCAL_CONTINUATION_KEY]["operator_user_id"] == "op-2"
+    assert foreign[STRATEGIC_LOCAL_CONTINUATION_KEY]["last_seen_at"] == old
+
+    # A missing caller identity can never renew anything.
+    anonymous = _owned_continuation_vision(last_seen=old)
+    assert (
+        renew_strategic_local_continuation_from_resident_work(
+            anonymous, operator_user_id=""
+        )
+        is False
+    )
+    assert anonymous[STRATEGIC_LOCAL_CONTINUATION_KEY]["last_seen_at"] == old
+
+
+def test_resident_work_renewal_is_paced_so_an_op_burst_writes_once():
+    """A just-renewed anchor is left alone, so a burst of ops is not a write burst.
+
+    The exported ``..._is_due`` predicate must give the SAME answer as the
+    renewal itself for every case here. Callers holding the Project lock gate
+    the locked read-modify-write on it (``with_vision_locked`` marks the column
+    dirty before it can see the helper's return value), so a predicate that
+    disagreed would either write on every op or never renew at all.
+    """
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_CONTINUATION_KEY,
+        renew_strategic_local_continuation_from_resident_work,
+        strategic_local_continuation_work_renewal_is_due,
+    )
+
+    just_now = _utcnow().isoformat()
+    vision = _owned_continuation_vision(last_seen=just_now)
+    assert (
+        strategic_local_continuation_work_renewal_is_due(
+            vision, operator_user_id="op-1"
+        )
+        is False
+    )
+    assert (
+        renew_strategic_local_continuation_from_resident_work(
+            vision, operator_user_id="op-1"
+        )
+        is False
+    )
+    assert vision[STRATEGIC_LOCAL_CONTINUATION_KEY]["last_seen_at"] == just_now
+
+    # Same predicate, every refusal shape the renewal itself declines.
+    old = "2020-01-01T00:00:00"
+    for case, kwargs in (
+        ({}, {"operator_user_id": "op-1"}),  # popped / never armed
+        (_owned_continuation_vision(last_seen=old, active=False),
+         {"operator_user_id": "op-1"}),  # deactivated
+        (_owned_continuation_vision(last_seen=old, operator="op-2"),
+         {"operator_user_id": "op-1"}),  # foreign owner
+        (_owned_continuation_vision(last_seen=old), {"operator_user_id": ""}),
+    ):
+        assert (
+            strategic_local_continuation_work_renewal_is_due(case, **kwargs) is False
+        )
+        assert (
+            renew_strategic_local_continuation_from_resident_work(case, **kwargs)
+            is False
+        )
+
+    # And the due case agrees in the other direction.
+    due = _owned_continuation_vision(last_seen=old)
+    assert (
+        strategic_local_continuation_work_renewal_is_due(due, operator_user_id="op-1")
+        is True
+    )
+    assert (
+        renew_strategic_local_continuation_from_resident_work(
+            due, operator_user_id="op-1"
+        )
+        is True
+    )
+
+
 def test_operator_workbench_fixture_attention_has_more_matches_counts():
     fixture_attention = _operator_workbench_fixture()["strategic_state_response"][
         "attention"

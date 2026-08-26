@@ -139,7 +139,9 @@ from app.strategic_watches import (
     serialize_watch,
 )
 from app.workbench_state import (
+    renew_strategic_local_continuation_from_resident_work,
     strategic_local_continuation_status_from_vision,
+    strategic_local_continuation_work_renewal_is_due,
 )
 from app.strategic_constants import (
     STRATEGIC_DIRECTION_TEXT_MAX,
@@ -1073,7 +1075,36 @@ async def _enforce_resident_mutation_fence(
     task: Task,
     op: str,
 ) -> None:
-    """Require fresh continuation and sole Strategic-lane ownership for mutations."""
+    """Require an OWNED continuation and sole Strategic-lane ownership for mutations.
+
+    The two halves of this fence protect different things and are satisfiable in
+    different ways:
+
+    * **Ownership** (below). The continuation marker must exist, be armed, and
+      belong to the operator who owns this Resident session. Those are identity
+      facts — a mismatch means this worker is not the lane's writer — so they
+      stay hard refusals.
+    * **Freshness** is NOT an authority condition and no longer refuses.
+      Continuation freshness governs the *local-runner pin*
+      (``strategic_local_runner_required``); its lapse is what hands the
+      Strategic lane back to the cloud cadence. Whether a live Resident may
+      write is already fully decided upstream by the session-id / task-id /
+      worker-generation / process-incarnation checks against the freshly locked
+      ``Project`` and ``Task`` rows, plus the Strategic-lane check below.
+      Treating a stale pin as revoked authority also made the failure
+      self-reinforcing: the lapse lets the cadence spawn a cloud one-shot, and
+      that one-shot then trips the lane check, so a lease the Resident could not
+      renew by working fenced it behind a task its own lapse created.
+      Instead, an identity-verified mutation RENEWS the anchor — the Resident
+      re-arms by working. This is strictly narrower than the heartbeat, which
+      already renews the same anchor on a bare ``continuous_liveness`` beat.
+      The dead-man's switch is unchanged for its real purpose: a session that
+      issues no ops and no heartbeats still goes stale inside the TTL and still
+      releases the pin.
+
+    Every surviving refusal names WHICH condition failed — a bare state name
+    leaves the Resident unable to tell the operator what blocked it.
+    """
     if op in ("create_message", "resolve_message"):
         return
     resident_blob = _read_resident_session(project.vision)
@@ -1087,12 +1118,53 @@ async def _enforce_resident_mutation_fence(
     if (
         not operator_user_id
         or not continuation.get("enabled")
-        or not continuation.get("fresh")
         or not continuation.get("owned_by_current_operator")
     ):
         raise HTTPException(
             status_code=409,
-            detail="Resident continuation expired or ownership changed",
+            detail=(
+                "Resident continuation is not armed for this operator "
+                f"(reason={continuation.get('reason')}; "
+                f"operator_user_id={'present' if operator_user_id else 'missing'}; "
+                f"enabled={bool(continuation.get('enabled'))}; "
+                f"ownership={continuation.get('ownership')}; "
+                f"owned_by_current_operator="
+                f"{bool(continuation.get('owned_by_current_operator'))}). "
+                "Continuation freshness is NOT the blocker: a stale-but-owned "
+                "lease is renewed by this mutation. This refusal means the "
+                "marker is absent, disabled, or owned by another operator "
+                "session — restart the Workday session to re-arm it."
+            ),
+        )
+
+    # Self-renewal: the mutation IS the liveness proof. A no-op unless the
+    # marker is already armed for exactly this operator, so it can neither mint
+    # a marker nor resurrect one that Stop or a Chat-mode switch popped. It
+    # rides this request's transaction under the Project lock we already hold,
+    # so a refused op below rolls it back with everything else.
+    #
+    # The pacing check is OUTSIDE the locked write on purpose. ``_with_vision_locked``
+    # calls ``flag_modified`` on ``project.vision`` unconditionally, so handing it
+    # a mutate_fn that decides to do nothing still emits a full JSONB UPDATE of
+    # the column — an op burst would rewrite it once per op, which is exactly
+    # what the pacing threshold exists to prevent. We hold the Project row lock,
+    # so ``project.vision`` here is the same row the write would re-read.
+    if strategic_local_continuation_work_renewal_is_due(
+        project.vision,
+        operator_user_id=operator_user_id,
+    ):
+
+        def _renew_continuation_from_work(vision: dict[str, Any]) -> None:
+            renew_strategic_local_continuation_from_resident_work(
+                vision,
+                operator_user_id=operator_user_id,
+            )
+
+        await _with_vision_locked(
+            session,
+            project.id,
+            _renew_continuation_from_work,
+            _locked_project=project,
         )
 
     active_candidates = (
@@ -1111,13 +1183,27 @@ async def _enforce_resident_mutation_fence(
             )
         )
     ).scalars()
-    if any(
-        (candidate.first_payload or {}).get("type") in STRATEGIC_TASK_TYPES
-        for candidate in active_candidates
-    ):
+    conflicting = next(
+        (
+            candidate
+            for candidate in active_candidates
+            if (candidate.first_payload or {}).get("type") in STRATEGIC_TASK_TYPES
+        ),
+        None,
+    )
+    if conflicting is not None:
+        conflicting_status = getattr(conflicting.status, "value", conflicting.status)
         raise HTTPException(
             status_code=409,
-            detail="Resident no longer owns the Strategic mutation lane",
+            detail=(
+                "Resident no longer owns the Strategic mutation lane: task "
+                f"{conflicting.id} "
+                f"(type={(conflicting.first_payload or {}).get('type')}; "
+                f"status={conflicting_status}) is also live in the Strategic "
+                "lane, so writing now would make two writers. This is "
+                "TRANSIENT and needs no operator action: it clears by itself "
+                "when that task reaches a terminal status — retry the op then."
+            ),
         )
 
 
