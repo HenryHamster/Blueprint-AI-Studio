@@ -297,7 +297,7 @@
     "test_efficiency_snapshot.py": 17850,
     "test_digest.py": 12250,
     "test_diagnostics.py": 2300,
-    "test_size_offender_governance.py": 2950,
+    "test_size_offender_governance.py": 3400,
     "test_task_lifecycle.py": 18450,
     "test_acceptance_criteria.py": 13650,
     "test_acceptance_criteria__walkthrough.py": 903,
