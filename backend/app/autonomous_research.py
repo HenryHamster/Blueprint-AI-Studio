@@ -2130,13 +2130,16 @@ async def _spawn_research_task_inner(
             session, project, force_strategic=force_strategic
         )
         if gate_decision.skip:
+            # Log the gate's OWN reason. This branch also carries the
+            # consecutive-stall cutoff, where "nothing meaningful changed" is
+            # actively false and hid the one line an operator needed.
             logger.info(
-                "[STRATEGIC] no-delta gate: skipping strategic cycle for project %s "
-                "(watermark=%s, signals=%s) — nothing meaningful changed since the "
-                "last cycle",
+                "[STRATEGIC] gate: skipping strategic cycle for project %s "
+                "(watermark=%s, signals=%s) — %s",
                 project.id,
                 gate_decision.watermark,
                 gate_decision.signals.as_dict(),
+                gate_decision.reason,
             )
             await record_no_delta_skip(
                 session,

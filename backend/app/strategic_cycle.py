@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Mapping, Optional
 
@@ -35,7 +36,10 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.orchestrator_runner_placement import task_is_local_only_placement_hold
+from app.orchestrator_runner_placement import (
+    local_only_placement_wait_record,
+    task_is_local_only_placement_hold,
+)
 from app.problem_model import sanitize_problem_model_raw
 from app.strategic_constants import CYCLE_SUMMARY_MAX
 from app.strategic_runtime_work import task_is_strategic_local_runner_hold
@@ -70,6 +74,42 @@ OUTCOME_STALLED_PHASE1 = "stalled_phase1"
 OUTCOME_STALLED_PHASE2 = "stalled_phase2"
 OUTCOME_FAILED_PHASE2_SPAWN = "failed_phase2_spawn"
 OUTCOME_THINKER_ARTIFACTS_MISSING = "thinker_artifacts_missing"
+
+STALLED_OUTCOMES: frozenset[str] = frozenset(
+    {OUTCOME_STALLED_PHASE1, OUTCOME_STALLED_PHASE2}
+)
+
+# Cycle metadata carrying WHY the reaper declared a stall.
+#
+# ``CYCLE_META_STALL_SIGNATURE`` is a coarse, stable *cause* key (e.g.
+# ``"phase2:queued_never_dispatched"``) — deliberately NOT the cycle id, the
+# task id, or anything else that changes every attempt, because its whole job
+# is to let consecutive attempts be recognised as the SAME failure.
+# ``CYCLE_META_STALL_REASON`` is the human-readable sentence built alongside it.
+CYCLE_META_STALL_SIGNATURE = "stall_signature"
+CYCLE_META_STALL_REASON = "stall_reason"
+
+#: Prefix of the cadence-gate skip reason written when the consecutive-stall
+#: cutoff holds re-minting. A skip carrying this is a BLOCKED strategist, the
+#: opposite of the healthy-idle receipt an ordinary no-delta skip records, and
+#: the starvation detector must not accept it as one.
+STALL_CUTOFF_REASON_PREFIX = "stall_cutoff:"
+
+#: Consecutive same-cause stalls tolerated before automatic re-minting stops.
+#:
+#: A stalled cycle makes the NEXT cadence tick a must-run
+#: (``strategic_cycle_gating.must_run_reasons`` -> ``prior_cycle_failed``), so a
+#: cause that survives the retry re-arms its own trigger: mint -> stall -> mint,
+#: every ~3h, forever.  Nineteen consecutive stalls on one project (NeurIPS,
+#: 2026-08-16..26) is what that costs when nothing counts.  Three attempts is
+#: enough to ride out a transient (a runner restart, a rate-limit requeue) and
+#: few enough that a genuinely unschedulable phase task stops burning a cycle
+#: every 3h and starts asking for a human instead.
+MAX_CONSECUTIVE_STALLS = 3
+
+# How many recent cycles the streak walk inspects. The walk stops at the first
+# non-matching row, so this only has to be comfortably larger than the cutoff.
+_STALL_STREAK_SCAN_LIMIT = 25
 
 # Optional cycle metadata written when a linked terminal task is reconciled.
 # Legacy rows omit this key and continue to use their outcome for inference.
@@ -1178,3 +1218,200 @@ async def find_stalled(
         if len(stalled) >= limit:
             break
     return stalled
+
+
+# ── Stall diagnosis + consecutive-stall accounting ──────────────────────────
+#
+# A stalled cycle is not just a state; it has a CAUSE, and the cause is what
+# decides whether retrying can possibly help.  These helpers keep that cause on
+# the row so the next attempt (and the operator alert) can see it.
+
+
+@dataclass(frozen=True)
+class StallStreak:
+    """Consecutive most-recent cycles that stalled for the SAME cause."""
+
+    count: int = 0
+    signature: str | None = None
+    reason: str | None = None
+    latest_cycle_id: str | None = None
+
+    @property
+    def exhausted(self) -> bool:
+        """True once automatic re-minting must stop and ask for a human."""
+        return self.count >= MAX_CONSECUTIVE_STALLS
+
+
+def stall_signature(cycle: StrategicCycle) -> str | None:
+    """The stored cause key for a stalled cycle, if one was recorded.
+
+    Rows written before stall diagnosis existed have no key; callers fall back
+    to the outcome so a pre-existing stall run still counts as a run.
+    """
+    value = (cycle.cycle_metadata or {}).get(CYCLE_META_STALL_SIGNATURE)
+    return value if isinstance(value, str) and value else None
+
+
+def stall_reason(cycle: StrategicCycle) -> str | None:
+    """The stored human-readable stall explanation, if one was recorded."""
+    value = (cycle.cycle_metadata or {}).get(CYCLE_META_STALL_REASON)
+    return value if isinstance(value, str) and value else None
+
+
+def record_stall_diagnosis(
+    cycle: StrategicCycle, *, signature: str, reason: str
+) -> None:
+    """Persist WHY this cycle stalled onto the row.
+
+    Written by the reaper at the moment it declares the stall, while the linked
+    task is still in hand — reconstructing the cause afterwards is impossible
+    once the task has been force-terminated.
+    """
+    meta = dict(cycle.cycle_metadata or {})
+    meta[CYCLE_META_STALL_SIGNATURE] = signature
+    meta[CYCLE_META_STALL_REASON] = reason
+    cycle.cycle_metadata = meta
+    flag_modified(cycle, "cycle_metadata")
+
+
+async def consecutive_stall_streak(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    exclude_cycle_id: str | None = None,
+) -> StallStreak:
+    """Count the newest run of consecutive same-cause stalls for a project.
+
+    Walks cycles newest-first and stops at the first row that is not a stall or
+    whose cause differs from the newest stall's.  Any non-stall outcome
+    (notably ``completed``) therefore RESETS the streak — which is what makes
+    the cutoff self-healing: once a human clears the blocker and one cycle gets
+    through, the count is zero again with no separate reset to remember.
+
+    ``exclude_cycle_id`` omits a row the caller is itself mid-way through
+    mutating, so the count is deterministic regardless of whether that pending
+    change has been flushed.
+    """
+    stmt = (
+        select(StrategicCycle)
+        .where(StrategicCycle.project_id == project_id)
+        .order_by(desc(StrategicCycle.phase1_started_at))
+        .limit(_STALL_STREAK_SCAN_LIMIT)
+    )
+    if exclude_cycle_id is not None:
+        stmt = stmt.where(StrategicCycle.id != exclude_cycle_id)
+    rows = (await session.execute(stmt)).scalars().all()
+
+    streak = StallStreak()
+    for row in rows:
+        if row.outcome not in STALLED_OUTCOMES:
+            break
+        # Legacy stalled rows carry no signature; their outcome is the coarsest
+        # honest cause key available, so they still count as a run.
+        sig = stall_signature(row) or row.outcome
+        if streak.count == 0:
+            streak = StallStreak(
+                count=1,
+                signature=sig,
+                reason=stall_reason(row),
+                latest_cycle_id=row.id,
+            )
+            continue
+        if sig != streak.signature:
+            break
+        streak = StallStreak(
+            count=streak.count + 1,
+            signature=streak.signature,
+            reason=streak.reason,
+            latest_cycle_id=streak.latest_cycle_id,
+        )
+    return streak
+
+
+def _age_phrase(since, now) -> str:
+    """Compact ``for 4.2h``-style age, or empty when the timestamp is unusable."""
+    if since is None or now is None:
+        return ""
+    try:
+        hours = (now - since).total_seconds() / 3600.0
+    except TypeError:
+        return ""
+    if hours < 0:
+        return ""
+    return f" for {hours:.1f}h"
+
+
+def describe_phase_stall(
+    linked_task: Task | None, *, phase: str, now=None
+) -> tuple[str, str]:
+    """Explain WHY a phase could not progress: ``(signature, reason)``.
+
+    "Stalled in phase2" is a state, and a state is not actionable.  This turns
+    the linked task's own evidence — status, placement hold, blocked reason,
+    heartbeat, age — into a sentence an operator can act on, plus a coarse
+    cause key stable across attempts so repeats can be counted.
+
+    Called at declaration time, while the task still holds its pre-termination
+    status; the reaper force-terminates some of these tasks immediately after.
+    """
+    if linked_task is None:
+        return (
+            f"{phase}:no_linked_task",
+            f"{phase} has no linked task row — the phase task was never "
+            f"created or was deleted, so no worker could ever report progress",
+        )
+
+    status = getattr(linked_task.status, "value", linked_task.status)
+    age = _age_phrase(getattr(linked_task, "created_at", None), now)
+    detail_parts: list[str] = []
+    if linked_task.blocked_reason:
+        detail_parts.append(f"blocked_reason={linked_task.blocked_reason!r}")
+    if linked_task.latest_status_message:
+        detail_parts.append(
+            f"last_status={linked_task.latest_status_message[:160]!r}"
+        )
+    detail = f" ({'; '.join(detail_parts)})" if detail_parts else ""
+
+    placement = local_only_placement_wait_record(linked_task)
+    if placement is not None:
+        if placement.get("unsatisfiable") is True:
+            return (
+                f"{phase}:placement_unsatisfiable",
+                f"{phase} task {linked_task.id} is QUEUED{age} under an "
+                f"UNSATISFIABLE local_only placement hold — no runner bound to "
+                f"this project can ever satisfy it, so waiting cannot clear it "
+                f"and a human must bind or unpause an eligible runner{detail}",
+            )
+        return (
+            f"{phase}:placement_wait",
+            f"{phase} task {linked_task.id} is QUEUED{age} waiting for a "
+            f"local_only-eligible runner{detail}",
+        )
+
+    if linked_task.status == TaskStatus.QUEUED:
+        return (
+            f"{phase}:queued_never_dispatched",
+            f"{phase} task {linked_task.id} never left QUEUED{age} — no runner "
+            f"claimed it, so the agent never started and no completion handler "
+            f"could fire{detail}",
+        )
+    if linked_task.status == TaskStatus.PROVISIONING:
+        return (
+            f"{phase}:provisioning_never_started",
+            f"{phase} task {linked_task.id} never left PROVISIONING{age} — the "
+            f"runner accepted it but the agent never came up{detail}",
+        )
+    if linked_task.status == TaskStatus.IN_PROGRESS:
+        hb = linked_task.last_heartbeat
+        hb_desc = f"last heartbeat {hb}" if hb else "never heartbeated"
+        return (
+            f"{phase}:agent_heartbeat_lost",
+            f"{phase} task {linked_task.id} is IN_PROGRESS{age} but its agent "
+            f"stopped reporting ({hb_desc}) — the run died without reaching the "
+            f"completion handler{detail}",
+        )
+    return (
+        f"{phase}:task_{status}",
+        f"{phase} task {linked_task.id} is {status}{age} yet the cycle was "
+        f"never completed — the completion handler did not run{detail}",
+    )

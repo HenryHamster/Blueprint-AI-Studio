@@ -77,6 +77,7 @@ from app.reaper_orphan_classify import (
 from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
 import app.reaper_sweeps as _rs
+import app.strategic_cycle as _strategic_cycle
 from app.reaper_sweeps import event_driven_unblock_on_knowledge
 from app.time_utils import _utcnow
 from app.workbench_state import (
@@ -6471,8 +6472,14 @@ async def test_step7_wedged_queued_phase_task_without_activity_still_reaped(
     assert stalled == 1
     assert task.status == TaskStatus.FAILED
     assert cycle.outcome == "stalled_phase2"
-    assert cycle.failure_reason == (
-        "reaper_stall: cycle in phase2 >3h with no completion"
+    # The reason now names the CAUSE, not just the state: this task never left
+    # QUEUED, so no agent ever ran and no completion handler could fire.
+    assert cycle.failure_reason.startswith(
+        "reaper_stall (attempt 1, cause phase2:queued_never_dispatched):"
+    ), cycle.failure_reason
+    assert "never left QUEUED" in cycle.failure_reason
+    assert cycle.cycle_metadata["stall_signature"] == (
+        "phase2:queued_never_dispatched"
     )
 
 
@@ -6772,9 +6779,9 @@ async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
     assert payload["completion"]["status_message"] == (
         "reaper declared strategic cycle stalled in phase1 after >3h"
     )
-    assert payload["completion"]["failure_reason"] == (
-        "reaper_stall: cycle in phase1 >3h with no completion"
-    )
+    assert payload["completion"]["failure_reason"].startswith(
+        "reaper_stall (attempt 1, cause phase1:agent_heartbeat_lost):"
+    ), payload["completion"]["failure_reason"]
     assert events.index("commit") < events.index(alert) < events.index(completion)
 
 
@@ -6836,9 +6843,9 @@ async def test_step7_stalled_phase2_completion_broadcasts_after_commit(reaper_db
     assert completion[2]["completion"]["status_message"] == (
         "reaper declared strategic cycle stalled in phase2 after >3h"
     )
-    assert completion[2]["completion"]["failure_reason"] == (
-        "reaper_stall: cycle in phase2 >3h with no completion"
-    )
+    assert completion[2]["completion"]["failure_reason"].startswith(
+        "reaper_stall (attempt 1, cause phase2:"
+    ), completion[2]["completion"]["failure_reason"]
     assert events.index("commit") < events.index(alert) < events.index(completion)
 
 
@@ -21367,3 +21374,301 @@ async def test_step7_stalled_cycle_alert_dedupes_across_two_cycle_ids(
     # The row ages from the FIRST stall, but its message names the LATEST cycle.
     assert cycle_ids[0] not in alert.title
     assert cycle_ids[1] in alert.message
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_alert_names_the_reason_not_just_the_state(
+    reaper_db, mocker
+):
+    """"Stalled in phase2" is a state. The alert must carry the CAUSE.
+
+    A phase task that never left QUEUED means no agent ever ran, which is a
+    different operator action from an agent that died mid-run — and the alert
+    is the only place that distinction reaches a human.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+        blocked_reason="no eligible runner bound to project",
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    # Force updated_at into the past (bypassing the onupdate hook) so the row
+    # counts as untouched since long before the liveness window.
+    from sqlalchemy import update as _sa_update
+
+    await reaper_db.execute(
+        _sa_update(Task)
+        .where(Task.id == task.id)
+        .values(
+            updated_at=_utcnow() - timedelta(hours=2),
+            created_at=_utcnow() - timedelta(hours=4),
+        )
+    )
+    await reaper_db.commit()
+
+    assert (
+        await _rs.sweep_stalled_strategic_cycles(
+            reaper_db,
+            _utcnow(),
+            heartbeat_stale_cutoff_fn=lambda _t, now: now - timedelta(minutes=5),
+        )
+        == 1
+    )
+
+    alert = (
+        await reaper_db.execute(
+            _select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.event_type == "research.diagnosis_stalled",
+            )
+        )
+    ).scalars().one()
+    # The cause key, the human sentence, and the operator's own blocked_reason
+    # all reach the alert.
+    assert "phase2:queued_never_dispatched" in alert.message
+    assert "never left QUEUED" in alert.message
+    assert "no eligible runner bound to project" in alert.message
+    # First stall of three: still a retryable WARNING, and it says so.
+    assert alert.severity == AlertSeverity.WARNING
+    assert "Stall 1 of 3" in alert.message
+
+    # And the cause is durable on the cycle row, not only in the alert text.
+    await reaper_db.refresh(cycle)
+    assert cycle.cycle_metadata["stall_signature"] == "phase2:queued_never_dispatched"
+    assert "never left QUEUED" in cycle.cycle_metadata["stall_reason"]
+
+
+@pytest.mark.asyncio
+async def test_step7_repeated_same_cause_stalls_escalate_one_alert_to_error(
+    reaper_db, mocker
+):
+    """19 identical WARNINGs was the defect. One row escalates instead.
+
+    Same dedupe key across attempts, so the occurrence count climbs on ONE row
+    and the severity crosses to ERROR at the retry bound — the point at which
+    the pipeline has stopped re-minting and only a human can clear it.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    for _ in range(_strategic_cycle.MAX_CONSECUTIVE_STALLS):
+        task = Task(
+            project_id=project.id,
+            title="strategic-phase2",
+            payloads=[{"type": "strategic_review", "scope": "medium"}],
+            status=TaskStatus.QUEUED,
+            last_heartbeat=None,
+        )
+        reaper_db.add(task)
+        await reaper_db.commit()
+        await reaper_db.refresh(task)
+        cycle = StrategicCycle(
+            id=_make_cycle_id(),
+            project_id=project.id,
+            outcome="phase2_running",
+            phase2_task_id=task.id,
+            phase1_started_at=_utcnow() - timedelta(hours=5),
+            phase2_started_at=_utcnow() - timedelta(hours=4),
+        )
+        reaper_db.add(cycle)
+        await reaper_db.commit()
+        # Age the row past the liveness window so the sweep sees a task that
+        # has not been touched, not one whose recovery is in flight.
+        from sqlalchemy import update as _sa_update
+
+        await reaper_db.execute(
+            _sa_update(Task)
+            .where(Task.id == task.id)
+            .values(
+                updated_at=_utcnow() - timedelta(hours=2),
+                created_at=_utcnow() - timedelta(hours=4),
+            )
+        )
+        await reaper_db.commit()
+        assert (
+            await _rs.sweep_stalled_strategic_cycles(
+                reaper_db,
+                _utcnow(),
+                heartbeat_stale_cutoff_fn=lambda _t, now: now - timedelta(minutes=5),
+            )
+            == 1
+        )
+
+    alerts = list(
+        (
+            await reaper_db.execute(
+                _select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.event_type == "research.diagnosis_stalled",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # ONE row, not one per stall.
+    assert len(alerts) == 1, [a.title for a in alerts]
+    alert = alerts[0]
+    assert alert.occurrence_count == _strategic_cycle.MAX_CONSECUTIVE_STALLS
+    # Escalated, and the message says retrying has stopped.
+    assert alert.severity == AlertSeverity.ERROR
+    assert "automatic retry stopped" in alert.title
+    assert "SUPPRESSED" in alert.message
+    assert "stall 3 in a row" in alert.message
+
+    # The final cycle's failure_reason carries the attempt count and cause.
+    last = (
+        (
+            await reaper_db.execute(
+                _select(StrategicCycle)
+                .where(StrategicCycle.project_id == project.id)
+                .order_by(StrategicCycle.phase1_started_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert "attempt 3" in last.failure_reason
+    assert "phase2:queued_never_dispatched" in last.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_step7_stall_streak_does_not_leak_across_projects(reaper_db, mocker):
+    """The cutoff is per project; one project's stalls must not bound another."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+
+    noisy = await _make_project(reaper_db)
+    for _ in range(_strategic_cycle.MAX_CONSECUTIVE_STALLS):
+        reaper_db.add(
+            StrategicCycle(
+                id=_make_cycle_id(),
+                project_id=noisy.id,
+                outcome="stalled_phase2",
+                phase1_started_at=_utcnow() - timedelta(hours=9),
+                cycle_metadata={
+                    "stall_signature": "phase2:queued_never_dispatched",
+                    "stall_reason": "phase2 task never left QUEUED",
+                },
+            )
+        )
+    await reaper_db.commit()
+
+    quiet = await _make_project(reaper_db)
+    task = Task(
+        project_id=quiet.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    reaper_db.add(
+        StrategicCycle(
+            id=_make_cycle_id(),
+            project_id=quiet.id,
+            outcome="phase2_running",
+            phase2_task_id=task.id,
+            phase1_started_at=_utcnow() - timedelta(hours=5),
+            phase2_started_at=_utcnow() - timedelta(hours=4),
+        )
+    )
+    await reaper_db.commit()
+
+    # Force updated_at into the past (bypassing the onupdate hook) so the row
+    # counts as untouched since long before the liveness window.
+    from sqlalchemy import update as _sa_update
+
+    await reaper_db.execute(
+        _sa_update(Task)
+        .where(Task.id == task.id)
+        .values(
+            updated_at=_utcnow() - timedelta(hours=2),
+            created_at=_utcnow() - timedelta(hours=4),
+        )
+    )
+    await reaper_db.commit()
+
+    assert (
+        await _rs.sweep_stalled_strategic_cycles(
+            reaper_db,
+            _utcnow(),
+            heartbeat_stale_cutoff_fn=lambda _t, now: now - timedelta(minutes=5),
+        )
+        == 1
+    )
+
+    alert = (
+        await reaper_db.execute(
+            _select(Alert).where(
+                Alert.project_id == quiet.id,
+                Alert.event_type == "research.diagnosis_stalled",
+            )
+        )
+    ).scalars().one()
+    # First stall for THIS project despite the neighbour's exhausted streak.
+    assert alert.severity == AlertSeverity.WARNING
+    assert "Stall 1 of 3" in alert.message
+
+
+def test_stall_cutoff_skip_is_not_a_healthy_idle_receipt():
+    """A cutoff skip must not suppress the strategic-starvation alert.
+
+    The cutoff writes into the same ``_strategic_no_delta_skips`` log as an
+    ordinary quiet-project skip, but it means the strategist is BLOCKED. If it
+    counted as an intentional-idle receipt the cutoff would mute the one
+    detector that notices a halted strategic loop.
+    """
+    cutoff = _utcnow() - timedelta(hours=6)
+    recent = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    blocked = {
+        "_strategic_no_delta_skips": [
+            {
+                "skipped_at": recent,
+                "reason": (
+                    "stall_cutoff: 3 consecutive strategic cycles stalled "
+                    "with the same cause [phase2:queued_never_dispatched]"
+                ),
+            }
+        ]
+    }
+    assert _rs._recent_no_delta_skip_at(blocked, cutoff) is None
+
+    # A genuine quiet-project skip still counts.
+    quiet = {
+        "_strategic_no_delta_skips": [
+            {
+                "skipped_at": recent,
+                "reason": "no_meaningful_delta_since_last_cycle",
+            }
+        ]
+    }
+    assert _rs._recent_no_delta_skip_at(quiet, cutoff) is not None
+
+    # Legacy entries predate the reason key and must keep counting.
+    legacy = {"_strategic_no_delta_skips": [{"skipped_at": recent}]}
+    assert _rs._recent_no_delta_skip_at(legacy, cutoff) is not None
