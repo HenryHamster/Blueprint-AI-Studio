@@ -3360,6 +3360,13 @@ async def create_project_strategic_session_message(
         persist_empty_workbench_context=False,
         sync_local_continuation_marker=False,
         surface=MessageSurface.CONVERSATION,
+        # This IS the Strategic conversation composer (the UI Workday/chat box,
+        # ``blueprint strategic send`` and ``blueprint strategic chat``, and the
+        # operator-access mirror that delegates here). Every turn accepted here
+        # must have a reader: the bound Resident when one is live, the armed
+        # cadence otherwise. Without this the CLI default ``--type NOTE`` in
+        # Chat mode classified as ``passive_note``, armed nothing, and stranded.
+        conversation_turn=True,
         reply_to_message_id=payload.reply_to_message_id,
         include_strategic_session_snapshot=False,
         precommit_validate=_revalidate_message_context,

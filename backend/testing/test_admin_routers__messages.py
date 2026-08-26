@@ -2553,7 +2553,12 @@ class TestMessages:
         first_body = first.json()
         second_body = second.json()
         assert first_body["status"] == "created"
-        assert first_body["arming"] == "passive_note"
+        # A turn typed into the Strategic conversation always gets a reader,
+        # whatever its (client-defaulted) message type -- see
+        # ``test_chat_mode_strategic_note_arms_a_reader_instead_of_stranding``.
+        # This assertion is incidental to the idempotency contract under test;
+        # it used to read ``passive_note``, which was the strand.
+        assert first_body["arming"] == "steering"
         assert first_body["message"]["id"] == first_body["id"]
         assert first_body["message"]["message_type"] == "NOTE"
         assert first_body["message"]["content"] == body["content"]
@@ -2582,6 +2587,68 @@ class TestMessages:
             action="created",
             excerpt="Keep this visible in the Strategic workbench.",
         )
+
+    @pytest.mark.asyncio
+    async def test_chat_mode_strategic_note_arms_a_reader_instead_of_stranding(
+        self, client: AsyncClient, db_session
+    ):
+        """A Strategic conversation turn always reaches a reader; a board NOTE does not.
+
+        Asserted A/B in one test so neither leg can pass vacuously.
+
+        Leg A is the operator-steerability defect this fixes. With no Workday
+        session bound (Chat mode -- the state the workbench falls back to
+        whenever a session expires), ``blueprint strategic send`` and
+        ``blueprint strategic chat`` both post ``--type NOTE`` by default. That
+        classified as ``passive_note``: no Resident consumed it, no cadence was
+        armed, and the reaper eventually marked it FAILED as unhandled. The
+        operator's message was accepted, stored, and read by nobody.
+
+        Leg B is the fence: the message BOARD (``POST /api/admin/messages``)
+        also defaults to the ``conversation`` surface, so surface alone cannot
+        separate the lanes. A filed memo must stay passive, or the fix would
+        turn every note into a strategic wake.
+        """
+        from app.strategic_trigger import strategic_refresh_pending
+
+        conversation_project = await _make_project(db_session, name="Chat lane")
+        board_project = await _make_project(db_session, name="Board lane")
+
+        conversation = await client.post(
+            f"/api/admin/projects/{conversation_project.id}/strategic-session/messages",
+            json={
+                "message_type": "NOTE",
+                "content": "Drop the promotion work and fix the deploy first.",
+                "idempotency_key": "chat-mode-note-arms-1",
+            },
+        )
+        assert conversation.status_code == 200, conversation.text
+        assert conversation.json()["arming"] == "steering"
+
+        board = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(board_project.id),
+                "message_type": "NOTE",
+                "content": "Drop the promotion work and fix the deploy first.",
+            },
+        )
+        assert board.status_code == 200, board.text
+        assert board.json()["arming"] == "passive_note"
+
+        conversation_vision = await self._reload_vision(
+            db_session, conversation_project.id
+        )
+        assert strategic_refresh_pending(conversation_vision) is True
+        marker = conversation_vision["_strategic_refresh"]
+        assert marker["origin"] == "operator"
+        assert marker["reason"] == "operator_message"
+        # The steer text rides the marker so it survives the recent-messages
+        # snapshot aging out before the deferred cycle reaches its review phase.
+        assert marker["excerpt"] == "Drop the promotion work and fix the deploy first."
+
+        board_vision = await self._reload_vision(db_session, board_project.id)
+        assert strategic_refresh_pending(board_vision) is False
 
     @pytest.mark.asyncio
     async def test_strategic_session_message_persists_workbench_snapshot_and_arms(

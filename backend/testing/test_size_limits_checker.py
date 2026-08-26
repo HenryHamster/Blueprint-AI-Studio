@@ -667,7 +667,7 @@ diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_si
 +    "main.py": 3900,
    }
 """
-    records = slp._parse_git_diff_output(log, "main.py")
+    records = slp._parse_git_diff_output(log, "main.py", "backend")
     # (3700, 3800) appeared twice — collapsed to the earlier commit (aaa111),
     # even though the later duplicate (bbb222) appears first in the output.
     # (3800, 3900) is a distinct later bump and survives.
@@ -702,7 +702,7 @@ diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_si
 +    "m.py": 1000,
    }
 """
-    records = slp._parse_git_diff_output(log, "m.py")
+    records = slp._parse_git_diff_output(log, "m.py", "backend")
     assert [(r["commit_sha"], r["old_cap"], r["new_cap"]) for r in records] == [
         ("aaa111", 800, 1000),
         ("bbb222", 1000, 1200),
@@ -739,7 +739,7 @@ diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_si
 +    "main.py": 3800,
    }
 """
-    records = slp._parse_git_diff_output(log, "main.py")
+    records = slp._parse_git_diff_output(log, "main.py", "backend")
     # bbb222 (-07:00) is 2026-05-22T05:00:00+00:00 — LATER than aaa111's
     # 00:30+00:00, so aaa111 wins even though "22:00-07:00" < "00:30+00:00"
     # as a raw string.
@@ -2195,7 +2195,7 @@ def test_read_git_bump_history_argv_pins_safe_directory_to_the_ref_probe(tmp_pat
 
     mocker.patch("app.size_limit_policy.subprocess.run", side_effect=record)
 
-    slp._read_git_bump_history("big.py", root)
+    slp._read_git_bump_history("big.py", root, section="backend")
 
     probes = [c for c in calls if "rev-parse" in c and "--verify" in c]
     reads = [c for c in calls if "log" in c]

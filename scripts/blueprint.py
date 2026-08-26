@@ -3346,10 +3346,16 @@ def _report_arming(result, *, lane: str) -> None:
       reader, so ``not_armed`` there is proof the message will never be read --
       a hard failure, not a warning.
     * The ``strategic`` lane additionally passes ``precreate_ensure``, which can
-      bind the message to a live Workday session. Its arming outcome therefore
-      does NOT decide readability on its own: a bound ``passive_note`` IS read,
-      an unbound one is not. So report the verdict verbatim without claiming
-      delivery, and never fail the send on the CLI's guess.
+      bind the message to a live Workday session -- but binding is NOT invisible
+      to the verdict. ``create_operator_project_message`` overwrites the arming
+      outcome to ``resident_session`` for every CONVERSATION row it binds
+      (backend/app/project_message_creation.py, "every canonical conversation
+      row belongs to the active Resident"), and the server now classifies every
+      conversation turn as steering whatever its message type. So on this lane
+      ``not_armed`` / ``passive_note`` is proof of the opposite of binding: no
+      Resident took it AND no cadence was armed. That is a strand, and it fails
+      exit 1 exactly like the plain lane. (This used to exit 0 on the theory
+      that a bound message could still report ``passive_note``; it cannot.)
 
     Everything here goes to stderr: ``--json`` callers parse stdout, and they
     read the verdict from the ``arming`` key of the emitted receipt instead.
@@ -3368,21 +3374,20 @@ def _report_arming(result, *, lane: str) -> None:
         print(f"  Handling: {arming} -- {_ARMING_SERVICED[arming]}", file=sys.stderr)
         return
     if lane == "strategic":
-        if arming == _ARMING_UNSERVICED:
+        if arming == _ARMING_UNSERVICED or arming in _ARMING_PASSIVE:
+            # A bound turn is reported as ``resident_session``, so reaching here
+            # means nothing bound it and nothing was armed. Only an unknown
+            # (newer-server) verdict falls through to the neutral report below,
+            # so a future serviced outcome is never mistaken for a strand.
             print(
-                "WARNING: arming=not_armed -- no strategic cycle was armed for "
-                "this message. It is read only if the Workday session bound it, "
-                "so check for a reply before assuming it landed.",
+                f"ERROR: this Strategic turn was STORED but arming={arming}: no "
+                "Workday session bound it and no strategic cycle was armed, so "
+                "nothing will ever read or answer it. Re-send to retry, or "
+                "start a Workday session ('blueprint strategic start') first.",
                 file=sys.stderr,
             )
-            return
-        detail = _ARMING_PASSIVE.get(arming)
-        suffix = f" -- {detail}" if detail else ""
-        print(
-            f"  Handling: {arming}{suffix}; delivery depends on the Workday "
-            "session bound to this thread.",
-            file=sys.stderr,
-        )
+            sys.exit(1)
+        print(f"  Handling: {arming}", file=sys.stderr)
         return
     if arming == _ARMING_UNSERVICED:
         print(

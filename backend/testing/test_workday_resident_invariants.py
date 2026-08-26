@@ -52,8 +52,11 @@ from app.strategic_resident_session import (
 )
 from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY, persist_strategic_workbench_update
 from app.strategic_trigger import (
+    ARMING_PASSIVE_NOTE,
     ARMING_RESIDENT_SESSION,
+    ARMING_STEERING,
     maybe_arm_operator_refresh,
+    strategic_refresh_pending,
 )
 from app.work_session_command_execution import _request_arming_after_receipt
 
@@ -1100,6 +1103,86 @@ async def test_workbench_and_work_session_arming_suppressed_during_resident_sess
 # with ``sequence IS NULL``, and this function pre-allocates the sequence before
 # INSERT, so the wrong value is durable.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+
+def test_the_conversation_composer_marks_its_turns_as_conversation_turns():
+    """The operator conversation entrypoint must flag the turn as such.
+
+    ``conversation_turn`` is what guarantees a turn typed at the Resident gets a
+    reader (bound Resident, else armed cadence) instead of stranding as a
+    passive note. It cannot be derived from ``surface``: the message-BOARD
+    routes also default to ``MessageSurface.CONVERSATION``, so the two lanes are
+    indistinguishable at the seam. That makes this router call site the single
+    load-bearing binding, and a silent drop of the kwarg would re-open the
+    strand with every behavioural test still green (the board leg would pass and
+    the conversation leg would simply go quiet). Pin it structurally.
+
+    ``agent_strategic_messages.create_finalized_call_transcript`` is the only
+    other CONVERSATION-surface operator input, and it is deliberately NOT
+    flagged: its ``_revalidate_call_lease`` precommit requires an IN_PROGRESS
+    resident task owning the exact live session, so every turn it accepts is
+    already bound and reports ``resident_session``. Flagging it would change no
+    outcome.
+    """
+    source = inspect.getsource(
+        strategic_session_router.create_project_strategic_session_message
+    )
+    assert "create_operator_project_message(" in source
+    assert "conversation_turn=True" in source
+
+
+@pytest.mark.asyncio
+async def test_server_authored_activation_turn_never_arms_a_cadence_cycle(db_session):
+    """The Resident activation prompt is not operator steering.
+
+    It is written through the same helper with ``MessageType.NOTE`` on the
+    CONVERSATION surface, so if it ever reached the conversation lane it would
+    look exactly like an operator chat turn and wake a cadence cycle nobody
+    asked for. The activation marker excludes it at the arming site.
+
+    Asserted A/B: the identical call WITHOUT the activation marker must arm, or
+    the exclusion leg proves nothing.
+    """
+    project = Project(name="Activation fence", user_id="operator", vision={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activation = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="Resident activation prompt.",
+        context={},
+        server_context={RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY: True},
+        workbench_context=None,
+        idempotency_key=str(uuid.uuid4()),
+        conversation_turn=True,
+        include_strategic_session_snapshot=False,
+    )
+    assert activation.arming == ARMING_PASSIVE_NOTE
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+    operator_turn = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="Actually, stop the promotion and fix the deploy.",
+        context={},
+        workbench_context=None,
+        idempotency_key=str(uuid.uuid4()),
+        conversation_turn=True,
+        include_strategic_session_snapshot=False,
+    )
+    assert operator_turn.arming == ARMING_STEERING
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
 
 
 @pytest.mark.asyncio

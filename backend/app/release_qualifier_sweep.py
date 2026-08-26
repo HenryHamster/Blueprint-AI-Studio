@@ -63,12 +63,14 @@ from app.release_qualifier_redrive import (
     _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
     _MAX_DEFERRED_UNSYNCED_WAIT_SECONDS,  # noqa: F401 — re-exported for tests
     _PROMOTION_MECHANICS_FAILURES,  # noqa: F401 — re-exported for tests
+    _TRIGGER_ROUTING_DECISION_KEY,  # noqa: F401 — re-exported for tests
     _TRANSIENT_ERROR_CODES,  # noqa: F401 — re-exported for tests
     _redrive_deferred_unsynced_qualification,  # noqa: F401 - re-exported for tests
     _redrive_error_qualification,
     _redrive_infra_failure_qualification,
     _redrive_promotion_failed_qualification,  # noqa: F401 - re-exported for tests
     _redrive_rubric_changed_qualification,
+    _record_discarded_trigger_routing,
     _redrive_walkthrough_contract_qualification,
     run_redrive_legs,
 )
@@ -1238,7 +1240,10 @@ async def _fire_auto_triggered_qualification(
     cycle. Returns True only when ``run_qualification`` reports ``spawned``.
     """
     from app import release_qualifier
-    from app.qualification_triggers import resolve_qualification_trigger
+    from app.qualification_triggers import (
+        SWEEP_OWNED_TRIGGERS,
+        resolve_qualification_trigger,
+    )
     from app.runtime_config_state import get_auto_qualification_triggers_mode
 
     knob = get_auto_qualification_triggers_mode()
@@ -1367,29 +1372,19 @@ async def _fire_auto_triggered_qualification(
         # Raw status/blocker skips previously hid candidate_advanced for
         # non-coverage blockers. Apply executor ownership only after resolution.
         #
-        # The claim below — that every OTHER trigger is owned by a dedicated
-        # re-driver — was FALSE for ``blockers_cleared`` (promotion_failed) and
+        # The claim "every OTHER trigger is owned by a dedicated re-driver" was
+        # FALSE for ``blockers_cleared`` (promotion_failed) and
         # ``deferred_unsynced_redrive`` from commit a9ed8d6e until those two
         # re-drivers were restored: the resolver armed the version, this filter
-        # discarded the decision, and nothing re-fired qualification.  It is
-        # true now, and the exhaustive mapping is:
-        #   rubric_redrive          -> _redrive_rubric_changed_qualification
-        #   error_redrive           -> _redrive_error_qualification
-        #   infra_failure_redrive   -> _redrive_infra_failure_qualification
-        #   blockers_cleared        -> _redrive_promotion_failed_qualification
-        #   deferred_unsynced_redrive -> _redrive_deferred_unsynced_qualification
-        # Any NEW resolver trigger must land in that table or in this set before
-        # it is added; a trigger in neither place dead-ends silently.
-        if decision.trigger not in {
-            "coverage_complete",
-            "candidate_advanced",
-            "post_dry_run_advance",
-        }:
-            logger.info(
-                "[RELEASE_QUALIFIER] sweep: resolver armed version %s with "
-                "trigger=%s, but that trigger is owned by its dedicated re-driver",
-                version_id,
-                decision.trigger,
+        # discarded the decision, nothing re-fired qualification, and NOTHING
+        # RECORDED THAT A DECISION HAD BEEN DISCARDED.  The routing tables now
+        # live in ``qualification_triggers`` as data, and the discard below
+        # stamps a breadcrumb naming the trigger and its owner -- alerting when
+        # the named owner does not exist, because a trigger routed to a
+        # non-existent owner is a permanent silent latch.
+        if decision.trigger not in SWEEP_OWNED_TRIGGERS:
+            await _record_discarded_trigger_routing(
+                version_id, decision.trigger, session_factory=session_factory
             )
             return False
 

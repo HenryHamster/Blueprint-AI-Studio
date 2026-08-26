@@ -627,7 +627,7 @@ index 111..222
 
 
 def test_parse_git_diff_extracts_bumps():
-    records = _parse_git_diff_output(_FIXTURE_GIT_LOG, "reaper_sweeps.py")
+    records = _parse_git_diff_output(_FIXTURE_GIT_LOG, "reaper_sweeps.py", "backend")
     assert len(records) == 2
     assert records[0]["old_cap"] == 3500
     assert records[0]["new_cap"] == 4050
@@ -638,7 +638,7 @@ def test_parse_git_diff_extracts_bumps():
 
 
 def test_parse_git_diff_ignores_other_keys():
-    records = _parse_git_diff_output(_FIXTURE_GIT_LOG, "orchestrator.py")
+    records = _parse_git_diff_output(_FIXTURE_GIT_LOG, "orchestrator.py", "backend")
     assert records == []
 
 
@@ -650,16 +650,18 @@ diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_si
 --- a/backend/testing/module_size_limits.json
 +++ b/backend/testing/module_size_limits.json
 @@ -5,7 +5,7 @@
+   "backend": {
 -    "tiny_module.py": 5000,
 +    "tiny_module.py": 100,
+   }
 """
-    records = _parse_git_diff_output(log_with_decrease, "tiny_module.py")
+    records = _parse_git_diff_output(log_with_decrease, "tiny_module.py", "backend")
     # Decrease (5000 → 100) is NOT a bump; should be excluded.
     assert records == []
 
 
 def test_parse_git_diff_empty_output():
-    assert _parse_git_diff_output("", "anything.py") == []
+    assert _parse_git_diff_output("", "anything.py", "backend") == []
 
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +1203,11 @@ def test_cap_bump_history_ledger_matches_git():
             slp._mainline_git_ref(repo_root),
             "--format=COMMIT %H %aI",
             "-p",
+            # Whole-file context: a cap's identity is (section, key), and the
+            # enclosing ``"<section>": {`` opener is outside a default -U3 hunk.
+            # Without this the guard reads a bump of testing/X.py as a bump of
+            # scripts/X.py -- the exact collision it is here to catch.
+            slp._FULL_CONTEXT_DIFF_ARG,
             "--",
             slp._MODULE_SIZE_LIMITS_RELPATH,
         ],
@@ -1237,12 +1244,15 @@ def test_cap_bump_history_ledger_matches_git():
         ),
         default=None,
     )
+    # Parsed ONCE for every (section, key): the full-context stream is
+    # multi-megabyte and this loop walks several hundred caps.
+    git_by_section_key = slp._parse_git_log_bump_records(git_out)
     mismatches = []
     for section, keys in caps.items():
         if not isinstance(keys, dict):
             continue
         for key in keys:
-            git_records = _parse_git_diff_output(git_out, key)
+            git_records = git_by_section_key.get((section, key), [])
             ledger_recs = ledger_history.get(section, {}).get(key, [])
             ledger_pairs = {
                 (r["old_cap"], r["new_cap"]) for r in ledger_recs
@@ -1850,7 +1860,7 @@ def test_mainline_ref_scope_excludes_non_ancestor_bumps(tmp_path, mocker):
             return real_run(args, *call_args, **call_kwargs)
 
         mocker.patch.object(slp.subprocess, "run", side_effect=record_git_call)
-        records = slp._read_git_bump_history("m.py")
+        records = slp._read_git_bump_history("m.py", section="backend")
         assert records is not None
         assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
         assert ["-c", f"safe.directory={repo}"] == git_calls[-1][1:3]
@@ -1875,7 +1885,7 @@ def test_mainline_ref_scope_excludes_non_ancestor_bumps(tmp_path, mocker):
             cwd=repo,
             check=True,
         ).stdout
-        all_records = slp._parse_git_diff_output(all_out, "m.py")
+        all_records = slp._parse_git_diff_output(all_out, "m.py", "backend")
         assert [(r["old_cap"], r["new_cap"]) for r in all_records] == [
             (100, 200),
             (200, 300),
@@ -2236,3 +2246,375 @@ def test_per_root_git_probes_do_not_rescale_with_module_count(tmp_path, mocker):
         f"be memoised, or probe cost scales with the number of modules a single "
         f"sweep classifies -- the 288-spawn reaper stall this test pins."
     )
+
+
+# ---------------------------------------------------------------------------
+# Section-collision attribution.
+#
+# ``module_size_limits.json`` maps a SECTION to ``{module_basename: cap}``, and
+# the same basename legitimately exists in two sections pointing at two
+# DIFFERENT real files: ``test_local_runner.py`` is both a ``testing`` cap and
+# a ``scripts`` cap.  The git-history parse used to key bumps by basename
+# alone, with no idea which section object enclosed the diff line.  That was
+# wrong in BOTH directions, and both are pinned here:
+#
+# (a) FALSE FAIL — a bump of ``testing/X.py`` was reported as unrecorded drift
+#     in ``scripts/X.py``.  The checker exited 1 on a correct ledger and its
+#     ``--fix`` wrote a record for a transition that never happened.
+# (b) FALSE ACCEPT — a ledger record filed under section A could be
+#     "justified" by an unrelated bump in section B carrying a coincidentally
+#     equal ``(old_cap, new_cap)`` pair, so a fabricated record survived the
+#     phantom guard.  This is the direction that actually protects the guard;
+#     the live ledger had exactly one such record.
+#
+# Attribution needs the enclosing ``"<section>": {`` opener, which is outside
+# a default three-line diff hunk — hence ``_FULL_CONTEXT_DIFF_ARG`` on every
+# read of the caps file.
+# ---------------------------------------------------------------------------
+
+# Literal pin: the real basename that collides across sections today. Keeping
+# it literal means a future rename cannot quietly make these tests vacuous.
+_COLLIDING_BASENAME = "test_local_runner.py"
+
+
+def _two_section_repo(tmp_path, revisions, name="collide"):
+    """Hermetic repo whose caps file holds ONE basename in TWO sections.
+
+    ``revisions`` is a list of ``(testing_cap, scripts_cap, iso_date)`` written
+    and committed in order.  Returns ``(repo, caps_path, [sha, ...])``.
+    """
+    repo = tmp_path / name
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    caps_path = repo / "module_size_limits.json"
+    shas: list[str] = []
+    for testing_cap, scripts_cap, date in revisions:
+        caps_path.write_text(
+            json.dumps(
+                {
+                    "_doc": "fixture",
+                    "testing": {_COLLIDING_BASENAME: testing_cap},
+                    "scripts": {_COLLIDING_BASENAME: scripts_cap},
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        env = {**os.environ, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
+        subprocess.run(
+            ["git", "add", "module_size_limits.json"], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "-m", f"caps {testing_cap}/{scripts_cap}"],
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+        shas.append(_hermetic_head_sha(str(repo)))
+    return str(repo), str(caps_path), shas
+
+
+def _write_ledger(tmp_path, history, name="cap_bump_history.json"):
+    path = tmp_path / name
+    path.write_text(
+        json.dumps({"schema_version": 1, "history": history}, indent=2),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_scan_diff_bumps_attributes_a_shared_basename_to_its_own_section():
+    """Two sections, one basename, one changed: only that section gets the pair."""
+    diff = (
+        "diff --git a/module_size_limits.json b/module_size_limits.json\n"
+        "--- a/module_size_limits.json\n"
+        "+++ b/module_size_limits.json\n"
+        "@@ -1,9 +1,9 @@\n"
+        " {\n"
+        '   "testing": {\n'
+        f'     "{_COLLIDING_BASENAME}": 15100\n'
+        "   },\n"
+        '   "scripts": {\n'
+        f'-    "{_COLLIDING_BASENAME}": 14250\n'
+        f'+    "{_COLLIDING_BASENAME}": 16650\n'
+        "   }\n"
+        " }\n"
+    )
+    scanned = slp._scan_diff_bumps(diff)
+    assert scanned.by_section_key == {
+        ("scripts", _COLLIDING_BASENAME): {(14250, 16650)}
+    }
+    assert ("testing", _COLLIDING_BASENAME) not in scanned.by_section_key
+    assert scanned.unattributed_keys == frozenset()
+
+
+def test_scan_diff_bumps_fails_open_when_the_section_is_not_in_the_hunk():
+    """No enclosing section opener: evidence is UNATTRIBUTED, never guessed.
+
+    A default ``-U3`` hunk does not carry the section opener.  Attributing such
+    a line to some default section is the defect; reporting it as absent
+    evidence is the safe direction for BOTH halves of the ledger guard.
+    """
+    diff = (
+        "@@ -340,7 +340,7 @@\n"
+        f'-    "{_COLLIDING_BASENAME}": 15100,\n'
+        f'+    "{_COLLIDING_BASENAME}": 19700,\n'
+    )
+    scanned = slp._scan_diff_bumps(diff)
+    assert scanned.by_section_key == {}
+    assert scanned.unattributed_keys == frozenset({_COLLIDING_BASENAME})
+
+
+def test_scan_diff_bumps_tracks_old_and_new_section_cursors_independently():
+    """A renamed section: the ``-`` entry is old-side, the ``+`` entry new-side."""
+    diff = (
+        "@@ -1,5 +1,5 @@\n"
+        " {\n"
+        '-  "old_section": {\n'
+        f'-    "{_COLLIDING_BASENAME}": 100\n'
+        '+  "new_section": {\n'
+        f'+    "{_COLLIDING_BASENAME}": 200\n'
+        "   }\n"
+        " }\n"
+    )
+    scanned = slp._scan_diff_bumps(diff)
+    # Neither side sees BOTH an old and a new value, so neither is a bump —
+    # a section rename is not a cap raise and must not be reported as one.
+    assert scanned.by_section_key == {}
+    assert scanned.unattributed_keys == frozenset()
+
+
+def test_caps_file_diff_reads_request_whole_file_context():
+    """Every read of the caps file must render full context.
+
+    Literal pin, deliberately not the constant it checks: with git's default
+    three context lines the enclosing ``"<section>": {`` opener is outside the
+    hunk (git's funcname heuristic finds nothing in JSON either), so every bump
+    would be unattributable and the guard would silently stop looking — the
+    "could not look, then reported clean" class of #17872/#17920.
+    """
+    assert slp._FULL_CONTEXT_DIFF_ARG == "-U100000"
+    source = Path(slp.__file__).read_text(encoding="utf-8")
+    # Every ``git log -p`` argv in the module must be followed immediately by
+    # the full-context argument, so a new read cannot be added section-blind.
+    log_renders = source.split('"-p",')[1:]
+    assert len(log_renders) >= 4, len(log_renders)
+    for chunk in log_renders:
+        assert chunk.lstrip().startswith("_FULL_CONTEXT_DIFF_ARG,"), chunk[:120]
+    # ``git show`` renders the caps-file diff too and needs the same context.
+    show_renders = source.split('"show",')[1:]
+    sha_renders = [c for c in show_renders if c.lstrip().startswith("sha,")]
+    assert len(sha_renders) == 1, len(sha_renders)
+    assert sha_renders[0].split("sha,", 1)[1].lstrip().startswith(
+        "_FULL_CONTEXT_DIFF_ARG,"
+    )
+
+
+def test_missing_ledger_bumps_are_not_attributed_to_another_section(tmp_path):
+    """(a) FALSE FAIL: a testing/ bump must never be charged to scripts/.
+
+    Mutation proof: with the section-blind parse this returns TWO entries — the
+    real ``testing`` bump AND a fabricated ``scripts`` one for the same pair,
+    which is the ``[ledger-missing] scripts/test_local_runner.py`` line the
+    checker emitted against a correct ledger.
+    """
+    repo, caps_path, shas = _two_section_repo(
+        tmp_path,
+        [
+            (15100, 16650, "2026-01-01T00:00:00+00:00"),
+            # ONLY the testing cap moves; scripts stays at 16650 throughout.
+            (19700, 16650, "2026-01-02T00:00:00+00:00"),
+        ],
+    )
+    ledger_path = _write_ledger(tmp_path, {})
+
+    with patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        missing = slp.missing_ledger_bump_records(
+            repo_root=repo, caps_json_path=caps_path, ledger_path=ledger_path
+        )
+
+    assert [entry[0] for entry in missing if entry[0] == "scripts"] == []
+    assert len(missing) == 1, missing
+    section, key, old_cap, new_cap, commit_sha, _date, status = missing[0]
+    assert (section, key, old_cap, new_cap) == (
+        "testing",
+        _COLLIDING_BASENAME,
+        15100,
+        19700,
+    )
+    assert commit_sha == shas[1]
+    assert status == slp.LEDGER_BUMP_ABSENT
+
+
+def test_missing_ledger_bumps_clean_when_only_the_right_section_is_recorded(tmp_path):
+    """The same history with a correct ledger must produce NO findings.
+
+    This is the end-to-end shape of the false failure: the ledger records the
+    testing bump and nothing else, which is the truth, yet the section-blind
+    parse still demanded a ``scripts`` record for a transition that never
+    happened — and ``--fix`` would have written it.
+    """
+    repo, caps_path, shas = _two_section_repo(
+        tmp_path,
+        [
+            (15100, 16650, "2026-01-01T00:00:00+00:00"),
+            (19700, 16650, "2026-01-02T00:00:00+00:00"),
+        ],
+    )
+    ledger_path = _write_ledger(
+        tmp_path,
+        {
+            "testing": {
+                _COLLIDING_BASENAME: [
+                    {
+                        "commit_sha": shas[1],
+                        "commit_date": "2026-01-02T00:00:00+00:00",
+                        "old_cap": 15100,
+                        "new_cap": 19700,
+                    }
+                ]
+            }
+        },
+    )
+
+    with patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        missing = slp.missing_ledger_bump_records(
+            repo_root=repo, caps_json_path=caps_path, ledger_path=ledger_path
+        )
+
+    assert missing == []
+
+
+def test_phantom_ledger_rejects_a_cross_section_justification(tmp_path):
+    """(b) FALSE ACCEPT: section B's bump must not justify section A's record.
+
+    The security-relevant direction.  The commit raises ``scripts/X.py``
+    14250 -> 16650 and leaves ``testing/X.py`` untouched, but the ledger files
+    that pair under ``testing``.  With the section-blind parse the commit's
+    diff "showed" the pair for the bare basename, the fabricated record was
+    accepted, and the deployed chronic-offender classifier counted a bump that
+    never happened for that file.  The live ledger held exactly this record.
+
+    Mutation proof: the unfixed parser returns ``[]`` here.
+    """
+    repo, _caps_path, shas = _two_section_repo(
+        tmp_path,
+        [
+            (15100, 14250, "2026-01-01T00:00:00+00:00"),
+            # ONLY the scripts cap moves; testing stays at 15100 throughout.
+            (15100, 16650, "2026-01-02T00:00:00+00:00"),
+        ],
+    )
+    ledger = {
+        "schema_version": 1,
+        "history": {
+            "testing": {
+                _COLLIDING_BASENAME: [
+                    {
+                        "commit_sha": shas[1],
+                        "commit_date": "2026-01-02T00:00:00+00:00",
+                        "old_cap": 14250,
+                        "new_cap": 16650,
+                    }
+                ]
+            }
+        },
+    }
+
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        phantoms = slp.phantom_ledger_records(repo_root=repo, history=ledger)
+
+    assert len(phantoms) == 1, phantoms
+    section, key, old_cap, new_cap, sha, reason = phantoms[0]
+    assert (section, key, old_cap, new_cap, sha) == (
+        "testing",
+        _COLLIDING_BASENAME,
+        14250,
+        16650,
+        shas[1],
+    )
+    assert "no recorded bump" in reason
+
+
+def test_phantom_ledger_accepts_the_same_pair_filed_under_the_right_section(tmp_path):
+    """Control for the test above: the record IS justified under ``scripts``.
+
+    Without this, "flag everything" would pass the false-accept test.  The
+    identical pair and commit, filed under the section that actually moved,
+    must survive.
+    """
+    repo, _caps_path, shas = _two_section_repo(
+        tmp_path,
+        [
+            (15100, 14250, "2026-01-01T00:00:00+00:00"),
+            (15100, 16650, "2026-01-02T00:00:00+00:00"),
+        ],
+    )
+    ledger = {
+        "schema_version": 1,
+        "history": {
+            "scripts": {
+                _COLLIDING_BASENAME: [
+                    {
+                        "commit_sha": shas[1],
+                        "commit_date": "2026-01-02T00:00:00+00:00",
+                        "old_cap": 14250,
+                        "new_cap": 16650,
+                    }
+                ]
+            }
+        },
+    }
+
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        phantoms = slp.phantom_ledger_records(repo_root=repo, history=ledger)
+
+    assert phantoms == []
+
+
+def test_parse_bump_history_does_not_borrow_another_sections_bumps(tmp_path):
+    """The production history read is section-scoped too.
+
+    ``parse_bump_history`` feeds the chronic-offender classifier.  A
+    section-blind read gave ``testing/X.py`` the bump history of
+    ``scripts/X.py`` — a file it has nothing to do with — which is how a
+    routine first bump could be refused as chronic (or vice versa).
+    """
+    repo, _caps_path, _shas = _two_section_repo(
+        tmp_path,
+        [
+            (15100, 14250, "2026-01-01T00:00:00+00:00"),
+            (15100, 16650, "2026-01-02T00:00:00+00:00"),
+        ],
+    )
+
+    slp._bump_history_cache.clear()
+    try:
+        with patch(
+            "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH",
+            "module_size_limits.json",
+        ):
+            testing_history = slp.parse_bump_history(
+                _COLLIDING_BASENAME, "testing", repo
+            )
+            scripts_history = slp.parse_bump_history(
+                _COLLIDING_BASENAME, "scripts", repo
+            )
+    finally:
+        slp._bump_history_cache.clear()
+
+    assert testing_history == []
+    assert [(r["old_cap"], r["new_cap"]) for r in scripts_history] == [(14250, 16650)]

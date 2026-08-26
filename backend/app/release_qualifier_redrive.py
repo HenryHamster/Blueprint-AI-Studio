@@ -54,6 +54,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
+from app.qualification_triggers import qualification_trigger_owner
 from app.time_utils import _utcnow
 
 # First cap for this module: it crossed the 1500-line coverage threshold
@@ -1231,6 +1232,10 @@ _MAX_DEFERRED_UNSYNCED_WAIT_SECONDS = 6 * 60 * 60
 # Keys under which each re-driver stamps its decision on ``last_qualification``.
 _PROMOTION_REDRIVE_DECISION_KEY = "promotion_redrive_decision"
 _DEFERRED_UNSYNCED_DECISION_KEY = "deferred_unsynced_redrive_decision"
+# Where the sweep's auto-fire executor stamps what it did with an armed decision
+# it does not own.  Read by an operator asking "the panel says armed -- who is
+# supposed to act on that?"
+_TRIGGER_ROUTING_DECISION_KEY = "auto_trigger_routing"
 
 
 def _parse_iso_timestamp(raw) -> datetime | None:
@@ -1288,6 +1293,103 @@ async def _record_redrive_decision(
     session.add(version)
     await session.commit()
     return True
+
+
+async def _record_discarded_trigger_routing(
+    version_id,
+    trigger: str,
+    *,
+    session_factory=None,
+) -> bool:
+    """Stamp WHY the sweep discarded an armed trigger -- and ALERT if orphaned.
+
+    The sweep's auto-fire executor runs ``SWEEP_OWNED_TRIGGERS`` inline and
+    discards every other armed decision as re-driver-owned.  That discard used
+    to be LOG-ONLY.  Logs rotate, so the read surface showed
+    ``{"fire": true, "trigger": "blockers_cleared", "reason": "armed"}`` with
+    ``blocking: []`` for as long as the wedge lasted, and an operator reading the
+    version back had no way to learn a decision had been made and thrown away.
+    This writes that fact onto ``last_qualification`` where they will see it.
+
+    FAILS LOUDLY when the routing dead-ends.  A trigger with no entry in either
+    ownership table, or one naming a re-driver this build does not define, is a
+    PERMANENT SILENT LATCH: the resolver re-arms every cycle, the sweep discards
+    every cycle, and no owner ever runs.  That is the exact shape of the
+    ``blockers_cleared`` wedge -- the resolver named an owner the deployed build
+    did not have.  So an unowned trigger records ``decision="orphaned"`` and
+    raises an operator Alert once, instead of being dropped.
+
+    Idempotent by content via ``_record_redrive_decision``: a steady-state
+    routed discard does not rewrite the row (or re-alert) on every ~60s sweep.
+    """
+    if not trigger or trigger == "none":
+        return False
+    owner = qualification_trigger_owner(trigger)
+    orphaned = not callable(globals().get(owner)) if owner else True
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        version = await session.get(release_version.ReleaseVersion, version_id)
+        if version is None or not isinstance(version.last_qualification, dict):
+            return False
+        if orphaned:
+            logger.error(
+                "[RELEASE_QUALIFIER] sweep: resolver armed v%d with trigger=%r "
+                "but NOTHING owns it (owner=%r) -- the decision is discarded "
+                "every cycle and no re-driver will ever execute it; this is a "
+                "permanent silent latch",
+                version.version_number,
+                trigger,
+                owner,
+            )
+            prior = version.last_qualification.get(_TRIGGER_ROUTING_DECISION_KEY)
+            if not (
+                isinstance(prior, dict)
+                and prior.get("decision") == "orphaned"
+                and prior.get("trigger") == trigger
+            ):
+                session.add(
+                    Alert(
+                        project_id=version.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=(
+                            f"Release v{version.version_number} armed trigger "
+                            f"'{trigger}' has no executor"
+                        ),
+                        message=(
+                            f"The qualification resolver armed release "
+                            f"v{version.version_number} with trigger "
+                            f"'{trigger}', but no executor owns it: the sweep "
+                            f"discards it as re-driver-owned and this build "
+                            f"defines no re-driver "
+                            + (
+                                f"named '{owner}'"
+                                if owner
+                                else "for it at all"
+                            )
+                            + ". The version will re-arm and be discarded every "
+                            "sweep cycle without progressing. Operator action is "
+                            "required."
+                        ),
+                        event_type="release.qualification_trigger_unowned",
+                    )
+                )
+        else:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: resolver armed version %s with "
+                "trigger=%s, routed to its dedicated re-driver %s",
+                version_id,
+                trigger,
+                owner,
+            )
+        return await _record_redrive_decision(
+            session,
+            version,
+            _TRIGGER_ROUTING_DECISION_KEY,
+            "orphaned" if orphaned else "routed",
+            "no_executor_owns_this_trigger" if orphaned else "owned_by_redriver",
+            trigger=trigger,
+            owner=owner,
+        )
 
 
 def _promotion_failure_needs_new_candidate(error: str) -> bool:
