@@ -575,7 +575,7 @@ async def _check_full_suite_drift_sentinel(
         terminal_promotion_ci_dispatch_receipt,
         terminal_promotion_ci_dispatch_receipt_active,
     )
-    from app.release_readiness import compute_promotion_ci_green_gate
+    from app.release_readiness import PROMOTION_CI_GREEN_STATES, compute_promotion_ci_green_gate
     from app.release_reconciliation import _harvest_promotion_ci_failures
 
     factory = session_factory or AsyncSessionLocal
@@ -744,10 +744,10 @@ async def _check_full_suite_drift_sentinel(
                             head_sha[:8] if head_sha else "?",
                         )
                         return True
-                    if gate_state in ("green", "pending"):
-                        # A run for the HEAD is green or in flight — nothing left
-                        # to do; the sentinel will read it on the next sweep.
-                        if gate_state == "green":
+                    if gate_state in PROMOTION_CI_GREEN_STATES or gate_state == "pending":
+                        # A full matrix passed for the HEAD, or one is in flight —
+                        # nothing left to do; the sentinel reads it next sweep.
+                        if gate_state in PROMOTION_CI_GREEN_STATES:
                             await _retire_sentinel_incidents(
                                 session,
                                 version.project_id,
@@ -862,8 +862,13 @@ async def _check_full_suite_drift_sentinel(
                 return True
 
             if gate_state != "red":
-                if gate_state == "green":
-                    # The ONLY state that falsifies every sentinel claim at once.
+                if gate_state in PROMOTION_CI_GREEN_STATES:
+                    # Branch HEALTH, so ``green_rehearsal`` retires here too and
+                    # must: every incident this sentinel raises comes from a
+                    # dispatch run itself, making red-cleared-by-green symmetric.
+                    # Refusing would strand the red incident forever.  Cutting a
+                    # promotion PR is the OTHER question — that one needs
+                    # promotion_ci_gate_proves_promotion, not this flag.
                     await _retire_sentinel_incidents(
                         session,
                         version.project_id,
@@ -1314,7 +1319,7 @@ async def _fire_auto_triggered_qualification(
             )
             automain_sha = _gate.get("head_sha")
             _gstate = _gate.get("gate_state")
-            if _gstate in ("red", "green", "pending", "no_checks"):
+            if _gstate in ("red", "green", "green_rehearsal", "pending", "no_checks"):
                 automain_ci_state = _gstate
         except Exception:  # noqa: BLE001 — best-effort; degrade to None
             logger.warning(

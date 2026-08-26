@@ -436,7 +436,8 @@
     "check_test_imports.py": 800,
     "test_test_imports_checker.py": 850,
     "test_orchestrator_liveness.py": 2250,
-    "test_lane_baseline_snapshot.py": 1750
+    "test_lane_baseline_snapshot.py": 1750,
+    "test_impacted_tests.py": 1650
   },
   "scripts": {
     "test_local_runner.py": 16650,

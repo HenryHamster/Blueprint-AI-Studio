@@ -837,6 +837,62 @@ async def test_green_full_suite_gate_retires_every_open_sentinel_incident(
 
 
 @pytest.mark.asyncio
+async def test_green_rehearsal_also_retires_open_sentinel_incidents(
+    db_session, mocker
+):
+    """The sentinel asks BRANCH HEALTH, which a dispatch rehearsal answers.
+
+    ``green_rehearsal`` is the gate's honest verdict for a full matrix that
+    passed on a ``workflow_dispatch`` run: it proves the branch is not broken,
+    but its checkout shape differs from a promotion PR's so it does not predict
+    the promotion PR's verdict.  Those are two different questions, and this
+    producer asks the first one.
+
+    Retirement here must stay symmetric or the sentinel deadlocks: EVERY incident
+    it raises comes from a dispatch run in the first place (the gate dispatches
+    ci.yml on the integration branch), so refusing to let a dispatch run clear
+    what a dispatch run raised would strand the red incident forever.  Cutting a
+    promotion PR is the other question -- that one requires
+    ``promotion_ci_gate_proves_promotion``.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    for key in (
+        f"drift_sentinel:red:{project_id}",
+        f"drift_sentinel:unavailable:{project_id}",
+    ):
+        await _seed_legacy_sentinel_alert(db_session, project_id, key)
+    assert len(await _sentinel_alert_rows(db_session, project_id)) == 2
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "green_rehearsal",
+                "head_sha": "aa11bb22cc33",
+                "ci_event": "workflow_dispatch",
+                "full_matrix_passed": True,
+                "promotion_equivalent": False,
+            }
+        ),
+    )
+
+    assert (
+        await _check_full_suite_drift_sentinel(
+            version_id, session_factory=_shared_session_factory(db_session)
+        )
+        is False
+    ), "a passing full matrix is not a drift incident, whatever shape ran it"
+
+    open_rows = await _sentinel_alert_rows(db_session, project_id)
+    assert open_rows == [], (
+        "a rehearsal that passed the full matrix falsifies every drift claim, "
+        f"but these incidents are still open: {[r.dedupe_key for r in open_rows]}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_authoritative_red_retires_only_the_could_not_evaluate_incidents(
     db_session, mocker
 ):

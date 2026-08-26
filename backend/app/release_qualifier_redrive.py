@@ -1310,7 +1310,21 @@ async def _redrive_promotion_failed_qualification(
        landed fix flips a finding to ``stale`` in the first place.  Readiness
        also carries the in-flight ``promotion_ci_remediation`` deferral, so the
        re-drive waits while the harvested fix is still being worked.
-    2. The promotion-CI gate for the integration HEAD is not ``red``.
+    2. The promotion-CI gate for the integration HEAD is not ``red``.  NOT-RED,
+       never REQUIRE-GREEN, and that asymmetry is deliberate.  An ordinary
+       integration HEAD has no ``ci.yml`` run at all (ci.yml's ``pull_request``
+       trigger is ``branches: [main]``, so integration-branch PRs get zero
+       check-runs by design), and the run the gate CAN obtain for that HEAD is a
+       ``workflow_dispatch`` rehearsal, which does not share a checkout shape
+       with the ``pull_request`` run a promotion PR gets — different ref
+       (``refs/heads/<branch>`` vs a detached ``refs/pull/N/merge``), different
+       tree whenever the base has moved, different ref inventory.  The gate now
+       says so out loud: a dispatch-derived success is reported as
+       ``green_rehearsal`` with ``promotion_equivalent=False``, never as
+       ``green``.  So gate green was already treated here as WEAK evidence and
+       still is; what bounds this loop is the circuit breaker below, not the
+       gate.  A ``red`` still holds, because a full matrix that broke found
+       something real whichever shape produced it.
     3. The integration HEAD resolves at all (fail closed when GitHub is
        unavailable -- an unresolved HEAD cannot prove the fix landed).
     4. CANDIDATE IDENTITY.  For a genuine failure (``required_check_failed``,
@@ -1555,6 +1569,12 @@ async def _redrive_promotion_failed_qualification(
                     result_status=result_status,
                     promotion_failure_count=failure_count,
                     candidate_sha=candidate_sha[:12],
+                    # Record WHICH evidence this re-drive proceeded on.  Without
+                    # it, a re-drive that fired on a dispatch rehearsal and one
+                    # that fired on a real pull_request run are indistinguishable
+                    # afterwards — and they are not the same claim.
+                    gate_state=gate_state,
+                    gate_promotion_equivalent=bool(gate.get("promotion_equivalent")),
                 )
             except Exception:  # noqa: BLE001 -- provenance, never the verdict
                 logger.warning(
