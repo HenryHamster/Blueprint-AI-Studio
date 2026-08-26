@@ -1859,6 +1859,7 @@ async def _record_promotion_failure(
     detail: str | None = None,
     pr_url: str | None = None,
     conflict: bool = False,
+    candidate_sha: str | None = None,
     lock_released: bool,
 ) -> dict[str, Any]:
     """Record a failed promotion: keep the version open, set phase=stabilize.
@@ -1885,6 +1886,22 @@ async def _record_promotion_failure(
     self-contradictory terminal record.  When the re-locked row is no longer
     ``open`` this returns an ``already_promoted``-style result WITHOUT touching
     ``last_qualification``, exactly mirroring ``_record_promotion_success``.
+
+    Candidate identity is pinned HERE, not inherited on trust.  Its success twin
+    ``_record_promotion_success`` takes ``candidate_sha`` and writes it into the
+    record explicitly; this function used to take the key only from whatever the
+    caller happened to put in ``base_record``.  Every current caller does supply
+    it, so this is latent rather than live -- but the degenerate case is
+    strictly WORSE than an ordinary failure, which is why it is closed rather
+    than documented.  An empty ``candidate_sha`` on a ``promotion_failed``
+    record sends the sweep re-driver down its ``candidate_identity_unknown``
+    branch, and unlike the sibling ``candidate_unchanged`` branch that one has
+    no Alert: the version holds silently, forever, with the read surface
+    reporting nothing wrong.  Resolution order is the explicit argument, then
+    ``base_record``, then the candidate on the row's own prior record (the
+    ``promotion_pending``/qualification record for this same attempt).  When
+    none resolves, ``candidate_sha_unresolved`` is stamped so the hold has a
+    stated reason instead of being a blank.
     """
     locked = await _relock_version_for_promotion_write(
         session, version, lock_released=lock_released
@@ -1925,12 +1942,38 @@ async def _record_promotion_failure(
         _prev_count = int(
             version.last_qualification.get("promotion_failure_count") or 0
         )
+    _pinned_candidate = str(
+        candidate_sha
+        or base_record.get("candidate_sha")
+        or (
+            version.last_qualification.get("candidate_sha")
+            if isinstance(version.last_qualification, dict)
+            else None
+        )
+        or ""
+    ).strip()
     record = {
         **base_record,
         "status": "promotion_failed",
         "error": error,
         "promotion_failure_count": _prev_count + 1,
     }
+    if _pinned_candidate:
+        record["candidate_sha"] = _pinned_candidate
+    else:
+        # Do NOT invent one.  Say so, loudly and on the record: the re-driver
+        # branch this reaches has no cap and no Alert of its own.
+        record.pop("candidate_sha", None)
+        record["candidate_sha_unresolved"] = True
+        logger.error(
+            "[RELEASE_QUALIFIER] promote: recording a '%s' failure for v%d with "
+            "NO resolvable candidate_sha — the sweep re-driver will hold this "
+            "version at candidate_identity_unknown, which is uncapped and "
+            "unalerted; stamping candidate_sha_unresolved so the hold is not a "
+            "blank",
+            error,
+            version.version_number,
+        )
     if detail:
         record["detail"] = detail
     if pr_url:
@@ -2086,6 +2129,28 @@ async def _record_promotion_success(
         "promoted_sha": effective_sha,
         "pr_url": pr_url,
     }
+    # Clear the PREVIOUS attempt's failure state.  ``base_record`` on the
+    # reconcile paths is ``dict(last_qualification)`` of a ``promotion_failed``
+    # record (release_reconciliation._reconcile_if_promotion_failed_landed), so
+    # ``status`` was overwritten above while ``error`` / ``detail`` / ``conflict``
+    # rode through untouched: v40-v44 all promoted SUCCESSFULLY and all still
+    # read ``error: "required_check_failed"``.  That makes ``error`` unusable as
+    # a state signal -- an operator cannot tell a currently-failing version from
+    # one that failed once and shipped weeks ago.  Nothing reads ``error`` /
+    # ``detail`` / ``conflict`` except under ``status in {"promotion_failed",
+    # "error", "infra_failure"}``, so a promoted record has no consumer for
+    # them; the history is preserved verbatim under ``prior_promotion_failure``
+    # (alongside ``promotion_failure_count``, which already survives) rather
+    # than deleted.
+    _prior_failure = {
+        key: record[key]
+        for key in ("error", "detail", "conflict")
+        if record.get(key)
+    }
+    for key in ("error", "detail", "conflict"):
+        record.pop(key, None)
+    if _prior_failure:
+        record["prior_promotion_failure"] = _prior_failure
     if empty_diff:
         record["empty_diff"] = True
     if already_landed:
