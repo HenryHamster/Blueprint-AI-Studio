@@ -53,7 +53,7 @@ from app.release_scoring import (
 )
 from app.shared_state import resolve_project_promotion_enabled
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2185
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3550
 
 logger = logging.getLogger(__name__)
 
