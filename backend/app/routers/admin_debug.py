@@ -44,7 +44,9 @@ from app.autonomous_research import project_parallelism_cap
 from app.reaper import _heartbeat_stale_cutoff
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.payload_schemas import _MAX_PAYLOAD_BYTES
-from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+from app.strategic_cycle_admission import (
+    describe_automatic_strategic_cycles,
+)
 from app.task_evaluators import (
     ADVERSARIAL_GATE_VERDICT_KEY,
     ADVERSARIAL_PARSE_OK,
@@ -725,7 +727,8 @@ async def get_autonomy_debug(
     import app.shared_state as _shared_state_mod
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
-    automatic_strategic_enabled = automatic_strategic_cycles_enabled(project)
+    strategic_lane = describe_automatic_strategic_cycles(project)
+    automatic_strategic_enabled = strategic_lane.enabled
 
     now = _utcnow()
     blocking_guards = []
@@ -1216,8 +1219,14 @@ async def get_autonomy_debug(
     return {
         "spawn_blocked": len(blocking_guards) > 0,
         # Informational only: disabling automatic Strategic cycles must not make
-        # the tactical autonomy projection report itself blocked.
+        # the tactical autonomy projection report itself blocked.  The decoded
+        # record travels with the boolean so the operator read path (UI and
+        # ``blueprint tasks autonomy-debug``) can show WHY the lane is off, who
+        # turned it off, and whether it expires -- the one lever with no CLI
+        # write verb, and the one whose bare stored ``false`` used to be
+        # completely self-describing-free.
         "automatic_strategic_cycles_enabled": automatic_strategic_enabled,
+        "automatic_strategic_cycles_disable": strategic_lane.as_projection(),
         "blocking_guards": blocking_guards,
         "circuit_breaker": circuit_breaker_info,
         "rate_limit": {
@@ -1253,7 +1262,8 @@ async def get_strategic_debug(
     from app.shared_state import runtime_config as _runtime_config
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
-    automatic_strategic_enabled = automatic_strategic_cycles_enabled(project)
+    strategic_lane = describe_automatic_strategic_cycles(project)
+    automatic_strategic_enabled = strategic_lane.enabled
     vision = project.vision or {}
     now = _utcnow()
     blocking_guards: list[dict] = []
@@ -1264,8 +1274,10 @@ async def get_strategic_debug(
                 "guard": "automatic_strategic_cycles_disabled",
                 "reason": (
                     "Automatic Strategic cycles are disabled for this project; "
-                    "explicit/manual Strategic launches remain available"
+                    "explicit/manual Strategic launches remain available "
+                    f"({strategic_lane.describe()})"
                 ),
+                "disable": strategic_lane.as_projection(),
             }
         )
 
@@ -1474,6 +1486,7 @@ async def get_strategic_debug(
     return {
         "phase": phase,
         "automatic_strategic_cycles_enabled": automatic_strategic_enabled,
+        "automatic_strategic_cycles_disable": strategic_lane.as_projection(),
         "blocking_guards": blocking_guards,
         "payload_bloat_skip": payload_bloat_skip,
         "problem_model_trim": problem_model_trim,

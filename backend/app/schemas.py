@@ -1290,6 +1290,45 @@ class ResourceEnvelope(BaseModel):
         return v
 
 
+class StrategicLaneDisableWindow(BaseModel):
+    """Bounded, self-describing disable of the automatic Strategic lane.
+
+    A bare stored ``automatic_strategic_cycles_enabled: false`` is a disable
+    with no bound, no expiry, no reason and no actor -- nothing in the codebase
+    ever writes it back to ``true``, so a "bounded tactical canary" silently
+    became permanent and halted a project's whole strategic authoring engine
+    for ten days.  This shape makes the bound and the intent part of the value.
+
+    ``until`` is an ISO-8601 timestamp; once it lapses the lane re-enables
+    itself (``strategic_cycle_admission.describe_automatic_strategic_cycles``).
+    Omitting it is still legal and still means "no expiry", but that state is
+    now named by the build-config lint and by the suppression notice instead of
+    being invisible.
+    """
+
+    enabled: bool
+    until: str | None = None
+    reason: str | None = None
+    disabled_by: str | None = None
+    disabled_at: str | None = None
+
+    @field_validator("until")
+    @classmethod
+    def _validate_until(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        candidate = v.strip()
+        if not candidate:
+            return None
+        try:
+            datetime.fromisoformat(candidate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "until must be an ISO-8601 timestamp (e.g. 2026-09-01T00:00:00Z)"
+            ) from exc
+        return candidate
+
+
 class BuildConfig(BaseModel):
     """Schema for project build configuration."""
 
@@ -1306,7 +1345,13 @@ class BuildConfig(BaseModel):
     # by ``Project.autonomous_enabled`` and is intentionally unaffected when
     # this is False.  Explicit/manual Strategic surfaces also bypass this flag.
     # Default True preserves every existing project's historical behavior.
-    automatic_strategic_cycles_enabled: bool = True
+    #
+    # Two accepted forms.  The bare boolean is the legacy shape and still means
+    # exactly what it always meant (``False`` = disabled, unbounded, forever).
+    # The mapping form is the bounded, self-describing shape: it carries an
+    # expiry, a reason and an actor, so a deliberately quiet lane can be told
+    # apart from a wedged one.  See ``strategic_cycle_admission``.
+    automatic_strategic_cycles_enabled: bool | StrategicLaneDisableWindow = True
     # Per-project branch and PR metadata — must be preserved through
     # detect/save/patch round-trips so project-specific branch naming and
     # PR title prefixes survive schema validation.

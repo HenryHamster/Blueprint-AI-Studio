@@ -1126,7 +1126,7 @@
         "test_classify_orphan_resident_session_exempt_from_progress_staleness",
         "test_classify_resident_session_warm_idle_not_reaped"
       ],
-      "test_count": 495
+      "test_count": 499
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",

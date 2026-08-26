@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import func
 from sqlmodel import select
 
 import app.orchestrator as _orch
@@ -450,6 +451,166 @@ class TestStrategicLoopLiveness:
                 )
             )
         ).scalars().first()
+
+
+    async def test_quiet_lane_is_downgraded_not_dropped(self, db_session):
+        """A deliberately quiet portfolio must stay VISIBLE, just not paging.
+
+        The sweep excludes a disabled lane from the halt detector AND retires
+        any open halt WARNING on it. Correct on its own terms -- no cycle
+        receipt can be expected -- but until this signal existed it meant a
+        wedged project and a deliberately quiet one produced byte-identical
+        alert feeds. That silence is the defect: it hid a whole strategic
+        engine being off for ten days.
+        """
+        from app.alert_dispatch import (
+            _STRATEGIC_LANE_DISABLED_ALERT_TITLE,
+            strategic_lane_disabled_dedupe_key,
+        )
+        from app.models import AlertSeverity
+        from app.reaper_sweeps import (
+            _RESIDENT_LIVENESS_SUPPRESSION_KEY,
+            _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={
+                "automatic_strategic_cycles_enabled": {
+                    "enabled": False,
+                    "reason": "bounded tactical canary",
+                    "disabled_by": "operator-patch",
+                }
+            },
+            created_at=now - timedelta(days=3),
+            vision={_RESIDENT_LIVENESS_SUPPRESSION_KEY: 3},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        # The halt detector still reports zero: this is a downgrade, not a new
+        # paging condition, and it must not inflate the sweep's halt count.
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+
+        signal = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_LANE_DISABLED_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert signal.severity == AlertSeverity.INFO
+        assert signal.dedupe_key == strategic_lane_disabled_dedupe_key(project.id)
+        assert "bounded tactical canary" in signal.message
+        assert "operator-patch" in signal.message
+        assert "expires=never" in signal.message
+        assert not (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+            )
+        ).scalars().first()
+
+    async def test_quiet_lane_signal_is_deduped_across_sweeps(self, db_session):
+        """One row, no occurrence churn, however often the reaper sweeps.
+
+        A sibling investigation found 19 identical WARNINGs minted because
+        ``dedupe_key``/``occurrence_count`` went unused. This producer must not
+        repeat that: an unchanged description is a no-op write, so neither a new
+        row nor an ``occurrence_count`` bump happens on a quiet re-sweep.
+        """
+        from app.alert_dispatch import _STRATEGIC_LANE_DISABLED_ALERT_TITLE
+        from app.reaper_sweeps import (
+            _RESIDENT_LIVENESS_SUPPRESSION_KEY,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={"automatic_strategic_cycles_enabled": False},
+            created_at=now - timedelta(days=3),
+            vision={_RESIDENT_LIVENESS_SUPPRESSION_KEY: 3},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        for _ in range(5):
+            assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+
+        rows = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _STRATEGIC_LANE_DISABLED_ALERT_TITLE,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert (rows[0].occurrence_count or 1) == 1
+        assert "legacy-bare-boolean" in rows[0].message
+
+    async def test_quiet_lane_signal_retires_when_the_window_lapses(
+        self, db_session
+    ):
+        """Re-enabling the lane (or letting ``until`` pass) dismisses the row."""
+        from app.alert_dispatch import _STRATEGIC_LANE_DISABLED_ALERT_TITLE
+        from app.reaper_sweeps import (
+            _RESIDENT_LIVENESS_SUPPRESSION_KEY,
+            _sweep_strategic_cycle_starvation,
+        )
+
+        now = _utcnow()
+        until = now + timedelta(hours=6)
+        project = make_project(
+            autonomous_enabled=True,
+            build_config={
+                "automatic_strategic_cycles_enabled": {
+                    "enabled": False,
+                    "until": until.isoformat() + "Z",
+                    "reason": "six hour canary",
+                }
+            },
+            created_at=now - timedelta(days=3),
+            vision={_RESIDENT_LIVENESS_SUPPRESSION_KEY: 3},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        project_id = project.id
+
+        assert await _sweep_strategic_cycle_starvation(db_session, now) == 0
+        opened = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.title == _STRATEGIC_LANE_DISABLED_ALERT_TITLE,
+                )
+            )
+        ).scalars().one()
+        assert opened.dismissed_at is None
+
+        # The very same stored value, swept after the bound lapses: the lane is
+        # live again with no operator write at all, and the signal retires.
+        await _sweep_strategic_cycle_starvation(
+            db_session, until + timedelta(minutes=1)
+        )
+        await db_session.refresh(opened)
+        assert opened.dismissed_at is not None
+        assert (
+            await db_session.execute(
+                select(func.count())
+                .select_from(Alert)
+                .where(
+                    Alert.project_id == project_id,
+                    Alert.title == _STRATEGIC_LANE_DISABLED_ALERT_TITLE,
+                )
+            )
+        ).scalar_one() == 1
 
     async def test_successful_resident_recovery_suppresses_alert(
         self, db_session, monkeypatch

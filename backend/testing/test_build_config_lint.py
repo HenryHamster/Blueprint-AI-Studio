@@ -127,3 +127,104 @@ class TestBuildConfigLintWarnings:
     def test_non_dict_entries_are_skipped(self):
         bc = {"directories": ["not a dict", None, 42]}
         assert build_config_lint_warnings(bc) == []
+
+
+class TestStrategicLaneLintWarning:
+    """`automatic_strategic_cycles_enabled` off + `autonomous_enabled` true.
+
+    That combination is ALWAYS an operator-intent mismatch: the tactical loop
+    keeps spawning research (so every liveness surface stays green) while the
+    whole automatic Strategic authoring lane is off, and nothing in the codebase
+    ever writes the flag back to true.  Before this lint existed there was no
+    warning anywhere -- not in the lint, not in the logs, not in the alert feed.
+    """
+
+    _DISABLED = {"automatic_strategic_cycles_enabled": False}
+
+    def test_warns_when_autonomous_project_has_the_lane_off(self):
+        warnings = build_config_lint_warnings(
+            dict(self._DISABLED), autonomous_enabled=True
+        )
+        assert len(warnings) == 1
+        assert "automatic_strategic_cycles_enabled is disabled" in warnings[0]
+        assert "autonomous_enabled is true" in warnings[0]
+        assert "NO expiry" in warnings[0]
+
+    def test_warning_names_the_bound_reason_and_actor(self):
+        warnings = build_config_lint_warnings(
+            {
+                "automatic_strategic_cycles_enabled": {
+                    "enabled": False,
+                    "until": "2099-01-01T00:00:00Z",
+                    "reason": "bounded tactical canary",
+                    "disabled_by": "henry",
+                }
+            },
+            autonomous_enabled=True,
+        )
+        assert len(warnings) == 1
+        assert "expires 2099-01-01T00:00:00" in warnings[0]
+        assert "bounded tactical canary" in warnings[0]
+        assert "henry" in warnings[0]
+        assert "NO expiry" not in warnings[0]
+
+    def test_lapsed_window_is_not_a_mismatch(self):
+        assert (
+            build_config_lint_warnings(
+                {
+                    "automatic_strategic_cycles_enabled": {
+                        "enabled": False,
+                        "until": "2020-01-01T00:00:00Z",
+                    }
+                },
+                autonomous_enabled=True,
+            )
+            == []
+        )
+
+    def test_malformed_until_warns_that_the_disable_is_unbounded(self):
+        warnings = build_config_lint_warnings(
+            {
+                "automatic_strategic_cycles_enabled": {
+                    "enabled": False,
+                    "until": "next tuesday",
+                }
+            },
+            autonomous_enabled=True,
+        )
+        assert len(warnings) == 2
+        assert any("UNBOUNDED" in w and "next tuesday" in w for w in warnings)
+
+    def test_no_warning_when_the_lane_is_enabled(self):
+        assert (
+            build_config_lint_warnings(
+                {"automatic_strategic_cycles_enabled": True}, autonomous_enabled=True
+            )
+            == []
+        )
+        assert build_config_lint_warnings({"directories": []}, autonomous_enabled=True) == []
+
+    def test_no_warning_when_autonomy_is_off_or_unknown(self):
+        """A non-autonomous project turning the lane off is coherent intent."""
+        assert (
+            build_config_lint_warnings(dict(self._DISABLED), autonomous_enabled=False)
+            == []
+        )
+        assert (
+            build_config_lint_warnings(dict(self._DISABLED), autonomous_enabled=None)
+            == []
+        )
+        # The historical positional-only call site must stay a no-op here.
+        assert build_config_lint_warnings(dict(self._DISABLED)) == []
+
+    def test_lane_warning_is_appended_after_lint_cmd_warnings(self):
+        warnings = build_config_lint_warnings(
+            {
+                "automatic_strategic_cycles_enabled": False,
+                "directories": [{"path": "backend", "lint_cmd": "make lint"}],
+            },
+            autonomous_enabled=True,
+        )
+        assert len(warnings) == 2
+        assert "backend" in warnings[0]
+        assert "automatic_strategic_cycles_enabled is disabled" in warnings[1]

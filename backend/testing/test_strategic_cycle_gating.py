@@ -38,6 +38,10 @@ from app.models import (
     TaskStatus,
 )
 from app.release_models import ReleaseVersion
+from app.strategic_cycle import (
+    MAX_CONSECUTIVE_STALLS,
+    consecutive_stall_streak,
+)
 from app.strategic_cycle_gating import (
     compute_cycle_delta_signals,
     latest_cycle_watermark,
@@ -576,3 +580,219 @@ def test_must_run_reasons_fail_closed():
     )
     reasons = must_run_reasons(saturated, "completed", 0, {"purpose": "test"})
     assert "all_directions_saturated" in reasons
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consecutive-stall cutoff.
+#
+# A stalled cycle appends ``prior_cycle_failed`` to must_run, so the stall makes
+# the NEXT tick a must-run: the failure re-arms its own trigger and the lineage
+# mints a fresh doomed attempt every cadence tick, forever. These cover the
+# bound that stops it, and the intervention that releases the bound.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _add_stalled_cycle(
+    db_session,
+    project_id,
+    *,
+    started_at,
+    signature: str = "phase2:queued_never_dispatched",
+    reason: str = "phase2 task never left QUEUED",
+    outcome: str = "stalled_phase2",
+) -> StrategicCycle:
+    cycle = StrategicCycle(
+        id=uuid.uuid4().hex,
+        project_id=project_id,
+        outcome=outcome,
+        phase1_started_at=started_at,
+        cycle_metadata={"stall_signature": signature, "stall_reason": reason},
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+    return cycle
+
+
+@pytest.mark.asyncio
+async def test_consecutive_stall_streak_counts_same_cause(db_session):
+    project = _gate_project(name="Streak Counting")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base = _utcnow() - timedelta(hours=30)
+    for i in range(4):
+        await _add_stalled_cycle(
+            db_session, project.id, started_at=base + timedelta(hours=3 * i)
+        )
+
+    streak = await consecutive_stall_streak(db_session, project.id)
+    assert streak.count == 4
+    assert streak.signature == "phase2:queued_never_dispatched"
+    assert streak.exhausted is True
+
+    # The newest cycle can be excluded so a caller mid-mutation counts only
+    # the rows it is not itself writing.
+    newest = await _add_stalled_cycle(
+        db_session, project.id, started_at=_utcnow()
+    )
+    excluded = await consecutive_stall_streak(
+        db_session, project.id, exclude_cycle_id=newest.id
+    )
+    assert excluded.count == 4
+
+
+@pytest.mark.asyncio
+async def test_stall_streak_resets_on_any_non_stall_outcome(db_session):
+    """A completed cycle RESETS the streak — the cutoff is self-healing."""
+    project = _gate_project(name="Streak Reset")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base = _utcnow() - timedelta(hours=30)
+    for i in range(3):
+        await _add_stalled_cycle(
+            db_session, project.id, started_at=base + timedelta(hours=i)
+        )
+    # One cycle got through afterwards.
+    await _add_completed_cycle(
+        db_session, project.id, started_at=base + timedelta(hours=5)
+    )
+
+    streak = await consecutive_stall_streak(db_session, project.id)
+    assert streak.count == 0
+    assert streak.exhausted is False
+
+
+@pytest.mark.asyncio
+async def test_stall_streak_breaks_on_a_different_cause(db_session):
+    """Only the SAME underlying cause accumulates toward the cutoff."""
+    project = _gate_project(name="Streak Cause Change")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base = _utcnow() - timedelta(hours=30)
+    await _add_stalled_cycle(
+        db_session,
+        project.id,
+        started_at=base,
+        signature="phase2:agent_heartbeat_lost",
+    )
+    await _add_stalled_cycle(
+        db_session,
+        project.id,
+        started_at=base + timedelta(hours=3),
+        signature="phase2:queued_never_dispatched",
+    )
+    streak = await consecutive_stall_streak(db_session, project.id)
+    assert streak.count == 1
+    assert streak.signature == "phase2:queued_never_dispatched"
+
+
+@pytest.mark.asyncio
+async def test_stall_cutoff_stops_reminting_after_max_consecutive_stalls(db_session):
+    """The loop-breaker: past the bound the gate SKIPS despite must-run.
+
+    Without the cutoff this exact state runs a cycle every tick forever,
+    because ``prior_cycle_failed`` is a must-run reason and a stalled cycle is
+    what puts it there.
+    """
+    project = _gate_project(name="Stall Cutoff")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base = _utcnow() - timedelta(hours=30)
+    for i in range(MAX_CONSECUTIVE_STALLS):
+        await _add_stalled_cycle(
+            db_session, project.id, started_at=base + timedelta(hours=3 * i)
+        )
+
+    decision = await should_skip_strategic_cycle(db_session, project)
+    assert decision.skip is True, decision.reason
+    # The reason names the cause and the count — not just "stalled".
+    assert decision.reason.startswith("stall_cutoff:")
+    assert str(MAX_CONSECUTIVE_STALLS) in decision.reason
+    assert "phase2:queued_never_dispatched" in decision.reason
+    assert "never left QUEUED" in decision.reason
+    # The must-run reason that drives the loop is still REPORTED (so the state
+    # stays visible) — it just no longer forces a doomed cycle.
+    assert "prior_cycle_failed" in decision.must_run_reasons
+
+
+@pytest.mark.asyncio
+async def test_stall_cutoff_not_engaged_below_the_bound(db_session):
+    """Below the bound a stall still retries — transients must survive."""
+    project = _gate_project(name="Stall Under Bound")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base = _utcnow() - timedelta(hours=10)
+    for i in range(MAX_CONSECUTIVE_STALLS - 1):
+        await _add_stalled_cycle(
+            db_session, project.id, started_at=base + timedelta(hours=3 * i)
+        )
+
+    decision = await should_skip_strategic_cycle(db_session, project)
+    assert decision.skip is False
+    assert decision.reason == "must_run"
+    assert "prior_cycle_failed" in decision.must_run_reasons
+
+
+@pytest.mark.asyncio
+async def test_stall_cutoff_released_by_open_operator_message(db_session):
+    """Fresh human intent is exactly the intervention the cutoff waits for."""
+    project = _gate_project(name="Stall Cutoff Release")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base = _utcnow() - timedelta(hours=30)
+    for i in range(MAX_CONSECUTIVE_STALLS + 2):
+        await _add_stalled_cycle(
+            db_session, project.id, started_at=base + timedelta(hours=3 * i)
+        )
+
+    # Held first...
+    held = await should_skip_strategic_cycle(db_session, project)
+    assert held.skip is True
+
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.NOTE,
+            content="I rebound a runner, try again",
+            status="open",
+            created_at=_utcnow(),
+        )
+    )
+    await db_session.commit()
+
+    released = await should_skip_strategic_cycle(db_session, project)
+    assert released.skip is False
+    assert "open_operator_message" in released.must_run_reasons
+
+
+@pytest.mark.asyncio
+async def test_stall_cutoff_released_by_explicit_force(db_session):
+    """An explicit operator force still runs — the cutoff is not a lockout."""
+    project = _gate_project(name="Stall Cutoff Force")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base = _utcnow() - timedelta(hours=30)
+    for i in range(MAX_CONSECUTIVE_STALLS + 1):
+        await _add_stalled_cycle(
+            db_session, project.id, started_at=base + timedelta(hours=3 * i)
+        )
+
+    decision = await should_skip_strategic_cycle(
+        db_session, project, force_strategic=True
+    )
+    assert decision.skip is False
+    assert decision.reason == "forced_strategic"

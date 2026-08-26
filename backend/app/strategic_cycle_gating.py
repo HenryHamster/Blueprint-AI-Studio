@@ -76,6 +76,20 @@ _FAILED_CYCLE_OUTCOMES = frozenset(
     }
 )
 
+# Must-run reasons that represent FRESH intent arriving from outside the
+# pipeline, rather than a persistent structural state the pipeline re-observes
+# every tick. ONLY these release the consecutive-stall cutoff below: a human
+# saying something new is exactly the intervention the cutoff is waiting for,
+# whereas "the prior cycle failed" or "no active directions" will still be true
+# on the next tick and would re-open the loop the cutoff exists to close.
+_INTERVENTION_MUST_RUN_REASONS = frozenset(
+    {
+        "open_operator_message",
+        "pending_strategic_refresh",
+        "pending_strategic_review_retry",
+    }
+)
+
 # Bound on the vision skip log so a repeatedly-quiet project cannot grow vision
 # without bound. The skip COUNTER (_strategic_no_delta_skip_count) is unbounded
 # by design — it is a cheap integer and exists to make skips countable.
@@ -346,6 +360,37 @@ async def should_skip_strategic_cycle(
     must_run = must_run_reasons(
         project, last_outcome, signals.open_user_messages, project.vision or {}
     )
+    # ── Consecutive-stall cutoff ────────────────────────────────────────────
+    #
+    # A stalled cycle appends ``prior_cycle_failed`` to must_run, so a stall
+    # GUARANTEES the next tick runs: the failure re-arms its own trigger and
+    # the lineage mints a fresh doomed attempt every cadence tick forever
+    # (19 consecutive on NeurIPS, 2026-08-16..26, each dying identically).
+    # Retrying only helps a TRANSIENT cause; once the same cause has taken
+    # MAX_CONSECUTIVE_STALLS attempts it is structural, and the honest move is
+    # to stop burning cycles and hold for a human. The streak resets itself the
+    # moment any cycle reaches a non-stall outcome, so this needs no manual
+    # clear — and genuine new operator intent overrides it immediately.
+    stall_streak = await strategic_cycle_mod.consecutive_stall_streak(
+        session, project.id
+    )
+    if stall_streak.exhausted and not (
+        set(must_run) & _INTERVENTION_MUST_RUN_REASONS
+    ):
+        return CycleGateDecision(
+            skip=True,
+            watermark=watermark,
+            signals=signals,
+            must_run_reasons=must_run,
+            reason=(
+                f"{strategic_cycle_mod.STALL_CUTOFF_REASON_PREFIX} "
+                f"{stall_streak.count} consecutive strategic "
+                f"cycles stalled with the same cause "
+                f"[{stall_streak.signature}] — automatic re-minting suppressed "
+                f"pending operator intervention"
+                + (f"; {stall_streak.reason}" if stall_streak.reason else "")
+            ),
+        )
     if must_run:
         return CycleGateDecision(
             skip=False,
@@ -391,6 +436,9 @@ async def record_no_delta_skip(
         "skipped_at": _utcnow().isoformat(),
         "watermark": decision.watermark.isoformat() if decision.watermark else None,
         "signals": decision.signals.as_dict(),
+        # Not every skip is a quiet project: the consecutive-stall cutoff skips
+        # too, and an audit row that cannot tell the two apart is misleading.
+        "reason": decision.reason,
     }
 
     def _mutate(vision: dict) -> None:
