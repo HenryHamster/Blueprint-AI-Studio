@@ -441,7 +441,8 @@
     "test_lane_baseline_snapshot.py": 1750,
     "test_impacted_tests.py": 1750,
     "test_discovery_review_packet_budget.py": 2450,
-    "test_test_durations_freshness.py": 1950
+    "test_test_durations_freshness.py": 1950,
+    "test_workday_resident_invariants.py": 1900
   },
   "scripts": {
     "test_local_runner.py": 16650,
