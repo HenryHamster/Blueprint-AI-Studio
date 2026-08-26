@@ -3262,6 +3262,102 @@ def test_tasks_failures_empty(monkeypatch, capsys):
     assert "No failed tasks." in out
 
 
+def _failures_api(tasks):
+    """Build a fake api() that serves ``tasks`` for the FAILED listing."""
+    def fake_api(method, path, body=None, timeout=30):
+        return {"tasks": tasks, "total": len(tasks)}
+
+    return fake_api
+
+
+def _run_failures_json(monkeypatch, capsys, tasks):
+    fake_api = _failures_api(tasks)
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    assert blueprint.main(["--json", "tasks", "failures"]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_tasks_failures_buckets_on_persisted_failure_category(monkeypatch, capsys):
+    """context['failure_category'] is the canonical persisted class and must bucket.
+
+    Regression pin: this grouping used to read ONLY context['failure_class'] --
+    the sparse authoritative-verdict cache that only the reaper writes -- so a
+    task the backend had properly classified via persist_failure_category()
+    landed in UNKNOWN. A classified failure reported as UNKNOWN is state without
+    reason, which is the whole point of this view.
+    """
+    parsed = _run_failures_json(monkeypatch, capsys, [
+        {"id": "fc-aaa0-0000-0000-000000000000", "task_type": "create",
+         "title": "timed out task", "status": "FAILED", "attempt_count": 1,
+         "latest_status_message": "agent stopped reporting",
+         "error_logs": "",
+         "context": {"failure_category": "AGENT_TIMEOUT"}},
+    ])
+    assert "AGENT_TIMEOUT" in parsed["buckets"], parsed["buckets"]
+    assert "UNKNOWN" not in parsed["buckets"]
+
+
+def test_tasks_failures_falls_back_to_top_level_failure_class(monkeypatch, capsys):
+    """The server-derived top-level failure_class is the last-resort reason."""
+    parsed = _run_failures_json(monkeypatch, capsys, [
+        {"id": "fc-bbb0-0000-0000-000000000000", "task_type": "fix",
+         "title": "provision died", "status": "FAILED", "attempt_count": 1,
+         "latest_status_message": "instance never came up",
+         "error_logs": "", "context": {},
+         "failure_class": "PROVISION_FAILURE"},
+    ])
+    assert "PROVISION_FAILURE" in parsed["buckets"], parsed["buckets"]
+
+
+def test_tasks_failures_emits_the_persisted_reason_fields(monkeypatch, capsys):
+    """Each emitted row carries the reason the terminalizing path recorded."""
+    parsed = _run_failures_json(monkeypatch, capsys, [
+        {"id": "fc-ccc0-0000-0000-000000000000", "task_type": "review",
+         "title": "superseded review", "status": "FAILED", "attempt_count": 1,
+         "latest_status_message": "agent stopped reporting",
+         "error_logs": "",
+         "context": {"failure_category": "AGENT_TIMEOUT",
+                     "failure_detail": "superseded_by_review_pipeline"}},
+    ])
+    entry = parsed["buckets"]["AGENT_TIMEOUT"][0]
+    assert entry["failure_class"] == "AGENT_TIMEOUT"
+    assert entry["failure_detail"] == "superseded_by_review_pipeline"
+
+
+def test_tasks_failures_human_render_shows_why(monkeypatch, capsys):
+    """The human render prints the persisted reason, not only the bucket header."""
+    tasks = [
+        {"id": "fc-ddd0-0000-0000-000000000000", "task_type": "review",
+         "title": "superseded review", "status": "FAILED", "attempt_count": 1,
+         "latest_status_message": "agent stopped reporting",
+         "error_logs": "",
+         "context": {"failure_category": "AGENT_TIMEOUT",
+                     "failure_detail": "superseded_by_review_pipeline"}},
+    ]
+    fake_api = _failures_api(tasks)
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    assert blueprint.main(["tasks", "failures"]) == 0
+    out = capsys.readouterr().out
+    assert "WHY: AGENT_TIMEOUT / superseded_by_review_pipeline" in out
+
+
+def test_tasks_failures_classless_row_reports_its_detail_not_unknown(
+    monkeypatch, capsys
+):
+    """A row with no class but a failure_detail is bucketed by that detail."""
+    parsed = _run_failures_json(monkeypatch, capsys, [
+        {"id": "fc-eee0-0000-0000-000000000000", "task_type": "create",
+         "title": "shelved", "status": "FAILED", "attempt_count": 0,
+         "latest_status_message": "stopped", "error_logs": "",
+         "context": {"failure_detail": "review_cap_exhausted"}},
+    ])
+    assert "DETAIL:review_cap_exhausted" in parsed["buckets"], parsed["buckets"]
+
+
 # ── help text and output formatting polish ────────────────────────────────────
 
 def test_tasks_help_has_description():

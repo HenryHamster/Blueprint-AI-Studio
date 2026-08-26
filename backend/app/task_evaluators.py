@@ -469,7 +469,33 @@ def record_failed_gate(task: Task, verdict: EvaluationVerdict) -> None:
     here has no lifecycle path back out and would hang forever (and pin its
     parent). FAILED is the honest terminal outcome for an artifact that never
     cleared its gate.
+
+    TERMINAL REASON (why the stamp below is not optional)
+    ----------------------------------------------------
+    This is the widest terminalizing helper in the backend — every forward
+    evaluation gate (audit responsiveness, perf, walkthrough E2E,
+    compute-experiment criteria, memo parse, knowledge documents, research
+    output) reaches FAILED through here. Until this stamp existed it recorded
+    the verdict only under the bespoke ``evaluation_gate`` key, which the
+    ground-truth reader ``platform_kill_metrics`` deliberately does not consult
+    (it reads ``failure_category`` / ``failure_class`` / ``failure_detail`` plus
+    a narrow message allowlist). Every one of those rows therefore landed in
+    ``unclassified``: a terminal state carrying no machine-readable reason,
+    exactly what the "surface reasons, not just states" rule forbids.
+
+    ``CODE_ERROR`` is not a downgrade of information — it is the class
+    ``classify_failure`` already derives for these rows from the status message,
+    so persisting it changes no existing consumer's verdict. It only stops the
+    ground-truth reader from having to guess. The gate identity stays fully
+    addressable through ``failure_detail`` and the untouched ``evaluation_gate``
+    record.
     """
+    from app.failure_classification import (
+        CODE_ERROR,
+        EVALUATION_GATE_FAILED_DETAIL,
+        persist_failure_category,
+    )
+
     task.status = TaskStatus.FAILED
     task.latest_status_message = (
         f"Evaluation gate ({verdict.strategy}) failed: {verdict.reason}"
@@ -480,7 +506,9 @@ def record_failed_gate(task: Task, verdict: EvaluationVerdict) -> None:
         "passed": False,
         "reason": verdict.reason,
     }
+    context["failure_detail"] = EVALUATION_GATE_FAILED_DETAIL
     task.context = context
+    persist_failure_category(task, CODE_ERROR)
 
 
 def _task_type_of(task: Task) -> str:

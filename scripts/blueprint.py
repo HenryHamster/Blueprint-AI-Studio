@@ -1228,6 +1228,37 @@ def _render_task_tree(data: dict) -> None:
         print(f"    [{icon}] {cid}  merged={str(merged):<5}  pr={pr:<4}  {title}")
 
 
+def _resolved_failure_class(t: dict) -> str:
+    """Return the persisted failure class for a task dict, most canonical first.
+
+    Three fields carry a failure class on the admin task projection and they are
+    NOT interchangeable:
+
+    * ``context['failure_category']`` -- the canonical one. Every terminal-FAILED
+      code path is required to stamp it via
+      ``failure_classification.persist_failure_category``, so this is the field
+      that is actually populated on the estate.
+    * ``context['failure_class']`` -- the authoritative-verdict cache written by
+      ``persist_authoritative_verdict``. Only the reaper writes it, so it is
+      present on a small minority of rows.
+    * top-level ``failure_class`` -- the server-side ``classify_failure(task)``
+      projection, derived from log text at read time. A useful last resort, but
+      the endpoint only computes it for FAILED/CANCELLED rows that have a status
+      message.
+
+    Reading only ``context['failure_class']`` therefore reports nothing for most
+    genuinely classified failures -- state without reason, which is the exact
+    thing the operator surfaces are supposed to stop doing.
+    """
+    ctx = t.get("context") or {}
+    return (
+        ctx.get("failure_category")
+        or ctx.get("failure_class")
+        or t.get("failure_class")
+        or ""
+    )
+
+
 def _tasks_failures(args: argparse.Namespace) -> None:
     """Fetch FAILED tasks, group by root cause, and emit triage-ready output."""
     pid = get_project_id(getattr(args, "project_id", None))
@@ -1252,7 +1283,8 @@ def _tasks_failures(args: argparse.Namespace) -> None:
         msg = t.get("latest_status_message") or ""
         error = t.get("error_logs") or ""
         ctx = t.get("context") or {}
-        fc = ctx.get("failure_class", "")
+        fc = _resolved_failure_class(t)
+        detail = ctx.get("failure_detail") or ""
 
         cause = "UNKNOWN"
         if "API usage exhausted" in error or "API usage exhausted" in msg:
@@ -1293,6 +1325,11 @@ def _tasks_failures(args: argparse.Namespace) -> None:
             cause = "AGENT_TIMEOUT"
         elif fc:
             cause = fc
+        elif detail:
+            # No class at all, but the terminalizing path left a finer-grained
+            # marker. Surfacing it beats reporting UNKNOWN: the operator gets a
+            # name to grep for instead of a shrug.
+            cause = f"DETAIL:{detail}"
 
         buckets.setdefault(cause, []).append(t)
 
@@ -1308,6 +1345,13 @@ def _tasks_failures(args: argparse.Namespace) -> None:
                     "parent_task_id": t.get("parent_task_id"),
                     "latest_status_message": t.get("latest_status_message"),
                     "error_logs": t.get("error_logs"),
+                    # The persisted reason itself, not just the derived bucket:
+                    # a bucket says which pile the row landed in, these say what
+                    # the terminalizing path actually recorded on the row.
+                    "failure_class": _resolved_failure_class(t) or None,
+                    "failure_detail": (t.get("context") or {}).get(
+                        "failure_detail"
+                    ),
                 }
                 for t in group
             ]
@@ -1339,6 +1383,12 @@ def _render_failures(data: dict) -> None:
             msg = _safe_trunc(t.get("latest_status_message") or "", 100)
             error = _safe_trunc((t.get("error_logs") or "").split("\n")[0], 120)
             print(f"  {tid}  [{ttype:8}]  att={attempts}  parent={parent or '-':>8}  {title}")
+            reason_bits = [
+                part for part in (t.get("failure_class"), t.get("failure_detail"))
+                if part
+            ]
+            if reason_bits:
+                print(f"    WHY: {' / '.join(reason_bits)}")
             if error:
                 print(f"    ERR: {error}")
             elif msg:
@@ -1431,10 +1481,12 @@ def _render_task_detail(t: dict) -> None:
     if msg:
         print(f"  Message:  {msg[:200]}")
     ctx = t.get("context") or {}
-    fc = (ctx.get("failure_category") or ctx.get("failure_class")
-          or t.get("failure_class"))
+    fc = _resolved_failure_class(t)
     if fc and t.get("status") in ("FAILED", "CANCELLED"):
         print(f"  FailClass: {fc}")
+    fdetail = ctx.get("failure_detail")
+    if fdetail and t.get("status") in ("FAILED", "CANCELLED"):
+        print(f"  FailDetail: {fdetail}")
     # Why a task is not moving is the first thing an operator asks, and it was
     # the one thing this view never answered -- the fields were in the JSON and
     # absent from the human render, so `tasks show` reported the state and

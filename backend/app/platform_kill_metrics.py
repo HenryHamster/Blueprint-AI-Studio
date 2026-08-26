@@ -104,6 +104,7 @@ from app.failure_classification import (
     ADMIN_CANCEL,
     AGENT_STALLED,
     AGENT_TIMEOUT,
+    ALL_CHILDREN_SHELVED_DETAIL,
     APPROVED_CAP_PR_CLOSED,
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
@@ -112,13 +113,21 @@ from app.failure_classification import (
     COMPUTE_PREFLIGHT_SMOKE_FAILED,
     COMPUTE_UNMEASURED_CRITERION,
     DEAD_AUTH,
+    DEPENDENCY_TASK_FAILED_DETAIL,
+    EVALUATION_GATE_FAILED_DETAIL,
     EXTERNAL_API,
     MALFORMED_TASK_PAYLOAD,
     MIGRATION_ERROR,
     NO_PROGRESS_TIMEOUT,
+    PARENT_CI_BACKSTOP_CASCADE_DETAIL,
+    PARENT_DEPENDENCY_FAILED_DETAIL,
+    PARENT_EVALUATION_TIMEOUT_CASCADE_DETAIL,
     PARK_WAKE_STRANDED,
     PARK_WAKE_TIMEOUT,
     PR_BRANCH_DELETED,
+    PR_EXECUTION_FENCE_DENIED_DETAIL,
+    PREREQUISITE_NO_PROVIDER_DETAIL,
+    PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL,
     PROVISION_FAILURE,
     RATE_LIMIT,
     REASSIGNED,
@@ -303,6 +312,80 @@ _DETAIL_VERDICTS: Dict[str, tuple[str, str]] = {
         NOT_A_DEATH,
         "stopped by the churn guardrail, not by a failure of the work",
     ),
+    # A PR-less approval hold that nobody answered. The row already RECORDED
+    # this reason (recovery_evaluating_prless_hold stamps it as failure_detail);
+    # it was simply never registered here, so a fully-explained terminal row was
+    # reported as "we do not know" — a false unknown, which is worse than an
+    # honest one because it hides in the same bucket.
+    #
+    # NOT_A_DEATH rather than PLATFORM_KILL is taken from the codebase's own
+    # existing ruling on this exact key: ``direction_outcomes`` excludes it from
+    # direction health because it is *operator latency*, not a failure of the
+    # work or of the platform. Note this deliberately differs from the sibling
+    # ``approval_timeout_preserved_for_handmerge`` above, which is a kill because
+    # there the GATE itself never resolved rather than a human never answering.
+    "approval_timeout_hold_expired": (
+        NOT_A_DEATH,
+        "a PR-less approval hold expired without an operator answering it; the "
+        "change was never rejected and the work was never run",
+    ),
+    # ── terminal paths that used to record no reason at all ──
+    #
+    # Every key below is imported from ``failure_classification`` rather than
+    # retyped, so a writer and this registry cannot drift apart, and
+    # ``ALL_TERMINAL_REASON_DETAILS`` gives the suite something total to assert
+    # over. See the module note on ``_TERMINAL_MESSAGE_MARKERS``: three of these
+    # replace a literal-substring match on a log sentence with a durable field,
+    # and their verdicts reproduce the marker's verdict EXACTLY so the recorded
+    # evidence improves without the measured number moving.
+    EVALUATION_GATE_FAILED_DETAIL: (
+        WORK_OUTCOME,
+        "the deliverable did not clear its own forward evaluation gate; which "
+        "gate and why is recorded under context['evaluation_gate']",
+    ),
+    PR_EXECUTION_FENCE_DENIED_DETAIL: (
+        NOT_A_DEATH,
+        "the PR execution fence refused this row's claim — another task "
+        "canonically owns the PR, or the assigned target no longer exists; the "
+        "winning claimant is named in context['pr_execution_fence']['reason']",
+    ),
+    DEPENDENCY_TASK_FAILED_DETAIL: (
+        WORK_OUTCOME,
+        "the prerequisite this task declared failed, so the dependent could "
+        "never run — a dependency-ordering outcome. The prerequisite's own row "
+        "carries whatever killed IT; attributing it here too would multiply one "
+        "defect into a whole cascade",
+    ),
+    PARENT_DEPENDENCY_FAILED_DETAIL: (
+        WORK_OUTCOME,
+        "swept up in a dependency cascade: this row's parent was cancelled "
+        "because ITS prerequisite failed",
+    ),
+    PARENT_EVALUATION_TIMEOUT_CASCADE_DETAIL: (
+        PLATFORM_KILL,
+        "cancelled because an EVALUATING parent was reaped after waiting out "
+        "its evaluation window — runnable work ended by the parent's clock",
+    ),
+    PARENT_CI_BACKSTOP_CASCADE_DETAIL: (
+        PLATFORM_KILL,
+        "cancelled because the parent's CI-wait backstop fired — CI never "
+        "reported, so a gate deadlock took the children down with it",
+    ),
+    ALL_CHILDREN_SHELVED_DETAIL: (
+        NOT_A_DEATH,
+        "every subtask was deliberately shelved, superseded or administratively "
+        "cancelled, so the parent had nothing left to roll up",
+    ),
+    PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL: (
+        WORK_OUTCOME,
+        "the declared prerequisite was structurally unresolvable, so the work "
+        "was escalated to the parent instead of blocked",
+    ),
+    PREREQUISITE_NO_PROVIDER_DETAIL: (
+        WORK_OUTCOME,
+        "the declared prerequisite had no spawned, deferred or in-flight "
+        "provider this cycle, so the work was escalated to the parent",
+    ),
 }
 
 
@@ -319,6 +402,15 @@ _DETAIL_VERDICTS: Dict[str, tuple[str, str]] = {
 # ``unclassified`` — which is the correct answer, not a failure of the classifier.
 # Widening this list to "reduce unclassified" would be exactly the vacuous-guard
 # mistake this module exists to avoid.
+#
+# THIS LIST IS NOW A BACK-COMPAT TAIL, NOT THE PRIMARY EVIDENCE. The three
+# orchestration paths behind the first, second and fourth entries now stamp a
+# durable ``failure_detail`` (see the terminal-reason detail keys in
+# ``failure_classification``), which is read at precedence 1 and produces the
+# SAME verdict each marker produces here. The markers are retained because rows
+# terminalized before that change carry only the prose, and deleting the marker
+# would silently reclassify live history. Do not add new entries: a new
+# terminalizing path must stamp a field, not hope its log sentence survives.
 
 _TERMINAL_MESSAGE_MARKERS: tuple[tuple[str, str, str], ...] = (
     (

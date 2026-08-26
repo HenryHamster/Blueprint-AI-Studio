@@ -51,6 +51,14 @@ from app.time_utils import _utcnow, clear_retry_after
 # to avoid importing the heavy classification module into this leaf helper).
 BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 
+# Terminal-reason detail for the escalation branch of ``enter_blocked_state``
+# (mirrors app.failure_classification.PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_
+# DETAIL, duplicated for the same reason as the class above). The mirror is
+# pinned against the canonical constant by
+# ``test_terminal_reason_stamping.test_task_blocked_detail_mirror_matches``, so
+# it cannot drift out of the verdict registry unnoticed.
+PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL = "structurally_unresolvable"
+
 # JSONB key under Task.context that holds the structured blocker metadata.
 BLOCKER_CONTEXT_KEY = "blocker"
 PUBLICATION_GATE_RECEIPT_KEY = "publication_gate_receipt"
@@ -896,6 +904,15 @@ def enter_blocked_state(
         ctx = dict(task.context or {})
         ctx[BLOCKER_CONTEXT_KEY] = meta
         ctx["precondition_escalated_to_parent"] = True
+        # TERMINAL REASON. This branch is the one that actually TERMINALIZES the
+        # task (CANCELLED, returned here), yet it used to skip the
+        # ``failure_category`` / ``failure_class`` writes that the merely-BLOCKED
+        # branch eleven lines below performs — the non-terminal path explained
+        # itself and the terminal path did not. Every row escalated this way was
+        # left with no machine-readable reason at all.
+        ctx["failure_category"] = failure_class
+        ctx["failure_class"] = failure_class
+        ctx["failure_detail"] = PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL
         task.context = ctx
         task.status = TaskStatus.CANCELLED
         task.latest_status_message = meta["escalation_detail"]
