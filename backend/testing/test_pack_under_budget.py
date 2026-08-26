@@ -2975,6 +2975,31 @@ def test_compact_version_phase_passes_failure_marker_through():
     assert out_floor.get("promotion_target") == "main"
 
 
+def test_compact_version_phase_keeps_the_goal_omission_streak():
+    """The re-ask's own history must survive payload compaction.
+
+    ``goal_needed`` alone is an identical request every cycle;
+    ``goal_omission_cycles`` is what lets the strategist see that this exact
+    output was asked for and not delivered N times. Compaction dropping the
+    streak would restore the first-time-ask illusion under exactly the budget
+    pressure that long-running versions make likely.
+    """
+    from app.strategic_payload_compaction import _compact_version_phase
+
+    block = {
+        "version_number": 7,
+        "phase": "build",
+        "goal_needed": True,
+        "goal_omission_cycles": 4,
+    }
+
+    assert _compact_version_phase(block).get("goal_omission_cycles") == 4
+    assert _compact_version_phase(block, floor=True).get("goal_omission_cycles") == 4, (
+        "The floor path is the one that runs under budget pressure; dropping "
+        "the streak there is where the signal would actually be lost."
+    )
+
+
 # ---------------------------------------------------------------------------
 # lifecycle_bound_problem_model — through apply_agent_update (write-path proof)
 #

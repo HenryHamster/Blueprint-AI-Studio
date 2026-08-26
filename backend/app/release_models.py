@@ -119,6 +119,40 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(255), nullable=True),
     )
 
+    # ----- Goal-authoring compliance ledger -----
+    # ``goal`` opens NULL by design: ``open_version`` leaves it unset and the
+    # strategic agent is asked to author it via the ``new_version_goal`` output
+    # field (``version_phase.goal_needed`` is emitted while ``goal is None``).
+    # That ask used to have no owner — when the agent simply omitted the field,
+    # ``_apply_new_version_goal`` returned on its first guard and nothing
+    # recorded that a required output had been requested and had not arrived.
+    # Six consecutive versions shipped with a NULL goal and no signal anywhere.
+    #
+    # These two columns give the ask an owner. They are a compliance ledger, not
+    # a gate: a missing goal still degrades gracefully everywhere it is read
+    # (see ``release_scoring.evaluate_goal_coverage_drift``, which returns
+    # ``not_applicable``). Same durable-anchor pattern as
+    # ``build_stall_alerted_at`` / ``calcification_alerted_blocker`` below.
+
+    # Consecutive COMPLETED strategic cycles in which the goal was requested
+    # (open version, ``goal is None``) and the agent's output did not carry a
+    # usable ``new_version_goal``. Reset to 0 the moment a goal is authored.
+    goal_omission_cycles: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
+    # Dedup anchor for the counter above: the strategic cycle id (or task id for
+    # legacy cycles without one) that last incremented it. A single cycle can
+    # reach the apply path more than once — ``set_problem_model`` applies the
+    # field inline AND stows it in ``task.context`` for the completion handler —
+    # so without this anchor one omitted output would count two or three times
+    # and fire the escalation early.
+    goal_omission_last_cycle: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
     opened_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
