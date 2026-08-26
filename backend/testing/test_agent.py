@@ -33,6 +33,7 @@ from app.models import (
     ProjectStatus,
     ReleaseDeployArtifact,
     ReleaseVersion,
+    VersionAcceptanceCriterion,
     SourceKind,
     Task,
     TaskHistory,
@@ -22961,6 +22962,20 @@ async def test_legacy_qualifier_smoketest_artifact_is_stored_but_inert(
     await db_session.commit()
     await db_session.refresh(project)
     version = await _rv.open_version(db_session, project.id, version_number=1)
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key="c-test-operator-authorship",
+            text="test fixture declares candidate authorship budget",
+            created_by="test",
+            evidence_contract={
+                "type": "operator_authored_commits",
+                "predicate": {"max_count": 0},
+            },
+            evidence_contract_updated_by="test",
+        )
+    )
     await db_session.commit()
     await db_session.refresh(version)
 

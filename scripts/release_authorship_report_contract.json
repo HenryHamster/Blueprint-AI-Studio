@@ -1,0 +1,108 @@
+{
+  "contract_sha256": "87bd0966aa301875988e5b11db276412bbc1f88f168e28e108dcfcedcba400ae",
+  "instrument": "scripts/release_authorship_report.py",
+  "releases": [
+    {
+      "base_sha": "0830ebb9e56fdeba7f16c2cacef2ff8816bbfdf2",
+      "commit_sha": "8e080d2b7b5df08bf52b5510900c2e5e1357bd93",
+      "force_promote_history": {
+        "reason": "Per-version force-promote actions are historically unrecoverable: old release records retained only a mutable last_qualification slot; missing evidence is not zero.",
+        "status": "unrecoverable"
+      },
+      "non_bot_authored_commits": 1,
+      "parents": [
+        "0830ebb9e56fdeba7f16c2cacef2ff8816bbfdf2",
+        "a18d89a6eaadfddbf83bad3c247d573c7ab7a5bd"
+      ],
+      "provenance": {
+        "bot_identity": 2,
+        "co_authored_by": 1,
+        "merged_parent": 0,
+        "unattributed": 0
+      },
+      "tag_object_sha": "f34fd895ccfe096481955f642c0e1678409950b2",
+      "total_commits": 3,
+      "unattributed_shas": [],
+      "version": "v37",
+      "zero_unattributed_commits": true
+    },
+    {
+      "base_sha": "8e080d2b7b5df08bf52b5510900c2e5e1357bd93",
+      "commit_sha": "d869f0cce702c10566b246ca4170101ba8fb2796",
+      "force_promote_history": {
+        "reason": "Per-version force-promote actions are historically unrecoverable: old release records retained only a mutable last_qualification slot; missing evidence is not zero.",
+        "status": "unrecoverable"
+      },
+      "non_bot_authored_commits": 6,
+      "parents": [
+        "8e080d2b7b5df08bf52b5510900c2e5e1357bd93",
+        "07696883411a6f4b9e597315f49cc24fdd9b3d87"
+      ],
+      "provenance": {
+        "bot_identity": 12,
+        "co_authored_by": 6,
+        "merged_parent": 0,
+        "unattributed": 0
+      },
+      "tag_object_sha": "d4dcaeb0fe6c605d1e24e7918aba9a039c4dab89",
+      "total_commits": 18,
+      "unattributed_shas": [],
+      "version": "v38",
+      "zero_unattributed_commits": true
+    },
+    {
+      "base_sha": "4ac0aec933396bd5220b84e466ec5d68b65b3964",
+      "commit_sha": "ad3228ce3c0a5ae0d2e52aed1ec792a09cef54eb",
+      "force_promote_history": {
+        "reason": "Per-version force-promote actions are historically unrecoverable: old release records retained only a mutable last_qualification slot; missing evidence is not zero.",
+        "status": "unrecoverable"
+      },
+      "non_bot_authored_commits": 13,
+      "parents": [
+        "4ac0aec933396bd5220b84e466ec5d68b65b3964",
+        "552a38efbee124f1fc2e93c4d36c12a13c54cbf9"
+      ],
+      "provenance": {
+        "bot_identity": 2,
+        "co_authored_by": 13,
+        "merged_parent": 0,
+        "unattributed": 0
+      },
+      "tag_object_sha": "0b4dbf00416c8c442e38a2f273f46a52a013e6f5",
+      "total_commits": 15,
+      "unattributed_shas": [],
+      "version": "v42",
+      "zero_unattributed_commits": true
+    },
+    {
+      "base_sha": "0c45d166455ad675affede99d7ee1d0cb4e7f9b0",
+      "commit_sha": "354f08269a1ae64487949cedb184757d45cd5c51",
+      "force_promote_history": {
+        "reason": "Per-version force-promote actions are historically unrecoverable: old release records retained only a mutable last_qualification slot; missing evidence is not zero.",
+        "status": "unrecoverable"
+      },
+      "non_bot_authored_commits": 118,
+      "parents": [
+        "0c45d166455ad675affede99d7ee1d0cb4e7f9b0",
+        "260e18607e1908e4465323d2919477af14029133"
+      ],
+      "provenance": {
+        "bot_identity": 31,
+        "co_authored_by": 90,
+        "merged_parent": 28,
+        "unattributed": 0
+      },
+      "tag_object_sha": "6882f06869d8fec82335beb833a39ff4efd58a31",
+      "total_commits": 149,
+      "unattributed_shas": [],
+      "version": "v45",
+      "zero_unattributed_commits": true
+    }
+  ],
+  "schema_version": 1,
+  "trusted_signals": [
+    "exact Blueprint bot author name and GitHub noreply email",
+    "accepted Co-authored-by trailer for Blueprint Agent or Claude Opus 5",
+    "recursive attribution of merged non-first-parent history"
+  ]
+}
