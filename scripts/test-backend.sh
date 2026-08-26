@@ -817,6 +817,20 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_vitest_durations_freshness.py
     testing/test_test_imports_checker.py
     testing/test_scripts_lane_hermetic_credentials.py
+    # Live-tree module-size guardrail. Required here, not optional: it is
+    # registered in drift_sentinel_surfaces.json against agent/src/**,
+    # admin-ui/src/** and scripts/**/*.py, and corpus_lane_required_sentinels()
+    # demands a roster seat for any sentinel with a non-backend surface -- the
+    # corpus lane is the only lane a diff carrying no backend Python reaches.
+    # It is a corpus scan, and its cost is file I/O: ~2.6s with the repo on a
+    # Linux filesystem (CI), but 78-103s across a Docker-on-Windows bind mount
+    # -- both measured 3x. So it fits this lane's --timeout=30 in CI and blows
+    # through it on a Windows dev box, which is why the module carries an
+    # explicit @pytest.mark.timeout(120) -- the same house budget
+    # test_string_patch_targets_resolve uses for the same reason. Never remove
+    # that marker without re-measuring on BOTH: a corpus scan killed at 30s
+    # reports a slow filesystem as a size defect.
+    testing/test_module_size_live_tree.py
     )
     # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
     # The scripts roster is explicitly maintained above and checked by
