@@ -643,6 +643,13 @@ async def sweep_stalled_strategic_cycles(
 
     _phase_cutoff = _step7_now - timedelta(hours=3)
     for c in _locked_cycles:
+        # Reset per iteration: a cycle with no linked task id would otherwise
+        # inherit the PREVIOUS cycle's task here and get diagnosed against it.
+        linked_task = None
+        # Diagnosis captured BEFORE this sweep force-terminates the task below.
+        # Read afterwards it would report the reaper's own FAILED write back as
+        # the cause, erasing the only evidence of why the phase never ran.
+        pre_kill_diagnosis: tuple[str, str] | None = None
         if c.outcome in (
             strategic_cycle.OUTCOME_IN_PROGRESS,
             strategic_cycle.OUTCOME_PHASE1_RUNNING,
@@ -755,6 +762,9 @@ async def sweep_stalled_strategic_cycles(
                     persist_failure_category,
                 )
 
+                pre_kill_diagnosis = strategic_cycle.describe_phase_stall(
+                    linked_task, phase=stalled_phase, now=_step7_now
+                )
                 persist_failure_category(linked_task, AGENT_STALLED)
                 linked_task.status = TaskStatus.FAILED
                 linked_task.latest_status_message = (
@@ -767,13 +777,39 @@ async def sweep_stalled_strategic_cycles(
                     f"{linked_task_id} linked to stalled cycle {c.id}"
                 )
 
+        # WHY the phase could not progress, read off the linked task while it
+        # still holds its pre-termination status. Recorded on the row so the
+        # next attempt, the operator alert, and the retry bound all name the
+        # same cause instead of re-deriving "stalled" from nothing.
+        stall_sig, stall_reason_text = (
+            pre_kill_diagnosis
+            or strategic_cycle.describe_phase_stall(
+                linked_task, phase=stalled_phase, now=_step7_now
+            )
+        )
+        # Consecutive same-cause stalls, counting this one. The prior run is
+        # read with this cycle excluded so the count does not depend on whether
+        # the outcome write below has been flushed yet.
+        _prior_streak = await strategic_cycle.consecutive_stall_streak(
+            session, c.project_id, exclude_cycle_id=c.id
+        )
+        if _prior_streak.count and _prior_streak.signature == stall_sig:
+            stall_streak = _prior_streak.count + 1
+        else:
+            stall_streak = 1
+        retry_exhausted = stall_streak >= strategic_cycle.MAX_CONSECUTIVE_STALLS
+
         if stalled_phase == "phase1":
             c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE1
         else:
             c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE2
+        strategic_cycle.record_stall_diagnosis(
+            c, signature=stall_sig, reason=stall_reason_text
+        )
         if c.failure_reason is None:
             c.failure_reason = (
-                f"reaper_stall: cycle in {stalled_phase} >3h with no completion"
+                f"reaper_stall (attempt {stall_streak}, cause {stall_sig}): "
+                f"{stall_reason_text}"
             )
         session.add(c)
         actually_stalled.append(c)
@@ -807,16 +843,49 @@ async def sweep_stalled_strategic_cycles(
             # CONDITION (project + phase); the cycle id stays in the message,
             # which ``_update_existing_alert`` refreshes on every re-fire along
             # with ``occurrence_count`` and ``last_seen_at``.
+            # Severity tracks the CONDITION, not the occurrence. While retries
+            # remain this is a WARNING that a cycle was lost; once the same
+            # cause has burned the retry budget the pipeline has stopped
+            # re-minting on its own and only a human can clear it, which is an
+            # ERROR. Re-firing through the stable dedupe key ESCALATES the one
+            # open row in place (``_update_existing_alert`` overwrites severity
+            # and bumps ``occurrence_count``) instead of minting a fresh
+            # WARNING every 3h — 19 identical rows was itself the defect.
+            if retry_exhausted:
+                _stall_severity = AlertSeverity.ERROR
+                _stall_title = (
+                    f"Strategic cycle stalled in {stalled_phase} — "
+                    f"automatic retry stopped"
+                )
+                _stall_tail = (
+                    f"This is stall {stall_streak} in a row from the SAME cause, "
+                    f"so automatic re-minting is now SUPPRESSED for this project "
+                    f"and no successor cycle will spawn until a human clears the "
+                    f"blocker (or sends an operator message, which releases the "
+                    f"cutoff). Retrying cannot fix this cause."
+                )
+            else:
+                _stall_severity = AlertSeverity.WARNING
+                _stall_title = f"Strategic cycle stalled in {stalled_phase}"
+                _stall_tail = (
+                    f"Stall {stall_streak} of "
+                    f"{strategic_cycle.MAX_CONSECUTIVE_STALLS} from this cause; "
+                    f"a successor cycle will retry. At "
+                    f"{strategic_cycle.MAX_CONSECUTIVE_STALLS} consecutive "
+                    f"same-cause stalls automatic retrying stops and this alert "
+                    f"escalates to ERROR."
+                )
             alert, alert_created, _decision = await create_project_alert_if_allowed(
                 session,
                 project_id=c.project_id,
                 event_type="research.diagnosis_stalled",
-                severity=AlertSeverity.WARNING,
-                title=f"Strategic cycle stalled in {stalled_phase}",
+                severity=_stall_severity,
+                title=_stall_title,
                 message=(
                     f"Cycle {c.id} has been in {stalled_phase} for >3h with no "
-                    f"completion handler update. Marking stalled — next strategic "
-                    f"cycle will spawn a fresh attempt. Phase1 task: {c.phase1_task_id}, "
+                    f"completion handler update. Cause [{stall_sig}]: "
+                    f"{stall_reason_text}. {_stall_tail} "
+                    f"Phase1 task: {c.phase1_task_id}, "
                     f"phase2 task: {c.phase2_task_id}."
                 ),
                 source="reaper",
@@ -829,7 +898,7 @@ async def sweep_stalled_strategic_cycles(
                         str(c.project_id),
                         {
                             "alert_id": str(alert.id),
-                            "severity": "WARNING",
+                            "severity": _stall_severity.value,
                             "title": alert.title,
                         },
                     )
@@ -2411,10 +2480,24 @@ _RESIDENT_LIVENESS_SUPPRESSION_BUDGET = 3
 
 
 def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime | None:
-    """Return the newest intentional no-delta receipt inside ``cutoff``."""
+    """Return the newest intentional no-delta receipt inside ``cutoff``.
+
+    Only an INTENTIONAL idle counts. The consecutive-stall cutoff also lands in
+    this log (it is a skip, and suppressing it there would lose the audit
+    trail), but it means the strategist is BLOCKED, not quiet — accepting it as
+    a healthy-idle receipt would let the cutoff silence the very starvation
+    alert that is supposed to notice a halted strategic loop.
+    """
+    from app.strategic_cycle import STALL_CUTOFF_REASON_PREFIX
+
     newest: datetime | None = None
     for entry in (vision or {}).get("_strategic_no_delta_skips") or []:
         if not isinstance(entry, dict):
+            continue
+        reason = entry.get("reason")
+        if isinstance(reason, str) and reason.startswith(
+            STALL_CUTOFF_REASON_PREFIX
+        ):
             continue
         raw = entry.get("skipped_at")
         if not isinstance(raw, str):
