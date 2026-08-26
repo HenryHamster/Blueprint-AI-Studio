@@ -50,7 +50,7 @@ import {
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   shouldRunAutonomousTurn, actionableFiredWatchRevision, wakeBarrierRevision,
-  hasPendingOwnedWork, explorationWakeProjection,
+  hasPendingOwnedWork, explorationWakeProjection, formatWatchingWorkNote,
   EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
@@ -5659,9 +5659,7 @@ export async function handleStrategicResident(
           // deliberate gated-idle is visibly different from a dark/crashed session.
           const msSinceWatching = Date.now() - lastWatchingEmitAt;
           if (msSinceWatching >= cfg.idleTickMs * 2) {
-            const rawInFlight = hb?.work_state_summary?.in_flight;
-            const inFlight = typeof rawInFlight === 'number' ? rawInFlight : null;
-            const taskNote = inFlight !== null ? `${inFlight} task${inFlight === 1 ? '' : 's'} in flight; ` : '';
+            const taskNote = formatWatchingWorkNote(currentWorkStateSummary);
             streamer.status(
               `watching — ${taskNote}next review ${wakeProjection.nextReview}`
               + (wakeProjection.nextReviewAt ? ' or on state change' : ''),
