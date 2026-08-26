@@ -69,8 +69,8 @@ describe('strategic ops registry — internal consistency', () => {
 describe('shared manifest lockstep', () => {
   it('backend/app/strategic_ops_manifest.json equals the registry projection', () => {
     const onDisk: unknown = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8'));
-    // If this fails after a registry edit, regenerate the manifest from
-    // strategicOpsManifest() (see strategic-ops-registry.ts header).
+    // If this fails after a registry edit, regenerate the manifest:
+    //   cd agent && npx tsx scripts/regen-strategic-ops-manifest.mjs
     expect(onDisk).toEqual(strategicOpsManifest());
   });
 });

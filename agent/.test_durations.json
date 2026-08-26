@@ -15,8 +15,8 @@
     },
     {
       "file": "src/handlers/strategic-helpers.test.ts",
-      "duration_ms": 36234,
-      "tests": 116,
+      "duration_ms": 39534,
+      "tests": 118,
       "measured": true,
       "flaky": false
     },

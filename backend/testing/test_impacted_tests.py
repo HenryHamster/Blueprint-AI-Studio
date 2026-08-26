@@ -610,6 +610,60 @@ def test_scripts_change_resolves_conversational_workday_sentinel():
     assert "backend/testing/test_conversational_workday_protection.py" in selected
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "backend/app/release_qualifier.py",
+        "backend/testing/test_impacted_tests.py",
+        "backend/testing/module_size_limits.json",
+        "agent/src/handlers/strategic.ts",
+        "admin-ui/src/components/MessagesPanel.tsx",
+        "scripts/static_release_guard.py",
+    ],
+)
+def test_every_governed_size_surface_resolves_the_live_tree_size_sentinel(changed):
+    """A diff in any governed size section must select the live-tree size gate.
+
+    THE GAP THIS PINS: the module-size guardrail ran against the live tree only
+    inside ``test_invariants.py``, which lives in the ci.yml backend matrix --
+    and ci.yml's ``pull_request`` trigger is ``branches: [main]``, so an
+    ``automain`` PR never runs it. guard-data.yml's impacted job runs only what
+    this manifest selects, and nothing here mapped a governed source surface to
+    a size scan. A breach therefore first turned red at the ``automain``->
+    ``main`` promotion PR, where a red usually CLOSES the PR and deletes its
+    release branch. Proven live: PR #17966 took this very file from 1431 to
+    1522 lines -- past the 1500-line uncapped threshold, with no cap entry --
+    and merged into ``automain`` green.
+
+    Parametrized over one representative path per governed section so dropping
+    any single registration is a named failure rather than a silent narrowing.
+    This module is itself in guard-data.yml's Derived-artifacts selector list,
+    so this assertion runs on EVERY automain PR regardless of its diff.
+    """
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    selected = impacted_tests.resolve_impacted([changed], repo_root)
+    assert "backend/testing/test_module_size_live_tree.py" in selected
+
+
+def test_live_tree_size_sentinel_is_carried_by_the_standalone_roster():
+    """Its non-backend surfaces oblige a corpus-lane seat -- assert it has one.
+
+    ``corpus_lane_required_sentinels`` derives the obligation; this pins that
+    the obligation is actually met for THIS sentinel, because the corpus lane
+    is the only lane a diff carrying no backend Python file ever reaches.
+    """
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    required = impacted_tests.corpus_lane_required_sentinels(repo_root)
+    assert "backend/testing/test_module_size_live_tree.py" in required
+    root = _repo_root_with("scripts/test-backend.sh")
+    if root is None:
+        pytest.skip("scripts/test-backend.sh not available in this layout")
+    with open(os.path.join(root, "scripts", "test-backend.sh"), encoding="utf-8") as fh:
+        roster = _standalone_roster(fh.read())
+    assert roster, "STANDALONE_ARGS parser matched nothing"
+    assert "testing/test_module_size_live_tree.py" in roster
+
+
 def test_indirectly_reached_module_via_two_hop_chain(tmp_path):
     """A two-hop chain (test -> intermediate -> changed leaf) selects the test.
 

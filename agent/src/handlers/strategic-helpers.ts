@@ -322,8 +322,18 @@ _call() {
       return 0
     fi
     if [ "$http_code" -eq 409 ]; then
-      printf '%s' "$body"
-      echo "[CONSTRAINT] $1 rejected (HTTP 409)" >&2
+      # A 409 is a REFUSAL: the server did NOT apply this mutation. Emitting the
+      # bare error envelope on stdout and returning 0 made a refusal read as a
+      # succeeded-with-no-effect call, so the caller could neither report the
+      # block to the operator nor retry it. Wrap it in an explicit refusal
+      # envelope that names the op and carries the server's reason verbatim.
+      # Exit status stays 0 on purpose: 409 on this endpoint also covers ordinary
+      # constraint outcomes (direction cap, dedup, project paused, reply-lease
+      # ownership) that must not abort the turn — the turn has to stay alive to
+      # SAY it was refused.
+      printf '{"status":"refused","applied":false,"op":%s,"http_status":409,"reason":%s}' "$(_json_str "$1")" "$(_json_str "$body")"
+      echo "[CONSTRAINT] $1 REFUSED (HTTP 409) — NOT applied. Reason: $body" >&2
+      echo "[CONSTRAINT] Treat this as blocked, not done: report the reason above to the operator." >&2
       return 0
     fi
     attempt=$((attempt + 1))
