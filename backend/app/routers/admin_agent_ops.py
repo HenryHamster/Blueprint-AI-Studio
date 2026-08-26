@@ -13,7 +13,7 @@ import re
 import uuid
 from typing import Any, List, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import func as _func
@@ -240,6 +240,14 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "begin_autonomous_turn",
     "report_autonomous_finding",
     "end_autonomous_turn",
+    # Pipeline ACTION verbs. Each re-enters the SAME server-side implementation
+    # the equivalent operator lever calls (app/strategic_pipeline_actions.py has
+    # the op -> implementation table); none of them is a parallel reimplementation.
+    "force_promote",
+    "requeue_task",
+    "reset_iteration_cap",
+    "set_task_priority",
+    "unhold_direction",
 })
 
 def _cap_str(
@@ -1288,6 +1296,7 @@ async def _reject_dependency_cycles(
 async def strategic_operation(
     request: Request,
     payload: StrategicOp,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
@@ -7010,6 +7019,334 @@ async def strategic_operation(
                 "op": "request_qualification",
                 "reason_received": (qualify_request or {}).get("reason") or None,
                 "probes_received": (qualify_request or {}).get("probes") or [],
+            }
+        )
+
+    # ── Pipeline ACTION verbs ────────────────────────────────────────────────
+    # The strategist could describe the pipeline but could not act on it: no
+    # verb existed for promote, requeue/retry, unpark, reprioritise, or
+    # iteration-cap reset, so every one of those instructions bottlenecked on a
+    # human driving the operator HTTP levers by hand. Each op below re-enters
+    # the SAME server-side implementation its operator lever calls; the op ->
+    # implementation table lives in app/strategic_pipeline_actions.py.
+    #
+    # Two rules these handlers all obey:
+    #   1. Slow GitHub I/O runs POST-COMMIT on a fresh session, never under the
+    #      Project/Task FOR UPDATE locks this dispatch holds (see the module
+    #      docstring, and request_qualification above for the same shape).
+    #   2. They report the REASON an action did not happen instead of asserting
+    #      success. force_promote in particular skips the release AUDIT gate and
+    #      ONLY that -- CI still gates the merge.
+
+    elif payload.op == "force_promote":
+        # Data shape: {"reason": "<required>", "candidate_sha": "<optional>"}.
+        # Re-enters release_qualifier.force_promote_current_version, the same
+        # function behind the owner-only POST /projects/{id}/promote/force.
+        #
+        # WHAT IT SKIPS: the release AUDIT / qualification scoring gate, and
+        # only that. WHAT IT DOES NOT SKIP: CI. The release branch is still cut,
+        # the release-vN -> promotion-target PR is still opened, and the normal
+        # CI-wait / managed-check-wait machinery still has to see the promotion
+        # target's required branch-protection checks go green before anything
+        # merges. Reporting this to an operator as "skipping CI" would be false.
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            apply_force_promote_post_commit,
+            parse_force_promote,
+            summarize_promotion,
+        )
+
+        try:
+            _fp_reason, _fp_candidate_sha = parse_force_promote(data)
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _fp_project_id = project.id
+        _fp_actor = f"strategic_task:{task.id}"
+        await session.commit()
+        _fp_outcome = await apply_force_promote_post_commit(
+            project_id=_fp_project_id,
+            actor=_fp_actor,
+            reason=_fp_reason,
+            candidate_sha=_fp_candidate_sha,
+        )
+        _fp_promotion = summarize_promotion(_fp_outcome["promotion"])
+        return _resp(
+            {
+                "status": "ok",
+                "op": "force_promote",
+                "promoted": _fp_outcome["promoted"],
+                "promotion_status": _fp_promotion.get("status"),
+                "promotion": _fp_promotion,
+                "audit_gate": "skipped",
+                "ci_gate": (
+                    "NOT skipped — the promotion PR must still go green on the "
+                    "promotion target's required checks before it merges"
+                ),
+            }
+        )
+
+    elif payload.op == "requeue_task":
+        # Data shape: {"target_task_id": "<uuid>", "reason": "<required>",
+        #              "guidance": "<optional retry instruction>"}.
+        # This is also the RETRY verb -- retrying a failed task IS requeueing
+        # it. Re-enters admin_task_mutations.modify_task_apply, the same
+        # function behind PATCH /api/admin/tasks/{id} and the project-operator
+        # requeue lever, so attempt/runtime reset, blocker clearing, cascade
+        # rules, and review/fix PR admission are identical.
+        #
+        # Runs post-commit: a review/fix requeue fetches the PR from GitHub
+        # inside modify_task_apply, which must not happen under our locks.
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            apply_requeue_post_commit,
+            load_same_project_task,
+            parse_requeue_task,
+        )
+
+        try:
+            _rt_task_id, _rt_reason, _rt_guidance = parse_requeue_task(data)
+            # Cheap same-project check under the lock so an obviously wrong
+            # target is refused before anything is committed.
+            await load_same_project_task(
+                session,
+                target_task_id=_rt_task_id,
+                project_id=project.id,
+                op="requeue_task",
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _rt_project_id = project.id
+        await _record_workday_entity("task", _rt_task_id)
+        await session.commit()
+        try:
+            _rt_result = await apply_requeue_post_commit(
+                target_task_id=_rt_task_id,
+                project_id=_rt_project_id,
+                guidance=_rt_guidance,
+                background_tasks=background_tasks,
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        logger.info(
+            "[STRATEGIC API] requeue_task: task %s re-drove %s from %s to QUEUED "
+            "(reason=%s) for project %s",
+            task.id,
+            _rt_task_id,
+            _rt_result["previous_status"],
+            _rt_reason,
+            _rt_project_id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "requeue_task",
+                "target_task_id": str(_rt_task_id),
+                "previous_status": _rt_result["previous_status"],
+                "new_status": TaskStatus.QUEUED.value,
+            }
+        )
+
+    elif payload.op == "reset_iteration_cap":
+        # Data shape: {"target_task_id": "<uuid>", "reason": "<required>"}.
+        # This is the UNPARK verb for a review-fix chain: per
+        # app.review_park_disposition a chain parked for operator disposition is
+        # released by exactly this operation. Re-enters
+        # iteration_cap_reset.apply_iteration_cap_reset -- the same body behind
+        # POST /api/admin/tasks/{id}/reset-iteration-cap, extracted so the two
+        # callers cannot drift.
+        #
+        # Pure DB work, so it runs inline; the helper commits, which also
+        # persists the _strategic_api_called stamp and the workday entity below.
+        from app.iteration_cap_reset import (
+            IterationCapResetError,
+            apply_iteration_cap_reset,
+        )
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            load_same_project_task,
+            parse_reset_iteration_cap,
+        )
+
+        try:
+            _ic_task_id, _ic_reason = parse_reset_iteration_cap(data)
+            await load_same_project_task(
+                session,
+                target_task_id=_ic_task_id,
+                project_id=project.id,
+                op="reset_iteration_cap",
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await _record_workday_entity("task", _ic_task_id)
+        try:
+            _ic_result = await apply_iteration_cap_reset(
+                session,
+                task_id=_ic_task_id,
+                project_id=project.id,
+                actor=f"strategic_task:{task.id}",
+            )
+        except IterationCapResetError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        logger.info(
+            "[STRATEGIC API] reset_iteration_cap: task %s unparked %s (PR #%s, "
+            "reason=%s) — nothing was re-spawned",
+            task.id,
+            _ic_task_id,
+            _ic_result.get("pr_number"),
+            _ic_reason,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "reset_iteration_cap",
+                "respawned": False,
+                **_ic_result,
+            }
+        )
+
+    elif payload.op == "set_task_priority":
+        # Data shape: {"target_task_id": "<uuid>", "priority": "high|medium|low"
+        #              or 0-100, "reason": "<required>"}.
+        # Rewrites Task.priority, the integer the dispatch loop's candidate
+        # query orders by. This is the one pipeline action verb with no
+        # pre-existing operator HTTP lever to re-enter, so the write is inline
+        # here -- exactly as cancel_task writes target_task.status inline above.
+        #
+        # DOES NOT dispatch the task, raise a cap, or clear a dependency gate.
+        # Priority only decides ORDER among rows that are ALREADY eligible, so
+        # raising it on a gated row changes nothing; the response reports the
+        # target's status so the caller can say that rather than imply progress.
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            load_same_project_task,
+            parse_set_task_priority,
+        )
+
+        try:
+            _sp_task_id, _sp_priority, _sp_reason = parse_set_task_priority(data)
+            _sp_target = await load_same_project_task(
+                session,
+                target_task_id=_sp_task_id,
+                project_id=project.id,
+                op="set_task_priority",
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        _sp_previous = (
+            _sp_target.priority if _sp_target.priority is not None else 50
+        )
+        _sp_target.priority = _sp_priority
+        _sp_ctx = dict(_sp_target.context or {})
+        _sp_ctx["priority_set_by_strategic_task_id"] = str(task.id)
+        _sp_ctx["priority_set_reason"] = _sp_reason
+        _sp_target.context = _sp_ctx
+        flag_modified(_sp_target, "context")
+        session.add(_sp_target)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _sp_status = getattr(
+            _sp_target.status, "value", str(_sp_target.status)
+        )
+        await _record_workday_entity("task", _sp_task_id)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] set_task_priority: task %s set %s priority %s→%s "
+            "(status=%s, reason=%s)",
+            task.id,
+            _sp_task_id,
+            _sp_previous,
+            _sp_priority,
+            _sp_status,
+            _sp_reason,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_task_priority",
+                "target_task_id": str(_sp_task_id),
+                "previous_priority": _sp_previous,
+                "priority": _sp_priority,
+                "target_status": _sp_status,
+                "dispatched": False,
+            }
+        )
+
+    elif payload.op == "unhold_direction":
+        # Data shape: {"direction_id": "d-1210b9", "reason": "<required>"}.
+        # Clears the consecutive-failure hold that stops a direction from
+        # dispatching new tasks -- the same app.shared_state helpers behind
+        # POST /projects/{id}/directions/{direction_id}/unhold, including its
+        # 404 when the id is not one of this project's directions.
+        #
+        # DOES NOT change the direction's status, reset saturation, re-activate
+        # a retired/staged direction, or spawn anything. The hold is re-derived
+        # each cycle, so clearing it without fixing the underlying failure just
+        # lets the direction fail back into a hold.
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            clear_direction_hold_for_project,
+            parse_unhold_direction,
+        )
+
+        try:
+            _uh_direction_id, _uh_reason = parse_unhold_direction(data)
+            _uh_was_held = await clear_direction_hold_for_project(
+                session,
+                project_id=project.id,
+                direction_id=_uh_direction_id,
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await _record_workday_entity("direction", _uh_direction_id)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] unhold_direction: task %s cleared hold on %s "
+            "(was_held=%s, reason=%s) for project %s",
+            task.id,
+            _uh_direction_id,
+            _uh_was_held,
+            _uh_reason,
+            project.id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "unhold_direction",
+                "direction_id": _uh_direction_id,
+                "was_held": _uh_was_held,
+                "spawned": False,
             }
         )
 

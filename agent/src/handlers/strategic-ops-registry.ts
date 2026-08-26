@@ -10,6 +10,8 @@
  * the bootstrap prompt op list are DERIVED from it (no more hand-typed lists),
  * and a checked-in shared manifest (`backend/app/strategic_ops_manifest.json`)
  * mirrors it so the Python backend and the TypeScript agent stay in lockstep.
+ * After editing this registry, REGENERATE that manifest:
+ *   cd agent && npx tsx scripts/regen-strategic-ops-manifest.mjs
  *
  * Drift-guard tests keep every surface honest:
  *  - agent-side (strategic-ops-registry.test.ts): the generated CLI + bootstrap
@@ -228,6 +230,90 @@ const INPUTS = {
       'request_id cancels durable work only while it remains deferred.',
     ],
   },
+  force_promote: {
+    kind: 'json' as const,
+    required: ['reason'],
+    fields: ['reason', 'candidate_sha'],
+    example: {
+      reason: 'Release claims are proven by landed work; only the audit lane is outstanding.',
+      candidate_sha: '0c45d166455a0f6d3c1a2b4e5d6f708192a3b4c5',
+    },
+    notes: [
+      'DOES: cut the release branch, open the release-vN -> promotion-target PR, and hand it to the normal CI-wait / managed-check-wait machinery.',
+      'SKIPS: the release AUDIT / qualification scoring gate, and ONLY that.',
+      'DOES NOT SKIP CI. The promotion PR must still go green on the promotion-target required branch-protection checks before anything merges. Never report this to the operator as "skipping CI".',
+      'Two-phase by design: the first call cuts the PR and returns a waiting status (commonly promotion_check_wait); call it again once CI is green to land it.',
+      'Refuses as a no-op status rather than an error when there is no open version, credentials are missing, or a promotion is already in flight. Report the returned status and detail verbatim instead of asserting success.',
+      'candidate_sha defaults to the current integration-branch HEAD. Pin it only to promote a specific proven commit.',
+      'Use request-qualification instead when the audit verdict is what is actually wanted.',
+    ],
+  },
+  requeue_task: {
+    kind: 'json' as const,
+    required: ['target_task_id', 'reason'],
+    fields: ['target_task_id', 'reason', 'guidance'],
+    example: {
+      target_task_id: '7b48ce0f-55c6-4f62-904f-ec624bc32763',
+      reason: 'Platform-killed on an AGENT_TIMEOUT; the work itself was never attempted.',
+      guidance: 'The previous attempt died before writing any code. Start from the branch as it stands.',
+    },
+    notes: [
+      'DOES: re-drive one same-project task back to QUEUED through the SAME admin status-transition path an operator PATCH uses, so attempt/runtime reset, cascade rules, and review/fix PR admission all behave identically.',
+      'This is also the RETRY verb. Retrying a failed task IS requeueing it; there is no separate retry op.',
+      'Retryable source statuses are FAILED, CANCELLED, BLOCKED, EVALUATING, and PARKED. Anything else is refused 409 with the current status as the reason.',
+      'DOES NOT re-run a failed release qualification (use request-qualification), DOES NOT unpark a review-fix loop or restore an exhausted iteration cap (use reset-iteration-cap), and DOES NOT resurrect a COMPLETED task.',
+      'guidance is an optional one-shot retry instruction appended to the requeued prompt; it defaults to the reason, because requeueing with no instruction at all is how an agent repeats the attempt that just failed. Never write _original_prompt_suffix; that key is internal retry-dedup metadata and is refused.',
+      'Scoped to the calling project. A cross-project target is refused 403.',
+    ],
+  },
+  reset_iteration_cap: {
+    kind: 'json' as const,
+    required: ['target_task_id', 'reason'],
+    fields: ['target_task_id', 'reason'],
+    example: {
+      target_task_id: '7b48ce0f-55c6-4f62-904f-ec624bc32763',
+      reason: 'The cap tripped on three infra timeouts, not on real review iterations.',
+    },
+    notes: [
+      'This is the UNPARK verb for a review-fix chain. A chain parked for operator disposition (review_loop_abandon_candidate, or a stuck/standoff terminal outcome) is released by exactly this operation and by nothing else.',
+      'DOES: archive the FAILED review/fix tasks on the PR so they leave the per-PR cap census, zero the per-chain iteration counter, stamp the reset marker that also releases the merge-gate exact-target respawn budget, clear the abandon-candidate park marker, and clear the approval hold ONLY when that hold provably belongs to this cap episode.',
+      'DOES NOT re-spawn anything. The next orchestrator cycle or an explicit rollup has to pick the chain back up.',
+      'DOES NOT close, merge, or otherwise touch the PR, and DOES NOT stamp resolved:true on the terminal outcome, because a reset is not evidence that the loop converged.',
+      'Requires the task to carry context.review_loop.pr_number or context.rollup_pr_number; a task with no PR is refused 400.',
+      'Same implementation as the operator lever POST /api/admin/tasks/{id}/reset-iteration-cap. One code path, not a parallel one.',
+    ],
+  },
+  set_task_priority: {
+    kind: 'json' as const,
+    required: ['target_task_id', 'priority', 'reason'],
+    fields: ['target_task_id', 'priority', 'reason'],
+    example: {
+      target_task_id: '7b48ce0f-55c6-4f62-904f-ec624bc32763',
+      priority: 'high',
+      reason: 'This unblocks two other directions and should dispatch ahead of queued research.',
+    },
+    notes: [
+      'DOES: rewrite Task.priority, the integer the dispatch loop orders its candidate queue by. priority accepts high|medium|low (100|50|0) or an explicit integer 0-100.',
+      'DOES NOT dispatch the task, raise a concurrency cap, bypass a dependency or landing gate, or unblock a BLOCKED row. Priority only decides ORDER among rows that are already eligible, so raising it on a gated task changes nothing.',
+      'To reprioritise a DIRECTION use update-direction with priority=high|medium|low. This op is for tasks only.',
+      'Scoped to the calling project. A cross-project target is refused 403.',
+    ],
+  },
+  unhold_direction: {
+    kind: 'json' as const,
+    required: ['direction_id', 'reason'],
+    fields: ['direction_id', 'reason'],
+    example: {
+      direction_id: 'd-1210b9',
+      reason: 'The three consecutive failures were one platform defect, now root-fixed.',
+    },
+    notes: [
+      'DOES: clear the consecutive-failure hold that stops a direction from dispatching new tasks. Idempotent: was_held=false when the direction was already healthy.',
+      'DOES NOT change the direction status, reset saturation or refractory state, re-activate a retired or staged direction (use activate-direction), or spawn any task. It only removes the failure hold.',
+      'The hold is control-plane state re-evaluated each cycle, so clearing it without fixing the underlying failure just lets the direction fail back into a hold.',
+      'Same implementation as the operator lever POST /api/admin/projects/{id}/directions/{direction_id}/unhold.',
+    ],
+  },
   set_running_update: markdownInput(),
 } satisfies Record<string, StrategicOpInputContract>;
 
@@ -342,6 +428,29 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'request_qualification', alias: 'request-qualification', cli: true, prompt: true, internalReason: null,
     description: 'Request a fresh release qualification at a stable checkpoint, with only explicitly selected product probes.',
     input: INPUTS.request_qualification },
+
+  // ── Pipeline ACTION verbs. Direction and task lifecycle, promotion, and
+  //    recovery must not bottleneck on the operator, so the strategist owns
+  //    these levers directly rather than asking for them. Each one is wired to
+  //    the SAME server-side implementation the equivalent operator lever calls —
+  //    there is no parallel code path — and each description states what the
+  //    verb does NOT do, so the strategist cannot overstate a lever when it
+  //    reports back.
+  { op: 'force_promote', alias: 'force-promote', cli: true, prompt: true, internalReason: null,
+    description: 'Promote the open release version, SKIPPING the release audit gate — it does NOT skip CI: the promotion PR must still go green before it merges.',
+    input: INPUTS.force_promote },
+  { op: 'requeue_task', alias: 'requeue-task', cli: true, prompt: true, internalReason: null,
+    description: 'Re-drive one same-project failed, cancelled, blocked, evaluating, or parked task back to QUEUED (this is also the retry verb). Does NOT re-run a qualification and does NOT unpark a review loop.',
+    input: INPUTS.requeue_task },
+  { op: 'reset_iteration_cap', alias: 'reset-iteration-cap', cli: true, prompt: true, internalReason: null,
+    description: 'UNPARK a parked review-fix chain and reset its exhausted per-PR/per-chain iteration cap. Does NOT re-spawn any task and never touches the PR.',
+    input: INPUTS.reset_iteration_cap },
+  { op: 'set_task_priority', alias: 'set-task-priority', cli: true, prompt: true, internalReason: null,
+    description: 'Reprioritise one same-project task by rewriting the integer the dispatch loop orders by. Does NOT dispatch it, raise a cap, or clear a dependency gate.',
+    input: INPUTS.set_task_priority },
+  { op: 'unhold_direction', alias: 'unhold-direction', cli: true, prompt: true, internalReason: null,
+    description: 'Clear a consecutive-failure hold so a direction dispatches work again. Does NOT change its status, reset saturation, or spawn anything.',
+    input: INPUTS.unhold_direction },
 ];
 
 /** Registry entries surfaced on the `./strategic` CLI, in canonical order. */
