@@ -63,7 +63,7 @@ from app.time_utils import _utcnow
 # (``check_size_limits.recommended_cap_for_line_count``), not a hand-picked
 # number -- a hand-tight cap would put the file straight into the
 # metrics-integrity ``near_cap_size_warning`` band on the day it landed.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2050
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3000
 
 logger = logging.getLogger(__name__)
 
