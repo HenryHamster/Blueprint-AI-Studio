@@ -192,10 +192,15 @@ def test_an_absent_artifact_is_not_an_error(tmp_path: Path) -> None:
 
 
 # One pass over the real 21k-row artifact and the whole backend test roster.
-# The standalone lane runs with --timeout=30; an inner budget below the honest
-# cost of a healthy run fails as a TIMEOUT rather than an assertion, which reads
-# as infrastructure and gets retried instead of fixed.
-@pytest.mark.timeout(240)
+# An inner budget below the honest cost of a healthy run fails as a TIMEOUT
+# rather than an assertion, which reads as infrastructure and gets retried
+# instead of fixed.
+#
+# Whole file measured 9.6s. 120s is ~12x that, matching the sibling budget in
+# scripts/test_derived_artifact_classify.py so the scripts lane can grant both
+# files one number. It was 240s, sized to clear the old 30s lane default rather
+# than sized on the work.
+@pytest.mark.timeout(120)
 def test_the_real_repository_artifacts_are_prunable_and_carry_no_rot() -> None:
     """Two properties on the real tree, in one pass because the walk is not cheap.
 
