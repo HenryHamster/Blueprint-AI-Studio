@@ -5509,6 +5509,27 @@ def _build_direction_stats(
                 stat_entry["churn_retirement_recommended_at"] = d.get(
                     "churn_retirement_recommended_at"
                 )
+        # Cost-efficiency retirement consideration (direction_lifecycle raises it
+        # when a direction's rolling cost/merge exceeds a multiple of the project
+        # median). This is the cull signal that actually fires in practice, and
+        # until now it was written to the direction dict and consumed by nothing
+        # but the admin-ui card — so the strategist chose directions with no
+        # visibility of it and no keep-or-retire decision was ever owed. Surface
+        # the flag, the reason and the bounded evidence next to the churn
+        # recommendation so the same decision path can act on it.
+        if d.get("retirement_consideration_needed"):
+            stat_entry["retirement_consideration_needed"] = True
+            if d.get("retirement_consideration_reason"):
+                stat_entry["retirement_consideration_reason"] = d.get(
+                    "retirement_consideration_reason"
+                )
+            if d.get("retirement_consideration_at"):
+                stat_entry["retirement_consideration_at"] = d.get(
+                    "retirement_consideration_at"
+                )
+            _rc_ev = d.get("retirement_consideration_evidence")
+            if _rc_ev:
+                stat_entry["retirement_consideration_evidence"] = _rc_ev
         # Surface non-default recommended_mode so the strategic agent can bias
         # its direction decisions (audit/fundamentals → prefer non-feature work;
         # pause → tactical spawning should be skipped by autonomous_research).

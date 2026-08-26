@@ -235,6 +235,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "research.direction_auto_completed": STRATEGIST_INTERNAL,
     "research.direction_auto_retired": STRATEGIST_INTERNAL,
     "research.churn_retirement_recommended": STRATEGIST_INTERNAL,
+    "research.retirement_consideration_needed": STRATEGIST_INTERNAL,
     "research.anomaly_auto_adjusted": STRATEGIST_INTERNAL,
     "research.escalation_delivery_failed": OPERATOR_ACTION_NEEDED,
     "research.diagnosis_stalled": OPERATOR_ACTION_NEEDED,

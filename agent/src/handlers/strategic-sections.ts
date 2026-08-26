@@ -1327,10 +1327,28 @@ export function buildDirSummaryText(
       churnRetireSection = `\n   ⚠ CHURN-RETIREMENT-RECOMMENDED${detail}: this direction has repeatedly churn-paused with no escape and now stays PAUSED pending your explicit decision. It will NOT auto-retire — either retire it via the retirement path or give it a concrete new approach.`;
     }
 
+    // Cost-efficiency retirement consideration. The backend has raised this
+    // signal for a long time but never delivered it anywhere a decision could be
+    // made, so cost-outlier directions kept being selected forever. Render it
+    // with its reason and the decision that is owed.
+    const costRetireNote = d.retirement_consideration_needed === true ? ' [COST-RETIRE-CONSIDER]' : '';
+
+    let costRetireSection = '';
+    if (d.retirement_consideration_needed === true) {
+      const ev = d.retirement_consideration_evidence as Record<string, unknown> | undefined;
+      const detail = ev && typeof ev === 'object'
+        ? ` (cost/merge $${fmtScalar(ev.direction_cost_per_merge_usd, 'n/a')} vs $${fmtScalar(ev.threshold_usd, 'n/a')} threshold over ${fmtScalar(ev.window_cycles, 'n/a')} cycles)`
+        : '';
+      const reason = strVal(d.retirement_consideration_reason, '');
+      const since = strVal(d.retirement_consideration_at, '');
+      const sincePart = since ? ` Raised ${since} and unanswered since.` : '';
+      costRetireSection = `\n   ⚠ COST-RETIREMENT-CONSIDERATION${detail}: ${reason || 'this direction is a cost-per-merge outlier for this project.'}${sincePart} A keep-or-retire decision is owed. It stays ACTIVE and will keep consuming cycles until you decide — a cost breach alone is NOT proof of low value, so either retire it via the retirement path, narrow its scope, or state why the spend is justified.`;
+    }
+
     const groundingText = formatRetiredDirectionGrounding(d.retired_direction_grounding);
     const groundingSection = groundingText ? `\n   ${groundingText}` : '';
 
-    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}${churnRetireNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}${churnRetireSection}${groundingSection}`;
+    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}${churnRetireNote}${costRetireNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}${churnRetireSection}${costRetireSection}${groundingSection}`;
   }).join('\n\n');
   // When the shipped detail list is shorter than the authoritative active count,
   // render an honest "showing M of N" header instead of letting the reader infer
