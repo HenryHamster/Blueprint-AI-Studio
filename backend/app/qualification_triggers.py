@@ -81,6 +81,57 @@ _CI_RED = "red"
 CANDIDATE_ADVANCED_QUIET_WINDOW_SECONDS: int = 30 * 60
 
 
+# ---------------------------------------------------------------------------
+# Trigger OWNERSHIP.  ``resolve_qualification_trigger`` only DECIDES; something
+# else has to execute.  Two executors exist:
+#
+#   * the sweep's own auto-fire path (``release_qualifier_sweep.
+#     _fire_auto_triggered_qualification``) runs ``SWEEP_OWNED_TRIGGERS`` inline;
+#   * every other armed trigger is routed to a dedicated bounded re-driver in
+#     ``release_qualifier_redrive``, named in ``REDRIVE_TRIGGER_OWNERS``.
+#
+# A trigger in NEITHER table dead-ends SILENTLY: the resolver arms the version
+# every cycle, the sweep discards the decision as "owned by its dedicated
+# re-driver", and no such re-driver exists.  That is not hypothetical -- it is
+# what held a version at ``{"fire": true, "trigger": "blockers_cleared",
+# "reason": "armed"}`` while the read surface reported "armed, nothing
+# blocking" for the whole wedge, because the deployed build had no
+# ``blockers_cleared`` owner.  These tables exist so the routing is DATA an
+# executor can check and a test can pin, instead of a comment nobody enforces.
+SWEEP_OWNED_TRIGGERS: frozenset[str] = frozenset(
+    {
+        "coverage_complete",
+        "candidate_advanced",
+        "post_dry_run_advance",
+    }
+)
+
+# trigger -> the ``release_qualifier_redrive`` coroutine that owns executing it.
+# Names, not references: this module is deliberately DB-free and import-free of
+# the executor layer.  ``release_qualifier_redrive`` resolves the name and fails
+# LOUDLY when it does not resolve.
+REDRIVE_TRIGGER_OWNERS: dict[str, str] = {
+    "rubric_redrive": "_redrive_rubric_changed_qualification",
+    "error_redrive": "_redrive_error_qualification",
+    "infra_failure_redrive": "_redrive_infra_failure_qualification",
+    "blockers_cleared": "_redrive_promotion_failed_qualification",
+    "deferred_unsynced_redrive": "_redrive_deferred_unsynced_qualification",
+}
+
+
+def qualification_trigger_owner(trigger: str | None) -> str | None:
+    """Name the re-driver that owns ``trigger``, or None.
+
+    None means one of two very different things, and the caller must not
+    conflate them: the trigger is sweep-owned (in ``SWEEP_OWNED_TRIGGERS``, so
+    the sweep executes it inline), or NOTHING owns it. Check
+    ``SWEEP_OWNED_TRIGGERS`` first.
+    """
+    if not trigger:
+        return None
+    return REDRIVE_TRIGGER_OWNERS.get(trigger)
+
+
 class TriggerDecision:
     """Result of ``resolve_qualification_trigger``.
 
@@ -525,6 +576,7 @@ def explain_qualification_trigger(
           "auto_trigger": "armed|waiting|in_flight|capped|settled|observe|off",
           "last_attempt": {...},
           "next_expected_trigger": "<event>",
+          "trigger_owner": "sweep|<redriver name>|null",
           "blocking": [...],
           "lifetime_qualification_attempts": N,
           "error_retry_episode": {"count": M, "cap": 5},
@@ -605,14 +657,38 @@ def explain_qualification_trigger(
         "candidate_quiet_window": "sweep_retry",
         "findings_unresolved": "findings_resolved",
         "not_applicable": "operator_or_strategist_only",
-        "armed": "sweep_retry",  # fire=True means next sweep will fire
+        # NB: no "armed" entry.  An armed decision's next expected event is the
+        # TRIGGER THAT IS ARMED, resolved below -- see the comment there.
     }
     next_expected = reason_to_next.get(decision.reason, "operator_or_strategist_only")
+    trigger_owner: str | None = None
+    if decision.reason == "armed":
+        # Report the trigger that is ACTUALLY armed.  This used to be a
+        # hardcoded "sweep_retry" for all eight armed triggers, which read as
+        # "the next sweep will fire this" even for a trigger the sweep DISCARDS
+        # as re-driver-owned.  During the blockers_cleared wedge the panel said
+        # ``next_expected_trigger: "sweep_retry", blocking: []`` for a version
+        # nothing would ever retry -- a state report that was not true, which is
+        # exactly how the wedge stayed invisible.  Name the trigger and name its
+        # owner, so "who is supposed to act on this" is answerable from the read
+        # surface alone.
+        next_expected = decision.trigger or "sweep_retry"
+        trigger_owner = (
+            "sweep"
+            if decision.trigger in SWEEP_OWNED_TRIGGERS
+            else qualification_trigger_owner(decision.trigger)
+        )
 
     out = {
         "auto_trigger": auto_trigger,
         "last_attempt": last_attempt,
         "next_expected_trigger": next_expected,
+        # Who executes the armed trigger: "sweep" for the sweep's own inline
+        # auto-fire path, the re-driver's name for a routed trigger, and None
+        # when nothing is armed OR nothing owns it.  A non-None
+        # ``next_expected_trigger`` with a null owner while ``auto_trigger`` is
+        # "armed" is the silent-latch signature.
+        "trigger_owner": trigger_owner,
         "blocking": decision.blocking,
         # These are deliberately separate: lifetime attempts are diagnostic
         # history, while the cap applies only to retries in this error episode.

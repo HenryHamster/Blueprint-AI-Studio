@@ -211,6 +211,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "release.qualification_crash_loop": AlertEventPolicy(
         "release.qualification_crash_loop", domain=DOMAIN_RELEASE_LIFECYCLE
     ),
+    "release.qualification_trigger_unowned": AlertEventPolicy(
+        "release.qualification_trigger_unowned", domain=DOMAIN_RELEASE_LIFECYCLE
+    ),
     "release.walkthrough_key_unmatched": AlertEventPolicy(
         "release.walkthrough_key_unmatched", domain=CORE_ALERT_DOMAIN
     ),
@@ -324,6 +327,7 @@ _MANUAL_RETIREMENT_EVENTS = frozenset(
         "review.fail_open",
         "release.qualification_timeout",
         "release.qualification_crash_loop",
+        "release.qualification_trigger_unowned",
         "release.walkthrough_key_unmatched",
         "rollup.backmerge_blocked",
         "rollup.pr_blocked",
