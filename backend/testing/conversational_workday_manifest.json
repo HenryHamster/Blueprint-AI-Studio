@@ -4,11 +4,12 @@
   "protect": [
     {
       "path": "backend/testing/test_project_message_projection.py",
-      "reason": "Protects the bounded realtime/canonical preview fields that power the truthful non-interruptive Workday-consulted cue in Chat.",
+      "reason": "Protects the bounded realtime/canonical preview fields that power the truthful non-interruptive Workday-consulted cue in Chat, and the legacy direction-message projection that must keep handling_state alongside status \u2014 the only field separating a message a runner answered from one the stranded-message sweep terminalized because nothing ever read it.",
       "test_ids": [
-        "test_message_preview_preserves_bounded_workday_chat_provenance"
+        "test_message_preview_preserves_bounded_workday_chat_provenance",
+        "test_legacy_direction_projection_separates_answered_from_never_read"
       ],
-      "test_count": 29
+      "test_count": 30
     },
     {
       "path": "backend/testing/test_strategic_session_messages.py",
