@@ -1031,6 +1031,77 @@ jobs:
           echo "::error::Backend shards result: $R"
           exit 1
 
+  # Reconstruct backend/.test_durations from the timings the shards just
+  # produced, at zero extra compute. ADVISORY BY DESIGN: it uploads a refreshed
+  # artifact and prints the delta, it does not commit and it is not a required
+  # check. A duration merge must never be able to red a promotion PR -- someone
+  # lands the refreshed file deliberately, which is also what keeps the change
+  # reviewable rather than a bot silently rewriting the shard balancer's input.
+  #
+  # No base_ref condition: on.pull_request.branches is [main], so every run of
+  # this workflow already IS a main-targeted promotion PR.
+  backend-durations:
+    name: CI / Backend durations
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
+    needs: [detect, backend]
+    # always() so a RED shard still contributes the timings it did measure. A
+    # bare `needs: backend` would skip this job on any shard failure -- and a
+    # run where one shard blew its budget is precisely the run whose balance
+    # data is most worth having.
+    if: always() && needs.detect.outputs.backend == 'true'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
+      - uses: actions/checkout@v4
+
+      - name: Download shard durations
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-durations-*
+          path: shard-durations
+          merge-multiple: true
+
+      - name: Merge shard durations over the committed baseline
+        run: |
+          set -euo pipefail
+          if ! ls shard-durations/shard-*.json >/dev/null 2>&1; then
+            echo "::notice::no shard duration artifacts uploaded; nothing to merge"
+            exit 0
+          fi
+          ls -la shard-durations/
+          mkdir -p durations-merged
+          # --output, NOT an in-place rewrite of the checkout: this runner is
+          # shared, and leaving a dirty backend/.test_durations behind would
+          # follow the next job on the same workspace. The tool logs its own
+          # per-shard fresh counts, add/refresh/preserve totals and quality
+          # verdict, so no git diff is needed to see what changed.
+          #
+          # It fails closed (exit 2) on a malformed partial, and tolerates a
+          # MISSING shard loudly -- that shard's baseline entries are kept
+          # rather than dropped, so a merge from 7 of 8 shards degrades the
+          # freshness of one eighth instead of corrupting the balancer.
+          python3 scripts/merge_shard_durations.py \
+            shard-durations/shard-*.json \
+            --baseline backend/.test_durations \
+            --output durations-merged/.test_durations
+
+      - name: Upload merged .test_durations
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-test-durations
+          path: durations-merged/.test_durations
+          if-no-files-found: ignore
+          retention-days: 14
+
   agent:
     name: CI / Agent
     runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
