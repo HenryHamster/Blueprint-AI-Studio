@@ -4861,40 +4861,73 @@ def test_messages_send_warns_when_a_passive_note_wakes_nobody(monkeypatch, capsy
     assert "nothing will act on this message" in err
 
 
-def test_strategic_send_does_not_warn_on_passive_note(monkeypatch, capsys):
-    """The strategic lane binds a Workday session, so arming is not the whole story.
+def test_strategic_send_fails_on_a_passive_note_because_a_bound_turn_is_not_passive(
+    monkeypatch, capsys
+):
+    """``passive_note`` on the strategic lane is proof of a strand, not of binding.
 
-    That endpoint passes ``precreate_ensure``, which can bind the message to a live
-    session that reads the thread directly. A ``passive_note`` there means only
-    "no strategic cycle was armed", so the plain lane's unserviced WARNING must
-    not fire and scare the operator off the lane that works -- while the report
-    must still stop short of claiming the message was delivered.
+    The old contract here exited 0 on the theory that ``precreate_ensure`` could
+    bind the turn to a live Workday session that reads it whatever the arming
+    outcome. That theory is false against the server:
+    ``create_operator_project_message`` overwrites the outcome to
+    ``resident_session`` for every CONVERSATION row it binds, and the server now
+    classifies every conversation turn as steering regardless of message type.
+    So ``passive_note`` here can only mean nothing bound it AND nothing armed --
+    the exact silent-drop this whole verdict exists to expose.
     """
     _install_arming_cli(monkeypatch, "passive_note")
 
-    rc = blueprint.main(["strategic", "send", "continue the current strategy"])
-    assert rc == 0
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["strategic", "send", "continue the current strategy"])
+    assert exc.value.code == 1
     err = capsys.readouterr().err
-    assert "WARNING" not in err
+    assert "ERROR" in err
     assert "passive_note" in err
-    assert "delivery depends on the Workday" in err
+    assert "nothing will ever read or answer it" in err
 
 
-def test_strategic_send_reports_but_does_not_kill_an_unarmed_send(monkeypatch, capsys):
-    """``not_armed`` on the strategic lane is reported, never turned into exit 1.
+def test_strategic_send_fails_loudly_on_an_unarmed_send(monkeypatch, capsys):
+    """``not_armed`` on the strategic lane is a strand and must exit 1.
 
-    Arming is the SOLE gate only on the plain ``messages`` lane. On the strategic
-    lane a bound Workday session reads the thread whatever the arming outcome, so
-    failing the send here would be the CLI guessing -- and guessing wrong would
-    push the operator off the serviced lane. Report loudly, exit 0.
+    A bound turn reports ``resident_session``; an armed one reports
+    ``steering``. ``not_armed`` is therefore the server saying, unambiguously,
+    that the row was stored with no reader on either path.
     """
     _install_arming_cli(monkeypatch, "not_armed")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["strategic", "send", "change the plan"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "not_armed" in err
+    assert "ERROR" in err
+    assert "blueprint strategic start" in err
+
+
+def test_strategic_send_reports_a_bound_resident_turn_as_serviced(monkeypatch, capsys):
+    """The serviced verdicts stay exit 0 -- the fix must not break the happy path."""
+    _install_arming_cli(monkeypatch, "resident_session")
 
     rc = blueprint.main(["strategic", "send", "change the plan"])
     assert rc == 0
     err = capsys.readouterr().err
-    assert "not_armed" in err
-    assert "WARNING" in err
+    assert "resident_session" in err
+    assert "ERROR" not in err
+
+
+def test_strategic_send_does_not_fail_on_an_unknown_future_verdict(monkeypatch, capsys):
+    """Only the KNOWN unserviced verdicts exit 1.
+
+    A newer server introducing an additional serviced outcome must not be turned
+    into a false strand by an older CLI, so an unrecognised verdict is reported
+    neutrally rather than failed.
+    """
+    _install_arming_cli(monkeypatch, "some_future_outcome")
+
+    rc = blueprint.main(["strategic", "send", "change the plan"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "some_future_outcome" in err
     assert "ERROR" not in err
 
 
