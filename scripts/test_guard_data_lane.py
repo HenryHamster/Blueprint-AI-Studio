@@ -26,12 +26,17 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+# scripts/*.py tests run with --noconftest, so the shared offender-identity
+# producer is reached by the same explicit path insertion the other scripts
+# guards use rather than by a conftest-installed sys.path entry.
+sys.path.insert(0, str(REPO_ROOT / "backend"))
 
 from derived_artifact_classify import (  # noqa: E402
     DECISION_BEARING,
     DIRECTIONAL,
     NOT_DIRECTIONAL,
 )
+from testing.fixgate_attribution import format_offender_marker  # noqa: E402
 
 LANE = REPO_ROOT / "scripts" / "guard_data_lane.sh"
 ROSTER = REPO_ROOT / "scripts" / "guard_data_selectors.txt"
@@ -293,6 +298,8 @@ def test_every_classified_derived_artifact_guard_is_on_the_roster() -> None:
     assert not missing, (
         f"classified but never run by the guard-data lane: {missing}; add the "
         "selector to scripts/guard_data_selectors.txt or stop classifying it"
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -327,4 +334,6 @@ def test_every_roster_selector_is_accounted_for_in_one_direction_or_the_other() 
         f"{unexplained} guard a generated artifact and run in this lane, but "
         "derived_artifact_classify neither classifies them nor records why "
         "not; a reader of their red gets no rot-vs-addition answer"
+        + "\n"
+        + format_offender_marker(unexplained)
     )
