@@ -563,6 +563,7 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
         "phase",
         "goal",
         "goal_needed",
+        "goal_omission_cycles",
         "phase_changed_at",
         "tasks_merged_this_version",
         "qualification_attempts",

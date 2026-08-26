@@ -1174,6 +1174,165 @@ def extract_new_version_goal(raw: object) -> str | None:
     return cleaned
 
 
+# Bounded re-ask budget for the version goal. ``version_phase.goal_needed`` is
+# emitted on every cycle while the open version's goal is NULL, so each
+# completed strategic cycle is one ask. After this many consecutive cycles that
+# were asked and did not deliver, stop relying on the re-ask alone and raise a
+# durable, condition-scoped operator signal. Bounded, then loud.
+_VERSION_GOAL_OMISSION_ALERT_AFTER = 3
+
+# How long an unanswered goal-omission alert may sit before it escalates from
+# WARNING to ERROR. Mirrors the severity-on-age ladder in
+# ``runner_health_alerts._maybe_escalate_runner_deactivated_alert``: the alert
+# row is condition-keyed, so ``created_at`` is the age of the CONDITION (this
+# version has no goal), not of the latest occurrence.
+_VERSION_GOAL_OMISSION_ESCALATE_AFTER = timedelta(hours=24)
+
+# The condition-scoped event type and its dedupe key live in
+# ``app.release_version``, beside the ledger columns' write funnel, because the
+# RESOLVE side has three owners (strategist here, the operator
+# ``version-goal`` endpoint, and the auto-derive refresh) while this module
+# only owns the RAISE side. One definition keeps raise and resolve keyed
+# identically by construction.
+
+
+def _strategic_cycle_anchor(task: Task) -> str:
+    """Stable per-cycle identity used to dedupe the omission counter.
+
+    One strategic cycle can reach :func:`_apply_new_version_goal` more than
+    once: ``set_problem_model`` applies the field inline (``api_inline``) *and*
+    stows it in ``task.context`` for the completion handler (``api``). Counting
+    per call would inflate the streak and fire the escalation early, so the
+    counter is keyed to the cycle instead. Falls back to the task id for legacy
+    cycles that carry no ``strategic_cycle_id``.
+    """
+    cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+        "strategic_cycle_id"
+    )
+    return str(cycle_id or task.id)[:64]
+
+
+async def _alert_version_goal_not_authored(
+    open_ver: Any,
+    project: Project,
+    session: AsyncSession,
+) -> None:
+    """Raise/refresh the condition-scoped operator signal for a missing goal.
+
+    The dedupe key names the CONDITION - this project, this version - never the
+    occurrence. An occurrence-keyed alert would mint one immortal row per cycle
+    and reset ``created_at`` each time, so the condition could never age into
+    the escalation below.
+
+    Deliberately NOT a block: a null goal still degrades gracefully everywhere
+    it is read (``release_scoring.evaluate_goal_coverage_drift`` returns
+    ``not_applicable``). The defect being fixed is silence, not tolerance.
+    """
+    from app.alert_policy import create_project_alert_if_allowed
+    from app.models import Alert, AlertSeverity
+    from app.release_version import (
+        VERSION_GOAL_OMISSION_EVENT_TYPE,
+        version_goal_omission_dedupe_key,
+    )
+
+    dedupe_key = version_goal_omission_dedupe_key(
+        project.id, open_ver.version_number
+    )
+    severity = AlertSeverity.WARNING
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dedupe_key == dedupe_key,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        if existing.acknowledged_at is not None:
+            # An operator has seen it and owns it - keep refreshing the row's
+            # occurrence count but never re-page by escalating underneath them.
+            severity = existing.severity
+        elif (
+            _utcnow() - existing.created_at
+        ) >= _VERSION_GOAL_OMISSION_ESCALATE_AFTER:
+            severity = AlertSeverity.ERROR
+
+    cycles = int(getattr(open_ver, "goal_omission_cycles", 0) or 0)
+    await create_project_alert_if_allowed(
+        session,
+        project_id=project.id,
+        event_type=VERSION_GOAL_OMISSION_EVENT_TYPE,
+        severity=severity,
+        # Condition-named title: it names WHICH version has no goal and nothing
+        # about this particular occurrence, so the row stays stable while the
+        # condition holds.
+        title=f"Version goal not authored - v{open_ver.version_number}",
+        message=(
+            f"ASKED FOR: a 1-3 sentence outcome-framed goal for "
+            f"v{open_ver.version_number}, requested from the strategic agent as "
+            f"the `new_version_goal` output field (signalled every cycle via "
+            f"`version_phase.goal_needed=true` while the goal is null). "
+            f"CAME BACK: no usable `new_version_goal` on {cycles} consecutive "
+            f"completed strategic cycles. "
+            f"CONSEQUENCE: v{open_ver.version_number} is accumulating merged work "
+            f"with no stated objective, and the independent merge grade has "
+            f"nothing to score it against - goal-coverage drift reports "
+            f"'not applicable' rather than failing, which is why this can run for "
+            f"several versions unnoticed. Nothing is blocked; promotion is "
+            f"unaffected. "
+            f"TO RESOLVE: have the strategist emit `new_version_goal` next cycle, "
+            f"or set it directly with "
+            f"POST /api/admin/projects/{project.id}/version-goal."
+        )[:1000],
+        source="version_goal_omission",
+        dedupe_key=dedupe_key,
+    )
+
+
+async def _record_version_goal_omission(
+    open_ver: Any,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Own the outcome of an unanswered ``new_version_goal`` request.
+
+    Called when the open version's goal is still NULL - which is exactly the
+    predicate ``strategic_spawning`` uses to emit ``goal_needed`` - and the
+    agent's output carried no usable value. Before this, that case returned on
+    the first guard of :func:`_apply_new_version_goal` and left no trace, so an
+    omitted required output was indistinguishable from one never requested.
+    """
+    anchor = _strategic_cycle_anchor(task)
+    if open_ver.goal_omission_last_cycle == anchor:
+        # Already counted for this cycle (inline + completion both land here).
+        return
+    open_ver.goal_omission_cycles = int(open_ver.goal_omission_cycles or 0) + 1
+    open_ver.goal_omission_last_cycle = anchor
+    session.add(open_ver)
+    logger.warning(
+        "[STRATEGIC] Task %s (%s path): v%d requested `new_version_goal` "
+        "(goal is NULL, version_phase.goal_needed=True) and the agent output "
+        "carried none - consecutive omissions=%d (alert at %d) project=%s",
+        task.id,
+        path,
+        open_ver.version_number,
+        open_ver.goal_omission_cycles,
+        _VERSION_GOAL_OMISSION_ALERT_AFTER,
+        project.id,
+    )
+    if open_ver.goal_omission_cycles < _VERSION_GOAL_OMISSION_ALERT_AFTER:
+        return
+    await _alert_version_goal_not_authored(open_ver, project, session)
+
+
 async def _apply_new_version_goal(
     goal: object,
     task: Task,
@@ -1188,43 +1347,67 @@ async def _apply_new_version_goal(
       - the API path: ``task.context.get(NEW_VERSION_GOAL_CONTEXT_KEY)``
       - the fallback parse path: ``parsed.get("new_version_goal")``
 
+    Returns ``True`` when a goal was authored by this call, ``False`` otherwise.
+    (The signature always claimed ``bool`` but every branch used to fall out on
+    a bare ``return``, so the value was unconditionally ``None``; no caller read
+    it. It now carries real information.)
+
     When valid, sets the goal with ``source='strategist'`` and ``session.add``s
-    the row — the caller's surrounding ``await session.commit()`` persists it.
+    the row - the caller's surrounding ``await session.commit()`` persists it.
     Strategic may correct any system-written version goal when evidence shows
     it is infeasible or badly scoped; ``goal_editor_info`` retains provenance.
 
-    Silently no-ops when:
-      - ``goal`` is None / not a non-empty string
-      - ``is_contentless_goal`` returns True
-      - The project has no open ``ReleaseVersion``
+    When NOTHING usable arrives, this no longer returns silently. If the open
+    version's goal is still NULL then the ask was made this cycle, and the
+    omission is recorded on the version's compliance ledger - bounded re-ask,
+    then a condition-scoped operator alert. See
+    :func:`_record_version_goal_omission`.
 
-    All errors are logged and swallowed — a bad or absent goal must never
+    Still a pure no-op (not an omission) when:
+      - The project has no open ``ReleaseVersion`` - nothing was asked for.
+      - The open version already HAS a goal and none arrived - again no ask was
+        made, because ``goal_needed`` is only emitted while the goal is null.
+
+    All errors are logged and swallowed - a bad or absent goal must never
     block vision/direction writes.
     """
-    if not goal or not isinstance(goal, str):
-        return
-    _nvg_text = goal.strip()
-    if not _nvg_text:
-        return
     try:
         from app.release_scoring import is_contentless_goal
         from app.release_version import (
             current_open_version as _cur_open_version,
+            resolve_version_goal_omission_alert as _resolve_goal_omission_alert,
             set_version_goal as _set_version_goal,
         )
 
-        if is_contentless_goal(_nvg_text):
-            return
+        _nvg_text = goal.strip() if isinstance(goal, str) else ""
+        if _nvg_text and is_contentless_goal(_nvg_text):
+            # A contentless placeholder ("n/a", "test") is a non-answer, not an
+            # answer - fall through to the omission path rather than returning.
+            _nvg_text = ""
+
+        # Resolve the open version FIRST, for the omission branch as well as the
+        # apply branch. The old ``if not goal: return`` short-circuited before
+        # ever looking, which is precisely why an omitted required output left
+        # no trace anywhere.
         _open_ver = await _cur_open_version(session, project.id)
         if _open_ver is None:
-            logger.info(
-                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
-                "— skipping new_version_goal",
-                task.id,
-                path,
-                project.id,
-            )
-            return
+            if _nvg_text:
+                logger.info(
+                    "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for "
+                    "project %s - skipping new_version_goal",
+                    task.id,
+                    path,
+                    project.id,
+                )
+            return False
+
+        if not _nvg_text:
+            if _open_ver.goal is None:
+                await _record_version_goal_omission(
+                    _open_ver, task, project, session, path=path
+                )
+            return False
+
         if _open_ver.goal is not None:
             logger.info(
                 "[STRATEGIC] Task %s (%s path): correcting open version v%d goal "
@@ -1240,6 +1423,14 @@ async def _apply_new_version_goal(
             editor_id=str(task.id)[:8],
             source="strategist",
         )
+        # The ask has been answered. ``set_version_goal`` already cleared the
+        # compliance ledger (single funnel, so the operator endpoint clears it
+        # too); retire the condition-scoped alert as well. Its retirement mode
+        # is SOURCE_CONDITION, which means THIS producer owns the resolver -
+        # ``alert_dispatch.sweep_resolve_policy_retirement_alerts`` reconciles
+        # only TASK_TERMINAL and TIMELINE_ONLY rows and would leave this one
+        # open forever.
+        await _resolve_goal_omission_alert(session, _open_ver)
         session.add(_open_ver)
         logger.info(
             "[STRATEGIC] Task %s (%s path): authored version goal for v%d project=%s: %.80s",
@@ -1249,12 +1440,14 @@ async def _apply_new_version_goal(
             project.id,
             _nvg_text,
         )
+        return True
     except Exception:
         logger.exception(
             "[STRATEGIC] Task %s (%s path): failed to apply new_version_goal (non-fatal)",
             task.id,
             path,
         )
+        return False
 
 
 async def _apply_new_acceptance_criteria(

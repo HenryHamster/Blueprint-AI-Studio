@@ -199,6 +199,13 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "release.stabilize_stalled": AlertEventPolicy(
         "release.stabilize_stalled", domain=DOMAIN_RELEASE_LIFECYCLE
     ),
+    # The strategic agent was asked for the version goal and did not emit it.
+    # Condition-scoped (project + version) and non-blocking: a null goal still
+    # degrades gracefully in release_scoring; this only makes the omission
+    # audible instead of silent.
+    "release.version_goal_not_authored": AlertEventPolicy(
+        "release.version_goal_not_authored", domain=DOMAIN_RELEASE_LIFECYCLE
+    ),
     "release.promotion_deploy_failed": AlertEventPolicy(
         "release.promotion_deploy_failed", domain=DOMAIN_RELEASE_LIFECYCLE
     ),

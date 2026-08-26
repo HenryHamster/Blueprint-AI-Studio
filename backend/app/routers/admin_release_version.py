@@ -1158,6 +1158,11 @@ async def set_version_goal(
 
     operator_id = current_user.get("email") or current_user["user_id"]
     _release_version.set_version_goal(open_ver, payload.goal, editor_id=operator_id)
+    # This endpoint is the escape hatch named in the goal-omission alert's own
+    # "TO RESOLVE" line, so taking it must end the condition. set_version_goal
+    # cleared the streak counter; retire the durable alert row too — its
+    # SOURCE_CONDITION retirement mode means no sweep will ever do it for us.
+    await _release_version.resolve_version_goal_omission_alert(session, open_ver)
     session.add(open_ver)
     await session.commit()
     await session.refresh(open_ver)
