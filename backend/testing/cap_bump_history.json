@@ -5653,8 +5653,8 @@
           "new_cap": 2950
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-26T16:05:26.024363+00:00",
+          "commit_sha": "d770bb396d43ac5234f5194ce4fe79b03a51a181",
+          "commit_date": "2026-08-26T09:09:05-07:00",
           "old_cap": 2950,
           "new_cap": 3400,
           "justification": "Henry: standing approval to raise chronic caps generously (2026-08-25) \u2014 this file is the size-governance guard suite itself, so it grows whenever a new governance rule is pinned; decomposing it would split guards away from the rules they pin. Raise well clear rather than nibble."
