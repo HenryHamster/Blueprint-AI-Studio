@@ -48,11 +48,14 @@ from app.release_promotion_pending import (
     _PROMOTION_PENDING_MANAGED,
     _canonicalize_promotion_pending,
     _classify_405_message,
-    _increment_pending_transient_red_count,
     _managed_check_wait_snapshot,
     _parse_promotion_pending_time,
     _persist_managed_check_wait_snapshot,
     _promotion_pending_fallback_enabled_at,
+)
+from app.release_promotion_ci_rerun import (
+    blocking_promotion_check_names,
+    hold_red_promotion_ci,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
 from app.ci_resolution import (
@@ -1071,8 +1074,13 @@ async def _reconcile_if_managed_check_wait(
     * **Out-of-band landing** — candidate already reachable from the promotion
       target → record success through the existing promotion success path.
     * **CI still pending / no checks** — leave pending for the next sweep.
-    * **CI red** — record ``required_check_failed`` with the failing check
-      names so retry machinery applies.
+    * **CI red** — hold the attempt for one bounded ``rerun-failed-jobs``
+      (``app.release_promotion_ci_rerun.hold_red_promotion_ci``); the PR and
+      ``release-v{N}`` stay intact so a re-run or a pushed fix can still land
+      this attempt.  Red stays BLOCKING — the merge below still requires a
+      fresh ``_CI_GREEN`` read.  Once the rerun budget or its observe window is
+      spent, record ``required_check_failed`` with the failing check names so
+      retry machinery applies.
     * **PR closed without merging** — record ``pr_closed_without_merge``.
     * **Alembic guard blocks** — record ``migration_guard_blocked``.
     * **Non-check branch-protection block** (green CI but merge refused) —
@@ -1521,46 +1529,21 @@ async def _reconcile_if_managed_check_wait(
 
             ci_state = _classify_check_runs(check_result)
             if ci_state == _CI_RED:
-                if not _check_result_has_genuine_failure(check_result):
-                    # Only transient conclusions (cancelled / timed_out) — do
-                    # not tear down the PR or release branch.  Increment the
-                    # sweep counter and leave pending until it hits the cap.
-                    new_count = await _increment_pending_transient_red_count(
-                        session,
-                        version.id,
-                        pr_number=int(pr_number),
-                    )
-                    max_sweeps = _max_transient_ci_red_sweeps()
-                    if new_count < max_sweeps:
-                        logger.warning(
-                            "[RELEASE_QUALIFIER] reconcile managed_check_wait: "
-                            "PR #%s for v%d has transient-only red CI "
-                            "(cancelled/timed_out, sweep %d/%d) — leaving pending",
-                            pr_number,
-                            version.version_number,
-                            new_count,
-                            max_sweeps,
-                        )
-                        return False
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: "
-                        "PR #%s for v%d reached transient-red sweep cap (%d) "
-                        "— escalating to required_check_failed",
-                        pr_number,
-                        version.version_number,
-                        max_sweeps,
-                    )
-                blocking_conclusions = {
-                    "failure",
-                    "cancelled",
-                    "timed_out",
-                    "action_required",
-                }
-                failing_names = [
-                    d.get("name", "unknown")
-                    for d in check_result.get("details", [])
-                    if d.get("conclusion") in blocking_conclusions
-                ]
+                failing_names = blocking_promotion_check_names(check_result)
+                if await hold_red_promotion_ci(
+                    session,
+                    version,
+                    token,
+                    owner,
+                    repo,
+                    int(pr_number),
+                    pr_head_sha,
+                    check_result,
+                    failing_names,
+                    genuine_failure=_check_result_has_genuine_failure(check_result),
+                    max_transient_sweeps=_max_transient_ci_red_sweeps(),
+                ):
+                    return False
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
                     "for v%d has red CI — recording required_check_failed: %s",
