@@ -1119,6 +1119,8 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "confirmed_finding_trend",
         "outcome_scaffolding_flagged",
         "churn_retirement_recommended",
+        "retirement_consideration_needed",
+        "retirement_consideration_at",
     ):
         _put_present(out, stat, key)
     for key in (
@@ -1128,6 +1130,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "success_evidence",
         "retirement_condition",
         "outcome_scaffolding_evidence",
+        "retirement_consideration_reason",
     ):
         _put_present(out, stat, key, text_cap=_DIRECTION_SUMMARY_LONG_TEXT_CAP)
     research_context = _bounded_text(
@@ -1141,6 +1144,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "recent_findings_verification_basis",
         "recent_findings_challenge_summary",
         "churn_retirement_evidence",
+        "retirement_consideration_evidence",
     ):
         compact = _compact_scalar_mapping(stat.get(key), text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
         if compact:

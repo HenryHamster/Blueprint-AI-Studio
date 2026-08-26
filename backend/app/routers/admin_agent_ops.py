@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from typing import Any, List, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -1075,13 +1076,86 @@ async def agent_annotate(
     return response
 
 
+def _resident_process_task(candidate: Task) -> bool:
+    """Return whether *candidate* is a Resident process incarnation.
+
+    A Continuous Workday generation runs AS a ``strategic_review`` Task, so
+    payload type alone cannot tell a Resident worker apart from a one-shot
+    strategic cycle. The server-owned context markers can, and the same two
+    markers are already the canonical discriminator in
+    ``app.strategic_completion`` / ``app.strategic_cycle``, where a Resident
+    generation is explicitly classified as "process infrastructure, not a
+    one-shot strategic result".
+    """
+    context = getattr(candidate, "context", None) or {}
+    return (
+        context.get("_resident_session") is True
+        or context.get("_resident_infrastructure") is True
+    )
+
+
+def _competing_one_shot_strategic_task(candidates: Iterable[Task]) -> Task | None:
+    """Return the first candidate that is a LIVE one-shot Strategic writer.
+
+    "Live one-shot Strategic writer" is the exact thing the Resident mutation
+    fence must not race, and it is narrower than "any active task whose payload
+    type is strategic":
+
+    * Resident process incarnations are excluded. Single-writer among Resident
+      workers is already enforced — far more precisely — by the session-id,
+      worker-generation and process-incarnation checks the caller runs
+      immediately before this fence. Counting a sibling Resident row here only
+      mutes the live Resident during a handoff (predecessor generation still
+      winding down, adopted cadence duplicate, retry re-provision), which is
+      exactly the window in which the operator is talking to it.
+    * A one-shot that has never begun executing is excluded. It has issued no
+      strategic op and holds no pre-mutation snapshot, so there is nothing for
+      the Resident's write to clobber (and nothing of the Resident's for its
+      completion to clobber: it will read state fresh when it does start).
+      ``started_at is None`` is the same "not-yet-executing" predicate
+      ``strategic_resident_session._task_is_adoptable`` uses. A QUEUED one-shot
+      that cannot dispatch would otherwise fence the Resident indefinitely.
+    * Archived rows are excluded.
+
+    An IN_PROGRESS / EVALUATING one-shot still fences even if ``started_at`` was
+    never stamped: those statuses mean an agent ran, so a claim-time bookkeeping
+    gap must not open the race.
+    """
+    for candidate in candidates:
+        if getattr(candidate, "archived", False):
+            continue
+        if (candidate.first_payload or {}).get("type") not in STRATEGIC_TASK_TYPES:
+            continue
+        if _resident_process_task(candidate):
+            continue
+        if candidate.started_at is None and candidate.status not in (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ):
+            continue
+        return candidate
+    return None
+
+
 async def _enforce_resident_mutation_fence(
     session: AsyncSession,
     project: Project,
     task: Task,
     op: str,
 ) -> None:
-    """Require fresh continuation and sole Strategic-lane ownership for mutations."""
+    """Require fresh continuation and sole Strategic-lane ownership for mutations.
+
+    The invariant being protected is *one Strategic writer per project*: a
+    one-shot ``design_doc_update`` / ``strategic_review`` cycle applies a
+    whole-cycle result derived from the state it read when it started, so it
+    must not interleave with the Resident's incremental mutations in either
+    direction. It is NOT "no other strategic-typed row may exist" — see
+    ``_competing_one_shot_strategic_task`` for why those are different.
+
+    Every refusal carries WHY (which lease condition failed, or which task owns
+    the lane and in what state); a bare state name leaves the Resident unable to
+    tell the operator what blocked it.
+    """
     if op in ("create_message", "resolve_message"):
         return
     resident_blob = _read_resident_session(project.vision)
@@ -1100,7 +1174,16 @@ async def _enforce_resident_mutation_fence(
     ):
         raise HTTPException(
             status_code=409,
-            detail="Resident continuation expired or ownership changed",
+            detail=(
+                "Resident continuation expired or ownership changed "
+                f"(reason={continuation.get('reason')}; "
+                f"operator_user_id={'present' if operator_user_id else 'missing'}; "
+                f"enabled={bool(continuation.get('enabled'))}; "
+                f"fresh={bool(continuation.get('fresh'))}; "
+                f"owned_by_current_operator="
+                f"{bool(continuation.get('owned_by_current_operator'))}; "
+                f"expires_at={continuation.get('expires_at')})"
+            ),
         )
 
     active_candidates = (
@@ -1119,13 +1202,18 @@ async def _enforce_resident_mutation_fence(
             )
         )
     ).scalars()
-    if any(
-        (candidate.first_payload or {}).get("type") in STRATEGIC_TASK_TYPES
-        for candidate in active_candidates
-    ):
+    blocking = _competing_one_shot_strategic_task(active_candidates)
+    if blocking is not None:
+        blocking_type = (blocking.first_payload or {}).get("type")
+        blocking_status = getattr(blocking.status, "value", blocking.status)
         raise HTTPException(
             status_code=409,
-            detail="Resident no longer owns the Strategic mutation lane",
+            detail=(
+                "Resident no longer owns the Strategic mutation lane: one-shot "
+                f"{blocking_type} task {blocking.id} is {blocking_status} and "
+                "owns the Strategic writer lane. Retry this mutation after it "
+                "reaches a terminal status."
+            ),
         )
 
 

@@ -27,6 +27,11 @@ from app.release_promotion_pending import (
     _LEGACY_NATIVE_PROMOTION_PENDING_KEYS,
     _normalize_legacy_promotion_pending,
 )
+from app.release_promotion_ci_rerun import (
+    _PROMOTION_CI_RERUN_BUDGET_DEFAULT,
+    _PROMOTION_CI_RERUN_OBSERVE_SECONDS_DEFAULT,
+    _promotion_ci_rerun_budget,
+)
 from app.release_reconciliation import (
     _PROMOTION_CLAIM_TIMEOUT_SECONDS,
     _promotion_pending_timeout_seconds,
@@ -5598,6 +5603,503 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
     # infrastructure (Strategic refresh armed) and spawns NO code-fix task.
     refresh_mock.assert_awaited_once()
     handle_mock.assert_not_awaited()
+
+
+# ── Bounded promotion-CI rerun gate ─────────────────────────────────────────
+# A red promotion PR used to be DESTROYED on first observation: the reconciler
+# closed the PR and deleted release-v{N} before anything else ran, so a single
+# flaky shard cost a full re-cut and a human nudge.  Ordinary task PRs already
+# get one bounded `rerun-failed-jobs` before a fix cycle is burned
+# (app.ci_completion._CI_RERUN_BUDGET); the promotion PR — the only source of
+# promotion-EQUIVALENT CI evidence in the system — got none.  These tests pin
+# the survivable behaviour AND all three of its bounds.  In every one of them
+# CI red remains blocking: no merge is ever attempted on a red read.
+
+
+def _genuine_red_check_result(*, failed_run_ids=None) -> dict:
+    """A genuinely-failing promotion CI read (one real test failure)."""
+
+    result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "genuine_failure": True,
+        "details": [
+            {
+                "name": "CI / Backend (shard 2)",
+                "status": "completed",
+                "conclusion": "failure",
+            },
+            {
+                "name": "CI / Frontend",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ],
+    }
+    if failed_run_ids is not None:
+        result["failed_run_ids"] = failed_run_ids
+    return result
+
+
+def _patch_managed_red_pr(mocker, pr_head: str, check_result: dict):
+    """Wire the GitHub surface for a managed_check_wait PR whose CI is red."""
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"ref": "release-v1", "sha": pr_head},
+                "base": {"ref": "release", "sha": "base0001"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value=check_result),
+    )
+
+
+def _rerun_ledger(*, count: int, age_seconds: float, head_sha: str) -> dict:
+    return {
+        "ci_rerun_count": count,
+        "ci_rerun_at": (_utcnow() - timedelta(seconds=age_seconds)).isoformat(),
+        "ci_rerun_head_sha": head_sha,
+    }
+
+
+def test_promotion_ci_rerun_bounds_are_pinned():
+    """Literal pins for the two bounds that keep a held attempt escapable.
+
+    These are deliberately literal rather than derived from the constants they
+    guard: a diff that widens the budget or the observe window has to change
+    this assertion too, which is what makes such a change reviewable.  Budget 1
+    mirrors ``app.ci_completion._CI_RERUN_BUDGET``; 20 minutes sits far below
+    the 4h managed_check_wait stall alert and the 24h promotion_pending
+    deadline, so a hold can never outlive either backstop.
+    """
+
+    assert _PROMOTION_CI_RERUN_BUDGET_DEFAULT == 1
+    assert _PROMOTION_CI_RERUN_OBSERVE_SECONDS_DEFAULT == 1200
+
+
+def test_promotion_ci_rerun_budget_resolver_honours_explicit_zero():
+    """0 disables the gate (restores teardown-on-first-red); junk falls back."""
+
+    from app import shared_state
+
+    with contextlib.ExitStack() as stack:
+        stack.callback(
+            lambda: shared_state.runtime_config.pop("promotion_ci_rerun_budget", None)
+        )
+        shared_state.runtime_config["promotion_ci_rerun_budget"] = 0
+        assert _promotion_ci_rerun_budget() == 0
+        shared_state.runtime_config["promotion_ci_rerun_budget"] = 3
+        assert _promotion_ci_rerun_budget() == 3
+        # Negative / unparseable must NOT silently disable or invert the gate.
+        shared_state.runtime_config["promotion_ci_rerun_budget"] = -5
+        assert _promotion_ci_rerun_budget() == _PROMOTION_CI_RERUN_BUDGET_DEFAULT
+        shared_state.runtime_config["promotion_ci_rerun_budget"] = "nonsense"
+        assert _promotion_ci_rerun_budget() == _PROMOTION_CI_RERUN_BUDGET_DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_genuine_red_reruns_ci_instead_of_destroying_pr(
+    db_session, mocker
+):
+    """MUTATION PIN: a genuinely red promotion PR is HELD, not destroyed.
+
+    Before the fix the first red observation closed the PR and deleted
+    release-v{N} (``_cleanup_managed_check_wait_failure_artifacts``) and drove
+    the version to ``promotion_failed``, so the attempt could only be recovered
+    by a full re-cut.  Now the reconciler spends one bounded rerun of the failed
+    workflow runs and leaves the PR and branch intact.
+
+    The red stays BLOCKING: no merge is attempted, the version stays
+    ``pending``, and nothing records a green verdict.
+    """
+
+    pr_head = "feedface" * 5
+    _patch_managed_red_pr(
+        mocker, pr_head, _genuine_red_check_result(failed_run_ids=[4242, 4243])
+    )
+    rerun = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+    merge = mocker.patch("app.github.merge_pull_request", new=AsyncMock())
+    harvest = mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = _managed_check_wait_qual(pr_head)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False, "a rerun-held attempt is not terminal"
+    # The destructive pair must not have run.
+    cleanup.assert_not_called()
+    # ... and the red must still be blocking.
+    merge.assert_not_awaited()
+    harvest.assert_not_awaited()
+    assert rerun.await_count == 2
+    assert [c.args[3] for c in rerun.await_args_list] == [4242, 4243]
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["pr_number"] == 42
+    # Durable, bounded ledger — this is what stops an unbounded rerun loop.
+    assert pending["ci_rerun_count"] == 1
+    assert pending["ci_rerun_head_sha"] == pr_head
+    assert pending["ci_rerun_run_ids"] == [4242, 4243]
+    # Operator-visible REASON: why it paused and what releases it.
+    snapshot = pending["check_snapshot"]
+    assert snapshot["reason"] == "promotion_ci_rerun_issued"
+    assert "CI / Backend (shard 2)" in snapshot["detail"]
+    assert "1/1" in snapshot["detail"]
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_holds_while_issued_rerun_is_still_settling(
+    db_session, mocker
+):
+    """A stale red read inside the observe window must not tear the attempt down.
+
+    GitHub keeps serving the superseded ``completed/failure`` verdict briefly
+    after ``rerun-failed-jobs`` is accepted (and the check-runs cache holds it
+    for up to 30s).  Without this hold the very next sweep would destroy the PR
+    anyway, making the rerun pointless.  The budget is already spent, so this
+    sweep must NOT issue a second rerun.
+    """
+
+    pr_head = "feedface" * 5
+    _patch_managed_red_pr(
+        mocker, pr_head, _genuine_red_check_result(failed_run_ids=[4242])
+    )
+    rerun = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    qual = _managed_check_wait_qual(pr_head)
+    qual["promotion_pending"].update(
+        _rerun_ledger(count=1, age_seconds=60, head_sha=pr_head)
+    )
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    cleanup.assert_not_called()
+    assert rerun.await_count == 0, "budget already spent — must not re-run again"
+    await db_session.refresh(version)
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["ci_rerun_count"] == 1
+    snapshot = pending["check_snapshot"]
+    assert snapshot["reason"] == "promotion_ci_rerun_awaiting"
+    assert "1/1" in snapshot["detail"]
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_rerun_hold_expires_and_tears_down(db_session, mocker):
+    """BOUNDED ESCAPE: once the observe window lapses the terminal path runs.
+
+    This is the anti-wedge pin.  A rerun that was issued, spent the budget, and
+    still reads red after the window must fall through to the UNCHANGED
+    ``required_check_failed`` teardown — the hold can never become permanent.
+    """
+
+    pr_head = "feedface" * 5
+    _patch_managed_red_pr(
+        mocker, pr_head, _genuine_red_check_result(failed_run_ids=[4242])
+    )
+    rerun = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    qual = _managed_check_wait_qual(pr_head)
+    qual["promotion_pending"].update(
+        _rerun_ledger(count=1, age_seconds=2 * 3600, head_sha=pr_head)
+    )
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    cleanup.assert_called_once()
+    assert rerun.await_count == 0, "budget exhausted — no second rerun"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "required_check_failed"
+    assert "CI / Backend (shard 2)" in version.last_qualification.get("detail", "")
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_red_without_failed_run_ids_still_tears_down(
+    db_session, mocker
+):
+    """No rerunnable workflow run => today's behaviour, unchanged.
+
+    A red with nothing to re-run (checks published by an external provider, or
+    a run GitHub no longer exposes) must not become a hold with no way out.
+    """
+
+    pr_head = "feedface" * 5
+    _patch_managed_red_pr(mocker, pr_head, _genuine_red_check_result())
+    rerun = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = _managed_check_wait_qual(pr_head)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    assert rerun.await_count == 0
+    cleanup.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["error"] == "required_check_failed"
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_rerun_gate_disabled_by_zero_budget(
+    db_session, mocker
+):
+    """A deliberate ``promotion_ci_rerun_budget: 0`` restores teardown-on-red.
+
+    The off switch must be real — the gate is a behaviour change on the release
+    path, and an operator must be able to turn it off without a deploy.
+    """
+
+    pr_head = "feedface" * 5
+    _patch_managed_red_pr(
+        mocker, pr_head, _genuine_red_check_result(failed_run_ids=[4242])
+    )
+    mocker.patch(
+        "app.release_promotion_ci_rerun._promotion_ci_rerun_budget",
+        return_value=0,
+    )
+    rerun = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = _managed_check_wait_qual(pr_head)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    assert rerun.await_count == 0
+    cleanup.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["error"] == "required_check_failed"
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_rerun_rejected_by_github_tears_down(
+    db_session, mocker
+):
+    """GitHub refusing every rerun must not create a hold with no rerun behind it."""
+
+    pr_head = "feedface" * 5
+    _patch_managed_red_pr(
+        mocker, pr_head, _genuine_red_check_result(failed_run_ids=[4242])
+    )
+    rerun = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=False),
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = _managed_check_wait_qual(pr_head)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    rerun.assert_awaited_once()
+    cleanup.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["error"] == "required_check_failed"
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_held_attempt_merges_when_rerun_goes_green(
+    db_session, mocker
+):
+    """The payoff: the SAME PR and release branch merge, with no re-cut.
+
+    A version carrying a spent rerun ledger whose re-run came back green must
+    promote through the normal path.  The merge happens only because a FRESH
+    read classified green — the rerun ledger grants no authority of its own.
+    """
+
+    candidate_sha = "feedface" * 5
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"ref": "release-v1", "sha": candidate_sha},
+                "base": {"ref": "release", "sha": "base0001"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "completed", "conclusion": "success", "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    promoted_sha = "merge00" * 5
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "sha": promoted_sha}),
+    )
+    mocker.patch(
+        "app.task_locking.acquire_merge_submission_locks",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=promoted_sha))
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    qual = _managed_check_wait_qual(candidate_sha)
+    qual["promotion_pending"].update(
+        _rerun_ledger(count=1, age_seconds=60, head_sha=candidate_sha)
+    )
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.promoted_sha == promoted_sha
+    assert merge_mock.call_args.kwargs["expected_head_sha"] == candidate_sha
+    cleanup.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -143,6 +143,36 @@
       "glob": "scripts/test_local_runner.py",
       "sentinels": ["backend/testing/test_conversational_workday_protection.py"],
       "why": "conversational_workday_manifest.json's PROTECT list names this exact file. Same scoping rationale as scripts/test_runner_isolation.py above."
+    },
+    {
+      "glob": "backend/app/**/*.py",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "SIZE-GUARDRAIL LEFT SHIFT. The module-size guardrail (module_size_limits.json caps + the 1500-line uncapped coverage threshold) was enforced against the LIVE TREE only by test_invariants.py, which runs in the ci.yml backend matrix -- and ci.yml's pull_request trigger is `branches: [main]`, so an automain PR never runs it. The only workflow an automain PR does get is guard-data.yml, whose Derived-artifacts job replaces the standalone roster wholesale via BLUEPRINT_STATIC_GUARD_SELECTORS (no size scan in that list) and whose Impacted-backend-tests job runs only what this manifest selects. Before this entry NO glob mapped a governed source surface to any live-tree size scan, so a size breach first turned red on the automain->main promotion PR -- the worst place for it, since a red promotion PR usually CLOSES and deletes its release branch. Proven live, not theoretical: PR #17966 took backend/testing/test_impacted_tests.py from 1431 to 1522 lines past the uncapped threshold and merged into automain green. backend/app is the 'backend' section's source root, so any change here can breach a cap. The sentinel imports check_size_limits, not the modules it scans, so the dotted-import reverse-dep scan can never select it for an arbitrary app file."
+    },
+    {
+      "glob": "backend/testing/**/*.py",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "backend/testing is the 'testing' section's source root and the surface the proven breach (test_impacted_tests.py at 1522 uncapped lines, merged green into automain) actually landed on. Registered as **/*.py rather than test_*.py because the section scans every .py under the root, helpers included."
+    },
+    {
+      "glob": "backend/testing/module_size_limits.json",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "The cap ledger itself. Lowering a cap, or deleting an entry, turns a previously-clean file into a violation without touching a single source file, so the gate has to re-run on an edit to this artifact. It is not a .py file, so neither the reverse-dep scan nor the test_<module>.py convention can reach it."
+    },
+    {
+      "glob": "agent/src/**",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "agent/src is the 'agent' section's source root. A PR confined to agent/ contains no backend Python at all, so the reverse-dep scan selects nothing and only this registration (plus the standalone roster seat it forces) puts a size scan on that diff."
+    },
+    {
+      "glob": "admin-ui/src/**",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "admin-ui/src is the 'frontend' section's source root (.ts/.tsx, excluding *.test.ts(x) and *.d.ts). Same selection gap as agent/src/** above."
+    },
+    {
+      "glob": "scripts/**/*.py",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "scripts/ is the 'scripts' section's source root, with 17 capped modules and release-critical logic. A scripts/**-shaped glob is safe here where the older conversational-workday entries deliberately used exact filenames: scripts/ is ALREADY a static_release_guard STATIC_PATH_PREFIXES member derived from conversational_workday_manifest.json (test_static_scope_matches_path_boundaries asserts scripts/test-backend.sh.bak is in scope), so this widens nothing there. Registering these three non-backend surfaces is what makes impacted_tests.corpus_lane_required_sentinels demand a STANDALONE_ARGS seat for this sentinel -- deliberate, and paid for honestly: the scan is a corpus walk whose cost is file I/O, measured 3x on each filesystem it runs on -- ~2.6s with the repo on a Linux filesystem (what CI does) but 78-103s across a Docker-on-Windows bind mount (what ./check test does on a Windows dev box). It therefore carries an explicit @pytest.mark.timeout(120) rather than sitting under that lane's --timeout=30 and reporting a slow filesystem as a size defect. See the module docstring for both measurements."
     }
   ]
 }
