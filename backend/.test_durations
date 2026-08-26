@@ -15982,7 +15982,7 @@
   "testing/test_release_commit_authorship.py::test_unresolved_confirmation_receipt_preserves_serving_truth": 0.5051245508948341,
   "testing/test_release_commit_authorship.py::test_web_flow_committer_does_not_mask_operator_authorship": 0.005666497047059238,
   "testing/test_release_operator_commit_gate.py::test_candidate_absent_or_unresolvable_evidence_fails_closed": 0.002609396062325686,
-  "testing/test_release_operator_commit_gate.py::test_candidate_no_contract_declared_is_not_applicable_and_passes": 0.006708534026984125,
+  "testing/test_release_operator_commit_gate.py::test_candidate_no_contract_declared_is_unconfigured_and_blocks": 0.006708534026984125,
   "testing/test_release_operator_commit_gate.py::test_candidate_nonzero_operator_commits_blocks_distinctly": 0.008065607049502432,
   "testing/test_release_operator_commit_gate.py::test_candidate_zero_operator_commits_passes": 0.009547913970891386,
   "testing/test_release_operator_commit_gate.py::test_explicit_authorship_budget_is_surfaced_to_the_operator": 0.005369522958062589,

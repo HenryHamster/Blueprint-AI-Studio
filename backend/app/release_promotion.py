@@ -562,6 +562,12 @@ async def _record_qualification_verdict(
             promotion_pr_url=base_record.get("pr_url"),
             promotion_conflict=(conflict if isinstance(conflict, bool) else None),
             promotion_error_detail=promotion_error_detail,
+            # Force-promote provenance is copied into every immutable verdict
+            # row so later qualification writes cannot erase the operator's
+            # actor, justification, or timestamp.
+            forced_promote_by=base_record.get("forced_promote_by"),
+            forced_promote_at=_parse_iso_dt(base_record.get("forced_promote_at")),
+            forced_promote_reason=base_record.get("forced_promote_reason"),
         )
         # Flush the caller's staged mutations into the outer transaction first,
         # so the savepoint below isolates ONLY the verdict INSERT.
