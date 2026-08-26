@@ -43,7 +43,7 @@ import logging
 import tarfile
 import time
 from collections import OrderedDict
-from typing import Dict, Tuple
+from typing import Any, Callable, Coroutine, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +83,11 @@ _blob_cache: "OrderedDict[str, str]" = OrderedDict()
 _blob_cache_bytes = 0
 _archive_cache: "OrderedDict[Tuple[str, str, str], bytes]" = OrderedDict()
 _archive_cache_bytes = 0
-# Single-flight: concurrent grounding passes share one tree fetch per branch.
-_tree_fetch_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
+# Single-flight: concurrent grounding passes share one tree fetch per exact SHA.
+_tree_fetch_tasks: Dict[Tuple[str, str, str], asyncio.Task[Tuple[Dict[str, str], bool] | None]] = {}
+# Cache-default callers in this module and app.github_refs share the same
+# branch-tip request, while each caller retains its own response contract.
+_branch_sha_fetch_tasks: Dict[Tuple[str, str, str], asyncio.Task[Any]] = {}
 # A completed task is removed by its own callback, so waiters that already
 # acquired this exact flight continue to share its success or failure.
 _archive_fetch_tasks: Dict[Tuple[str, str, str], asyncio.Task[bytes | None]] = {}
@@ -140,17 +143,12 @@ async def _resolve_branch_sha(
         _bump_cache_stat("branch_sha_snapshot")
         return cached[0]
 
-    from urllib.parse import quote
-
-    from app.github import _github_request
-
-    url = (
-        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/"
-        f"{quote(branch, safe='')}"
-    )
     try:
-        response = await _github_request(
-            "GET", url, _headers(token), max_retries=2, project_id=project_id
+        response = await _get_shared_branch_sha_response(
+            key,
+            lambda: _fetch_branch_sha_response(
+                token, owner, repo, branch, project_id, max_retries=2
+            ),
         )
         if response.status_code != 200:
             logger.warning(
@@ -164,7 +162,7 @@ async def _resolve_branch_sha(
         sha = (response.json().get("object") or {}).get("sha")
         if not isinstance(sha, str) or not sha:
             return None
-        _branch_sha_cache[key] = (sha, now)
+        _branch_sha_cache[key] = (sha, time.monotonic())
         return sha
     except Exception as e:  # noqa: BLE001 — snapshot reads must degrade, not raise
         logger.warning(
@@ -175,6 +173,54 @@ async def _resolve_branch_sha(
             e,
         )
         return None
+
+
+async def _fetch_branch_sha_response(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+    *,
+    max_retries: int | None = None,
+) -> Any:
+    """Fetch a branch response for the shared cache-default flight."""
+    from urllib.parse import quote
+
+    from app.github import _github_request
+
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/"
+        f"{quote(branch, safe='')}"
+    )
+    kwargs: dict[str, Any] = {"project_id": project_id}
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    return await _github_request("GET", url, _headers(token), **kwargs)
+
+
+async def _get_shared_branch_sha_response(
+    key: Tuple[str, str, str],
+    fetcher: Callable[[], Coroutine[Any, Any, Any]],
+) -> Any:
+    """Return one shared in-flight branch response for *key*.
+
+    The response is intentionally translated by the caller: snapshot reads
+    degrade to ``None`` while ``github_refs.get_branch_sha`` preserves its
+    HTTPException contract. Failed responses are never cached, because the
+    completed flight is removed before a later cache miss creates a retry.
+    """
+    flight = _branch_sha_fetch_tasks.get(key)
+    if flight is None:
+        flight = asyncio.create_task(fetcher())
+        _branch_sha_fetch_tasks[key] = flight
+
+        def _clear_completed_flight(done_task: asyncio.Task[Any]) -> None:
+            if _branch_sha_fetch_tasks.get(key) is done_task:
+                _branch_sha_fetch_tasks.pop(key, None)
+
+        flight.add_done_callback(_clear_completed_flight)
+    return await asyncio.shield(flight)
 
 
 async def _fetch_tree(
@@ -274,14 +320,12 @@ async def _get_snapshot_at_sha(
         _tree_cache.move_to_end(key)
         _bump_cache_stat("tree_snapshot")
         return snapshot
-    lock = _tree_fetch_locks.setdefault(key, asyncio.Lock())
-    try:
-        async with lock:
-            # Re-check after the wait: a concurrent pass may have populated it.
+    flight = _tree_fetch_tasks.get(key)
+    if flight is None:
+        async def _fetch_and_cache_tree() -> Tuple[Dict[str, str], bool] | None:
             snapshot = _tree_cache.get(key)
             if snapshot is not None:
                 _tree_cache.move_to_end(key)
-                _bump_cache_stat("tree_snapshot")
                 return snapshot
             snapshot = await _fetch_tree(token, owner, repo, sha, project_id)
             if snapshot is None:
@@ -290,8 +334,18 @@ async def _get_snapshot_at_sha(
             while len(_tree_cache) > _TREE_CACHE_MAX_ENTRIES:
                 _tree_cache.popitem(last=False)
             return snapshot
-    finally:
-        _tree_fetch_locks.pop(key, None)
+
+        flight = asyncio.create_task(_fetch_and_cache_tree())
+        _tree_fetch_tasks[key] = flight
+
+        def _clear_completed_flight(
+            done_task: asyncio.Task[Tuple[Dict[str, str], bool] | None],
+        ) -> None:
+            if _tree_fetch_tasks.get(key) is done_task:
+                _tree_fetch_tasks.pop(key, None)
+
+        flight.add_done_callback(_clear_completed_flight)
+    return await asyncio.shield(flight)
 
 
 def _blob_cache_get(blob_sha: str) -> str | None:

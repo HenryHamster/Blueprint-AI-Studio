@@ -425,6 +425,7 @@ async def get_branch_sha(
             _BRANCH_SHA_TTL_S,
             _branch_sha_cache,
             _bump_cache_stat,
+            _get_shared_branch_sha_response,
         )
 
         _hit = _branch_sha_cache.get((owner, repo, branch))
@@ -437,12 +438,23 @@ async def get_branch_sha(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    response = await _github_request(
-        "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
-        headers,
-        project_id=project_id,
-    )
+    if live:
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
+            headers,
+            project_id=project_id,
+        )
+    else:
+        response = await _get_shared_branch_sha_response(
+            (owner, repo, branch),
+            lambda: _github_request(
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
+                headers,
+                project_id=project_id,
+            ),
+        )
     if response.status_code == 404:
         logger.warning(f"Branch '{branch}' not found (404)")
         raise HTTPException(
