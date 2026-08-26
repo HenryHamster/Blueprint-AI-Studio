@@ -1187,6 +1187,30 @@ _PROMOTION_MECHANICS_FAILURES: frozenset[str] = frozenset(
     }
 )
 
+# Genuine (non-mechanics) promotion failures whose verdict can be NON-DETERMINISTIC
+# for an unchanged candidate, and which may therefore be re-attempted on the same
+# sha given positive evidence that the sha itself passes the full matrix.
+#
+# Only ``required_check_failed`` qualifies.  A required check is red because some
+# shard reported failure, and a shard reports failure for two very different
+# reasons: the code is wrong, or the harness flaked (a timeout, an OOM, a runner
+# eviction, a budget inversion).  The first is a property of the sha and will
+# reproduce; the second is not and will not.  ``promotion_failed`` records both
+# under one code, so the code alone cannot tell them apart -- which is why the
+# gate below demands separate evidence rather than trusting the code.
+#
+# Deliberately NOT included: ``migration_guard_blocked`` and every other
+# unrecognised code.  A migration guard evaluates the same tree deterministically
+# and will block the same sha every time; re-promoting it burns a release-branch
+# cut and a full-matrix run to reach the identical verdict.  Unrecognised codes
+# stay out for the same fail-closed reason ``_promotion_failure_needs_new_candidate``
+# gives: an unknown failure mode is treated as a real verdict on the candidate.
+_PROMOTION_FLAKE_RETRYABLE_FAILURES: frozenset[str] = frozenset(
+    {
+        "required_check_failed",
+    }
+)
+
 # Minimum wait between two deferred_unsynced sync re-checks.  This is NOT a
 # "retry after N minutes" firing rule -- the DECISION is made by the qualify-on-
 # synced gate inside ``run_qualification``, which re-reads the promotion-target
@@ -1332,9 +1356,34 @@ async def _redrive_promotion_failed_qualification(
        ``_PROMOTION_MECHANICS_FAILURES``) the integration HEAD must have moved
        PAST the failed candidate sha.  Re-promoting the identical sha against
        unchanged evidence is the infinite-loop failure mode and it costs a full
-       release-branch cut plus a full-matrix CI run every single time.  Only a
+       release-branch cut plus a full-matrix CI run every single time.  A
        promotion MECHANICS failure -- where the candidate was never the problem
        -- may re-attempt on the unchanged sha.
+
+       ONE FURTHER EXCEPTION, added because the rule above had a hole that
+       latched PERMANENTLY and SILENTLY.  When a promotion PR reds on a FLAKY
+       shard there is nothing to remediate, so no fix lands, so the integration
+       HEAD never advances, so ``candidate_unchanged`` holds -- every cycle,
+       forever, with no Alert and a status field that reads like an ordinary
+       stabilize.  The only exit was a human noticing and force-promoting by
+       hand.  So for ``_PROMOTION_FLAKE_RETRYABLE_FAILURES`` (today just
+       ``required_check_failed``) the unchanged sha MAY be re-attempted, but
+       only on positive evidence: ``gate_state`` in ``PROMOTION_CI_GREEN_STATES``
+       (``green`` or ``green_rehearsal``), i.e. a COMPLETED ``ci.yml`` run for
+       exactly that HEAD sha concluded success, whichever event shape ran it.
+
+       WHAT THAT EVIDENCE IS AND IS NOT.  It is not proof the promotion PR will
+       pass.  The gate's run is a ``workflow_dispatch`` on the integration
+       branch; the promotion PR's run is a ``pull_request`` event, and the two
+       do not share a checkout shape -- the same sha on the same shard and the
+       same runner has been observed green under one and red under the other 31
+       minutes apart, which is how a git ``safe.directory`` asymmetry stayed
+       hidden.  It IS evidence that the tree at this sha builds and its tests
+       pass somewhere, which is strictly more than the zero evidence the
+       permanent hold rested on.  The retry is bounded by the SAME circuit
+       breaker as every other path here, so the honest worst case is at most two
+       additional promotion attempts followed by an operator Alert -- a loud
+       stop replacing a silent one.
 
     BOUNDED.  The cap is the EXISTING circuit breaker,
     ``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS`` against the existing
@@ -1368,6 +1417,7 @@ async def _redrive_promotion_failed_qualification(
     """
     from app import release_qualifier
     from app.release_readiness import (
+        PROMOTION_CI_GREEN_STATES,
         auto_mark_stale_audit_findings,
         compute_promotion_ci_green_gate,
         compute_requalification_readiness,
@@ -1512,17 +1562,41 @@ async def _redrive_promotion_failed_qualification(
             )
             return False
         needs_new_candidate = _promotion_failure_needs_new_candidate(error)
+        # A same-candidate retry for a flake-retryable failure, permitted ONLY on
+        # positive evidence that this exact sha passes the full matrix.  Anything
+        # short of a completed-green run for this HEAD -- pending, no_signal,
+        # dispatched, unavailable -- is not evidence and does not unlock it.
+        #
+        # BOTH green states count, and they must.  The question here is "does the
+        # full matrix pass at this sha", not "will the promotion PR agree" -- the
+        # docstring above is explicit that this evidence is NOT the latter.  The
+        # run the gate can obtain for an integration HEAD is a
+        # ``workflow_dispatch``, which the gate now reports honestly as
+        # ``green_rehearsal``; matching only the literal ``"green"`` would make
+        # this escape hatch unreachable in exactly the situation it was added
+        # for, restoring the permanent silent latch it exists to break.
+        same_candidate_flake_retry = bool(
+            needs_new_candidate
+            and head_sha == candidate_sha
+            and error in _PROMOTION_FLAKE_RETRYABLE_FAILURES
+            and gate_state in PROMOTION_CI_GREEN_STATES
+        )
         if needs_new_candidate and head_sha == candidate_sha:
-            await _record_redrive_decision(
-                redrive_session,
-                version,
-                _PROMOTION_REDRIVE_DECISION_KEY,
-                "held",
-                "candidate_unchanged",
-                promotion_error=error or "unknown",
-                candidate_sha=candidate_sha[:12],
-            )
-            return False
+            if not same_candidate_flake_retry:
+                await _record_redrive_decision(
+                    redrive_session,
+                    version,
+                    _PROMOTION_REDRIVE_DECISION_KEY,
+                    "held",
+                    "candidate_unchanged",
+                    promotion_error=error or "unknown",
+                    candidate_sha=candidate_sha[:12],
+                    # WHY the hold stands, so an operator reading this back does
+                    # not have to re-derive which of the two conditions failed.
+                    flake_retryable=error in _PROMOTION_FLAKE_RETRYABLE_FAILURES,
+                    gate_state=gate_state,
+                )
+                return False
 
         logger.info(
             "[RELEASE_QUALIFIER] sweep: re-driving promotion_failed v%d "
@@ -1535,10 +1609,15 @@ async def _redrive_promotion_failed_qualification(
             head_sha[:8],
             gate_state,
             (
-                "remediation resolved and the integration HEAD advanced past "
-                "the failed candidate"
-                if needs_new_candidate
-                else "the failure was promotion mechanics, not the candidate"
+                "the candidate sha is unchanged but its own full-matrix run is "
+                "green -- re-attempting a flake-retryable failure"
+                if same_candidate_flake_retry
+                else (
+                    "remediation resolved and the integration HEAD advanced "
+                    "past the failed candidate"
+                    if needs_new_candidate
+                    else "the failure was promotion mechanics, not the candidate"
+                )
             ),
         )
         # End this session's read transaction BEFORE re-entering the qualifier:
@@ -1575,6 +1654,19 @@ async def _redrive_promotion_failed_qualification(
                     # afterwards — and they are not the same claim.
                     gate_state=gate_state,
                     gate_promotion_equivalent=bool(gate.get("promotion_equivalent")),
+                    # Which of the three doors this went through.  A
+                    # same-candidate retry is the one an operator most needs to
+                    # recognise on sight: it is re-attempting evidence that
+                    # already failed once, and its budget is the failure cap.
+                    retry_class=(
+                        "same_candidate_flake_retry"
+                        if same_candidate_flake_retry
+                        else (
+                            "head_advanced"
+                            if needs_new_candidate
+                            else "promotion_mechanics"
+                        )
+                    ),
                 )
             except Exception:  # noqa: BLE001 -- provenance, never the verdict
                 logger.warning(

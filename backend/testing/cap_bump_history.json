@@ -2813,8 +2813,8 @@
           "new_cap": 2150
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-25T19:52:59.689832+00:00",
+          "commit_sha": "c8ee4fe5a7fcb30b1a189d0bb5ee5f5a9f39714c",
+          "commit_date": "2026-08-25T13:17:24-07:00",
           "old_cap": 2150,
           "new_cap": 2250
         }
@@ -3277,8 +3277,8 @@
       ],
       "discovery_review_packet.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-25T17:25:24.008230+00:00",
+          "commit_sha": "26280dbb3a1fab0758832ec8f8f626f2844b69ad",
+          "commit_date": "2026-08-25T12:32:29-07:00",
           "old_cap": 1800,
           "new_cap": 2200
         }
@@ -4685,8 +4685,8 @@
           "new_cap": 2100
         },
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-25T15:29:54.080099+00:00",
+          "commit_sha": "22342df49cd1eb9f9a25bd2e8216b6ce3cfd66a3",
+          "commit_date": "2026-08-25T06:02:57-07:00",
           "old_cap": 2100,
           "new_cap": 2700
         }

@@ -6497,8 +6497,235 @@ async def test_promotion_failed_redrive_holds_on_unchanged_candidate(
     assert decision["decision"] == "held"
     assert decision["reason"] == "candidate_unchanged"
     assert decision["promotion_error"] == "required_check_failed"
+    # required_check_failed IS flake-retryable, so the thing holding this back is
+    # the absence of green evidence for the sha — not the failure code. Pinning
+    # both fields separates the two conditions for whoever reads the record, and
+    # keeps this test honest about which one it is exercising.
+    assert decision["flake_retryable"] is True
+    assert decision["gate_state"] == "no_signal"
     # The circuit breaker must survive a hold — a reset would uncap the loop.
     assert version.last_qualification["promotion_failure_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_retries_unchanged_candidate_when_ci_green(
+    db_session, mocker
+):
+    """A FLAKY promotion red must not latch the candidate forever.
+
+    THE HOLE THIS CLOSES. When a promotion PR reds on a flaky shard there is
+    nothing to remediate. No fix task lands, so the integration HEAD never
+    advances, so the candidate-identity guard holds — every cycle, forever, with
+    no Alert and a status field that reads like an ordinary stabilize. Nothing
+    in the pipeline could ever exit that state; the only recovery was a human
+    noticing and force-promoting by hand.
+
+    The exit is positive evidence, not a timer: a COMPLETED ci.yml run for
+    exactly this HEAD sha concluded success, which is more than the zero
+    evidence the permanent hold rested on. It is deliberately NOT proof the
+    promotion PR will pass (that run is a workflow_dispatch, the promotion PR's
+    is a pull_request, and the two do not share a checkout shape), which is why
+    the attempt is spent from the promotion-failure budget and not from a new
+    one — see the cap test below.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, head_sha=_FAILED_CANDIDATE, gate_state="green"
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True
+    mock_run_qual.assert_called_once()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "fired"
+    # WHICH door it went through. An operator reading this back needs to see at a
+    # glance that this re-attempted evidence that already failed once, rather
+    # than reacting to a genuinely advanced HEAD.
+    assert decision["retry_class"] == "same_candidate_flake_retry"
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_retries_unchanged_candidate_on_rehearsal(
+    db_session, mocker
+):
+    """``green_rehearsal`` must unlock the same-candidate retry too.
+
+    The retry above asks ONE question: does the full matrix pass at this exact
+    sha?  The run that can answer it for an integration HEAD is a
+    ``workflow_dispatch`` -- ci.yml's ``pull_request`` trigger is
+    ``branches: [main]``, so an integration-branch PR gets zero check-runs.  The
+    gate now reports that shape honestly as ``green_rehearsal`` rather than
+    calling it the ``green`` a promotion PR earns.
+
+    That honesty must not narrow this door.  Matching only the literal
+    ``"green"`` would make the escape hatch unreachable in precisely the
+    situation it was built for, silently restoring the permanent latch: no
+    remediation, no HEAD advance, no Alert, forever.  The retry never claimed
+    promotion-equivalence -- the docstring says so and the decision record
+    stamps ``gate_promotion_equivalent`` -- so it is spent from the same
+    promotion-failure budget either way.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, head_sha=_FAILED_CANDIDATE, gate_state="green_rehearsal"
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True, (
+        "a dispatch rehearsal that passed the full matrix is the ONLY evidence "
+        "this path can ever obtain -- refusing it re-latches the loop forever"
+    )
+    mock_run_qual.assert_called_once()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "fired"
+    assert decision["retry_class"] == "same_candidate_flake_retry"
+    # WHICH evidence it fired on, recorded so the two are never conflated after
+    # the fact: the branch looks healthy, the promotion PR is still unproven.
+    assert decision["gate_state"] == "green_rehearsal"
+    assert decision["gate_promotion_equivalent"] is False
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_requires_green_not_merely_not_red(
+    db_session, mocker
+):
+    """Only a completed-green run unlocks the retry. Absence of red is not green.
+
+    ``gate_state == "red"`` is already refused two gates earlier, so every state
+    reaching the identity gate is non-red — which makes "not red" a vacuous
+    condition. pending / dispatched / no_signal / unavailable each mean the run
+    has not concluded success for this sha, and treating any of them as licence
+    would turn a condition-driven retry into the blind one this module exists to
+    avoid.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    for gate_state in ("pending", "dispatched", "no_signal", "unavailable"):
+        _project, version = await _seed_promotion_failed(db_session)
+        mock_run_qual = _patch_promotion_redrive_inputs(
+            mocker, head_sha=_FAILED_CANDIDATE, gate_state=gate_state
+        )
+
+        fired = await _redrive_promotion_failed_qualification(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+
+        assert fired is False, gate_state
+        mock_run_qual.assert_not_called()
+        await db_session.refresh(version)
+        decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+        assert decision["reason"] == "candidate_unchanged", gate_state
+        assert decision["gate_state"] == gate_state
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_redrive_holds_deterministic_failure_though_green(
+    db_session, mocker
+):
+    """A DETERMINISTIC genuine failure stays held even with a green gate.
+
+    The retry exists because a required check can be red for two different
+    reasons — wrong code, or a flaked harness — and the failure code alone
+    cannot tell them apart. That ambiguity is what the green run resolves. A
+    migration guard has no such ambiguity: it evaluates the same tree the same
+    way every time and will block the identical sha again, so re-promoting it
+    buys a release-branch cut and a full-matrix run to reach the verdict already
+    on file. Unrecognised codes are held for the same fail-closed reason.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    for error in ("migration_guard_blocked", "some_unrecognised_future_code"):
+        _project, version = await _seed_promotion_failed(db_session, error=error)
+        mock_run_qual = _patch_promotion_redrive_inputs(
+            mocker, head_sha=_FAILED_CANDIDATE, gate_state="green"
+        )
+
+        fired = await _redrive_promotion_failed_qualification(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+
+        assert fired is False, error
+        mock_run_qual.assert_not_called()
+        await db_session.refresh(version)
+        decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+        assert decision["reason"] == "candidate_unchanged", error
+        assert decision["flake_retryable"] is False, error
+
+
+@pytest.mark.asyncio
+async def test_same_candidate_flake_retry_spends_the_existing_failure_budget(
+    db_session, mocker
+):
+    """The retry is NOT a new budget. At the cap it escalates like anything else.
+
+    This is the pin that keeps the escape hatch from becoming the infinite loop
+    it was carved out of. A green gate for an unchanged sha is weak evidence by
+    construction, so if it were checked before the circuit breaker — or against
+    a counter of its own — a promotion PR that reds deterministically under
+    pull_request while the dispatch run stays green would re-cut a release
+    branch and burn a full 8-shard matrix every single sweep, forever.
+
+    Spending the shared promotion_failure_count instead bounds the honest worst
+    case at two extra attempts followed by an operator Alert: a LOUD stop
+    replacing the silent permanent one, which is the whole point.
+    """
+    from app.release_qualifier_redrive import (
+        _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    project, version = await _seed_promotion_failed(
+        db_session,
+        promotion_failure_count=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    )
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, head_sha=_FAILED_CANDIDATE, gate_state="green"
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "capped"
+    assert decision["reason"] == "promotion_failure_cap"
+    # And it escalated to a human rather than latching quietly, which is the
+    # behaviour this whole change is trading the permanent hold for.
+    assert version.last_qualification["promotion_loop_escalated"] is True
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
 
 
 @pytest.mark.asyncio

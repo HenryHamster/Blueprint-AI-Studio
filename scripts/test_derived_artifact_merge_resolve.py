@@ -506,7 +506,13 @@ def test_merge_driver_writes_the_union_into_the_ours_path(tmp_path):
         "b::y": 2.0,
         "c::z": 3.0,
     }
-    assert "\r" not in Path(ours).read_text(encoding="utf-8", newline="")
+    # Read bytes, not text. read_text() applies universal-newline translation,
+    # which rewrites a stray CRLF to LF before the assertion can see it and
+    # makes this check vacuous. The newline="" kwarg that would defeat that
+    # translation only exists on Path.read_text() in Python 3.13+, and the
+    # scripts test lane runs the backend image's Python 3.11 -- passing it
+    # there raises TypeError. Bytes need no kwarg and hold on every version.
+    assert b"\r" not in Path(ours).read_bytes()
 
 
 def test_merge_driver_treats_an_empty_ancestor_as_no_common_ancestor(tmp_path):
