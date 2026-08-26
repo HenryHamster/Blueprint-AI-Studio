@@ -15,6 +15,7 @@ from app.discovery_admission import (
     ensure_discovery_cycle_for_research,
 )
 from app.discovery_review import (
+    DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS,
     DiscoveryReviewResultError,
     block_failed_discovery_review,
     complete_discovery_review,
@@ -143,6 +144,78 @@ def _result(cycle: DiscoveryCycle, review: Task, *, action: str = "advance"):
         result["evidence_citations"] = []
         result["operator_question"] = "Which product constraint should dominate?"
     return result
+
+
+async def _give_the_cohort_real_evidence(db_session, cycle, source) -> Task:
+    """Add one citable research outcome so the packet is not substantively empty.
+
+    ``_cycle_with_source`` alone produces the *empty* shape -- a research parent
+    that settled without a single actionable child -- which the decision
+    boundary now re-commissions rather than measures. Tests that mean to
+    exercise the "evidence exists but was not checked" branch must say so.
+    """
+
+    child = Task(
+        project_id=source.project_id,
+        discovery_cycle_id=cycle.id,
+        parent_task_id=source.id,
+        title="Cohort research child",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        plan_output=[{"title": "A real finding", "evidence": "receipt"}],
+        context={FINALIZED_RESEARCH_FINDINGS_KEY: True},
+    )
+    db_session.add(child)
+    await db_session.flush()
+    return child
+
+
+async def _settled_recommission(db_session, cycle, *, generation: int) -> DiscoveryCycle:
+    """A terminal prior generation the engine re-commissioned instead of asking."""
+
+    prior = DiscoveryCycle(
+        project_id=cycle.project_id,
+        direction_key=cycle.direction_key,
+        generation=generation,
+        outcome_kind=cycle.outcome_kind,
+        state="reviewed",
+        verdict="advance",
+        intent_snapshot=dict(cycle.intent_snapshot or {}),
+        bet_snapshot=dict(cycle.bet_snapshot or {}),
+        review_result={
+            "action": "advance",
+            "converted_from_ask_operator": {
+                "reason": "binding_decision_allowed",
+                "reason_code": "discovery_parent_auto_completed_zero_tasks",
+                "disposition": "recommission",
+                "original_action": "ask_operator",
+            },
+        },
+    )
+    db_session.add(prior)
+    await db_session.flush()
+    return prior
+
+
+def _withhold_binding_authority(db_session, review: Task) -> None:
+    """Rewrite this decision packet's manifest as an incomplete-evidence one.
+
+    ``ask_operator`` is only reachable through a packet that withholds binding
+    authority, so coverage of the operator-resolution path builds that packet
+    shape explicitly. Only the manifest field is rewritten; ``evidence_packet``
+    and ``packet_checksum`` stay exactly as the server froze them, so the
+    stale-packet guard still sees the same packet.
+    """
+
+    payload = dict(review.first_payload)
+    payload["evidence_packet_manifest"] = {
+        **dict(payload.get("evidence_packet_manifest") or {}),
+        "binding_decision_allowed": False,
+        "required_evidence_omitted": True,
+    }
+    review.payloads = [payload, *list(review.payloads or [])[1:]]
+    db_session.add(review)
 
 
 @pytest.mark.asyncio
@@ -1364,6 +1437,10 @@ async def test_ask_operator_wakes_resident_and_does_not_spawn_more_review(db_ses
     _, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
+    # ask_operator survives only for a packet that withholds binding authority;
+    # a complete packet converts it into a bounded evidence bet instead.
+    _withhold_binding_authority(db_session, review)
+    await db_session.flush()
 
     await complete_discovery_review(
         db_session,
@@ -1394,6 +1471,521 @@ async def test_ask_operator_wakes_resident_and_does_not_spawn_more_review(db_ses
     assert operator_message.context["audience"] == "operator-action-needed"
 
 
+@pytest.mark.asyncio
+async def test_evidence_question_is_dispatched_not_escalated(db_session):
+    """A packet that grants authority never hands its question back.
+
+    Verbatim from direction d-1210b978 cycle 81ba8010 on 2026-08-24: the
+    reviewer correctly refused to grade a claim it had not verified, correctly
+    named the remedy -- re-dispatch a verification task -- and then asked the
+    operator for permission to do the thing it was already authorised to do.
+    The direction sat at discovery_ask_operator_awaiting_resolution for ~16
+    hours. ask_operator is for preference, authority, scope, and priority
+    calls only.
+
+    Pinned here on a cohort that really holds evidence, which is what a bounded
+    ``measure`` successor is the right answer to.
+    """
+    project, cycle, source = await _cycle_with_source(db_session)
+    await _give_the_cohort_real_evidence(db_session, cycle, source)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["binding_decision_allowed"] is True
+    assert manifest["required_evidence_omitted"] is False
+    # This branch is specifically "evidence exists, the reviewer did not check
+    # it". The empty-cohort variant of the same escalation is a different
+    # disposition entirely -- see
+    # test_empty_research_result_is_recommissioned_not_escalated.
+    assert manifest["evidence_substantively_empty"] is False
+
+    question = (
+        "The packet carries a research finding for this bet, but nothing in it "
+        "actually checked whether the named liveness tests exist and pass at "
+        "fad98a14. Should we re-dispatch a direct verification task before this "
+        "bet can be graded?"
+    )
+    reviewer_summary = (
+        "The manifest formally marks binding_decision_allowed true, but that "
+        "reflects packet completeness, not substantive verification."
+    )
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = question
+    escalation["summary"] = reviewer_summary
+
+    completed = await complete_discovery_review(
+        db_session, task=review, raw_result=escalation
+    )
+    await db_session.flush()
+
+    assert completed.id == cycle.id
+    assert cycle.state == "reviewed"
+    # Literal pin: the escalation vocabulary is unreachable for this packet.
+    assert cycle.verdict == "advance"
+    assert cycle.verdict != "ask_operator"
+    assert cycle.review_result["operator_question"] is None
+
+    # It continues with a bounded bet that goes and gets the missing evidence,
+    # and does not fabricate a grade for the bet it could not verify.
+    next_bet = cycle.review_result["next_bet"]
+    assert next_bet["mode"] == "measure"
+    assert question in next_bet["decision_question"]
+    assert reviewer_summary in cycle.review_result["summary"]
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["original_action"] == "ask_operator"
+    assert conversion["original_operator_question"] == question
+
+    # The successor is really dispatched, not merely recorded.
+    successor = await db_session.get(
+        DiscoveryCycle, uuid.UUID(cycle.review_result["next_cycle_id"])
+    )
+    assert successor is not None
+    assert successor.generation == cycle.generation + 1
+    assert successor.bet_snapshot["mode"] == "measure"
+    request = await db_session.get(
+        StrategicSpawnRequest,
+        uuid.UUID(cycle.review_result["successor_spawn_request_id"]),
+    )
+    assert request is not None
+    assert request.discovery_cycle_id == successor.id
+
+    # Nothing woke the operator and the direction stays live.
+    messages = list(
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(
+        message.context["event_type"] != "discovery.operator_question"
+        for message in messages
+    )
+    await db_session.refresh(project)
+    direction = next(
+        item for item in project.directions if item["id"] == cycle.direction_key
+    )
+    assert direction["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_dispatched_evidence_bet_does_not_block_the_direction(db_session):
+    """The converted verdict must clear direction admission, not just look right."""
+    from app.discovery_admission import direction_discovery_admission_decision
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    await _give_the_cohort_real_evidence(db_session, cycle, source)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = (
+        "Should we re-run the two named tests at that head before grading?"
+    )
+    await complete_discovery_review(
+        db_session, task=review, raw_result=escalation
+    )
+    await db_session.flush()
+
+    await db_session.refresh(project)
+    direction = next(
+        item for item in project.directions if item["id"] == cycle.direction_key
+    )
+    decision = direction_discovery_admission_decision(direction, cycle)
+    # Literal pin on the reason code that stranded d-1210b978 for ~16 hours.
+    assert decision.reason_code != "discovery_ask_operator_awaiting_resolution"
+    assert "ask_operator" not in decision.reason_code
+
+
+@pytest.mark.asyncio
+async def test_empty_research_result_is_recommissioned_not_escalated(db_session):
+    """An empty research result is a pipeline outcome, not an operator decision.
+
+    2026-08-25: ``tasks autonomy-debug`` read ``can_spawn: NO (blocked)`` with
+    three directions at once ineligible on
+    ``discovery_ask_operator_awaiting_resolution``, every one of them with
+    ``binding_allowed=yes`` and an evidence packet that was structurally
+    perfect and substantively empty -- the research parent auto-completed with
+    zero actionable tasks. The engine asked a human about a void it had
+    produced itself, and the operator cleared all three by hand.
+    """
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+
+    # The precise shape of the defect: authority granted, nothing omitted, and
+    # still nothing to judge.
+    assert manifest["binding_decision_allowed"] is True
+    assert manifest["required_evidence_omitted"] is False
+    assert manifest["missing_required_evidence"] == []
+    assert manifest["evidence_substantively_empty"] is True
+    assert (
+        manifest["substantive_emptiness_reason_code"]
+        == "discovery_parent_auto_completed_zero_tasks"
+    )
+
+    question = (
+        "The research task for this bet auto-completed with 0 actionable "
+        "findings, so nothing in the packet actually checked whether the named "
+        "liveness tests exist and pass. Should we re-dispatch before grading?"
+    )
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = question
+    await complete_discovery_review(db_session, task=review, raw_result=escalation)
+    await db_session.flush()
+
+    # Literal pin: the escalation vocabulary is unreachable for this packet.
+    assert cycle.verdict == "advance"
+    assert cycle.verdict != "ask_operator"
+    assert cycle.review_result["operator_question"] is None
+
+    # It re-runs the research bet rather than measuring a void.
+    next_bet = cycle.review_result["next_bet"]
+    assert next_bet["mode"] == "research"
+    assert question in next_bet["decision_question"]
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["disposition"] == "recommission"
+    assert conversion["reason_code"] == "discovery_parent_auto_completed_zero_tasks"
+    assert conversion["original_action"] == "ask_operator"
+    assert conversion["original_operator_question"] == question
+
+    successor = await db_session.get(
+        DiscoveryCycle, uuid.UUID(cycle.review_result["next_cycle_id"])
+    )
+    assert successor is not None
+    assert successor.generation == cycle.generation + 1
+    assert successor.bet_snapshot["mode"] == "research"
+
+    # No human was woken and the direction stays live and admissible.
+    from app.discovery_admission import direction_discovery_admission_decision
+
+    messages = list(
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(
+        message.context["event_type"] != "discovery.operator_question"
+        for message in messages
+    )
+    completion = next(
+        message
+        for message in messages
+        if message.context["event_type"] == "discovery.review_completed"
+    )
+    # Surface the reason, not just the state.
+    assert (
+        completion.context["escalation_replacement_reason_code"]
+        == "discovery_parent_auto_completed_zero_tasks"
+    )
+    assert completion.context["escalation_replacement_disposition"] == "recommission"
+    await db_session.refresh(project)
+    direction = next(
+        item for item in project.directions if item["id"] == cycle.direction_key
+    )
+    assert direction["status"] == "active"
+    decision = direction_discovery_admission_decision(direction, cycle)
+    assert decision.reason_code != "discovery_ask_operator_awaiting_resolution"
+
+
+@pytest.mark.asyncio
+async def test_platform_killed_research_parent_is_recommissioned(db_session):
+    """A platform kill carries no verdict about the work, so it is re-run.
+
+    "Re-evaluation limit reached (2 attempts) -- children consistently failing"
+    and the 2h approval-gate timeout are defects in the engine, not findings
+    about the bet. Handing that to the operator asks them to adjudicate an
+    infrastructure failure.
+    """
+    _, cycle, _ = await _cycle_with_source(
+        db_session, source_status=TaskStatus.FAILED
+    )
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["binding_decision_allowed"] is True
+    assert (
+        manifest["substantive_emptiness_reason_code"]
+        == "discovery_parent_platform_failed"
+    )
+
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = (
+        "The research parent failed outright. Should we retry this direction?"
+    )
+    await complete_discovery_review(db_session, task=review, raw_result=escalation)
+    await db_session.flush()
+
+    assert cycle.verdict == "advance"
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["reason_code"] == "discovery_parent_platform_failed"
+    assert conversion["disposition"] == "recommission"
+    assert cycle.review_result["next_bet"]["mode"] == "research"
+
+
+@pytest.mark.asyncio
+async def test_cohort_that_ran_and_produced_nothing_is_recommissioned(db_session):
+    """Children ran, nothing citable came back: still empty, still not a question."""
+    _, cycle, source = await _cycle_with_source(db_session)
+    db_session.add(
+        Task(
+            project_id=source.project_id,
+            discovery_cycle_id=cycle.id,
+            parent_task_id=source.id,
+            title="Child that produced nothing",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            plan_output=[],
+            context={FINALIZED_RESEARCH_FINDINGS_KEY: True},
+        )
+    )
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["task_count"] == 2
+    assert (
+        manifest["substantive_emptiness_reason_code"]
+        == "discovery_empty_evidence_coverage"
+    )
+
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = "Nothing came back. What should we do?"
+    await complete_discovery_review(db_session, task=review, raw_result=escalation)
+    await db_session.flush()
+
+    assert cycle.verdict == "advance"
+    assert (
+        cycle.review_result["converted_from_ask_operator"]["reason_code"]
+        == "discovery_empty_evidence_coverage"
+    )
+
+
+@pytest.mark.asyncio
+async def test_type_filtered_only_cycle_is_recommissioned_not_escalated(db_session):
+    """A cycle whose only finding was type-filtered is a recommission candidate.
+
+    Live shape, ``d-1210b978`` gen=5 and again gen=9: the research DID produce a
+    finding, but it was a ``design_doc_observation`` / ``direction_update``, so
+    ``research_completion`` routed it to the design doc or the direction row
+    instead of spawning a task. It therefore never joined the surviving-child
+    set that ``finalized_research_findings_for_survivors`` builds ``plan_output``
+    from, so the packet's coverage is all zeros while the manifest -- which can
+    only report on evidence it knows about -- says nothing was omitted.
+
+    Making that manifest honest about the filtered finding is a separate change
+    in ``research_completion``/``discovery_review_packet``. This pins the part
+    the decision boundary owns: however the finding went missing, the engine
+    re-commissions the bet instead of asking a human about a packet it cannot
+    read. The status string is a verbatim literal from the live incident so a
+    reworded emission cannot silently un-pin this path.
+    """
+    _, cycle, source = await _cycle_with_source(db_session)
+    source.latest_status_message = (
+        "Research created 0 tasks from 1 findings (1 type-filtered skipped)"
+        " — auto-completed (no actionable tasks)"
+    )
+    db_session.add(
+        Task(
+            project_id=source.project_id,
+            discovery_cycle_id=cycle.id,
+            parent_task_id=source.id,
+            title="Sibling that also produced nothing citable",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            plan_output=[],
+            context={FINALIZED_RESEARCH_FINDINGS_KEY: True},
+        )
+    )
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    # More than one task ran, so the reason code comes from the auto-completed
+    # marker, not from the "cohort never fanned out" shortcut.
+    assert manifest["task_count"] == 2
+    assert manifest["binding_decision_allowed"] is True
+    assert (
+        manifest["substantive_emptiness_reason_code"]
+        == "discovery_parent_auto_completed_zero_tasks"
+    )
+
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = (
+        "The packet is empty but the parent says it had one finding. "
+        "Do the named liveness tests exist?"
+    )
+    await complete_discovery_review(db_session, task=review, raw_result=escalation)
+    await db_session.flush()
+
+    assert cycle.verdict == "advance"
+    assert cycle.review_result["operator_question"] is None
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["disposition"] == "recommission"
+    assert conversion["reason_code"] == "discovery_parent_auto_completed_zero_tasks"
+
+
+@pytest.mark.asyncio
+async def test_recommission_ceiling_parks_instead_of_re_firing(db_session):
+    """The replacement for an unbounded escalation must not be an unbounded loop.
+
+    Two consecutive engine re-commissions is the whole budget; the third empty
+    settle is evidence about the bet, not about the run. It degrades to a park
+    carrying a terminal reason code -- never a loop, and never a quiet second
+    escalation.
+    """
+    assert DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS == 2
+    project, cycle, _ = await _cycle_with_source(
+        db_session, generation=DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS + 1
+    )
+    for generation in range(1, DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS + 1):
+        await _settled_recommission(db_session, cycle, generation=generation)
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    assert review.first_payload["evidence_packet_manifest"][
+        "evidence_substantively_empty"
+    ] is True
+
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = "Still nothing. Should we keep going?"
+    await complete_discovery_review(db_session, task=review, raw_result=escalation)
+    await db_session.flush()
+
+    # Terminal and legible, not another successor and not another question.
+    assert cycle.verdict == "park"
+    assert cycle.verdict != "ask_operator"
+    assert cycle.review_result.get("next_cycle_id") is None
+    assert cycle.review_result["operator_question"] is None
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["reason_code"] == "discovery_recommission_ceiling_reached"
+    assert conversion["disposition"] == "recommission_ceiling_park"
+    assert (
+        conversion["consecutive_recommissions"]
+        == DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS
+    )
+    assert "discovery_recommission_ceiling_reached" not in cycle.review_result[
+        "park_reason"
+    ]
+    assert "re-commission ceiling reached" in cycle.review_result["park_reason"]
+    assert (
+        await db_session.execute(
+            select(StrategicSpawnRequest).where(
+                StrategicSpawnRequest.direction_id == cycle.direction_key
+            )
+        )
+    ).scalars().first() is None
+
+    await db_session.refresh(project)
+    direction = next(
+        item for item in project.directions if item["id"] == cycle.direction_key
+    )
+    assert direction["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_a_progressing_direction_never_accumulates_a_ceiling(db_session):
+    """Only an unbroken run of engine re-commissions counts toward the ceiling."""
+    _, cycle, _ = await _cycle_with_source(
+        db_session, generation=DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS + 1
+    )
+    # The most recent prior generation was the reviewer's own call, which
+    # breaks the run no matter how many re-commissions preceded it.
+    for generation in range(1, DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS):
+        await _settled_recommission(db_session, cycle, generation=generation)
+    reviewer_decided = DiscoveryCycle(
+        project_id=cycle.project_id,
+        direction_key=cycle.direction_key,
+        generation=DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS,
+        outcome_kind=cycle.outcome_kind,
+        state="reviewed",
+        verdict="advance",
+        intent_snapshot=dict(cycle.intent_snapshot or {}),
+        bet_snapshot=dict(cycle.bet_snapshot or {}),
+        review_result={"action": "advance"},
+    )
+    db_session.add(reviewer_decided)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = "Nothing came back again. What now?"
+    await complete_discovery_review(db_session, task=review, raw_result=escalation)
+    await db_session.flush()
+
+    assert cycle.verdict == "advance"
+    assert (
+        cycle.review_result["converted_from_ask_operator"]["disposition"]
+        == "recommission"
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_evidence_without_authority_still_escalates(db_session):
+    """Narrow ask_operator; do not remove it.
+
+    A packet that withholds binding authority is the genuine judgement-call
+    shape, and it keeps reaching the operator even when the cohort is empty --
+    the emptiness classifier must not silently swallow it.
+    """
+    _, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    assert review.first_payload["evidence_packet_manifest"][
+        "evidence_substantively_empty"
+    ] is True
+    _withhold_binding_authority(db_session, review)
+    await db_session.flush()
+
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="ask_operator"),
+    )
+    await db_session.flush()
+
+    assert cycle.verdict == "ask_operator"
+    assert "converted_from_ask_operator" not in cycle.review_result
+    operator_messages = [
+        message
+        for message in (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
+            )
+        )
+        .scalars()
+        .all()
+        if message.context["event_type"] == "discovery.operator_question"
+    ]
+    assert len(operator_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_manifest_reports_substance_when_the_cohort_has_any(db_session):
+    """The classifier must not fire on a packet that carries real evidence."""
+    _, cycle, source = await _cycle_with_source(db_session)
+    await _give_the_cohort_real_evidence(db_session, cycle, source)
+
+    _, _, _, manifest, _, _ = (
+        await discovery_review_packet.build_discovery_review_packet(db_session, cycle)
+    )
+
+    assert manifest["evidence_substantively_empty"] is False
+    assert manifest["substantive_emptiness_reason_code"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_invalid_or_failed_decision_blocks_visibly(db_session):
     _, cycle, _ = await _cycle_with_source(db_session)
@@ -1605,6 +2197,8 @@ async def test_operator_continue_uses_same_atomic_successor_contract(db_session)
     project, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority(db_session, review)
+    await db_session.flush()
     await complete_discovery_review(
         db_session,
         task=review,
@@ -1682,6 +2276,8 @@ async def test_resident_can_resolve_discovery_through_strategic_op(
     project, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority(db_session, review)
+    await db_session.flush()
     await complete_discovery_review(
         db_session,
         task=review,

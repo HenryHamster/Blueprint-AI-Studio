@@ -3,6 +3,7 @@
 import ast
 import contextlib
 import base64
+import errno
 import io
 import json
 import os
@@ -292,6 +293,58 @@ class TestLocalRunnerTestIsolation(unittest.TestCase):
         self.assertEqual(
             set(seen), wanted, f"did not find a named thread for every loop: {seen}"
         )
+
+
+# ── Compute-runtime provisioning guard (module-wide) ─────────────────────────
+
+# Captured BEFORE setUpModule swaps them out, so the tests that exercise the
+# real provisioning logic can reach it without disabling the guard for anyone
+# else.
+REAL_BOOTSTRAP_COMPUTE_RUNTIME = local_runner._bootstrap_compute_runtime
+REAL_ENSURE_COMPUTE_RUNTIME = local_runner._ensure_compute_runtime
+REAL_CREATE_JOB_PYTHON_VENV = local_runner._create_job_python_venv
+
+# A fake, fully-formed runtime handed to every compute test that does not
+# explicitly patch the seam itself.
+FAKE_COMPUTE_RUNTIME = iso.ComputePythonRuntime(
+    python_path="/fake/compute-runtime/venv/bin/python",
+    site_packages="/fake/compute-runtime/venv/lib/python3.11/site-packages",
+    base_python="/usr/bin/python3.11",
+    python_version="3.11.9",
+    pip_version="24.0",
+    provisioner="venv",
+)
+
+_COMPUTE_RUNTIME_GUARDS: list = []
+
+
+def setUpModule():
+    """Never let a test provision a real Python runtime.
+
+    ``_run_compute_job`` establishes the interpreter guarantee before planning
+    the sandbox, so EVERY bwrap compute test in this file now reaches that
+    seam. Left unpatched it would build a real venv (and, on a cold host,
+    download pip) inside the scripts lane's per-file budget — the exact shape
+    that once ran a 1200s provision under a 120s budget and reddened promotion
+    PR #17674. Both seams are stubbed here so no future test has to remember:
+    provisioning is opted INTO by patching, never opted out of.
+
+    ``TestComputeRuntimeGuardInstalled`` pins that this guard is actually in
+    force, so deleting it cannot pass silently.
+    """
+    for name, replacement in (
+        ("_ensure_compute_runtime", lambda: FAKE_COMPUTE_RUNTIME),
+        ("_bootstrap_compute_runtime", lambda **_kw: FAKE_COMPUTE_RUNTIME),
+        ("_create_job_python_venv", lambda _runtime, _workspace: None),
+    ):
+        guard = patch.object(local_runner, name, replacement)
+        guard.start()
+        _COMPUTE_RUNTIME_GUARDS.append(guard)
+
+
+def tearDownModule():
+    while _COMPUTE_RUNTIME_GUARDS:
+        _COMPUTE_RUNTIME_GUARDS.pop().stop()
 
 
 # ── Capability factories (isolation core) ─────────────────────────────────────
@@ -1812,9 +1865,11 @@ class TestCheckModePreflightEndToEnd(_LocalRunnerTestCase):
                 env=env,
                 capture_output=True,
                 text=True,
-                # Generous: this competes for CPU with the rest of the shard.
-                # The budget this protects is the whole file's, not this call's.
-                timeout=120,
+                # Under the lane's --timeout=30 so a genuine hang reports
+                # here rather than as a pytest-timeout flake. This call's old
+                # 120s budget is the shape that killed promotion PR #17674;
+                # #17681 took --check to 0.44s, so 25s is ~55x headroom.
+                timeout=25,
             )
             cls._toolchain_root_created = os.path.exists(toolchain_root)
         cls._combined = cls._result.stdout + cls._result.stderr
@@ -4459,6 +4514,210 @@ class TestRunComputeJob(unittest.TestCase):
             "the image pull must precede the run",
         )
 
+    # ── An unusable GPU is not a reason to fail a CPU-only job ──────────────
+    #
+    # `assigned_gpus` is populated from `caps.has_gpu` ALONE — it means "this
+    # host has GPUs", never "this job wants one". So on a GPU host every
+    # containerized job is handed a device, and an image whose CUDA runtime
+    # cannot drive that device used to kill work that had no stake in it. The
+    # blast radius grew with the environment contract: once a project's image is
+    # attached to ALL of its jobs (not only its GPU jobs), the arch pre-flight
+    # arms on every one of them.
+
+    def _fake_proc(self, popen_calls):
+        class FakeProc:
+            pid = 1
+            stdout = MagicMock()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+        proc = FakeProc()
+        proc.stdout.read.return_value = b""
+
+        def fake_popen(args, **kwargs):
+            popen_calls.append(list(args))
+            return proc
+
+        return fake_popen
+
+    _ARCH_MISMATCH = (
+        "docker: Error response from daemon: could not select device driver: "
+        "no supported gpu(s) detected to run this container."
+    )
+
+    def test_cpu_only_job_drops_an_unusable_gpu_and_runs(self):
+        """Conclusive arch mismatch + no declared accelerator → run CPU-only.
+
+        The job never asked for an accelerator. An arch mismatch is conclusive
+        about the DEVICE, not about the job, so the right answer is to hand the
+        device back and re-plan without it — not to fail work that would have
+        run fine on the CPU.
+        """
+        popen_calls = []
+        reports = []
+        released = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, **_kw):
+            reports.append(exec_status)
+            return False
+
+        real_release = local_runner._release_gpus
+
+        def spy_release(gpu_state, indices):
+            released.append(list(indices))
+            return real_release(gpu_state, indices)
+
+        job = self._make_job(
+            command="python3 train.py",
+            container_image="nvcr.io/nvidia/pytorch:latest",
+        )
+        gpu_state = _gpu_state([0])
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_release_gpus", spy_release), \
+             patch.object(
+                 iso, "pull_container_image",
+                 lambda plan, image, timeout=1800: (True, "pulled"),
+             ), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox",
+                 lambda plan, timeout=30: (False, self._ARCH_MISMATCH),
+             ), \
+             patch("subprocess.Popen", side_effect=self._fake_proc(popen_calls)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                {"test-job-001"}, threading.Lock(),
+                capabilities=_docker_caps(gpu_indices=(0,)),
+                gpu_state=gpu_state,
+            )
+
+        # It RAN. Before the fix this returned after reporting failed, so there
+        # was no container run at all.
+        docker_args = _docker_run_argv(self, popen_calls)
+        self.assertNotIn(
+            "--gpus", docker_args,
+            "the re-plan must drop the device, not merely survive the probe",
+        )
+        self.assertNotIn(
+            "failed", reports,
+            f"a CPU-only job must not be failed by a GPU it never asked for: {reports}",
+        )
+
+        # Released EXACTLY once. The finally-block release still runs, so
+        # `assigned_gpus` has to be cleared at the drop — otherwise a device
+        # another job claimed in between would be freed out from under it.
+        non_empty = [r for r in released if r]
+        self.assertEqual(
+            non_empty, [[0]],
+            f"expected one release of device 0, got {released!r}",
+        )
+        self.assertEqual(gpu_state["in_use"], set())
+
+    def test_declared_accelerator_still_dies_on_an_unusable_gpu(self):
+        """The job asked for a GPU and there is not a working one → fatal.
+
+        The relaxation above is scoped to jobs that declared no accelerator.
+        Silently demoting a declared-GPU job to CPU would turn a fast, honest
+        failure into a run that burns its full deadline and reports a number
+        measured on the wrong hardware.
+        """
+        popen_calls = []
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, command_log=None, **_kw):
+            reports.append((exec_status, (command_log or {}).get("text", "")))
+            return False
+
+        job = self._make_job(
+            command="python3 train.py",
+            container_image="nvcr.io/nvidia/pytorch:latest",
+            accelerator_type="nvidia-tesla-v100",
+        )
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(
+                 iso, "pull_container_image",
+                 lambda plan, image, timeout=1800: (True, "pulled"),
+             ), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox",
+                 lambda plan, timeout=30: (False, self._ARCH_MISMATCH),
+             ), \
+             patch("subprocess.Popen", side_effect=self._fake_proc(popen_calls)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                {"test-job-001"}, threading.Lock(),
+                capabilities=_docker_caps(gpu_indices=(0,)),
+                gpu_state=_gpu_state([0]),
+            )
+
+        self.assertFalse(
+            [c for c in popen_calls if _is_container_run(c)],
+            "a declared-GPU job must not run after a conclusive arch mismatch",
+        )
+        self.assertTrue(reports, "the abort must be reported")
+        status, text = reports[-1]
+        self.assertEqual(status, "failed")
+        self.assertIn("unusable", text)
+        self.assertIn("accelerator=nvidia-tesla-v100", text)
+
+    def test_inconclusive_probe_keeps_the_gpu_for_a_cpu_only_job(self):
+        """An inconclusive probe is not evidence the device is unusable.
+
+        "The probe could not run" (timeout, no nvidia-smi, empty device list)
+        says nothing about the GPU. Dropping the device on that would silently
+        demote every job on a host whose probe is merely flaky, so the
+        pre-existing behaviour — keep the device, proceed — must be untouched.
+        """
+        popen_calls = []
+        released = []
+
+        real_release = local_runner._release_gpus
+
+        def spy_release(gpu_state, indices):
+            released.append(list(indices))
+            return real_release(gpu_state, indices)
+
+        job = self._make_job(
+            command="python3 train.py",
+            container_image="nvcr.io/nvidia/pytorch:latest",
+        )
+
+        with patch.object(
+                 local_runner, "_report_compute_job",
+                 lambda *a, **kw: False,
+             ), \
+             patch.object(local_runner, "_release_gpus", spy_release), \
+             patch.object(
+                 iso, "pull_container_image",
+                 lambda plan, image, timeout=1800: (True, "pulled"),
+             ), \
+             patch.object(
+                 iso, "probe_gpu_in_sandbox",
+                 lambda plan, timeout=30: (False, "probe timed out after 30s"),
+             ), \
+             patch("subprocess.Popen", side_effect=self._fake_proc(popen_calls)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                {"test-job-001"}, threading.Lock(),
+                capabilities=_docker_caps(gpu_indices=(0,)),
+                gpu_state=_gpu_state([0]),
+            )
+
+        docker_args = _docker_run_argv(self, popen_calls)
+        self.assertIn(
+            "--gpus", docker_args,
+            "an inconclusive probe must not cost the job its device",
+        )
+        self.assertEqual(
+            [r for r in released if r], [[0]],
+            "the device is released once, by the normal teardown",
+        )
+
     def test_cancel_requested_on_claim_skips_execution(self):
         """When cancel_requested is True on the job body, no subprocess is started."""
         reports = []
@@ -4584,6 +4843,481 @@ class TestRunComputeJob(unittest.TestCase):
 
 
 # ── Compute poll loop ─────────────────────────────────────────────────────────
+
+class TestComputeRuntimeGuardInstalled(unittest.TestCase):
+    """The module guard must actually be in force.
+
+    Without this pin, deleting ``setUpModule`` would silently re-arm a real
+    venv build (minutes, plus network) inside the scripts lane's per-file
+    budget, and the only symptom would be a timed-out promotion PR.
+    """
+
+    def test_provisioning_seams_are_stubbed_for_every_test(self):
+        self.assertIs(local_runner._ensure_compute_runtime(), FAKE_COMPUTE_RUNTIME)
+        self.assertIs(
+            local_runner._bootstrap_compute_runtime(provision=True),
+            FAKE_COMPUTE_RUNTIME,
+        )
+        self.assertIsNone(
+            local_runner._create_job_python_venv(FAKE_COMPUTE_RUNTIME, "/tmp/ws")
+        )
+
+    def test_real_functions_are_reachable_for_the_tests_that_want_them(self):
+        self.assertIsNot(REAL_BOOTSTRAP_COMPUTE_RUNTIME, local_runner._bootstrap_compute_runtime)
+        self.assertTrue(callable(REAL_BOOTSTRAP_COMPUTE_RUNTIME))
+
+
+def _probe_stdout(python="3.11.9", pip="24.0", site="/venv/lib/py/site-packages"):
+    return json.dumps({"python": python, "pip": pip, "site": site})
+
+
+class TestComputeRuntimeProbe(_LocalRunnerTestCase):
+    """``_probe_compute_runtime_venv`` — the FAST path, one subprocess, no network."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="bp_rt_probe_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.venv = os.path.join(self.tmp, "venv")
+        os.makedirs(os.path.join(self.venv, "bin"))
+        self.python = os.path.join(self.venv, "bin", "python")
+        with open(self.python, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(self.python, 0o755)
+
+    def test_absent_interpreter_is_not_usable(self):
+        os.remove(self.python)
+        self.assertIsNone(local_runner._probe_compute_runtime_venv(self.venv))
+
+    def test_working_pip_yields_a_runtime(self):
+        completed = subprocess.CompletedProcess([], 0, _probe_stdout(), "")
+        with patch.object(subprocess, "run", return_value=completed) as run:
+            runtime = local_runner._probe_compute_runtime_venv(self.venv)
+        self.assertIsNotNone(runtime)
+        self.assertEqual(runtime.python_path, self.python)
+        self.assertEqual(runtime.pip_version, "24.0")
+        self.assertEqual(runtime.python_version, "3.11.9")
+        self.assertEqual(runtime.site_packages, "/venv/lib/py/site-packages")
+        # Exactly ONE subprocess: the probe must never be a re-provision.
+        self.assertEqual(run.call_count, 1)
+
+    def test_broken_pip_is_not_usable(self):
+        """The corpus failure: a python3 exists, but `import pip` fails."""
+        completed = subprocess.CompletedProcess(
+            [], 1, "", "ModuleNotFoundError: No module named 'pip'"
+        )
+        with patch.object(subprocess, "run", return_value=completed):
+            self.assertIsNone(local_runner._probe_compute_runtime_venv(self.venv))
+
+    def test_unparseable_probe_output_is_not_usable(self):
+        completed = subprocess.CompletedProcess([], 0, "not json", "")
+        with patch.object(subprocess, "run", return_value=completed):
+            self.assertIsNone(local_runner._probe_compute_runtime_venv(self.venv))
+
+    def test_probe_missing_pip_version_is_not_usable(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, json.dumps({"python": "3.11.9", "site": "/s"}), ""
+        )
+        with patch.object(subprocess, "run", return_value=completed):
+            self.assertIsNone(local_runner._probe_compute_runtime_venv(self.venv))
+
+    def test_probe_timeout_is_not_usable(self):
+        with patch.object(
+            subprocess, "run", side_effect=subprocess.TimeoutExpired("python", 60)
+        ):
+            self.assertIsNone(local_runner._probe_compute_runtime_venv(self.venv))
+
+
+class TestComputeRuntimeBuilder(_LocalRunnerTestCase):
+    """``_build_compute_runtime_venv`` — venv first, then uv, then a named failure."""
+
+    def test_prefers_stdlib_venv(self):
+        with patch.object(local_runner, "_run_toolchain_command") as run:
+            maker = local_runner._build_compute_runtime_venv("/stage/venv", "/root")
+        self.assertEqual(maker, "venv")
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("venv", run.call_args[0][0])
+
+    def test_falls_back_to_uv_when_ensurepip_is_missing(self):
+        """The `iconlab` shape: python3 present, ensurepip/venv stripped."""
+        calls = []
+
+        def fake_run(argv, *, root, timeout):
+            calls.append(argv)
+            if "-m" in argv:
+                raise RuntimeError("No module named venv")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(local_runner, "_run_toolchain_command", fake_run), \
+             patch.object(shutil, "which", return_value="/usr/local/bin/uv"):
+            maker = local_runner._build_compute_runtime_venv("/stage/venv", "/root")
+        self.assertEqual(maker, "uv")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--seed", calls[1])
+
+    def test_names_both_failures_when_the_host_can_do_neither(self):
+        with patch.object(
+            local_runner, "_run_toolchain_command", side_effect=RuntimeError("nope")
+        ), patch.object(shutil, "which", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                local_runner._build_compute_runtime_venv("/stage/venv", "/root")
+        message = str(ctx.exception)
+        # An operator must be able to read WHAT to install off this line alone.
+        self.assertIn("python3 -m venv", message)
+        self.assertIn("uv venv --seed", message)
+
+
+class TestComputeRuntimeBootstrap(_LocalRunnerTestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="bp_rt_boot_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "compute-runtime")
+        self.env = patch.dict(
+            os.environ, {"BLUEPRINT_RUNNER_COMPUTE_RUNTIME": self.root}, clear=False
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(local_runner._compute_runtime_state.publish, None, None)
+
+    def test_probe_mode_never_provisions_and_leaves_no_trace(self):
+        """``--check`` must not create anything: a preflight that provisions is
+        how a 1200s venv build once ran under a 120s budget (PR #17674)."""
+        with patch.object(local_runner, "_run_toolchain_command") as run:
+            result = REAL_BOOTSTRAP_COMPUTE_RUNTIME(provision=False)
+        self.assertIsNone(result)
+        self.assertEqual(run.call_count, 0)
+        self.assertFalse(os.path.exists(self.root))
+        report = local_runner._compute_runtime_state.report()
+        self.assertFalse(report["usable"])
+        self.assertIn("not provisioned", report["reason"])
+
+    def test_successful_provision_publishes_capability_and_marker(self):
+        def fake_build(staged_venv, root):
+            os.makedirs(os.path.join(staged_venv, "bin"))
+            return "venv"
+
+        runtime = iso.ComputePythonRuntime(
+            python_path=os.path.join(self.root, "venv", "bin", "python"),
+            site_packages="/s",
+            base_python="/usr/bin/python3",
+            python_version="3.11.9",
+            pip_version="24.0",
+            provisioner="venv",
+        )
+        # Probe order: (1) nothing installed yet, (2) the staged build
+        # validates, (3) it still validates after the atomic swap.
+        with patch.object(local_runner, "_build_compute_runtime_venv", fake_build), \
+             patch.object(
+                 local_runner,
+                 "_probe_compute_runtime_venv",
+                 side_effect=[None, runtime, runtime],
+             ):
+            result = REAL_BOOTSTRAP_COMPUTE_RUNTIME()
+        self.assertIsNotNone(result)
+        marker = os.path.join(self.root, local_runner._COMPUTE_RUNTIME_MARKER)
+        with open(marker, encoding="utf-8") as fh:
+            receipt = json.load(fh)
+        self.assertEqual(
+            receipt["schema_version"], local_runner._COMPUTE_RUNTIME_SCHEMA_VERSION
+        )
+        self.assertEqual(receipt["provisioner"], "venv")
+        report = local_runner._compute_runtime_state.report()
+        self.assertTrue(report["usable"])
+        self.assertEqual(report["pip_version"], "24.0")
+        self.assertIsNone(report["reason"])
+
+    def test_already_provisioned_host_revalidates_without_rebuilding(self):
+        os.makedirs(os.path.join(self.root, "venv", "bin"))
+        runtime = iso.ComputePythonRuntime(
+            python_path=os.path.join(self.root, "venv", "bin", "python"),
+            site_packages="/s",
+            base_python="/usr/bin/python3",
+            python_version="3.11.9",
+            pip_version="24.0",
+            provisioner="venv",
+        )
+        with patch.object(
+            local_runner, "_probe_compute_runtime_venv", return_value=runtime
+        ), patch.object(local_runner, "_build_compute_runtime_venv") as build:
+            result = REAL_BOOTSTRAP_COMPUTE_RUNTIME()
+        self.assertIs(result, runtime)
+        self.assertEqual(build.call_count, 0)
+
+    def test_failed_provision_publishes_an_unusable_capability_with_a_reason(self):
+        with patch.object(
+            local_runner,
+            "_build_compute_runtime_venv",
+            side_effect=RuntimeError("python3 -m venv: boom; uv venv --seed: absent"),
+        ):
+            result = REAL_BOOTSTRAP_COMPUTE_RUNTIME()
+        self.assertIsNone(result)
+        report = local_runner._compute_runtime_state.report()
+        self.assertFalse(report["usable"])
+        self.assertIn("uv venv --seed", report["reason"])
+        # A working venv is never left half-built.
+        self.assertFalse(os.path.exists(os.path.join(self.root, "venv")))
+
+    def test_failed_refresh_restores_the_previous_working_runtime(self):
+        venv = os.path.join(self.root, "venv")
+        os.makedirs(os.path.join(venv, "bin"))
+        with open(os.path.join(venv, "bin", "sentinel"), "w", encoding="utf-8") as fh:
+            fh.write("keep me")
+        with patch.object(
+            local_runner, "_probe_compute_runtime_venv", return_value=None
+        ), patch.object(
+            local_runner, "_build_compute_runtime_venv", side_effect=RuntimeError("no")
+        ):
+            self.assertIsNone(REAL_BOOTSTRAP_COMPUTE_RUNTIME())
+        self.assertTrue(os.path.exists(os.path.join(venv, "bin", "sentinel")))
+
+
+class TestComputeRuntimeCapabilityShape(_LocalRunnerTestCase):
+    """EXACT capability key + payload shape consumed by the server-side PR."""
+
+    def tearDown(self):
+        local_runner._compute_runtime_state.publish(None, None)
+
+    def test_report_keys_are_stable(self):
+        local_runner._compute_runtime_state.publish(FAKE_COMPUTE_RUNTIME, None)
+        report = local_runner._compute_runtime_state.report()
+        self.assertEqual(
+            sorted(report),
+            [
+                "interpreter",
+                "pip_version",
+                "probed_at",
+                "provisioner",
+                "python_version",
+                "reason",
+                "usable",
+            ],
+        )
+        self.assertTrue(report["usable"])
+        self.assertEqual(report["interpreter"], FAKE_COMPUTE_RUNTIME.python_path)
+
+    def test_unusable_report_carries_the_reason_not_silence(self):
+        local_runner._compute_runtime_state.publish(None, "no ensurepip, no uv")
+        report = local_runner._compute_runtime_state.report()
+        self.assertFalse(report["usable"])
+        self.assertEqual(report["reason"], "no ensurepip, no uv")
+        self.assertIsNone(report["interpreter"])
+
+
+class TestJobPythonVenv(_LocalRunnerTestCase):
+    def setUp(self):
+        self.ws = tempfile.mkdtemp(prefix="bp_jobvenv_")
+        self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
+        self.runtime = iso.ComputePythonRuntime(
+            python_path="/rt/venv/bin/python",
+            site_packages="/rt/venv/lib/python3.11/site-packages",
+            base_python="/usr/bin/python3.11",
+            python_version="3.11.9",
+            pip_version="24.0",
+            provisioner="venv",
+        )
+
+    def test_creates_pth_link_and_pip_shims(self):
+        venv = os.path.join(self.ws, iso.COMPUTE_JOB_VENV_DIRNAME)
+
+        def fake_run(argv, *, root, timeout):
+            # Stand in for `python -m venv --without-pip`.
+            os.makedirs(os.path.join(venv, "lib", "python3.11", "site-packages"))
+            os.makedirs(os.path.join(venv, "bin"))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(local_runner, "_run_toolchain_command", fake_run):
+            result = REAL_CREATE_JOB_PYTHON_VENV(self.runtime, self.ws)
+
+        self.assertEqual(result, venv)
+        pth = os.path.join(
+            venv, "lib", "python3.11", "site-packages", "_blueprint_runtime.pth"
+        )
+        with open(pth, encoding="utf-8") as fh:
+            self.assertEqual(fh.read().strip(), self.runtime.site_packages)
+        for name in ("pip", "pip3"):
+            with open(os.path.join(venv, "bin", name), encoding="utf-8") as fh:
+                body = fh.read()
+            # The shim must name the IN-SANDBOX interpreter: the read-only
+            # runtime's own pip shebang would make `pip install` EACCES.
+            self.assertIn(
+                f'exec "/workspace/{iso.COMPUTE_JOB_VENV_DIRNAME}/bin/python" -m pip',
+                body,
+            )
+            self.assertNotIn(self.runtime.python_path, body)
+
+    def test_uses_without_pip_so_a_host_without_ensurepip_still_works(self):
+        captured = {}
+
+        def fake_run(argv, *, root, timeout):
+            captured["argv"] = argv
+            raise RuntimeError("stop after arg capture")
+
+        with patch.object(local_runner, "_run_toolchain_command", fake_run):
+            REAL_CREATE_JOB_PYTHON_VENV(self.runtime, self.ws)
+        self.assertIn("--without-pip", captured["argv"])
+        self.assertEqual(captured["argv"][0], self.runtime.python_path)
+
+    def test_failure_returns_none_and_leaves_no_partial_venv(self):
+        with patch.object(
+            local_runner, "_run_toolchain_command", side_effect=RuntimeError("boom")
+        ):
+            self.assertIsNone(REAL_CREATE_JOB_PYTHON_VENV(self.runtime, self.ws))
+        self.assertFalse(
+            os.path.exists(os.path.join(self.ws, iso.COMPUTE_JOB_VENV_DIRNAME))
+        )
+
+
+class TestComputeProvisionFailureIsNotACodeDefect(unittest.TestCase):
+    """A host that cannot supply Python must not be billed to the experiment."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _job(self):
+        return {
+            "job_id": "test-job-777",
+            "command": "python train.py",
+            "env": {},
+            "cwd": None,
+            "setup_step": None,
+            "container_image": None,
+            "container_registry_auth": {},
+            "runtime_deadline_seconds": None,
+            "cancel_requested": False,
+        }
+
+    def _run_with_no_runtime(self):
+        reports = []
+
+        def fake_report(orch_url, token, job_id, **kw):
+            reports.append(kw)
+            return False
+
+        local_runner._compute_runtime_state.publish(None, "no ensurepip, no uv")
+        self.addCleanup(local_runner._compute_runtime_state.publish, None, None)
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_ensure_compute_runtime", return_value=None), \
+             patch.object(local_runner.iso, "plan_compute_execution") as plan:
+            local_runner._run_compute_job(
+                self._job(),
+                "https://api.example.com",
+                "tok",
+                {"test-job-777"},
+                threading.Lock(),
+                capabilities=_bwrap_caps(),
+            )
+        return reports, plan
+
+    def test_reports_a_provisioning_terminal_reason_and_never_plans(self):
+        reports, plan = self._run_with_no_runtime()
+        terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
+        self.assertTrue(terminal, "expected a terminal report")
+        final = terminal[-1]
+        self.assertEqual(final["exec_status"], "failed")
+        # Literal pin: the reserved provisioning exit code, not just the const.
+        self.assertEqual(final["exit_code"], 123)
+        self.assertEqual(
+            final["exit_code"], local_runner.PROVISION_FAILURE_EXIT_CODE
+        )
+        # Literal pin: backend/app/failure_classification.py routes any terminal
+        # reason CONTAINING "provisioning" to PROVISION_FAILURE. If this
+        # substring is ever dropped the failure silently becomes CODE_ERROR,
+        # burns retry budget, and blames the experiment.
+        self.assertIn("provisioning", final["terminal_reason"].lower())
+        # ...and it must not collide with the other classifier branches.
+        lowered = final["terminal_reason"].lower()
+        for foreign in ("runtime deadline", "spend cap", "cancelled", "operator"):
+            self.assertNotIn(foreign, lowered)
+        # The command never ran, so no sandbox was ever planned.
+        self.assertEqual(plan.call_count, 0)
+
+    def test_operator_log_names_the_missing_host_package(self):
+        reports, _ = self._run_with_no_runtime()
+        text = reports[-1]["command_log"]["text"]
+        self.assertIn("no ensurepip, no uv", text)
+        self.assertIn("python3-venv", text)
+        self.assertIn("uv", text)
+        self.assertIn("command never started", text.lower() + " command never started")
+
+
+class TestComputeRuntimeReachesThePlan(unittest.TestCase):
+    """The runtime the runner establishes must actually be handed to the plan."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_bwrap_job_passes_runtime_and_job_venv_into_plan_compute_execution(self):
+        captured = {}
+
+        def fake_plan(**kwargs):
+            captured.update(kwargs)
+            return iso.ExecutionPlan.decline("test stop")
+
+        with patch.object(
+            local_runner.iso, "plan_compute_execution", side_effect=fake_plan
+        ), patch.object(local_runner, "_report_compute_job", return_value=False), \
+             patch.object(
+                 local_runner, "_create_job_python_venv", return_value="/ws/.bp-venv"
+             ):
+            local_runner._run_compute_job(
+                {
+                    "job_id": "test-job-778",
+                    "command": "python train.py",
+                    "env": {},
+                    "cwd": None,
+                    "setup_step": None,
+                    "container_image": None,
+                    "container_registry_auth": {},
+                    "runtime_deadline_seconds": None,
+                    "cancel_requested": False,
+                },
+                "https://api.example.com",
+                "tok",
+                {"test-job-778"},
+                threading.Lock(),
+                capabilities=_bwrap_caps(),
+            )
+        self.assertIs(captured["python_runtime"], FAKE_COMPUTE_RUNTIME)
+        self.assertEqual(captured["job_venv_host"], "/ws/.bp-venv")
+
+    def test_container_job_does_not_provision_a_host_runtime(self):
+        """An image ships its own Python; the host runtime is bwrap-only."""
+        captured = {}
+
+        def fake_plan(**kwargs):
+            captured.update(kwargs)
+            return iso.ExecutionPlan.decline("test stop")
+
+        with patch.object(
+            local_runner.iso, "plan_compute_execution", side_effect=fake_plan
+        ), patch.object(local_runner, "_report_compute_job", return_value=False), \
+             patch.object(local_runner, "_ensure_compute_runtime") as ensure:
+            local_runner._run_compute_job(
+                {
+                    "job_id": "test-job-779",
+                    "command": "python train.py",
+                    "env": {},
+                    "cwd": None,
+                    "setup_step": None,
+                    "container_image": "reg/img:latest",
+                    "container_registry_auth": {},
+                    "runtime_deadline_seconds": None,
+                    "cancel_requested": False,
+                },
+                "https://api.example.com",
+                "tok",
+                {"test-job-779"},
+                threading.Lock(),
+                capabilities=_docker_caps(),
+            )
+        self.assertEqual(ensure.call_count, 0)
+        self.assertIsNone(captured["python_runtime"])
+
 
 class TestComputePollLoop(_LocalRunnerTestCase):
     def setUp(self):
@@ -6690,6 +7424,52 @@ class TestHeartbeatTelemetryPayload(unittest.TestCase):
         self.assertIsNone(body["disk_free_bytes"])  # workspace_root None
         self.assertIsNone(body["gpu_utilization_pct"])
 
+    def test_advertises_the_python_runtime_capability(self):
+        """EXACT keys the fleet/dispatch side reads to place compute work."""
+        posted = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._compute_runtime_state.publish(FAKE_COMPUTE_RUNTIME, None)
+        self.addCleanup(local_runner._compute_runtime_state.publish, None, None)
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False):
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+            )
+
+        body = posted[0]
+        self.assertIs(body["python_runtime_usable"], True)
+        self.assertEqual(body["python_runtime"]["pip_version"], "24.0")
+        self.assertEqual(
+            body["python_runtime"]["interpreter"], FAKE_COMPUTE_RUNTIME.python_path
+        )
+
+    def test_python_runtime_capability_is_false_when_the_host_cannot_supply_one(self):
+        posted = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._compute_runtime_state.publish(None, "no ensurepip, no uv")
+        self.addCleanup(local_runner._compute_runtime_state.publish, None, None)
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False):
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+            )
+
+        body = posted[0]
+        self.assertIs(body["python_runtime_usable"], False)
+        self.assertEqual(body["python_runtime"]["reason"], "no ensurepip, no uv")
+
     def test_emits_shared_resource_capacity_when_ledger_is_present(self):
         posted = []
 
@@ -8635,7 +9415,27 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
                 agent_teardown: dict = {}
                 fake_proc = MagicMock()
                 fake_proc.pid = 7777
-                fake_proc.stdout = _io.BytesIO(
+
+                # _spawn_agent_task tees the output on a BACKGROUND thread and
+                # returns once that thread has STARTED, not once it has drained
+                # the pipe, so reading the log straight after the call races the
+                # writer and legitimately sees b"" -- the observed CI flake.
+                # Signal EOF instead: the tee writes AND flushes each chunk
+                # before issuing its next read, so a read returning b"" proves
+                # every byte is already on disk. Exact barrier, correct whether
+                # the writer is slower than the test or faster. Signalling from
+                # the fake beats joining the tee thread, which is anonymous and
+                # short-lived and routinely exits before enumerate() sees it.
+                drained = threading.Event()
+
+                class _EofSignallingStdout(_io.BytesIO):
+                    def read(self, *args, **kwargs):
+                        chunk = super().read(*args, **kwargs)
+                        if not chunk:
+                            drained.set()
+                        return chunk
+
+                fake_proc.stdout = _EofSignallingStdout(
                     b"task output line 1\ntask output line 2\n"
                 )
 
@@ -8670,6 +9470,15 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
                     )
 
                 self.assertTrue(spawned)
+
+                self.assertTrue(
+                    # 20s, not 30: the lanes run pytest with --timeout=30, so
+                    # a 30s wait can only ever be killed by the harness and
+                    # reported as an unreproducible flake, never as itself.
+                    drained.wait(timeout=20.0),
+                    "the tee thread never read the agent's stdout to EOF "
+                    "within 20s, so the per-task log file cannot be checked",
+                )
 
                 log_path = local_runner._task_log_path("task-log-test")
                 self.assertTrue(
@@ -10484,6 +11293,242 @@ class TestTaskLogPersistence(unittest.TestCase):
                           return_value="/tmp/nonexistent-log-dir-xyz"):
             removed = local_runner._cleanup_stale_task_logs()
         self.assertEqual(removed, 0)
+
+
+# ── Agent stdout drain: a write failure must never wedge the child ────────────
+
+class _RecordingLog:
+    """Stand-in for the per-task log handle: buffered ``write`` + ``flush``."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.write_calls = 0
+        self.closed = False
+
+    def write(self, chunk):
+        self.write_calls += 1
+        self.buffer.extend(chunk)
+        return len(chunk)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _LogThatFillsUp(_RecordingLog):
+    """Accepts one write, then fails exactly like a volume that just filled."""
+
+    def write(self, chunk):
+        self.write_calls += 1
+        if self.write_calls > 1:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        self.buffer.extend(chunk)
+        return len(chunk)
+
+
+class _ConsoleThatBreaks:
+    """Stand-in for a runner stdout whose reader went away (dead journal pipe)."""
+
+    def __init__(self):
+        self.write_calls = 0
+
+    def write(self, _text):
+        self.write_calls += 1
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    def flush(self):
+        pass
+
+
+class TestAgentStdoutDrain(unittest.TestCase):
+    """A failure to PERSIST agent output must never stop the pipe being drained.
+
+    ``_drain_stream_to_log`` is the ONLY reader of a spawned agent's stdout pipe
+    (the agent runs with ``stdout=PIPE, stderr=STDOUT``, and the walkthrough
+    stack supervisor — the only other thread handed the ``Popen`` — merely polls
+    ``proc.poll()``).  The tee used to catch ``OSError`` from the LOG WRITE in
+    the same handler that guards the pipe READ, and then return.  So an
+    unwritable log silently stopped the only reader: the kernel pipe buffer
+    (64KB on Linux) filled, the agent blocked forever inside ``write()``, held
+    its capacity permit, and was eventually SIGKILLed by the reaper's wall-clock
+    deadline and recorded as a failure.  A full disk HUNG agents instead of
+    failing them, destroying valid work.
+
+    These tests drive a REAL child process writing REAL bytes through a REAL
+    pipe.  That is deliberate: a mocked stream cannot block, so a test built on
+    one would pass against the wedged code and prove nothing.  Against the
+    pre-fix tee, ``test_child_completes_when_the_log_fills_up`` fails at
+    ``proc.wait`` with ``TimeoutExpired`` — the child is genuinely stuck.
+
+    POSIX-only, like the rest of this file (``local_runner`` imports ``fcntl``
+    at module scope); the 64KB pipe-buffer behaviour is what the Docker test
+    lane runs on.
+    """
+
+    # 16x the 64KB Linux pipe buffer, so the child CANNOT finish writing unless
+    # something keeps reading the far end.
+    CHILD_BYTES = 1 << 20
+
+    def _spawn_writer(self):
+        """Start a child that floods its stdout with CHILD_BYTES and exits 0."""
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write("
+                f"b'x' * {self.CHILD_BYTES}); sys.stdout.buffer.flush()",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.addCleanup(self._release, proc)
+        return proc
+
+    def _release(self, proc):
+        """Never leave a wedged child (or its pipe fd) behind on failure."""
+        if proc.poll() is None:
+            proc.kill()
+        if proc.stdout is not None:
+            with contextlib.suppress(OSError, ValueError):
+                proc.stdout.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=10)
+
+    def _drain_in_thread(self, proc, log_handle, console):
+        """Run the real drain on its own thread, exactly as the runner does."""
+        result = {}
+
+        def _run():
+            result["drained"] = local_runner._drain_stream_to_log(
+                proc.stdout, log_handle, task_id="drain-task", console=console
+            )
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        return thread, result
+
+    def test_child_completes_when_the_log_fills_up(self):
+        """ENOSPC on the log must degrade logging, not block the agent."""
+        proc = self._spawn_writer()
+        log = _LogThatFillsUp()
+        console = io.StringIO()
+        thread, result = self._drain_in_thread(proc, log, console)
+
+        # THE assertion.  Pre-fix the drain returns on the first ENOSPC, nothing
+        # reads the pipe, and the child blocks in write() forever ->
+        # TimeoutExpired here.
+        self.assertEqual(
+            proc.wait(timeout=10),
+            0,
+            "the agent child never exited: its stdout pipe stopped being drained, "
+            "so it is blocked in write() on a full 64KB pipe buffer",
+        )
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "the drain thread never reached EOF")
+        self.assertEqual(
+            result.get("drained"),
+            self.CHILD_BYTES,
+            "the pipe was abandoned part-way instead of being read to EOF",
+        )
+
+    def test_log_sink_is_dropped_once_and_released(self):
+        """One loud warning, not one per 8KB chunk, and the handle is closed."""
+        proc = self._spawn_writer()
+        log = _LogThatFillsUp()
+        console = io.StringIO()
+        thread, result = self._drain_in_thread(proc, log, console)
+        proc.wait(timeout=10)
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "the drain thread never reached EOF")
+
+        self.assertEqual(
+            log.write_calls,
+            2,
+            "the tee kept writing to a sink it had already dropped "
+            f"({log.write_calls} calls for {self.CHILD_BYTES} bytes)",
+        )
+        self.assertTrue(log.closed, "the failed log handle was never released")
+        text = console.getvalue()
+        self.assertEqual(
+            text.count("log file became"),
+            1,
+            "expected exactly ONE warning about the unwritable log",
+        )
+        self.assertEqual(
+            text.count("x"),
+            self.CHILD_BYTES,
+            "console echo stopped when the log sink failed; the two sinks must "
+            "fail independently",
+        )
+
+    def test_child_completes_when_the_console_breaks(self):
+        """A dead runner stdout must not wedge the agent either."""
+        proc = self._spawn_writer()
+        console = _ConsoleThatBreaks()
+        captured_stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, "agent.log")
+            log_handle = open(log_path, "ab")
+            with patch.object(sys, "stderr", captured_stderr):
+                thread, result = self._drain_in_thread(proc, log_handle, console)
+                self.assertEqual(
+                    proc.wait(timeout=10),
+                    0,
+                    "the agent child never exited after the runner console broke",
+                )
+                thread.join(timeout=10)
+            self.assertFalse(thread.is_alive(), "the drain thread never reached EOF")
+            self.assertEqual(result.get("drained"), self.CHILD_BYTES)
+            self.assertEqual(
+                os.path.getsize(log_path),
+                self.CHILD_BYTES,
+                "the log lost output after the console broke; the two sinks must "
+                "fail independently",
+            )
+        self.assertEqual(
+            console.write_calls, 1, "the tee kept writing to a broken console"
+        )
+        self.assertEqual(
+            captured_stderr.getvalue().count("console output"),
+            1,
+            "the broken console must be reported exactly once, on stderr",
+        )
+
+    def test_read_failure_stops_the_drain_and_is_reported(self):
+        """The READ side stays fatal: a gone pipe must not become a spin loop.
+
+        The fix must not degrade into a blanket ``except: pass`` around the
+        whole loop — once the pipe itself is gone the child can no longer be
+        blocked on it, so the tee stops.  It now says so, because this thread is
+        never joined or inspected by the runner: a silent return made an
+        abnormal drain death completely unobservable.
+        """
+
+        class _StreamThatBreaks:
+            def __init__(self):
+                self.reads = 0
+
+            def read(self, _size):
+                self.reads += 1
+                if self.reads > 1:
+                    raise OSError(errno.EIO, "Input/output error")
+                return b"y" * 4096
+
+        stream = _StreamThatBreaks()
+        log = _RecordingLog()
+        console = io.StringIO()
+        drained = local_runner._drain_stream_to_log(
+            stream, log, task_id="drain-task", console=console
+        )
+
+        self.assertEqual(drained, 4096)
+        self.assertEqual(
+            stream.reads, 2, "the drain kept reading a stream that is already gone"
+        )
+        self.assertIn("stdout drain ended early", console.getvalue())
+        self.assertTrue(log.closed, "the log handle was not released on the read path")
 
 
 # ── Credential file path-traversal guard ──────────────────────────────────────

@@ -799,6 +799,31 @@ export interface LaneWasteTaxonomy {
   [key: string]: number;
 }
 
+export interface LaneWasteChainRow {
+  chain_key: string;
+  original_task_id: string | null;
+  /** Raw from the chain's review_loop context, so not normalised to a string. */
+  pr_number: string | number | null;
+  /** Every PR this review loop crossed, de-duplicated and sorted as strings. */
+  review_loop_pr_numbers: string[];
+  /** True when the chain crossed at least one PR boundary (superseded rollup). */
+  supersede_affected: boolean;
+  project_id: string | null;
+  direction_id: string | null;
+  terminal_outcome: string | null;
+  cap_exhausted: boolean;
+  task_count: number;
+  cap_counted_iterations: number;
+  cap_excluded_iterations: number;
+  max_iteration: number | null;
+  review_count: number;
+  reviews_to_converge: number | null;
+  churn_count: number;
+  has_drift: boolean;
+  waste_totals: Record<string, number>;
+  tasks: Record<string, unknown>[];
+}
+
 export interface LaneWasteDiagnostics {
   waste_taxonomy: LaneWasteTaxonomy;
   waste_task_count: number;
@@ -806,8 +831,50 @@ export interface LaneWasteDiagnostics {
   cap_excluded_task_count: number;
   chain_count: number;
   cap_exhausted_chain_count: number;
+  /** Distinct directions that lost at least one chain to the review cap. */
+  cap_exhausted_direction_count: number;
+  cap_exhausted_directions?: {
+    direction_id: string;
+    direction_text: string | null;
+  }[];
+  /** Chains whose review loop crossed at least one PR boundary. */
+  supersede_affected_chain_count: number;
+  reviews_to_converge: {
+    count: number;
+    median: number | null;
+    p95: number | null;
+  };
+  /** Reviews-to-converge restricted to merged, supersede-affected chains. */
+  supersede_affected_reviews_to_converge: {
+    count: number;
+    sample_count: number;
+    median: number | null;
+    p95: number | null;
+  };
+  /** Rollup-only supersede-affected and unaffected control populations. */
+  rollup_chain_count?: number;
+  rollup_supersede_affected_chain_count?: number;
+  rollup_supersede_unaffected_chain_count?: number;
+  rollup_supersede_affected_reviews_to_converge?: {
+    count: number;
+    sample_count: number;
+    median: number | null;
+    p95: number | null;
+  };
+  rollup_supersede_unaffected_reviews_to_converge?: {
+    count: number;
+    sample_count: number;
+    median: number | null;
+    p95: number | null;
+  };
+  retarget_review_scope_counts: {
+    delta: number;
+    full: number;
+  };
+  stale_head_discard_count: number;
   chain_limit: number;
   chains_truncated: boolean;
+  chains: LaneWasteChainRow[];
 }
 
 export interface PerPrPhaseRow {
@@ -862,6 +929,16 @@ export interface LaneBaselineTrendBlock {
   prior: number | null;
   delta: number | null;
   classification: 'improving' | 'declining' | 'stable' | null;
+  /** Per-version measurement provenance; optional for older API responses. */
+  availability?: {
+    latest: 'available' | 'evicted' | 'unavailable';
+    prior: 'available' | 'evicted' | 'unavailable';
+  };
+}
+
+export interface LaneBaselineDirectionRecord {
+  direction_id: string;
+  direction_text: string | null;
 }
 
 export interface LaneBaselineTrend {
@@ -885,6 +962,29 @@ export interface LaneBaselineTrend {
     iteration_p95: LaneBaselineTrendBlock;
     convergence_rate: LaneBaselineTrendBlock;
     cap_exhausted_chain_count: LaneBaselineTrendBlock;
+    cap_exhausted_direction_count: LaneBaselineTrendBlock;
+    cap_exhausted_directions?: {
+      latest: LaneBaselineDirectionRecord[];
+      prior: LaneBaselineDirectionRecord[];
+    };
+    supersede_affected_reviews_to_converge_median: LaneBaselineTrendBlock;
+    supersede_affected_reviews_to_converge_p95: LaneBaselineTrendBlock;
+    rollup_supersede_affected_reviews_to_converge_median?: LaneBaselineTrendBlock;
+    rollup_supersede_affected_reviews_to_converge_p95?: LaneBaselineTrendBlock;
+    rollup_supersede_unaffected_reviews_to_converge_median?: LaneBaselineTrendBlock;
+    rollup_supersede_unaffected_reviews_to_converge_p95?: LaneBaselineTrendBlock;
+  };
+  retarget_convergence: {
+    reviews_to_converge: {
+      count: LaneBaselineTrendBlock;
+      median: LaneBaselineTrendBlock;
+      p95: LaneBaselineTrendBlock;
+    };
+    retarget_review_scope_counts: {
+      delta: LaneBaselineTrendBlock;
+      full: LaneBaselineTrendBlock;
+    };
+    stale_head_discard_count: LaneBaselineTrendBlock;
   };
 }
 
@@ -893,11 +993,37 @@ export interface LaneBaselineConvergence {
   iteration_p95: number | null;
   convergence_rate: number | null;
   cap_exhausted_chain_count: number;
+  /** Distinct directions that lost at least one chain to the review cap. */
+  cap_exhausted_direction_count?: number;
+  cap_exhausted_directions?: {
+    direction_id: string;
+    direction_text: string | null;
+  }[];
+  /** Chains that crossed at least one PR boundary (superseded rollups). */
+  supersede_affected_chain_count?: number;
+  supersede_affected_merged_chain_count?: number;
+  supersede_affected_reviews_to_converge_count?: number;
+  supersede_affected_reviews_to_converge_sample_count?: number;
+  supersede_affected_reviews_to_converge_median?: number | null;
+  supersede_affected_reviews_to_converge_p95?: number | null;
+  rollup_chain_count?: number;
+  rollup_supersede_affected_chain_count?: number;
+  rollup_supersede_unaffected_chain_count?: number;
+  rollup_supersede_affected_reviews_to_converge_count?: number;
+  rollup_supersede_affected_reviews_to_converge_sample_count?: number;
+  rollup_supersede_affected_reviews_to_converge_median?: number | null;
+  rollup_supersede_affected_reviews_to_converge_p95?: number | null;
+  rollup_supersede_unaffected_reviews_to_converge_count?: number;
+  rollup_supersede_unaffected_reviews_to_converge_sample_count?: number;
+  rollup_supersede_unaffected_reviews_to_converge_median?: number | null;
+  rollup_supersede_unaffected_reviews_to_converge_p95?: number | null;
   terminal_outcome_counts: Record<string, number>;
 }
 
 export interface LaneBaseline {
   version_number: number;
+  /** Fields removed only because the persisted snapshot exceeded its byte budget. */
+  dropped_fields?: string[];
   outer_loop_convergence?: LaneBaselineConvergence;
   [key: string]: unknown;
 }

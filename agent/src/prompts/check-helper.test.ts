@@ -1,6 +1,8 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
+import { POSIX_SHIM_SANDBOX_SUPPORTED } from '../test-python.js';
 import type { DirectoryConfig } from '../utils/test-runners.js';
+import { FIXTURE_SHARED_FILES, testingImportClosure } from './check-helper.fixture-deps.js';
 
 describe('tracked root check delegation contract', () => {
   it('prefers a generated gate and reserves the tracked default for true developer checkouts', async () => {
@@ -192,7 +194,7 @@ describe('writeCheckHelper — direct invocation', () => {
     // ...and it is emitted at shell TOP LEVEL (column 0), not indented inside
     // `if touches backend/`. Its drift sentinels guard admin-ui/, agent/ and
     // scripts/ surfaces a backend-gated lane can never see (promotion #17738).
-    expect(script).toMatch(/^if \[ "\$WITH_TESTS" = "1" \] && \[ "1" = "1" \]; then\n  run "backend pytest \(attributed\)"/m);
+    expect(script).toMatch(/^if \[ "\$WITH_TESTS" = "1" \] && \[ "1" = "1" \]; then\n\s{2}run "backend pytest \(attributed\)"/m);
     expect(script).not.toContain('BPYTEST_BASELINE_FAILED');
     expect(script).not.toContain('backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR');
     // Conflict-resolution verification shares this one attributed backend lane;
@@ -814,6 +816,8 @@ describe('writeCheckHelper — configured test commands', () => {
   });
 });
 
+// `runtime:` cases run the real ./check in a POSIX-shim sandbox — see test-python.ts.
+const itRuntime = POSIX_SHIM_SANDBOX_SUPPORTED ? it : it.skip;
 
 describe('writeCheckHelper — required backend-authoring verification', () => {
   let capturedScripts: Record<string, string> = {};
@@ -921,7 +925,7 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     // Every reference to the Blueprint-local writer is behind the readability
     // guard, and the fallback that runs without it writes the same receipt.
     const guardAt = script.indexOf('if [ -r scripts/verification_receipt.py ]; then');
-    const fallbackAt = script.indexOf('elif python3 -c ');
+    const fallbackAt = script.lastIndexOf('elif python3 -c ');
     const verdictAt = script.indexOf('if [ "$_verification_receipt_written" = "1" ]; then');
     expect(guardAt).toBeGreaterThan(-1);
     expect(fallbackAt).toBeGreaterThan(guardAt);
@@ -930,9 +934,9 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     // the readability guard, so its absence takes the `elif` fallback rather
     // than exiting non-zero.
     for (
-      let at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest');
+      let at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest --receipt');
       at !== -1;
-      at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest', at + 1)
+      at = script.indexOf('python3 scripts/verification_receipt.py backend-pytest --receipt', at + 1)
     ) {
       expect(at).toBeGreaterThan(guardAt);
       expect(at).toBeLessThan(fallbackAt);
@@ -1178,13 +1182,12 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       const productionRoot = realPath.resolve(process.cwd(), '..');
       // Keep the isolated fixture's shared size-guard imports identical to a
       // real checkout; the Python shim below only intercepts direct test calls.
+      // The closure walk covers intra-``testing`` imports so a new one cannot
+      // reach CI as a bare ModuleNotFoundError inside a captured guard log.
+      const closureEntries = FIXTURE_SHARED_FILES.filter(f => f.endsWith('.py'));
       for (const relative of [
-        'scripts/backend_verification_guard.py', 'scripts/verification_receipt.py',
-        'scripts/guard_suppression_receipt.py', 'scripts/static_release_guard.py',
-        'backend/testing/fixgate_attribution.py', 'backend/testing/impacted_tests.py',
-        'backend/testing/drift_sentinel_surfaces.json', 'backend/testing/check_size_limits.py',
-        'backend/testing/module_size_limits.json', 'backend/testing/cap_bump_history.json',
-        'backend/app/__init__.py', 'backend/app/size_limit_policy.py',
+        ...FIXTURE_SHARED_FILES,
+        ...testingImportClosure(realFs, realPath, productionRoot, closureEntries),
       ]) {
         realFs.copyFileSync(realPath.join(productionRoot, relative), realPath.join(dir, relative));
       }
@@ -1307,7 +1310,7 @@ exit ${scenario.harnessExit}
       realFs.rmSync(dir, { recursive: true, force: true });
     }
   };
-  it('runtime: mints a receipt only after real-shaped Ruff and targeted Postgres evidence', async () => {
+  itRuntime('runtime: mints a receipt only after real-shaped Ruff and targeted Postgres evidence', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0, docker: true, harnessExit: 0, seedCapabilityReceipt: true,
     });
@@ -1328,7 +1331,7 @@ exit ${scenario.harnessExit}
     });
     expect(result.capabilityReceipt).toBeUndefined();
   });
-  it('runtime: combines changed tests with resolver output, filters deletions, and deduplicates', async () => {
+  itRuntime('runtime: combines changed tests with resolver output, filters deletions, and deduplicates', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: true,
@@ -1350,7 +1353,7 @@ exit ${scenario.harnessExit}
       pytest: { selectors: ['testing/test_bar.py', 'testing/test_x.py'] },
     });
   });
-  it('runtime: a nested opted-in project ignores non-Python-only changes', async () => {
+  itRuntime('runtime: a nested opted-in project ignores non-Python-only changes', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: false,
@@ -1362,7 +1365,7 @@ exit ${scenario.harnessExit}
     expect(result.stdout).not.toContain('no Python target');
     expect(result.receipt).toBeUndefined();
   });
-  it('runtime: an opted-in root project executes for repo-relative Python changes and fails closed', async () => {
+  itRuntime('runtime: an opted-in root project executes for repo-relative Python changes and fails closed', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'verify-authoring-1',
@@ -1390,12 +1393,14 @@ exit ${scenario.harnessExit}
     expect(result.log).toContain('ruff -m ruff check');
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
-    expect(result.receipt).toBeUndefined();
+    expect(result.receipt).toMatchObject({
+      lanes: { 'backend-pytest': { state: 'runtime_unavailable', blocking: true } },
+    });
     expect(result.capabilityReceipt).toBe(
       `backend_verification:runtime_unavailable:v1:${result.taskId}\n`,
     );
   });
-  it('runtime: an opted-in ./backend project executes for repo-relative Python changes and fails closed', async () => {
+  itRuntime('runtime: an opted-in ./backend project executes for repo-relative Python changes and fails closed', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'verify-authoring-1',
@@ -1419,12 +1424,14 @@ exit ${scenario.harnessExit}
     expect(result.log).toContain('ruff -m ruff check');
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
-    expect(result.receipt).toBeUndefined();
+    expect(result.receipt).toMatchObject({
+      lanes: { 'backend-pytest': { state: 'runtime_unavailable', blocking: true } },
+    });
     expect(result.capabilityReceipt).toBe(
       `backend_verification:runtime_unavailable:v1:${result.taskId}\n`,
     );
   });
-  it.each([
+  itRuntime.each([
     ['missing Ruff', { ruffExit: 1, docker: true, harnessExit: 0 }],
     ['daemonless Docker', { ruffExit: 0, docker: false, harnessExit: 0 }],
     ['Postgres harness failure', { ruffExit: 0, docker: true, harnessExit: 1 }],
@@ -1434,15 +1441,15 @@ exit ${scenario.harnessExit}
     expect(result.status, result.stdout).not.toBe(0);
     if (result.receipt !== undefined) {
       const receipt = result.receipt as {
-        pytest: { exit_code: number };
-        lanes?: Record<string, { blocking?: boolean }>;
+        pytest?: { exit_code?: number };
+        lanes?: Record<string, { blocking?: boolean; state?: string }>;
       };
-      expect(receipt.pytest.exit_code).not.toBe(0);
+      if (receipt.pytest) expect(receipt.pytest.exit_code).not.toBe(0);
       expect(receipt.lanes?.['backend-pytest']?.blocking).toBe(true);
     }
     expect(result.stdout).toContain('FAIL');
   });
-  it('runtime: a blocking backend attribution receipt is retained with all buckets', async () => {
+  itRuntime('runtime: a blocking backend attribution receipt is retained with all buckets', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: true,
@@ -1468,7 +1475,7 @@ exit ${scenario.harnessExit}
       },
     });
   });
-  it.each(['missing', 'syntax-invalid'] as const)(
+  itRuntime.each(['missing', 'syntax-invalid'] as const)(
     'runtime: %s route helper cannot mint backend capability authority', async (routeHelper) => {
       const result = await runRequiredCheck(await render(), {
         ruffExit: 0, docker: true, harnessExit: 0, routeHelper, seedCapabilityReceipt: true,
@@ -1476,12 +1483,14 @@ exit ${scenario.harnessExit}
       expect(result.status, result.stdout).not.toBe(0);
       expect(result.stdout).toContain('route helper unavailable or invalid');
       expect(result.stdout).not.toContain('PostgreSQL runtime unavailable');
-      expect(result.receipt).toBeUndefined();
+      expect(result.receipt).toMatchObject({
+        lanes: { 'backend-pytest': { state: 'route_helper_unavailable', blocking: true } },
+      });
       expect(result.capabilityReceipt).toBeUndefined();
       expect(result.log).not.toContain('harness USE_TEST_POSTGRES=true');
     },
   );
-  it('runtime: baked sandbox venv + PG bindir select --sandbox-postgres without Docker', async () => {
+  itRuntime('runtime: baked sandbox venv + PG bindir select --sandbox-postgres without Docker', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: false,
@@ -1504,7 +1513,7 @@ exit ${scenario.harnessExit}
       },
     });
   });
-  it('runtime: PG bindir present but baked venv missing falls back to the Docker --postgres sidecar', async () => {
+  itRuntime('runtime: PG bindir present but baked venv missing falls back to the Docker --postgres sidecar', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: true,
@@ -1528,7 +1537,7 @@ exit ${scenario.harnessExit}
       },
     });
   });
-  it('runtime: PG bindir present but baked venv missing and no Docker fails closed', async () => {
+  itRuntime('runtime: PG bindir present but baked venv missing and no Docker fails closed', async () => {
     const result = await runRequiredCheck(await render(), {
       ruffExit: 0,
       docker: false,
@@ -1538,7 +1547,9 @@ exit ${scenario.harnessExit}
     });
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.stdout).toContain('PostgreSQL runtime unavailable');
-    expect(result.receipt).toBeUndefined();
+    expect(result.receipt).toMatchObject({
+      lanes: { 'backend-pytest': { state: 'runtime_unavailable', blocking: true } },
+    });
   });
 });
 

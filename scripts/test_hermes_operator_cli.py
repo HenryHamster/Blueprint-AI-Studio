@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import blueprint
+import blueprint_api
 import pytest
 
 
@@ -18,6 +19,40 @@ PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 TASK_ID = "22222222-2222-4222-8222-222222222222"
 MESSAGE_ID = "33333333-3333-4333-8333-333333333333"
 DIRECTION_ID = "d-hermes-1"
+
+# The catalog ``validate_project_id`` checks ``--project-id`` against. Every
+# test here passes ``--project-id PROJECT_ID``, so the id has to be present or
+# ``main()`` exits 1 before reaching the command under test.
+PROJECT_CATALOG = [
+    {
+        "id": PROJECT_ID,
+        "name": "hermes/scoped-project",
+        "github_owner": "hermes",
+        "github_repo": "scoped-project",
+        "role": "member",
+    }
+]
+
+
+def _install_double(monkeypatch, name: str, value) -> None:
+    """Install a test double on BOTH bindings of a ``blueprint_api`` name.
+
+    ``blueprint.py`` does ``from blueprint_api import (api, get_project_id,
+    list_projects, load_config, validate_project_id, ...)``, so every one of
+    those names exists twice: once in ``blueprint`` and once in
+    ``blueprint_api``. Patching only ``blueprint`` leaves the calls that
+    ``blueprint_api`` makes *internally* bound to the real functions --
+    ``main()`` -> ``validate_project_id()`` -> ``list_projects()`` ->
+    ``load_config()``/``api()`` never saw the mock, resolved the operator's
+    ambient ``~/.blueprint-config.json``, and issued live authenticated
+    requests to the production orchestrator (21 of them from this file alone).
+    CI containers have no config file, so the mock hole was invisible there.
+
+    Patch the source of truth as well, so a double that is supposed to
+    intercept actually does.
+    """
+    monkeypatch.setattr(blueprint_api, name, value)
+    monkeypatch.setattr(blueprint, name, value)
 
 
 @pytest.fixture(autouse=True)
@@ -33,16 +68,17 @@ def _install_scoped_cli(
 ) -> list[tuple[str, str, dict | None]]:
     calls: list[tuple[str, str, dict | None]] = []
 
-    monkeypatch.setattr(
-        blueprint,
+    _install_double(
+        monkeypatch,
         "load_config",
         lambda: {"api_key": "bpsc_hermes-test", "default_repo": "ignored/repo"},
     )
-    monkeypatch.setattr(
-        blueprint,
+    _install_double(
+        monkeypatch,
         "get_project_id",
         lambda project_id=None: project_id or PROJECT_ID,
     )
+    _install_double(monkeypatch, "list_projects", lambda: list(PROJECT_CATALOG))
 
     def fake_api(method: str, path: str, body: dict | None = None, **_kwargs):
         calls.append((method, path, body))
@@ -55,7 +91,7 @@ def _install_scoped_cli(
             return responder(method, path, body)
         return {}
 
-    monkeypatch.setattr(blueprint, "api", fake_api)
+    _install_double(monkeypatch, "api", fake_api)
     return calls
 
 

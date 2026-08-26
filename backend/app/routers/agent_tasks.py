@@ -25,21 +25,40 @@ back to the task it spawned.
 
 The response is a compact, agent-safe subset of the admin task detail:
 no cost, no billing, no other users' data.
+
+``GET /projects/{project_id}/task-census`` is the deliberate exception to the
+strategist-lineage filter. Nearly all pipeline activity is authored with
+``created_by="ORCHESTRATOR"`` (autonomous_research, direction_lifecycle,
+review_pipeline, release_qualifier_audit, discovery_review, plan_completion,
+strategic_spawning, hotfix_backmerge, …), so the lineage-scoped views above
+show the resident almost none of what the pipeline is actually doing. The
+census answers "what is running, and what is stuck" project-wide — as
+aggregate counts plus the oldest non-terminal rows, never as an unbounded task
+dump (see app.agent_read_budget for why the size ceiling is load-bearing).
 """
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+from app.agent_read_budget import (
+    AGENT_READ_AGGREGATE_TOP_N,
+    bound_counts,
+    clamp_read_response,
+    clip_text,
+)
 from app.database import get_session
 from app.models import Artifact, ArtifactType, Task, TaskStatus
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.shared_state import limiter
+from app.time_utils import utc_iso
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -53,15 +72,47 @@ _TERMINAL_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
 
+# ── Project-wide census bounds ──────────────────────────────────────────────
+# Non-terminal work is what the census is for; terminal history is summarized
+# as counts over a recent window instead of being walked.
+_NON_TERMINAL_STATUSES: tuple[TaskStatus, ...] = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+    TaskStatus.BLOCKED,
+    TaskStatus.PARKED,
+)
+# Hard row ceiling on the non-terminal scan. Counts derived from a capped scan
+# are reported with ``scan_capped`` so a saturated fleet reads as saturated
+# rather than as a suspiciously round number.
+_CENSUS_SCAN_LIMIT = 2000
+_CENSUS_OLDEST_DEFAULT = 25
+_CENSUS_OLDEST_MAX = 100
+_CENSUS_TERMINAL_WINDOW_HOURS = 24
+
 
 def _iso(dt: Any) -> str | None:
-    return dt.isoformat() if dt else None
+    if isinstance(dt, datetime):
+        return utc_iso(dt)
+    return dt.isoformat() if dt else None  # utc-iso-ok: non-datetime (date) value -- no zone applies
 
 
 def _task_type(task: Task) -> str | None:
-    """Extract task_type from first payload."""
+    """Extract task_type from first payload, clipped to the shared text ceiling.
+
+    ``payloads`` is JSONB and ``chk_task_payloads_size`` (alembic 0065) bounds
+    only its total *bytes*: nothing constrains the ``type`` value's vocabulary,
+    length, or even its JSON type. Unlike ``created_by`` — which
+    ``chk_task_created_by`` (alembic 0067) pins to 11 values — a task type is a
+    free string, so it is clipped here rather than trusted. It reaches the
+    census both as a response field and as a dict *key*, and an unclipped key
+    is untrimmable by ``clamp_read_response``; see app.agent_read_budget.
+    """
     fp = task.first_payload
-    return fp.get("type") if isinstance(fp, dict) else None
+    if not isinstance(fp, dict):
+        return None
+    return clip_text(fp.get("type"))
 
 
 def _build_task_response(
@@ -354,3 +405,203 @@ async def agent_list_tasks(
         items.append(item)
 
     return {"status": "success", "data": items, "count": len(items)}
+
+
+@router.get("/projects/{project_id}/task-census")
+@limiter.limit("30/minute")
+async def agent_task_census(
+    request: Request,
+    project_id: uuid.UUID,
+    oldest: int = Query(default=_CENSUS_OLDEST_DEFAULT, ge=1, le=_CENSUS_OLDEST_MAX),
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+) -> dict[str, Any]:
+    """Project-wide census of in-flight work, across every ``created_by``.
+
+    ``GET /projects/{project_id}/tasks`` deliberately seeds its recursive walk
+    on ``created_by = "STRATEGIC_AGENT"``. That is correct for "what did I
+    spawn" and useless for "what is the pipeline doing": the orchestrator
+    authors the overwhelming majority of tasks as ``ORCHESTRATOR``, so the
+    lineage view is blind to them. This endpoint is the complement — same
+    per-project trust boundary, no ``created_by`` filter.
+
+    It answers two questions and nothing else:
+
+    * **How much of what is in flight** — non-terminal counts by status, by
+      task type, and by author, plus a recent-window terminal breakdown so a
+      healthy standing queue can be told apart from a stalled one.
+    * **What is oldest** — up to ``oldest`` (default 25, max 100) of the
+      longest-running non-terminal tasks, oldest first, with age in hours and
+      the blocked/parked reason. Age-sorted rather than recency-sorted because
+      the failure mode worth catching is a task stranded for days.
+
+    Bounded on four axes, none of them optional:
+
+    * the scan stops at ``_CENSUS_SCAN_LIMIT`` rows (reported as
+      ``scan_capped``);
+    * free text is clipped per field;
+    * the aggregate maps are folded to ``AGENT_READ_AGGREGATE_TOP_N`` keys plus
+      ``other`` by ``bound_counts``, with totals preserved exactly. This one is
+      load-bearing rather than tidy: the task type is a free string out of
+      payload JSONB with no allowlist, so ``non_terminal_by_type`` has
+      structurally unbounded cardinality, and the byte clamp below cannot shed
+      a single byte of a count map. Roughly 300 in-flight types used to return
+      2x the ceiling with every detail row already dropped;
+    * the whole response is then clamped to ``AGENT_READ_MAX_RESPONSE_BYTES``
+      by shedding detail rows only — the counts always survive, and
+      ``bounds.over_budget`` says outright whether the ceiling was met.
+
+    See ``app.agent_read_budget``: an oversized read here degrades the
+    strategic envelope into a coreless stub and livelocks the reclaim loop
+    (PR #17424).
+    """
+    await _resolve_agent_project(project_id, token, session)
+
+    now = datetime.now(timezone.utc)
+
+    scanned = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.parent_task_id,
+                        Task.status,
+                        Task.created_by,
+                        Task.created_at,
+                        Task.updated_at,
+                        Task.title,
+                        Task.payloads,
+                        Task.latest_status_message,
+                        Task.blocked_reason,
+                        Task.blocker_kind,
+                        Task.park_reason,
+                        raiseload=True,
+                    )
+                )
+                .where(
+                    Task.project_id == project_id,
+                    Task.status.in_(_NON_TERMINAL_STATUSES),
+                )
+                .order_by(Task.created_at.asc())
+                .limit(_CENSUS_SCAN_LIMIT + 1)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    scan_capped = len(scanned) > _CENSUS_SCAN_LIMIT
+    rows = list(scanned[:_CENSUS_SCAN_LIMIT])
+
+    # Aggregate in Python rather than in SQL: the task type lives inside the
+    # ``payloads`` JSON, and extracting it in SQL needs dialect-specific
+    # json_extract / JSONB paths. The scan is row-capped, so this stays cheap
+    # and stays identical on SQLite and Postgres.
+    by_status: dict[str, int] = {}
+    by_type: dict[str, dict[str, int]] = {}
+    by_created_by: dict[str, int] = {}
+    for task in rows:
+        status_val = (
+            getattr(task.status, "value", str(task.status))
+            if task.status
+            else "unknown"
+        )
+        task_type = _task_type(task) or "unknown"
+        by_status[status_val] = by_status.get(status_val, 0) + 1
+        type_bucket = by_type.setdefault(task_type, {})
+        type_bucket[status_val] = type_bucket.get(status_val, 0) + 1
+        author = task.created_by or "unknown"
+        by_created_by[author] = by_created_by.get(author, 0) + 1
+
+    # Bound the aggregate maps BEFORE they reach the clamp. ``by_type`` is keyed
+    # on a free string out of payload JSONB with no allowlist behind it, so its
+    # cardinality is structurally unbounded — roughly 300 in-flight types breach
+    # the response ceiling on their own, and ``clamp_read_response`` cannot shed
+    # a single byte of a count map. ``bound_counts`` folds the tail into
+    # ``other`` with the totals preserved exactly. ``by_created_by`` is already
+    # bounded to 11 values by ``chk_task_created_by`` (alembic 0067); it goes
+    # through the same fold anyway so that relaxing that constraint cannot
+    # silently reintroduce the breach. ``by_status`` is keyed on the TaskStatus
+    # enum and needs no fold.
+    distinct_types = len(by_type)
+    distinct_created_by = len(by_created_by)
+    bounded_by_type = bound_counts(by_type)
+    bounded_by_created_by = bound_counts(by_created_by)
+
+    # Recent terminal throughput: pure SQL GROUP BY, no JSON extraction, so it
+    # costs one aggregate query regardless of how much history exists.
+    window_start = now - timedelta(hours=_CENSUS_TERMINAL_WINDOW_HOURS)
+    terminal_counts: dict[str, int] = {}
+    terminal_rows = (
+        await session.execute(
+            select(Task.status, func.count())
+            .where(
+                Task.project_id == project_id,
+                Task.status.in_(tuple(_TERMINAL_STATUSES)),
+                Task.updated_at >= window_start,
+            )
+            .group_by(Task.status)
+        )
+    ).all()
+    for status_col, count in terminal_rows:
+        terminal_counts[getattr(status_col, "value", str(status_col))] = int(count)
+
+    oldest_rows: list[dict[str, Any]] = []
+    for task in rows[:oldest]:
+        status_val = (
+            getattr(task.status, "value", str(task.status)) if task.status else None
+        )
+        age_hours = None
+        if task.created_at is not None:
+            created = task.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            age_hours = round((now - created).total_seconds() / 3600.0, 1)
+        item: dict[str, Any] = {
+            "id": str(task.id),
+            "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
+            "status": status_val,
+            "task_type": _task_type(task),
+            "created_by": task.created_by,
+            "created_at": _iso(task.created_at),
+            "age_hours": age_hours,
+            "title": clip_text(task.title),
+            "latest_status_message": clip_text(task.latest_status_message),
+        }
+        if task.status == TaskStatus.BLOCKED:
+            item["blocked_reason"] = clip_text(task.blocked_reason)
+            item["blocker_kind"] = task.blocker_kind
+        if task.status == TaskStatus.PARKED:
+            item["park_reason"] = clip_text(task.park_reason)
+        oldest_rows.append(item)
+
+    data: dict[str, Any] = {
+        "generated_at": utc_iso(now),
+        "non_terminal_total": len(rows),
+        "non_terminal_by_status": by_status,
+        "non_terminal_by_type": bounded_by_type,
+        "non_terminal_by_created_by": bounded_by_created_by,
+        "recent_terminal": {
+            "window_hours": _CENSUS_TERMINAL_WINDOW_HOURS,
+            "by_status": terminal_counts,
+        },
+        "oldest_non_terminal": oldest_rows,
+        "bounds": {
+            "scan_limit": _CENSUS_SCAN_LIMIT,
+            "scan_capped": scan_capped,
+            "oldest_requested": oldest,
+            # How much vocabulary the ``other`` fold is hiding. Without these a
+            # reader cannot tell a project with 20 task types from one with 300,
+            # since both render as 20 named keys plus a bucket.
+            "aggregate_top_n": AGENT_READ_AGGREGATE_TOP_N,
+            "distinct_types": distinct_types,
+            "distinct_created_by": distinct_created_by,
+        },
+    }
+    data = clamp_read_response(
+        data,
+        trim_order=("oldest_non_terminal",),
+        returned_counts={"oldest_returned": "oldest_non_terminal"},
+    )
+    return {"status": "success", "data": data}

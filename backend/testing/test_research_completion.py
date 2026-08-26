@@ -610,6 +610,29 @@ class TestResearchFindingTypeContract:
                 {"runner_target": {"runner_id": "not-a-uuid"}},
                 "runner_target is invalid",
             ),
+            # The artifact_produced relaxation below must not become a hole: a
+            # criterion that says it is a metric still has to carry one, and an
+            # unrecognized kind is not a second way to skip the check.
+            (
+                {
+                    "success_criterion": {
+                        "kind": "metric",
+                        "operator": ">=",
+                        "threshold": 10,
+                    }
+                },
+                "finite numeric threshold",
+            ),
+            (
+                {
+                    "success_criterion": {
+                        "kind": "vibes",
+                        "operator": ">=",
+                        "threshold": 10,
+                    }
+                },
+                "finite numeric threshold",
+            ),
         ],
     )
     def test_compute_contract_rejects_coercible_or_malformed_v2_shapes(
@@ -667,6 +690,62 @@ class TestResearchFindingTypeContract:
                     "error_excerpt": "",
                 },
             },
+        }
+
+        assert _research_finding_contract_errors(finding) == []
+
+    @_pytest.mark.parametrize(
+        "launch_override",
+        [
+            {"success_criterion": {"kind": "artifact_produced", "min_file_count": 2}},
+            {"success_criterion": {"kind": "artifact_produced"}},
+            {"success_criteria": [{"kind": "artifact_produced", "min_file_count": 1}]},
+            {},
+        ],
+        ids=[
+            "singular-with-file-count",
+            "singular-default-file-count",
+            "plural",
+            "no-criterion",
+        ],
+    )
+    def test_compute_contract_accepts_an_experiment_whose_result_is_its_output(
+        self, launch_override
+    ):
+        """A run whose deliverable is what it leaves behind is authorable.
+
+        ``kind="artifact_produced"`` has always been evaluated at runtime --
+        task_evaluators._normalize_success_criterion rewrites it to
+        ``durable_file_count >= min_file_count`` -- and the plural
+        ``success_criteria`` branch has always accepted it, as has the Pydantic
+        model both fields share (payload_schemas.ComputeSuccessCriterion). Only
+        the singular branch demanded a metric, and singular is the form every
+        authoring prompt teaches, so the artifact goal was unreachable through
+        the only door authors are shown. That is a direct reason the corpus
+        reaches for metrics that merely restate delivery (``artifacts_returned
+        >= 2``, declared 58 times) instead of asking for the artifacts.
+        """
+        launch = {
+            "command": "python3 -m testing.train_baseline",
+            "spend_cap_usd": 2,
+            "deadline_seconds": 300,
+            "smoke_sample": {
+                "exit_code": 0,
+                "startup_ok": True,
+                "metric_captured": True,
+                "timed_out": False,
+                "error_excerpt": "",
+            },
+            **launch_override,
+        }
+        finding = {
+            "type": "compute_experiment",
+            "title": "Train the baseline policy",
+            "prompt": "Run the bounded training loop and keep the checkpoints.",
+            "actionability_grade": "HIGH",
+            "work_class": "confirmatory",
+            "stop_or_pivot_condition": "Stop when the checkpoints are written.",
+            "compute_experiment": launch,
         }
 
         assert _research_finding_contract_errors(finding) == []
@@ -9040,7 +9119,14 @@ async def test_member_cannot_retarget_authenticated_child_finding_hash(
             (1, {"title": "Undelivered"}, "undelivered-hash"),
         ],
     )
-    assert survivors == [{"title": "Trusted"}]
+    # ``finalized_research_findings_for_survivors`` now returns a
+    # ``ResearchFinalizationDelivery`` so the same locked join can also carry
+    # findings that produced no child task (and therefore no surviving hash).
+    # The original assertion is preserved verbatim on ``.findings`` and
+    # strengthened: passing no withheld records must yield an empty withheld
+    # stream, never a silent copy of the survivors.
+    assert survivors.findings == [{"title": "Trusted"}]
+    assert survivors.withheld == []
 
 
 @_pytest.mark.asyncio
@@ -9577,6 +9663,205 @@ async def test_design_doc_observation_dedup_on_reprocessing(db_session, mocker):
         and p.get("section") == "architecture"
         for p in proposals_after_second
     ), "the original observation must still be in proposed_changes"
+
+
+@_pytest.mark.asyncio
+async def test_type_routed_finding_is_recorded_in_the_withheld_carry(
+    db_session, mocker
+):
+    """A routed finding must leave a structured, content-carrying record.
+
+    Verbatim live shape, ``d-1210b978`` generations 5 and 9 and six research
+    parents in one 60-row task page on 2026-08-25. The routing itself is
+    correct -- "the design doc should say X" is not an implementation task --
+    but a routed finding has no child task, so it carries no ``finding_hash``
+    into the survivors join, never reaches ``plan_output``, and therefore
+    reached the discovery decision packet as nothing at all. Only a bare count
+    survived, and only in a status string. This pins the durable structured
+    record that replaces it: content, type, destination, and whether the side
+    effect landed.
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-withheld-routed"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": "Reorder _SLIM_OVERFLOW_DROPPABLE",
+                "description": (
+                    "The droppable order spends the bounded packet budget on"
+                    " the collection a reviewer needs most."
+                ),
+                "section": "architecture",
+                "prompt": "noted",
+                "type": "design_doc_observation",
+                "direction_id": direction["id"],
+            }
+        ],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Routing is unchanged: still no task, still auto-completed, and the live
+    # status string is reproduced character for character.
+    assert task.plan_output == []
+    assert task.latest_status_message == (
+        "Research created 0 tasks from 1 findings (1 type-filtered skipped)"
+        " — auto-completed (no actionable tasks)"
+    )
+
+    carry = (task.context or {})["withheld_findings"]
+    assert carry["total_count"] == 1
+    assert carry["omitted_count"] == 0
+    assert carry["omitted_checksum"] is None
+    (record,) = carry["records"]
+    assert record["disposition"] == "type_routed"
+    assert record["finding_type"] == "design_doc_observation"
+    assert record["routed_to"] == "project_design_doc.proposed_changes"
+    assert record["routing_applied"] is True
+    assert record["destination_id"]
+    assert record["content"]["title"] == "Reorder _SLIM_OVERFLOW_DROPPABLE"
+    assert "bounded packet budget" in record["content"]["description"]
+    assert record["content"]["section"] == "architecture"
+    assert record["content_truncated"] is False
+    assert len(record["finding_checksum"]) == 64
+
+
+@_pytest.mark.asyncio
+async def test_direction_update_without_target_records_a_no_op_route(
+    db_session, mocker
+):
+    """The no-op route was the strictly worse hole: not even a count.
+
+    ``type_filtered_count`` only increments once the side effect actually
+    lands. A ``direction_update`` naming no target direction fell through to
+    ``_noop_metadata_finding_ids`` and vanished with no counter at all -- so a
+    cycle that produced a finding and threw it away rendered identically to one
+    that genuinely found nothing. It now gets its own status-string part, its
+    own breakdown key, and a withheld record flagged ``routing_applied: False``.
+    """
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-withheld-noop"
+    )
+    # A production research parent carries its direction in context; the shared
+    # fixture does not, and the durable filter_breakdown is written per
+    # direction, so name it explicitly.
+    task.context = {**(task.context or {}), "direction_id": direction["id"]}
+    db_session.add(task)
+    await db_session.commit()
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": "Retire the exhausted direction",
+                "description": "Two probes without improvement; retire it.",
+                "prompt": "noted",
+                "type": "direction_update",
+            }
+        ],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # The denominator reads 0 because ``_noop_metadata_finding_ids`` prunes the
+    # finding out of ``findings`` before the status message is built -- which is
+    # exactly how a cycle that produced a finding and threw it away used to
+    # render character-for-character identical to one that genuinely found
+    # nothing. The new filter part is the only thing in this string that says
+    # otherwise, so it is pinned verbatim.
+    assert task.latest_status_message == (
+        "Research created 0 tasks from 0 findings (1 type-routed no-op skipped)"
+        " — auto-completed (no actionable tasks)"
+    )
+
+    carry = (task.context or {})["withheld_findings"]
+    assert carry["total_count"] == 1
+    (record,) = carry["records"]
+    assert record["disposition"] == "type_routed"
+    assert record["finding_type"] == "direction_update"
+    assert record["routed_to"] == "direction.pending_update"
+    assert record["routing_applied"] is False
+    assert record["destination_id"] is None
+    assert "no-op" in record["reason"]
+    assert record["content"]["title"] == "Retire the exhausted direction"
+
+    await db_session.refresh(_project)
+    (entry,) = [
+        history
+        for row in (_project.directions or [])
+        for history in (row.get("research_history") or [])
+    ]
+    assert entry["filter_breakdown"]["type_routed_noop"] == 1
+    assert entry["filter_breakdown"]["type_filtered"] == 0
+
+
+@_pytest.mark.asyncio
+async def test_dedup_filtered_finding_is_recorded_in_the_withheld_carry(
+    db_session, mocker
+):
+    """The second filter produces the identical lying-manifest shape.
+
+    Two filters were observed live on 2026-08-25, not one: ``type-filtered``
+    and ``word-overlap``, with ``283a2ae2`` hitting both in the same run and
+    ``4fe8e806`` auto-completing on a word-overlap drop alone. A dedup-filtered
+    finding also spawns no child, so it also carried no hash into the survivors
+    join and also reached the packet as nothing.
+    """
+    from app.finding_deduplication import DedupOutcome
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-withheld-dedup"
+    )
+    _patch_research_externals(mocker)
+    dropped = {
+        "title": "Pin the landed HEAD claim",
+        "description": "The verified landed-HEAD claim needs a literal pin.",
+        "prompt": "pin it",
+        "type": "improvement",
+        "direction_id": direction["id"],
+    }
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[dropped],
+    )
+    mocker.patch(
+        "app.research_completion.deduplicate_findings",
+        return_value=DedupOutcome(
+            deduplicated=[],
+            word_overlap_count=1,
+            filtered=[
+                {
+                    "title": dropped["title"],
+                    "direction_id": direction["id"],
+                    "reason": "word overlap with in-flight work",
+                    "finding": dropped,
+                }
+            ],
+        ),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    carry = (task.context or {})["withheld_findings"]
+    assert carry["total_count"] == 1
+    (record,) = carry["records"]
+    assert record["disposition"] == "dedup_filtered"
+    assert record["reason"] == "word overlap with in-flight work"
+    assert record["routed_to"] is None
+    assert record["routing_applied"] is False
+    assert record["content"]["title"] == "Pin the landed HEAD claim"
+    assert "literal pin" in record["content"]["description"]
 
 
 @_pytest.mark.asyncio

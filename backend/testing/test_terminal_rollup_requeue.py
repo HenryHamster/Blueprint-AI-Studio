@@ -229,6 +229,10 @@ async def test_terminal_requeue_closed_only_releases_identity_for_fresh_rollup(
         "iteration": 3,
         "original_task_id": "chain-root",
         "fix_reason": "preserve this chain reason",
+        # Releasing the closed PR is a PR boundary: rollup_management will open
+        # a fresh PR for the same chain, so the closed number must stay in the
+        # lineage or the converged chain stops reading as supersede-affected.
+        "superseded_pr_numbers": ["15488"],
     }
     replacement_lookup.assert_awaited_once_with(
         "token",
@@ -405,7 +409,110 @@ async def test_terminal_requeue_closed_pr_adopts_unique_open_replacement(
     assert loop["ci_wait_pause_baseline"] == 4.0
     assert "review_approved" not in loop
     assert "verify_tests_task_id" not in loop
+    # The closed predecessor must survive the replacement rebind.
+    assert loop["superseded_pr_numbers"] == ["15488"]
     replacement_lookup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminal_requeue_replacement_rebind_extends_existing_lineage(
+    db_session, mocker
+):
+    """A second PR boundary appends; it does not overwrite prior lineage."""
+
+    stale = _stale_loop(15488)
+    stale["superseded_pr_numbers"] = ["9001"]
+    parent = await _rollup_parent(
+        db_session,
+        context={
+            "rollup_pr_number": 15488,
+            "_is_rollup_review": True,
+            "review_loop": stale,
+        },
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 15488,
+            "state": "closed",
+            "merged": False,
+            "head": {"ref": "research/parent1", "sha": "closed-head"},
+            "base": {"ref": "automain"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 15494,
+            "state": "open",
+            "merged": False,
+            "head": {"ref": "research/parent1", "sha": "replacement-head"},
+            "base": {"ref": "automain"},
+        },
+    )
+    mocker.patch(
+        "app.pause_clock.current_baseline",
+        new_callable=AsyncMock,
+        return_value=4.0,
+    )
+
+    outcome = await reconcile_terminal_rollup_requeue(parent, db_session)
+
+    assert outcome == "replacement_pr_rearmed"
+    loop = (parent.context or {})["review_loop"]
+    assert loop["pr_number"] == 15494
+    assert loop["superseded_pr_numbers"] == ["9001", "15488"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_requeue_open_rearm_does_not_supersede_its_own_pr(
+    db_session, mocker
+):
+    """Re-arming the same PR identity is not a PR boundary."""
+
+    parent = await _rollup_parent(
+        db_session,
+        context={
+            "rollup_pr_number": 15494,
+            "_is_rollup_review": True,
+            "review_loop": _stale_loop(15494),
+        },
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 15494,
+            "state": "open",
+            "merged": False,
+            "head": {"ref": "research/parent1", "sha": "open-head"},
+            "base": {"ref": "automain"},
+        },
+    )
+    mocker.patch(
+        "app.pause_clock.current_baseline",
+        new_callable=AsyncMock,
+        return_value=4.0,
+    )
+
+    outcome = await reconcile_terminal_rollup_requeue(parent, db_session)
+
+    assert outcome == "open_pr_rearmed"
+    loop = (parent.context or {})["review_loop"]
+    assert loop["pr_number"] == 15494
+    assert "superseded_pr_numbers" not in loop
 
 
 @pytest.mark.asyncio
@@ -569,6 +676,10 @@ def test_attempt_reset_preserves_chain_metadata_only():
             "iteration_reset_by": "operator@example.test",
             "max_iterations": 6,
             "reviewer_model": "reviewer-chain-pin",
+            # Compact PR lineage: this is chain-level convergence provenance and
+            # must survive a PR boundary, or a chain that crossed PRs stops
+            # being classifiable as supersede-affected downstream.
+            "superseded_pr_numbers": ["77"],
         }
     )
 
@@ -595,4 +706,5 @@ def test_attempt_reset_preserves_chain_metadata_only():
         "iteration_reset_by": "operator@example.test",
         "max_iterations": 6,
         "reviewer_model": "reviewer-chain-pin",
+        "superseded_pr_numbers": ["77"],
     }

@@ -26,31 +26,43 @@ import os
 import pytest
 
 from app.compute_jobs import _NO_USABLE_GPU_LOG_MARKERS
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
+
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+_RUNNER_ISOLATION_ENV = "BLUEPRINT_RUNNER_ISOLATION_PY"
 
 
-def _resolve_runner_isolation_path() -> "str | None":
-    """Locate ``scripts/runner_isolation.py`` across local + Docker test envs.
+def _resolve_runner_isolation_path() -> "tuple[str | None, str]":
+    """Locate ``scripts/runner_isolation.py``, or return the NAMED absence reason.
 
-    Mirrors ``test_local_runner_terminal_log.py``: explicit env override, then
-    the ``/repo`` bind-mount that ``scripts/test-backend.sh`` provides, then the
-    repo root two levels above this file.
+    The file-level ``BLUEPRINT_RUNNER_ISOLATION_PY`` override still points
+    straight at a script. Everything below it is delegated to the shared
+    ``resolve_scripts_dir_from_env`` (backend/testing/repo_scripts_path.py) so
+    the candidate order, the ``/repo`` bind-mount constant and the sentinel
+    check are defined ONCE. This module used to re-type all three by hand,
+    which stays correct only until one copy is edited and the others are not.
+
+    Returns ``(path, "")`` on a hit and ``(None, reason)`` on a miss.
     """
-    candidates = []
-    env_override = os.getenv("BLUEPRINT_RUNNER_ISOLATION_PY")
+    env_override = os.getenv(_RUNNER_ISOLATION_ENV)
     if env_override:
-        candidates.append(env_override)
-    candidates.append("/repo/scripts/runner_isolation.py")
-    candidates.append(
-        os.path.normpath(
-            os.path.join(
-                os.path.dirname(__file__), "..", "..", "scripts", "runner_isolation.py"
-            )
-        )
+        if os.path.isfile(env_override):
+            return os.path.normpath(env_override), ""
+        return None, f"{_RUNNER_ISOLATION_ENV}={env_override!r} does not name a file"
+    scripts_dir, unavailable = resolve_scripts_dir_from_env(_BACKEND_DIR)
+    if scripts_dir is None:
+        return None, unavailable
+    candidate = os.path.join(scripts_dir, "runner_isolation.py")
+    if os.path.isfile(candidate):
+        return candidate, ""
+    # Present-and-broken, not missing: the tree carries the shared sentinel and
+    # the file this parity guard reads is gone. Never let that read as
+    # "nothing to check" (#17872).
+    return None, (
+        f"{scripts_dir} is the repo scripts/ tree (it carries the resolver "
+        f"sentinel) but runner_isolation.py is not in it — the scripts tree is "
+        f"present and broken, not missing"
     )
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
 
 
 def _require_runner_isolation_path() -> str:
@@ -60,18 +72,17 @@ def _require_runner_isolation_path() -> str:
     and a drift guard that quietly does not run is worse than none, because it
     reads as coverage.
     """
-    path = _resolve_runner_isolation_path()
+    path, unavailable = _resolve_runner_isolation_path()
     if path is not None:
         return path
     msg = (
-        "scripts/runner_isolation.py not available in this test environment "
-        "(checked BLUEPRINT_RUNNER_ISOLATION_PY, the /repo bind-mount that "
-        "scripts/test-backend.sh provides, and ../../scripts relative to this file)"
+        "scripts/runner_isolation.py not available in this test environment: "
+        f"{unavailable}"
     )
     if os.getenv("CI"):
         pytest.fail(
             msg + " — refusing to skip in CI: mount the repo root at /repo or set "
-            "BLUEPRINT_RUNNER_ISOLATION_PY so this parity invariant enforces"
+            f"{_RUNNER_ISOLATION_ENV} so this parity invariant enforces"
         )
     pytest.skip(msg)
 

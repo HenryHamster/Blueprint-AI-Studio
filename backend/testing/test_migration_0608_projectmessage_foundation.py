@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -366,12 +367,31 @@ def test_postgresql_rollout_shape_is_low_lock_and_bounded():
 def test_production_message_writers_use_canonical_sequence_builder():
     app_dir = Path(__file__).resolve().parents[1] / "app"
     violations: list[str] = []
+    # This guard is about WRITERS. A module that only *constructs* a
+    # ProjectMessage and hands it back to a caller never reaches the sequence
+    # allocator, so requiring build_project_message there is a category error.
+    preview_only = app_dir / "conversation_streaming.py"
     allowed_direct = {
         app_dir / "project_message_creation.py",
         # The pure onboarding seed receives an allocator value from its async
         # production caller and explicitly supplies the durable fields.
         app_dir / "routers" / "admin_onboard.py",
+        # Builds a client-side cumulative streaming PREVIEW and returns it
+        # unpersisted; the no-persistence pin below keeps that true.
+        preview_only,
     }
+    # The preview allowance is sound only while that module writes nothing.
+    # Pin it, so the first persistence call to appear there re-arms the guard
+    # instead of inheriting a blanket exemption.
+    persistence = re.findall(
+        r"\.(?:add|add_all|merge|bulk_save_objects)\(|\bexecute\(\s*insert\(",
+        preview_only.read_text(encoding="utf-8"),
+    )
+    assert not persistence, (
+        f"{preview_only.name} may construct ProjectMessage directly only because it persists "
+        f"nothing, but it now calls {sorted(set(persistence))} — route the write through "
+        "build_project_message, or move the builder out and drop this allowance"
+    )
     for path in app_dir.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):

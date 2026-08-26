@@ -2,15 +2,31 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
+
+# The release scripts under test live in the repo's ``scripts/`` dir, which is
+# NOT ``<this file>/../../scripts`` in every layout. The Docker test image
+# carries the backend tree as /app with no scripts/ sibling and reaches the
+# repo only through the /repo bind mount, so the old fixed walk inserted a
+# nonexistent ``/scripts`` and the two imports below succeeded there ONLY when
+# some earlier-collected module (test_check_gate_fail_closed.py) had already
+# pushed /repo/scripts onto sys.path. That is a collection-order accident, and
+# pytest-split rebalancing across the CI shards is exactly what turns it into a
+# red promotion PR. Resolve it properly, and fail with the NAMED reason.
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+_SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(_BACKEND_DIR)
+if _SCRIPTS_DIR is None:
+    raise RuntimeError(_SCRIPTS_DIR_UNAVAILABLE)
+_SCRIPTS = Path(_SCRIPTS_DIR)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 import bootstrap_local_app_release as bootstrap  # noqa: E402
 import release_preconditions  # noqa: E402

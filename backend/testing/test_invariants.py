@@ -24,11 +24,17 @@ from pathlib import Path
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.repo_checkout import (
+    git_command,
+    require_git_readable_repo_root,
+    require_repo_root,
+)
 from testing.identity_extraction import (
     extract_python_test_ids,
     extract_python_test_ids_from_file,
     extract_python_test_nodes,
 )
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
@@ -42,15 +48,27 @@ os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
 
 
 def _script_test_harness() -> Path:
-    """Resolve the roster owner in both the CI mount and local checkout."""
-    candidates = (
-        Path("/repo/scripts/test-backend.sh"),
-        BACKEND_ROOT.parent / "scripts" / "test-backend.sh",
-    )
-    for candidate in candidates:
+    """Resolve the roster owner in both the CI mount and local checkout.
+
+    Delegated to the shared resolver (backend/testing/repo_scripts_path.py) so
+    the candidate order and the ``/repo`` bind-mount constant are defined once.
+    A miss still ``pytest.fail``s -- it must never degrade into "no roster to
+    check" (#17872) -- but it now carries the resolver's named reason, which
+    lists every candidate probed and both escape hatches.
+    """
+    scripts_dir, unavailable = resolve_scripts_dir_from_env(os.fspath(BACKEND_ROOT))
+    if scripts_dir is not None:
+        candidate = Path(scripts_dir) / "test-backend.sh"
         if candidate.is_file():
             return candidate
-    pytest.fail("scripts/test-backend.sh is unavailable; roster cannot be checked")
+        pytest.fail(
+            f"{scripts_dir} is the repo scripts/ tree (it carries the resolver "
+            f"sentinel) but test-backend.sh is not in it; roster cannot be checked"
+        )
+    pytest.fail(
+        f"scripts/test-backend.sh is unavailable; roster cannot be checked: "
+        f"{unavailable}"
+    )
 
 
 def _parse_test_module_roots(harness: Path) -> tuple[Path, ...]:
@@ -1125,39 +1143,26 @@ class TestSchemaRevisionSync:
     def test_agent_helper_exclusions_match_prompt_and_gitignore(self):
         """Agent helper exclusions must stay aligned with prompt.ts and gitignore.
 
-        Skipped when running in environments without the agent/ source tree
-        or repo root checkout (e.g. CI's backend-only Docker build context,
-        which excludes agent/, .gitignore, and .git). Locally and in any
-        environment that does see the repo root the check fires normally.
+        Resolves the checkout through ``testing.repo_checkout``. The previous
+        spelling walked up from ``__file__`` to find the repo root, which is
+        correct in a plain checkout and resolves to ``/`` inside every
+        containerised lane (backend/ is mounted at /app, the repo root at
+        /repo) -- so this guard reported SKIPPED on every CI run and had never
+        enforced anything in the gate it exists to protect. It now FAILS rather
+        than skips when no checkout is visible.
         """
-        helpers_path = os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "agent",
-            "src",
-            "prompts",
-            "code-change-helpers.ts",
+        repo_root = require_repo_root()
+        helpers_path = (
+            repo_root / "agent" / "src" / "prompts" / "code-change-helpers.ts"
         )
-        gitignore_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", ".gitignore"
+        gitignore_path = repo_root / ".gitignore"
+        assert helpers_path.is_file(), (
+            f"{helpers_path} is missing from the checkout at {repo_root}; the "
+            "agent helper exclusion list cannot be read, so this guard cannot "
+            "report clean."
         )
-        repo_root = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..")
-        )
-        if not (
-            os.path.exists(helpers_path)
-            and os.path.exists(gitignore_path)
-            and os.path.isdir(os.path.join(repo_root, ".git"))
-        ):
-            pytest.skip(
-                "repo root sources not available in this test environment "
-                "(CI docker context is ./backend; run locally or via "
-                "scripts/test-backend.sh from a checkout for enforcement)"
-            )
 
-        with open(helpers_path) as f:
-            prompt = f.read()
+        prompt = helpers_path.read_text()
         match = re.search(r"export const AGENT_HELPER_NAMES = \[(.*?)\];", prompt, re.S)
         assert match, (
             "Could not find AGENT_HELPER_NAMES literal in agent/src/prompts/code-change-helpers.ts"
@@ -1167,20 +1172,30 @@ class TestSchemaRevisionSync:
             for name in match.group(1).split(",")
             if name.strip()
         ]
+        assert helpers, (
+            "AGENT_HELPER_NAMES parsed to an empty list -- the literal's shape "
+            "changed and every assertion below would be vacuous."
+        )
 
-        with open(gitignore_path) as f:
-            gitignore = f.read().splitlines()
+        gitignore = gitignore_path.read_text().splitlines()
         for helper in helpers:
             assert f"/{helper}" in gitignore, f".gitignore is missing /{helper}"
         assert "*.bak" in gitignore, ".gitignore is missing *.bak"
 
-        tracked = subprocess.run(
-            ["git", "ls-files"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
+        # Reading git is a capability separate from seeing the checkout, so it
+        # is required separately -- and only after the file-content assertions
+        # above have already run.
+        git_root = require_git_readable_repo_root()
+        listing = git_command(git_root, "ls-files")
+        assert listing.returncode == 0, (
+            f"git ls-files failed in {git_root} (exit {listing.returncode}): "
+            f"{listing.stderr.strip()}"
+        )
+        tracked = listing.stdout.splitlines()
+        assert tracked, (
+            f"git ls-files reported no tracked files in {git_root} -- the leak "
+            "scan below would be vacuous."
+        )
         pattern = re.compile(rf"^(?:{'|'.join(map(re.escape, helpers))})$|\.bak$")
         # 'check' is the repo's own build-runner and is intentionally tracked in git.
         # It also appears in AGENT_HELPER_NAMES because agents overwrite it with a
@@ -1203,49 +1218,32 @@ class TestSchemaRevisionSync:
         ignore rule must be root-anchored so it does NOT swallow nested
         fixtures such as backend/testing/**/self_review_*.json.
 
-        Skipped when the repo root / .git checkout is unavailable (e.g. CI's
-        backend-only Docker build context), following the same repo-root
-        availability pattern as test_agent_helper_exclusions_match_prompt_and_gitignore.
+        Resolves the checkout through ``testing.repo_checkout`` for the same
+        reason as test_agent_helper_exclusions_match_prompt_and_gitignore: the
+        walk-up spelling lands on ``/`` inside every containerised lane, so
+        this guard used to report SKIPPED on every CI run. A missing checkout
+        is now a FAILURE, not a skip.
         """
-        gitignore_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", ".gitignore"
-        )
-        repo_root = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..")
-        )
-        if not (
-            os.path.exists(gitignore_path)
-            and os.path.isdir(os.path.join(repo_root, ".git"))
-        ):
-            pytest.skip(
-                "repo root sources not available in this test environment "
-                "(CI docker context is ./backend; run locally or via "
-                "scripts/test-backend.sh from a checkout for enforcement)"
-            )
-
-        with open(gitignore_path) as f:
-            gitignore = f.read().splitlines()
+        repo_root = require_repo_root()
+        gitignore = (repo_root / ".gitignore").read_text().splitlines()
         assert "/self_review_*.json" in gitignore, (
             ".gitignore is missing the root-anchored '/self_review_*.json' rule "
             "— repo-root self-review output would become committable noise."
         )
 
+        git_root = require_git_readable_repo_root()
+
         # The rule must be root-anchored: git must ignore a root stray but must
         # NOT ignore a nested fixture of the same name.
-        root_ignored = subprocess.run(
-            ["git", "check-ignore", "self_review_probe.json"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
+        root_ignored = git_command(
+            git_root, "check-ignore", "self_review_probe.json"
         )
         assert root_ignored.returncode == 0, (
-            "repo-root self_review_probe.json is not ignored by .gitignore"
+            "repo-root self_review_probe.json is not ignored by .gitignore "
+            f"(git exit {root_ignored.returncode}: {root_ignored.stderr.strip()})"
         )
-        nested_ignored = subprocess.run(
-            ["git", "check-ignore", "backend/testing/self_review_probe.json"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
+        nested_ignored = git_command(
+            git_root, "check-ignore", "backend/testing/self_review_probe.json"
         )
         assert nested_ignored.returncode == 1, (
             "nested backend/testing/self_review_probe.json must NOT be ignored "
@@ -1253,13 +1251,16 @@ class TestSchemaRevisionSync:
         )
 
         # No root-level self_review_*.json file may be tracked.
-        tracked = subprocess.run(
-            ["git", "ls-files"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
+        listing = git_command(git_root, "ls-files")
+        assert listing.returncode == 0, (
+            f"git ls-files failed in {git_root} (exit {listing.returncode}): "
+            f"{listing.stderr.strip()}"
+        )
+        tracked = listing.stdout.splitlines()
+        assert tracked, (
+            f"git ls-files reported no tracked files in {git_root} -- the leak "
+            "scan below would be vacuous."
+        )
         leaked_root = [
             path for path in tracked if re.match(r"^self_review_.*\.json$", path)
         ]
@@ -3729,6 +3730,28 @@ class TestPreMergeDualHeadGuardCoverage:
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
         guard_names = self._GUARD_NAMES
         merge_names = self._MERGE_NAMES
+        # Only a file that literally spells one of the merge identifiers can
+        # produce an offender: ``_collect_offenders`` appends only for calls
+        # whose ``_called_name`` is in ``merge_names``, and ``_called_name``
+        # reads ``ast.Name.id`` / ``ast.Attribute.attr`` -- a Python identifier,
+        # which the grammar forbids splitting across whitespace, comments or a
+        # backslash continuation. So "identifier absent from the text" implies
+        # "no such call node", and the prefilter is sound by construction rather
+        # than merely adequate in practice. (A dynamic ``getattr(m, "merge_" +
+        # "pull_request")()`` is invisible to the AST scan with or without it.)
+        #
+        # Derived from the authoritative frozensets, never hardcoded, so adding
+        # a name to either set widens the prefilter in the same edit;
+        # ``test_merge_site_scan_prefilter_cannot_narrow_the_scan`` pins that.
+        # The authority names are not offender-producing today -- including them
+        # is deliberately conservative.
+        #
+        # Measured over backend/app: 565 files / 23.2MB, of which 15 (3%,
+        # 1.35MB) contain any merge identifier. Whole scan 10.77s -> 0.67s,
+        # 16.0x, byte-identical offender list. The cost is per-file
+        # ``ast.parse`` plus a whole-tree ``parent_by_node`` map, so skipping
+        # 97% of the files skips essentially all of the work.
+        scan_hint_names = self._MERGE_NAMES | self._MERGE_AUTHORITY_NAMES
         offenders: list[str] = []
         for root, _dirs, files in os.walk(app_dir):
             for fname in sorted(files):
@@ -3739,6 +3762,8 @@ class TestPreMergeDualHeadGuardCoverage:
                 fpath = os.path.join(root, fname)
                 with open(fpath, encoding="utf-8") as f:
                     source = f.read()
+                if not any(name in source for name in scan_hint_names):
+                    continue
                 rel = os.path.relpath(fpath, app_dir)
                 offenders.extend(
                     self._collect_offenders(
@@ -3764,6 +3789,68 @@ class TestPreMergeDualHeadGuardCoverage:
             "TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES with a documented "
             "reason.\n"
             "Offenders:\n" + "\n".join(offenders) + "\n" + format_offender_marker(str(offender) for offender in offenders)
+        )
+
+    def test_merge_site_scan_prefilter_cannot_narrow_the_scan(self):
+        """The text prefilter admits every source the AST scan could flag.
+
+        ``test_all_pr_merge_sites_guarded`` skips any app file whose text
+        contains none of ``_MERGE_NAMES | _MERGE_AUTHORITY_NAMES``. That is only
+        safe while the prefilter is a superset of the names the scan can flag
+        on, and the failure mode is silent -- a narrowed prefilter turns the
+        guard vacuous for the newly-added name without failing anything.
+
+        So this pins it behaviourally rather than by restating the constant:
+        for every flaggable name, an unguarded merge site written with that name
+        must be both admitted by the prefilter AND reported by the scanner.
+        Adding a name to ``_MERGE_NAMES`` and forgetting the prefilter fails
+        here.
+        """
+        import textwrap
+
+        scan_hint_names = self._MERGE_NAMES | self._MERGE_AUTHORITY_NAMES
+        assert scan_hint_names >= self._MERGE_NAMES
+
+        for name in sorted(self._MERGE_NAMES):
+            source = textwrap.dedent(
+                f"""
+                async def _unguarded_merge_site(client):
+                    await {name}(client, expected_head_sha=None)
+                """
+            )
+            assert any(hint in source for hint in scan_hint_names), (
+                f"prefilter would SKIP a file containing a {name}() merge site, "
+                "making the dual-head guard silently vacuous for that name. Add "
+                "the name to _MERGE_NAMES/_MERGE_AUTHORITY_NAMES so the derived "
+                "prefilter picks it up."
+            )
+            offenders = self._collect_offenders(
+                source,
+                filename="probe.py",
+                rel="probe.py",
+                guard_names=self._GUARD_NAMES,
+                merge_names=self._MERGE_NAMES,
+            )
+            assert offenders, (
+                f"scanner no longer flags an unguarded {name}() site; the "
+                "prefilter pin above is measuring nothing."
+            )
+
+        # A file with no merge identifier is skipped, and genuinely has nothing
+        # to report -- the two must agree, or the prefilter is hiding offenders.
+        benign = textwrap.dedent(
+            """
+            async def _no_merge_here(client):
+                await client.get("/x")
+            """
+        )
+        assert not any(hint in benign for hint in scan_hint_names)
+        assert not self._collect_offenders(
+            benign,
+            filename="probe.py",
+            rel="probe.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
         )
 
     def test_premerge_helper_whole_function_exemptions_are_not_blanket_trust_zones(
@@ -4683,6 +4770,10 @@ class TestOperatorMessageArmingGateCoverage:
 
     _GATE_NAME = "maybe_arm_operator_refresh"
     _MESSAGE_CLASS = "ProjectMessage"
+    # The keyword the scan reads to decide a construction is operator-authored.
+    # Shared by _is_operator_message_call and the prefilter below so a rename
+    # cannot make one of them look for a spelling the other no longer matches.
+    _FROM_TYPE_KWARG = "from_type"
 
     # Allowlisted (file, function) sites that intentionally seed an operator
     # message without a wake decision. The onboarding goal setter writes a
@@ -4697,6 +4788,40 @@ class TestOperatorMessageArmingGateCoverage:
             "loop exists; intentionally does not wake the strategist"
         ),
     }
+
+    # Every backend/app/ file that carries a real operator-authored
+    # ``ProjectMessage`` construction today, exempt sites included. The textual
+    # prefilter below must admit all of them; see
+    # ``test_prefilter_admits_every_live_operator_message_file`` for why a
+    # prefilter that silently dropped one would make the whole-package scan
+    # report clean without ever parsing the file that holds the site.
+    _KNOWN_OPERATOR_MESSAGE_FILES = (
+        "project_message_creation.py",
+        "routers/admin_onboard.py",
+    )
+
+    @staticmethod
+    def _source_may_hold_operator_message(source: str) -> bool:
+        """Sound prefilter: can this source possibly hold a flagged site?
+
+        ``_is_operator_message_call`` matches only a call whose callee name
+        resolves to ``_MESSAGE_CLASS`` -- reached either as a bare ``Name``
+        (``ProjectMessage(...)``) or as an ``Attribute``
+        (``models.ProjectMessage(...)``, where ``_ast_called_name`` returns
+        ``.attr``) -- and which carries a keyword argument literally named
+        ``_FROM_TYPE_KWARG``. Both are *identifiers*, not string constants, so
+        neither can be assembled by concatenation or an f-string: a source that
+        does not contain both tokens cannot produce an offender, and skipping
+        its ``ast.parse`` cannot hide one.
+        """
+        cls = TestOperatorMessageArmingGateCoverage
+        # Identifier boundaries, so "from_types" or "MyProjectMessage" do
+        # not admit a file on a coincidental substring.
+        word = r"\b{}\b"
+        return bool(
+            re.search(word.format(re.escape(cls._MESSAGE_CLASS)), source)
+            and re.search(word.format(re.escape(cls._FROM_TYPE_KWARG)), source)
+        )
 
     @staticmethod
     def _collect_offenders(
@@ -4789,7 +4914,8 @@ class TestOperatorMessageArmingGateCoverage:
                 return False
             for kw in node.keywords:
                 if (
-                    kw.arg == "from_type"
+                    kw.arg
+                    == TestOperatorMessageArmingGateCoverage._FROM_TYPE_KWARG
                     and isinstance(kw.value, ast.Constant)
                     and kw.value.value == "user"
                 ):
@@ -4941,6 +5067,144 @@ class TestOperatorMessageArmingGateCoverage:
             "referencing the gate symbol is not the same as using its verdict."
         )
 
+    def test_operator_message_prefilter_cannot_skip_a_flagged_site(self):
+        """Vacuity ratchet: the whole-package prefilter must admit every source
+        the scanner would flag.
+
+        The prefilter exists for speed: it skips the ``ast.parse`` for the
+        ~92% of app files that cannot hold a match. That makes it a vacuity
+        risk — an unsound prefilter turns the whole-package scan green because
+        it never looked, which is indistinguishable from green because the
+        codebase is clean. Both directions are pinned here: every callee
+        spelling ``_ast_called_name`` resolves is admitted *and* flagged, and
+        each source the prefilter drops is proved offender-free by running the
+        scanner on it anyway.
+        """
+        from textwrap import dedent
+
+        for call in (self._MESSAGE_CLASS, f"models.{self._MESSAGE_CLASS}"):
+            source = dedent(
+                f"""
+                async def create_message(session, project_id, content):
+                    msg = {call}(
+                        project_id=project_id,
+                        {self._FROM_TYPE_KWARG}="user",
+                        content=content
+                    )
+                    await session.add(msg)
+                """
+            )
+            assert self._source_may_hold_operator_message(source), (
+                f"prefilter would skip a {call}(...) site the scanner flags — "
+                "the whole-package guard is vacuous for this spelling"
+            )
+            assert self._collect_offenders(
+                source,
+                filename="synthetic_operator_msg_fixture.py",
+                rel="synthetic_operator_msg_fixture.py",
+                gate_name=self._GATE_NAME,
+                message_class=self._MESSAGE_CLASS,
+            ), f"scanner failed to flag the {call}(...) spelling"
+
+        # The two ways a source can be dropped. Each is proved empty by the
+        # scanner itself, so the skip is never hiding an offender.
+        no_kwarg = dedent(
+            f"""
+            def build(project_id, content):
+                return {self._MESSAGE_CLASS}(
+                    project_id=project_id, content=content
+                )
+            """
+        )
+        no_message_class = dedent(
+            f"""
+            async def reply(session, project_id, answer):
+                return await post_question_answer(
+                    session, project_id, answer, {self._FROM_TYPE_KWARG}="user"
+                )
+            """
+        )
+        for source in (no_kwarg, no_message_class):
+            assert not self._source_may_hold_operator_message(source)
+            assert (
+                self._collect_offenders(
+                    source,
+                    filename="synthetic_operator_msg_fixture.py",
+                    rel="synthetic_operator_msg_fixture.py",
+                    gate_name=self._GATE_NAME,
+                    message_class=self._MESSAGE_CLASS,
+                )
+                == []
+            ), (
+                "prefilter dropped a source the scanner would have flagged — "
+                "the whole-package scan cannot see this file at all"
+            )
+
+    def test_prefilter_admits_every_live_operator_message_file(self):
+        """Literal pin against a vacuously green whole-package scan.
+
+        Soundness by construction (identifiers cannot be assembled at runtime)
+        is the argument; this is the evidence. Every app file that carries a
+        real operator-authored message today — the exempt onboarding seeder
+        included — must survive the prefilter, and must still actually carry
+        the site, so the pin cannot rot into an assertion about nothing.
+        """
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        for rel in self._KNOWN_OPERATOR_MESSAGE_FILES:
+            fpath = os.path.join(app_dir, *rel.split("/"))
+            with open(fpath, encoding="utf-8") as f:
+                source = f.read()
+
+            assert self._source_may_hold_operator_message(source), (
+                f"prefilter drops {rel}, which carries a live operator-authored "
+                f"{self._MESSAGE_CLASS} site — the whole-package scan would "
+                "report clean without ever parsing it"
+            )
+
+            tree = ast.parse(source, filename=fpath)
+            assert any(
+                isinstance(node, ast.Call)
+                and _ast_called_name(node) == self._MESSAGE_CLASS
+                and any(
+                    kw.arg == self._FROM_TYPE_KWARG
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "user"
+                    for kw in node.keywords
+                )
+                for node in ast.walk(tree)
+            ), (
+                f"{rel} no longer constructs an operator-authored "
+                f"{self._MESSAGE_CLASS}. Drop it from "
+                "_KNOWN_OPERATOR_MESSAGE_FILES — and first check where the "
+                "site moved, because the prefilter has not been proved against "
+                "its new home."
+            )
+
+    # Budget, not a default. This guard reads and parses all 572
+    # backend/app/*.py. The standalone lane runs it under --timeout=30, a
+    # budget sized on a native Linux filesystem; over the Docker-on-Windows
+    # bind mount it died as `Failed: Timeout (>30.0s) from pytest-timeout` at
+    # 29.96s while its three synthetic sibling tests passed -- which reads as
+    # an unguarded operator-message site, when the scan underneath had found
+    # zero offenders. A timeout, not an assertion, is the tell.
+    #
+    # Profiled in the lane's own container: read 20.67s, prefilter 2.11s,
+    # parse of the 46 surviving files 2.83s; parsing all 572 instead is
+    # 10.77s. So the prefilter below removes the reducible half (10.77s ->
+    # 2.83s), taking the guard from ~31.6s to 19.21s warm. What is left is one
+    # read of every app file, and the guard cannot skip it -- the prefilter
+    # needs the text. At 20.67s that read alone is two thirds of a 30s budget,
+    # before any contention from the 1842-test session it runs inside, and on
+    # a cold page cache the whole guard measured 46.87s. The prefilter is
+    # worth keeping, but it cannot move this guard off a 30s boundary; only a
+    # budget can.
+    #
+    # 120s is the house budget for corpus-scanning guards
+    # (test_string_patch_targets_resolve, test_mock_patch_targets_resolve;
+    # test_websocket_emitter_inventory at 90s). It clears the worst bind-mount
+    # figure by ~2.5x, and CI's native filesystem runs this in single-digit
+    # seconds.
+    @pytest.mark.timeout(120)
     def test_all_operator_message_sites_route_through_shared_gate(self):
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
         offenders: list[str] = []
@@ -4953,6 +5217,17 @@ class TestOperatorMessageArmingGateCoverage:
                 rel = os.path.relpath(fpath, app_dir).replace(os.sep, "/")
                 with open(fpath, encoding="utf-8") as f:
                     source = f.read()
+
+                # Sound prefilter, sound by construction and pinned by
+                # test_operator_message_prefilter_cannot_skip_a_flagged_site
+                # and test_prefilter_admits_every_live_operator_message_file:
+                # 46 of 572 app files carry both identifier tokens, so 526
+                # ast.parse calls are skipped. Same repair as
+                # test_no_deprecated_datetime_utcnow_calls below. See the
+                # budget note on this test for the measurements and for why
+                # the remaining read cost still needs an explicit budget.
+                if not self._source_may_hold_operator_message(source):
+                    continue
 
                 offenders.extend(
                     self._collect_offenders(
@@ -6141,41 +6416,32 @@ class TestTestFileSizeGuardrails:
         testing_root = os.path.dirname(__file__)
         _assert_no_stale_caps(TESTING_SIZE_LIMITS, testing_root, "testing")
 
-def _resolve_scripts_root() -> str | None:
-    """Resolve the repo's scripts/ directory across both test layouts.
-
-    The CI shard containers mount the backend at /app and the full repo at
-    /repo, so ``../../scripts`` relative to testing/ does not exist there —
-    /repo/scripts is the canonical location (same convention as
-    ``_script_test_harness``). Local checkouts resolve the sibling path.
-    When CI is set and neither candidate exists the guardrail must HARD-FAIL,
-    not skip: a silently unresolvable scripts/ tree would blind every scripts
-    cap in module_size_limits.json.
-    """
-    candidates = (
-        os.path.join("/repo", "scripts"),
-        os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
-        ),
-    )
-    for candidate in candidates:
-        if os.path.isdir(candidate):
-            return candidate
-    return None
-
-
-_SCRIPTS_ROOT = _resolve_scripts_root()
+# Resolve the repo's scripts/ dir through the shared resolver rather than a
+# private copy of the probe. The CI shard containers mount the backend at /app
+# and the full repo at /repo, so ``../../scripts`` relative to testing/ does not
+# exist there. The old copy accepted a candidate on ``os.path.isdir`` alone --
+# mere directory existence, the same predicate shape that made three other
+# guards vacuous (#17872). The shared resolver requires the sentinel, so a
+# directory that merely exists can never be mistaken for the repo's scripts/.
+_SCRIPTS_ROOT, _SCRIPTS_ROOT_UNAVAILABLE = resolve_scripts_dir_from_env(
+    os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+)
 
 
 def _require_scripts_root() -> str:
+    """Return the scripts root, or fail — HARD in CI, skip only ad hoc.
+
+    A silently unresolvable scripts/ tree would blind every scripts cap in
+    module_size_limits.json, so CI never skips. Either way the resolver's named
+    reason is reported instead of a restatement that can drift from it.
+    """
     if _SCRIPTS_ROOT is None:
         if os.environ.get("CI"):
             pytest.fail(
-                "scripts/ directory is unavailable (checked /repo/scripts and "
-                "the repo-relative sibling); the CI harness must mount the "
+                _SCRIPTS_ROOT_UNAVAILABLE + "; the CI harness must mount the "
                 "repo at /repo so scripts size caps stay enforced"
             )
-        pytest.skip("scripts/ directory not available in this environment")
+        pytest.skip(_SCRIPTS_ROOT_UNAVAILABLE)
     return _SCRIPTS_ROOT
 
 class TestScriptsModuleSizeGuardrails:
@@ -11661,6 +11927,21 @@ def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] |
                 names.add(alias.asname if alias.asname else alias.name)
     return names
 
+# Budget, not a default: this guard tokenises all 627 backend/testing/*.py
+# (37.1MB). Measured on this host it is 12.34s, and the work is irreducible --
+# the scanner already skips any file without "app." in its text, already
+# memoises the whole scan (_iter_app_patch_target_sites is @cache-d, so the
+# vacuous-mock guard below reuses it for free), and already memoises the app
+# module parses. What is left is one tokenize pass over the corpus.
+#
+# The standalone lane runs with --timeout=30 sized on a native Linux
+# filesystem. Over the Docker-on-Windows bind mount the same work is ~2.3x
+# slower (~28s), so the guard was landing on the wrong side of its budget and
+# failing as a TIMEOUT -- reporting a slow filesystem as a stale-patch-target
+# defect. 120s matches the house budget for corpus-scanning guards
+# (test_websocket_emitter_inventory, test_patched_app_symbols_have_production_
+# call_sites at 90s) and leaves ~4x headroom over the bind-mount figure.
+@pytest.mark.timeout(120)
 def test_string_patch_targets_resolve():
     """Every app.* string patch target in backend/testing/*.py must resolve to
     an existing top-level name in its module.
@@ -12792,6 +13073,86 @@ class TestRouteContractOwnership:
             f"valid, got: {errors}"
         )
 
+# The scanner below flags exactly one shape: an ``ast.Call`` whose func is
+# ``ast.Attribute(attr="utcnow", value=ast.Name(id="datetime"))``. Reaching that
+# node requires the source text to contain a NAME token spelled ``utcnow``, and
+# Python's tokenizer cannot split an identifier — no whitespace, comment or
+# backslash continuation may appear inside one, and maximal munch means the
+# token is never a prefix of a longer identifier. So "the bare token ``utcnow``
+# is absent from the text" provably implies "no such Call node exists", and this
+# prefilter can never hide an offender the scanner would have reported. The
+# converse is not claimed: a file admitted here still gets the full AST check.
+#
+# The lookarounds exclude only ASCII identifier characters, so a non-ASCII
+# identifier such as ``éutcnow`` is admitted rather than skipped. That errs
+# toward parsing, which is the safe direction.
+_DATETIME_UTCNOW_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])utcnow(?![A-Za-z0-9_])")
+
+
+def _datetime_utcnow_call_linenos(source: str, filename: str) -> list[int]:
+    """Line numbers of every ``datetime.utcnow(...)`` call in *source*.
+
+    The authoritative scanner for :func:`test_no_deprecated_datetime_utcnow_calls`.
+    Factored out so the prefilter above can be pinned against the very code it
+    is allowed to skip, instead of the two drifting apart and leaving the guard
+    silently vacuous.
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+
+    linenos: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "utcnow"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "datetime"
+        ):
+            linenos.append(node.lineno)
+    return linenos
+
+
+def test_utcnow_prefilter_admits_every_form_the_scanner_flags():
+    """The cheap text prefilter must never skip a file the AST scanner would flag.
+
+    A prefilter that drifts from its scanner does not make the guard slower — it
+    makes it vacuous, and silently. Every spelling below is one the tokenizer
+    accepts for ``datetime.utcnow()``; each is asserted to be flagged by the
+    scanner AND admitted by the prefilter, so neither side can move alone.
+    """
+    flagged_forms = [
+        "import datetime\ndatetime.utcnow()\n",
+        # Whitespace is legal between any two adjacent tokens.
+        "import datetime\ndatetime . utcnow ()\n",
+        # Backslash continuation joins the logical line.
+        "import datetime\ndatetime.\\\n    utcnow()\n",
+        # Inside brackets a comment and a newline may separate the tokens.
+        "import datetime\n(datetime.  # noqa\n    utcnow())\n",
+        # Nested in an expression rather than a bare statement.
+        "import datetime\nx = {'k': [datetime.utcnow()]}\n",
+    ]
+    for source in flagged_forms:
+        assert _datetime_utcnow_call_linenos(source, "<synthetic>"), (
+            f"scanner failed to flag a datetime.utcnow() call:\n{source}"
+        )
+        assert _DATETIME_UTCNOW_TOKEN_RE.search(source), (
+            "prefilter would skip a file the scanner flags — the guard is "
+            f"vacuous for this spelling:\n{source}"
+        )
+
+    # The canonical replacement must stay cheap to skip: it is why the prefilter
+    # keys on the bare token rather than the substring (267 of 569 app files
+    # contain "utcnow" as part of "_utcnow"; only 3 carry the bare token).
+    replacement = "from app.time_utils import _utcnow\n_utcnow()\n"
+    assert not _datetime_utcnow_call_linenos(replacement, "<synthetic>")
+    assert not _DATETIME_UTCNOW_TOKEN_RE.search(replacement)
+
+
 def test_no_deprecated_datetime_utcnow_calls():
     """No app/ file may call datetime.utcnow() — use _utcnow() from app.time_utils instead.
 
@@ -12806,24 +13167,25 @@ def test_no_deprecated_datetime_utcnow_calls():
 
     for py_file in sorted(app_dir.rglob("*.py")):
         source = py_file.read_text(encoding="utf-8")
-        try:
-            tree = ast.parse(source, filename=str(py_file))
-        except SyntaxError:
+        # Sound prefilter (see _DATETIME_UTCNOW_TOKEN_RE): 3 of 569 app files
+        # carry the bare token, so 566 ast.parse calls are skipped.
+        #
+        # Why a guard that measures 9.85s needed this at all: that is the
+        # isolated cost over the Docker-on-Windows bind mount, but the lane
+        # runs it inside a 1842-test session against --timeout=30, and there
+        # it died on `Failed: Timeout (>30.0s) from pytest-timeout` -- reading
+        # 569 files off a contended bind mount is several times its solo cost,
+        # and the failure is intermittent precisely because it sat close to
+        # the line. A timeout, not an assertion, reports a slow filesystem as
+        # a de-utcnow regression. Isolated cost is now 9.85s -> 3.30s, moving
+        # the whole guard off that boundary rather than raising its budget.
+        if not _DATETIME_UTCNOW_TOKEN_RE.search(source):
             continue
 
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if (
-                isinstance(func, ast.Attribute)
-                and func.attr == "utcnow"
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "datetime"
-            ):
-                rel = py_file.relative_to(BACKEND_ROOT)
-                violating_files.append(f"  {rel}:{node.lineno}")
-                break  # one report per file is enough
+        linenos = _datetime_utcnow_call_linenos(source, str(py_file))
+        if linenos:
+            rel = py_file.relative_to(BACKEND_ROOT)
+            violating_files.append(f"  {rel}:{linenos[0]}")  # one report per file
 
     assert not violating_files, (
         f"Found datetime.utcnow() calls in {len(violating_files)} app/ file(s).\n"
@@ -12921,6 +13283,23 @@ def test_orchestrator_health_vocab_guard_catches_injected_fake_type():
         "The standing vocab check would silently pass on real drift."
     )
 
+# Budget, not a default: collect_first_party_patch_targets AST-parses all 627
+# backend/testing/test_*.py (37.1MB) to recover 970 patch targets. Measured on
+# this host: 16.24s for the test, of which ast.parse is 11.03s of 11.67s
+# (94.5%) -- the read is 0.12s and the ast.walk only 2.47s, and an
+# ast.NodeVisitor is no faster (2.75s), so there is no traversal win to take.
+#
+# A textual prefilter was measured and rejected rather than skipped: the only
+# prefilter that is sound by construction here is the identifier "patch"
+# (a string-constant prefilter like "app." is defeated by implicit literal
+# concatenation), and 92% of the corpus bytes live in files containing it --
+# a 1.09x saving. Even the unsound "app. in a string" variant only reaches
+# 1.19x. The parse is the cost and the parse is required.
+#
+# So this is the case the sweep raises a budget for. See the note on
+# test_string_patch_targets_resolve above for why 30s is the wrong number over
+# the bind mount and why 120s is the right one.
+@pytest.mark.timeout(120)
 def test_mock_patch_targets_resolve():
     """Every first-party mock.patch() string target in the test suite must resolve.
 
@@ -14293,6 +14672,128 @@ def test_ci_runner_script_suite_names_only_files_that_exist_on_disk():
     )
 
 
+_GIT_READS_A_REMOTE_REF = re.compile(
+    r"""git\b[^\n]*?\b(?:diff|log|rev-parse|rev-list|merge-base|show)\b"""
+    r"""[^\n]*?origin/(?P<ref>[^\s"':]+)"""
+)
+_GIT_FETCHES = re.compile(r"""git\b[^\n]*?\bfetch\b[^\n]*""")
+
+
+def _ci_jobs_with_shallow_checkout(workflow_source: str) -> dict[str, dict]:
+    """Jobs whose actions/checkout leaves only the PR head in the object store.
+
+    actions/checkout defaults to ``fetch-depth: 1``. A job that does not
+    override it holds exactly one commit and one remote ref; every other
+    ``origin/<branch>`` is simply absent from the workspace.
+    """
+    import yaml
+
+    document = yaml.safe_load(workflow_source) or {}
+    shallow: dict[str, dict] = {}
+    for job_name, job in (document.get("jobs") or {}).items():
+        depths = [
+            (step.get("with") or {}).get("fetch-depth")
+            for step in (job.get("steps") or [])
+            if str(step.get("uses", "")).startswith("actions/checkout")
+        ]
+        if not depths:
+            continue
+        if all(depth is None or str(depth) == "1" for depth in depths):
+            shallow[job_name] = job
+    return shallow
+
+
+def test_ci_steps_fetch_every_remote_ref_they_read():
+    """A CI guard must never report "clean" because it could not look.
+
+    ci.yml's checkouts are shallow -- no step sets ``fetch-depth``, so every
+    one is depth 1 -- which means ``origin/main`` and ``origin/automain`` do
+    not exist in the workspace. A step that reads one without fetching it
+    first gets a git failure, and these guards uniformly funnel a git failure
+    into an empty result that reads as "nothing to check".
+
+    That is not hypothetical. The Migration linter shipped for its entire life
+    as ``git diff ... origin/$BASE_BRANCH ... 2>/dev/null || true``. It printed
+    "No new migrations - skipping" on every run -- including runs that added
+    migrations -- and so never once enforced the ``nullable=False``-without-
+    ``server_default`` rule it exists to enforce.
+
+    ci.yml is an operator-only surface for agents, so this test is the only
+    place the invariant can be pinned from inside the repo.
+    """
+    workflow = _ci_workflow_path()
+    source = workflow.read_text(encoding="utf-8")
+    offenders: list[str] = []
+
+    for job_name, job in _ci_jobs_with_shallow_checkout(source).items():
+        for step in job.get("steps") or []:
+            body = step.get("run")
+            if not isinstance(body, str):
+                continue
+            uncommented = "\n".join(
+                line
+                for line in body.splitlines()
+                if not line.strip().startswith("#")
+            )
+            read_refs = {
+                match.group("ref")
+                for match in _GIT_READS_A_REMOTE_REF.finditer(uncommented)
+            }
+            if not read_refs:
+                continue
+            fetches = " ".join(_GIT_FETCHES.findall(uncommented))
+            for ref in sorted(read_refs):
+                if ref not in fetches:
+                    offenders.append(
+                        f"{job_name}/{step.get('name', '<unnamed>')}"
+                        f":origin/{ref}"
+                    )
+
+    assert not offenders, (
+        "ci.yml step(s) read a remote ref that a depth-1 checkout does not "
+        "have, so the git command fails and the guard silently passes: "
+        + ", ".join(offenders)
+        + "\n"
+        + format_offender_marker(offenders)
+    )
+
+
+def _standalone_backend_roster_entries(harness: Path) -> list[str]:
+    """Literal ``testing/...`` selectors from the harness STANDALONE_ARGS block.
+
+    DERIVED, never hand-mirrored.  The fixture below has to materialise a
+    stand-in for every backend entry the harness will execute, and a
+    hand-maintained second copy of that list rots silently the moment anyone
+    adds a roster entry: #17890 added ``testing/test_wire_timestamp_zone.py``
+    to the harness, the copy did not follow, and the harness aborted with
+    "ERROR: file or directory not found" -- reddening this invariant on the
+    promotion rehearsal for a roster that was in fact perfectly correct.
+    Reading the roster from its single owner makes that rot unrepresentable.
+
+    Parsed by literal marker rather than by invoking the harness: this
+    assertion has to hold in the --noconftest, Docker-less standalone lane,
+    which cannot start the harness it is checking.
+    """
+    source = harness.read_text(encoding="utf-8")
+    marker = "STANDALONE_ARGS=(\n"
+    start = source.find(marker)
+    assert start != -1, "standalone harness must declare a STANDALONE_ARGS block"
+    start += len(marker)
+    end = source.index("\n    )", start)
+    entries = [
+        line.strip()
+        for line in source[start:end].splitlines()
+        if line.strip().startswith("testing/")
+    ]
+    # Never scan vacuously: a parser that silently matched nothing would let
+    # every assertion below pass against an empty fake checkout (#17872).
+    assert entries, (
+        "standalone harness declared no literal testing/ roster entries; "
+        "the STANDALONE_ARGS parser matched nothing"
+    )
+    return entries
+
+
 def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path):
     """Docker-less standalone execution must not silently drop discovered entries."""
     bash_executable = "bash"
@@ -14364,41 +14865,25 @@ def test_standalone_script_roster_executes_every_non_exempt_entry(tmp_path: Path
         (run_scripts / filename).write_text(
             "def test_roster_placeholder():\n    pass\n", encoding="utf-8"
         )
-    backend_tests = [
-        "test_security.py",
-        "test_pipeline.py",
-        "test_invariants.py",
-        "test_impacted_tests.py",
-        "test_audit_finding_class_guards.py",
-        "test_admin_auth_invariant.py",
-        "test_release_promotion_metric_manifest.py",
-        "test_dependency_deprecations.py",
-        "test_websocket_emitter_inventory.py",
-        "test_operator_workbench_contracts.py",
-        "test_monthly_budget_alerts.py",
-        "test_migration_chain.py",
-        "test_message_audience.py",
-        "test_event_type_invariants.py",
-        "test_salvage_bundle_standalone.py",
-        "test_test_durations_freshness.py",
-        "test_test_estate_ranked_queue.py",
-        "test_shard_balance.py",
-        "test_conversational_workday_protection.py",
-        "test_vitest_durations_freshness.py",
-        "test_test_imports_checker.py",
-    ]
+    # Materialise a stand-in for every literal backend entry the harness will
+    # execute, derived from the harness roster itself (see the helper above).
+    # A ``file.py::selector`` entry also needs that selector to exist, or the
+    # harness aborts with "no tests ran" instead of exercising the roster.
+    roster_selectors: dict[str, set[str]] = {}
+    for entry in _standalone_backend_roster_entries(harness):
+        relative, _, selector = entry.partition("::")
+        filename = relative.rsplit("/", 1)[-1]
+        roster_selectors.setdefault(filename, set())
+        if selector:
+            roster_selectors[filename].add(selector)
+    assert roster_selectors, "standalone backend roster resolved to no files"
     run_testing = run_backend / "testing"
     run_testing.mkdir()
-    for filename in backend_tests:
+    for filename, selected in sorted(roster_selectors.items()):
         test_body = "def test_roster_placeholder():\n    pass\n"
-        if filename == "test_operator_workbench_contracts.py":
-            test_body += (
-                "\ndef test_websocket_emitter_inventory_covers_current_emitters():\n"
-                "    pass\n"
-            )
-        (run_testing / filename).write_text(
-            test_body, encoding="utf-8"
-        )
+        for function_name in sorted(selected):
+            test_body += f"\n\ndef {function_name}():\n    pass\n"
+        (run_testing / filename).write_text(test_body, encoding="utf-8")
     run_harness = run_scripts / harness.name
 
     for path in sorted(
@@ -14928,6 +15413,14 @@ def test_standalone_corpus_set_guards_emit_offender_identity():
     )
 
 
+# This shells out to scripts/test-backend.sh for a roster read. Measured
+# at 17.8s on an idle Windows host, and the CI lanes run pytest with
+# --timeout=30 -- so under an eight-shard load this lands on the wrong
+# side of its budget and fails as a TIMEOUT, reporting a slow harness
+# boot as a roster defect. 180s leaves ~10x headroom over the measured
+# figure and stays above the 120s inner subprocess timeout below, which
+# is what must be allowed to fire first.
+@pytest.mark.timeout(180)
 def test_standalone_offender_roster_covers_the_harness_inventory():
     """The scanned roster is never narrower than the lane the harness runs.
 

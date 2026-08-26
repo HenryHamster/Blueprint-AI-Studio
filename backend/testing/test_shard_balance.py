@@ -18,6 +18,7 @@ i.e. a threshold picked to match that number is unreachable by construction.
 
 Runs under --noconftest (no DB, no conftest fixtures).
 """
+import functools
 import heapq
 import importlib.util
 import json
@@ -255,14 +256,28 @@ def _extract_valid_test_ids(filepath: Path) -> set:
     return extract_python_test_ids_from_file(filepath)
 
 
-def _enumerate_collected_test_ids() -> set:
-    """Enumerate every ``testing/test_<file>.py::<id>`` pytest would collect."""
+@functools.lru_cache(maxsize=1)
+def _enumerate_collected_test_ids() -> frozenset:
+    """Enumerate every ``testing/test_<file>.py::<id>`` pytest would collect.
+
+    Memoized because both shard-balance tests need the same answer and the walk
+    is not cheap: parsing the 627-file backend test corpus and resolving the
+    collector-faithful identities costs ~15s measured over the Docker-on-Windows
+    bind mount the standalone lane runs on. Paying it twice put the second
+    caller's total over the lane's budget for no new information.
+
+    Safe to memoize here, not in general: the input is the real checkout's
+    ``backend/testing/test_*.py``, and no test in this module writes to it —
+    every synthetic corpus these guards build lives under ``tmp_path``. The
+    shared extractor in ``testing/identity_extraction.py`` is deliberately left
+    uncached, because its other callers do rewrite files in-process.
+    """
     universe: set = set()
     for path in sorted(BACKEND_ROOT.glob(TEST_FILE_GLOB)):
         rel = path.relative_to(BACKEND_ROOT).as_posix()
         for test_id in _extract_valid_test_ids(path):
             universe.add(f"{rel}::{test_id}")
-    return universe
+    return frozenset(universe)
 
 
 def _resolve_quality_path() -> Path | None:
@@ -336,6 +351,25 @@ def _simulate_ldf_allocation(durations: dict, num_shards: int) -> list[float]:
     return shard_totals
 
 
+# The standalone lane passes --timeout=30 on the command line, a number sized on
+# a native Linux filesystem. This guard's cost is dominated by
+# _enumerate_collected_test_ids(), which must read and parse all 627 backend
+# test files and resolve collector-faithful identities for each. Measured over the
+# Docker-on-Windows bind mount the lane runs on: 17.82s cold, 14.64s with the
+# page cache already hot -- so a warm cache does not rescue it either. Against
+# a 30s budget that is a coin flip, and on the lane it lost: the guard died on
+# `Failed: Timeout (>30.0s) from pytest-timeout`, the signal landing mid-walk
+# inside the per-file read (identity_extraction -> Path.read_text) rather than
+# on any assertion -- i.e. it reported a slow filesystem as a shard-imbalance
+# defect.
+#
+# The walk is irreducible -- every test file must be enumerated, and there is
+# no sound textual prefilter for "contains a test". So the budget is the thing
+# that was wrong. 180 matches the number
+# test_test_estate_ranked_queue.py::test_checked_in_queue_ranks_every_collected_test_file
+# already carries for the same whole-corpus enumeration, and leaves ~10x
+# headroom over the measurement for a CI runner competing for slots.
+@pytest.mark.timeout(180)
 def test_projected_shard_balance_within_threshold() -> None:
     """
     Simulate 8-shard LDF allocation from committed durations (plus mean-
@@ -448,6 +482,12 @@ def test_impute_missing_mean_matches_durations_quality() -> None:
     assert module.impute_missing_mean({}) == _impute_missing_mean({}) == 0.0
 
 
+# Same whole-corpus enumeration, same budget rationale as
+# test_projected_shard_balance_within_threshold above. It survived the lane run
+# that killed its sibling at 14.64s of a 30s budget -- a pass by 15 seconds, not
+# by design. The memoization above now makes it nearly free when it runs second,
+# but ordering is not a contract, so it carries the marker on its own account.
+@pytest.mark.timeout(180)
 def test_projected_shard_balance_threshold_is_reachable() -> None:
     """
     Prove MAX_IMBALANCE_RATIO can actually fail, not just pass by construction.

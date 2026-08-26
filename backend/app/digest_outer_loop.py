@@ -41,6 +41,7 @@ _TERMINAL_OUTCOME_KEYS = frozenset(
     }
 )
 _ESCALATION_OUTCOME_KEYS = frozenset({"stuck", "standoff", "repeat_fingerprint_halt"})
+_CAP_EXHAUSTED_DIRECTION_LIMIT = 20
 
 
 def _outer_loop_pct(values: List[int], p: int) -> Optional[int]:
@@ -199,6 +200,93 @@ def _resolve_chain_outcome(
     return None
 
 
+def _outer_loop_is_rollup_chain(
+    chain_tasks: List[Task], outcome_tasks: List[Task]
+) -> bool:
+    """Return whether a chain carries the canonical rollup lineage marker."""
+    # Keep the predicate in review_pipeline authoritative.  The local import
+    # avoids making this pure digest helper part of review-pipeline imports.
+    from app.review_pipeline import _is_rollup_chain_source
+
+    return any(
+        _is_rollup_chain_source(task)
+        for task in [*chain_tasks, *outcome_tasks]
+    )
+
+
+def _outer_loop_direction_text(
+    direction_id: Optional[str], chain_tasks: List[Task], outcome_tasks: List[Task]
+) -> Optional[str]:
+    """Find the bounded human-readable label attached to a direction."""
+    if not direction_id:
+        return None
+    for task in [*chain_tasks, *outcome_tasks]:
+        context = task.context or {}
+        payload = task.first_payload or {}
+        candidate = (
+            context.get("direction_text")
+            or context.get("direction_name")
+            or payload.get("direction_text")
+            or payload.get("direction_name")
+        )
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()[:200]
+    return None
+
+
+def _bounded_direction_records(
+    direction_records: Dict[str, Optional[str]], limit: int = _CAP_EXHAUSTED_DIRECTION_LIMIT
+) -> List[Dict[str, Optional[str]]]:
+    """Return deterministic, bounded cap-loss direction records."""
+    return [
+        {"direction_id": direction_id, "direction_text": direction_text}
+        for direction_id, direction_text in sorted(direction_records.items())[:limit]
+    ]
+
+
+def _outer_loop_review_stats(values: List[int]) -> Dict[str, Any]:
+    """Summarize a reviews-to-converge population without truncating it."""
+    return {
+        "count": len(values),
+        "sample_count": len(values),
+        "median": _outer_loop_pct(values, 50),
+        "p95": _outer_loop_pct(values, 95),
+    }
+
+
+def _new_rollup_convergence_fold() -> Dict[str, Any]:
+    """Create the shared rollup convergence-arm accumulator.
+
+    The outer-loop convergence and lane-waste reducers expose the same rollup
+    population. Keeping the population fold here prevents their denominators
+    and merged-only review samples from drifting apart.
+    """
+    return {
+        "chain_count": 0,
+        "supersede_affected_chain_count": 0,
+        "supersede_unaffected_chain_count": 0,
+        "supersede_affected_review_counts": [],
+        "supersede_unaffected_review_counts": [],
+    }
+
+
+def _fold_rollup_convergence_arm(
+    fold: Dict[str, Any], observation: Dict[str, Any]
+) -> None:
+    """Add one chain observation to the shared rollup convergence arms."""
+    if not observation["is_rollup"]:
+        return
+
+    fold["chain_count"] += 1
+    arm = "supersede_affected" if observation["supersede_affected"] else "supersede_unaffected"
+    fold[f"{arm}_chain_count"] += 1
+    if (
+        observation["outcome"] == "merged"
+        and observation["reviews_to_converge"] is not None
+    ):
+        fold[f"{arm}_review_counts"].append(observation["reviews_to_converge"])
+
+
 def _outer_loop_chain_observation(
     key: str,
     chain_tasks: List[Task],
@@ -228,11 +316,31 @@ def _outer_loop_chain_observation(
     pr_number = rl0.get("pr_number")
     direction_id = None
     review_count = 0
+    review_loop_pr_numbers: set[str] = set()
+    superseded_pr_numbers: set[str] = set()
     for t in chain_tasks:
         context = t.context or {}
         if direction_id is None and context.get("direction_id"):
             direction_id = str(context["direction_id"])
         rl = (t.context or {}).get("review_loop") or {}
+        pr = rl.get("pr_number")
+        if pr is not None and str(pr).strip():
+            review_loop_pr_numbers.add(str(pr).strip())
+        prior_prs = rl.get("superseded_pr_numbers")
+        if isinstance(prior_prs, list):
+            superseded_pr_numbers.update(
+                str(prior_pr).strip()
+                for prior_pr in prior_prs
+                if prior_pr is not None and str(prior_pr).strip()
+            )
+        # Legacy retarget receipts predate the durable lineage field.  Reading
+        # them keeps a currently-retargeted task correctly classified while
+        # successor tasks use ``superseded_pr_numbers`` above.
+        legacy_retarget = rl.get("head_drift_retargeted_from")
+        if isinstance(legacy_retarget, dict):
+            prior_pr = legacy_retarget.get("pr_number")
+            if prior_pr is not None and str(prior_pr).strip():
+                superseded_pr_numbers.add(str(prior_pr).strip())
         if pr_number is None and rl.get("pr_number") is not None:
             pr_number = rl.get("pr_number")
         it = rl.get("iteration")
@@ -257,6 +365,12 @@ def _outer_loop_chain_observation(
                 break
 
     outcome = _resolve_chain_outcome(outcome_tasks, chain_reasons)
+    chain_pr_numbers = review_loop_pr_numbers | superseded_pr_numbers
+    supersede_affected = len(chain_pr_numbers) > 1
+    is_rollup = _outer_loop_is_rollup_chain(chain_tasks, outcome_tasks)
+    direction_text = _outer_loop_direction_text(
+        direction_id, chain_tasks, outcome_tasks
+    )
 
     project_id = None
     for t in outcome_tasks:
@@ -271,8 +385,15 @@ def _outer_loop_chain_observation(
         "churn_count": chain_churn,
         "has_drift": chain_has_drift,
         "direction_id": direction_id,
+        "direction_text": direction_text,
+        "is_rollup": is_rollup,
         "review_count": review_count,
         "reviews_to_converge": review_count if outcome == "merged" else None,
+        # A recreated PR remains one chain because the original-task identity
+        # is stable. Retained prior PRs make supersession observable after the
+        # original iteration tasks have aged out of the reporting window.
+        "review_loop_pr_numbers": sorted(chain_pr_numbers),
+        "supersede_affected": supersede_affected,
         "original_task_id": str(oid) if oid else None,
         "pr_number": pr_number,
         "task_ids": [str(t.id) for t in chain_tasks],

@@ -44,7 +44,13 @@ from google.cloud import storage as gcs_storage
 from app import compute
 from app import storage
 from app.compute_experiment_contract import ENV_KEY_RE
-from app.failure_classification import NO_PROGRESS_TIMEOUT_TERMINAL_REASON
+from app.failure_classification import (
+    NO_PROGRESS_TIMEOUT_TERMINAL_REASON,
+    PROVISIONING_TTL_TERMINAL_REASON,
+    RUNTIME_TTL_TERMINAL_REASON,
+    environment_failure_terminal_reason,
+    is_environment_exit_code,
+)
 from app.managed_compute import (
     assert_managed_compute_enabled,
     assert_task_managed_execution_allowed_authoritative,
@@ -369,6 +375,38 @@ PROGRESS_FILE_ENV = "BLUEPRINT_PROGRESS_FILE"
 # to silently drift, the platform kill would collapse to ``CODE_ERROR`` — burning
 # retry budget and misattributing blame to the operator's command.
 NO_PROGRESS_WATCHDOG_EXIT_CODE = 125
+
+
+def _terminal_failure_message(
+    *,
+    exit_code: object,
+    reason: str | None,
+    default: str,
+) -> str:
+    """Resolve the terminal reason a FAILED poll records, preserving the exit code.
+
+    Every backend previously collapsed a non-zero exit into an untyped prose
+    string ("compute job failed", "local subprocess exited with code 127",
+    "compute-job startup script failed"). ``classify_compute_terminal_reason``
+    substring-matches that prose and matched none of it, so EVERY substrate
+    failure -- including the shell's own 127 "command not found" and 126 "not
+    executable" -- landed on CODE_ERROR: the class reserved for a genuine
+    command/work defect. That burned the owning task's retry budget and blamed
+    the experiment's author for a bootstrap fault they did not cause.
+
+    This is the single seam that stops the laundering. When the exit code is one
+    the SHELL reserves for "the environment did not have what the command
+    needed" (:data:`app.failure_classification.ENVIRONMENT_EXIT_CODES`) the
+    message carries the typed environment sentinel, which the classifier maps to
+    PROVISION_FAILURE -- an INFRA class, so the attempt is budget-exempt and does
+    not penalize direction health. Every other exit code keeps its existing
+    message verbatim, so a real command defect still routes to CODE_ERROR.
+    """
+    if is_environment_exit_code(exit_code):
+        return environment_failure_terminal_reason(int(exit_code), reason)  # type: ignore[arg-type]
+    return reason or default
+
+
 # Designated result-file path the command writes; read back after it finishes.
 _GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
 # On-VM artifact directory the GCP startup script provisions and uploads.
@@ -431,6 +469,27 @@ _BUNDLE_DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024  # 4 MiB
 # Hard ceiling on the artifact upload so an oversized tree can never wedge
 # poweroff — the upload is abandoned (best-effort) once it elapses.
 _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS = 180
+# Phase-1 ceiling of the VM's TWO-PHASE self-destruct clock: the wall-clock
+# budget for everything BEFORE the experiment's command starts — boot, repo
+# clone, container image pull, checkpoint hydration, setup_step.
+#
+# Before this existed, the startup script armed ONE clock at the very top of the
+# script with the experiment's own ``runtime_deadline_seconds + 30``, so clone +
+# image pull + hydration + setup all ate the experiment's declared budget and a
+# slow bootstrap silently shortened the run to "deadline minus however long
+# provisioning took". That asymmetry was already recognised for the no-progress
+# watchdog (armed AFTER setup, "so slow provisioning is never mistaken for a
+# stalled job") but not for the TTL. Both clocks now start from the same point.
+#
+# One hour is deliberately generous: it must cover a multi-GB CUDA image pull
+# plus a multi-GB checkpoint hydration on a cold VM. It is still a hard bound —
+# an orphaned compute VM is the costliest leak on the platform — and the phase-1
+# expiry records terminal reason ``provisioning_ttl``, which classifies as
+# PROVISION_FAILURE (budget-exempt) rather than blaming the experiment's author.
+# Worst-case VM lifetime is therefore bootstrap + runtime rather than runtime
+# alone; that is the explicit, bounded price of not stealing the experiment's
+# budget to pay for provisioning.
+_GCP_BOOTSTRAP_TTL_SECONDS = 3600
 _LOCAL_RESULT_FILENAME = "result.json"
 _LOCAL_ARTIFACT_DIRNAME = "artifacts"
 # Defensive bounds on the reported-metrics payload — a garbled/oversized marker
@@ -1134,7 +1193,11 @@ class LocalSubprocessComputeBackend:
             )
         return ComputeStatusResult(
             status=ComputeJobStatus.FAILED,
-            message=f"local subprocess exited with code {return_code}",
+            message=_terminal_failure_message(
+                exit_code=return_code,
+                reason=None,
+                default=f"local subprocess exited with code {return_code}",
+            ),
             exit_code=return_code,
             finished_at=_utcnow(),
         )
@@ -1433,6 +1496,16 @@ class RunnerSubprocessBackend:
                     ).replace(tzinfo=None)
                 except (ValueError, AttributeError):
                     pass
+            raw_reason = meta.get("runner_terminal_reason")
+            # Structured cause the runner attached to its terminal report
+            # (ComputeJobReportRequest.terminal_reason). Server-bounded on stamp;
+            # re-validated here because polling_metadata is a JSONB column that
+            # older rows and other writers also touch.
+            reported_reason = (
+                raw_reason.strip()
+                if isinstance(raw_reason, str) and raw_reason.strip()
+                else None
+            )
             no_progress_timeout = exit_code == NO_PROGRESS_WATCHDOG_EXIT_CODE
             cjs = (
                 ComputeJobStatus.SUCCEEDED
@@ -1446,16 +1519,48 @@ class RunnerSubprocessBackend:
             if cjs == ComputeJobStatus.SUCCEEDED:
                 message = "compute job succeeded"
             elif no_progress_timeout:
-                # No-progress watchdog kill on the runner. The runner /report
-                # endpoint carries only exec_status/exit_code (no reason field),
-                # so translate the reserved exit code here into a terminal reason
-                # string classify_compute_terminal_reason keys on. Without this the
-                # kill collapses to CODE_ERROR (burns retry budget, misattributes
-                # blame) instead of NO_PROGRESS_TIMEOUT — matching the GCP/local
-                # -subprocess paths which emit REASON=no_progress_timeout directly.
+                # No-progress watchdog kill on the runner. The reserved exit code
+                # is translated here into the terminal reason string
+                # classify_compute_terminal_reason keys on. Without this the kill
+                # collapses to CODE_ERROR (burns retry budget, misattributes blame)
+                # instead of NO_PROGRESS_TIMEOUT — matching the GCP/local-subprocess
+                # paths which emit REASON=no_progress_timeout directly.
+                #
+                # A runner-reported ``terminal_reason`` deliberately does NOT
+                # override this one. 125 is a RESERVED code with exactly one
+                # meaning, shared literal-for-literal with the emitter, and the
+                # sentinel it maps to is pinned by test. Letting free prose win
+                # here would put the reserved code's classification at the mercy of
+                # whatever wording a future runner happens to send.
                 message = NO_PROGRESS_TIMEOUT_TERMINAL_REASON
             else:
-                message = "compute job failed"
+                # Two independent channels of evidence for how the job died, in
+                # order of specificity:
+                #
+                # 1. ``reported_reason`` -- the runner's own structured cause,
+                #    posted as ComputeJobReportRequest.terminal_reason. This is the
+                #    precise string (e.g. "runner provisioning failure: no usable
+                #    python runtime on this host"), and the classifier already
+                #    routes it correctly. It arrives here only because the field is
+                #    DECLARED on the request model: pydantic's ``extra="ignore"``
+                #    default silently destroyed it at the API boundary for as long
+                #    as it was undeclared, which is exactly how a host-capability
+                #    gap came to be billed to the experiment's author.
+                # 2. The exit code, when the SHELL reserves it for "the environment
+                #    did not have what the command needed" (126/127). Discarding
+                #    that into the untyped prose "compute job failed" made no
+                #    interpreter on the runner -- the commonest bootstrap death in
+                #    the corpus -- classify as CODE_ERROR, burning the task's retry
+                #    budget on a defect that is not in the code.
+                #
+                # _terminal_failure_message resolves both: an environment exit code
+                # carries the typed sentinel (with the reason preserved as detail),
+                # otherwise the reported reason wins over the untyped default.
+                message = _terminal_failure_message(
+                    exit_code=exit_code,
+                    reason=reported_reason,
+                    default="compute job failed",
+                )
             return ComputeStatusResult(
                 status=cjs,
                 exit_code=exit_code if exit_code is not None else (0 if cjs == ComputeJobStatus.SUCCEEDED else None),
@@ -1662,7 +1767,11 @@ def _read_local_terminal_status_for_external_id(
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
-        message=reason or f"local subprocess exited with code {exit_code}",
+        message=_terminal_failure_message(
+            exit_code=exit_code,
+            reason=reason,
+            default=f"local subprocess exited with code {exit_code}",
+        ),
         exit_code=exit_code,
         finished_at=finished_at,
         metrics=metrics,
@@ -1877,18 +1986,33 @@ fi"""
             )
         else:
             _np_container_kill = ""
-        _no_progress_watchdog_block = f"""# No-progress watchdog: kills the job if the progress file is untouched
+        _no_progress_watchdog_block = f"""# No-progress watchdog: kills the job if the progress file STOPS advancing
 # for {_np_seconds}s. Runs in parallel with the command as a SLIDING window —
 # each interval that advances the progress mtime resets the deadline, so a job
 # that progresses then stalls is still cut on the next quiet interval (matches
 # the GCP startup-script and scripts/local_runner.py watchdogs).
-touch {progress_file} 2>/dev/null || true
+#
+# INERT UNTIL TELEMETRY REPORTS ONCE. Nothing but the experiment's own command
+# ever writes $BLUEPRINT_PROGRESS_FILE, so before the first write there is no
+# progress signal to observe. This block used to `touch` the file itself and
+# then compare mtimes: for a command that never writes progress the mtime was
+# constant by construction, so the "watchdog" degenerated into an unconditional
+# fixed-duration kill that fired on every long job regardless of health, and
+# recorded it as no_progress_timeout. A watchdog that cannot observe progress
+# must not kill on the absence of progress — so the file is NOT pre-created,
+# `_NP_START` stays empty until the file first exists, and only an observed
+# PLATEAU (two consecutive samples with the same mtime) is a kill. The "declared
+# a metric and never reported it" case is still enforced — by the server-side
+# watchdog in compute_jobs.py (`_classify_watchdog`), which is the only layer
+# that knows whether a metric was declared; the runtime deadline remains the
+# unconditional backstop.
 (
-  _NP_START=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+  _NP_START=
   while true; do
     sleep {_np_seconds}
+    [ -e {progress_file} ] || continue
     _NP_NOW=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
-    if [ "$_NP_NOW" = "$_NP_START" ]; then
+    if [ -n "$_NP_START" ] && [ "$_NP_NOW" = "$_NP_START" ]; then
       # No progress in the last window — terminal reason no_progress_timeout.
       FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
       cat > {terminal_path} <<NP_EOF
@@ -3464,6 +3588,7 @@ def _build_gcp_startup_script(
     return f"""#!/bin/bash
 set -u -o pipefail
 TTL_SECONDS={deadline_seconds}
+_BOOT_TTL_SECS={_GCP_BOOTSTRAP_TTL_SECONDS}
 _NP_TIMEOUT_SECONDS={np_timeout}
 echo '{command_runner_b64}' | base64 -d > /tmp/blueprint_command_runner.py
 echo '{artifact_upload_b64}' | base64 -d > /tmp/blueprint_artifact_upload.py
@@ -3503,13 +3628,26 @@ trap upload_artifacts EXIT HUP INT TERM QUIT
 # paths that run before the resume block, and so the TTL subshell below (forked
 # before resume) can still read the value via the /tmp file written on success.
 __BP_RESUME_D=""
+# PHASE 1 of a two-phase self-destruct clock: the PROVISIONING budget. It covers
+# boot, repo clone, container image pull, checkpoint hydration and setup_step —
+# everything before the experiment's command exists. Phase 2 (below, armed at the
+# same point as the no-progress watchdog) replaces it with the experiment's own
+# runtime deadline.
+#
+# One clock used to cover both, armed here with the experiment's
+# runtime_deadline_seconds + 30, so a slow bootstrap silently ate the run's
+# declared budget — the exact asymmetry the no-progress watchdog already avoids
+# by arming late. Phase 1 expiry is a PROVISIONING fault: it records terminal
+# reason provisioning_ttl (-> PROVISION_FAILURE, budget-exempt), never
+# runtime_ttl, so a VM that died bootstrapping is not billed to the experiment's
+# retry budget.
 (
-  sleep "$TTL_SECONDS"
+  sleep "$_BOOT_TTL_SECS"
   _BP_TTL_PROV=$(cat /tmp/blueprint_resume_d.b64 2>/dev/null || true)
   python3 /tmp/blueprint_terminal_record.py \
-    {artifact_dir} FAILED 124 runtime_ttl {result_file} {command_log_path} \
+    {artifact_dir} FAILED 124 {PROVISIONING_TTL_TERMINAL_REASON} {result_file} {command_log_path} \
     "$_BP_TTL_PROV" >/dev/null 2>&1 || true
-  echo "{_SERIAL_REASON_PREFIX}runtime_ttl"
+  echo "{_SERIAL_REASON_PREFIX}{PROVISIONING_TTL_TERMINAL_REASON}"
   echo "{_SERIAL_STATUS_PREFIX}FAILED"
   echo "{_SERIAL_EXIT_PREFIX}124"
   upload_artifacts
@@ -3570,20 +3708,55 @@ python3 /tmp/blueprint_terminal_record.py \
 {repo_setup_block}
 {setup_step_block}
 {cwd_line}
-{docker_setup_block}# No-progress watchdog: ARMED HERE, after all setup (repo clone, container image
+{docker_setup_block}# PHASE 2 of the self-destruct clock: the experiment's OWN runtime budget, armed
+# HERE — at the same point as the no-progress watchdog, after repo clone,
+# container image pull, resume hydration and setup_step. Phase 1 (armed at the
+# top of the script) covered provisioning; it is cancelled now so the two clocks
+# do not overlap and bootstrap does not consume the run's declared deadline.
+#
+# TTL_PID is REASSIGNED, so every existing `kill "$TTL_PID" ...` cleanup line
+# keeps disarming the live clock without change.
+kill "$TTL_PID" 2>/dev/null || true
+(
+  sleep "$TTL_SECONDS"
+  _BP_TTL_PROV=$(cat /tmp/blueprint_resume_d.b64 2>/dev/null || true)
+  python3 /tmp/blueprint_terminal_record.py \
+    {artifact_dir} FAILED 124 {RUNTIME_TTL_TERMINAL_REASON} {result_file} {command_log_path} \
+    "$_BP_TTL_PROV" >/dev/null 2>&1 || true
+  echo "{_SERIAL_REASON_PREFIX}{RUNTIME_TTL_TERMINAL_REASON}"
+  echo "{_SERIAL_STATUS_PREFIX}FAILED"
+  echo "{_SERIAL_EXIT_PREFIX}124"
+  upload_artifacts
+  poweroff || shutdown -h now || true
+) &
+TTL_PID=$!
+# No-progress watchdog: ARMED HERE, after all setup (repo clone, container image
 # pull, resume hydration, setup step) has completed, so slow provisioning never
 # counts as "no progress" and cannot trip a false kill. Mirrors the local
 # subprocess wrapper, which launches its watchdog after setup_step + container
 # pull. Polls the progress file's mtime; each interval that advances it resets
 # the deadline (sliding window). When _NP_TIMEOUT_SECONDS is 0 the block is inert.
-touch {progress_file} 2>/dev/null || true
+#
+# ALSO INERT UNTIL TELEMETRY REPORTS ONCE. Nothing but the experiment's own
+# command writes $BLUEPRINT_PROGRESS_FILE. This block used to `touch` the file
+# itself and then compare mtimes, so for a command that never writes progress
+# the mtime was constant by construction and the "watchdog" degenerated into an
+# unconditional fixed-duration kill of a perfectly healthy job, recorded as
+# no_progress_timeout. A watchdog that cannot observe progress must not kill on
+# the absence of progress: the file is NOT pre-created, _NP_START stays empty
+# until it first exists, and only an observed PLATEAU (two consecutive samples
+# with the same mtime) is a kill. The "declared a metric and never reported it"
+# case is still enforced by the server-side watchdog in compute_jobs.py
+# (`_classify_watchdog`) — the only layer that knows whether a metric was
+# declared — and TTL_SECONDS remains the unconditional backstop.
 (
   if [ "$_NP_TIMEOUT_SECONDS" -gt 0 ]; then
-    _NP_START=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
+    _NP_START=
     while true; do
       sleep "$_NP_TIMEOUT_SECONDS"
+      [ -e {progress_file} ] || continue
       _NP_NOW=$(stat -c %Y {progress_file} 2>/dev/null || echo 0)
-      if [ "$_NP_NOW" = "$_NP_START" ]; then
+      if [ -n "$_NP_START" ] && [ "$_NP_NOW" = "$_NP_START" ]; then
         python3 /tmp/blueprint_terminal_record.py \
           {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
           "$__BP_RESUME_D" >/dev/null 2>&1 || true
@@ -3837,7 +4010,11 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
-        message=reason or "compute-job startup script failed",
+        message=_terminal_failure_message(
+            exit_code=exit_code,
+            reason=reason,
+            default="compute-job startup script failed",
+        ),
         exit_code=exit_code,
         finished_at=_utcnow(),
         metrics=metrics,
@@ -3932,7 +4109,11 @@ def _reconcile_terminal_record_to_status(
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
-        message=reason or "compute-job startup script failed",
+        message=_terminal_failure_message(
+            exit_code=exit_code,
+            reason=reason,
+            default="compute-job startup script failed",
+        ),
         exit_code=exit_code,
         finished_at=_utcnow(),
         metrics=metrics,

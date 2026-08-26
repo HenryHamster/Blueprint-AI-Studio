@@ -1675,6 +1675,11 @@ export interface BootstrapContext {
    *  session restart. Empty string or whitespace → section omitted. Absent or
    *  omitted defaults to ''. */
   recentHandledConversationText?: string;
+  /** Formatted operator attention census (payload.operator_attention): what the
+   *  workbench rail would be telling the operator needs a look. Rendered as a
+   *  `## Operator attention census` section when non-empty; refresh it any time
+   *  with `./fetch attention`. Absent or omitted defaults to ''. */
+  operatorAttentionText?: string;
   sessionId: string;
   /** Conditional guidance for the provisioned compute-artifact helper. */
   computeArtifactGuidanceText?: string;
@@ -1771,6 +1776,14 @@ ${ctx.toolContentText.trim()}`);
   }
   if (ctx.openMessagesText.trim()) {
     sections.push(`## Open operator messages\n${ctx.openMessagesText.trim()}`);
+  }
+  // Operator attention census — the backlog the workbench rail shows the
+  // operator. Distinct from the inbox above: these are conditions (stale tasks,
+  // stranded approved PRs, error alerts), not messages addressed to you. It is a
+  // point-in-time snapshot taken at spawn; re-read it with `./fetch attention`.
+  if (ctx.operatorAttentionText?.trim()) {
+    sections.push(`## Operator attention census (snapshot at session start — re-read with \`./fetch attention\`)
+${ctx.operatorAttentionText.trim()}`);
   }
   // Recently-answered operator conversation tail — READ-ONLY. These messages are
   // already handled/resolved, so they are NOT an inbox and must not be
@@ -2234,6 +2247,15 @@ const EXAM_FETCH_SURFACES: ReadonlyArray<{ key: string; hint: string }> = [
   { key: 'vm-cost', hint: './fetch vm-cost — check the spend trend for anything anomalous' },
   { key: 'compute-sweeps', hint: './fetch compute-sweeps — review sweep outcomes for a lead' },
   { key: 'capability-trials', hint: './fetch capability-trials — review trial verdicts for a follow-up' },
+  // Pipeline-visibility surfaces. These describe the state of the pipeline
+  // itself rather than the resident's own lineage; without them on the
+  // examination rotation the autonomous tick never looks at the pipeline it is
+  // supposed to be steering.
+  { key: 'attention', hint: './fetch attention — read the operator attention census; what is waiting on a human, and is any of it something you can clear?' },
+  { key: 'task-census', hint: './fetch task-census — project-wide in-flight work across every created_by; look at the oldest non-terminal tasks for anything stranded' },
+  { key: 'autonomy-debug', hint: './fetch autonomy-debug — is autonomy spawning? check per-direction block_reason_code for a direction stranded on a clearable blocker' },
+  { key: 'alerts', hint: './fetch alerts — look at the alert mix by event_type for a recurring condition worth a direction, not at individual notices' },
+  { key: 'deploy-state', hint: './fetch deploy-state — confirm what SHA is actually serving and whether deploys are paused or rolled back' },
 ];
 
 /**

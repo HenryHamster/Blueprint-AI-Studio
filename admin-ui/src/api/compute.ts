@@ -977,13 +977,20 @@ export interface ComputeJob {
    *  ('deadline'), budget cap ('spend_cap'), operator kill ('operator'), and
    *  natural failure ('failure'). Absent on legacy rows. */
   terminal_kind?: 'deadline' | 'no_progress' | 'spend_cap' | 'operator' | 'failure' | null;
-  /** True only when the server has enough fresh receipt-time history to enforce
-   *  a no-progress cut right now. */
+  /** True when the no-progress watchdog is ENFORCING on this job right now --
+   *  either armed and watching a moving metric ('protected'), or about to
+   *  terminate it ('cutting'). It is not a synonym for "this job is safe". */
   watchdog_active?: boolean | null;
   /** Additive watchdog state. Older backends omit it; consumers should fall back
-   *  to watchdog_active when absent. */
+   *  to watchdog_active when absent.
+   *
+   *  'cutting' means the no-progress condition holds and the next poll pass
+   *  terminates the job. 'stale_telemetry' is a legacy value: the backend now
+   *  reports that condition as 'cutting' with watchdog_cut_reason
+   *  'stale_telemetry', because it is one of the conditions that CAUSES a cut. */
   watchdog_state?:
     | 'protected'
+    | 'cutting'
     | 'warming_up'
     | 'insufficient_history'
     | 'stale_telemetry'
@@ -996,8 +1003,13 @@ export interface ComputeJob {
   /** Server receipt timestamp of the most recent enforceable progress sample.
    *  Null when no trustworthy progress samples have been emitted yet. */
   last_progress_at?: string | null;
-  /** Machine-readable reason the watchdog is not currently protecting this job. */
+  /** Machine-readable reason the watchdog is not currently protecting this job.
+   *  Null whenever the watchdog is enforcing, including while it is cutting. */
   watchdog_inert_reason?: string | null;
+  /** Machine-readable reason the watchdog is cutting this job: 'plateau',
+   *  'stale_telemetry', 'no_telemetry' or 'malformed_history'. Null unless
+   *  watchdog_state is 'cutting'. */
+  watchdog_cut_reason?: string | null;
   /** Cross-job checkpoint resume: predecessor job ID that the backend validated
    *  as the resume source for checkpoint hydration. Present when the compute job
    *  was launched with a checkpoint source; absent otherwise. Promoted from

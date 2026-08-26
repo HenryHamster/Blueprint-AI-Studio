@@ -889,6 +889,146 @@ async def test_active_one_shot_records_cycle_reason_then_completion_retries(
 
 
 @pytest.mark.asyncio
+async def test_completion_retry_not_suppressed_by_active_blob_with_dead_worker(
+    db_session, mocker
+):
+    """A terminal resident worker must NOT suppress the post-commit Workday retry.
+
+    ``_resident_strategic_session`` is a status-only operator-facing projection:
+    it keeps ``status: "active"`` after its worker task goes terminal. Gating the
+    post-commit retry on ``resident_session_is_active`` alone therefore suppresses
+    the recovery forever — the Resident is dead, nothing restarts it, and the
+    Workday auto-start this path exists to re-drive never happens.
+    """
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.FAILED
+    )
+    # The blob still advertises a live session even though its exact worker died.
+    assert project.vision[RESIDENT_SESSION_KEY]["status"] == "active"
+    assert project.vision[RESIDENT_SESSION_KEY]["stop_requested"] is False
+    assert str(project.vision[RESIDENT_SESSION_KEY]["task_id"]) == str(task.id)
+    assert task.status == TaskStatus.FAILED
+
+    vision = dict(project.vision or {})
+    vision[RESIDENT_SESSION_REASON_KEY] = {
+        "reason": RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+        "operator_user_id": "operator",
+    }
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+    factory = _test_session_factory(db_session)
+    project_id = project.id
+    mocker.patch(
+        "app.workbench_state.get_strategic_workbench_state",
+        new=mocker.AsyncMock(return_value={"interaction_mode": "continuous"}),
+    )
+    retry = mocker.patch(
+        "app.strategic_resident_session._auto_start_on_workday_entry",
+        new_callable=mocker.AsyncMock,
+    )
+
+    await _maybe_retry_workday_auto_start(project_id, session_factory=factory)
+
+    retry.assert_awaited_once_with(
+        project_id,
+        operator_user_id="operator",
+        session_factory=factory,
+    )
+
+
+@pytest.mark.asyncio
+async def test_completion_retry_still_suppressed_by_healthy_resident_worker(
+    db_session, mocker
+):
+    """The health guard must not degrade into "always retry".
+
+    A live, identity-matched, freshly-heartbeating worker still owns the project,
+    so the post-commit retry must stay suppressed and never spawn a second one.
+    """
+    project, _task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = now_iso
+    blob["worker_heartbeat_at"] = now_iso
+    vision[RESIDENT_SESSION_KEY] = blob
+    vision[RESIDENT_SESSION_REASON_KEY] = {
+        "reason": RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+        "operator_user_id": "operator",
+    }
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+    factory = _test_session_factory(db_session)
+    project_id = project.id
+    mocker.patch(
+        "app.workbench_state.get_strategic_workbench_state",
+        new=mocker.AsyncMock(return_value={"interaction_mode": "continuous"}),
+    )
+    retry = mocker.patch(
+        "app.strategic_resident_session._auto_start_on_workday_entry",
+        new_callable=mocker.AsyncMock,
+    )
+
+    await _maybe_retry_workday_auto_start(project_id, session_factory=factory)
+
+    retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completion_retry_suppressed_when_worker_generation_superseded(
+    db_session, mocker
+):
+    """An active blob naming a REPLACEMENT generation is not this task's liveness.
+
+    The recorded task belongs to generation 1 while the blob advertises
+    generation 2, so the blob's ``task_id`` no longer identifies a worker this
+    projection can vouch for. The identity leg of the health contract must reject
+    it exactly as the liveness sweep does, and the retry must proceed.
+    """
+    project, _task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS, blob_generation=2
+    )
+    now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = now_iso
+    blob["worker_heartbeat_at"] = now_iso
+    vision[RESIDENT_SESSION_KEY] = blob
+    vision[RESIDENT_SESSION_REASON_KEY] = {
+        "reason": RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+        "operator_user_id": "operator",
+    }
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+    factory = _test_session_factory(db_session)
+    project_id = project.id
+    mocker.patch(
+        "app.workbench_state.get_strategic_workbench_state",
+        new=mocker.AsyncMock(return_value={"interaction_mode": "continuous"}),
+    )
+    retry = mocker.patch(
+        "app.strategic_resident_session._auto_start_on_workday_entry",
+        new_callable=mocker.AsyncMock,
+    )
+
+    await _maybe_retry_workday_auto_start(project_id, session_factory=factory)
+
+    retry.assert_awaited_once_with(
+        project_id,
+        operator_user_id="operator",
+        session_factory=factory,
+    )
+
+
+@pytest.mark.asyncio
 async def test_workbench_and_work_session_arming_suppressed_during_resident_session(
     db_session, mocker
 ):

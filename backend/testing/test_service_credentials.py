@@ -19,7 +19,7 @@ Two auth postures are exercised:
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -445,6 +445,16 @@ async def test_coding_agent_read_scope_is_bounded_introspectable_and_non_mutatin
     task_ids = {item["id"] for item in task_list_body["tasks"]}
     assert str(own_task.id) in task_ids
     assert str(foreign_task.id) not in task_ids
+    # This bounded projection -- not /api/admin/tasks -- is what
+    # `blueprint tasks list --json` reads on a scoped credential, so it has to
+    # answer the same "when did this last move?" question, in a stated zone.
+    own_row = next(
+        item for item in task_list_body["tasks"] if item["id"] == str(own_task.id)
+    )
+    assert own_row.get("updated_at"), "agent-access task rows must carry updated_at"
+    assert datetime.fromisoformat(own_row["updated_at"]).tzinfo is not None, (
+        f"agent-access updated_at is naive: {own_row['updated_at']!r}"
+    )
     assert raw_task_list.status_code == 403, raw_task_list.text
     assert foreign_task_list.status_code == 404, foreign_task_list.text
     assert task_detail.status_code == 200, task_detail.text

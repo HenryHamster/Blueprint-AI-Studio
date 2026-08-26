@@ -1542,37 +1542,58 @@ async def test_asset_serving_404_nonexistent_file(
 async def test_asset_serving_blocks_path_traversal(
     client: AsyncClient, db_session,
 ):
-    """Path traversal attempts (..) are rejected with 400.
+    """Path traversal attempts (..) are rejected with 400 by the handler itself.
 
     The rejection is tested via direct function call (the handler's own check)
     because FastAPI normalises ``..`` segments before routing, so an HTTP-level
     ``..`` in the path never reaches the handler to trip the guard. The
     handler's guard is a second layer; FastAPI's router is the first.
-    """
-    import uuid as _uuid
 
+    Two things this test previously got wrong, both of which made it incapable
+    of failing:
+
+    1. It wrapped the call in ``try: ... assert False ...  except Exception:
+       pass``. ``assert False`` raises ``AssertionError``, which IS an
+       ``Exception``, so the handler returning normally — no rejection at all —
+       was swallowed into a pass.
+    2. It passed ``token="dummy"``. The capability-JWT check in
+       ``_serve_tool_asset_impl`` runs BEFORE the traversal check, so a dummy
+       token short-circuits at 401 and the traversal branch is never reached.
+
+    So the token must be valid and the status code must be pinned to 400.
+    """
     from fastapi import HTTPException
 
-    from app.routers.admin_project_tools import serve_tool_asset
+    from app.routers.admin_project_tools import (
+        _create_tool_asset_token,
+        serve_tool_asset,
+    )
 
-    # The serve_tool_asset handler checks `".." in path` — verify that
-    # assertion directly so the guard is covered regardless of FastAPI's
-    # own normalisation.
-    try:
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    with pytest.raises(HTTPException) as excinfo:
         await serve_tool_asset(
-            project_id=_uuid.UUID("00000000-0000-0000-0000-000000000000"),
-            tool_slug="test",
+            project_id=project.id,
+            tool_slug="my-tool",
             path="../secret.html",
             request=None,
             session=db_session,
-            token="dummy",
+            token=token,
         )
-        assert False, "expected HTTPException for path traversal"
-    except HTTPException:
-        pass  # The traversal guard fires before JWT validation.
-    except Exception:
-        # Any exception before the JWT check is fine — the traversal was caught.
-        pass
+
+    # 400 pinned as a literal: a 401 here would mean the JWT layer, not the
+    # traversal guard, produced the rejection, and the guard would again be
+    # untested.
+    assert excinfo.value.status_code == 400, (
+        f"path traversal must be rejected by the handler's own guard with 400; "
+        f"got {excinfo.value.status_code}: {excinfo.value.detail}"
+    )
+    assert "Invalid asset path" in str(excinfo.value.detail)
 
 
 @pytest.mark.asyncio

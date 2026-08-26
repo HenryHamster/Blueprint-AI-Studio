@@ -5,6 +5,7 @@ import {
   type StreamFrameKind,
   type StreamFrameStatus,
 } from './strategic-resident-lib.js';
+import { WsFrameBudget } from './ws-frame-budget.js';
 
 // Coalesce streamed assistant deltas to at most ~10 WebSocket frames/sec so the
 // live transcript stays well under the backend's 20 msg/s close threshold
@@ -48,13 +49,20 @@ export type SessionDeltaKind = StreamFrameKind;
 export class SessionStreamer {
   private readonly queue = new FrameCoalescer();
   private timer: NodeJS.Timeout | null = null;
-  private lastEmitAt = 0;
   private seq = 0;
+  private readonly budget: WsFrameBudget;
   constructor(
     private readonly ws: WebSocket | null,
     private readonly sessionId: string,
     private readonly taskId: string,
-  ) {}
+    /** Pass the SOCKET's shared budget whenever another streamer writes to the
+     *  same websocket (typed Fast runs this transcript and the conversation
+     *  reply preview concurrently). Omitted, this streamer owns the whole
+     *  <=10 frames/s on its own, which is correct when it is the only writer. */
+    budget?: WsFrameBudget,
+  ) {
+    this.budget = budget ?? new WsFrameBudget(STREAM_FLUSH_MS);
+  }
 
   private emit(kind: SessionDeltaKind, text: string, status?: StreamFrameStatus): void {
     const clean = sanitize(text);
@@ -79,15 +87,15 @@ export class SessionStreamer {
   }
 
   // Schedule the drain so it emits at most one queued frame per STREAM_FLUSH_MS
-  // window (measured from the last real emit) — the shared ≤10/s rate budget.
+  // window (measured from the last real emit on the SHARED socket budget, so a
+  // concurrent conversation-preview streamer counts against the same ≤10/s).
   private scheduleDrain(): void {
     if (this.timer || this.queue.isEmpty) return;
-    const elapsed = Date.now() - this.lastEmitAt;
-    const wait = elapsed >= STREAM_FLUSH_MS ? 0 : STREAM_FLUSH_MS - elapsed;
+    const wait = this.budget.delayMs();
     this.timer = setTimeout(() => {
       this.timer = null;
       const item = this.queue.next();
-      if (item) { this.emit(item.kind, item.text, item.status); this.lastEmitAt = Date.now(); }
+      if (item) { this.emit(item.kind, item.text, item.status); this.budget.consume(); }
       this.scheduleDrain();
     }, wait);
   }

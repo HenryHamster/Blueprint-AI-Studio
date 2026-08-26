@@ -16,27 +16,9 @@ import sys
 
 import pytest
 
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
-def _resolve_scripts_dir() -> "str | None":
-    """Locate the repo's ``scripts/`` dir across local + Docker test environments.
-
-    Candidates, in order: explicit env override, the ``/repo`` bind-mount
-    (``scripts/test-backend.sh`` mounts the repo root read-only at ``/repo``
-    in its Docker harness), then the repo root two levels above this file
-    (plain checkouts and non-Docker runs).
-    """
-    candidates = []
-    env_override = os.getenv("BLUEPRINT_SCRIPTS_DIR")
-    if env_override:
-        candidates.append(env_override)
-    candidates.append("/repo/scripts")
-    candidates.append(
-        os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-    )
-    for path in candidates:
-        if os.path.isfile(os.path.join(path, "local_runner.py")):
-            return path
-    return None
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _require_scripts_dir() -> str:
@@ -44,22 +26,18 @@ def _require_scripts_dir() -> str:
 
     A silent skip in the promotion CI means the runner-side protocol checks
     never enforce; only ad-hoc environments without the checkout may skip.
+    Either way the resolver's NAMED reason is reported, so the miss says which
+    candidates were probed instead of only that something was absent.
     """
-    scripts_dir = _resolve_scripts_dir()
+    scripts_dir, unavailable = resolve_scripts_dir_from_env(_BACKEND_DIR)
     if scripts_dir is not None:
         return scripts_dir
-    msg = (
-        "scripts/ not available in this test environment "
-        "(checked BLUEPRINT_SCRIPTS_DIR, the /repo bind-mount that "
-        "scripts/test-backend.sh provides, and ../../scripts relative to "
-        "this file)"
-    )
     if os.getenv("CI"):
         pytest.fail(
-            msg + " — refusing to skip in CI: mount the repo root at /repo "
-            "or set BLUEPRINT_SCRIPTS_DIR so these invariants enforce"
+            unavailable + " — refusing to skip in CI: mount the repo root at "
+            "/repo or set BLUEPRINT_SCRIPTS_DIR so these invariants enforce"
         )
-    pytest.skip(msg)
+    pytest.skip(unavailable)
 
 
 def _import_runner_modules():

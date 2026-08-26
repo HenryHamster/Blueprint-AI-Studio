@@ -413,9 +413,22 @@ async def _attempt_merge_with_retry_and_escalation(
             or ci_loop.get("head_sha")
             or ""
         )
+        _sc_expected_base = str(
+            checked_base_sha
+            or ci_loop.get("ci_checked_base_sha")
+            or ci_loop.get("base_sha")
+            or ""
+        )
         if not _sc_expected_head:
             task.latest_status_message = (
                 "Merge held — size-cap guard lacks an immutable CI head; "
+                "awaiting fresh CI"
+            )[:500]
+            session.add(task)
+            return False
+        if not _sc_expected_base:
+            task.latest_status_message = (
+                "Merge held — size-cap guard lacks an immutable CI base; "
                 "awaiting fresh CI"
             )[:500]
             session.add(task)
@@ -428,7 +441,7 @@ async def _attempt_merge_with_retry_and_escalation(
             isinstance(precomputed_size_cap, SizeCapPreflightResult)
             and bool(ci_base)
             and precomputed_size_cap.target_branch == ci_base
-            and precomputed_size_cap.is_bound_to(_sc_expected_head)
+            and precomputed_size_cap.is_bound_to(_sc_expected_head, _sc_expected_base)
         )
         if _reuse_precomputed_size_cap:
             _sc_result = precomputed_size_cap
@@ -442,6 +455,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 project_id=str(task.project_id) if task.project_id else None,
                 expected_head_sha=_sc_expected_head,
                 target_branch=ci_base,
+                expected_base_sha=_sc_expected_base,
             )
         if not isinstance(_sc_result, SizeCapPreflightResult):
             # No compatibility path: allowing legacy unkeyed tuples turns the
@@ -454,7 +468,9 @@ async def _attempt_merge_with_retry_and_escalation(
             return False
         _sc_verdict = _sc_result.status
         _sc_reason = _sc_result.reason
-        if _sc_verdict == "ok" and not _sc_result.is_bound_to(_sc_expected_head):
+        if _sc_verdict == "ok" and not _sc_result.is_bound_to(
+            _sc_expected_head, _sc_expected_base
+        ):
             task.latest_status_message = (
                 "Merge held — size-cap verdict head differs from immutable CI head; "
                 "awaiting fresh evaluation"
@@ -504,6 +520,12 @@ async def _attempt_merge_with_retry_and_escalation(
             )[:500]
             session.add(task)
             return False
+        if _sc_reason:
+            logger.warning(
+                "[CI] PR #%s size-cap preflight reports inherited debt without blocking: %s",
+                ci_pr_number,
+                _sc_reason,
+            )
         # The merge authority below must submit the very head the cap guard
         # evaluated, not merely the prior CI-loop read of it.
         checked_head_sha = _sc_result.head_sha

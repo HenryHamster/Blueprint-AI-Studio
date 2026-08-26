@@ -16,6 +16,7 @@ from app.landed_signal import is_merged_completion
 from app.models import Task, TaskStatus, Project, _utcnow
 from app.auth import get_current_user, require_admin
 from app.routers.admin_analytics import _derive_completed_at
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -205,8 +206,8 @@ def _compute_medium_scope_measurement(
             "merge_rate": round(merged / created, 3) if created > 0 else None,
             "created": created,
             "merged": merged,
-            "window_start": window_start.isoformat() if window_start else None,
-            "window_end": window_end.isoformat() if window_end else None,
+            "window_start": utc_iso(window_start),
+            "window_end": utc_iso(window_end),
         }
 
     def _rolling_window_stats(all_tasks: list, since: datetime) -> Dict[str, Any]:
@@ -243,8 +244,8 @@ def _compute_medium_scope_measurement(
             "merged": merged,
             "finished": finished,
             "spawned": spawned,
-            "window_start": since.isoformat(),
-            "window_end": now.isoformat(),
+            "window_start": utc_iso(since),
+            "window_end": utc_iso(now),
         }
 
     # --- Pre/post split ---
@@ -300,7 +301,7 @@ def _compute_medium_scope_measurement(
             continue
         task_date = t.created_at.date()
         week_monday = task_date - timedelta(days=task_date.weekday())
-        week_key = week_monday.isoformat()
+        week_key = week_monday.isoformat()  # utc-iso-ok: date, not datetime -- no zone applies
         week_bucket[week_key]["created"] += 1
         is_merged = is_merged_completion(t)
         if is_merged:
@@ -415,7 +416,7 @@ def _compute_medium_scope_measurement(
                 continue
             task_date = t.created_at.date()
             week_monday = task_date - timedelta(days=task_date.weekday())
-            week_key = week_monday.isoformat()
+            week_key = week_monday.isoformat()  # utc-iso-ok: date, not datetime -- no zone applies
             correlated_changes.append(
                 {
                     "title": t.title,
@@ -428,7 +429,7 @@ def _compute_medium_scope_measurement(
         "medium_scope_conversion_rate": medium_scope_conversion_rate,
         "total_created": total_created,
         "total_merged": total_merged,
-        "investment_start": investment_start.isoformat() if investment_start else None,
+        "investment_start": utc_iso(investment_start),
         "pre_investment": pre_investment,
         "post_investment": post_investment,
         "recent_30d": recent_30d,
@@ -494,8 +495,8 @@ def _compute_first_attempt_measurement(
             return {
                 "rate": _fa_rate(task_subset),
                 "sample_size": len(task_subset),
-                "window_start": window_start.isoformat() if window_start else None,
-                "window_end": window_end.isoformat() if window_end else None,
+                "window_start": utc_iso(window_start),
+                "window_end": utc_iso(window_end),
             }
 
         pre_start = min((_derive_completed_at(t) for t in pre_tasks), default=None)
@@ -511,7 +512,7 @@ def _compute_first_attempt_measurement(
         completed = _derive_completed_at(t)
         task_date = completed.date()
         week_monday = task_date - timedelta(days=task_date.weekday())
-        week_key = week_monday.isoformat()
+        week_key = week_monday.isoformat()  # utc-iso-ok: date, not datetime -- no zone applies
         week_bucket[week_key]["measured"] += 1
         if t.context["_first_attempt_succeeded"]:
             week_bucket[week_key]["succeeded"] += 1

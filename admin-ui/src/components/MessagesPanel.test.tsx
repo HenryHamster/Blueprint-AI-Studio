@@ -694,6 +694,7 @@ describe('MessagesPanel chrome modes', () => {
     }, [message]);
 
     await waitFor(() => expect(el.textContent).toContain('Viewer-readable update'));
+    expect(el.querySelector('[data-testid="conversation-utility-alert"]')?.textContent).toContain('Capacity warning');
     expect(el.querySelector('textarea')).toBeNull();
     expect(el.querySelector('button[aria-label="Acknowledge alert"]')).toBeNull();
     expect(el.querySelector('button[title="Dismiss"]')).toBeNull();
@@ -1945,8 +1946,12 @@ describe('MessagesPanel chrome modes', () => {
       },
     });
 
-    // Clean by default: chat hides the operational banners.
+    // Clean by default: Chat keeps verbose triage hidden, but exposes the
+    // actionable alert signal without making the operator open Details.
     expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+    const utilityAlert = el.querySelector('[data-testid="conversation-utility-alert"]');
+    expect(utilityAlert).not.toBeNull();
+    expect(utilityAlert?.textContent).toContain('Zone Capacity Exhausted');
     expect(el.textContent).not.toContain('Cycle complete');
 
     const detailToggle = el.querySelector('[data-testid="conversation-detail-toggle"]') as HTMLButtonElement | null;
@@ -1959,6 +1964,7 @@ describe('MessagesPanel chrome modes', () => {
     const banner = el.querySelector('[data-testid="alerts-inline-banner"]');
     expect(banner).not.toBeNull();
     expect(banner?.textContent).toContain('Zone Capacity Exhausted');
+    expect(el.querySelector('[data-testid="conversation-utility-alert"]')).toBeNull();
     expect(el.textContent).toContain('Cycle complete');
     expect(el.textContent).toContain('+2 directions');
 
@@ -1966,6 +1972,7 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(detailToggle.getAttribute('aria-pressed')).toBe('false');
     expect(el.querySelector('[data-testid="alerts-inline-banner"]')).toBeNull();
+    expect(el.querySelector('[data-testid="conversation-utility-alert"]')).not.toBeNull();
     expect(el.textContent).not.toContain('Cycle complete');
   });
 
@@ -2480,8 +2487,8 @@ describe('MessagesPanel live strategist streaming', () => {
     return { project_id: 'proj-1', session_id: 'sess-1', text: '', ...over };
   }
 
-  const DURABLE_REPLY_AT = '2026-06-01T10:00:10.000Z';
-  const STREAM_AT = '2026-06-01T10:00:05.000Z';
+  const DURABLE_REPLY_AT = new Date(Date.now() - 10_000).toISOString();
+  const STREAM_AT = new Date(Date.now() - 15_000).toISOString();
   // The durable reply the poll eventually delivers. Its `created_at` is NEWER
   // than every streamed delta's `ts`, which is what retires the preview.
   const durableReply = () => makeMsg({
@@ -2804,7 +2811,8 @@ describe('MessagesPanel live strategist streaming', () => {
 
     await waitFor(() => expect(el.textContent).toContain('The durable strategist reply.'));
     const settledStatus = el.querySelector('[data-testid="conversation-workday-status"]');
-    expect(settledStatus).toHaveTextContent('Workday off');
-    expect(settledStatus).not.toHaveAttribute('data-chat-live-phase');
+    expect(settledStatus).toHaveTextContent('Chat ready');
+    expect(settledStatus).toHaveAttribute('data-chat-live-phase', 'idle');
+    expect(settledStatus).not.toHaveTextContent('Workday off');
   });
 });

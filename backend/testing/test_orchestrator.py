@@ -10,6 +10,7 @@ Tests three areas:
 import os
 
 import asyncio
+import itertools
 import pytest
 import json
 import uuid
@@ -37,6 +38,38 @@ from app.models import Project, Task, TaskStatus, MaxPlanAccount
 from testing.factories import make_project, make_task
 
 _TEST_USER = "test-user-123"
+
+# ── Runner-entry contract for dispatch scaffolding ───────────────────────────
+# The orchestrator refuses to PLACE a `fix`/`review` task whose payload cannot
+# clear the agent's entry checks (#17936): `handleFix` throws
+# `branch is required` / `Invalid pr_number` on its first line of real work
+# (agent/src/handlers/review-fix.ts), so such a task provisions a VM only to
+# die. Production never produces one -- every fix/review spawn site
+# (auto_review, review_pipeline x3, warm_pool_maintainer) sets branch,
+# pr_number and prompt.
+#
+# The dispatch-pipeline tests below are about PLACEMENT -- VM caps, zone
+# gating, warm-pin continuity, pool leases, execution resources -- and treat
+# the payload as inert scaffolding. Scaffolding that omits these fields is
+# asserting that a task which can never run gets placed anyway, so it must
+# carry them. Nothing in these tests asserts on either value; they exist only
+# to make the fixture a task production could actually have created.
+_DISPATCHABLE_BRANCH = "blueprint/task-dispatch"
+_dispatchable_pr_seq = itertools.count(4242)
+
+
+def _next_dispatchable_pr() -> int:
+    """A DISTINCT PR number per scaffolded fix/review payload.
+
+    ``filter_pipeline_duplicates`` groups active pipeline tasks by
+    ``(project_id, pr_number, task_type)`` and CANCELS every loser but one, so
+    two scaffolded ``fix`` tasks sharing a PR number inside one project are a
+    duplicate pair by production's own definition -- the thing spawn-time dedup
+    exists to guarantee never happens. Handing out a fresh number keeps every
+    fixture a task production could have created. Nothing asserts on the value.
+    """
+
+    return next(_dispatchable_pr_seq)
 
 
 async def _handle_research_completion(task, logs, session, **kwargs):
@@ -976,6 +1009,112 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
         {project_id: [incapable]}, project_id, "salvage_bundle", None, {}
     )
     assert legacy is not None and legacy.id == incapable.id
+
+
+def test_select_eligible_runner_excludes_proven_python_runtime_failure():
+    """An imageless compute job must not re-pin to a host with no interpreter.
+
+    Compute placement is PRE-PINNED via ``runner_target_id`` with a stable
+    per-task ``dispatch_seed``, and a job that self-fails never records a
+    DECLINE — so without this gate every budget-exempt retry of a
+    provisioning-failed job lands on the same incapable box forever.
+    """
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+    proven_unfit = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "python_runtime": {
+                "usable": False,
+                "reason": "python3 -m venv failed and uv is not installed",
+            },
+            "python_runtime_usable": False,
+        },
+    )
+    capable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "python_runtime": {"usable": True, "provisioner": "venv"},
+            "python_runtime_usable": True,
+        },
+    )
+
+    selected = _select_eligible_runner(
+        {project_id: [proven_unfit, capable]},
+        project_id,
+        "compute_experiment",
+        None,
+        {},
+    )
+    assert selected is not None and selected.id == capable.id
+
+    # Alone, the proven-unfit runner is no candidate at all: the job holds for
+    # a host that can actually provision, or falls through to cloud dispatch.
+    assert (
+        _select_eligible_runner(
+            {project_id: [proven_unfit]},
+            project_id,
+            "compute_experiment",
+            None,
+            {},
+        )
+        is None
+    )
+
+
+def test_python_runtime_gate_excludes_only_on_proof():
+    """Fail-OPEN by construction: only proof excludes, nothing else.
+
+    The runner computes the flat ``python_runtime_usable`` bool as
+    ``bool((report or {}).get("usable"))``, so a host whose boot-time
+    provisioner thread has not published yet advertises ``False`` while being
+    perfectly capable. A gate that read that bit would empty the candidate pool
+    of a healthy fleet every time it restarted.
+    """
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+
+    def _pick(caps, task_type="compute_experiment", **kwargs):
+        runner = RunnerDispatchSnapshot(
+            id=uuid.uuid4(), project_id=project_id, capabilities=caps
+        )
+        return _select_eligible_runner(
+            {project_id: [runner]}, project_id, task_type, None, {}, **kwargs
+        )
+
+    # Older runner: no evidence at all -> unknown -> eligible.
+    assert _pick({"task_types": "all"}) is not None
+    # Boot window: flat bit False, nested report not published yet -> eligible.
+    assert _pick({"task_types": "all", "python_runtime_usable": False}) is not None
+    # Unreadable verdict -> unknown, never coerced into an exclusion.
+    assert _pick({"task_types": "all", "python_runtime": {"usable": None}}) is not None
+    assert _pick({"task_types": "all", "python_runtime": "broken"}) is not None
+
+    # And the gate is scoped: the interpreter guarantee in local_runner.py runs
+    # only on the bwrap path, so a container-image job (which ships its own
+    # Python) and non-compute work are not gated by it at all.
+    unfit = {
+        "task_types": "all",
+        "isolation_backends": {"docker_usable": True},
+        "container_images_present": ["repo/img:tag"],
+        "disk_free_bytes": 500 * 1024**3,
+        "workspace_free_bytes": 500 * 1024**3,
+        "python_runtime": {"usable": False, "reason": "no python3 on PATH"},
+    }
+    assert _pick(unfit, container_image="repo/img:tag") is not None
+    assert _pick(unfit, task_type="create") is not None
 
 
 @pytest.mark.asyncio
@@ -8638,7 +8777,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": target_vm,
                     "warm_target_pr": "1234",
@@ -8708,7 +8854,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": target_vm,
                     "warm_target_pr": "5555",
@@ -8783,7 +8936,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": target_vm,
                     "warm_target_pr": "9999",
@@ -8874,7 +9034,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": target_vm,
                     "warm_target_pr": "1234",
@@ -9330,7 +9497,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 title="fix(size): attribute merge cap breaches",
                 status=TaskStatus.COMPLETED,
-                payloads=[{"type": "fix", "prompt": "prereq"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "prereq",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
             )
             session.add(prereq)
             await session.commit()
@@ -9450,7 +9624,14 @@ class TestWarmVMSkipProvision:
         task = make_task(
             project_id=project.id,
             status=TaskStatus.EVALUATING,
-            payloads=[{"type": "review", "pr_number": 123, "base_branch": "release"}],
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 123,
+                    "base_branch": "release",
+                    "branch": _DISPATCHABLE_BRANCH,
+                }
+            ],
             context={
                 "review_loop": {
                     "pr_number": 123,
@@ -9588,7 +9769,14 @@ class TestWarmVMSkipProvision:
                 task = make_task(
                     project_id=project.id,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     retry_after_until=self._naive_utcnow()
                     + timedelta(minutes=5),
@@ -9689,7 +9877,14 @@ class TestWarmVMSkipProvision:
                     # the clear branch must reset it.
                     vm_instance_id=target_vm,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={
                         "warm_target_vm_id": target_vm,
                         "warm_handoff_deadline": deadline,
@@ -9913,7 +10108,14 @@ class TestWarmVMSkipProvision:
                 # agent_status stamps the held VM id onto vm_instance_id
                 vm_instance_id=parked_vm,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": parked_vm,
                     "warm_handoff_deadline": deadline,
@@ -9988,7 +10190,14 @@ class TestWarmVMSkipProvision:
                 project_id=project.id,
                 vm_instance_id=parked_vm,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={
                     "warm_target_vm_id": parked_vm,
                     "warm_handoff_deadline": expired,
@@ -10074,7 +10283,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     # Sticky blacklist must flow into excluded_account_ids.
                     context={"provision_failed_accounts": ["acct-dead"]},
                 )
@@ -10151,7 +10367,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -10216,7 +10439,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -10299,7 +10529,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -10381,7 +10618,14 @@ class TestWarmVMSkipProvision:
                     make_task(
                         project_id=capped.id,
                         status=TaskStatus.IN_PROGRESS,
-                        payloads=[{"type": "fix", "prompt": "active"}],
+                        payloads=[
+                            {
+                                "type": "fix",
+                                "prompt": "active",
+                                "branch": _DISPATCHABLE_BRANCH,
+                                "pr_number": _next_dispatchable_pr(),
+                            }
+                        ],
                         created_at=now - timedelta(minutes=10),
                     )
                 )
@@ -10389,7 +10633,14 @@ class TestWarmVMSkipProvision:
                     project_id=capped.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "wait",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     created_at=now - timedelta(minutes=5),
                 )
@@ -10397,7 +10648,14 @@ class TestWarmVMSkipProvision:
                     project_id=open_project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "dispatch"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "dispatch",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     created_at=now - timedelta(minutes=4),
                 )
@@ -10427,6 +10685,151 @@ class TestWarmVMSkipProvision:
             assert capped_row.status == TaskStatus.QUEUED
             assert "project VM capacity" in (capped_row.latest_status_message or "")
             assert open_row.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_malformed_payload_never_preempts_a_reversible_deferral(
+        self, orch_warm_db, mocker
+    ):
+        """ORDERING GUARD: a TERMINAL verdict must never outrank a REVERSIBLE one.
+
+        The malformed-payload gate (#17936) fails a task whose payload can never
+        clear the agent's entry checks. That verdict is terminal, and
+        ``MALFORMED_TASK_PAYLOAD`` sits outside ``INFRA_CLASSES``, so the
+        reaper's resurrection sweep can never bring the row back.
+
+        #17936 first ran that gate as a pre-ranking bulk filter -- ahead of the
+        slot budget, the row lock, the approval flag, the capability fence and
+        the per-project VM-cap / spend-ceiling / monthly-budget deferral, and
+        applied to every scanned candidate rather than only the rows actually
+        being placed. That ordering converts "wait your turn" into "permanently
+        dead", and lets one false positive in a hand-mirrored copy of the
+        agent's TypeScript entry checks terminalize a whole queue in one cycle.
+
+        Pinned directly here rather than as a side effect of some other test:
+        the SAME row must come out QUEUED while its project is at its VM cap,
+        and FAILED once the cap frees and the orchestrator genuinely tries to
+        place it. Both halves matter -- the second is what stops the gate from
+        being quietly neutered into a no-op."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+        from app.failure_classification import MALFORMED_TASK_PAYLOAD
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Capped With Malformed Queue",
+                    user_id=_TEST_USER,
+                    build_config={"resource_envelope": {"max_concurrent_vms": 1}},
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                now = self._naive_utcnow()
+                active = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.IN_PROGRESS,
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "holds the only slot",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
+                    created_at=now - timedelta(minutes=10),
+                )
+                # No branch, no pr_number: the exact shape the gate exists for.
+                malformed = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "unrunnable"}],
+                    context={},
+                    created_at=now - timedelta(minutes=5),
+                )
+                session.add_all([active, malformed])
+                await session.commit()
+                await session.refresh(active)
+                await session.refresh(malformed)
+                active_id = active.id
+                malformed_id = malformed.id
+
+            await self._run_one_cycle(mocker)
+
+            async with orch_warm_db() as verify:
+                row = (
+                    (await verify.execute(_select(Task).where(Task.id == malformed_id)))
+                    .scalars()
+                    .one()
+                )
+                assert row.status == TaskStatus.QUEUED, (
+                    "a malformed payload sitting behind a project VM cap must be "
+                    f"DEFERRED, not terminalized -- got {row.status}. The cap says "
+                    "'not now'; only the gate that runs when the task is actually "
+                    "being placed may say 'never'."
+                )
+                assert MALFORMED_TASK_PAYLOAD not in (
+                    row.latest_status_message or ""
+                ), (
+                    "the terminal verdict leaked into a cycle where the task was "
+                    f"never placed: {row.latest_status_message!r}"
+                )
+                assert "project VM capacity" in (row.latest_status_message or "")
+
+            # Free the cap: the same row is now genuinely next to be placed.
+            async with orch_warm_db() as session:
+                active_row = (
+                    (await session.execute(_select(Task).where(Task.id == active_id)))
+                    .scalars()
+                    .one()
+                )
+                active_row.status = TaskStatus.COMPLETED
+                session.add(active_row)
+                await session.commit()
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == malformed_id)))
+                .scalars()
+                .one()
+            )
+            assert row.status == TaskStatus.FAILED, (
+                "with the cap freed the orchestrator does try to place this row, so "
+                "a payload that can never clear the agent's entry checks must be "
+                f"failed BEFORE a VM is spent -- got {row.status}"
+            )
+            assert MALFORMED_TASK_PAYLOAD in (row.latest_status_message or "")
+            assert "branch is required" in (row.latest_status_message or "")
 
     @pytest.mark.asyncio
     async def test_resident_session_task_excluded_from_project_vm_cap(
@@ -10500,7 +10903,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "should dispatch"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "should dispatch",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     created_at=now - timedelta(minutes=5),
                 )
@@ -10583,7 +10993,14 @@ class TestWarmVMSkipProvision:
                     make_task(
                         project_id=project.id,
                         status=TaskStatus.IN_PROGRESS,
-                        payloads=[{"type": "fix", "prompt": "active"}],
+                        payloads=[
+                            {
+                                "type": "fix",
+                                "prompt": "active",
+                                "branch": _DISPATCHABLE_BRANCH,
+                                "pr_number": _next_dispatchable_pr(),
+                            }
+                        ],
                         context={},
                         created_at=now - timedelta(minutes=10),
                     )
@@ -10592,7 +11009,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "should stay queued"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "should stay queued",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                     created_at=now - timedelta(minutes=5),
                 )
@@ -10673,7 +11097,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "wait",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(queued)
@@ -10748,7 +11179,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "wait",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(queued)
@@ -10815,7 +11253,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "dispatch"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "dispatch",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(queued)
@@ -10875,7 +11320,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -10976,7 +11428,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -11054,7 +11513,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -11142,7 +11608,14 @@ class TestWarmVMSkipProvision:
                     project_id=project.id,
                     vm_instance_id=None,
                     status=TaskStatus.QUEUED,
-                    payloads=[{"type": "fix", "prompt": "x"}],
+                    payloads=[
+                        {
+                            "type": "fix",
+                            "prompt": "x",
+                            "branch": _DISPATCHABLE_BRANCH,
+                            "pr_number": _next_dispatchable_pr(),
+                        }
+                    ],
                     context={},
                 )
                 session.add(task)
@@ -14367,7 +14840,14 @@ class TestDispatchCrashContainment:
                 project_id=project.id,
                 status=TaskStatus.QUEUED,
                 vm_instance_id=None,
-                payloads=[{"type": "review", "prompt": "healthy review task"}],
+                payloads=[
+                    {
+                        "type": "review",
+                        "prompt": "healthy review task",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={"_dispatch_prep_failures": threshold - 1},
             )
             session.add(contended)
@@ -16159,6 +16639,360 @@ async def test_forced_runner_gpu_in_container_hold_names_probe_blocker(
     assert "verified GPU passthrough probe" in message
 
 
+# ── The environment contract applies to ALL of a project's compute ──────────
+#
+# A project that declares a compute image means it for every job, not only its
+# GPU jobs. Image resolution used to be gated on `accelerator`, and since the
+# large majority of compute_experiment jobs declare none, most of them skipped
+# the contract entirely and ran as a bare `bash -lc` against whatever toolchain
+# the claiming host happened to have — the source of the "no working pip found"
+# / exit-127 / exit-126 failures in the production corpus.
+
+
+async def _dispatched_container_image(
+    db_session,
+    mocker,
+    *,
+    payload,
+    pinned_image,
+    image_error=None,
+    initial_context=None,
+):
+    """Dispatch one compute_experiment and return the ComputeJob's container_image.
+
+    Stubs the strict project-image resolver so the test pins the DISPATCH
+    decision (does the contract apply to this job?) rather than re-testing the
+    resolver, which owns its own fail-closed proofs in
+    test_compute_experiment_spawn.py.
+    """
+    from app import compute_backends
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+    from app.models import ComputeJob
+    from sqlalchemy import select
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="EnvContractProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    async def _resolved(*_args, **_kwargs):
+        return pinned_image, image_error
+
+    mocker.patch.object(
+        compute_backends, "resolve_project_baked_image_strict", _resolved
+    )
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[payload],
+        context=dict(initial_context or {}),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+    # Re-read the row before any caller asserts on `task.context`. `Task.context`
+    # is a plain JSONB column, NOT `MutableDict.as_mutable`, so an in-place
+    # mutation is invisible to the unit of work and never reaches the database.
+    # Asserting against the in-memory dict would therefore pass identically
+    # whether the stamp was PERSISTED or merely assigned to an attribute
+    # SQLAlchemy never flushed — the two outcomes the fallback-stamp tests below
+    # exist to tell apart. Same idiom as the forced-runner hold test above.
+    await db_session.refresh(task)
+
+    jobs = (
+        (await db_session.execute(select(ComputeJob).where(ComputeJob.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    # The launch image is a durable launch input on polling_metadata, not a
+    # column — this is the same key the runner-dispatch body and the resume
+    # rehydration read (`meta["container_image"]`).
+    images = [(j.polling_metadata or {}).get("container_image") for j in jobs]
+    return task, jobs, images
+
+
+@pytest.mark.asyncio
+async def test_cpu_only_experiment_gets_the_project_image(db_session, mocker):
+    """No accelerator, no payload image → still resolves the project's image.
+
+    This is the whole environment contract. Gating it on `accelerator` meant a
+    CPU-only training run got no image and no reproducible toolchain, which is
+    exactly the class of job the contract exists for.
+    """
+    pinned = "registry.example.com/proj@sha256:" + "a" * 64
+    _task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image=pinned,
+    )
+    assert len(jobs) == 1, f"expected one ComputeJob, got {len(jobs)}"
+    assert images[0] == pinned, (
+        "a compute_experiment that declared no accelerator must still run inside "
+        f"the project's declared image, got {images[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_payload_image_is_not_overridden(db_session, mocker):
+    """An explicit container_image in the payload wins over the project default.
+
+    Ungating the resolver must not turn the project image into an override: a
+    task that names its own image is making a deliberate choice.
+    """
+    explicit = "nvcr.io/nvidia/pytorch:25.01-py3"
+    _task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+            "container_image": explicit,
+        },
+        pinned_image="registry.example.com/proj@sha256:" + "b" * 64,
+    )
+    assert len(jobs) == 1
+    assert images[0] == explicit
+
+
+@pytest.mark.asyncio
+async def test_project_with_no_image_still_dispatches_image_less(db_session, mocker):
+    """A project that declares no image keeps today's image-less behaviour.
+
+    Ungating the resolver means it now runs for CPU-only jobs, which is a code
+    path it never ran on. `resolve_project_baked_image_strict` returns
+    ``(None, None)`` for a project with no declared image, and that must stay a
+    normal dispatch — not a new failure mode for every project that has not
+    adopted a compute image.
+    """
+    task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image=None,
+    )
+    assert len(jobs) == 1, "a project with no declared image must still dispatch"
+    assert images[0] is None, (
+        f"expected no image, got {images[0]!r} — a project that declared nothing "
+        "must not acquire an image at dispatch"
+    )
+    # ...but "keeps dispatching" must not mean "keeps doing it silently". This
+    # was the ONE fully silent branch: no failure, no warning, no record — and
+    # the branch essentially every job takes in a project with no
+    # `.blueprint/tools.json` compute.image. The launch is now attributable.
+    #
+    # The key and reason code are pinned as LITERALS on purpose: the operator
+    # query (`context->'compute_host_toolchain_fallback'`) IS the contract, so
+    # asserting against the constants that define it would certify itself.
+    stamp = (task.context or {}).get("compute_host_toolchain_fallback")
+    assert stamp is not None, (
+        "an image-less launch must be attributable on the task, not only a log "
+        f"line nobody reads; task.context was {task.context!r}"
+    )
+    assert stamp["reason_code"] == "no_project_compute_image", (
+        "a project that declares no compute.image must be distinguishable from "
+        f"one whose declared image failed to resolve; got {stamp['reason_code']!r}"
+    )
+    assert stamp["accelerator_declared"] is False
+    assert stamp["detail"], "the stamp must say WHY, not just that it happened"
+
+
+@pytest.mark.asyncio
+async def test_cpu_only_experiment_degrades_when_the_image_is_unresolvable(
+    db_session, mocker
+):
+    """A payload that asked for NO accelerator launches image-less when the
+    project's declared image does not resolve. It is not terminal-failed.
+
+    Applying the environment contract to every job means the resolver now runs
+    for jobs that never asked for an image, so its FAILURE direction decides how
+    much blast radius the ungate has. The commonest reason a declared image does
+    not resolve is that it has not been built yet -- transient project state.
+    Failing closed there would convert a pending build into an outage for every
+    CPU-only job in the project: a new kill class, traded for a contract those
+    jobs never invoked.
+
+    A payload that DID declare an accelerator still fails closed, because it
+    cannot run meaningfully without the image it asked for -- see
+    test_dispatch_fails_closed_when_baked_image_declared_but_no_build_record.
+    """
+    task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image=None,
+        image_error="declared build recipe has no digest-pinned build record",
+    )
+    assert len(jobs) == 1, (
+        "a bare payload must still launch when the project image is "
+        f"unresolvable; got {len(jobs)} job(s) and task status {task.status}"
+    )
+    assert task.status != TaskStatus.FAILED, (
+        "an unresolvable project image must not terminal-fail a job that never "
+        f"asked for an image; got {task.status}"
+    )
+    assert images[0] is None, (
+        "an unresolvable image must degrade to image-less, not attach a "
+        f"half-resolved reference; got {images[0]!r}"
+    )
+    # Degrading is the right CALL; degrading invisibly is not. A project that
+    # HAS a contract and is not applying it is strictly more alarming than one
+    # with no contract, so the two must not collapse into a single reason code.
+    stamp = (task.context or {}).get("compute_host_toolchain_fallback")
+    assert stamp is not None, (
+        "a degraded launch must be attributable on the task; task.context was "
+        f"{task.context!r}"
+    )
+    assert stamp["reason_code"] == "project_compute_image_unresolvable", (
+        "a declared-but-unresolvable image must not be reported as 'no image "
+        f"declared'; got {stamp['reason_code']!r}"
+    )
+    assert "digest-pinned build record" in stamp["detail"], (
+        "the resolver's own reason must survive onto the task so an operator "
+        f"can act on it; got {stamp['detail']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_contracted_launch_records_no_host_toolchain_fallback(
+    db_session, mocker
+):
+    """A job that DID launch under the project image carries no fallback stamp.
+
+    The stamp is only worth querying if its presence means something.
+    """
+    task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image="registry.example.com/proj@sha256:" + "c" * 64,
+    )
+    assert len(jobs) == 1
+    assert images[0] is not None
+    assert "compute_host_toolchain_fallback" not in (task.context or {}), (
+        "a job that launched inside the project's image must not be reported as "
+        f"a host-toolchain fallback; task.context was {task.context!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_toolchain_stamp_is_cleared_once_an_image_resolves(
+    db_session, mocker
+):
+    """A retry that now resolves an image clears the earlier fallback stamp.
+
+    Without this the stamp is a one-way latch: a project that adopts a compute
+    image (or whose pending build finally lands) would keep answering an
+    operator query with a claim that stopped being true, and the degrade census
+    could only ever grow.
+    """
+    stale = {
+        "reason_code": "no_project_compute_image",
+        "detail": "project declares no compute.image",
+        "accelerator_declared": False,
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+    }
+    task, jobs, images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image="registry.example.com/proj@sha256:" + "d" * 64,
+        initial_context={"compute_host_toolchain_fallback": stale},
+    )
+    assert len(jobs) == 1
+    assert images[0] is not None
+    assert "compute_host_toolchain_fallback" not in (task.context or {}), (
+        "a launch that DID get an image must clear the earlier fallback stamp; "
+        f"task.context was {task.context!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_toolchain_stamp_is_not_rewritten_when_unchanged(
+    db_session, mocker
+):
+    """Re-dispatching an unchanged degrade does not churn the task row.
+
+    ``recorded_at`` is volatile, so a naive full-record comparison would rewrite
+    task.context every cycle a job re-dispatches under the same condition — the
+    churn `_pin_hold_stable_key` already avoids for the strict-pin hold. Only
+    the reason code and detail decide whether the stamp is rewritten.
+    """
+    prior = {
+        "reason_code": "no_project_compute_image",
+        "detail": (
+            "project declares no compute.image in .blueprint/tools.json; the "
+            "command runs against whatever toolchain the claiming host has"
+        ),
+        "accelerator_declared": False,
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+    }
+    task, jobs, _images = await _dispatched_container_image(
+        db_session,
+        mocker,
+        payload={
+            "type": "compute_experiment",
+            "command": "python3 train.py",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 1800,
+        },
+        pinned_image=None,
+        initial_context={"compute_host_toolchain_fallback": dict(prior)},
+    )
+    assert len(jobs) == 1
+    stamp = (task.context or {}).get("compute_host_toolchain_fallback")
+    assert stamp == prior, (
+        "an unchanged fallback condition must leave the existing stamp alone, "
+        f"including its original recorded_at; got {stamp!r}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_gpu_in_container_hold_fires_for_vram_only_no_accelerator(
     db_session, mocker
@@ -16512,12 +17346,10 @@ async def test_dispatch_defaults_project_baked_image_when_payload_has_none(
     Closes the images-first USE-default gap on the dispatch path: experiments
     that never went through the plan/research completion authors (operator
     experiments, planned prerequisites, retries) previously ran image-less on the
-    host toolchain, unreproducibly. This default only applies when the payload
+    host toolchain, unreproducibly. The default applies whether or not the payload
     declares an accelerator — see
-    test_dispatch_bare_payload_stays_image_less_even_with_baked_record for the
-    no-accelerator case, which must NOT inherit a default image (that would arm
-    the runner's fatal GPU-arch pre-flight for a task that never asked for a
-    GPU).
+    test_dispatch_bare_payload_inherits_the_project_baked_image for the
+    no-accelerator case.
     """
     from types import SimpleNamespace
     from app.orchestrator_runner_dispatch import (
@@ -16627,19 +17459,33 @@ async def test_dispatch_defaults_project_baked_image_when_payload_has_none(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_bare_payload_stays_image_less_even_with_baked_record(
+async def test_dispatch_bare_payload_inherits_the_project_baked_image(
     db_session, mocker
 ):
-    """A compute_experiment dispatched with NEITHER accelerator NOR
-    container_image must run bare: no default image attached, even though the
-    project has a resolvable digest-pinned baked image record.
+    """A bare payload (no accelerator, no container_image) DOES inherit the
+    project's digest-pinned baked image.
 
-    Root-fix regression test for the NeurIPS-fleet outage (task 52684be0 and 11
-    others): attaching a default image to an accelerator-less task arms the
-    runner's fatal GPU-arch pre-flight (``assigned_gpus and (accelerator_type or
-    container_image)``) on GPU hosts, aborting CPU-only jobs whose incidentally
-    attached image doesn't support the host's GPU arch. The strict resolver must
-    not even be consulted for a bare payload.
+    This test previously asserted the opposite, as the regression guard for the
+    NeurIPS-fleet outage (task 52684be0 and 11 others): attaching a default
+    image to an accelerator-less task armed the runner's then-fatal GPU-arch
+    pre-flight (``assigned_gpus and (accelerator_type or container_image)``) on
+    GPU hosts, aborting CPU-only jobs whose incidentally attached image did not
+    support the host's arch.
+
+    Withholding the image was a workaround at the wrong layer. It bought outage
+    safety by denying the environment contract to the large majority of
+    compute_experiment jobs -- the ones that declare no accelerator -- which is
+    why those jobs ran as a bare ``bash -lc`` against the host toolchain and
+    produced the corpus's ``no working pip found`` / exit-127 / exit-126
+    failures.
+
+    The kill is now fixed where it lives. A job that declared no accelerator
+    and hits a conclusive arch mismatch RELEASES the device and re-plans
+    CPU-only instead of aborting, so an incidentally attached image can no
+    longer end it. The outage itself is still guarded, by a test that
+    reproduces the actual mechanism rather than avoiding it:
+    ``scripts/test_local_runner.py::TestRunComputeJob::
+    test_cpu_only_job_drops_an_unusable_gpu_and_runs``.
     """
     from types import SimpleNamespace
     from app.orchestrator_runner_dispatch import (
@@ -16712,7 +17558,117 @@ async def test_dispatch_bare_payload_stays_image_less_even_with_baked_record(
     await db_session.commit()
     await db_session.refresh(task)
 
-    # No isolation_backends capability needed — the job must not require one.
+    # The runner IS container-capable. That is now a REQUIREMENT rather than a
+    # detail: an inherited image gates runner eligibility exactly as a declared
+    # one does, so this job no longer routes to a runner with no isolation
+    # backend. See test_inherited_image_gates_on_container_capability for the
+    # other side of that.
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "launched", f"expected 'launched', got {result!r}"
+    assert (
+        captured.get("container_image")
+        == "reg.example.com/org/repo/compute-proj@sha256:deadbeefcafe"
+    ), (
+        "a bare payload must inherit the project's digest-pinned baked image — "
+        "the environment contract is not conditional on asking for a GPU; got "
+        f"{captured.get('container_image')!r}"
+    )
+    manifest_spy.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_inherited_image_gates_on_container_capability(db_session, mocker):
+    """A job that inherits the project image is held when no runner can run a
+    container — and the hold says the image was INHERITED, not declared.
+
+    This is the routing consequence of applying the environment contract to
+    every job, and it is disclosed rather than hidden: a payload that names no
+    image now needs a container-capable runner. Holding is the honest outcome.
+    Degrading to a bare ``bash -lc`` because the fleet is short a runtime would
+    silently reinstate the unreproducible host-toolchain execution this change
+    exists to end, and it would do so in exactly the situation an operator most
+    needs to see.
+
+    The reason string carries the provenance because the operator reading it
+    would otherwise go looking for a ``container_image`` in a payload that does
+    not contain one.
+    """
+    from types import SimpleNamespace
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+    from app.models import ProjectComputeImage
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="InheritedImageHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-inherit",
+            tag="latest",
+            pinned_ref="reg.example.com/org/repo/compute-proj@sha256:deadbeefcafe",
+            digest="sha256:deadbeefcafe",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {
+                    "name": "reg.example.com/org/repo/compute-proj:latest",
+                    "build": {"dockerfile": "Dockerfile"},
+                }
+            }
+        },
+    )
+    mocker.patch(
+        "app.compute_jobs.create_compute_job",
+        new=AsyncMock(
+            side_effect=AssertionError("must not launch without a container runtime")
+        ),
+    )
+    mocker.patch("app.task_lifecycle.park_task", new_callable=AsyncMock)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python analyze.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
     runner = RunnerDispatchSnapshot(
         id=uuid.uuid4(),
         project_id=project.id,
@@ -16723,12 +17679,16 @@ async def test_dispatch_bare_payload_stays_image_less_even_with_baked_record(
         db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
     )
 
-    assert result == "launched", f"expected 'launched', got {result!r}"
-    assert "container_image" not in captured, (
-        "a bare payload (no accelerator, no container_image) must never inherit "
-        f"the project default image; got {captured.get('container_image')!r}"
+    assert result == "held", f"expected 'held', got {result!r}"
+    msg = task.latest_status_message or ""
+    assert "the payload declared none" in msg, (
+        "the hold must say the image was inherited from the project contract, "
+        f"not that the job declared it; got {msg!r}"
     )
-    manifest_spy.assert_not_called()
+    assert "job declares container_image" not in msg, (
+        "a payload that names no image must not be described as declaring one; "
+        f"got {msg!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -17003,14 +17963,23 @@ async def test_dispatch_fails_closed_when_baked_image_declared_but_no_build_reco
 async def test_dispatch_bare_payload_does_not_fail_closed_on_unresolvable_baked_image(
     db_session, mocker
 ):
-    """A bare payload (no accelerator, no container_image) must NOT be
-    terminal-failed by the strict baked-image resolver, even when the project
-    declares an unresolvable build recipe. The resolver must not be consulted
-    at all for a task that never asked for an image — it must launch bare.
+    """A bare payload is never terminal-failed by the strict baked-image
+    resolver, even when the project declares an unresolvable build recipe. It
+    launches image-less.
 
-    This is the direct fix for the class of outage this defect caused: a
-    CPU-only compute_experiment (no accelerator declared) must never be blocked
-    or mis-armed by the project's GPU/image manifest state.
+    The resolver IS now consulted for a bare payload — that is the environment
+    contract, and when the image resolves the job gets it (see
+    test_dispatch_bare_payload_inherits_the_project_baked_image). What must not
+    change is the FAILURE direction. The commonest reason a declared image does
+    not resolve is that it has not been built yet, as this test's
+    ``not-built-yet`` fixture says out loud, and that window is transient
+    project state. Terminal-failing every CPU-only job in the project because a
+    build is pending would turn ordinary project state into an outage for work
+    that never asked for an image.
+
+    Fail-closed still applies to a payload that DID declare an accelerator —
+    see test_dispatch_fails_closed_when_baked_image_declared_but_no_build_record
+    — because that job cannot run meaningfully without the image it asked for.
     """
     from app.orchestrator_runner_dispatch import (
         _dispatch_compute_experiment_directly,
@@ -17081,8 +18050,11 @@ async def test_dispatch_bare_payload_does_not_fail_closed_on_unresolvable_baked_
         "a bare payload must launch image-less, never terminal-fail on an "
         f"unresolvable project default; got {result!r}"
     )
-    assert "container_image" not in captured
-    manifest_spy.assert_not_called()
+    assert "container_image" not in captured, (
+        "an unresolvable image must degrade to image-less, not attach a "
+        f"half-resolved reference; got {captured.get('container_image')!r}"
+    )
+    manifest_spy.assert_called()
 
 
 @pytest.mark.asyncio
@@ -17469,7 +18441,14 @@ class TestZoneExhaustionColdProvisionGate:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={},
             )
             session.add(task)
@@ -17518,7 +18497,14 @@ class TestZoneExhaustionColdProvisionGate:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={},
             )
             session.add(task)
@@ -17585,7 +18571,14 @@ class TestZoneExhaustionColdProvisionGate:
                 project_id=project.id,
                 vm_instance_id=None,
                 status=TaskStatus.QUEUED,
-                payloads=[{"type": "fix", "prompt": "x"}],
+                payloads=[
+                    {
+                        "type": "fix",
+                        "prompt": "x",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+                ],
                 context={},
             )
             session.add(task)

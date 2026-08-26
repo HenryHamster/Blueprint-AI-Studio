@@ -3,6 +3,7 @@
 import json
 
 import blueprint
+import blueprint_api
 import pytest
 
 
@@ -12,6 +13,41 @@ WINDOW_END = "2026-08-15T00:00:00+00:00"
 BUGGY_REVISION = "4" * 40
 FIXED_REVISION = "5" * 40
 CANDIDATE_DIGEST = "a" * 64
+
+# ``main()`` validates an explicit ``--project-id`` against the catalog before
+# dispatching, so the id has to be resolvable from a mock rather than from the
+# host's real credential.
+PROJECT_CATALOG = [
+    {
+        "id": PROJECT_ID,
+        "name": "hermes/fast-claim-project",
+        "github_owner": "hermes",
+        "github_repo": "fast-claim-project",
+        "role": "owner",
+    }
+]
+
+
+def _install_double(monkeypatch, name: str, value) -> None:
+    """Install a test double on BOTH bindings of a ``blueprint_api`` name.
+
+    ``blueprint.py`` does ``from blueprint_api import (...)``, so patching only
+    the ``blueprint`` module leaves ``blueprint_api``'s internal calls --
+    ``main()`` -> ``validate_project_id()`` -> ``list_projects()`` ->
+    ``load_config()``/``api()`` -- bound to the real functions. Those resolved
+    the operator's ambient ``~/.blueprint-config.json`` and made live
+    authenticated requests to the production orchestrator from this unit test.
+    """
+    monkeypatch.setattr(blueprint_api, name, value)
+    monkeypatch.setattr(blueprint, name, value)
+
+
+def _install_project_catalog(monkeypatch) -> None:
+    """Resolve ``--project-id`` from a mock, never from a real credential."""
+    _install_double(monkeypatch, "list_projects", lambda: list(PROJECT_CATALOG))
+    _install_double(
+        monkeypatch, "get_project_id", lambda project_id=None: project_id or PROJECT_ID
+    )
 
 
 def _common_args(mode: str) -> list[str]:
@@ -46,8 +82,9 @@ def _apply_args() -> list[str]:
 
 
 def _operator_config(monkeypatch) -> None:
-    monkeypatch.setattr(
-        blueprint,
+    _install_project_catalog(monkeypatch)
+    _install_double(
+        monkeypatch,
         "load_config",
         lambda: {"api_key": "operator-admin-key", "read_only": False},
     )
@@ -123,8 +160,10 @@ def test_dry_run_posts_only_review_fences_and_emits_json(monkeypatch, capsys):
         calls.append((method, path, body))
         return response
 
-    monkeypatch.setattr(blueprint, "api", fake_api)
-    monkeypatch.setattr(blueprint, "get_project_id", lambda project_id=None: project_id)
+    _install_double(monkeypatch, "api", fake_api)
+    _install_double(
+        monkeypatch, "get_project_id", lambda project_id=None: project_id
+    )
 
     assert blueprint.main([*_common_args("dry-run"), "--json"]) == 0
 
@@ -166,8 +205,10 @@ def test_apply_posts_every_exact_fence_and_renders_receipt(monkeypatch, capsys):
         calls.append((method, path, body))
         return response
 
-    monkeypatch.setattr(blueprint, "api", fake_api)
-    monkeypatch.setattr(blueprint, "get_project_id", lambda project_id=None: project_id)
+    _install_double(monkeypatch, "api", fake_api)
+    _install_double(
+        monkeypatch, "get_project_id", lambda project_id=None: project_id
+    )
 
     assert blueprint.main(_apply_args()) == 0
 
@@ -196,13 +237,14 @@ def test_apply_posts_every_exact_fence_and_renders_receipt(monkeypatch, capsys):
 
 
 def test_read_only_config_fails_before_repair_request(monkeypatch):
-    monkeypatch.setattr(
-        blueprint,
+    _install_project_catalog(monkeypatch)
+    _install_double(
+        monkeypatch,
         "load_config",
         lambda: {"api_key": "agent-jwt", "read_only": True},
     )
-    monkeypatch.setattr(
-        blueprint,
+    _install_double(
+        monkeypatch,
         "api",
         lambda *_args, **_kwargs: pytest.fail("repair endpoint must not be called"),
     )
@@ -215,8 +257,9 @@ def test_read_only_config_fails_before_repair_request(monkeypatch):
 
 def test_project_operator_is_denied_before_repair_endpoint(monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        blueprint,
+    _install_project_catalog(monkeypatch)
+    _install_double(
+        monkeypatch,
         "load_config",
         lambda: {"api_key": "bpsc_project_operator", "read_only": False},
     )
@@ -228,7 +271,7 @@ def test_project_operator_is_denied_before_repair_endpoint(monkeypatch):
             return {"credential": {"scopes": ["project-operator"]}}
         pytest.fail("owner-only repair endpoint must not be called")
 
-    monkeypatch.setattr(blueprint, "api", fake_api)
+    _install_double(monkeypatch, "api", fake_api)
 
     assert blueprint.main(_common_args("dry-run")) == 1
     assert calls == [("GET", "/api/agent-access/v1/me", None)]

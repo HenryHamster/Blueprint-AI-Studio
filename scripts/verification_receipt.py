@@ -33,6 +33,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from utf8_io import force_utf8_streams
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
+
 RECEIPT_VERSION = 1
 
 # Where ./check and the generated gate both put the sidecar.
@@ -411,6 +419,38 @@ def record_backend_pytest(
     )
 
 
+def record_backend_pytest_diagnosis(
+    *,
+    receipt: Path,
+    task_id: str,
+    directory: str,
+    state: str,
+    reason: str,
+    current_exit_code: int = 1,
+) -> bool:
+    """Record a blocking backend pre-guard diagnosis without a test report.
+
+    The backend lane can fail before it has a selector roster or JUnit report.
+    Keep that diagnosis in the same lane protocol, with all four attribution
+    maps present and a blocking marker that can never be mistaken for a pass
+    credential.  This is deliberately additive to ``record_backend_pytest``;
+    callers with a completed run continue to use the legacy top-level block.
+    """
+
+    return record_lane(
+        LANE_BACKEND_PYTEST,
+        state=state,
+        blocking=True,
+        extra={
+            "task_id": task_id,
+            "directory": directory,
+            "error": reason,
+            "current_exit_code": int(current_exit_code),
+        },
+        receipt_path=receipt,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Multi-lane projection into the PR body and the durable publication receipt
 # ---------------------------------------------------------------------------
@@ -587,8 +627,13 @@ def project_attribution_command(gate: Path, receipt: Path) -> int:
         if not isinstance(gate_payload, dict):
             return 0
         gate_payload.update(attribution)
+        # newline="": this receipt is parsed downstream by jq and by
+        # agent/src/prompts/pr-helper.ts, so its bytes must not depend on
+        # which host wrote it.
         gate.write_text(
-            json.dumps(gate_payload, separators=(",", ":")) + "\n", encoding="utf-8"
+            json.dumps(gate_payload, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+            newline="",
         )
     except Exception:  # noqa: BLE001 - a receipt never decides a verdict
         return 0
@@ -596,6 +641,7 @@ def project_attribution_command(gate: Path, receipt: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     backend = subparsers.add_parser(
@@ -615,6 +661,16 @@ def main(argv: list[str] | None = None) -> int:
     attribution.add_argument("--attribution")
     attribution.add_argument("--attribution-file", type=Path)
     backend.add_argument("--junit", type=Path, required=True)
+    diagnosis = subparsers.add_parser(
+        "backend-pytest-diagnosis",
+        help="record a blocking backend pre-guard diagnosis",
+    )
+    diagnosis.add_argument("--receipt", type=Path, required=True)
+    diagnosis.add_argument("--task-id", required=True)
+    diagnosis.add_argument("--directory", required=True)
+    diagnosis.add_argument("--state", required=True)
+    diagnosis.add_argument("--reason", required=True)
+    diagnosis.add_argument("--current-exit-code", type=int, default=1)
     render = subparsers.add_parser(
         "render-suppressed",
         help="print the PR-body section naming every lane's suppressed failures",
@@ -632,6 +688,16 @@ def main(argv: list[str] | None = None) -> int:
         return render_suppressed_command(args.receipt)
     if args.command == "project-attribution":
         return project_attribution_command(args.gate, args.receipt)
+    if args.command == "backend-pytest-diagnosis":
+        record_backend_pytest_diagnosis(
+            receipt=args.receipt,
+            task_id=args.task_id,
+            directory=args.directory,
+            state=args.state,
+            reason=args.reason,
+            current_exit_code=args.current_exit_code,
+        )
+        return 0
 
     attribution_json = (
         args.attribution

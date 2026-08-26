@@ -178,7 +178,7 @@ from app.task_locking import (
     with_directions_locked as _with_directions_locked,
     with_vision_locked as _with_vision_locked,
 )
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, utc_iso
 
 router = APIRouter()
 
@@ -609,7 +609,7 @@ async def update_design_doc(
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
 
     meta["revision"] = meta.get("revision", 0) + 1
-    meta["last_updated"] = _utcnow().isoformat()
+    meta["last_updated"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     meta["updated_by_task"] = str(task.id)
     doc["_meta"] = meta
 
@@ -771,7 +771,7 @@ async def update_playbook(
         entry: dict = {
             "content": payload.value,
             "source_task_id": str(task.id),
-            "updated_at": _utcnow().isoformat(),
+            "updated_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             "confirmed_count": existing.get("confirmed_count", 0),
         }
         if payload.applicable_types is not None:
@@ -824,7 +824,7 @@ async def update_playbook(
                 detail=f"Playbook too large ({playbook_total} bytes, max {_PLAYBOOK_CAPACITY_BYTES} bytes) and no evictable entries",
             )
     meta["revision"] = meta.get("revision", 0) + 1
-    meta["last_updated"] = _utcnow().isoformat()
+    meta["last_updated"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     meta["updated_by_task"] = str(task.id)
     doc["_meta"] = meta
 
@@ -1621,7 +1621,7 @@ async def strategic_operation(
         else:
             new_vision = dict(data)
         new_vision["revision"] = (current.get("revision", 0) or 0) + 1
-        new_vision["last_updated"] = _utcnow().isoformat()
+        new_vision["last_updated"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         # Preserve internal tracking fields; reset failure counters on success
         new_vision.update(
             {
@@ -1831,7 +1831,7 @@ async def strategic_operation(
                 [
                     {
                         "text": f"Created by strategic review: {rationale}",
-                        "added_at": _utcnow().isoformat(),
+                        "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     }
                 ]
                 if rationale
@@ -1843,7 +1843,7 @@ async def strategic_operation(
                         "text": (
                             f"Staged to begin after v{staged_for_version} promotes"
                         ),
-                        "added_at": _utcnow().isoformat(),
+                        "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     }
                 ]
                 if staged_create
@@ -1858,7 +1858,7 @@ async def strategic_operation(
                             f"(status={matched.get('status')}) — created on the "
                             "agent's judgment; retire one if redundant."
                         ),
-                        "added_at": _utcnow().isoformat(),
+                        "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     }
                 ]
                 if matched
@@ -1878,7 +1878,7 @@ async def strategic_operation(
                 )
         if staged_create:
             new_dir["staged_for_version"] = staged_for_version
-            new_dir["staged_at"] = _utcnow().isoformat()
+            new_dir["staged_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         if implementation_constraints:
             new_dir["context"]["implementation_constraints"] = (
                 implementation_constraints
@@ -1960,7 +1960,7 @@ async def strategic_operation(
                 new_dir["gap_id"],
                 None,
                 new_status=new_dir.get("status"),
-                now_iso=_utcnow().isoformat(),
+                now_iso=_utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             )
             if _gap_reconcile.get("problem_model") is not None:
                 project.problem_model = _gap_reconcile["problem_model"]
@@ -2061,7 +2061,7 @@ async def strategic_operation(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        now_iso = _utcnow().isoformat()
+        now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         rationale = _cap_str(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
@@ -2193,7 +2193,7 @@ async def strategic_operation(
                     else:
                         d["status"] = changes["status"]
                     if changes["status"] == "superseded":
-                        d["completed_at"] = _utcnow().isoformat()
+                        d["completed_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                         superseded_by = changes.get("superseded_by")
                         if not superseded_by:
                             succ_id = (
@@ -2205,7 +2205,7 @@ async def strategic_operation(
                             if succ_id:
                                 superseded_by = {
                                     "direction_id": str(succ_id),
-                                    "set_at": _utcnow().isoformat(),
+                                    "set_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                                 }
                         if superseded_by:
                             d["superseded_by"] = superseded_by
@@ -2324,7 +2324,7 @@ async def strategic_operation(
                         notes.append(
                             {
                                 "text": note_text,
-                                "added_at": _utcnow().isoformat(),
+                                "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                             }
                         )
                         d["notes"] = _cap_list(
@@ -2480,7 +2480,7 @@ async def strategic_operation(
         rationale = _cap_str(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
-        now_iso = _utcnow().isoformat()
+        now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         ctx = task.context or {}
         directions = list(project.directions or [])
         matched_direction = None
@@ -2637,7 +2637,7 @@ async def strategic_operation(
         rationale = _cap_str(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
-        now_iso = _utcnow().isoformat()
+        now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         directions = list(project.directions or [])
         matched_direction = next(
             (d for d in directions if d.get("id") == dir_id), None
@@ -2805,7 +2805,7 @@ async def strategic_operation(
         _gap_id = target.get("gap_id")
         target["status"] = "staged"
         target["staged_for_version"] = staged_for_version
-        target["staged_at"] = _utcnow().isoformat()
+        target["staged_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         notes = target.get("notes", [])
         notes.append(
             {
@@ -2813,7 +2813,7 @@ async def strategic_operation(
                     f"Staged to begin after v{staged_for_version} promotes"
                     + (f": {rationale}" if rationale else "")
                 ),
-                "added_at": _utcnow().isoformat(),
+                "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             }
         )
         target["notes"] = _cap_list(
@@ -2837,7 +2837,7 @@ async def strategic_operation(
                 _gap_id,
                 new_status="staged",
                 prior_status=_pre_status,
-                now_iso=_utcnow().isoformat(),
+                now_iso=_utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             )
             if _gap_reconcile.get("problem_model") is not None:
                 project.problem_model = _gap_reconcile["problem_model"]
@@ -2927,14 +2927,14 @@ async def strategic_operation(
                 status_code=409,
             )
         target["status"] = "active"
-        target["activated_at"] = _utcnow().isoformat()
+        target["activated_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         notes = target.get("notes", [])
         notes.append(
             {
                 "text": f"Approved by strategic review: {rationale}"
                 if rationale
                 else "Approved by strategic review",
-                "added_at": _utcnow().isoformat(),
+                "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             }
         )
         target["notes"] = _cap_list(
@@ -2943,7 +2943,7 @@ async def strategic_operation(
         if target.get("gap_id"):
             from app.problem_model import reconcile_gap_staffing_raw_result
 
-            now_iso = _utcnow().isoformat()
+            now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
                 dir_id,
@@ -3033,7 +3033,7 @@ async def strategic_operation(
                 "id": target["id"],
                 "text": rejected_text,
                 "status": "rejected",
-                "rejected_at": _utcnow().isoformat(),
+                "rejected_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 "rejected_by": "strategic",
                 **({"rejection_rationale": rationale} if rationale else {}),
             }
@@ -3192,7 +3192,7 @@ async def strategic_operation(
             notes.append(
                 {
                     "text": f"Reactivated by strategic op: {rationale}",
-                    "added_at": _utcnow().isoformat(),
+                    "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 }
             )
             target["notes"] = _cap_list(
@@ -3208,7 +3208,7 @@ async def strategic_operation(
                 _gap_id,
                 new_status="active",
                 prior_status=_pre_status,
-                now_iso=_utcnow().isoformat(),
+                now_iso=_utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
             )
             if _gap_reconcile.get("problem_model") is not None:
                 project.problem_model = _gap_reconcile["problem_model"]
@@ -4679,11 +4679,7 @@ async def strategic_operation(
                         "request_id": str(submission.request.id),
                         "type": spawn_type,
                         "reason": submission.request.admission_reason,
-                        "not_before": (
-                            submission.request.not_before.isoformat()
-                            if submission.request.not_before
-                            else None
-                        ),
+                        "not_before": utc_iso(submission.request.not_before),
                     }
                 ),
                 status_code=202,
@@ -5153,7 +5149,7 @@ async def strategic_operation(
         try:
             entry = SelfReflectionEntry.model_validate(
                 {
-                    "ts": _utcnow().isoformat(),
+                    "ts": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     "cycle_task_id": str(task.id),
                     **data,
                 }
@@ -5386,7 +5382,7 @@ async def strategic_operation(
             pending = PendingConfirmation.model_validate(
                 {
                     "id": data.get("id") or f"p-{uuid.uuid4().hex[:8]}",
-                    "created_at": _utcnow().isoformat(),
+                    "created_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     **data,
                 }
             )
@@ -5425,7 +5421,7 @@ async def strategic_operation(
         current_model.pending_user_confirmation.append(pending)
         from app.problem_model import append_revision_log as _append_revision_log
 
-        now_iso = _utcnow().isoformat()
+        now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         current_model.revision = (current_model.revision or 0) + 1
         current_model.last_updated = now_iso
         # Collection-only write to the agent-owned confirmation queue: do NOT
@@ -5511,7 +5507,7 @@ async def strategic_operation(
                 enforce_problem_model_size as _enforce_pm_size,
             )
 
-            now_iso = _utcnow().isoformat()
+            now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
             current_model.revision = (current_model.revision or 0) + 1
             current_model.last_updated = now_iso
             # Collection-only write to the agent-owned confirmation queue: preserve
@@ -5725,7 +5721,7 @@ async def strategic_operation(
         entry: dict[str, Any] = {
             "verdict": verdict,
             "evidence_source": "strategic_review",
-            "evaluated_at": _utcnow().isoformat(),
+            "evaluated_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
         }
         rationale_text = rationale.strip() if isinstance(rationale, str) else ""
         if rationale_text:
@@ -6830,7 +6826,7 @@ async def strategic_operation(
         target_ctx["cancelled_by"] = "STRATEGIC_AGENT"
         target_ctx["cancelled_by_task_id"] = str(task.id)
         target_ctx["cancel_reason"] = reason
-        target_ctx["cancelled_at"] = _utcnow().isoformat()
+        target_ctx["cancelled_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         target_task.context = target_ctx
         target_task.status = TaskStatus.CANCELLED
         target_task.latest_status_message = (

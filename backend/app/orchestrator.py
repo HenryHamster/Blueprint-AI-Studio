@@ -87,6 +87,7 @@ from app.orchestrator_filters import (
     filter_pipeline_duplicates,
     reserve_migration_revisions,
     filter_scope_empty,
+    filter_malformed_payloads,
     cap_pipeline_slots,
     reserve_slots_for_types,
     apply_project_fairness,
@@ -3550,6 +3551,72 @@ async def orchestrator_worker():
                                     },
                                 )
                             await session.commit()
+                            continue
+
+                        # Malformed-payload gate — terminally fail a task whose
+                        # payload can never clear the agent's entry checks (e.g. a
+                        # `fix` with no `branch`). Such a task is guaranteed to die
+                        # on the agent's first line of real work, so placing it
+                        # would spend a VM / pool lease / runner pin to learn what
+                        # the persisted row already states. 2026-08-23: four
+                        # guard-remediation tasks did exactly that 4x each — 16 VMs,
+                        # zero work possible, all four blamed on the agent as
+                        # CODE_ERROR (#17936).
+                        #
+                        # POSITION IS LOAD-BEARING, and it is here rather than in
+                        # the pre-ranking filter chain (where #17936 first put it,
+                        # at "Step 2.44") for two reasons:
+                        #
+                        #   1. A TERMINAL verdict must never preempt a REVERSIBLE
+                        #      one. Everything above this line can answer "not you,
+                        #      not now" and leave the row QUEUED for the next cycle:
+                        #      the slot budget, the per-type failure gate, the row
+                        #      lock (transient DB contention), the approval flag,
+                        #      the capability-proof fence, and
+                        #      _project_resource_dispatch_defer_message (per-project
+                        #      VM cap, spend ceiling, fleet monthly budget). Run
+                        #      ahead of those and a task that was merely waiting its
+                        #      turn is instead marked permanently dead — and
+                        #      MALFORMED_TASK_PAYLOAD is deliberately outside
+                        #      INFRA_CLASSES, so the reaper's resurrection sweep can
+                        #      never bring it back. The dispatch suite pins this
+                        #      ordering in ~6 independent tests (VM cap, spend
+                        #      ceiling, monthly budget, mid-cycle pause, transient
+                        #      contention, reserved-slot promotion); #17936 turned
+                        #      all of them red.
+                        #
+                        #   2. Blast radius. The pre-ranking placement judged EVERY
+                        #      scanned candidate (up to max(slots*2, 20) per project)
+                        #      and terminalized all matches in ONE cycle, unbounded
+                        #      by dispatch capacity. This contract is a hand-mirrored
+                        #      copy of TypeScript entry checks in agent/src/handlers
+                        #      ("keep in lockstep with the agent" — it will drift),
+                        #      so a false positive there kills the whole queue
+                        #      irreversibly. Here, at most `slots_available` rows per
+                        #      cycle are exposed, and only rows the orchestrator had
+                        #      already committed to placing right now.
+                        #
+                        # The "zero VMs" guarantee #17936 was built for is fully
+                        # preserved: this runs before EVERY placement path below
+                        # (compute launch, fleet-runner pin, warm-pin skip, pool
+                        # lease, Cloud Run, cold GCE provision), and the terminal
+                        # branch does not increment _cycle_dispatched, so the loop
+                        # backfills the freed slot with the next-ranked task instead
+                        # of losing it.
+                        from app.failure_classification import (
+                            malformed_task_payload_reason as _malformed_reason_fn,
+                        )
+
+                        if _malformed_reason_fn(task):
+                            # filter_malformed_payloads owns the terminal
+                            # transition + commit + broadcast. `continue`
+                            # unconditionally: if its commit failed it left the row
+                            # QUEUED on purpose, and a row we just judged unrunnable
+                            # must not fall through to placement on that path — the
+                            # next cycle re-derives the same verdict.
+                            await filter_malformed_payloads(
+                                [task.id], [task], session, broadcast_to_project
+                            )
                             continue
 
                         # Direct compute_experiment launch (no agent half). A

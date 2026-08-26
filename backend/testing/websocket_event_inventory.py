@@ -314,10 +314,16 @@ def build_from_sources(sources: dict[str, str]) -> list[dict[str, Any]]:
     """Build the emitter inventory from in-memory source texts.
 
     ``sources`` maps repo-relative ``backend/app/...`` paths to their file text.
-    Files are processed in sorted-key order so the result is deterministic and
-    independent of the caller's insertion order; because backend source paths are
-    all lowercase, this is byte-identical to the disk walk's sorted-``Path`` order
-    used by :func:`build_websocket_event_inventory`.
+    Files are processed in ``sorted`` key order. The keys are unique strings, so
+    that sort is TOTAL — no tie is ever broken by insertion order — and the
+    result is fully determined by the mapping's contents.
+
+    :func:`read_app_sources` enumerates in this SAME key order, so the disk walk
+    and an at-ref build over git-tree blobs emit one identical record sequence.
+    Do not narrow the key: ``source_path`` alone is what makes the order total.
+    Pinned by ``test_websocket_emitter_inventory.py``::
+
+        test_source_path_sort_is_total_across_tree_shapes
 
     This is the pure, filesystem-free core: the disk-walking function is a thin
     wrapper that reads the tree into ``sources`` and delegates here, so an at-ref
@@ -337,16 +343,29 @@ def read_app_sources(app_dir: Path) -> dict[str, str]:
     Keys are the same repo-relative ``backend/app/...`` paths used as the
     ``source_path`` field, so the result feeds :func:`build_from_sources`
     directly.
+
+    Enumeration is ordered by that emitted key, NOT by ``Path``. Sorting
+    ``Path`` objects is a different order: on Python 3.11 (the CI interpreter)
+    ``PurePath`` compares component lists, so ``app/routers/agent.py`` sorts
+    BEFORE ``app/routers.py`` while the string keys sort the other way round
+    (``.`` < ``/``). ``backend/app`` contains no ``X/`` + ``X.py`` pair today,
+    which is the only reason the two orders have ever agreed — an unremarkable
+    new module could split them at any time. Keying off ``source_path`` makes
+    "read order == build order" true by construction on every interpreter and
+    every tree shape, instead of by accident.
     """
     app_dir = app_dir.resolve()
     backend_root = app_dir.parent
-    sources: dict[str, str] = {}
-    for path in sorted(app_dir.rglob("*.py")):
+    discovered: list[tuple[str, Path]] = []
+    for path in app_dir.rglob("*.py"):
         if "__pycache__" in path.parts:
             continue
         source_path = f"backend/{path.relative_to(backend_root).as_posix()}"
-        sources[source_path] = path.read_text(encoding="utf-8")
-    return sources
+        discovered.append((source_path, path))
+    return {
+        source_path: path.read_text(encoding="utf-8")
+        for source_path, path in sorted(discovered, key=lambda item: item[0])
+    }
 
 
 def build_websocket_event_inventory(app_dir: Path) -> list[dict[str, Any]]:

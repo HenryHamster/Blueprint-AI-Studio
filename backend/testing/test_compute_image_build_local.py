@@ -6841,6 +6841,14 @@ def test_no_progress_watchdog_escalates_to_sigkill_when_sigterm_is_ignored(
         "with open(sys.argv[1], 'w') as fh:\n"
         "    fh.write(str(os.getpid()))\n"
         "    fh.flush()\n"
+        # Report progress exactly ONCE and then stall. The watchdog is inert
+        # until telemetry has actually reported — it must never kill on the
+        # absence of a channel it cannot observe — so a stalled-job test has to
+        # establish the channel first and only then go quiet. What is under test
+        # here is the SIGKILL escalation, not the arming rule.
+        "with open(os.environ['BLUEPRINT_PROGRESS_FILE'], 'w') as fh:\n"
+        "    fh.write('{\"metric\": \"loss\", \"value\": 1.0}')\n"
+        "    fh.flush()\n"
         "time.sleep(600)\n",
         encoding="utf-8",
     )
@@ -6848,7 +6856,9 @@ def test_no_progress_watchdog_escalates_to_sigkill_when_sigterm_is_ignored(
     wrapper = compute_backends_module._build_local_wrapper_command(
         f"python3 {shlex.quote(str(stubborn))} {shlex.quote(str(pid_file))}",
         external_id=external_id,
-        no_progress_timeout_seconds=5,  # the command never touches the progress file
+        # The command reports progress once, then stalls: two consecutive samples
+        # with the same mtime (~10s) are an OBSERVED plateau and must be cut.
+        no_progress_timeout_seconds=5,
     )
 
     def _alive(pid: int) -> bool:
@@ -6881,9 +6891,10 @@ def test_no_progress_watchdog_escalates_to_sigkill_when_sigterm_is_ignored(
             time.sleep(0.1)
         assert stubborn_pid, "the SIGTERM-ignoring command never started"
 
-        # The watchdog fires at ~5s (no progress), TERMs the group (which the
-        # command ignores), and must escalate to SIGKILL ~2s later.
-        deadline = time.monotonic() + 25
+        # The watchdog arms on the first sample (~5s) and fires on the second,
+        # identical one (~10s), TERMs the group (which the command ignores), and
+        # must escalate to SIGKILL ~2s later.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline and _alive(stubborn_pid):
             time.sleep(0.2)
 
@@ -7086,6 +7097,14 @@ def test_local_container_watchdog_actually_kills_containerized_workload(
         "with open(sys.argv[1], 'w') as fh:\n"
         "    fh.write(str(os.getpid()))\n"
         "    fh.flush()\n"
+        # Report progress exactly ONCE and then stall — see the bare-substrate
+        # twin above. The watchdog is inert until telemetry has reported, so the
+        # channel has to exist before the plateau it measures is meaningful.
+        # (host_out_dir is bind-mounted at container_out_dir, so the container's
+        # progress path and the host path the watchdog stats are one file.)
+        "with open(os.environ['BLUEPRINT_PROGRESS_FILE'], 'w') as fh:\n"
+        "    fh.write('{\"metric\": \"loss\", \"value\": 1.0}')\n"
+        "    fh.flush()\n"
         "time.sleep(600)\n",
         encoding="utf-8",
     )
@@ -7094,7 +7113,8 @@ def test_local_container_watchdog_actually_kills_containerized_workload(
         f"python3 {shlex.quote(str(stubborn))} {shlex.quote(str(pid_file))}",
         external_id=external_id,
         container_image="fake/trainer:latest",
-        no_progress_timeout_seconds=5,  # the command never touches the progress file
+        # Reports progress once, then stalls: an OBSERVED plateau at ~10s.
+        no_progress_timeout_seconds=5,
     )
     # Setup sanity: the container is named so the fake can record + target it.
     assert f"--name {shlex.quote(container_name)}" in wrapper
@@ -7138,9 +7158,10 @@ def test_local_container_watchdog_actually_kills_containerized_workload(
             "this to model a dockerd-parented workload"
         )
 
-        # The watchdog fires ~5s (no progress), group-TERMs (futile), then must
-        # `docker kill` the container ~2s later.
-        deadline = time.monotonic() + 25
+        # The watchdog arms on the first sample (~5s), fires on the second,
+        # identical one (~10s), group-TERMs (futile), then must `docker kill` the
+        # container ~2s later.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline and _alive(trainer_pid):
             time.sleep(0.2)
 

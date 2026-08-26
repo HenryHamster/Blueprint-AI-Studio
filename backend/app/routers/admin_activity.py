@@ -29,6 +29,7 @@ from app.findings_index import (
 )
 from app.sr_review_quality_metrics import _stash_projected_task_fields
 from app.task_surface_visibility import non_resident_infrastructure_task_filter
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +220,7 @@ async def get_activity(
                 {
                     "id": f"task-{tid}",
                     "type": "TASK_COMPLETED",
-                    "timestamp": completed_at.isoformat() if completed_at else None,
+                    "timestamp": utc_iso(completed_at),
                     "title": t.title or "Completed task",
                     "task_id": tid,
                     "task_type": task_type,
@@ -243,7 +244,7 @@ async def get_activity(
                 {
                     "id": f"task-{tid}",
                     "type": "TASK_FAILED",
-                    "timestamp": completed_at.isoformat() if completed_at else None,
+                    "timestamp": utc_iso(completed_at),
                     "title": t.title or "Failed task",
                     "task_id": tid,
                     "task_type": task_type,
@@ -274,7 +275,7 @@ async def get_activity(
                 {
                     "id": f"research-{tid}",
                     "type": "RESEARCH_FINDINGS",
-                    "timestamp": completed_at.isoformat() if completed_at else None,
+                    "timestamp": utc_iso(completed_at),
                     "title": f"Research findings: {t.title or tid}",
                     "task_id": tid,
                     "task_type": task_type,
@@ -320,13 +321,13 @@ async def get_activity(
             {
                 "id": f"inprogress-{tid}",
                 "type": "TASK_IN_PROGRESS",
-                "timestamp": t.started_at.isoformat()
+                "timestamp": utc_iso(t.started_at)
                 if t.started_at
-                else t.created_at.isoformat(),
+                else utc_iso(t.created_at),
                 "title": t.title or "In-progress task",
                 "task_id": tid,
                 "task_type": task_type,
-                "started_at": t.started_at.isoformat() if t.started_at else None,
+                "started_at": utc_iso(t.started_at),
                 "latest_status_message": t.latest_status_message,
                 "pr_url": None,
                 "repo_url": None,
@@ -346,7 +347,7 @@ async def get_activity(
         deploy_event: Dict[str, Any] = {
             "id": f"deploy-{short_sha or 'unknown'}",
             "type": "DEPLOY_EVENT",
-            "timestamp": state.deployed_at.isoformat(),
+            "timestamp": utc_iso(state.deployed_at),
             "title": f"Deploy {short_sha or 'unknown'} — {state.status}",
             "task_id": None,
             "task_type": None,

@@ -41,6 +41,8 @@ import {
 } from './typed-fast-resident.js';
 import { monitorClaimBoundWork } from './strategic-resident-claim-monitor.js';
 import { SessionStreamer } from './session-streamer.js';
+import { ConversationMessageStreamer } from './conversation-message-streamer.js';
+import { WsFrameBudget } from './ws-frame-budget.js';
 
 const COORDINATOR_API_ATTEMPTS = 1;
 const COORDINATOR_API_TIMEOUT_MS = 5_000;
@@ -323,27 +325,47 @@ export async function runCheckoutIndependentFastStartup(
   // durable reply commit. Drive the SAME rate-limited emitter the warm Resident
   // lane uses so a cold-start Fast turn streams too. Observational ONLY: nothing
   // here may change what is claimed, persisted, retried, or abandoned.
-  const streamer = new SessionStreamer(ws, sessionId, taskId);
+  // ONE budget for the socket. The live transcript and the conversation reply
+  // preview stream the same turn concurrently; each self-budgeting at <=10/s
+  // would put 20/s plus `log` frames against the backend's 20 msg/s close.
+  const wsFrameBudget = new WsFrameBudget();
+  const streamer = new SessionStreamer(ws, sessionId, taskId, wsFrameBudget);
+  let conversationStreamer: ConversationMessageStreamer | null = null;
   let streamTurnOpen = false;
-  const openStreamTurn = (): void => {
+  const openStreamTurn = (claimId: string, idempotencyKey: string): void => {
     if (streamTurnOpen) return;
     streamTurnOpen = true;
+    conversationStreamer = new ConversationMessageStreamer(
+      ws, sessionId, taskId, claimId, idempotencyKey, wsFrameBudget,
+    );
     streamer.responding();
   };
   /** Terminate an in-flight turn on EVERY exit path (success, provider failure,
    *  interrupt, claim loss, stop request) so no consumer is left with a stuck
    *  in-flight turn. Idempotent: a second call after `done` emits nothing. */
-  const closeStreamTurn = (): void => {
+  const closeStreamTurn = (terminal?: 'failed' | 'abandoned'): void => {
     if (!streamTurnOpen) return;
     streamTurnOpen = false;
+    // Bounded, rate-limited drain plus tombstone. Deliberately not awaited:
+    // every caller is a synchronous teardown path, and the terminal frame is
+    // no longer gated on the claim still being live (routers/projects.py).
+    void conversationStreamer?.finish(terminal);
+    conversationStreamer = null;
     streamer.flush();
     streamer.done();
   };
   const streamSessionEvent = (ev: ResidentSessionEvent): void => {
     if (ev.kind === 'text' && ev.text) {
-      // Live transcript only — the durable reply is still authored exclusively
-      // through the staged receipt-bound completion.
+      // Assistant text goes to BOTH surfaces. The `/strategic-session` live
+      // transcript is protected supported surface (CLAUDE.md) and must render
+      // exactly as it did before streaming existed — including every window
+      // where no conversation streamer is bound (READY probe, post-crash
+      // replacement, between a failed turn and the next dispatch). The
+      // cumulative canonical message preview is purely additive; the durable
+      // reply remains authored exclusively through the staged receipt-bound
+      // completion.
       streamer.delta(ev.text);
+      conversationStreamer?.delta(ev.text);
     } else if (ev.kind === 'tool' || ev.kind === 'activity') {
       if (ev.activity) {
         streamer.activity(ev.activity.kind as StreamFrameKind, ev.activity.text);
@@ -405,6 +427,11 @@ export async function runCheckoutIndependentFastStartup(
   };
 
   const abandonActiveClaim = async (): Promise<'fallback' | 'completed' | 'deferred'> => {
+    // Retract the ephemeral preview BEFORE the early returns. A stranded
+    // preview renders as a delivered answer, so the tombstone must not be
+    // conditional on this being the first abandon or on a claim still being
+    // held. `closeStreamTurn` is idempotent when no turn is open.
+    closeStreamTurn('abandoned');
     if (activeClaimId === null) return Promise.resolve('fallback');
     if (abandonAttempt !== null) return await abandonAttempt;
     const claimId = activeClaimId;
@@ -726,10 +753,16 @@ export async function runCheckoutIndependentFastStartup(
   const dispatchClaim = async (
     messages: ResidentInboundMessage[],
   ): Promise<'completed' | 'released' | 'deferred' | 'workspace'> => {
+    let outcome: 'completed' | 'released' | 'deferred' | 'workspace' | null = null;
     try {
-      return await dispatchClaimTurn(messages);
+      outcome = await dispatchClaimTurn(messages);
+      return outcome;
     } finally {
-      closeStreamTurn();
+      // Only 'completed' proves a durable reply landed to replace the preview.
+      // Every other exit, thrown errors included, must retract it — otherwise
+      // the operator keeps a complete-looking answer that does not exist
+      // server-side and vanishes on remount.
+      closeStreamTurn(outcome === 'completed' ? undefined : 'failed');
     }
   };
 
@@ -843,7 +876,7 @@ export async function runCheckoutIndependentFastStartup(
       if (previousStatus === null) previousStatus = statusRef.value;
       // Pending poll/readiness/claim is not yet a response in progress.
       statusRef.value = RESPONDING_STATUS;
-      openStreamTurn();
+      openStreamTurn(activeClaimId, receipt.idempotency_key);
       const dispatchOnce = () => exactController.dispatch(receipt, prompt).then(
         value => ({ status: 'fulfilled' as const, value }),
         (reason: unknown) => ({ status: 'rejected' as const, reason }),
@@ -867,6 +900,10 @@ export async function runCheckoutIndependentFastStartup(
       ) {
         exactController.replaceAfterCrash();
         transcriptSequence = 0;
+        // The retry re-runs the same receipt from the top, so its text is a new
+        // answer. Give it a distinct preview identity and tombstone attempt 1's
+        // partial rather than welding the two together.
+        conversationStreamer?.newAttempt();
         turnPromise = dispatchOnce();
         turnAttempt = await monitorColdClaimWork(
           turnPromise,

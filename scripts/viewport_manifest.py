@@ -29,6 +29,12 @@ import re
 import subprocess
 import sys
 
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from utf8_io import force_utf8_streams  # noqa: E402
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
+
 _WIDTH_RE = re.compile(r"-(\d+)px\.png$")
 # Status sort order for the printed table: changed first, then new, removed, unchanged.
 _STATUS_ORDER = {"changed": 0, "new": 1, "removed": 2, "unchanged": 3}
@@ -83,6 +89,8 @@ def _run_diff(before_path: str, after_path: str, diff_out: str) -> dict[str, obj
             ["node", _DIFF_HELPER, before_path, after_path, diff_out],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             cwd=os.path.join(_SCRIPT_DIR, "..", "admin-ui"),
         )
@@ -141,7 +149,7 @@ def build(before_dir: str, after_dir: str, base: str, run_id: str, out_path: str
 
     manifest = {"base": base, "run_id": run_id, "pairs": pairs, "summary": summary}
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="") as fh:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
 
@@ -191,6 +199,7 @@ def _print_report(
 
 
 def main(argv: list[str]) -> int:
+    force_utf8_streams()
     if len(argv) != 6:
         print(
             "usage: viewport_manifest.py <before_dir> <after_dir> <base> <run_id> <out_manifest>",

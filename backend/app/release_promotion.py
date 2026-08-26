@@ -1917,8 +1917,9 @@ async def _record_promotion_failure(
             "next_version_number": None,
             "already_promoted": True,
         }
-    # Carry forward the promotion_failure_count from the previous record so the
-    # Z circuit breaker in sweep_stuck_qualifications can cap re-qualify attempts.
+    # Carry forward the promotion_failure_count: it is the ONLY durable home of
+    # the promotion circuit breaker, read by run_qualification's pre-lock cap
+    # gate and by the sweep's _redrive_promotion_failed_qualification.
     _prev_count = 0
     if isinstance(version.last_qualification, dict):
         _prev_count = int(

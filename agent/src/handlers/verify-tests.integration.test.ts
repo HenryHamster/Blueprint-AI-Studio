@@ -40,6 +40,7 @@ vi.mock('child_process', async (importOriginal) => {
 
 import { handleVerifyTests } from './verify-tests.js';
 import * as index from '../index.js';
+import { SKIP_NEEDS_PYTHON3_BINARY } from '../test-python.js';
 
 const WORKSPACE = process.env.AGENT_WORKSPACE as string;
 const TEST_PATH = 'agent/src/handlers/verify-tests.test.ts';
@@ -60,7 +61,20 @@ function vitestReport(detail: string): string {
   });
 }
 
-describe('handleVerifyTests structured report integration', () => {
+// This suite deliberately runs the REAL testFixLoop, so it also runs the real
+// compareStructuredFailures — production code that execs a literal `python3`
+// (see agent/src/utils/test-fix-loop.ts). That hardcoding is correct: agents only
+// ever run on Linux. It does mean the whole base-vs-current attribution this file
+// exists to prove is unreachable on a Windows dev host with no `python3` binary —
+// the comparator returns null, testFixLoop sets verificationUnverified, and the
+// handler posts FAILED instead of COMPLETED. No test-side interpreter choice can
+// change what the production code execs, so the honest answer is to name the
+// missing precondition rather than assert against a degraded path.
+//
+// SKIP_NEEDS_PYTHON3_BINARY is true ONLY on win32 AND only when no real `python3`
+// executable exists, so Linux CI always runs this and a python3 that disappears
+// from a CI image still fails loudly.
+describe.skipIf(SKIP_NEEDS_PYTHON3_BINARY)('handleVerifyTests structured report integration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.spyOn(index, 'sendHeartbeatSync').mockImplementation(() => {});

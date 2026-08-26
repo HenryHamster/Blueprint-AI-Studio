@@ -23,7 +23,7 @@ from app.digest_precompute import (
     read_shared,
     shared_cache_key,
 )
-from app.time_utils import _to_naive_utc, _coerce_naive_utc
+from app.time_utils import _to_naive_utc, _coerce_naive_utc, utc_iso
 from app.models import (
     Task,
     TaskStatus,
@@ -274,7 +274,7 @@ async def get_digest(
         return annotate_precompute_metadata(
             shared.payload,
             precomputed=True,
-            precomputed_at=shared.computed_at.isoformat(),
+            precomputed_at=utc_iso(shared.computed_at),
             precompute_age_seconds=max(
                 0.0, (_utcnow() - shared.computed_at).total_seconds()
             ),
@@ -952,7 +952,7 @@ async def _compute_digest(
                 "reason": "failed",
                 "error_snippet": error_log_map.get(tid),
                 "pr_url": pr_artifact_map.get(tid),
-                "waiting_since": waiting_since.isoformat() if waiting_since else None,
+                "waiting_since": utc_iso(waiting_since),
                 "waiting_hours": waiting_hours,
                 "direction_id": t_dir_id,
                 "direction_text": t_dir_text,
@@ -979,7 +979,7 @@ async def _compute_digest(
             "reason": "approval_required",
             "error_snippet": None,
             "pr_url": pr_artifact_map.get(tid),
-            "waiting_since": waiting_since.isoformat() if waiting_since else None,
+            "waiting_since": utc_iso(waiting_since),
             "waiting_hours": waiting_hours,
             "approval_reason": t.latest_status_message,
             "touched_critical": (t.context or {}).get("touched_critical", []),
@@ -1027,7 +1027,7 @@ async def _compute_digest(
             {
                 "task_id": tid,
                 "title": t.title or "Failed task",
-                "failed_at": ts.isoformat() if ts else None,
+                "failed_at": utc_iso(ts),
                 "error_snippet": error_log_map.get(tid),
                 "waiting_hours": waiting_hours,
                 "attempt_count": t.attempt_count,
@@ -1136,7 +1136,7 @@ async def _compute_digest(
             {
                 "task_id": tid,
                 "title": t.title or "Completed task",
-                "completed_at": ts.isoformat() if ts else None,
+                "completed_at": utc_iso(ts),
                 "pr_url": pr_artifact_map.get(tid),
                 "task_type": task_type,
                 "direction_id": t_dir_id,
@@ -1184,7 +1184,7 @@ async def _compute_digest(
                 "title": t.title or "Active task",
                 "status": t.status.value if hasattr(t.status, "value") else t.status,
                 "task_type": (t.first_payload).get("type", "create"),
-                "started_at": t.started_at.isoformat() if t.started_at else None,
+                "started_at": utc_iso(t.started_at),
                 "direction_id": at_dir_id,
                 "direction_text": at_dir_text,
                 "running_cost_usd": running_cost_usd,
@@ -1587,12 +1587,8 @@ async def _compute_digest(
             if _sc_row is not None:
                 latest_cycle = {
                     "cycle_id": _sc_row.id,
-                    "started_at": _sc_row.phase1_started_at.isoformat()
-                    if _sc_row.phase1_started_at
-                    else None,
-                    "completed_at": _sc_row.phase2_completed_at.isoformat()
-                    if _sc_row.phase2_completed_at
-                    else None,
+                    "started_at": utc_iso(_sc_row.phase1_started_at),
+                    "completed_at": utc_iso(_sc_row.phase2_completed_at),
                     "outcome": _sc_row.outcome,
                     "directions_created": int(_sc_row.directions_created or 0),
                     "directions_retired": int(_sc_row.directions_retired or 0),
@@ -1754,7 +1750,7 @@ async def _compute_digest(
     if _digest_project is not None:
         from app.time_utils import _utcnow as _tv_utcnow  # noqa: PLC0415
 
-        _verdict_evaluated_at = _tv_utcnow().isoformat()
+        _verdict_evaluated_at = _tv_utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         _pending_trial_verdicts: list[tuple[str, dict[str, Any]]] = []
         # Collected gate-integrity alert detail (if any) — persisted durably in
         # the write-owned helper alongside the verdicts, NOT on the request
@@ -2173,7 +2169,7 @@ async def _compute_digest(
         # pipeline_health.py and re-exported for external importers).
         "edges_trend": edges_trend,
         "merge_early_exit_count": merge_early_exit_count,
-        "generated_at": _utcnow().isoformat(),
+        "generated_at": utc_iso(_utcnow()),
         "completed_count": len(completed_tasks),
         "failed_count": len(failed_tasks),
         "pending_approval_count": len(approval_tasks),

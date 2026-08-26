@@ -59,6 +59,7 @@ from app.runner_health_monitors import (
     _get_liveness_seconds,
 )
 from app.workbench_state import clear_preferred_runner_references
+from app.time_utils import utc_iso
 
 logger = logging.getLogger("blueprint")
 
@@ -508,11 +509,7 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "agent_unavailable_legs": (runner.capabilities or {}).get("agent_unavailable_legs"),
         "liveness_window_seconds": _get_liveness_seconds(),
         # Trust telemetry surfaced to the panel.
-        "last_successful_job_at": (
-            runner.last_successful_job_at.isoformat()
-            if runner.last_successful_job_at
-            else None
-        ),
+        "last_successful_job_at": utc_iso(runner.last_successful_job_at),
         "seconds_since_last_success": seconds_since_last_success,
         "consecutive_job_failures": consecutive_job_failures,
         "disk_free_bytes": disk_free_bytes,
@@ -614,10 +611,8 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
         "capabilities": runner.capabilities,
         "health": _runner_health(runner),
         "config": _runner_config_view(runner.capabilities),
-        "last_seen_at": (
-            runner.last_seen_at.isoformat() if runner.last_seen_at else None
-        ),
-        "created_at": runner.created_at.isoformat() if runner.created_at else None,
+        "last_seen_at": utc_iso(runner.last_seen_at),
+        "created_at": utc_iso(runner.created_at),
         "token_age_days": token_age_days,
         "current_token_heartbeat_confirmed": bool(
             runner.last_heartbeat_token_generation > 0
@@ -649,7 +644,7 @@ async def register_runner(
     # Baseline stamp for the desired live-safe config so the Fleet UI can bound how
     # long the first push has been pending (relative to enrollment) rather than
     # reading "just changed" forever for a runner that never phones home.
-    capabilities["live_config_changed_at"] = _utcnow().isoformat()
+    capabilities["live_config_changed_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
 
     runner = LocalRunner(
         project_id=project_id,
@@ -767,7 +762,7 @@ async def update_runner_capabilities(
     # actually moved. A no-op PATCH leaves the existing stamp (and thus the
     # pending-window clock) untouched.
     if live_safe_config_generation(caps) != generation_before:
-        caps["live_config_changed_at"] = _utcnow().isoformat()
+        caps["live_config_changed_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
 
     runner.capabilities = caps
     session.add(runner)
@@ -901,7 +896,7 @@ async def list_runners(
 
 def _snapshot_view(snap: RunnerHeartbeatSnapshot) -> Dict[str, Any]:
     return {
-        "captured_at": snap.captured_at.isoformat() if snap.captured_at else None,
+        "captured_at": utc_iso(snap.captured_at),
         "gpu_utilization_pct": snap.gpu_utilization_pct,
         "disk_free_bytes": snap.disk_free_bytes,
         "memory_free_bytes": snap.memory_free_bytes,
@@ -1140,8 +1135,8 @@ async def runner_stats(
             "outcome": (
                 j.outcome.value if getattr(j, "outcome", None) is not None else None
             ),
-            "created_at": j.created_at.isoformat() if j.created_at else None,
-            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+            "created_at": utc_iso(j.created_at),
+            "completed_at": utc_iso(j.completed_at),
             "terminal_reason": j.terminal_reason,
             "exit_code": (
                 exit_code
@@ -1232,7 +1227,7 @@ async def rotate_runner_token(
     return {
         "runner_id": str(runner_id),
         "token": token,
-        "rotated_at": f"{rotated_at.isoformat()}Z",
+        "rotated_at": utc_iso(rotated_at),
     }
 
 
@@ -1634,7 +1629,7 @@ async def fleet_runners_health_summary(
 
     fleet["cloud_cost_avoided_usd"] = round(fleet_cost_avoided_usd, 2)
     fleet["per_project"] = per_project_entries
-    fleet["generated_at"] = now.isoformat()
+    fleet["generated_at"] = utc_iso(now)
     fleet["project_count"] = len(per_project_entries)
     fleet["limit_reached"] = len(all_runners) >= _MAX_HEALTH_RUNNERS
     fleet["max_runners"] = _MAX_HEALTH_RUNNERS

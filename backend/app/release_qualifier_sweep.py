@@ -23,6 +23,7 @@ from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app import release_drift_sentinel_alerts as drift_alerts
 from app import release_qualification_deferral, release_version
 from app.database import AsyncSessionLocal
 from app.models import (
@@ -60,11 +61,16 @@ from app.release_qualifier_redrive import (
     _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,  # noqa: F401 — re-exported for release_qualifier
     _MAX_RUBRIC_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
     _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
+    _MAX_DEFERRED_UNSYNCED_WAIT_SECONDS,  # noqa: F401 — re-exported for tests
+    _PROMOTION_MECHANICS_FAILURES,  # noqa: F401 — re-exported for tests
     _TRANSIENT_ERROR_CODES,  # noqa: F401 — re-exported for tests
+    _redrive_deferred_unsynced_qualification,  # noqa: F401 - re-exported for tests
     _redrive_error_qualification,
     _redrive_infra_failure_qualification,
+    _redrive_promotion_failed_qualification,  # noqa: F401 - re-exported for tests
     _redrive_rubric_changed_qualification,
     _redrive_walkthrough_contract_qualification,
+    run_redrive_legs,
 )
 from app.release_qualifier_hotfix_audit import (
     _hotfix_audit_recovery_candidate_ids,
@@ -83,7 +89,9 @@ from app.release_sweep_crash_cause import (
 )
 
 logger = logging.getLogger(__name__)
-# Matches the design-pinned JSON cap; the debounce extraction keeps us under it.
+# Matches the design-pinned JSON cap.  Raised 2150 -> 2250 to seat the
+# promotion_failed / deferred_unsynced re-driver loops (the executors the
+# trigger resolver's T5/T5b decisions had been dead-ending without).
 _MODULE_SIZE_GOVERNANCE_CAP: int = 2150
 
 
@@ -517,6 +525,39 @@ def _drift_sentinel_cancelled_redispatch_due(
     ).total_seconds() >= _DRIFT_SENTINEL_CANCELLED_REDISPATCH_COOLDOWN_SECONDS
 
 
+async def _retire_sentinel_incidents(
+    session,
+    project_id,
+    *,
+    states: tuple[str, ...],
+    reason: str,
+) -> int:
+    """Retire sentinel incidents whose condition the current gate falsified.
+
+    ``release.ci_unresolved`` declares ``AlertRetirementMode.SOURCE_CONDITION``:
+    this producer owns retirement.  Best-effort and non-raising — a retirement
+    failure must never abort the sweep or, worse, suppress a live alert.
+    """
+    try:
+        retired = await drift_alerts.resolve_drift_sentinel_alerts(
+            session, project_id, states=states, reason=reason
+        )
+        if retired:
+            await session.commit()
+        return retired
+    except Exception:
+        logger.exception(
+            "[DRIFT_SENTINEL] failed to retire incidents for project %s", project_id
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "[DRIFT_SENTINEL] rollback failed for project %s", project_id
+            )
+        return 0
+
+
 async def _check_full_suite_drift_sentinel(
     version_id,
     *,
@@ -706,6 +747,16 @@ async def _check_full_suite_drift_sentinel(
                     if gate_state in ("green", "pending"):
                         # A run for the HEAD is green or in flight — nothing left
                         # to do; the sentinel will read it on the next sweep.
+                        if gate_state == "green":
+                            await _retire_sentinel_incidents(
+                                session,
+                                version.project_id,
+                                states=drift_alerts.ALL_STATES,
+                                reason=(
+                                    "ci.yml concluded success for integration "
+                                    f"HEAD {head_sha[:12] if head_sha else '?'}"
+                                ),
+                            )
                         return False
                     if gate_state != "red":
                         # unavailable / no_signal: the re-dispatch could not be
@@ -722,57 +773,36 @@ async def _check_full_suite_drift_sentinel(
                     _cancelled_unresolved = True
 
                 if _cancelled_unresolved:
-                    _dedupe_key = (
-                        f"drift_sentinel:cancelled:{version.project_id}:{head_sha}"
+                    run_url = gate.get("html_url") or str(gate.get("run_id") or "")
+                    await drift_alerts.raise_drift_sentinel_alert(
+                        session,
+                        project_id=version.project_id,
+                        state=drift_alerts.STATE_CANCELLED,
+                        severity=AlertSeverity.WARNING,
+                        title=(
+                            f"Full-suite CI run cancelled on integration "
+                            f"branch ({head_sha[:8] if head_sha else '?'})"
+                        ),
+                        message=(
+                            f"Standing drift sentinel: the ci.yml run for "
+                            f"integration HEAD "
+                            f"{head_sha[:12] if head_sha else '?'} was "
+                            "cancelled (the ci.yml concurrency policy "
+                            "cancels in-flight integration-branch runs). "
+                            "A fresh run will be re-dispatched after the "
+                            "cooldown window, so a quiet HEAD can still "
+                            "reach green."
+                            + (f" Run: {run_url}." if run_url else "")
+                        ),
                     )
-                    existing = (
-                        (
-                            await session.execute(
-                                select(Alert).where(
-                                    Alert.project_id == version.project_id,
-                                    Alert.dedupe_key == _dedupe_key,
-                                    Alert.dismissed_at.is_(None),
-                                )
-                            )
-                        )
-                        .scalars()
-                        .first()
+                    await session.commit()
+                    logger.warning(
+                        "[DRIFT_SENTINEL] full-suite CI run cancelled for "
+                        "project %s HEAD %s — standing incident raised, "
+                        "re-dispatch cooldown in effect",
+                        version.project_id,
+                        head_sha[:8] if head_sha else "?",
                     )
-                    if existing is None:
-                        run_url = gate.get("html_url") or str(
-                            gate.get("run_id") or ""
-                        )
-                        session.add(
-                            Alert(
-                                project_id=version.project_id,
-                                severity=AlertSeverity.WARNING,
-                                title=(
-                                    f"Full-suite CI run cancelled on integration "
-                                    f"branch ({head_sha[:8] if head_sha else '?'})"
-                                ),
-                                message=(
-                                    f"Standing drift sentinel: the ci.yml run for "
-                                    f"integration HEAD "
-                                    f"{head_sha[:12] if head_sha else '?'} was "
-                                    "cancelled (the ci.yml concurrency policy "
-                                    "cancels in-flight integration-branch runs). "
-                                    "A fresh run will be re-dispatched after the "
-                                    "cooldown window, so a quiet HEAD can still "
-                                    "reach green."
-                                    + (f" Run: {run_url}." if run_url else "")
-                                ),
-                                dedupe_key=_dedupe_key,
-                                event_type="release.ci_unresolved",
-                            )
-                        )
-                        await session.commit()
-                        logger.warning(
-                            "[DRIFT_SENTINEL] full-suite CI run cancelled for "
-                            "project %s HEAD %s — alert raised, re-dispatch "
-                            "cooldown in effect",
-                            version.project_id,
-                            head_sha[:8] if head_sha else "?",
-                        )
                     return True
 
             if gate_state in ("unavailable", "dispatch_rejected"):
@@ -791,123 +821,98 @@ async def _check_full_suite_drift_sentinel(
                 # single operator action. dispatch_outcome stays in the key:
                 # 403 and 404 are different diagnoses with different fixes.
                 outcome_label = str(gate.get("dispatch_outcome") or "unknown")
-                dedupe_key = (
-                    f"drift_sentinel:dispatch_rejected:{version.project_id}"
-                    f":{outcome_label}"
-                    if gate_state == "dispatch_rejected"
-                    else f"drift_sentinel:unavailable:{version.project_id}"
-                )
                 head_label = head_sha[:8] if head_sha else "?"
                 head_detail = head_sha[:12] if head_sha else "?"
-                title = (
-                    f"Full-suite CI unavailable on integration branch "
-                    f"({head_label})"
-                )
-                message = (
-                    f"Standing drift sentinel could not evaluate ci.yml "
-                    f"for automain HEAD {head_detail}: {reason}. "
-                    "Full-suite CI drift is currently unverified; "
-                    "inspect GitHub connectivity and retry."
-                )
-                existing = (
-                    (
-                        await session.execute(
-                            select(Alert).where(
-                                Alert.project_id == version.project_id,
-                                Alert.dedupe_key == dedupe_key,
-                                Alert.dismissed_at.is_(None),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
-                if existing is None:
-                    session.add(
-                        Alert(
-                            project_id=version.project_id,
-                            severity=AlertSeverity.WARNING,
-                            title=title,
-                            message=message,
-                            dedupe_key=dedupe_key,
-                            event_type="release.ci_unresolved",
-                        )
-                    )
-                    await session.commit()
-                    logger.warning(
-                        "[DRIFT_SENTINEL] full-suite CI gate unavailable for project %s "
-                        "HEAD %s — alert raised: %s",
-                        version.project_id,
-                        head_sha[:8] if head_sha else "?",
-                        reason,
-                    )
-                else:
-                    # Refresh the standing incident for BOTH states: a
-                    # per-project key would otherwise freeze the alert on a
-                    # days-old HEAD. occurrence_count now carries how long the
-                    # condition has persisted — the signal N alerts destroyed.
-                    existing.severity = AlertSeverity.WARNING
-                    existing.title = title
-                    existing.message = message
-                    existing.event_type = "release.ci_unresolved"
-                    existing.occurrence_count = int(existing.occurrence_count or 1) + 1
-                    existing.last_seen_at = _utcnow()
-                    session.add(existing)
-                    await session.commit()
-                    logger.warning(
-                        "[DRIFT_SENTINEL] full-suite CI gate unavailable for project %s "
-                        "HEAD %s — alert refreshed: %s",
-                        version.project_id,
-                        head_label,
-                        reason,
-                    )
-                return True
-
-            if gate_state != "red":
-                return False
-
-            # Red: raise a deduplicated alert + spawn harvest remediation.
-            dedupe_key = f"drift_sentinel:red:{version.project_id}:{head_sha}"
-            existing = (
-                (
-                    await session.execute(
-                        select(Alert).where(
-                            Alert.project_id == version.project_id,
-                            Alert.dedupe_key == dedupe_key,
-                            Alert.dismissed_at.is_(None),
-                        )
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if existing is None:
-                run_url = gate.get("html_url") or str(gate.get("run_id") or "")
-                session.add(
-                    Alert(
-                        project_id=version.project_id,
-                        severity=AlertSeverity.ERROR,
-                        title=(
-                            f"Full-suite CI red on integration branch "
-                            f"({head_sha[:8] if head_sha else '?'})"
-                        ),
-                        message=(
-                            f"Standing drift sentinel: ci.yml concluded failure for "
-                            f"integration HEAD {head_sha[:12] if head_sha else '?'}."
-                            + (f" Run: {run_url}." if run_url else "")
-                            + " Harvest remediation spawning."
-                        ),
-                        dedupe_key=dedupe_key,
-                        event_type="release.ci_unresolved",
-                    )
+                await drift_alerts.raise_drift_sentinel_alert(
+                    session,
+                    project_id=version.project_id,
+                    state=(
+                        drift_alerts.STATE_DISPATCH_REJECTED
+                        if gate_state == "dispatch_rejected"
+                        else drift_alerts.STATE_UNAVAILABLE
+                    ),
+                    # 403 and 404 are different diagnoses with different fixes,
+                    # so each keeps its own standing incident.
+                    diagnosis=(
+                        outcome_label if gate_state == "dispatch_rejected" else None
+                    ),
+                    severity=AlertSeverity.WARNING,
+                    title=(
+                        f"Full-suite CI unavailable on integration branch "
+                        f"({head_label})"
+                    ),
+                    # Refresh keeps the standing incident naming the CURRENT
+                    # HEAD; occurrence_count carries how long the condition has
+                    # persisted — the signal the per-HEAD alert stream destroyed.
+                    message=(
+                        f"Standing drift sentinel could not evaluate ci.yml "
+                        f"for automain HEAD {head_detail}: {reason}. "
+                        "Full-suite CI drift is currently unverified; "
+                        "inspect GitHub connectivity and retry."
+                    ),
                 )
                 await session.commit()
                 logger.warning(
-                    "[DRIFT_SENTINEL] full-suite CI red for project %s HEAD %s — "
-                    "alert raised, harvest spawning",
+                    "[DRIFT_SENTINEL] full-suite CI gate unavailable for project %s "
+                    "HEAD %s — standing incident raised: %s",
                     version.project_id,
-                    head_sha[:8] if head_sha else "?",
+                    head_label,
+                    reason,
                 )
+                return True
+
+            if gate_state != "red":
+                if gate_state == "green":
+                    # The ONLY state that falsifies every sentinel claim at once.
+                    await _retire_sentinel_incidents(
+                        session,
+                        version.project_id,
+                        states=drift_alerts.ALL_STATES,
+                        reason=(
+                            "ci.yml concluded success for integration HEAD "
+                            f"{head_sha[:12] if head_sha else '?'}"
+                        ),
+                    )
+                return False
+
+            # Red: raise the standing red incident + spawn harvest remediation.
+            run_url = gate.get("html_url") or str(gate.get("run_id") or "")
+            await drift_alerts.raise_drift_sentinel_alert(
+                session,
+                project_id=version.project_id,
+                state=drift_alerts.STATE_RED,
+                severity=AlertSeverity.ERROR,
+                title=(
+                    f"Full-suite CI red on integration branch "
+                    f"({head_sha[:8] if head_sha else '?'})"
+                ),
+                message=(
+                    f"Standing drift sentinel: ci.yml concluded failure for "
+                    f"integration HEAD {head_sha[:12] if head_sha else '?'}."
+                    + (f" Run: {run_url}." if run_url else "")
+                    + " Harvest remediation spawning."
+                ),
+            )
+            # An authoritative failure conclusion proves the gate CAN now be
+            # evaluated, so the "could not evaluate" incidents are over.  The red
+            # incident itself stays open — only green retires that.
+            await _retire_sentinel_incidents(
+                session,
+                version.project_id,
+                states=drift_alerts.EVALUABILITY_STATES,
+                reason=(
+                    "ci.yml returned an authoritative conclusion for integration "
+                    f"HEAD {head_sha[:12] if head_sha else '?'}; full-suite CI "
+                    "drift is no longer unverified"
+                ),
+            )
+            await session.commit()
+            logger.warning(
+                "[DRIFT_SENTINEL] full-suite CI red for project %s HEAD %s — "
+                "standing incident raised, harvest spawning",
+                version.project_id,
+                head_sha[:8] if head_sha else "?",
+            )
 
             # Harvest is best-effort and self-gating (per-hour/concurrent caps).
             integration_branch, _ = release_qualifier._lts_branch_names(project)
@@ -1339,6 +1344,7 @@ async def _fire_auto_triggered_qualification(
             promotion_check_wait=bool(qual.get("promotion_pending")),
             consecutive_infra_errors=int(qual.get("consecutive_infra_errors") or 0),
             rubric_redrive_count=int(qual.get("rubric_redrive_count") or 0),
+            promotion_failure_count=int(qual.get("promotion_failure_count") or 0),
             automain_head_quiet_seconds=automain_head_quiet_seconds,
         )
         if not decision.fire:
@@ -1355,6 +1361,20 @@ async def _fire_auto_triggered_qualification(
 
         # Raw status/blocker skips previously hid candidate_advanced for
         # non-coverage blockers. Apply executor ownership only after resolution.
+        #
+        # The claim below — that every OTHER trigger is owned by a dedicated
+        # re-driver — was FALSE for ``blockers_cleared`` (promotion_failed) and
+        # ``deferred_unsynced_redrive`` from commit a9ed8d6e until those two
+        # re-drivers were restored: the resolver armed the version, this filter
+        # discarded the decision, and nothing re-fired qualification.  It is
+        # true now, and the exhaustive mapping is:
+        #   rubric_redrive          -> _redrive_rubric_changed_qualification
+        #   error_redrive           -> _redrive_error_qualification
+        #   infra_failure_redrive   -> _redrive_infra_failure_qualification
+        #   blockers_cleared        -> _redrive_promotion_failed_qualification
+        #   deferred_unsynced_redrive -> _redrive_deferred_unsynced_qualification
+        # Any NEW resolver trigger must land in that table or in this set before
+        # it is added; a trigger in neither place dead-ends silently.
         if decision.trigger not in {
             "coverage_complete",
             "candidate_advanced",
@@ -2077,6 +2097,19 @@ async def sweep_stuck_qualifications(
     # another.  Extracted to a helper so the fresh-per-version re-read is
     # independently testable.
     await _run_lifecycle_stall_alerts(open_versions, session_factory=session_factory)
+
+    # Re-drive the two statuses whose resolver decisions the auto-trigger
+    # executor below discards as re-driver-owned: ``promotion_failed`` (T5,
+    # trigger ``blockers_cleared``) and ``deferred_unsynced`` (T5b).  Runs AFTER
+    # the reconcile legs (so a candidate that actually landed is recorded as
+    # promoted first) and BEFORE the auto-trigger executor, which keeps only the
+    # coverage/candidate triggers.  The dispatch itself lives beside the
+    # re-drivers it dispatches — see ``run_redrive_legs``.
+    await run_redrive_legs(
+        version_ids,
+        session_factory=session_factory,
+        pre_sweep_statuses=pre_sweep_statuses,
+    )
 
     # Qualification trigger auto-fire.  The resolver
     # (``qualification_triggers.resolve_qualification_trigger``) decides fire/hold

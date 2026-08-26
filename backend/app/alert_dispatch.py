@@ -2626,6 +2626,51 @@ async def _create_strategic_alert(
 _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE = (
     "Strategic engine halted: no completed cycle in window"
 )
+_STRATEGIC_CYCLE_LIVENESS_EVENT_TYPE = "research.strategic_cycle_liveness"
+_STRATEGIC_CYCLE_LIVENESS_WEBHOOK_EVENT = "STRATEGIC_ENGINE_HALTED"
+_STRATEGIC_CYCLE_LIVENESS_RESOLUTION_LIMIT = 100
+
+
+async def _resolve_strategic_cycle_liveness_alerts(
+    session: AsyncSession, project_id: "uuid.UUID"
+) -> int:
+    """Dismiss open strategic liveness alerts after the source recovers.
+
+    Match the stable title so rows created before this producer entered the
+    alert-policy registry are retired too. The resolver is idempotent: only
+    rows with no dismissal timestamp are selected.
+    """
+    open_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
+                )
+                .limit(_STRATEGIC_CYCLE_LIVENESS_RESOLUTION_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not open_alerts:
+        return 0
+
+    dismissed_at = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = dismissed_at
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
 
 
 async def _maybe_create_strategic_cycle_liveness_alert(
@@ -2653,8 +2698,10 @@ async def _maybe_create_strategic_cycle_liveness_alert(
         if last_successful_completed_at is not None
         else "never"
     )
-    alert = Alert(
+    alert, created, decision = await create_project_alert_if_allowed(
+        session,
         project_id=project_id,
+        event_type=_STRATEGIC_CYCLE_LIVENESS_EVENT_TYPE,
         severity=AlertSeverity.WARNING,
         title=_STRATEGIC_CYCLE_LIVENESS_ALERT_TITLE,
         message=(
@@ -2664,9 +2711,11 @@ async def _maybe_create_strategic_cycle_liveness_alert(
             "A recent intentional no-delta decision was not recorded, so the "
             "loop may be halted. Inspect the strategic scheduler and runtime logs."
         )[:1000],
-        event_type="research.strategic_cycle_liveness",
+        source="strategic_cycle_starvation",
+        dedupe_key=f"{_STRATEGIC_CYCLE_LIVENESS_EVENT_TYPE}:{project_id}",
     )
-    session.add(alert)
+    if not decision.emit or alert is None or not created:
+        return False
     await session.commit()
     await broadcast_to_project(
         str(project_id),
@@ -2677,6 +2726,27 @@ async def _maybe_create_strategic_cycle_liveness_alert(
             "title": alert.title,
         },
     )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006  # fire-and-forget; caller does not await
+            dispatch_external_notification(
+                project_id,
+                _STRATEGIC_CYCLE_LIVENESS_WEBHOOK_EVENT,
+                {
+                    "alert_id": str(alert.id),
+                    "title": alert.title,
+                    "message": alert.message,
+                    "starvation_hours": starvation_hours,
+                    "last_successful_completed_at": last_successful_completed_label,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning(
+            "[NOTIFY] STRATEGIC_ENGINE_HALTED dispatch setup failed: %s", _ne
+        )
     return True
 
 

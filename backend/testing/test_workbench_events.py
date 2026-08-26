@@ -1,5 +1,5 @@
 import uuid
-from datetime import timedelta
+from datetime import timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -451,7 +451,9 @@ async def test_build_workbench_event_feed_orders_tasks_by_semantic_activity(db_s
         "task",
     ]
     task_item = next(item for item in feed["items"] if item["resource"] == "task")
-    assert task_item["occurred_at"] == stale_heartbeat_task.started_at.isoformat()
+    assert task_item["occurred_at"] == stale_heartbeat_task.started_at.replace(
+        tzinfo=timezone.utc
+    ).isoformat()
 
 
 @pytest.mark.asyncio
@@ -490,7 +492,9 @@ async def test_build_workbench_event_feed_uses_task_status_transition_time(db_se
         "task",
         "project_message",
     ]
-    assert feed["items"][0]["occurred_at"] == (now - timedelta(minutes=2)).isoformat()
+    assert feed["items"][0]["occurred_at"] == (
+        now - timedelta(minutes=2)
+    ).replace(tzinfo=timezone.utc).isoformat()
 
 
 @pytest.mark.asyncio

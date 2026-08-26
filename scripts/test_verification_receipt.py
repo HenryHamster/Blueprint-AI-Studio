@@ -407,10 +407,10 @@ def test_the_backend_lane_cli_is_what_the_gates_invoke(tmp_path: Path) -> None:
     invocations = [
         match.start()
         for match in re.finditer(
-            r"python3 scripts/verification_receipt\.py backend-pytest", fragment
+            r"python3 scripts/verification_receipt\.py backend-pytest --receipt", fragment
         )
     ]
-    fallback_at = fragment.index("elif python3 -c ")
+    fallback_at = fragment.rindex("elif python3 -c ")
     assert invocations, "the fragment must still prefer the shared writer"
     assert all(guard_at < at < fallback_at for at in invocations)
     assert 'if [ "$_verification_receipt_written" = "1" ]; then' in fragment
@@ -460,6 +460,101 @@ def test_the_backend_lane_cli_is_what_the_gates_invoke(tmp_path: Path) -> None:
     assert payload["lanes"]["backend-pytest"]["suppressed_failures"] == payload[
         "pytest"
     ]["suppressed_failures"]
+
+
+def test_inline_backend_abort_fallback_writes_parseable_json(tmp_path: Path) -> None:
+    """The foreign-workspace abort fallback must emit valid JSON."""
+
+    for relative in (
+        Path("agent/src/prompts/check_backend_verification.sh"),
+        Path("scripts/check-default.sh"),
+    ):
+        shell = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        matches = re.finditer(r"elif python3 -c '(?P<code>.*?)' \\\n", shell, re.DOTALL)
+        code = next(
+            match.group("code")
+            for match in matches
+            if "out,task,directory,state,reason,code=sys.argv[1:]" in match.group("code")
+        )
+        path = tmp_path / f"{relative.name}.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                code,
+                str(path),
+                "abort-task",
+                "backend",
+                "route_helper_unavailable",
+                "route helper unavailable or invalid",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        lane = payload["lanes"]["backend-pytest"]
+        assert payload["version"] == 1
+        assert lane["state"] == "route_helper_unavailable"
+        assert lane["blocking"] is True
+        assert lane["error"] == "route helper unavailable or invalid"
+        assert lane["current_exit_code"] == 1
+
+
+def test_every_backend_lane_abort_records_a_blocking_lane_state(
+    tmp_path: Path,
+) -> None:
+    """Every pre-guard abort uses the shared diagnostic writer and blocks."""
+
+    fragment = (
+        REPO_ROOT / "agent" / "src" / "prompts" / "check_backend_verification.sh"
+    ).read_text(encoding="utf-8")
+    expected = {
+        "route_helper_unavailable",
+        "target_unavailable",
+        "lint_failure",
+        "resolver_failure",
+        "selector_unavailable",
+        "selector_cap_exceeded",
+        "capability_receipt_failure",
+        "harness_unavailable",
+        "runtime_unavailable",
+    }
+    for state in expected:
+        assert f"_record_backend_abort {state} " in fragment
+
+        path = tmp_path / f"{state}.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "verification_receipt.py"),
+                "backend-pytest-diagnosis",
+                "--receipt",
+                str(path),
+                "--task-id",
+                "abort-task",
+                "--directory",
+                "backend",
+                "--state",
+                state,
+                "--reason",
+                f"reason for {state}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        lane = json.loads(path.read_text(encoding="utf-8"))["lanes"][
+            "backend-pytest"
+        ]
+        assert lane["state"] == state
+        assert lane["blocking"] is True
+        assert lane["error"] == f"reason for {state}"
+        assert lane["current_exit_code"] == 1
+        assert all(lane[key] == {} for key in receipt.FAILURE_MAP_KEYS)
 
 
 # ---------------------------------------------------------------------------

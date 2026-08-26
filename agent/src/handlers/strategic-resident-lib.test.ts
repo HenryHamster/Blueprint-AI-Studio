@@ -2461,6 +2461,19 @@ describe('buildSurfaceCatalog', () => {
     // Diagnostic fetch surfaces from the STRATEGIC_FETCH_VERBS subset.
     expect(keys).toContain('qualification');
     expect(keys).toContain('ci-compliance');
+    // Pipeline-visibility surfaces: the autonomous tick only ever examines what
+    // the catalog enumerates, so these must be present or the resident never
+    // looks at the pipeline it is steering.
+    expect(keys).toContain('attention');
+    expect(keys).toContain('task-census');
+    expect(keys).toContain('autonomy-debug');
+    expect(keys).toContain('alerts');
+    expect(keys).toContain('deploy-state');
+    for (const key of ['attention', 'task-census', 'autonomy-debug', 'alerts', 'deploy-state']) {
+      const surface = catalog.find(s => s.key === key);
+      expect(surface?.kind).toBe('fetch');
+      expect(surface?.hint).toContain(`./fetch ${key}`);
+    }
     // Standing surfaces.
     expect(keys).toContain('messages:recent');
     expect(keys).toContain('knowledge:recent');

@@ -38,10 +38,12 @@ minutes; the pipeline keeps merging.
 import asyncio
 import base64
 import fnmatch
+import io
 import logging
+import tarfile
 import time
 from collections import OrderedDict
-from typing import Dict, Tuple
+from typing import Any, Callable, Coroutine, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,15 @@ _TREE_CACHE_MAX_ENTRIES = 8
 _BLOB_CACHE_MAX_BYTES = 24 * 1024 * 1024
 _BLOB_CACHE_MAX_ENTRIES = 512
 
+# Authoritative merge reads download the same immutable repository archive for
+# every preflight that examines a given commit. Cache the compressed response
+# bytes, not extracted text: callers request different path sets and may use
+# different ``allow_missing_paths`` contracts, so extraction must remain
+# request-local. Keep this cache deliberately small because one archive is
+# commonly ~20 MiB compressed.
+_ARCHIVE_CACHE_MAX_BYTES = 96 * 1024 * 1024
+_ARCHIVE_CACHE_MAX_ENTRIES = 4
+
 _branch_sha_cache: Dict[Tuple[str, str, str], Tuple[str, float]] = {}
 # (owner, repo, commit_sha) → (paths {path → blob_sha}, truncated)
 _tree_cache: "OrderedDict[Tuple[str, str, str], Tuple[Dict[str, str], bool]]" = (
@@ -70,8 +81,16 @@ _tree_cache: "OrderedDict[Tuple[str, str, str], Tuple[Dict[str, str], bool]]" = 
 )
 _blob_cache: "OrderedDict[str, str]" = OrderedDict()
 _blob_cache_bytes = 0
-# Single-flight: concurrent grounding passes share one tree fetch per branch.
-_tree_fetch_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
+_archive_cache: "OrderedDict[Tuple[str, str, str], bytes]" = OrderedDict()
+_archive_cache_bytes = 0
+# Single-flight: concurrent grounding passes share one tree fetch per exact SHA.
+_tree_fetch_tasks: Dict[Tuple[str, str, str], asyncio.Task[Tuple[Dict[str, str], bool] | None]] = {}
+# Cache-default callers in this module and app.github_refs share the same
+# branch-tip request, while each caller retains its own response contract.
+_branch_sha_fetch_tasks: Dict[Tuple[str, str, str], asyncio.Task[Any]] = {}
+# A completed task is removed by its own callback, so waiters that already
+# acquired this exact flight continue to share its success or failure.
+_archive_fetch_tasks: Dict[Tuple[str, str, str], asyncio.Task[bytes | None]] = {}
 
 
 def _bump_cache_stat(key: str) -> None:
@@ -124,17 +143,12 @@ async def _resolve_branch_sha(
         _bump_cache_stat("branch_sha_snapshot")
         return cached[0]
 
-    from urllib.parse import quote
-
-    from app.github import _github_request
-
-    url = (
-        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/"
-        f"{quote(branch, safe='')}"
-    )
     try:
-        response = await _github_request(
-            "GET", url, _headers(token), max_retries=2, project_id=project_id
+        response = await _get_shared_branch_sha_response(
+            key,
+            lambda: _fetch_branch_sha_response(
+                token, owner, repo, branch, project_id, max_retries=2
+            ),
         )
         if response.status_code != 200:
             logger.warning(
@@ -148,7 +162,7 @@ async def _resolve_branch_sha(
         sha = (response.json().get("object") or {}).get("sha")
         if not isinstance(sha, str) or not sha:
             return None
-        _branch_sha_cache[key] = (sha, now)
+        _branch_sha_cache[key] = (sha, time.monotonic())
         return sha
     except Exception as e:  # noqa: BLE001 — snapshot reads must degrade, not raise
         logger.warning(
@@ -159,6 +173,54 @@ async def _resolve_branch_sha(
             e,
         )
         return None
+
+
+async def _fetch_branch_sha_response(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+    *,
+    max_retries: int | None = None,
+) -> Any:
+    """Fetch a branch response for the shared cache-default flight."""
+    from urllib.parse import quote
+
+    from app.github import _github_request
+
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/"
+        f"{quote(branch, safe='')}"
+    )
+    kwargs: dict[str, Any] = {"project_id": project_id}
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    return await _github_request("GET", url, _headers(token), **kwargs)
+
+
+async def _get_shared_branch_sha_response(
+    key: Tuple[str, str, str],
+    fetcher: Callable[[], Coroutine[Any, Any, Any]],
+) -> Any:
+    """Return one shared in-flight branch response for *key*.
+
+    The response is intentionally translated by the caller: snapshot reads
+    degrade to ``None`` while ``github_refs.get_branch_sha`` preserves its
+    HTTPException contract. Failed responses are never cached, because the
+    completed flight is removed before a later cache miss creates a retry.
+    """
+    flight = _branch_sha_fetch_tasks.get(key)
+    if flight is None:
+        flight = asyncio.create_task(fetcher())
+        _branch_sha_fetch_tasks[key] = flight
+
+        def _clear_completed_flight(done_task: asyncio.Task[Any]) -> None:
+            if _branch_sha_fetch_tasks.get(key) is done_task:
+                _branch_sha_fetch_tasks.pop(key, None)
+
+        flight.add_done_callback(_clear_completed_flight)
+    return await asyncio.shield(flight)
 
 
 async def _fetch_tree(
@@ -258,14 +320,12 @@ async def _get_snapshot_at_sha(
         _tree_cache.move_to_end(key)
         _bump_cache_stat("tree_snapshot")
         return snapshot
-    lock = _tree_fetch_locks.setdefault(key, asyncio.Lock())
-    try:
-        async with lock:
-            # Re-check after the wait: a concurrent pass may have populated it.
+    flight = _tree_fetch_tasks.get(key)
+    if flight is None:
+        async def _fetch_and_cache_tree() -> Tuple[Dict[str, str], bool] | None:
             snapshot = _tree_cache.get(key)
             if snapshot is not None:
                 _tree_cache.move_to_end(key)
-                _bump_cache_stat("tree_snapshot")
                 return snapshot
             snapshot = await _fetch_tree(token, owner, repo, sha, project_id)
             if snapshot is None:
@@ -274,8 +334,18 @@ async def _get_snapshot_at_sha(
             while len(_tree_cache) > _TREE_CACHE_MAX_ENTRIES:
                 _tree_cache.popitem(last=False)
             return snapshot
-    finally:
-        _tree_fetch_locks.pop(key, None)
+
+        flight = asyncio.create_task(_fetch_and_cache_tree())
+        _tree_fetch_tasks[key] = flight
+
+        def _clear_completed_flight(
+            done_task: asyncio.Task[Tuple[Dict[str, str], bool] | None],
+        ) -> None:
+            if _tree_fetch_tasks.get(key) is done_task:
+                _tree_fetch_tasks.pop(key, None)
+
+        flight.add_done_callback(_clear_completed_flight)
+    return await asyncio.shield(flight)
 
 
 def _blob_cache_get(blob_sha: str) -> str | None:
@@ -302,6 +372,91 @@ def _blob_cache_put(blob_sha: str, text: str) -> None:
     ):
         _, evicted = _blob_cache.popitem(last=False)
         _blob_cache_bytes -= len(evicted)
+
+
+def _archive_cache_get(key: Tuple[str, str, str]) -> bytes | None:
+    archive = _archive_cache.get(key)
+    if archive is not None:
+        _archive_cache.move_to_end(key)
+        _bump_cache_stat("authoritative_archive")
+    return archive
+
+
+def _archive_cache_put(key: Tuple[str, str, str], archive: bytes) -> None:
+    global _archive_cache_bytes
+    size = len(archive)
+    if size > _ARCHIVE_CACHE_MAX_BYTES:
+        logger.warning(
+            "[REPO_SNAPSHOT] authoritative archive too large to cache for %s/%s@%s: %d bytes (limit %d)",
+            key[0],
+            key[1],
+            key[2][:12],
+            size,
+            _ARCHIVE_CACHE_MAX_BYTES,
+        )
+        return
+    existing = _archive_cache.pop(key, None)
+    if existing is not None:
+        _archive_cache_bytes -= len(existing)
+    _archive_cache[key] = archive
+    _archive_cache_bytes += size
+    while _archive_cache and (
+        _archive_cache_bytes > _ARCHIVE_CACHE_MAX_BYTES
+        or len(_archive_cache) > _ARCHIVE_CACHE_MAX_ENTRIES
+    ):
+        _, evicted = _archive_cache.popitem(last=False)
+        _archive_cache_bytes -= len(evicted)
+
+
+async def _fetch_authoritative_archive(
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    project_id: str | None,
+) -> bytes | None:
+    """Fetch and admit one immutable archive, returning None on failure."""
+    from urllib.parse import quote
+
+    from app.github import _github_request
+
+    cache_key = (owner, repo, commit_sha)
+    cached = _archive_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{quote(commit_sha, safe='')}"
+    try:
+        response = await _github_request(
+            "GET",
+            url,
+            _headers(token),
+            max_retries=2,
+            project_id=project_id,
+            follow_redirects=True,
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "[REPO_SNAPSHOT] authoritative archive fetch for %s/%s@%s: HTTP %s",
+                owner,
+                repo,
+                commit_sha[:12],
+                response.status_code,
+            )
+            return None
+        archive = response.content
+        _archive_cache_put(cache_key, archive)
+        return archive
+    except Exception as e:  # noqa: BLE001 — merge reads must degrade, not raise
+        logger.warning(
+            "[REPO_SNAPSHOT] authoritative archive fetch failed for %s/%s@%s: %s",
+            owner,
+            repo,
+            commit_sha[:12],
+            e,
+        )
+        return None
 
 
 async def _fetch_blob_text(
@@ -339,6 +494,88 @@ async def _fetch_blob_text(
             repo,
             blob_sha[:12],
             e,
+        )
+        return None
+
+
+async def authoritative_texts_at_commit(
+    paths: set[str],
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    project_id: str | None = None,
+    allow_missing_paths: bool = False,
+) -> dict[str, str] | None:
+    """Read several paths from one exact-SHA archive for a merge decision.
+
+    This is deliberately separate from the advisory grounding snapshot APIs
+    above: merge authority must not yield to ``GROUNDING_QUOTA_RESERVE`` or a
+    branch-tip cache.  GitHub's tarball endpoint accepts an immutable commit
+    SHA, so one request supplies a coherent tree without a Contents-API fanout.
+    ``None`` means the archive or a member's text could not be read and callers
+    must fail closed. ``allow_missing_paths`` preserves an exact tree's known
+    absences for baseline comparison; it never turns an archive failure into an
+    absence.
+    """
+    if not paths or any(not path or path.startswith("/") or ".." in path.split("/") for path in paths):
+        return None
+    cache_key = (owner, repo, commit_sha)
+    try:
+        archive_bytes = _archive_cache_get(cache_key)
+        if archive_bytes is None:
+            flight = _archive_fetch_tasks.get(cache_key)
+            if flight is None:
+                flight = asyncio.create_task(
+                    _fetch_authoritative_archive(
+                        token=token,
+                        owner=owner,
+                        repo=repo,
+                        commit_sha=commit_sha,
+                        project_id=project_id,
+                    )
+                )
+                _archive_fetch_tasks[cache_key] = flight
+
+                def _clear_completed_flight(done_task: asyncio.Task[bytes | None]) -> None:
+                    if _archive_fetch_tasks.get(cache_key) is done_task:
+                        _archive_fetch_tasks.pop(cache_key, None)
+
+                flight.add_done_callback(_clear_completed_flight)
+            # Shield the shared fetch from cancellation by one extraction
+            # caller; other callers still need its immutable result.
+            archive_bytes = await asyncio.shield(flight)
+
+        if archive_bytes is None:
+            return None
+
+        def _extract() -> dict[str, str] | None:
+            try:
+                with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+                    texts: dict[str, str] = {}
+                    for member in archive:
+                        if not member.isfile():
+                            continue
+                        member_path = member.name.split("/", 1)
+                        if len(member_path) != 2 or member_path[1] not in paths:
+                            continue
+                        handle = archive.extractfile(member)
+                        if handle is None:
+                            return None
+                        texts[member_path[1]] = handle.read().decode("utf-8", errors="replace")
+                    return texts if allow_missing_paths or set(texts) == paths else None
+            except (tarfile.TarError, OSError, UnicodeError):
+                return None
+
+        return await asyncio.to_thread(_extract)
+    except Exception:  # noqa: BLE001 — merge callers turn unavailable evidence into defer
+        logger.warning(
+            "[REPO_SNAPSHOT] authoritative archive read failed for %s/%s@%s",
+            owner,
+            repo,
+            commit_sha[:12],
+            exc_info=True,
         )
         return None
 

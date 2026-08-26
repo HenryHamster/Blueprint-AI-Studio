@@ -1,0 +1,615 @@
+name: Guard data
+
+# Close the one structural hole in the merge gate: automain PRs carry ZERO
+# check-runs by design.
+#
+# ci.yml's `pull_request` trigger is `branches: [main]` (automain was removed
+# 2026-06-20 with build_config.requires_ci_checks=false, because the full
+# 8-shard suite was re-running on every task PR and rollup into the integration
+# branch). The deterministic gate is therefore the automain->main promotion PR.
+#
+# That is the right call for the *suite*. It is the wrong call for one narrow
+# class: DERIVED ARTIFACTS. A PR that renames, adds or removes a test without
+# regenerating backend/.test_durations, admin-ui/.test_durations.json,
+# agent/.test_durations.json, test-estate-ranked-queue.md or a manifest JSON
+# merges unchecked and only reds the promotion PR — weeks and dozens of commits
+# later, blamed on whoever happened to cut it. Worse, the class is
+# SELF-CONCEALING: test_test_durations_freshness.py and its vitest twin compare
+# against origin/automain and downgrade *inherited* drift to a UserWarning, so
+# after one bad merge every later branch sees only a warning. It reappears only
+# where no baseline exists — the container, and the promotion PR.
+#
+# This workflow runs ONLY the guard-data subset, ONLY on automain-targeting
+# PRs. It is deliberately not the standalone lane and deliberately not a second
+# copy of ci.yml: main-targeting PRs already collect every one of these tests in
+# the 8-shard suite, so running here too would double the work and compete with
+# the promotion run for the self-hosted pool.
+#
+# DO NOT add this check to branch protection as *required*. A required-but-
+# pending check flips mergeable_state to `blocked`, which
+# orchestrator_ci_monitor.py handles by silently deferring BEFORE CI resolution
+# and only alerting at deferral 10. It gates correctly as an ordinary check:
+# proceed_on_no_checks (ci_resolution.py:88) only relaxes the *absence* of
+# checks; a present, red check resolves as a genuine failure and blocks.
+on:
+  pull_request:
+    # automain only. See above — main is already covered by ci.yml, and
+    # doubling up would contend for the same 4-slot self-hosted pool.
+    branches: [automain]
+    # 'edited' deliberately omitted, matching ci.yml: the autonomous pipeline
+    # PATCHes PR bodies on every fix iteration, and CI is SHA-keyed.
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# Own group. ci.yml's group embeds github.workflow, and so does this one, so the
+# two never queue behind each other.
+#
+# cancel-in-progress is safe here: a cancelled run belongs to the superseded
+# SHA, and CI resolution is SHA-keyed (resolve_ci_status), so the stale
+# conclusion is never queried. _details_have_genuine_failure() also counts only
+# `failure`/`action_required`, never `cancelled`.
+concurrency:
+  group: guard-data-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # Job name is a plain leaf with NO parenthetical sibling. github_checks.py's
+  # _details_have_genuine_failure() treats a check named `X` alongside `X (…)`
+  # as a matrix aggregate and discounts its failure as laundered — emitting that
+  # shape here would make a genuine guard-data failure invisible.
+  derived:
+    name: Derived artifacts
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
+    # Steady state is ~2 min, measured on this runner: 41s checkout, 1s deps,
+    # 268 passed / 1 skipped in 75.58s. The budget is sized for the rare cold
+    # case instead -- a PR that changes requirements.txt/Dockerfile has to build
+    # the deps layer (ci.yml gives that same build 15 min) before it can run a
+    # single test.
+    #
+    # It still has to stay well under the 60-minute
+    # ci_backstop_timeout_minutes (recovery_evaluating.py:125) that hard-FAILs
+    # the parent task and cascade-cancels its children. That backstop is why
+    # this number cannot simply be made generous: automain PRs previously
+    # resolved via `no_checks` in a single poll and never accumulated CI-wait at
+    # all, so this workflow re-arms a kill switch dormant for them.
+    timeout-minutes: 30
+    steps:
+      # MUST run before checkout, and checkout is exactly why.
+      #
+      # scripts/test-backend.sh bind-mounts the repo READ-WRITE and the
+      # container runs as root, so pytest leaves root-owned __pycache__,
+      # .pytest_cache and .testmondata in the workspace. The runner user cannot
+      # delete those, so the NEXT actions/checkout on this runner fails:
+      #
+      #   warning: failed to remove backend/app/routers/__pycache__/...pyc: Permission denied
+      #   ##[warning]Unable to clean or reset the repository. The repository will be recreated instead.
+      #   ##[error]File was unable to be removed Error: EACCES: permission denied,
+      #     unlink '.../backend/.pytest_cache/.gitignore'
+      #
+      # That workspace is _work/<repo>/<repo> — SHARED with ci.yml on the same
+      # runner. So one guard-data run could red an unrelated ci.yml job at
+      # checkout, on a runner that stays broken until someone repairs it by
+      # hand. Observed for real on runner-3, run 32790783814.
+      #
+      # ci.yml never hits this because it mounts `-v "$PWD:/repo:ro"` with
+      # PYTHONDONTWRITEBYTECODE=1 and `-p no:cacheprovider`. test-backend.sh
+      # cannot simply do the same: it is the developer/agent-VM harness and
+      # needs a writable tree.
+      #
+      # This step reclaims ownership before checkout so a workspace poisoned by
+      # an EARLIER run heals itself, and the paired always() step below stops
+      # this run from poisoning the next one. Both are cheap and idempotent.
+      #
+      # STOPGAP, and the root fix is still owed: test-backend.sh should not
+      # leave root-owned droppings in a bind-mounted tree at all — that also
+      # bites agent VMs and local checkouts, where it shows up as a git clean
+      # that silently cannot clean. Track it before deleting these steps.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20             -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null             || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
+      - uses: actions/checkout@v4
+        with:
+          # The freshness guards compare against origin/automain to tell drift
+          # this PR INTRODUCED from drift it merely inherited. Without the full
+          # fetch there is no baseline, and inherited drift hard-asserts —
+          # reddening every PR for someone else's rot.
+          fetch-depth: 0
+
+      # Resolve the deps layer BEFORE the test step, and leave it under the name
+      # tier 1 of resolve_deps_image (scripts/test-backend.sh:367) looks for --
+      # a zero-network `docker image inspect`. Two reasons this is a step and
+      # not left to the harness:
+      #
+      #  1. Correctness. The GHCR copy is pushed only by ci.yml's `backend-deps`
+      #     job, and ci.yml is `branches: [main]`. So an automain PR that
+      #     changes requirements.txt or Dockerfile misses tier 1 (never baked)
+      #     AND tier 2 (nobody pushed that reqhash yet) and silently falls to a
+      #     ~15-minute local build inside the test step's budget. That would red
+      #     an innocent PR for a dependency bump -- the precise class of
+      #     platform defect this gate exists to remove.
+      #  2. Speed. Once tagged locally, every later run on this runner takes
+      #     tier 1 and does no login, no pull, no network at all.
+      #
+      # Best-effort throughout, exactly like ci.yml's deps job: every failure
+      # path exits 0 and lets the harness fall back to its own local build, so
+      # this step can never be the thing that fails the check.
+      - name: Ensure deps image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -u
+          # Must match scripts/test-backend.sh:353 and ci.yml's backend-deps.
+          REQHASH=$(cat backend/requirements.txt backend/Dockerfile | sha256sum | cut -c1-16)
+          LOCAL="blueprint-backend-test-deps:$REQHASH"
+          echo "deps tag: $REQHASH"
+
+          if docker image inspect "$LOCAL" >/dev/null 2>&1; then
+            echo "$LOCAL already present — tier 1 hit, nothing to do"
+            exit 0
+          fi
+
+          REMOTE="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/backend-test-deps:$REQHASH"
+          if echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null 2>&1              && timeout 300 docker pull "$REMOTE" >/dev/null 2>&1; then
+            docker tag "$REMOTE" "$LOCAL"
+            echo "pulled $REMOTE and tagged it $LOCAL"
+            exit 0
+          fi
+
+          echo "::warning::deps image $REQHASH not cached anywhere — building it locally (one time, ~15 min). This is expected on a PR that changes backend/requirements.txt or backend/Dockerfile, because ci.yml (main-only) has not published that tag yet."
+          docker build --target deps -t "$LOCAL" ./backend             || echo "::warning::deps build failed — the harness will rebuild and surface the real error"
+          exit 0
+
+      - name: Run guard-data corpus
+        env:
+          # Wholesale override of the --standalone roster
+          # (scripts/test-backend.sh:665). Newline-separated selectors, base64.
+          # Narrower than --standalone on purpose: that roster is ~1800 tests
+          # and defaults Postgres ON. These are the derived-artifact and
+          # manifest guards only, and none of them needs a database.
+          BLUEPRINT_STATIC_GUARD_SELECTORS: |
+            dGVzdGluZy90ZXN0X3Rlc3RfZHVyYXRpb25zX2ZyZXNobmVzcy5weQp0ZXN0aW5nL3Rlc3Rfdml0
+            ZXN0X2R1cmF0aW9uc19mcmVzaG5lc3MucHkKdGVzdGluZy90ZXN0X3Rlc3RfZXN0YXRlX3Jhbmtl
+            ZF9xdWV1ZS5weQp0ZXN0aW5nL3Rlc3Rfc2hhcmRfYmFsYW5jZS5weQp0ZXN0aW5nL3Rlc3RfaW1w
+            YWN0ZWRfdGVzdHMucHkKdGVzdGluZy90ZXN0X3dlYnNvY2tldF9lbWl0dGVyX2ludmVudG9yeS5w
+            eQp0ZXN0aW5nL3Rlc3Rfb3BlcmF0b3Jfd29ya2JlbmNoX2NvbnRyYWN0cy5weTo6dGVzdF93ZWJz
+            b2NrZXRfZW1pdHRlcl9pbnZlbnRvcnlfY292ZXJzX2N1cnJlbnRfZW1pdHRlcnMKdGVzdGluZy90
+            ZXN0X2V2ZW50X3R5cGVfaW52YXJpYW50cy5weQp0ZXN0aW5nL3Rlc3RfbWlncmF0aW9uX2NoYWlu
+            LnB5CnRlc3RpbmcvdGVzdF9yZWxlYXNlX3Byb21vdGlvbl9tZXRyaWNfbWFuaWZlc3QucHkKdGVz
+            dGluZy90ZXN0X2NvbnZlcnNhdGlvbmFsX3dvcmtkYXlfcHJvdGVjdGlvbi5weQo=
+          # Fallback only: the step above normally leaves the image under the
+          # tier-1 local tag, so the harness never reaches tier 2. Keep the
+          # credentials anyway so that if the prep step failed for some reason,
+          # the GHCR pull (scripts/test-backend.sh:374) is still available
+          # rather than dropping straight to a ~15-minute local build.
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          # The env value above is soft-wrapped across lines for readability;
+          # the harness base64-decodes it and base64 ignores whitespace, but
+          # strip it anyway so the value is exactly what a local reproduction
+          # would export.
+          BLUEPRINT_STATIC_GUARD_SELECTORS="$(printf '%s' "$BLUEPRINT_STATIC_GUARD_SELECTORS" | tr -d '[:space:]')"
+          export BLUEPRINT_STATIC_GUARD_SELECTORS
+          bash scripts/test-backend.sh --standalone --no-postgres
+
+      - name: Explain a failure
+        if: failure()
+        run: |
+          # A red guard-data check spawns a real fix task
+          # (ci_completion.py, fix_reason="ci_failure"), which costs a VM. Give
+          # that agent — and a human — the exact command, so it converges in one
+          # pass instead of rediscovering the regeneration path.
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Guard data is stale
+
+          A derived artifact no longer matches the test estate. This is almost
+          always a test that was **added, renamed, or deleted** without
+          regenerating the file that indexes it.
+
+          Each guard names the offending entries in its own assertion — read the
+          failure above first; it is more specific than anything here.
+
+          Regenerate whichever artifact the failure names:
+
+          | Artifact | Command |
+          |---|---|
+          | `backend/.test_durations` | `scripts/store-backend-durations.sh` (~15-20 min, needs Docker + Postgres) |
+          | `admin-ui/.test_durations.json`, `agent/.test_durations.json` | `scripts/batch-store-durations.sh` |
+          | either of the above, from existing data | `scripts/regenerate-durations.py` |
+          | `test-estate-ranked-queue.md` | `python scripts/generate_test_estate_ranked_queue.py` |
+          | viewport manifest | `python scripts/viewport_manifest.py` |
+          | frontend release manifest | `python scripts/frontend_release_manifest.py` |
+
+          Reproduce this exact lane locally:
+
+          ```bash
+          export BLUEPRINT_STATIC_GUARD_SELECTORS="$(printf '%s\n' \
+            testing/test_test_durations_freshness.py \
+            testing/test_vitest_durations_freshness.py \
+            testing/test_test_estate_ranked_queue.py \
+            testing/test_shard_balance.py \
+            testing/test_impacted_tests.py \
+            testing/test_websocket_emitter_inventory.py \
+            'testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters' \
+            testing/test_event_type_invariants.py \
+            testing/test_migration_chain.py \
+            testing/test_release_promotion_metric_manifest.py \
+            testing/test_conversational_workday_protection.py | base64 -w0)"
+          bash scripts/test-backend.sh --standalone --no-postgres
+          ```
+
+          **Do not "fix" this by deleting the guard or the stale entry's test.**
+          If a test really was removed, regenerating the artifact drops its row
+          for you.
+          EOF
+
+      # Pair of the pre-checkout reclaim above. Runs even when the tests fail,
+      # so a red guard-data run does not additionally leave the runner unable to
+      # check out. Never fails the job.
+      - name: Hand the workspace back to the runner user
+        if: always()
+        run: |
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20             -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null             || echo "::warning::post-run reclaim failed; next checkout on this runner may fail"
+
+  # The SECOND structural hole in the merge gate, and the wider one.
+  #
+  # `derived` above closes the derived-artifact class. This job closes BEHAVIOUR
+  # regressions: today an automain PR runs no backend test at all, so a change
+  # that breaks backend behaviour merges unchecked and first goes red on the
+  # automain->main promotion PR — weeks and dozens of commits later, attributed
+  # to whoever cut the promotion rather than to the change that caused it. In
+  # this repo a red promotion run CLOSES the promotion PR and DELETES its
+  # release branch, so finding out late costs a full re-cut.
+  #
+  # Re-adding automain to ci.yml's trigger is NOT the fix and must not be done:
+  # that restores the full 8-shard suite on every task PR and every rollup,
+  # which is exactly what was removed 2026-06-20 for cost. Instead this runs a
+  # BOUNDED, diff-selected subset through backend/testing/impacted_tests.py —
+  # a module that already exists, is already covered by
+  # testing/test_impacted_tests.py, and whose docstring describes this exact
+  # "merge gate protocol" but which until now had no CI consumer at all. Its
+  # output is ranked by relevance to the diff, so a cap keeps the tests most
+  # likely to catch a contract break rather than an arbitrary prefix.
+  #
+  # DO NOT add this to branch protection as *required* — see the header note on
+  # `derived`. It gates correctly as an ordinary check.
+  impacted:
+    name: Impacted backend tests
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
+    # Budget arithmetic, load-bearing in BOTH directions.
+    #
+    # Ceiling: must stay well under ci_backstop_timeout_minutes = 60
+    # (recovery_evaluating.py:125), which hard-FAILs the parent task and
+    # cascade-cancels its children. A budget at or above that turns a
+    # slow-but-healthy run into a cascade kill — the harness-budget-inversion
+    # class. 30 leaves 30 minutes of slack for queueing on the 4-slot pool.
+    #
+    # A selector COUNT cap cannot bound wall time. That was measured, not
+    # assumed. Costed against backend/.test_durations (630 files, 183.6 min
+    # total), the eight heaviest backend test files sum to 2556.5s = 42.6 min
+    # — so even an 8-file selection has an absolute ceiling ABOVE this job's
+    # 30-minute budget, and only 17 min under the 60-minute backstop. Real
+    # single-module diffs are not much kinder: a task_lifecycle.py change
+    # selects 17.4 min of tests, models.py 15.6, main.py 14.3. A count-only
+    # cap would plant precisely the inversion the paragraph above forbids.
+    #
+    # So the real bound is a DURATION budget: --budget-seconds below, enforced
+    # by impacted_tests.py against measured per-file cost. Mandatory drift
+    # sentinels are charged first and are never deferred (a typical 6-sentinel
+    # match totals ~6s, so they are effectively free). The honest bound is
+    # `budget + cost of the single heaviest selected file`, because the first
+    # ordinary selector is always kept: a 10 min budget + a ~10 min worst-case
+    # file + ~2 min of Postgres sidecar and container startup still lands
+    # inside 30, with the remainder absorbing a cold deps build.
+    #
+    # SELECTION_LIMIT=8 is not a new number. It is the merge-gate protocol
+    # already pinned in backend/testing/drift_sentinel_surfaces.json's `_doc`,
+    # in scripts/test-backend.sh's verification-evidence check, and in
+    # agent/src/handlers/verify-tests.ts's IMPACTED_TEST_CAP. This job runs
+    # what an agent is already expected to run locally, no more.
+    #
+    # If this job starts TIMING OUT rather than failing an assertion, LOWER
+    # SELECTION_BUDGET_SECONDS. Do not raise timeout-minutes.
+    timeout-minutes: 30
+    steps:
+      # Same pre-checkout reclaim as `derived`, for the same reason: this job
+      # also bind-mounts the repo read-write through scripts/test-backend.sh and
+      # shares _work/<repo>/<repo> with ci.yml. See the long comment there.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
+      - uses: actions/checkout@v4
+        with:
+          # Required. The selector diffs against the PR base SHA, and a depth-1
+          # checkout does not contain it. A gate that cannot compute its own
+          # diff would report "nothing impacted" forever — the vacuous-guard
+          # class this job exists to avoid, not to join. The explicit
+          # base-commit verify and changed-file cross-check below are the
+          # belt-and-braces for the same failure mode.
+          fetch-depth: 0
+
+      # Byte-identical to `derived`'s step, and here it must run BEFORE
+      # selection: the selector itself executes inside this image, so the tag
+      # has to exist first. Best-effort — every failure path exits 0.
+      - name: Ensure deps image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -u
+          # Must match scripts/test-backend.sh:353 and ci.yml's backend-deps.
+          REQHASH=$(cat backend/requirements.txt backend/Dockerfile | sha256sum | cut -c1-16)
+          LOCAL="blueprint-backend-test-deps:$REQHASH"
+          echo "DEPS_IMAGE=$LOCAL" >> "$GITHUB_ENV"
+          echo "deps tag: $REQHASH"
+
+          if docker image inspect "$LOCAL" >/dev/null 2>&1; then
+            echo "$LOCAL already present — tier 1 hit, nothing to do"
+            exit 0
+          fi
+
+          REMOTE="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/backend-test-deps:$REQHASH"
+          if echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null 2>&1 && timeout 300 docker pull "$REMOTE" >/dev/null 2>&1; then
+            docker tag "$REMOTE" "$LOCAL"
+            echo "pulled $REMOTE and tagged it $LOCAL"
+            exit 0
+          fi
+
+          echo "::warning::deps image $REQHASH not cached anywhere — building it locally (one time, ~15 min). Expected on a PR that changes backend/requirements.txt or backend/Dockerfile, because ci.yml (main-only) has not published that tag yet."
+          docker build --target deps -t "$LOCAL" ./backend || echo "::warning::deps build failed — the harness will rebuild and surface the real error"
+          exit 0
+
+      # NOTHING in this step suppresses a git error, and that is deliberate.
+      #
+      # The failure mode to design against is not "the diff is wrong", it is
+      # "the diff could not be computed and the gate reported clean anyway" —
+      # ci.yml's migration linter lived that way for its entire life because it
+      # wrapped the read in `2>/dev/null || true` and treated empty output as
+      # "no migrations". So: `set -euo pipefail`, an explicit verify that the
+      # base commit is actually present, and a cross-check of our own diff
+      # against the changed-file count GitHub independently reports. If those
+      # two disagree, this step FAILS rather than selecting nothing.
+      - name: Select impacted backend tests
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          # See the timeout-minutes arithmetic above before changing either.
+          # The count cap is the documented merge-gate protocol; the duration
+          # budget is what actually bounds this job's wall time.
+          SELECTION_LIMIT: "8"
+          SELECTION_BUDGET_SECONDS: "600"
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/impacted"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+
+          if [ -n "${BASE_SHA:-}" ]; then
+            BASE="$BASE_SHA"
+          else
+            # workflow_dispatch has no PR context. Fetch the ref explicitly
+            # rather than assuming a remote-tracking branch exists.
+            git fetch --no-tags origin "+refs/heads/automain:refs/remotes/origin/automain"
+            BASE="$(git rev-parse origin/automain)"
+          fi
+
+          git rev-parse -q --verify "${BASE}^{commit}" >/dev/null || {
+            echo "::error::base commit ${BASE} is absent from this checkout — the diff cannot be computed, so this gate cannot report a result"
+            exit 1
+          }
+          echo "diffing ${BASE}..HEAD ($(git rev-parse HEAD))"
+
+          git diff --name-only "$BASE" HEAD > "$WORK/changed.txt"
+          CHANGED_COUNT=$(wc -l < "$WORK/changed.txt")
+          echo "changed files: $CHANGED_COUNT"
+
+          # Non-vacuity cross-check against a source we do not control. An
+          # empty diff when GitHub says the PR touches files means we could not
+          # look, which is the one outcome that must never read as a pass.
+          if [ "${GH_CHANGED_FILES:-0}" -gt 0 ] && [ "$CHANGED_COUNT" -eq 0 ]; then
+            echo "::error::GitHub reports ${GH_CHANGED_FILES} changed files but the diff against ${BASE} found none — refusing to report a vacuous pass"
+            exit 1
+          fi
+
+          # Run the selector inside the deps image rather than on the runner:
+          # same interpreter that will run the tests, no dependency on whatever
+          # python happens to be installed on a self-hosted host, and --user
+          # keeps it from leaving root-owned files behind.
+          docker run --rm -i \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:/repo:ro" \
+            -v "$WORK:/sel" \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            --entrypoint /usr/local/bin/python \
+            "$DEPS_IMAGE" \
+            /repo/backend/testing/impacted_tests.py \
+              --repo-root /repo \
+              --limit "$SELECTION_LIMIT" \
+              --budget-seconds "$SELECTION_BUDGET_SECONDS" \
+              --mandatory-output /sel/mandatory.txt \
+            < "$WORK/changed.txt" \
+            > "$WORK/ordinary.txt" \
+            2> "$WORK/overflow.txt"
+
+          cat "$WORK/mandatory.txt" "$WORK/ordinary.txt" > "$WORK/selected.txt"
+
+          # impacted_tests.py emits REPO-relative paths; scripts/test-backend.sh
+          # runs pytest with cwd=backend and wants BACKEND-relative selectors.
+          # Anything outside backend/testing/ is a contract break in the
+          # selector, not something to quietly skip.
+          SELECTORS=""
+          while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            case "$rel" in
+              backend/testing/test_*.py)
+                SELECTORS="${SELECTORS}${SELECTORS:+ }${rel#backend/}"
+                ;;
+              *)
+                echo "::error::impacted_tests.py emitted a selector outside backend/testing/: ${rel}"
+                exit 1
+                ;;
+            esac
+          done < "$WORK/selected.txt"
+
+          SELECTED_COUNT=$(wc -l < "$WORK/selected.txt")
+          echo "selectors=$SELECTORS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Impacted backend tests"
+            echo
+            echo "\`$CHANGED_COUNT\` changed file(s) → \`$SELECTED_COUNT\` selected test file(s)."
+            echo
+            if [ "$SELECTED_COUNT" -gt 0 ]; then
+              echo '```'
+              sed 's/^/  /' "$WORK/selected.txt"
+              echo '```'
+            else
+              echo "_Nothing in this diff maps to a backend test. This job is a green no-op._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # No silent caps. The overflow is real coverage this run did NOT
+          # provide, and it has to be visible in the check that claims to have
+          # verified the change.
+          #
+          # Deferral has TWO causes and they are reported separately on
+          # purpose. `deferred-rank:` is the long tail outside the relevance
+          # cap — a change to a core module puts HUNDREDS of files there, so
+          # rolling them into the summary would bury the signal; the selector's
+          # own `rank-cap:` count carries the magnitude instead.
+          # `deferred-budget:` entries were ranked IN as relevant and dropped
+          # only for wall clock, so those are named individually — there are at
+          # most SELECTION_LIMIT of them.
+          #
+          # A `budget: no usable measurements` line here is the tell that
+          # backend/.test_durations was missing or unparseable inside the deps
+          # image, which means this run was bounded by count alone and its
+          # wall time was NOT bounded at all. Surfaced as a warning, not
+          # swallowed: it is the fail-open path admitting it fell open.
+          {
+            BUDGET_LINE="$(sed -n 's/^budget: //p' "$WORK/overflow.txt")"
+            RANK_LINE="$(sed -n 's/^rank-cap: //p' "$WORK/overflow.txt")"
+          } || true
+
+          if [ -n "${BUDGET_LINE:-}" ]; then
+            echo "budget: $BUDGET_LINE"
+            printf '\n**Duration budget:** %s\n' "$BUDGET_LINE" >> "$GITHUB_STEP_SUMMARY"
+            case "$BUDGET_LINE" in
+              "no usable measurements"*)
+                echo "::warning::cost budgeting did not apply — $BUDGET_LINE. This run was bounded by selector count only, which does NOT bound wall time." ;;
+            esac
+          fi
+          if [ -n "${RANK_LINE:-}" ]; then
+            echo "rank-cap: $RANK_LINE"
+            printf '\n**Relevance cap:** %s — the long tail is covered by the promotion PR'"'"'s full matrix.\n' "$RANK_LINE" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if grep -q '^deferred-budget: ' "$WORK/overflow.txt"; then
+            echo "::warning::the tests below were ranked as impacted but dropped to stay inside the ${SELECTION_BUDGET_SECONDS}s budget; they are deferred to the promotion PR"
+            sed -n 's/^deferred-budget: /  /p' "$WORK/overflow.txt"
+            {
+              echo
+              echo "### Impacted but deferred by the \`${SELECTION_BUDGET_SECONDS}s\` duration budget"
+              echo
+              echo "These ranked **inside** the \`--limit ${SELECTION_LIMIT}\` relevance"
+              echo "cap and were skipped only for wall clock. They are covered by the"
+              echo "automain→main promotion PR's full matrix."
+              echo
+              echo '```'
+              sed -n 's/^deferred-budget: /  /p' "$WORK/overflow.txt"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Not a failure: a diff can legitimately impact no test (docs, a new
+          # module nothing references yet). But say so loudly, because "selected
+          # nothing" and "could not look" print the same way otherwise.
+          if [ "$SELECTED_COUNT" -eq 0 ] && [ "$CHANGED_COUNT" -gt 0 ]; then
+            echo "::notice::no backend test is impacted by these ${CHANGED_COUNT} changed file(s)"
+          fi
+
+      - name: Run impacted backend tests
+        env:
+          SELECTORS: ${{ steps.select.outputs.selectors }}
+          # Fallback only — the prep step normally leaves the image under the
+          # tier-1 local tag. Kept so a failed prep still reaches the GHCR pull
+          # instead of dropping to a ~15-minute local build.
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -uo pipefail
+          if [ -z "${SELECTORS:-}" ]; then
+            echo "No backend tests impacted by this diff — nothing to run."
+            exit 0
+          fi
+          echo "running: $SELECTORS"
+          # Deliberate word splitting: SELECTORS is a space-separated selector
+          # list built and shape-validated by the step above.
+          # shellcheck disable=SC2086
+          bash scripts/test-backend.sh $SELECTORS
+
+      - name: Explain a failure
+        if: failure()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## An impacted backend test failed
+
+          These tests were selected because this PR changed code they cover —
+          they are not a random sample. A failure here is a **behaviour
+          regression introduced by this PR**, and it is the same failure that
+          would otherwise have surfaced weeks later on the automain→main
+          promotion PR, where a red run closes the promotion PR and deletes its
+          release branch.
+
+          Reproduce exactly, from the repo root:
+
+          ```bash
+          # the selector list is printed by the "Select impacted backend tests"
+          # step above, and by `Run impacted backend tests` as `running: ...`
+          bash scripts/test-backend.sh testing/test_<one>.py testing/test_<two>.py
+          ```
+
+          Recompute the selection for an arbitrary diff:
+
+          ```bash
+          git diff --name-only origin/automain HEAD \
+            | python backend/testing/impacted_tests.py --limit 8 --budget-seconds 600
+          ```
+
+          **Diagnose before you edit.** Is the failure in the CODE or in the
+          TEST? Do not delete or skip a test to go green; if a test genuinely
+          checks a removed behaviour, remove the behaviour's test with the
+          behaviour, in the same diff, and say so.
+
+          If the failure is a `Timeout (>30.0s)` rather than an assertion, it is
+          a harness problem, not a finding — report it instead of retrying.
+          EOF
+
+      # Pair of the pre-checkout reclaim. Runs even when the tests fail, so a
+      # red run does not additionally leave the runner unable to check out.
+      # Never fails the job.
+      #
+      # Also drops this run's Postgres sidecar network. test-backend.sh names it
+      # blueprint-test-net-$$ and removes it in an EXIT trap, but a hard kill
+      # (concurrency cancel-in-progress) skips the trap and leaks it. `docker
+      # network rm` refuses a network that still has attached containers, so
+      # this cannot disturb a concurrent ci.yml or guard-data run. Cleanup is
+      # not evidence, so suppressing its errors here is not the vacuous-guard
+      # pattern the select step guards against.
+      - name: Hand the workspace back to the runner user
+        if: always()
+        run: |
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null || echo "::warning::post-run reclaim failed; next checkout on this runner may fail"
+          for net in $(docker network ls --filter 'name=blueprint-test-net-' --format '{{.Name}}'); do
+            docker network rm "$net" >/dev/null 2>&1 || true
+          done
+          exit 0

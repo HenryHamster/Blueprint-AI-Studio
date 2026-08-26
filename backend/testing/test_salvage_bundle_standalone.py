@@ -5459,23 +5459,55 @@ def test_m2_review_pipeline_blocker_stamps_audience():
     )
 
 
+# Non-vacuity floors for the scan below. Pinned as literals ON PURPOSE and set
+# far below the real counts (571 files / 74 matched constructors under
+# backend/app as of 2026-08-25), so a broken path — or a matcher that has
+# stopped recognising the call shape it polices — fails loudly instead of
+# passing on an empty corpus. Deriving them from the scan itself would make the
+# guard self-certifying.
+#
+# History: this guard globbed the CWD-relative pattern "backend/app/**/*.py".
+# Every lane that runs it has backend/ as its CWD (/app inside the test image),
+# so the pattern resolved to backend/backend/app/** — measured at 0 files — and
+# the guard passed unconditionally from the day it was written (issue #17872).
+_M2_APP_TREE_FILE_FLOOR = 400
+_M2_ALERT_CONSTRUCTOR_FLOOR = 40
+
+
 def test_m2_all_alert_constructors_have_event_type():
     """Every Alert(...) instantiation in backend/app/ must include event_type=.
 
-    Finding claim: ~93 of 112 direct Alert(...) constructors omit event_type=,
-    reaching the operator badge via the fail-open read filter.
+    Finding claim: direct Alert(...) constructors that omit event_type= reach
+    the operator badge via the fail-open read filter.
     Fix: every Alert() in the emitter surface must pass event_type= so the
     audience registry can route it.
+
+    The corpus root is resolved from ``__file__``, never from the CWD. The
+    matcher is deliberately narrow (assignments to ``alert``/``_alert``/
+    ``_res_alert``); the whole-tree AST form of this invariant lives in
+    ``test_message_audience.test_no_alert_constructor_bypasses_event_type_gate``.
+    The constructor floor is what keeps this narrow matcher honest.
     """
     import re
-    import glob
 
-    files = glob.glob("backend/app/**/*.py", recursive=True)
+    app_dir = _find_backend_app_file("message_audience.py").parent
+    files = sorted(str(path) for path in app_dir.rglob("*.py"))
+    assert len(files) >= _M2_APP_TREE_FILE_FLOOR, (
+        f"only {len(files)} python files scanned under {app_dir}; expected at "
+        f"least {_M2_APP_TREE_FILE_FLOOR}. The guard is not reaching the app "
+        f"tree, so a clean result proves nothing.\n"
+        # The offending identity here is the ROOT that came back short, not any
+        # individual file -- there is no offender list to name when the corpus
+        # is the thing that went missing.
+        + format_offender_marker([str(app_dir)])
+    )
+    matched_constructors = 0
     missing = []
-    for f in sorted(files):
-        with open(f) as fh:
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
             src = fh.read()
         for m in re.finditer(r"(?:alert|_alert|_res_alert)\s*=\s*Alert\s*\(", src):
+            matched_constructors += 1
             start = m.start()
             paren_pos = src.index("(", start)
             depth = 0
@@ -5493,6 +5525,12 @@ def test_m2_all_alert_constructors_have_event_type():
                 lineno = src[:start].count("\n") + 1
                 missing.append(f"{f}:{lineno}")
 
+    assert matched_constructors >= _M2_ALERT_CONSTRUCTOR_FLOOR, (
+        f"only {matched_constructors} Alert() constructors matched under "
+        f"{app_dir}; expected at least {_M2_ALERT_CONSTRUCTOR_FLOOR}. The "
+        f"matcher has stopped recognising the constructor shape it polices, so "
+        f"an empty offender list means nothing."
+    )
     assert not missing, (
         "These Alert() constructors are missing event_type= and will fail-open "
         "to the operator badge via the NULL read filter:\n"

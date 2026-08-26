@@ -948,6 +948,13 @@ def _make_baseline(
     iteration_p95: float | None = None,
     convergence_rate: float | None = None,
     cap_exhausted_chain_count: int | None = None,
+    cap_exhausted_directions: list[dict] | None = None,
+    reviews_to_converge_count: int = 0,
+    reviews_to_converge_median: float | None = None,
+    reviews_to_converge_p95: float | None = None,
+    retarget_delta_count: int = 0,
+    retarget_full_count: int = 0,
+    stale_head_discard_count: int = 0,
 ) -> dict:
     return {
         "version_number": version_number,
@@ -985,12 +992,23 @@ def _make_baseline(
         "lane_waste": {
             "waste_taxonomy": waste_taxonomy,
             "waste_task_count": waste_task_count,
+            "reviews_to_converge": {
+                "count": reviews_to_converge_count,
+                "median": reviews_to_converge_median,
+                "p95": reviews_to_converge_p95,
+            },
+            "retarget_review_scope_counts": {
+                "delta": retarget_delta_count,
+                "full": retarget_full_count,
+            },
+            "stale_head_discard_count": stale_head_discard_count,
         },
         "outer_loop_convergence": {
             "iteration_median": iteration_median,
             "iteration_p95": iteration_p95,
             "convergence_rate": convergence_rate,
             "cap_exhausted_chain_count": cap_exhausted_chain_count,
+            "cap_exhausted_directions": cap_exhausted_directions,
         },
     }
 
@@ -1026,6 +1044,12 @@ def test_lane_baseline_trend_uses_producer_lane_keys():
         iteration_p95=3.0,
         convergence_rate=0.8,
         cap_exhausted_chain_count=0,
+        cap_exhausted_directions=[
+            {"direction_id": "d-latest", "direction_text": "Latest cap loss"},
+            {"direction_id": "d-id-only", "direction_text": None},
+            {"direction_id": "", "direction_text": "invalid"},
+            "invalid-record",
+        ],
     )
     prior = _make_baseline(
         version_number=4,
@@ -1053,6 +1077,7 @@ def test_lane_baseline_trend_uses_producer_lane_keys():
         iteration_p95=4.0,
         convergence_rate=0.6,
         cap_exhausted_chain_count=2,
+        cap_exhausted_directions=[],
     )
 
     trend = compute_lane_baseline_trend([latest, prior])
@@ -1087,6 +1112,13 @@ def test_lane_baseline_trend_uses_producer_lane_keys():
     assert convergence["iteration_p95"]["classification"] == "improving"
     assert convergence["convergence_rate"]["classification"] == "improving"
     assert convergence["cap_exhausted_chain_count"]["classification"] == "improving"
+    assert convergence["cap_exhausted_directions"] == {
+        "latest": [
+            {"direction_id": "d-latest", "direction_text": "Latest cap loss"},
+            {"direction_id": "d-id-only", "direction_text": None},
+        ],
+        "prior": [],
+    }
 
     # conflict p50 improved: delta = -1.0
     conflict_p50 = trend["lane_iterations"]["conflict"]["p50"]
@@ -1121,6 +1153,87 @@ def test_lane_baseline_trend_uses_producer_lane_keys():
     # merge_conflict: latest = 2/10 = 0.2; prior = 1/5 = 0.2; delta = 0 → stable
     mc = trend["waste_taxonomy_shares"]["merge_conflict"]
     assert mc["classification"] == "stable"
+
+
+def test_lane_baseline_trend_reports_reviews_to_converge_and_retarget_scope():
+    """The two-version trend exposes the retarget convergence decision surface."""
+    from app.digest_metrics import compute_lane_baseline_trend
+
+    latest = _make_baseline(
+        version_number=6,
+        wall_clock=1000.0,
+        active=500.0,
+        gap=500.0,
+        task_count=2.0,
+        conflict_p50=1.0,
+        conflict_p90=2.0,
+        ci_p50=1.0,
+        ci_p90=2.0,
+        review_convergence_p50=1.0,
+        review_convergence_p90=2.0,
+        waste_taxonomy={"infra": 0, "unknown": 0},
+        waste_task_count=0,
+        reviews_to_converge_count=3,
+        reviews_to_converge_median=2.0,
+        reviews_to_converge_p95=5.0,
+        retarget_delta_count=1,
+        retarget_full_count=2,
+        stale_head_discard_count=0,
+    )
+    prior = _make_baseline(
+        version_number=5,
+        wall_clock=1000.0,
+        active=500.0,
+        gap=500.0,
+        task_count=2.0,
+        conflict_p50=1.0,
+        conflict_p90=2.0,
+        ci_p50=1.0,
+        ci_p90=2.0,
+        review_convergence_p50=1.0,
+        review_convergence_p90=2.0,
+        waste_taxonomy={"infra": 0, "unknown": 0},
+        waste_task_count=0,
+        reviews_to_converge_count=4,
+        reviews_to_converge_median=4.0,
+        reviews_to_converge_p95=7.0,
+        retarget_delta_count=3,
+        retarget_full_count=1,
+        stale_head_discard_count=2,
+    )
+
+    trend = compute_lane_baseline_trend([latest, prior])
+
+    assert trend is not None
+    retarget = trend["retarget_convergence"]
+    assert retarget["reviews_to_converge"]["count"]["delta"] == -1
+    # Sample size, not cost: converging fewer chains is a throughput drop, so
+    # it must never be classified (in either direction) on the operator surface.
+    assert retarget["reviews_to_converge"]["count"]["classification"] is None
+    assert retarget["reviews_to_converge"]["median"]["classification"] == "improving"
+    assert retarget["reviews_to_converge"]["p95"]["latest"] == 5.0
+    assert retarget["retarget_review_scope_counts"]["delta"]["classification"] == "improving"
+    assert retarget["retarget_review_scope_counts"]["full"]["classification"] == "declining"
+    assert retarget["stale_head_discard_count"]["classification"] == "improving"
+
+    legacy_latest = {**latest, "lane_waste": {**latest["lane_waste"]}}
+    legacy_prior = {**prior, "lane_waste": {**prior["lane_waste"]}}
+    for baseline in (legacy_latest, legacy_prior):
+        baseline["lane_waste"].pop("reviews_to_converge")
+        baseline["lane_waste"].pop("retarget_review_scope_counts")
+        baseline["lane_waste"].pop("stale_head_discard_count")
+
+    legacy_trend = compute_lane_baseline_trend([legacy_latest, legacy_prior])
+
+    assert legacy_trend is not None
+    # Never-measured (legacy baseline) reads "unavailable", not "evicted".
+    assert legacy_trend["retarget_convergence"]["reviews_to_converge"]["median"] == {
+        "latest": None,
+        "prior": None,
+        "delta": None,
+        "classification": None,
+        "availability": {"latest": "unavailable", "prior": "unavailable"},
+    }
 
 
 @pytest.mark.asyncio

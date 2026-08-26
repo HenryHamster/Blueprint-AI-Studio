@@ -222,6 +222,146 @@ def _open_pull_request(
     }
 
 
+def _no_check_runs() -> dict:
+    """Strict-mode check-runs result for a commit that carries NO check-runs."""
+    return {
+        "status": "no_checks",
+        "conclusion": None,
+        "details": [],
+        "failed_logs": "",
+        "genuine_failure": False,
+    }
+
+
+def _failed_check_runs(name: str = "Derived artifacts") -> dict:
+    """A PRESENT, COMPLETED, genuinely-failing LEAF check-run.
+
+    ``Derived artifacts`` is a leaf, not a matrix aggregate: no sibling check is
+    named ``Derived artifacts (...)``, so ``github_checks``'s aggregate-parent
+    discount (added for the laundered ``CI / Backend`` failure in PR #16885)
+    does not apply and this is a genuine red.
+    """
+    return {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [{"name": name, "status": "completed", "conclusion": "failure"}],
+        "failed_logs": f"{name} failed",
+        "genuine_failure": True,
+    }
+
+
+def _errored_check_runs() -> dict:
+    """The shape ``get_check_runs`` returns when the GitHub API call FAILS.
+
+    A 5xx, a rate-limit exhaustion or an expired install token all yield
+    ``status="pending"`` with an EMPTY ``details`` and ``_from_api_error=True``
+    — by state alone indistinguishable from a real in-progress build.
+    """
+    return {
+        "status": "pending",
+        "conclusion": None,
+        "details": [],
+        "failed_logs": "",
+        "genuine_failure": False,
+        "_from_api_error": True,
+    }
+
+
+def _started_check_runs(name: str = "Derived artifacts") -> dict:
+    """A check-run that has STARTED but NOT completed — the PR #17933 shape.
+
+    #17933's ``Derived artifacts`` check started at 15:24:56 and concluded
+    FAILURE at 15:26:36; the PR merged at 15:25:11 — 15 s after the check
+    started and 85 s before it finished. A started check is not a passed check.
+    """
+    return {
+        "status": "in_progress",
+        "conclusion": None,
+        "details": [{"name": name, "status": "in_progress", "conclusion": None}],
+        "failed_logs": "",
+        "genuine_failure": False,
+    }
+
+
+async def _setup_bypass_merge_task(session, mocker, *, check_runs: dict):
+    """Drive the review-BYPASS auto-merge path with an explicit CI precondition.
+
+    Returns ``(task, merge_spy, check_spy, spawned_types)``. The task is a
+    non-intermediate (base_branch=main) ``docs`` task, so
+    ``review_policy.should_skip_initial_review`` returns True and post-commit
+    routes it through the scan-then-auto-merge bypass.
+    """
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="docs",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    task.payloads = [{"type": "docs", "prompt": "update docs", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            **_open_pull_request(head_ref="blueprint/task-docs", base_ref="main"),
+            "additions": 5,
+            "deletions": 1,
+            "changed_files": 1,
+        },
+    )
+    merge_spy = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "docs/readme.md", "status": "modified"}],
+    )
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    check_spy = mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value=check_runs,
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new_callable=AsyncMock,
+        return_value=[],
+    )
+    spawned_types: list = []
+
+    async def _capture_spawn(src_task, ptype, *a, **kw):
+        spawned_types.append(ptype)
+        return (None, False)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    return task, merge_spy, check_spy, spawned_types
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _has_active_strategic_task
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3648,6 +3788,35 @@ async def test_process_post_commit_task_not_found_returns_accepted(tl_db):
 
 
 @pytest.mark.asyncio
+async def test_process_post_commit_delegates_to_extracted_stages(tl_db, mocker):
+    """The orchestration entry point delegates setup and preserves its response.
+
+    This runs the real extracted setup stage against the task-not-found path;
+    the spy proves ``_process_post_commit`` is its caller rather than merely
+    duplicating the old setup logic inline.
+    """
+    from app.task_lifecycle_post_commit_setup import run_post_commit_setup
+
+    _, factory = tl_db
+    task_id = uuid.uuid4()
+    payload = AgentStatusPayload(task_id=task_id, status=TaskStatus.COMPLETED)
+    setup_stage = mocker.patch(
+        "app.task_lifecycle.run_post_commit_setup",
+        wraps=run_post_commit_setup,
+    )
+
+    result = await _process_post_commit(
+        task_id, payload, _session_factory=factory
+    )
+
+    assert result == {"status": "accepted"}
+    setup_stage.assert_awaited_once()
+    assert setup_stage.await_args.kwargs["task_id"] == task_id
+    assert setup_stage.await_args.kwargs["payload"] is payload
+    assert setup_stage.await_args.kwargs["expected_post_commit_claim_token"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("task_type", ["fix", "review", "research", "create"])
 async def test_process_post_commit_locks_project_before_task_for_nonstrategic(
     tl_db, mocker, task_type
@@ -3896,15 +4065,20 @@ async def test_childless_recovery_current_handler_failure_propagates(tl_db, mock
 
 
 def test_strategic_completion_reserves_message_block_before_authority_locks():
-    source = _post_commit_sources()
+    from app import task_lifecycle_post_commit_setup
+
+    source = inspect.getsource(task_lifecycle_post_commit_setup)
     reserve_at = source.index("await reserve_project_message_sequences(")
     reservation_commit_at = source.index("await session.commit()", reserve_at)
     authority_lock_at = source.index("async with lock_project_then_task(")
 
     assert reserve_at < reservation_commit_at < authority_lock_at
     assert '_peek_task_type == "strategic_review"' not in source
-    assert '_peek_completion_handler == "strategic"' in source
-    assert "message_sequences=preallocated_strategic_message_sequences" in source
+    assert 'peek_completion_handler == "strategic"' in source
+    assert (
+        "message_sequences=preallocated_strategic_message_sequences"
+        in _post_commit_sources()
+    )
 
 
 @pytest.mark.asyncio
@@ -9396,6 +9570,19 @@ async def test_main_branch_non_rollup_skips_review_auto_merges(
         new_callable=AsyncMock,
         return_value=[{"filename": "docs/readme.md", "status": "modified"}],
     )
+    # Explicit CI precondition: this PR carries ZERO check-runs. The bypass
+    # merge gate consults check-runs, and a definitive absence must keep
+    # merging exactly as it did before the gate existed.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value=_no_check_runs(),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new_callable=AsyncMock,
+        return_value=[],
+    )
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     review_calls = []
@@ -9422,6 +9609,176 @@ async def test_main_branch_non_rollup_skips_review_auto_merges(
         "non-rollup main-branch task must skip review and auto-merge "
         "(v24 cost plan: CI + promotion gate backstop)"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Review-bypass merge CI gate (PRs #17933 / #17936 / #17942)
+#
+# The review-bypass path hard-coded ``ci_passed=True`` and merged without ever
+# querying GitHub, so a RED check-run merged anyway. These three tests pin the
+# whole decision surface: red BLOCKS, absence PROCEEDS, pending WAITS.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_bypass_merge_blocked_by_present_completed_red_check(tl_db, mocker):
+    """(a) PRESENT + COMPLETED + FAILURE → the bypass merge is refused.
+
+    Reconstructs #17936: a task PR into the integration branch whose
+    ``Derived artifacts`` check has completed with ``failure``. Before the
+    gate this merged regardless, carrying a production regression onto
+    automain. The task must NOT merge, must NOT fail, and must land in the
+    shared CI-wait loop where ``orchestrator_ci_monitor`` routes the red
+    through ``ci_completion.handle_ci_completion`` → ``fix`` recovery task.
+    """
+    session, factory = tl_db
+    task, merge_spy, check_spy, _spawned = await _setup_bypass_merge_task(
+        session, mocker, check_runs=_failed_check_runs()
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-docs",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    # The decisive assertion, made FIRST so a regression reports the real
+    # defect (a merge fired on a red check) rather than a downstream symptom.
+    merge_spy.assert_not_awaited()
+    assert result == {"status": "accepted"}
+
+    # CI was actually consulted, on the live PR head SHA.
+    check_spy.assert_awaited()
+    assert check_spy.await_args.args[3] == "abc123"
+    # Strict mode — an empty check list must not read as success here.
+    assert check_spy.await_args.kwargs["treat_missing_as_success"] is False
+
+    await session.refresh(task)
+    # Blocking must not FAIL the task and must not cancel its children.
+    assert task.status == TaskStatus.EVALUATING, (
+        "a red check means the work needs repair, not that the task is "
+        "worthless — failing here would cascade-cancel every child"
+    )
+    assert task.status != TaskStatus.FAILED
+    loop = (task.context or {})["review_loop"]
+    assert loop["ci_waiting"] is True
+    assert loop["ci_passed"] is False
+    # arm_ci_wait's co-stamped identity + clock: without both, the monitor
+    # either never polls the row or never times it out.
+    assert loop["pr_number"] == 77
+    assert loop["ci_wait_started"]
+    # The bypass policy decision itself survives, so the monitor keeps merge
+    # authority once CI turns green (ci_merge_helpers._review_approved).
+    assert loop["review_not_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_bypass_merge_proceeds_when_no_check_runs_present(tl_db, mocker):
+    """(b) ZERO check-runs → merges exactly as it did before the gate.
+
+    A merge-conflicted PR, a PR filtered out by path filters, and a PR opened
+    during a GitHub Actions outage all present as zero check-runs and are
+    indistinguishable from "not registered yet". Blocking on absence would
+    strand tasks until ``recovery_evaluating_ci_backstop`` FAILs the parent and
+    CANCELS every non-terminal child. Absence must stay a merge.
+
+    Note this is deliberately NOT routed through
+    ``ci_resolution.proceed_on_no_checks``, which returns False for a
+    default-configured project on a non-staging branch — gating on it would
+    turn an Actions outage into a fleet-wide cascade-kill.
+    """
+    session, factory = tl_db
+    task, merge_spy, _check_spy, spawned = await _setup_bypass_merge_task(
+        session, mocker, check_runs=_no_check_runs()
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-docs",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    merge_spy.assert_awaited()
+    assert "review" not in spawned
+    assert "fix" not in spawned
+
+
+@pytest.mark.asyncio
+async def test_bypass_merge_waits_on_started_but_incomplete_check(tl_db, mocker):
+    """(c) PRESENT + PENDING → no early merge, and no hard failure.
+
+    Regression test for the #17933 timing: its ``Derived artifacts`` check
+    started 15:24:56 and concluded FAILURE 15:26:36, but the PR merged at
+    15:25:11 — 15 s after the check started, 85 s before it finished. A check
+    that has STARTED must never be treated as a check that has PASSED.
+
+    The task parks in CI-wait so the monitor can reach a real verdict; it must
+    not be failed, because a still-running check is not evidence of bad work.
+    """
+    session, factory = tl_db
+    task, merge_spy, _check_spy, spawned = await _setup_bypass_merge_task(
+        session, mocker, check_runs=_started_check_runs()
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-docs",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    # Decisive assertion first: did not merge early on an unfinished check.
+    merge_spy.assert_not_awaited()
+    assert result == {"status": "accepted"}
+
+    await session.refresh(task)
+    # Did not hard-fail either.
+    assert task.status == TaskStatus.EVALUATING
+    assert task.status != TaskStatus.FAILED
+    loop = (task.context or {})["review_loop"]
+    assert loop["ci_waiting"] is True
+    assert loop["ci_passed"] is False
+    assert loop["pr_number"] == 77
+    assert loop["ci_wait_started"]
+    # No recovery spawned for a merely-unfinished check: nothing is broken yet.
+    assert "fix" not in spawned
+
+
+@pytest.mark.asyncio
+async def test_bypass_merge_proceeds_when_check_lookup_errors(tl_db, mocker):
+    """A FAILED check-runs lookup is not a present check — merge as before.
+
+    ``resolve_pr_ci_status`` reports a GitHub API error as ``pending`` with an
+    empty ``details``, so a state-only rule would wait on it. That would turn a
+    routine 5xx or an install-token rate-limit (Blueprint shares one 5000/hr
+    bucket) into a pipeline-wide stall, and every stalled task eventually hits
+    the ``recovery_evaluating_ci_backstop`` timeout that FAILs it and CANCELS
+    its children. Only an OBSERVED check-run may hold a merge.
+    """
+    session, factory = tl_db
+    task, merge_spy, _check_spy, spawned = await _setup_bypass_merge_task(
+        session, mocker, check_runs=_errored_check_runs()
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-docs",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    merge_spy.assert_awaited()
+    assert "fix" not in spawned
 
 
 @pytest.mark.asyncio

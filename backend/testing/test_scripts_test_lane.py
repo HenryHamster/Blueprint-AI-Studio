@@ -18,10 +18,12 @@ no capability exemption, since they read only checked-in text.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -52,6 +54,68 @@ INFRA_TEST_ROOTS = (
     REPOSITORY_ROOT / "infra" / "db_recovery",
     REPOSITORY_ROOT / "infra" / "livekit" / "tests",
 )
+
+# -- hermetic credentials for every lane subprocess --------------------------
+# Several scripts tests drive ``blueprint.main()`` for real. ``blueprint.py``
+# does ``from blueprint_api import (...)``, so a double installed on the
+# ``blueprint`` module does not intercept the copy of the same name that
+# ``blueprint_api`` resolves internally: ``validate_project_id`` ->
+# ``list_projects`` -> ``load_config`` -> ``api`` all run for real. The real
+# ``load_config()`` search order ends at the repo-root and
+# ``~/.blueprint-config.json`` files, so on a credentialed host this lane made
+# live authenticated requests to the production orchestrator carrying the
+# operator's admin key. CI containers hold no config file anywhere in that
+# search order, which is exactly why CI could never catch it.
+#
+# ``scripts/conftest.py`` closes the same hole for direct ``pytest scripts/...``
+# runs, but the subprocess below passes ``--noconftest``, so the guarantee has
+# to travel through the environment instead. ``BLUEPRINT_CONFIG`` is tier 1 of
+# ``load_config()`` and short-circuits the ambient files and the gcloud
+# bootstrap; the URL/key pair is tier 2, for tests that deliberately clear
+# tier 1. ``.invalid`` is reserved by RFC 6761 as guaranteed non-resolvable, so
+# a request that escapes every mock still cannot reach a real host.
+#
+# backend/testing/test_scripts_lane_hermetic_credentials.py proves this
+# environment defeats an ambient config and fails if it stops being applied.
+HERMETIC_API_URL = "https://scripts-lane.blueprint.invalid"
+HERMETIC_API_KEY = "hermetic-scripts-lane-not-a-credential"
+
+_HERMETIC_CONFIG_PATH = (
+    Path(tempfile.mkdtemp(prefix="blueprint-scripts-lane-hermetic-"))
+    / "hermetic-blueprint-config.json"
+)
+_HERMETIC_CONFIG_PATH.write_text(
+    json.dumps(
+        {
+            "api_url": HERMETIC_API_URL,
+            "api_key": HERMETIC_API_KEY,
+            "default_repo": "hermetic/scripts-lane",
+            "default_base_branch": "main",
+        }
+    ),
+    encoding="utf-8",
+)
+
+
+def hermetic_credential_environment() -> dict[str, str]:
+    """Env overrides that stop a lane subprocess resolving a real credential."""
+    return {
+        "BLUEPRINT_CONFIG": str(_HERMETIC_CONFIG_PATH),
+        "BLUEPRINT_API_URL": HERMETIC_API_URL,
+        "BLUEPRINT_API_KEY": HERMETIC_API_KEY,
+    }
+
+
+def lane_subprocess_environment() -> dict[str, str]:
+    """The exact environment every scripts-lane subprocess runs under."""
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    pythonpath = [str(SCRIPT_ROOT), str(REPOSITORY_ROOT / "backend")]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    environment.update(hermetic_credential_environment())
+    return environment
 
 
 def _script_test_exemptions() -> dict[str, str]:
@@ -158,6 +222,45 @@ _FILE_BUDGET_SECONDS_OVERRIDES = {
     # mocking the layer under test. Budgeted at ~3x measured for slower CI
     # hosts; a genuine wedge still trips it.
     "test_guard_gate_left_shift.py": 120,
+    # 30 tests that fork real shells to exercise the VM bootstrap/retry shell
+    # generators. Measured 31.73s in the backend test image (#17887), so the
+    # 25s default was never survivable here -- it went red on CI shard 8 the
+    # moment #17887 landed.
+    #
+    # The number is NOT sized against that measurement, though. This file
+    # carries `@pytest.mark.timeout(120)` on
+    # test_viewport_retry_distinguishes_infrastructure_from_child_exit, whose
+    # worst case is a child that traps TERM and sleeps. A per-test marker of
+    # 120s inside a file the lane only grants 25s is the SAME budget-inversion
+    # class #17887 set out to close, just one layer further out: the marker
+    # promises headroom this wrapper would refuse to honour. So the per-file
+    # budget must clear the largest marker in the file, plus the same grace the
+    # layers below use -- 120 + 60. test_scripts_lane_file_budgets_clear_their
+    # _own_timeout_markers in backend/testing/test_harness_timeout_budgets.py
+    # enforces exactly that relationship, so a future marker bump here fails
+    # loudly instead of reddening a promotion PR.
+    "test_github_actions_vm.py": 180,
+    # Latent instance of the same inversion, found by the guard below rather
+    # than by a red shard: test_real_probe_runs_live_sandbox_postgres_when
+    # _installed boots a live sandbox PostgreSQL under an inner 90s budget and
+    # carries @pytest.mark.timeout(180). It skips unless pg_config AND Ruff are
+    # both present, which is why 25s has held so far -- on an image that has
+    # them it would blow the per-file budget instead of running. 180 + 60.
+    "test_runner_isolation.py": 240,
+    # Real end-to-end compute-substrate checks: they build a throwaway Docker
+    # image and run a container to prove `blueprint compute run` honours a
+    # spec's image and setup_step. Measured 49.1s and 73.8s under CI conditions
+    # (docker-dependent tests deselected), so the 25s default is not
+    # survivable, and this file is deliberately NOT in test-backend.sh's
+    # CI_SCRIPT_TEST_EXEMPTIONS -- the static half of it must keep running.
+    #
+    # As with the two entries above, the number is sized by the largest marker
+    # in the file rather than by the measurement: three tests carry
+    # @pytest.mark.timeout(300), so the per-file budget must clear 300 + the
+    # same 60s grace the layers below use, or the marker promises headroom this
+    # wrapper would refuse to honour. 360 also leaves ~5x headroom over the
+    # slower measurement for a loaded 2-vCPU CI runner.
+    "test_blueprint_compute_local.py": 360,
 }
 
 # CI's sharded pytest invocation passes ``--timeout=30`` (pytest-timeout), which
@@ -176,12 +279,7 @@ def test_script_test_module_executes(script_test: Path) -> None:
     budget = _FILE_BUDGET_SECONDS_OVERRIDES.get(
         script_test.name, _FILE_BUDGET_SECONDS_DEFAULT
     )
-    environment = os.environ.copy()
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    pythonpath = [str(SCRIPT_ROOT), str(REPOSITORY_ROOT / "backend")]
-    if environment.get("PYTHONPATH"):
-        pythonpath.append(environment["PYTHONPATH"])
-    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    environment = lane_subprocess_environment()
 
     command = [
         sys.executable,

@@ -108,6 +108,8 @@ import {
 } from '../call-speech/config.js';
 import { STRATEGIC_RESIDENT_SYSTEM_PROMPT } from './strategic-resident-prompt.js';
 import { SessionStreamer } from './session-streamer.js';
+import { ConversationMessageStreamer } from './conversation-message-streamer.js';
+import { WsFrameBudget } from './ws-frame-budget.js';
 
 const _RESIDENT_STRATEGIC_TASK_TYPE = 'strategic_review' as const;
 
@@ -926,6 +928,40 @@ export async function handleStrategicResident(
       .join('\n\n');
   })();
 
+  // Format the operator attention census (payload.operator_attention) for the
+  // bootstrap context. Mirrors toolContentText: reads the bounded block the
+  // backend already clipped to <=8 items, renders one line per item, and yields
+  // '' when absent so the section is a no-op. The census is a snapshot; the
+  // prompt tells the resident to re-read it with `./fetch attention`.
+  const operatorAttentionText = ((): string => {
+    const raw = payload.operator_attention;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return '';
+    const block = raw as Record<string, unknown>;
+    const lines: string[] = [];
+    const level = strVal(block.level);
+    const summary = strVal(block.summary).trim();
+    if (level || summary) lines.push(`Level: ${level || 'unknown'}${summary ? ` — ${summary}` : ''}`);
+    const counts = block.counts;
+    if (counts !== null && typeof counts === 'object' && !Array.isArray(counts)) {
+      const pairs = Object.entries(counts as Record<string, unknown>)
+        .filter((pair): pair is [string, number] => typeof pair[1] === 'number' && pair[1] > 0)
+        .map(([k, v]) => `${k}=${v}`);
+      if (pairs.length > 0) lines.push(`Counts: ${pairs.join(', ')}`);
+    }
+    const items = Array.isArray(block.items) ? block.items : [];
+    for (const entry of items) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const item = entry as Record<string, unknown>;
+      const kind = strVal(item.kind);
+      const label = strVal(item.label).trim();
+      const detail = strVal(item.detail).trim();
+      if (!label && !detail) continue;
+      lines.push(`- ${kind ? `[${kind}] ` : ''}${label}${detail ? ` — ${detail}` : ''}`);
+    }
+    if (block.has_more === true) lines.push('- (more items exist — run `./fetch attention`)');
+    return lines.join('\n');
+  })();
+
   // ── Durable decisions register ──────────────────────────────────────────
   // Full-fidelity cross-tick memory of settled decisions, preserved across
   // compaction AND full session restarts (VM recycles, process crashes) so
@@ -963,6 +999,7 @@ export async function handleStrategicResident(
     purposeText,
     openMessagesText: buildOpenMessagesText(openMessages),
     recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
+    operatorAttentionText,
     sessionId,
     computeArtifactGuidanceText: artifactsHelperAvailable
       ? COMPUTE_ARTIFACT_GUIDANCE
@@ -1399,7 +1436,12 @@ export async function handleStrategicResident(
   };
 
   // ── Session + streaming wiring ──────────────────────────────────────────────
-  const streamer = new SessionStreamer(ws, sessionId, taskId);
+  // ONE budget for the socket. The live transcript and the typed Fast reply
+  // preview stream the same turn concurrently; each self-budgeting at <=10/s
+  // would put 20/s plus `log` frames against the backend's 20 msg/s close.
+  const wsFrameBudget = new WsFrameBudget();
+  const streamer = new SessionStreamer(ws, sessionId, taskId, wsFrameBudget);
+  let activeTypedReplyStreamer: ConversationMessageStreamer | null = null;
   // Private call work, typed-Fast consultations, and typed-Fast autonomous work
   // run through the long-lived Workday child. Scope suppression around the
   // entire turn, rather than trusting its prompt: no model deltas, tool
@@ -1429,6 +1471,18 @@ export async function handleStrategicResident(
     } else if (ev.kind === 'error' && ev.text) {
       streamer.status(`error: ${ev.text}`);
     }
+  };
+  const handleTypedFastSessionEvent = (ev: ResidentSessionEvent): void => {
+    // Assistant text is MIRRORED onto the canonical conversation-message
+    // transport; it is never diverted off the live transcript. The
+    // `/strategic-session` transcript is protected supported surface
+    // (CLAUDE.md), and `activeTypedReplyStreamer` is null for large parts of a
+    // session's life — the READY probe, the window after `replaceAfterCrash()`,
+    // between a failed turn and the next dispatch, and anything before
+    // `dispatchExactFastTurn` binds one. Returning early on `text` silently
+    // dropped assistant output in every one of those windows.
+    if (ev.kind === 'text') activeTypedReplyStreamer?.delta(ev.text || '');
+    handleSessionEvent(ev);
   };
   // Every subprocess gets a distinct listener epoch. Invalidate the old epoch
   // BEFORE closing a worker for forced restart: child stdout can drain after
@@ -2810,7 +2864,7 @@ export async function handleStrategicResident(
       // it to every session it starts, including a mid-turn crash replacement.
       // Bound before ensureReady() so no post-warmup turn can slip in unbound,
       // though suppressEvents scopes the private READY probe out regardless.
-      warmingController.onEvent(handleSessionEvent);
+      warmingController.onEvent(handleTypedFastSessionEvent);
       await warmingController.ensureReady();
       const warmingStillCurrent = foregroundTyped === warmingController
         && typedFastLease.leaseId === acquiredLease.leaseId
@@ -4383,6 +4437,11 @@ export async function handleStrategicResident(
   };
 
   const abandonTypedFastClaim = async (claimId: string): Promise<TypedAbandonResponse> => {
+    // Retract the ephemeral preview. Terminal frames bypass the relay's
+    // liveness gate (routers/projects.py), so this lands even once the claim is
+    // released — which is exactly when a stranded preview would otherwise
+    // outlive its turn.
+    void activeTypedReplyStreamer?.finish('abandoned');
     const response = await apiPost(
       `/api/agent/projects/${projectId}/conversation/turns/abandon`,
       {
@@ -4623,25 +4682,48 @@ export async function handleStrategicResident(
         );
       }
       const prompt = await promptPromise;
+      // Each dispatch attempt re-runs the SAME receipt from the top, so its
+      // text is a new answer rather than a continuation. The attempt index
+      // gives the retry its own preview identity instead of welding attempt 2's
+      // tail onto attempt 1's partial.
+      let replyAttempt = 0;
       const dispatchExactFastTurn = async () => {
-        const turnPromise = typedController.dispatch(receipt, prompt).then(
-          value => ({ status: 'fulfilled' as const, value }),
-          (reason: unknown) => ({ status: 'rejected' as const, reason }),
+        const replyStreamer = new ConversationMessageStreamer(
+          ws, sessionId, taskId, claimId, receipt.idempotency_key,
+          wsFrameBudget, replyAttempt++,
         );
-        const watch = await watchTypedFastTurn(
-          turnPromise,
-          fastClaim,
-          displacedWorkdayClaim,
-          () => { typedController.interrupt(); },
-        );
-        if (watch !== 'done') {
-          throw new Error(
-            watch === 'displaced_lost'
-              ? 'DISPLACED_WORKDAY_CLAIM_LOST'
-              : 'Fast Resident lost its exact conversation claim',
+        activeTypedReplyStreamer = replyStreamer;
+        let terminal: 'failed' | 'abandoned' | undefined = 'failed';
+        try {
+          const turnPromise = typedController.dispatch(receipt, prompt).then(
+            value => ({ status: 'fulfilled' as const, value }),
+            (reason: unknown) => ({ status: 'rejected' as const, reason }),
           );
+          const watch = await watchTypedFastTurn(
+            turnPromise,
+            fastClaim,
+            displacedWorkdayClaim,
+            () => { typedController.interrupt(); },
+          );
+          if (watch !== 'done') {
+            throw new Error(
+              watch === 'displaced_lost'
+                ? 'DISPLACED_WORKDAY_CLAIM_LOST'
+                : 'Fast Resident lost its exact conversation claim',
+            );
+          }
+          const result = await turnPromise;
+          if (
+            result.status === 'fulfilled'
+            && result.value.completion !== null
+            && !result.value.result.processGone
+          ) {
+            terminal = undefined;
+          }
+          return result;
+        } finally {
+          void replyStreamer.finish(terminal);
         }
-        return await turnPromise;
       };
       if (
         statusRef.value !== typedFastPendingStatus
@@ -4708,6 +4790,10 @@ export async function handleStrategicResident(
         status?: string;
         workday_packet?: { packet_id?: string; consultation_id?: string | null };
       };
+      // Release the preview only AFTER the completion POST proved a durable row
+      // exists to replace it. Clearing it before the POST left a thrown POST
+      // with neither a durable message nor a tombstone.
+      activeTypedReplyStreamer = null;
       typedFastTranscriptSequence = verified.envelope.transcript_sequence;
       typedFastFailureCount = 0;
       typedFastCircuitOpenUntil = 0;
@@ -4721,6 +4807,12 @@ export async function handleStrategicResident(
         consultationId,
       );
     } catch (error) {
+      // Any exit that is not a committed durable reply must retract the
+      // ephemeral preview, including the paths with no claim left to abandon
+      // (`claimId` empty, or the completion POST threw). Idempotent with the
+      // tombstone `abandonTypedFastClaim` sends below.
+      void activeTypedReplyStreamer?.finish('failed');
+      activeTypedReplyStreamer = null;
       const displacedWorkdayClaimLost = error instanceof Error
         && error.message === 'DISPLACED_WORKDAY_CLAIM_LOST';
       sendLog(ws, `[resident] typed Fast turn deferred: ${sanitize(String(error))}\n`);

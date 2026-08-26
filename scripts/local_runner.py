@@ -174,6 +174,47 @@ _REQUIRED_VERIFICATION_PACKAGES = frozenset(("ruff", "mypy", "pytest", "pgserver
 # surfacing the next time something invokes the script directly.
 _VERIFICATION_CONSOLE_SCRIPTS = ("pytest", "ruff", "mypy", "alembic")
 
+# ── Compute Python runtime (the platform's interpreter-with-pip contract) ────
+#
+# Imageless (bwrap) compute jobs used to be responsible for finding their own
+# Python. The commonest terminal log in the failure corpus was
+#   no working pip found (tried "-m pip" and PATH) - cannot provision the runtime
+# next to exit-127 (command not found) and exit-126 (not executable): every job
+# placed on a host without pip/ensurepip/venv died in bootstrap, before a line
+# of experiment code ran. The runner now establishes ONE interpreter with a
+# proven-working pip per host, caches it across jobs, and hands each job a
+# writable venv derived from it. An authored command bootstraps nothing.
+_compute_runtime: "iso.ComputePythonRuntime | None" = None
+_compute_runtime_lock = threading.Lock()
+_compute_runtime_bootstrap_lock = threading.Lock()
+_COMPUTE_RUNTIME_MARKER = "compute-runtime.json"
+_COMPUTE_RUNTIME_SCHEMA_VERSION = 1
+# Bounded budgets. `python3 -m venv` seeds pip OFFLINE from ensurepip's bundled
+# wheels (~3-8s); `uv venv --seed` is the fallback for a host whose ensurepip
+# was stripped (Debian's python3-venv split) and may fetch a pip wheel once.
+_COMPUTE_RUNTIME_VENV_TIMEOUT = 180
+_COMPUTE_RUNTIME_UV_TIMEOUT = 300
+_COMPUTE_RUNTIME_PROBE_TIMEOUT = 60
+# Per-job venv creation is offline and local: symlinks, a pyvenv.cfg and a .pth.
+_COMPUTE_JOB_VENV_TIMEOUT = 120
+
+# Reserved runner exit codes for PLATFORM kills reported on a compute job. The
+# server translates these into a terminal reason the failure classifier keys on,
+# so the kill does not collapse to CODE_ERROR (which burns retry budget and
+# misattributes blame to the experiment's code):
+#   124  runtime deadline exceeded
+#   125  no-progress watchdog (compute_backends.NO_PROGRESS_WATCHDOG_EXIT_CODE)
+#   123  the runner could NOT establish a Python runtime for this job
+PROVISION_FAILURE_EXIT_CODE = 123
+# Terminal reason string emitted alongside that exit code. It must contain the
+# substring "provisioning": app.failure_classification.classify_compute_terminal
+# _reason maps `"provisioning" in reason.lower()` to PROVISION_FAILURE. It must
+# NOT contain "runtime deadline", "cancelled" or "operator", which that same
+# function matches for other classes.
+COMPUTE_RUNTIME_PROVISION_TERMINAL_REASON = (
+    "runner provisioning failure: no usable python runtime on this host"
+)
+
 
 class _VerificationToolchainState:
     """Thread-safe report holder shared by recovery and heartbeat threads."""
@@ -515,6 +556,455 @@ def _bootstrap_verification_toolchain(
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         print(f"[runner] verification toolchain unavailable: {str(exc)[:700]}", flush=True)
         return None
+
+
+# ── Compute Python runtime provisioning ──────────────────────────────────────
+
+
+class _ComputeRuntimeState:
+    """Thread-safe capability report for the host's compute Python runtime.
+
+    Read by the heartbeat loop (which must never block on a probe) and written
+    by whichever thread last established or re-validated the runtime.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._report: dict | None = None
+
+    def report(self) -> dict | None:
+        with self._lock:
+            return dict(self._report) if self._report is not None else None
+
+    def publish(
+        self,
+        runtime: "iso.ComputePythonRuntime | None",
+        reason: str | None,
+    ) -> None:
+        report = {
+            "usable": runtime is not None,
+            "reason": reason,
+            "interpreter": runtime.python_path if runtime else None,
+            "python_version": runtime.python_version if runtime else None,
+            "pip_version": runtime.pip_version if runtime else None,
+            "provisioner": runtime.provisioner if runtime else None,
+            "probed_at": _utc_now_iso(),
+        }
+        with self._lock:
+            self._report = report
+
+
+_compute_runtime_state = _ComputeRuntimeState()
+
+
+def _compute_runtime_root() -> str:
+    configured = os.environ.get("BLUEPRINT_RUNNER_COMPUTE_RUNTIME", "").strip()
+    root = configured or os.path.join(
+        os.path.expanduser("~"), ".blueprint", "compute-runtime"
+    )
+    if not os.path.isabs(root) or "\x00" in root:
+        raise ValueError("compute runtime root must be an absolute path")
+    if os.path.islink(root):
+        raise ValueError("compute runtime root must not be a symlink")
+    return os.path.abspath(root)
+
+
+def _compute_runtime_base_interpreter() -> str:
+    """The host interpreter the sandbox ALSO binds, not the runner's own.
+
+    ``_COMPUTE_SANDBOX_TOOLS`` resolves ``python3``/``python`` off the host
+    PATH and binds them read-only into the jail, so the runtime venv must be
+    built on that same interpreter — a venv whose ``home`` pointed at some
+    other Python would resolve to nothing inside the sandbox.
+    """
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return sys.executable
+
+
+# One-line, no-backslash ``python -c`` probe (the form CLAUDE.md sanctions for
+# cross-language embedding). Proves in a SINGLE subprocess that pip imports and
+# reports where the interpreter's purelib lives, which is what a job venv links.
+_COMPUTE_RUNTIME_PROBE_SOURCE = (
+    "import json, sys, sysconfig, pip; "
+    "print(json.dumps({'python': sys.version.split()[0], "
+    "'pip': pip.__version__, 'site': sysconfig.get_paths()['purelib']}))"
+)
+
+
+def _probe_compute_runtime_venv(venv: str) -> "iso.ComputePythonRuntime | None":
+    """Validate an existing runtime venv. Cheap: one subprocess, no network.
+
+    This is the FAST PATH taken on every runner boot and every compute job on a
+    host that is already provisioned. It must never install anything — a
+    preflight that provisions is how a 1200s venv build once landed under a
+    120s test budget and reddened a promotion PR.
+    """
+    python_path = os.path.join(venv, "bin", "python")
+    if not os.access(python_path, os.X_OK):
+        return None
+    try:
+        probe = subprocess.run(
+            [python_path, "-c", _COMPUTE_RUNTIME_PROBE_SOURCE],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=_COMPUTE_RUNTIME_PROBE_TIMEOUT,
+            env=_toolchain_env(os.path.dirname(venv)),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if probe.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(probe.stdout.strip() or "{}")
+    except (ValueError, json.JSONDecodeError):
+        return None
+    site = parsed.get("site")
+    pip_version = parsed.get("pip")
+    python_version = parsed.get("python")
+    if not (
+        isinstance(site, str)
+        and site
+        and isinstance(pip_version, str)
+        and pip_version
+    ):
+        return None
+    marker = os.path.join(os.path.dirname(venv), _COMPUTE_RUNTIME_MARKER)
+    provisioner = "unknown"
+    base_python = _compute_runtime_base_interpreter()
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            receipt = json.load(fh)
+        if receipt.get("schema_version") == _COMPUTE_RUNTIME_SCHEMA_VERSION:
+            provisioner = str(receipt.get("provisioner") or "unknown")
+            base_python = str(receipt.get("base_python") or base_python)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return iso.ComputePythonRuntime(
+        python_path=python_path,
+        site_packages=site,
+        base_python=base_python,
+        python_version=str(python_version or "unknown"),
+        pip_version=pip_version,
+        provisioner=provisioner,
+    )
+
+
+def _build_compute_runtime_venv(staged_venv: str, root: str) -> str:
+    """Create a venv with a WORKING pip at ``staged_venv``; return the maker.
+
+    Two makers, tried in order, because the failing hosts in the corpus lacked
+    exactly the first one:
+      1. ``python3 -m venv`` — seeds pip offline from ensurepip's bundled
+         wheels. Unavailable when a distro strips ensurepip/venv.
+      2. ``uv venv --seed`` — a single static binary that seeds pip without
+         ensurepip. Already a bound compute sandbox tool.
+    Raises RuntimeError naming BOTH failures when neither works, so the
+    provisioning terminal reason can say what the host is missing.
+    """
+    base_python = _compute_runtime_base_interpreter()
+    errors: list[str] = []
+    try:
+        _run_toolchain_command(
+            [base_python, "-m", "venv", staged_venv],
+            root=root,
+            timeout=_COMPUTE_RUNTIME_VENV_TIMEOUT,
+        )
+        return "venv"
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        errors.append(f"python3 -m venv: {str(exc)[:250]}")
+        shutil.rmtree(staged_venv, ignore_errors=True)
+
+    uv = shutil.which("uv")
+    if uv:
+        try:
+            _run_toolchain_command(
+                [uv, "venv", "--seed", "--python", base_python, staged_venv],
+                root=root,
+                timeout=_COMPUTE_RUNTIME_UV_TIMEOUT,
+            )
+            return "uv"
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            errors.append(f"uv venv --seed: {str(exc)[:250]}")
+            shutil.rmtree(staged_venv, ignore_errors=True)
+    else:
+        errors.append("uv venv --seed: uv is not on the runner PATH")
+    raise RuntimeError("; ".join(errors))
+
+
+def _write_compute_runtime_marker(
+    marker: str, provisioner: str, runtime: "iso.ComputePythonRuntime"
+) -> None:
+    """Atomically publish the receipt only after the runtime validated."""
+    fd, temporary = tempfile.mkstemp(
+        prefix=".compute-runtime.", dir=os.path.dirname(marker)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "schema_version": _COMPUTE_RUNTIME_SCHEMA_VERSION,
+                    "provisioner": provisioner,
+                    "base_python": runtime.base_python,
+                    "python_version": runtime.python_version,
+                    "pip_version": runtime.pip_version,
+                },
+                fh,
+                sort_keys=True,
+            )
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, marker)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _bootstrap_compute_runtime(
+    *, provision: bool = True
+) -> "iso.ComputePythonRuntime | None":
+    """Return the host's compute interpreter-with-pip, building it when absent.
+
+    ``provision=False`` is a read-only probe: an already-built runtime is still
+    validated, but a missing one is REPORTED rather than created. ``--check``
+    passes it so a preflight can never spend a provisioning budget, and never
+    leaves a trace on a host it was only asked to inspect.
+
+    Always publishes a capability report (consumed by the heartbeat), including
+    on failure — "cannot provide a Python runtime" is exactly the fact placement
+    needs, and silence would read as healthy.
+    """
+    try:
+        root = _compute_runtime_root()
+        venv = os.path.join(root, "venv")
+        if not provision and not os.path.isdir(root):
+            reason = f"not provisioned ({root} is absent)"
+            print(
+                f"[runner] compute python runtime {reason} — it is built on the "
+                "next real boot; this probe does not provision.",
+                flush=True,
+            )
+            _compute_runtime_state.publish(None, reason)
+            return None
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+
+        # flock covers independent runner processes; the in-process lock also
+        # serializes threads because flock's semantics are process-scoped.
+        with _compute_runtime_bootstrap_lock, open(
+            os.path.join(root, ".refresh.lock"), "a+", encoding="utf-8"
+        ) as lock_file:
+            os.chmod(lock_file.name, 0o600)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                backup = os.path.join(root, ".venv.previous")
+                if not os.path.lexists(venv) and os.path.lexists(backup):
+                    os.replace(backup, venv)
+                existing = _probe_compute_runtime_venv(venv)
+                if existing is not None:
+                    _compute_runtime_state.publish(existing, None)
+                    return existing
+                if not provision:
+                    reason = "present but not validated against a working pip"
+                    print(
+                        f"[runner] compute python runtime {reason} — it is "
+                        "(re)built on the next real boot; this probe does not "
+                        "provision.",
+                        flush=True,
+                    )
+                    _compute_runtime_state.publish(None, reason)
+                    return None
+
+                # Never build in place: a half-written venv must not replace a
+                # working one.
+                stage = tempfile.mkdtemp(prefix=".refresh-", dir=root)
+                staged_venv = os.path.join(stage, "venv")
+                try:
+                    provisioner = _build_compute_runtime_venv(staged_venv, root)
+                    if _probe_compute_runtime_venv(staged_venv) is None:
+                        raise RuntimeError(
+                            f"{provisioner} produced a venv whose pip does not import"
+                        )
+                    if os.path.lexists(backup):
+                        shutil.rmtree(backup, ignore_errors=True)
+                    had_previous = os.path.lexists(venv)
+                    if had_previous:
+                        os.replace(venv, backup)
+                    try:
+                        os.replace(staged_venv, venv)
+                        # The rename invalidated every console script's absolute
+                        # shebang (pip, pip3, ...) — repair before anything runs
+                        # ``<venv>/bin/pip`` by path.
+                        _relink_console_script_shebangs(staged_venv, venv)
+                        activated = _probe_compute_runtime_venv(venv)
+                        if activated is None:
+                            raise RuntimeError(
+                                "compute runtime venv did not validate after activation"
+                            )
+                        _write_compute_runtime_marker(
+                            os.path.join(root, _COMPUTE_RUNTIME_MARKER),
+                            provisioner,
+                            activated,
+                        )
+                    except (
+                        OSError,
+                        RuntimeError,
+                        subprocess.SubprocessError,
+                        ValueError,
+                    ):
+                        if os.path.lexists(venv):
+                            shutil.rmtree(venv, ignore_errors=True)
+                        if had_previous and os.path.lexists(backup):
+                            os.replace(backup, venv)
+                        raise
+                    if os.path.lexists(backup):
+                        shutil.rmtree(backup, ignore_errors=True)
+                    print(
+                        "[runner] compute python runtime ready: python "
+                        f"{activated.python_version} / pip {activated.pip_version} "
+                        f"(via {provisioner})",
+                        flush=True,
+                    )
+                    _compute_runtime_state.publish(activated, None)
+                    return activated
+                finally:
+                    shutil.rmtree(stage, ignore_errors=True)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        reason = str(exc)[:700]
+        print(f"[runner] compute python runtime unavailable: {reason}", flush=True)
+        _compute_runtime_state.publish(None, reason)
+        return None
+
+
+def _set_compute_runtime(runtime: "iso.ComputePythonRuntime | None") -> None:
+    global _compute_runtime
+    with _compute_runtime_lock:
+        _compute_runtime = runtime
+
+
+def _ensure_compute_runtime() -> "iso.ComputePythonRuntime | None":
+    """Process-cached accessor used on the per-job path.
+
+    Once established, later jobs pay nothing: the validated runtime is held in
+    process. A job arriving before the boot-time provisioner finished blocks on
+    the same flock instead of racing a second build.
+    """
+    with _compute_runtime_lock:
+        cached = _compute_runtime
+    if cached is not None:
+        return cached
+    runtime = _bootstrap_compute_runtime()
+    _set_compute_runtime(runtime)
+    return runtime
+
+
+def _job_venv_site_packages(venv_host: str) -> str | None:
+    lib = os.path.join(venv_host, "lib")
+    try:
+        names = sorted(os.listdir(lib))
+    except OSError:
+        return None
+    for name in names:
+        candidate = os.path.join(lib, name, "site-packages")
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _write_job_venv_pip_shims(venv_host: str) -> None:
+    """Give the job venv its own ``pip``/``pip3`` on PATH.
+
+    ``--without-pip`` generates no console scripts, and the runtime venv's own
+    ``pip`` must stay OFF PATH: its shebang names the read-only runtime
+    interpreter, so ``pip install`` through it would target the read-only venv
+    and die with EACCES. These two-line shims name the IN-SANDBOX interpreter
+    path, which is where they are executed from.
+    """
+    sandbox_python = (
+        f"{iso.SANDBOX_WORKSPACE}/{iso.COMPUTE_JOB_VENV_DIRNAME}/bin/python"
+    )
+    bin_dir = os.path.join(venv_host, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    body = f'#!/bin/sh\nexec "{sandbox_python}" -m pip "$@"\n'
+    for name in ("pip", "pip3"):
+        path = os.path.join(bin_dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(path, 0o755)
+
+
+def _create_job_python_venv(
+    runtime: "iso.ComputePythonRuntime", workspace_host: str
+) -> str | None:
+    """Materialise the job's OWN writable venv under its workspace.
+
+    Why per job rather than sharing the host runtime: concurrent experiments
+    installing into one writable environment overwrite each other's dependency
+    sets, and the runtime venv is bound read-only precisely so they cannot.
+
+    Built with ``--without-pip`` and then linked back to the runtime's
+    site-packages through a ``.pth`` file, so:
+      * creation is OFFLINE and sub-second (symlinks plus a pyvenv.cfg) and
+        needs no ``ensurepip`` — the host that lacks it is the host we are
+        fixing;
+      * ``pip`` is importable but sits BEHIND the job's own site-packages in
+        ``sys.path``, so anything the job installs wins;
+      * ``pip install`` writes into the job venv (``sys.prefix`` resolves from
+        the interpreter's own path at runtime), which rides the read-write
+        workspace bind and is discarded with the job.
+
+    Every path baked into the venv is either a host path the sandbox binds at
+    the SAME location (the runtime interpreter) or is recomputed at runtime, so
+    nothing here depends on the workspace's host path. Returns the venv's host
+    path, or None when it could not be built — the caller then falls back to
+    the read-only runtime rather than failing the job.
+    """
+    venv_host = os.path.join(workspace_host, iso.COMPUTE_JOB_VENV_DIRNAME)
+    try:
+        _run_toolchain_command(
+            [runtime.python_path, "-m", "venv", "--without-pip", venv_host],
+            root=workspace_host,
+            timeout=_COMPUTE_JOB_VENV_TIMEOUT,
+        )
+        site_dir = _job_venv_site_packages(venv_host)
+        if site_dir is None:
+            raise RuntimeError("job venv has no site-packages directory")
+        with open(
+            os.path.join(site_dir, "_blueprint_runtime.pth"), "w", encoding="utf-8"
+        ) as fh:
+            fh.write(runtime.site_packages + "\n")
+        _write_job_venv_pip_shims(venv_host)
+        return venv_host
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        print(
+            "[compute] could not create the per-job python venv "
+            f"({str(exc)[:300]}); falling back to the read-only runtime",
+            flush=True,
+        )
+        shutil.rmtree(venv_host, ignore_errors=True)
+        return None
+
+
+def _compute_runtime_provision_failure_log(reason: str | None) -> str:
+    """Operator-facing log for a job killed because the host has no Python."""
+    return (
+        f"[runner] {COMPUTE_RUNTIME_PROVISION_TERMINAL_REASON}: "
+        f"{reason or 'unknown'}. The runner could not establish an interpreter "
+        "with a working pip for this sandbox (tried `python3 -m venv` then "
+        "`uv venv --seed`), so the command never started. This is a HOST "
+        "provisioning gap, not a defect in the experiment: install python3-venv "
+        "or uv on this runner."
+    )
+
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
@@ -4766,6 +5256,17 @@ def _heartbeat_loop(
                 ),
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
+                # Whether this host can give a bwrap compute job an interpreter
+                # with a WORKING pip. Read from the cached probe/provision
+                # report (never probed here — the heartbeat must not block), so
+                # the flat bit is False on a host that has python3 but no
+                # ensurepip/venv and no uv. The nested object carries the
+                # evidence: reason on failure, interpreter/versions/provisioner
+                # on success. Additive: an older orchestrator ignores both.
+                "python_runtime_usable": bool(
+                    (_compute_runtime_state.report() or {}).get("usable")
+                ),
+                "python_runtime": _compute_runtime_state.report(),
                 "llm_clis": llm_clis,
                 "cli_inventory": cli_inventory,
                 # Health telemetry consumed by the orchestrator to spot a runner
@@ -5362,6 +5863,7 @@ def _report_compute_job(
     resume_hydration: dict | None = None,
     artifact_delivery: dict | None = None,
     viewable_omissions: dict | None = None,
+    terminal_reason: str | None = None,
 ) -> bool:
     """POST a status report for a compute job. Returns cancel_requested.
 
@@ -5392,6 +5894,14 @@ def _report_compute_job(
         body["artifact_delivery"] = artifact_delivery
     if viewable_omissions is not None:
         body["viewable_omissions"] = viewable_omissions
+    if terminal_reason is not None:
+        # Structured cause for a terminal failure the COMMAND did not cause.
+        # The classifier keys on substrings of this string (e.g. "provisioning"
+        # -> PROVISION_FAILURE), so a host-capability gap is not billed to the
+        # experiment as a code defect. An older backend ignores the field
+        # (pydantic models here default to extra='ignore'), and the reserved
+        # exit code carries the same fact independently.
+        body["terminal_reason"] = terminal_reason
 
     durable = exec_status in _REPORT_TERMINAL_STATUSES
     max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
@@ -6977,6 +7487,7 @@ def _run_compute_job(
         command_log: dict | None = None,
         progress: dict | None = None,
         resume_hydration: dict | None = None,
+        terminal_reason: str | None = None,
     ) -> bool:
         """Persist artifacts before exposing a terminal execution report."""
         nonlocal artifact_delivery_attempted
@@ -7012,6 +7523,7 @@ def _run_compute_job(
             progress=progress,
             resume_hydration=resume_hydration,
             artifact_delivery=delivery,
+            terminal_reason=terminal_reason,
         )
 
 
@@ -7172,6 +7684,49 @@ def _run_compute_job(
             )
             return
 
+        # ── Interpreter guarantee (bwrap only) ───────────────────────────────
+        # A container image ships its own Python; a bwrap sandbox inherits only
+        # what the runner binds into it. The commonest terminal log in the
+        # compute corpus is `no working pip found (tried "-m pip" and PATH) -
+        # cannot provision the runtime`, because hosts like `iconlab` have a
+        # python3 but no ensurepip/venv, and every job there hand-rolled its own
+        # bootstrap and lost. Establish the runtime HERE, before setup_step or
+        # the command exists, so an authored experiment can simply use
+        # $BLUEPRINT_PYTHON / `pip install` and have it work.
+        python_runtime: "iso.ComputePythonRuntime | None" = None
+        job_venv_host: str | None = None
+        if backend_pre == iso.BACKEND_BWRAP:
+            with _ComputeJobReportHeartbeat(orchestrator_url, token, job_id):
+                python_runtime = _ensure_compute_runtime()
+            if python_runtime is None:
+                # NOT a code defect: the host cannot supply an interpreter, so
+                # the command never ran and the experiment is blameless. The
+                # reserved exit code and the terminal reason (which contains
+                # "provisioning") both classify this as PROVISION_FAILURE
+                # instead of collapsing to CODE_ERROR and burning retry budget
+                # against a job that is fine.
+                state = _compute_runtime_state.report() or {}
+                outcome = "failure"
+                print(
+                    f"[compute] job {job_id}: "
+                    f"{COMPUTE_RUNTIME_PROVISION_TERMINAL_REASON}",
+                    flush=True,
+                )
+                _report_terminal(
+                    exec_status="failed",
+                    exit_code=PROVISION_FAILURE_EXIT_CODE,
+                    terminal_reason=COMPUTE_RUNTIME_PROVISION_TERMINAL_REASON,
+                    command_log={
+                        "text": _compute_runtime_provision_failure_log(
+                            state.get("reason")
+                        ),
+                        "truncated": False,
+                    },
+                    resume_hydration=resume_hydration,
+                )
+                return
+            job_venv_host = _create_job_python_venv(python_runtime, tmpdir)
+
         # Fold setup_step into the sandboxed command so it runs INSIDE the same
         # boundary (never bare) and shares its environment. `&&` between brace
         # groups preserves the original semantics: a setup failure aborts before
@@ -7181,32 +7736,46 @@ def _run_compute_job(
             effective_command = "{\n" + setup_step + "\n} && {\n" + command + "\n}"
 
         container_name = f"bp-{str(job_id)[:12]}"
-        plan = iso.plan_compute_execution(
-            caps=caps,
-            command=effective_command,
-            image=container_image,
-            registry_auth=container_registry_auth or None,
-            workspace_host=tmpdir,
-            result_file_host=result_file,
-            artifact_dir_host=artifact_dir,
-            progress_file_host=progress_file,
-            clone_dir_host=clone_dir,
-            cwd_host=cwd,
-            job_env=env_override,
-            gpu_indices=assigned_gpus,
-            container_name=container_name,
-            source_env=dict(os.environ),
-            # ldconfig is only consulted for the bwrap backend (to bind driver
-            # libs living outside /usr); container backends provide their own.
-            ldconfig_output=(
-                _read_ldconfig()
-                if (assigned_gpus and backend_pre == iso.BACKEND_BWRAP)
-                else ""
-            ),
-            cpu_limit=cpu_limit,
-            mem_limit=mem_limit,
-            allow_host_fallback=allow_host_fallback,
-        )
+
+        def _build_plan(gpu_indices: list[int]):
+            """Plan the sandbox for a given GPU assignment.
+
+            Parameterized on the GPU set because the arch probe below may have to
+            rebuild the plan WITHOUT GPUs: a job that declared no accelerator has
+            no business dying because the host's GPU and the image's CUDA runtime
+            disagree. Every other input is fixed for the job, so a rebuild differs
+            only in the device set.
+            """
+            return iso.plan_compute_execution(
+                caps=caps,
+                command=effective_command,
+                image=container_image,
+                registry_auth=container_registry_auth or None,
+                workspace_host=tmpdir,
+                result_file_host=result_file,
+                artifact_dir_host=artifact_dir,
+                progress_file_host=progress_file,
+                clone_dir_host=clone_dir,
+                cwd_host=cwd,
+                job_env=env_override,
+                gpu_indices=gpu_indices,
+                container_name=container_name,
+                source_env=dict(os.environ),
+                # ldconfig is only consulted for the bwrap backend (to bind driver
+                # libs living outside /usr); container backends provide their own.
+                ldconfig_output=(
+                    _read_ldconfig()
+                    if (gpu_indices and backend_pre == iso.BACKEND_BWRAP)
+                    else ""
+                ),
+                cpu_limit=cpu_limit,
+                mem_limit=mem_limit,
+                allow_host_fallback=allow_host_fallback,
+                python_runtime=python_runtime,
+                job_venv_host=job_venv_host,
+            )
+
+        plan = _build_plan(assigned_gpus)
         # NOTE: BLUEPRINT_PROGRESS_FILE is NOT set here. plan_compute_execution
         # already injects it into plan.env with the correct IN-SANDBOX path
         # (translated from progress_file_host to the per-backend mount, e.g.
@@ -7265,34 +7834,78 @@ def _run_compute_job(
 
             probe_ok, probe_detail = iso.probe_gpu_in_sandbox(plan)
             if not probe_ok:
-                # An arch mismatch is CONCLUSIVE: the container itself reported it
-                # cannot use this GPU, so the run can only end in "no metric".
-                # Fatal no matter what the job declared.
+                # Two axes decide what a failed probe means, and they are
+                # independent:
                 #
-                # Every OTHER probe failure (timeout, no nvidia-smi, empty device
-                # list) is INCONCLUSIVE — it says the PROBE could not run, not
-                # that the JOB cannot. Killing on those would be a false failure,
-                # and the blast radius is wide: `assigned_gpus` is populated from
-                # caps.has_gpu ALONE, so on a GPU host it covers every
-                # containerized job, CPU-only ones included. Keep the old contract
-                # — only a job that DECLARED an accelerator dies on an
-                # inconclusive probe; an image-only job warns and proceeds.
+                #   CONCLUSIVE (arch mismatch) vs INCONCLUSIVE (timeout, no
+                #   nvidia-smi, empty device list). Only the first is evidence the
+                #   GPU is unusable; the rest say the PROBE could not run.
+                #
+                #   DECLARED an accelerator vs did not. `assigned_gpus` is
+                #   populated from caps.has_gpu ALONE, so on a GPU host every
+                #   containerized job is handed a device — CPU-only ones included.
+                #   A device the job never asked for cannot be a reason to fail it.
+                #
+                # Declared + conclusive, and declared + inconclusive, are both
+                # fatal: the job asked for an accelerator and there is not a
+                # working one. Undeclared + conclusive drops the device and
+                # re-plans CPU-only. Undeclared + inconclusive proceeds unchanged.
                 arch_mismatch = iso.no_usable_gpu_marker(probe_detail) is not None
-                if not arch_mismatch and not accelerator_type:
-                    print(
-                        f"[compute] job {job_id}: GPU probe inconclusive "
-                        f"({probe_detail}) — no accelerator was declared, so the "
-                        "job proceeds rather than fail on a probe it never needed",
-                        flush=True,
-                    )
+                if not accelerator_type:
+                    # The job never asked for a GPU. `assigned_gpus` is populated
+                    # from caps.has_gpu ALONE, so on a GPU host EVERY containerized
+                    # job is handed a device, CPU-only ones included. Killing such a
+                    # job because the image's CUDA runtime cannot drive this host's
+                    # arch fails work that would have run fine on the CPU.
+                    #
+                    # An arch mismatch here is conclusive about the DEVICE, not
+                    # about the job: drop the GPU and run CPU-only. An inconclusive
+                    # probe keeps the device and proceeds, exactly as before —
+                    # "the probe could not run" is not evidence the GPU is unusable.
+                    if arch_mismatch:
+                        print(
+                            f"[compute] job {job_id}: GPU unusable in sandbox "
+                            f"({probe_detail}) and no accelerator was declared — "
+                            "releasing the device and running CPU-only rather than "
+                            "failing a job that never asked for a GPU",
+                            flush=True,
+                        )
+                        _release_gpus(gpu_state, assigned_gpus)
+                        assigned_gpus = []
+                        plan = _build_plan(assigned_gpus)
+                        if plan.declined:
+                            print(
+                                f"[compute] DECLINED job {job_id} (fail-closed) on "
+                                f"CPU-only replan: {plan.decline_reason}",
+                                flush=True,
+                            )
+                            outcome = "failure"
+                            _report_terminal(
+                                exec_status="failed", exit_code=1,
+                                command_log={
+                                    "text": (
+                                        "Runner declined job (fail-closed isolation) "
+                                        "after dropping an unusable GPU: "
+                                        f"{plan.decline_reason}"
+                                    ),
+                                    "truncated": False,
+                                },
+                                resume_hydration=resume_hydration,
+                            )
+                            return
+                    else:
+                        print(
+                            f"[compute] job {job_id}: GPU probe inconclusive "
+                            f"({probe_detail}) — no accelerator was declared, so the "
+                            "job proceeds rather than fail on a probe it never needed",
+                            flush=True,
+                        )
                 else:
-                    declared = (
-                        f"accelerator={accelerator_type}"
-                        if accelerator_type
-                        else f"image={container_image}"
-                    )
+                    # Reached only when the job DECLARED an accelerator -- the
+                    # image-only case is handled above -- so the reason names the
+                    # declaration that makes this fatal.
                     terminal_reason = (
-                        f"GPU assigned ({declared}) but unusable "
+                        f"GPU assigned (accelerator={accelerator_type}) but unusable "
                         f"in sandbox: {probe_detail}"
                     )
                     print(f"[compute] ABORT job {job_id}: {terminal_reason}", flush=True)
@@ -8215,6 +8828,118 @@ def _cleanup_stale_task_logs(
     return removed
 
 
+def _drain_stream_to_log(
+    stream: "typing.BinaryIO",
+    log_handle: "typing.BinaryIO | None",
+    *,
+    task_id: str,
+    console: "typing.TextIO | None" = None,
+    chunk_size: int = 8192,
+) -> int:
+    """Drain *stream* to EOF, teeing every chunk to *log_handle* and *console*.
+
+    Runs on a daemon thread as the ONLY reader of a spawned agent's stdout pipe
+    (the agent is started with ``stdout=PIPE, stderr=STDOUT``, so this single
+    pipe carries both streams and nothing else ever reads it). That makes the
+    drain load-bearing for the CHILD'S LIVENESS, not merely for logging, which
+    is why the two failure domains are handled separately:
+
+    * A READ failure is fatal to the tee. The pipe was closed underneath us
+      (teardown / fd-leak guard), so there is nothing left to drain and the
+      loop must stop.
+
+    * A WRITE failure is NOT fatal, and must never stop the drain. The tee used
+      to catch ``OSError`` from ``log_handle.write()``/``flush()`` in the SAME
+      handler that guards ``stream.read()`` and then return, which meant an
+      unwritable log (ENOSPC on a full disk, a quota trip, EIO, the handle
+      closed underneath us) silently stopped the only reader of the pipe. Once
+      the kernel pipe buffer filled — 64KB on Linux — the agent blocked forever
+      in ``write()``, held its capacity permit, and was eventually SIGKILLed by
+      the reaper's wall-clock deadline and recorded as a FAILURE. A full disk
+      therefore HUNG agents instead of failing them, destroying valid work with
+      no signal pointing at the disk. Now a failing sink is dropped (with ONE
+      warning, not one per chunk) and the drain continues to EOF: output is
+      degraded, the child is never blocked.
+
+    The same reasoning applies to the console sink: the runner's own stdout can
+    break (a closed terminal, a dead journal pipe → ``BrokenPipeError``, itself
+    an ``OSError``), and that must not wedge the agent either.
+
+    This function OWNS *log_handle* and closes it on the way out. Returns the
+    number of bytes drained from *stream*, so a caller (or a test) can prove the
+    pipe was actually read to EOF rather than abandoned part-way.
+    """
+    out = sys.stdout if console is None else console
+    drained = 0
+    console_broken = False
+
+    def _warn(message: str) -> None:
+        # Best-effort operator warning. One of these sinks may BE the thing that
+        # just failed, so skip a console already known broken, fall through to
+        # stderr, and never let the warning path raise back into the drain loop.
+        sinks = (sys.stderr,) if console_broken else (out, sys.stderr)
+        for sink in sinks:
+            try:
+                sink.write(message + "\n")
+                sink.flush()
+                return
+            except Exception:  # noqa: BLE001 — a warning must never stop the drain
+                continue
+
+    try:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break  # EOF: the child closed its end of the pipe.
+            drained += len(chunk)
+            if log_handle is not None:
+                try:
+                    log_handle.write(chunk)
+                    log_handle.flush()
+                except (OSError, ValueError) as exc:
+                    _warn(
+                        f"[runner] warning: task {task_id} log file became "
+                        f"unwritable ({type(exc).__name__}: {exc}); dropping "
+                        f"further file logging for this task. The agent's "
+                        f"stdout pipe is still being drained."
+                    )
+                    try:
+                        log_handle.close()
+                    except Exception:  # noqa: BLE001 — best-effort release
+                        pass
+                    # Dropping the reference is what makes the warning fire
+                    # exactly once instead of once per 8KB chunk.
+                    log_handle = None
+            if not console_broken:
+                try:
+                    out.write(chunk.decode("utf-8", "replace"))
+                    out.flush()
+                except (OSError, ValueError) as exc:
+                    console_broken = True
+                    _warn(
+                        f"[runner] warning: task {task_id} console output "
+                        f"became unwritable ({type(exc).__name__}: {exc}); "
+                        f"dropping further console echo for this task. The "
+                        f"agent's stdout pipe is still being drained."
+                    )
+    except (ValueError, OSError) as exc:
+        # READ side only. Reaching here means the pipe itself is gone, so the
+        # child can no longer be blocked on it. Say so: this thread is never
+        # joined or inspected by the runner, so a silent return made an
+        # abnormal drain death completely unobservable.
+        _warn(
+            f"[runner] warning: task {task_id} stdout drain ended early after "
+            f"{drained} byte(s) ({type(exc).__name__}: {exc})."
+        )
+    finally:
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except Exception:  # noqa: BLE001 — best-effort release
+                pass
+    return drained
+
+
 def _compute_backend_summary(caps: "iso.Capabilities") -> str:
     """Human summary of which compute backends this host can build."""
     parts: list[str] = []
@@ -8513,6 +9238,14 @@ def _preflight(
     preflight_version = _runner_version()
     checkout_sha = _clean_source_sha(preflight_version)
 
+    # Compute interpreter capability. PROBE ONLY (provision=False): a preflight
+    # that provisions is how a 1200s venv build once ran under a 120s budget and
+    # reddened a promotion PR. An unprovisioned host reports "not provisioned"
+    # here and builds the runtime on its next real boot, leaving no trace on a
+    # host that was only asked to describe itself.
+    _bootstrap_compute_runtime(provision=False)
+    compute_runtime_report = _compute_runtime_state.report()
+
     # Orchestrator / token ping (the token validation).
     heartbeat_body = {
         # Preflight probe, NOT a genuine active-work report: this empty
@@ -8543,6 +9276,8 @@ def _preflight(
         "compute_backend": iso.decide_compute_backend(
             caps, has_image=agent_image is not None
         ),
+        "python_runtime_usable": bool((compute_runtime_report or {}).get("usable")),
+        "python_runtime": compute_runtime_report,
         **gpu_caps,
     }
     if project_verification is not None:
@@ -8617,6 +9352,17 @@ def _preflight(
         else "none (bwrap agent work disabled; no aggregate descendant cap)"
     )
     print(f"    resource cap : {caps_state}", flush=True)
+    if compute_runtime_report and compute_runtime_report.get("usable"):
+        runtime_state = (
+            f"python {compute_runtime_report.get('python_version')} / pip "
+            f"{compute_runtime_report.get('pip_version')} "
+            f"(via {compute_runtime_report.get('provisioner')})"
+        )
+    else:
+        runtime_state = (
+            f"NOT READY — {(compute_runtime_report or {}).get('reason') or 'unknown'}"
+        )
+    print(f"    py runtime   : {runtime_state}", flush=True)
 
     _fmt("gpus", f"{len(caps.gpu_indices)}x [{gpu_indices_str}]")
     _fmt(
@@ -9209,26 +9955,13 @@ def _spawn_agent_task(
     # Reader thread: tee the agent's stdout to both the per-task log file and
     # the runner's stdout (so output still appears in the terminal / systemd
     # journal, just as it did before with stdout=sys.stdout).
+    # This thread is the ONLY reader of the agent's pipe, so the drain is
+    # load-bearing for the child's liveness: a write failure must degrade the
+    # logging, never stop the reading. See _drain_stream_to_log.
     def _tee_agent_output() -> None:
-        try:
-            assert proc.stdout is not None
-            while True:
-                chunk = proc.stdout.read(8192)
-                if not chunk:
-                    break
-                if _log_file_handle is not None:
-                    _log_file_handle.write(chunk)
-                    _log_file_handle.flush()
-                sys.stdout.write(chunk.decode("utf-8", "replace"))
-                sys.stdout.flush()
-        except (ValueError, OSError):
-            return  # stdout closed underneath us (normal on teardown)
-        finally:
-            if _log_file_handle is not None:
-                try:
-                    _log_file_handle.close()
-                except Exception:
-                    pass
+        if proc.stdout is None:  # pragma: no cover - stdout=PIPE is set above
+            return
+        _drain_stream_to_log(proc.stdout, _log_file_handle, task_id=task_id)
 
     _log_reader = threading.Thread(target=_tee_agent_output, daemon=True)
     _log_reader.start()
@@ -9439,20 +10172,12 @@ def main() -> None:
         agent_image = None
 
     # Activate previously verified Blueprint-owned host CLIs before any host
-    # preflight/probe. Maintain them asynchronously so npm/registry trouble can
-    # never take healthy Claude, Gemini, compute, or heartbeat capacity offline.
-    # A genuinely Docker-only runner is image-managed and does not mutate host
-    # dependencies. Hybrid Docker+bwrap runners still maintain the host CLIs
-    # needed by their write/heavy bwrap task slice.
+    # preflight/probe. A genuinely Docker-only runner is image-managed and does
+    # not mutate host dependencies. Hybrid Docker+bwrap runners still maintain
+    # the host CLIs needed by their write/heavy bwrap task slice.
     host_agent_backend = _host_cli_maintenance_allowed(caps, agent_image)
     if host_agent_backend:
         _activate_managed_cli_paths()
-        if not check_mode:
-            threading.Thread(
-                target=_host_cli_maintenance_loop,
-                name="blueprint-cli-maintenance",
-                daemon=True,
-            ).start()
 
     # Resolve after managed PATH activation so bwrap binds the verified release.
     agent_binary = _locate_agent_binary()
@@ -9559,6 +10284,17 @@ def main() -> None:
     elif not result["token_valid"]:
         print("ERROR: initial heartbeat rejected the runner token.", file=sys.stderr)
         sys.exit(1)
+
+    # Start maintenance only after startup preflight succeeds. Besides avoiding
+    # unnecessary npm work for a runner that is already shutting down, this
+    # keeps an immediate preflight shutdown from racing the cleanup join while
+    # the maintenance loop is inside an install/probe subprocess.
+    if host_agent_backend and not _shutdown_event.is_set():
+        threading.Thread(
+            target=_host_cli_maintenance_loop,
+            name="blueprint-cli-maintenance",
+            daemon=True,
+        ).start()
 
     # NOTE: the env-var BLUEPRINT_RUNNER_MAX_CONCURRENT is only the INITIAL
     # default. The heartbeat RESPONSE carries a server-authoritative live-safe
@@ -9675,6 +10411,18 @@ def main() -> None:
     # DECLINE (e.g. imageless on a container-only box) is still enforced in
     # _run_compute_job; this avoids pulling work we plainly cannot sandbox.
     if compute_claimable:
+        # Establish the interpreter guarantee BEFORE the first job needs it, off
+        # the startup path: provisioning a venv can take minutes on a cold host
+        # and must not delay the heartbeat (which is what makes this runner
+        # visible to the fleet at all). A job that arrives first blocks on the
+        # same flock rather than racing a second build, so the work is done once
+        # either way — this thread only decides whether the FIRST job pays for
+        # it. --check exited above, so a preflight never reaches this.
+        threading.Thread(
+            target=lambda: _set_compute_runtime(_bootstrap_compute_runtime()),
+            name="blueprint-compute-runtime",
+            daemon=True,
+        ).start()
         compute_poll = threading.Thread(
             target=_compute_poll_loop,
             name="blueprint-compute-poll",

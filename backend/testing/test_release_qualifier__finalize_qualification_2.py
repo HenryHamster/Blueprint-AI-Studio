@@ -4674,9 +4674,23 @@ async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
 
 
 @pytest.mark.asyncio
-async def test_sweep_leaves_deferred_unsynced_for_strategic(db_session, mocker):
-    """A cleared deferral remains a Strategic delivery decision, not sweep work."""
+async def test_sweep_redrives_deferred_unsynced_once_the_back_merge_lands(
+    db_session, mocker
+):
+    """A deferral whose back-merge HAS landed is re-driven, not left parked.
+
+    This assertion is INVERTED from what it once pinned ("a cleared deferral
+    remains a Strategic delivery decision, not sweep work"), because that pin
+    described a dead-end rather than a decision: ``qualification_triggers``
+    T5b armed the version every cycle with ``deferred_unsynced_redrive``, the
+    sweep's auto-trigger executor discarded the decision as re-driver-owned,
+    and no such re-driver existed -- so a candidate whose ``main -> automain``
+    back-merge had already landed stayed parked until a human noticed.
+    Keeping the old pin would have re-asserted that stall as the contract.
+    """
     from datetime import datetime, timedelta
+
+    from app.release_qualifier_redrive import _DEFERRED_UNSYNCED_DECISION_KEY
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     # Stranded deferral, recorded a few minutes ago (well within the 30-min
@@ -4692,8 +4706,16 @@ async def test_sweep_leaves_deferred_unsynced_for_strategic(db_session, mocker):
 
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     # main is NOW absorbed into the (fresh) candidate — the back-merge landed.
+    absorbed = AsyncMock(return_value=True)
+    mocker.patch("app.release_qualifier._is_target_absorbed", new=absorbed)
+    # Promotion ARMED. Without this the fixture project has promotion
+    # disabled, run_qualification short-circuits at the promotion_disabled
+    # gate before it ever reaches the sync gate, and every mock below goes
+    # unconsulted -- the test would pass without exercising anything it
+    # claims to.
     mocker.patch(
-        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+        "app.release_qualifier.resolve_project_promotion_enabled",
+        return_value=True,
     )
 
     count = await rq.sweep_stuck_qualifications(
@@ -4701,10 +4723,24 @@ async def test_sweep_leaves_deferred_unsynced_for_strategic(db_session, mocker):
     )
     await db_session.commit()
 
+    # The sync gate was actually consulted. Asserting this is the difference
+    # between "the re-drive re-entered the qualifier" and "the qualifier
+    # bailed somewhere earlier and the test never noticed".
+    assert absorbed.await_count >= 1
+
+    # Re-driving is not "stuck qualification" work — the sweep's return value
+    # counts finalizations, and this one starts a qualification instead.
     assert count == 0
     await db_session.refresh(version)
-    assert version.last_qualification["status"] == "deferred_unsynced"
-    assert await _audit_tasks(db_session, project.id) == []
+    qual = version.last_qualification
+    # Off deferred_unsynced: the deferral is released, not re-recorded.
+    assert qual["status"] != "deferred_unsynced"
+    decision = qual[_DEFERRED_UNSYNCED_DECISION_KEY]
+    assert decision["decision"] == "fired"
+    assert decision["reason"] == "sync_gate_cleared"
+    assert decision["result_status"] == "spawned"
+    # And the release review it exists to start actually started.
+    assert await _audit_tasks(db_session, project.id) != []
 
 
 @pytest.mark.asyncio
@@ -4727,8 +4763,16 @@ async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mock
 
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     # Still NOT absorbed — the back-merge has not landed yet.
+    absorbed = AsyncMock(return_value=False)
+    mocker.patch("app.release_qualifier._is_target_absorbed", new=absorbed)
+    # Promotion ARMED. Without this the fixture project has promotion
+    # disabled, run_qualification short-circuits at the promotion_disabled
+    # gate before it ever reaches the sync gate, and every mock below goes
+    # unconsulted -- the test would pass without exercising anything it
+    # claims to.
     mocker.patch(
-        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False)
+        "app.release_qualifier.resolve_project_promotion_enabled",
+        return_value=True,
     )
 
     count = await rq.sweep_stuck_qualifications(
@@ -4737,11 +4781,18 @@ async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mock
     await db_session.commit()
 
     assert count == 0
+    # The sync gate was reached and said "still behind", so this test
+    # re-defers for the reason it names rather than because the qualifier
+    # bailed earlier.
+    assert absorbed.await_count >= 1
     await db_session.refresh(version)
     # Still deferred, nothing spawned, and the accrued-wait clock is preserved.
     assert version.last_qualification["status"] == "deferred_unsynced"
     assert version.last_qualification["first_deferred_at"] == first_deferred
     assert await _audit_tasks(db_session, project.id) == []
+    decision = version.last_qualification["deferred_unsynced_redrive_decision"]
+    assert decision["decision"] == "held"
+    assert decision["reason"] == "still_unsynced"
 
 
 @pytest.mark.asyncio
@@ -4780,6 +4831,15 @@ async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
         "app.release_qualifier_sweep._redrive_error_qualification",
         new=AsyncMock(return_value=False),
     )
+    # Promotion ARMED. Without this the fixture project has promotion
+    # disabled, run_qualification short-circuits at the promotion_disabled
+    # gate before it ever reaches the sync gate, and every mock below goes
+    # unconsulted -- the test would pass without exercising anything it
+    # claims to.
+    mocker.patch(
+        "app.release_qualifier.resolve_project_promotion_enabled",
+        return_value=True,
+    )
 
     count = await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)
@@ -4795,6 +4855,13 @@ async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
     assert version.last_qualification["first_deferred_at"] == first_deferred
     # No audit task should have been spawned.
     assert await _audit_tasks(db_session, project.id) == []
+    # The re-drive says only what it established. A transient 503 proves
+    # nothing about the back-merge, so the recorded reason must not claim it
+    # does; the exact status is stamped alongside for whoever reads it back.
+    decision = version.last_qualification["deferred_unsynced_redrive_decision"]
+    assert decision["decision"] == "held"
+    assert decision["reason"] == "run_qualification_no_progress"
+    assert decision["result_status"] == "sha_error"
 
 
 @pytest.mark.asyncio

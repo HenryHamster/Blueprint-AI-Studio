@@ -66,8 +66,35 @@ from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
     WORKBENCH_STATE_KEY,
 )
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
 
 TEST_USER_ID = "test-user-123"
+
+_BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _runner_scripts_dir() -> str:
+    """Put the repo ``scripts/`` dir on ``sys.path``, or FAIL with the reason.
+
+    The runner-side modules under test (``local_runner``, ``runner_isolation``)
+    ship in the repo's ``scripts/`` dir, which is NOT
+    ``<this file>/../../scripts`` in every layout: the Docker test image carries
+    the backend tree as /app with no scripts/ sibling and reaches the repo only
+    through the /repo bind mount. Six call sites below used the fixed relative
+    walk ALONE and imported successfully in that image only because an
+    earlier-collected module had already pushed /repo/scripts onto sys.path --
+    a collection-order accident, and pytest-split rebalancing across the CI
+    shards is what turns that into a red promotion PR.
+
+    A miss ASSERTS with the resolver's named reason rather than skipping: these
+    are the runner protocol's regression tests, and a lane that silently stops
+    running them reports coverage it does not have.
+    """
+    scripts_dir, unavailable = resolve_scripts_dir_from_env(_BACKEND_DIR)
+    assert scripts_dir is not None, unavailable
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    return scripts_dir
 
 
 async def _make_project(session, owner_id=TEST_USER_ID, name="Runner Project"):
@@ -3796,6 +3823,150 @@ class TestRunnerEndpoints:
         # The audit trail survives in its own key, where it cannot make a drained
         # task look "already examined".
         assert poisoned.context["runner_pull_unpins"] == 1
+        # ...and the episode-scoped budget that decides when to STOP recycling
+        # advanced with it. Without a reader the recycle loop is unbounded.
+        assert poisoned.context["runner_pull_unpin_cycles"] == 1
+
+    @pytest.mark.asyncio
+    async def test_unroutable_task_blocks_instead_of_recycling_forever(
+        self, client: AsyncClient, db_session
+    ):
+        """Past MAX_PULL_UNPIN_CYCLES the task BLOCKS with a reason — it does not
+        orbit PROVISIONING -> QUEUED -> PROVISIONING for the rest of time.
+
+        The unpin at SKIP_UNPIN_THRESHOLD only helps when the cause is transient.
+        When no enabled account can serve the task's routed model, the re-dispatch
+        re-pins it, it skips again, and ~25 minutes later it is unpinned again.
+        RUNNER_PULL_UNPINS_CONTEXT_KEY was WRITE-ONLY — nothing read it, so
+        nothing ever concluded the recycling was not working. That is how task
+        9ca108c5 held PROVISIONING for 68+ minutes behind an accurate status
+        message, in no terminal state and in no failed/blocked view.
+        """
+        from app.models import Alert
+        from app.runner_pull_skip import (
+            LLM_ROUTE_ALERT_TITLE,
+            LLM_ROUTE_BLOCKER_KIND,
+            MAX_PULL_UNPIN_CYCLES,
+            SKIP_UNPIN_THRESHOLD,
+        )
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        poisoned = self._with_skip_marker(
+            self._pinned(project.id, runner.id), count=SKIP_UNPIN_THRESHOLD - 1
+        )
+        # Already recycled the full budget: this is cycle N+1 of the same episode.
+        ctx = dict(poisoned.context or {})
+        ctx["runner_pull_unpin_cycles"] = MAX_PULL_UNPIN_CYCLES
+        poisoned.context = ctx
+        db_session.add(poisoned)
+        await db_session.commit()
+
+        # The EXACT live failure string from the incident.
+        async def _no_account(**kwargs):
+            kwargs["failure_reasons"].append(
+                "zai/claude-opus-5: glm: account disabled (manually)"
+            )
+            return None
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=_no_account),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 503
+
+        await db_session.refresh(poisoned)
+        # TERMINAL-for-now, not another lap. BLOCKED (not FAILED): nothing is
+        # wrong with the task, the pool cannot serve it, so no retry budget burns
+        # and no work is destroyed over an account toggle.
+        assert poisoned.status == TaskStatus.BLOCKED
+        assert poisoned.status != TaskStatus.PROVISIONING
+        assert poisoned.status != TaskStatus.QUEUED
+        assert poisoned.blocker_kind == LLM_ROUTE_BLOCKER_KIND
+        # The pin is gone, so it stops occupying a candidate-scan slot.
+        assert poisoned.vm_instance_id is None
+        assert "runner_target_id" not in (poisoned.context or {})
+
+        # REASONS, not just a state: machine-readable code + the exact model,
+        # provider and account, parsed out of the runner's own failure line.
+        block = poisoned.context["llm_route_block"]
+        assert block["code"] == "no_eligible_account"
+        assert block["provider"] == "zai"
+        assert block["model"] == "claude-opus-5"
+        assert block["unpin_cycles"] == MAX_PULL_UNPIN_CYCLES
+        assert "glm: account disabled (manually)" in block["reason"]
+
+        # ...and the human-readable half names the model AND the account.
+        assert "claude-opus-5" in (poisoned.blocked_reason or "")
+        assert "glm" in (poisoned.blocked_reason or "")
+        assert "claude-opus-5" in (poisoned.latest_status_message or "")
+
+        alerts = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.task_id == poisoned.id,
+                    Alert.title == LLM_ROUTE_ALERT_TITLE,
+                )
+            )
+        ).scalars().all()
+        assert len(alerts) == 1, "giving up on a task must reach an operator"
+        # ERROR, not WARNING: the repeated-skip alert promises a retry. This one
+        # says the platform has given up and a human must act.
+        assert alerts[0].severity == AlertSeverity.ERROR
+        assert "claude-opus-5" in alerts[0].message
+        assert "glm" in alerts[0].message
+
+    @pytest.mark.asyncio
+    async def test_dispatch_resets_the_unpin_cycle_budget(
+        self, client: AsyncClient, db_session
+    ):
+        """A task that actually DISPATCHES starts its next episode with a full budget.
+
+        The give-up counter is episode-scoped on purpose. If it survived a
+        successful dispatch, a task that hit three unrelated transient pool
+        cooldowns over its lifetime would be BLOCKED on the first skip of a
+        fourth — turning a bound on a broken loop into a new false-positive
+        wedge. The LIFETIME audit tally is untouched.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        healthy = self._pinned(project.id, runner.id)
+        ctx = dict(healthy.context or {})
+        ctx["runner_pull_unpin_cycles"] = 2
+        ctx["runner_pull_unpins"] = 7
+        healthy.context = ctx
+        db_session.add(healthy)
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(healthy.id)
+
+        await db_session.refresh(healthy)
+        assert "runner_pull_unpin_cycles" not in (healthy.context or {})
+        # The audit trail is NOT reset - it is the record of what happened.
+        assert healthy.context["runner_pull_unpins"] == 7
 
     @pytest.mark.asyncio
     async def test_fresh_skip_marker_short_circuits_credential_resolution(
@@ -11193,6 +11364,58 @@ class TestDirectComputeExperimentDispatch:
         assert await _compute_job_for_task(db_session, task.id) is None
 
     @pytest.mark.asyncio
+    async def test_strict_pin_holds_when_runner_has_no_python_runtime(
+        self, db_session
+    ):
+        """A pin to a host that proved it cannot build an interpreter must SAY so.
+
+        The generic ``not_eligible`` would leave the operator unable to tell a
+        host misconfiguration from a scheduling one — and this hold is fixable
+        in one command on the runner (install python3-venv or uv).
+        """
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "python_runtime": {
+                    "usable": False,
+                    "reason": "python3 -m venv failed and uv is not installed",
+                },
+                "python_runtime_usable": False,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    runner_target={"runner_id": str(runner.id), "strict": True}
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "missing_python_runtime", (
+            f"expected 'missing_python_runtime', got {hold['reason_code']}"
+        )
+        # The runner's OWN words, not a generic restatement: that string is what
+        # tells the operator which package is missing.
+        assert "uv is not installed" in hold["detail"]
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
     async def test_launch_pins_arch_compatible_runner(self, db_session):
         """Sanity: an image floor MET by the runner's GPU arch dispatches normally —
         the gate is a no-op when the hardware is compatible."""
@@ -12965,14 +13188,7 @@ async def test_capability_proof_trial_flag_off_records_nothing(db_session):
 
 
 def test_local_runner_receipt_requires_bootstrapped_toolchain_and_probe_legs():
-    from pathlib import Path
-
-    script_candidates = (
-        Path(__file__).parents[2] / "scripts",
-        Path("/repo/scripts"),
-    )
-    scripts_dir = next(path for path in script_candidates if path.is_dir())
-    sys.path.insert(0, str(scripts_dir))
+    _runner_scripts_dir()
     import local_runner as runner
 
     # Patch on the exact module object local_runner consults (runner.iso), not a
@@ -13366,15 +13582,8 @@ def test_large_checkpoint_round_trip_upload_bundle_resume(tmp_path, monkeypatch)
     import os
     import random
     import shutil
-    import sys
-    from pathlib import Path
 
-    script_candidates = (
-        Path(__file__).parents[2] / "scripts",
-        Path("/repo/scripts"),
-    )
-    scripts_dir = next(path for path in script_candidates if path.is_dir())
-    sys.path.insert(0, str(scripts_dir))
+    _runner_scripts_dir()
     import local_runner
 
     source = tmp_path / "source"
@@ -13525,9 +13734,7 @@ class TestRunnerResumeFail_Closed:
 
     @staticmethod
     def _bwrap_caps():
-        import sys
-        import pathlib
-        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        _runner_scripts_dir()
         import runner_isolation as iso
         return iso.Capabilities(bwrap_path="/usr/bin/bwrap", userns_ok=True)
 
@@ -13549,10 +13756,8 @@ class TestRunnerResumeFail_Closed:
 
     def test_runner_resume_fails_closed_when_bundle_unavailable(self):
         """A missing predecessor bundle aborts the job — command never starts."""
-        import sys
-        import pathlib
         import threading
-        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        _runner_scripts_dir()
         import local_runner
         from unittest.mock import patch
 
@@ -13611,10 +13816,8 @@ class TestRunnerResumeFail_Closed:
 
     def test_runner_resume_fails_closed_on_extract_error(self):
         """An extraction error also aborts the job — command never starts."""
-        import sys
-        import pathlib
         import threading
-        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        _runner_scripts_dir()
         import local_runner
         from unittest.mock import patch
 
@@ -13644,10 +13847,8 @@ class TestRunnerResumeFail_Closed:
 
     def test_runner_resume_proceeds_when_bundle_available(self):
         """Successful proof is repeated on a later durable terminal report."""
-        import sys
-        import pathlib
         import threading
-        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        _runner_scripts_dir()
         import local_runner
         from unittest.mock import patch
 
@@ -13698,10 +13899,7 @@ class TestScanViewableFilesCap:
 
     @staticmethod
     def _import_local_runner():
-        import sys
-        import pathlib
-        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
-        sys.path.insert(0, str(scripts_dir))
+        _runner_scripts_dir()
         import local_runner
         return local_runner
 
@@ -13779,10 +13977,7 @@ class TestStreamViewableAccountingReset:
 
     @staticmethod
     def _import_local_runner():
-        import sys
-        import pathlib
-        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
-        sys.path.insert(0, str(scripts_dir))
+        _runner_scripts_dir()
         import local_runner
         return local_runner
 

@@ -2338,7 +2338,7 @@ class TestBuildDeployStatePayload:
             payload = await build_deploy_state_payload(db_session)
 
             json.dumps(payload)
-            assert payload["external_health"]["last_check"] == "2026-04-27T08:00:00"
+            assert payload["external_health"]["last_check"] == "2026-04-27T08:00:00+00:00"
         finally:
             _shared_state.external_health["last_check"] = snap
 
@@ -3408,8 +3408,8 @@ class TestGetTaskWakeRegistration:
             "wake_source_kind": "compute_job_terminal",
             "wake_source_ref": "job-123",
             "delivery_state": "DELIVERED",
-            "deadline_at": "2026-06-01T13:00:00",
-            "fired_at": "2026-06-01T12:10:00",
+            "deadline_at": "2026-06-01T13:00:00+00:00",
+            "fired_at": "2026-06-01T12:10:00+00:00",
             "result_state": "resumed",
             "result_detail": "Task re-queued after compute job completed",
         }
@@ -4109,7 +4109,7 @@ class TestGetAuditFindings:
         assert data["source"] == "qualification_verdict"
         assert len(data["findings"]) == 1
         assert data["findings"][0]["severity"] == "high"
-        assert data["finalized_at"] == "2026-01-02T00:00:00"
+        assert data["finalized_at"] == "2026-01-02T00:00:00+00:00"
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_open_version(

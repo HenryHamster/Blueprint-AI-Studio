@@ -45,6 +45,7 @@ from app.models import (
     get_task_total_vm_cost_usd_or_none,
 )
 from app.vm_cost_rates import vm_cost_sql_expr
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -385,7 +386,7 @@ async def get_drift_snapshot(
             "total_directions": 0,
             "any_system_flagged": False,
             "by_system": {},
-            "generated_at": _utcnow().isoformat(),
+            "generated_at": utc_iso(_utcnow()),
             "window_days": window_days,
         }
 
@@ -405,7 +406,7 @@ async def get_drift_snapshot(
         # Reverse to chronological order for sparkline rendering (oldest first).
         history = [
             {
-                "snapshot_at": s.snapshot_at.isoformat(),
+                "snapshot_at": utc_iso(s.snapshot_at),
                 "claim_shipped_consistency": s.claim_shipped_consistency,
                 "over_claim_flag": s.over_claim_flag,
                 "stalled_despite_churn_flag": s.stalled_despite_churn_flag,
@@ -1142,7 +1143,7 @@ async def get_outer_loop_chains(
         description=(
             "Filter chains by terminal outcome / escalation reason: rejected, "
             "cap_exhausted, stuck, standoff, repeat_fingerprint_halt, or merged. "
-            "When omitted, all non-merged chains are returned."
+            "When omitted, all resolved chains are returned."
         ),
     ),
     limit: int = Query(50, ge=1, le=50),
@@ -1156,8 +1157,8 @@ async def get_outer_loop_chains(
     single count, this lists the actual PR-chains so an operator can open and
     investigate them. Read-only; reuses the SAME ``require_admin`` dependency,
     row caps, original-task hydration, and chain grouping as the other
-    outer-loop endpoints. When ``reason`` is omitted, all non-merged chains are
-    returned (the actionable set); otherwise only chains matching that outcome.
+    outer-loop endpoints. When ``reason`` is omitted, all resolved chains are
+    returned; otherwise only chains matching that outcome.
     """
     from app.digest_metrics import _resolve_outer_loop_chains  # noqa: PLC0415
 
@@ -1217,15 +1218,18 @@ async def get_outer_loop_chains(
     if reason is not None:
         selected = [c for c in chains if c["outcome"] == reason]
     else:
-        selected = [
-            c for c in chains if c["outcome"] is not None and c["outcome"] != "merged"
-        ]
+        selected = [c for c in chains if c["outcome"] is not None]
 
     rows = [
         {
+            "chain_key": c["chain_key"],
+            "original_task_id": c["original_task_id"],
             "pr_number": c["pr_number"],
+            "direction_id": c["direction_id"],
             "task_ids": c["task_ids"],
             "max_iteration": c["max_iteration"],
+            "review_count": c["review_count"],
+            "reviews_to_converge": c["reviews_to_converge"],
             "churn_count": c["churn_count"],
             "terminal_reason": c["outcome"],
             "project_id": c["project_id"],
@@ -1443,9 +1447,7 @@ async def get_pipeline_regressions(
             {
                 "signal_name": alert.title,
                 "regression_class": reg_class,
-                "detected_at": alert.created_at.isoformat()
-                if alert.created_at
-                else None,
+                "detected_at": utc_iso(alert.created_at),
                 "severity": "critical",
                 "current_rate": None,
                 "prior_rate": None,
@@ -1478,9 +1480,7 @@ async def get_pipeline_regressions(
             {
                 "signal_name": alert.title,
                 "regression_class": f"signal_staleness:{signal_name or 'unknown'}",
-                "detected_at": alert.created_at.isoformat()
-                if alert.created_at
-                else None,
+                "detected_at": utc_iso(alert.created_at),
                 "severity": "warning",
                 "current_rate": None,
                 "prior_rate": None,
@@ -1548,9 +1548,7 @@ async def get_pipeline_regressions(
             {
                 "signal_name": signal_name,
                 "regression_class": regression_class,
-                "detected_at": (task.updated_at or task.created_at).isoformat()
-                if (task.updated_at or task.created_at)
-                else None,
+                "detected_at": utc_iso(task.updated_at or task.created_at),
                 "severity": "critical",
                 "current_rate": None,
                 "prior_rate": None,
@@ -1836,7 +1834,7 @@ async def get_pipeline_efficiency(
         }
 
     return {
-        "computed_at": now.isoformat(),
+        "computed_at": utc_iso(now),
         "window_24h": _augment(cur_24h, pri_24h),
         "window_7d": _augment(cur_7d, pri_7d),
     }
@@ -2059,7 +2057,7 @@ async def pin_ui_load_timing_baseline(
                 "p90": b.p90,
                 "count": b.count,
                 "label": b.label,
-                "pinned_at": b.pinned_at.isoformat() if b.pinned_at else None,
+                "pinned_at": utc_iso(b.pinned_at),
             }
             for b in baselines
         ],
@@ -2107,7 +2105,7 @@ async def get_ui_load_timing(
             "p90": b.p90,
             "count": b.count,
             "label": b.label,
-            "pinned_at": b.pinned_at.isoformat() if b.pinned_at else None,
+            "pinned_at": utc_iso(b.pinned_at),
         }
         for b in baseline_rows
     ]

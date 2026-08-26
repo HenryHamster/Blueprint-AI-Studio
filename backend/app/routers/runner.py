@@ -88,6 +88,7 @@ from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
 from app.workbench_state import (
     refresh_strategic_local_continuation_on_runner_heartbeat,
 )
+from app.time_utils import utc_iso
 
 _MAX_RUNNER_COMMAND_LOG_BYTES = 65536
 _MAX_RUNNER_RESULT_METRICS_KEYS = 256
@@ -113,6 +114,12 @@ _ARTIFACT_TRANSFER_TTL_SECONDS = 60 * 60
 # writes (compute_jobs._apply_status_update + agent_compute_jobs heartbeat) and
 # the admin UI's live-output block reads. The runner sends ~4 KiB; server cap.
 _MAX_RUNNER_LIVE_OUTPUT_BYTES = 8192
+# Terminal-cause string a runner may attach to a terminal report
+# (ComputeJobReportRequest.terminal_reason). The real emitters are single
+# sentences ("runner provisioning failure: no usable python runtime on this
+# host"), so 500 chars is far beyond any legitimate value while bounding what
+# a crafted report can write into the JSONB polling_metadata column.
+_MAX_RUNNER_TERMINAL_REASON_CHARS = 500
 # Self-reported progress records (BLUEPRINT_PROGRESS_FILE protocol). Written by
 # sandboxed experiment code and relayed by the runner, so the server validates
 # every field and bounds every dimension before storing.
@@ -176,6 +183,12 @@ _PROJECT_VERIFICATION_VERSION = 1
 _MAX_PROJECT_VERIFICATION_REASON_CHARS = 500
 _PROJECT_VERIFICATION_BACKENDS = frozenset({"bwrap", "declined"})
 _PROJECT_VERIFICATION_BOUNDARY_CLASS = "agent"
+# Per-field bound for the runner's compute-interpreter capability report
+# (HeartbeatRequest.python_runtime). Its real values are a path, two version
+# strings, a provisioner name and one failure sentence, so 300 chars is far
+# beyond any legitimate value while bounding what a crafted heartbeat can
+# write into the capabilities JSONB column.
+_MAX_PYTHON_RUNTIME_FIELD_CHARS = 300
 # An idle runner normally completes its self-update within one or two 60s
 # retry cycles; an idle drain older than this means the update is failing
 # repeatedly (e.g. version hint unreachable from the branch the runner
@@ -323,6 +336,38 @@ def _sanitize_resource_capacity(raw: Any) -> dict | None:
             lambda value: _int(value, _MAX_RESOURCE_CAPACITY_BYTES),
         ),
         "gpu": _section("gpu", ("total", "reserved", "free"), lambda value: _int(value, _MAX_RESOURCE_CAPACITY_COUNT)),
+    }
+
+
+def _sanitize_python_runtime(raw: Any) -> dict | None:
+    """Normalize the runner's compute-interpreter capability report.
+
+    Untrusted runner input landing in the capabilities JSONB, so only the known
+    keys survive and every string is bounded.
+
+    ``usable`` is kept STRICTLY tri-state - ``True`` / ``False`` / ``None``.
+    ``None`` means "the runner sent a report whose verdict we cannot read", and
+    placement must treat that as UNKNOWN rather than as incapable: coercing an
+    unreadable report to False is how a capability gate starves a healthy fleet.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _text(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        trimmed = value.strip()[:_MAX_PYTHON_RUNTIME_FIELD_CHARS]
+        return trimmed or None
+
+    usable = raw.get("usable")
+    return {
+        "usable": usable if isinstance(usable, bool) else None,
+        "reason": _text(raw.get("reason")),
+        "interpreter": _text(raw.get("interpreter")),
+        "python_version": _text(raw.get("python_version")),
+        "pip_version": _text(raw.get("pip_version")),
+        "provisioner": _text(raw.get("provisioner")),
+        "probed_at": _text(raw.get("probed_at")),
     }
 
 
@@ -581,7 +626,7 @@ def _merge_progress_report(existing: Any, raw: Any, now: datetime) -> tuple[dict
     return {
         "records": merged,
         "count": max(count, len(merged)),
-        "updated_at": now.isoformat(),
+        "updated_at": now.isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
     }, new_records
 
 
@@ -735,6 +780,20 @@ class HeartbeatRequest(BaseModel):
     # {"docker": {"verified": true, "mode": "cdi", "reason": "verified"}}.
     # Old runners omit it and remain heartbeat-compatible.
     container_gpu_passthrough: dict | None = None
+    # Whether this host can give a bwrap compute job a Python interpreter with a
+    # WORKING pip, plus the evidence behind that verdict. scripts/local_runner.py
+    # has been sending BOTH keys on every heartbeat and every --check; pydantic's
+    # default extra="ignore" dropped them here, so they never reached
+    # runner.capabilities and placement stayed blind to a host that fails every
+    # imageless compute job at provisioning time.
+    #
+    # Route on the NESTED report, never on the flat bool: the runner derives the
+    # bool as bool((report or {}).get("usable")), so a host whose boot-time
+    # provisioner thread has not published yet reports False while being
+    # perfectly capable. Only the nested object separates "probed and failed" (a
+    # dict carrying usable=False and a reason) from "not probed yet" (absent).
+    python_runtime_usable: StrictBool | None = None
+    python_runtime: dict | None = None
     agent_backend: str | None = None
     compute_backend: str | None = None
     # Versioned functional evidence for project-authoring verification. Kept raw
@@ -1814,16 +1873,16 @@ async def heartbeat(
             # within one heartbeat interval, so a long idle drain means the
             # update keeps failing.
             if not was_update_draining:
-                caps["update_draining_since"] = now.isoformat()
+                caps["update_draining_since"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 caps.pop("update_drain_alerted_at", None)
             elif not caps.get("update_draining_since"):
-                caps["update_draining_since"] = now.isoformat()
+                caps["update_draining_since"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
             try:
                 _drain_age_s = (
                     now - datetime.fromisoformat(str(caps["update_draining_since"]))
                 ).total_seconds()
             except (TypeError, ValueError):
-                caps["update_draining_since"] = now.isoformat()
+                caps["update_draining_since"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 _drain_age_s = 0.0
             if payload.active_work_report:
                 _drain_active_work = bool(
@@ -1839,7 +1898,7 @@ async def heartbeat(
                 and not _drain_active_work
                 and not caps.get("update_drain_alerted_at")
             ):
-                caps["update_drain_alerted_at"] = now.isoformat()
+                caps["update_drain_alerted_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 from app.main import _current_sha
 
                 # Lazy: app.alert_dispatch imports this router's package.
@@ -1912,7 +1971,7 @@ async def heartbeat(
     if payload.active_work_report:
         caps["active_task_ids"] = list(payload.active_task_ids)
         caps["active_compute_job_ids"] = list(payload.active_compute_job_ids)
-        caps["active_work_reported_at"] = now.isoformat()
+        caps["active_work_reported_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     # Merge runner-reported hardware capabilities when present.
     # These override the registration-time default but never clobber
     # operator-configured fields (task_types, max_concurrent).
@@ -1949,6 +2008,30 @@ async def heartbeat(
         # image work that this daemon cannot prove it can execute. Non-report
         # preflights leave the last genuine daemon inventory untouched.
         caps.pop("container_gpu_passthrough", None)
+    # Compute-interpreter capability, persisted from GENUINE daemon heartbeats
+    # only. --check runs the probe with provision=False by design ("this probe
+    # does not provision"), so an unprovisioned host reports usable=False there
+    # while being perfectly able to build the runtime on its next real boot;
+    # writing that preflight verdict would make a healthy host permanently
+    # ineligible for imageless compute. A preflight therefore neither writes nor
+    # clears the last genuine daemon report.
+    #
+    # A daemon that sends no report (an older runner, or one whose boot-time
+    # provisioner has not published yet) CLEARS the keys rather than inheriting
+    # the previous process's verdict. That drops the runner back to "unknown",
+    # which is the fail-open side of this gate - and it also stops a stale
+    # positive from authorizing work the current process cannot prove it can do.
+    if payload.active_work_report:
+        sanitized_runtime = _sanitize_python_runtime(payload.python_runtime)
+        if sanitized_runtime is None:
+            caps.pop("python_runtime", None)
+            caps.pop("python_runtime_usable", None)
+        else:
+            caps["python_runtime"] = sanitized_runtime
+            # Derived from the sanitized report, never trusted from the wire:
+            # the flat bool is fleet-panel telemetry and must not be able to
+            # disagree with the evidence placement actually reads.
+            caps["python_runtime_usable"] = sanitized_runtime["usable"] is True
     if payload.llm_clis is not None:
         caps["llm_clis"] = payload.llm_clis
     if payload.agent_backend is not None:
@@ -2152,7 +2235,7 @@ async def heartbeat(
         # restart it. Only stamped on a genuine change so a steady-state runner
         # never carries a stale "just updated" marker.
         if previous_version is not None and new_version != previous_version:
-            caps["version_changed_at"] = now.isoformat()
+            caps["version_changed_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
             caps["previous_version"] = previous_version
         runner.version = new_version
     if "git_sha" in payload.model_fields_set:
@@ -2268,7 +2351,7 @@ async def heartbeat(
     generation = config_generation(live_config)
     return {
         "ok": True,
-        "last_seen_at": runner.last_seen_at.isoformat(),
+        "last_seen_at": utc_iso(runner.last_seen_at),
         "enrolled_max_concurrent": caps.get("max_concurrent"),
         "version_hint": _current_sha,
         "config": {**live_config, "config_generation": generation},
@@ -2385,6 +2468,24 @@ class ComputeJobReportRequest(BaseModel):
     # due to per-kind size cap or 25-file count cap. Only meaningful on "running"
     # reports; ignored on terminal ones.
     viewable_omissions: Any = None
+    # Structured cause for a terminal failure the COMMAND did not cause -- a
+    # host-capability gap, a runner-side deadline, a watchdog kill. The runner
+    # has been sending this key for as long as ``_report(terminal_reason=...)``
+    # has existed in scripts/local_runner.py; until this field was declared,
+    # pydantic's default ``extra="ignore"`` DESTROYED it at the API boundary --
+    # silently, with no log line. The consequence was not cosmetic: a host that
+    # could not produce a Python interpreter reported exit 123 plus "runner
+    # provisioning failure: no usable python runtime on this host", the reason
+    # never reached the row, ``poll_status`` fell through to the untyped
+    # "compute job failed" default, and classify_compute_terminal_reason billed
+    # the experiment's AUTHOR a CODE_ERROR -- not budget-exempt, not
+    # resurrection-eligible -- for a defect that was entirely in the host. The
+    # classifier was always correct; only this transport was missing.
+    #
+    # Stamped (bounded) into polling_metadata["runner_terminal_reason"] and
+    # preferred by RunnerSubprocessBackend.poll_status over the default, so
+    # EVERY future runner-side reason works, not just the interpreter one.
+    terminal_reason: str | None = None
 
 
 def _decrypt_registry_auth(auth: dict | None) -> dict | None:
@@ -2508,7 +2609,7 @@ async def next_compute_job(
     # runs this job. Stamp the durable first-class record of the claiming runner.
     job.ran_on_runner_id = runner.id
     meta = dict(job.polling_metadata or {})
-    meta["runner_claimed_at"] = now.isoformat()
+    meta["runner_claimed_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     job.polling_metadata = meta
     session.add(job)
     await session.commit()
@@ -2588,9 +2689,9 @@ async def report_compute_job(
 ):
     """Runner reports execution status for a claimed compute job.
 
-    Stamps exec_status, exit_code, result_metrics, and command_log into
-    ``polling_metadata`` so the monitor's existing ``poll_status``/finalize path
-    can pick up the terminal state. Does NOT finalize the job itself — the monitor
+    Stamps exec_status, exit_code, result_metrics, command_log and (on terminal
+    reports) terminal_reason into ``polling_metadata`` so the monitor's existing
+    ``poll_status``/finalize path can pick up the terminal state. Does NOT finalize the job itself — the monitor
     owns that transition so artifact-linking and wake delivery run on the normal path.
 
     Interim ``running`` reports may additionally carry:
@@ -2734,6 +2835,18 @@ async def report_compute_job(
             meta["runner_exec_status"] = payload.exec_status
         if payload.exit_code is not None and isinstance(payload.exit_code, int):
             meta["runner_exit_code"] = payload.exit_code
+        if payload.exec_status in ("succeeded", "failed") and isinstance(
+            payload.terminal_reason, str
+        ):
+            # Terminal-only: a mid-run report has no terminal cause to carry, and
+            # accepting one would let a live job pre-stamp the string the
+            # classifier keys on. Bounded before it lands in JSONB -- this is
+            # runner-supplied, attacker-adjacent input.
+            reason_text = payload.terminal_reason.strip()[
+                :_MAX_RUNNER_TERMINAL_REASON_CHARS
+            ]
+            if reason_text:
+                meta["runner_terminal_reason"] = reason_text
         if payload.result_metrics is not None and isinstance(payload.result_metrics, dict):
             meta["runner_result_metrics"] = _filter_result_metrics(payload.result_metrics)
         if payload.command_log is not None and payload.exec_status == "running":
@@ -2778,7 +2891,7 @@ async def report_compute_job(
                         # useful display data in `progress`, but watchdog timing
                         # must use the server receipt time so a job cannot extend
                         # or backdate its own protection window.
-                        t=rec.get("ts") or now.isoformat(),
+                        t=rec.get("ts") or now.isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                         received_at=now,
                     )
         if payload.exec_status == "running" and isinstance(payload.viewable_omissions, dict):
@@ -2790,7 +2903,7 @@ async def report_compute_job(
             if omissions:
                 meta["viewable_live_omissions"] = omissions
         if payload.exec_status in ("succeeded", "failed"):
-            meta["runner_finished_at"] = now.isoformat()
+            meta["runner_finished_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         if isinstance(payload.resume_hydration, dict):
             # Whitelist known provenance keys so a runner cannot bloat the row.
             raw = payload.resume_hydration
@@ -2820,7 +2933,7 @@ async def report_compute_job(
             if isinstance(reason, str) and reason.strip():
                 provenance["reason"] = reason.strip()[:200]
             if provenance:
-                provenance["recorded_at"] = now.isoformat()
+                provenance["recorded_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 meta["resume_provenance"] = provenance
         if (
             payload.exec_status in ("succeeded", "failed")
@@ -2848,7 +2961,7 @@ async def report_compute_job(
                 if isinstance(value, str) and value.strip():
                     delivery[key] = value.strip()[:limit]
             if delivery:
-                delivery["recorded_at"] = now.isoformat()
+                delivery["recorded_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 meta["artifact_delivery"] = delivery
         job.polling_metadata = meta
         job.last_heartbeat_at = now
@@ -3336,7 +3449,7 @@ async def complete_compute_job_artifact_upload(
         "transfer_id": str(payload.transfer_id),
     }
     meta["runner_artifact"] = artifact_info
-    meta["runner_artifact_transfer"] = {**current, "status": "verified", "verified_at": _utcnow().isoformat()}
+    meta["runner_artifact_transfer"] = {**current, "status": "verified", "verified_at": _utcnow().isoformat()}  # utc-iso-ok: persisted JSON round-trip, not a wire field
     job.polling_metadata = meta
     job.updated_at = _utcnow()
     session.add(job)

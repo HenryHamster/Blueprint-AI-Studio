@@ -37,14 +37,14 @@ vi.mock('child_process', () => ({
 // workspacePrep imports it for warning output.
 const cloneWithRetryMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const logMock = vi.hoisted(() => vi.fn());
-const registerSizeCapMergeDriverMock = vi.hoisted(() => vi.fn());
+const registerDerivedArtifactMergeDriversMock = vi.hoisted(() => vi.fn());
 
 vi.mock('./index.js', () => ({
   normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   cloneWithRetry: cloneWithRetryMock,
   log: logMock,
   GIT_REFERENCE_CACHE_ROOT: '/opt/agent-cache/git',
-  registerSizeCapMergeDriver: registerSizeCapMergeDriverMock,
+  registerDerivedArtifactMergeDrivers: registerDerivedArtifactMergeDriversMock,
 }));
 
 // Mock git-credential helpers so tests don't touch the filesystem or git config.
@@ -103,7 +103,7 @@ describe('prepareWorkspaceForRole', () => {
     fsMocks.statSync.mockReset();
     fsMocks.statSync.mockReturnValue(undefined);
     logMock.mockReset();
-    registerSizeCapMergeDriverMock.mockReset();
+    registerDerivedArtifactMergeDriversMock.mockReset();
     writeGitTokenFileMock.mockReset();
     writeGitTokenFileMock.mockReturnValue(true);
     setupGitCredentialHelperMock.mockReset();
@@ -250,7 +250,7 @@ describe('prepareWorkspaceForRole', () => {
     expect(setupGitCredentialHelperMock).toHaveBeenCalledWith('o', 'r', '/ws');
     // The sizecap merge driver is registered after the clone so the
     // .gitattributes mapping is actually active.
-    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
+    expect(registerDerivedArtifactMergeDriversMock).toHaveBeenCalledWith('/ws');
   });
 
   it('cold path: baseBranch present → fetch base into a remote-tracking ref so ./check can compute its diff', async () => {
@@ -271,7 +271,7 @@ describe('prepareWorkspaceForRole', () => {
       .filter(c => c[0] === 'git')
       .map(c => (c[1] as string[]).join(' '));
     expect(gitCalls).toContain('-C /ws fetch origin main:refs/remotes/origin/main');
-    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
+    expect(registerDerivedArtifactMergeDriversMock).toHaveBeenCalledWith('/ws');
   });
 
   it('cold path: baseBranch === branch → no separate base fetch (already cloned)', async () => {
@@ -571,7 +571,7 @@ describe('prepareWorkspaceForRole', () => {
     expect(cleanLine).toContain('-e .vitest_cache');
     expect(cleanLine).toContain('-e .pnpm-store');
     // Warm reuse also (re-)registers the sizecap merge driver.
-    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
+    expect(registerDerivedArtifactMergeDriversMock).toHaveBeenCalledWith('/ws');
   });
 
   // ── Review-fix lane pilot: warm-resume guard ───────────────────────────────
@@ -1733,8 +1733,13 @@ describe('shared pip/uv package store', () => {
 
     // Two workspaces being prepared concurrently must point at the SAME
     // content-addressed store — that is the sharing that avoids re-downloading.
-    const wsA = '/workspaces/a';
-    const wsB = '/workspaces/b';
+    // path.normalize keeps the literal POSIX pin readable while making the
+    // `startsWith(ws + path.sep)` containment checks below separator-correct on
+    // a Windows dev host (a no-op on Linux, where these paths are already
+    // native). Without it, resolvedEnvPath's path.join output uses `\` while
+    // the literal still uses `/`, and containment fails for the wrong reason.
+    const wsA = path.normalize('/workspaces/a');
+    const wsB = path.normalize('/workspaces/b');
     expect(process.env.PIP_CACHE_DIR).toBe(dirs.pip);
     expect(process.env.UV_CACHE_DIR).toBe(dirs.uv);
     expect(configurePackageStoreEnv().pip).toBe(dirs.pip);
@@ -1831,12 +1836,19 @@ describe('shared pip/uv package store', () => {
   it('configurePackageStoreEnv creates both store dirs and honors a custom root', () => {
     process.env.BLUEPRINT_PACKAGE_STORE_ROOT = '/mnt/package-cache';
     const dirs = configurePackageStoreEnv();
-    expect(dirs.pip).toBe('/mnt/package-cache/pip');
-    expect(dirs.uv).toBe('/mnt/package-cache/uv');
-    expect(process.env.PIP_CACHE_DIR).toBe('/mnt/package-cache/pip');
-    expect(process.env.UV_CACHE_DIR).toBe('/mnt/package-cache/uv');
-    expect(fsMocks.mkdirSync).toHaveBeenCalledWith('/mnt/package-cache/pip', { recursive: true });
-    expect(fsMocks.mkdirSync).toHaveBeenCalledWith('/mnt/package-cache/uv', { recursive: true });
+    // The SUT builds these with path.join, so the expected values must join the
+    // same way. On Linux these are byte-identical to the '/mnt/package-cache/pip'
+    // literal they replace; on a Windows dev host path.join yields backslashes
+    // and a hardcoded POSIX literal would fail for the separator, not the
+    // behaviour under test (that the custom root is honoured for BOTH dirs).
+    const expectedPip = path.join('/mnt/package-cache', 'pip');
+    const expectedUv = path.join('/mnt/package-cache', 'uv');
+    expect(dirs.pip).toBe(expectedPip);
+    expect(dirs.uv).toBe(expectedUv);
+    expect(process.env.PIP_CACHE_DIR).toBe(expectedPip);
+    expect(process.env.UV_CACHE_DIR).toBe(expectedUv);
+    expect(fsMocks.mkdirSync).toHaveBeenCalledWith(expectedPip, { recursive: true });
+    expect(fsMocks.mkdirSync).toHaveBeenCalledWith(expectedUv, { recursive: true });
   });
 
   it('prepareWorkspaceForRole configures the shared store env and attempts store setup', async () => {

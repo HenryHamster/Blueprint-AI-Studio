@@ -10639,6 +10639,406 @@ async def test_agent_ws_strategic_session_frame_forwards_to_emit(mocker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stream_seq", "event_name"),
+    [(0, "message_created"), (1, "message_updated")],
+    ids=["first-delta", "later-delta"],
+)
+async def test_agent_ws_conversation_delta_relays_claim_bound_preview(
+    mocker, stream_seq, event_name
+):
+    """The agent socket admits only a live task/session/claim-bound delta."""
+    import json as _json
+    import app.routers.projects as projects_module
+    from fastapi import WebSocketDisconnect
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    claim_id = uuid.uuid4()
+    token = create_agent_token(str(task_id), "agent-vm-stream", project_id=str(project_id))
+    task = MagicMock(
+        id=task_id,
+        project_id=project_id,
+        vm_instance_id="agent-vm-stream",
+        status=TaskStatus.IN_PROGRESS,
+        context={"strategic_session_id": "session-stream"},
+    )
+    auth_result = MagicMock()
+    auth_result.scalars.return_value.first.return_value = task
+    auth_session = AsyncMock()
+    auth_session.execute = AsyncMock(return_value=auth_result)
+    auth_cm = AsyncMock()
+    auth_cm.__aenter__.return_value = auth_session
+    auth_cm.__aexit__.return_value = None
+
+    claim = MagicMock()
+    relay_result = MagicMock()
+    relay_result.scalar_one_or_none.return_value = claim
+    relay_session = AsyncMock()
+    relay_session.get = AsyncMock(return_value=task)
+    relay_session.execute = AsyncMock(return_value=relay_result)
+    relay_session.scalar = AsyncMock(return_value=7)
+    relay_cm = AsyncMock()
+    relay_cm.__aenter__.return_value = relay_session
+    relay_cm.__aexit__.return_value = None
+
+    mocker.patch(
+        "app.routers.projects.AsyncSessionLocal",
+        side_effect=[auth_cm, relay_cm, relay_cm],
+    )
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.disconnect", new_callable=AsyncMock)
+    broadcast = mocker.patch(
+        "app.routers.projects.broadcast_to_project", new_callable=AsyncMock
+    )
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.receive_text = AsyncMock(side_effect=[
+        _json.dumps({
+            "type": "conversation_message_delta",
+            "payload": {
+                "session_id": "session-stream",
+                "task_id": str(task_id),
+                "claim_id": str(claim_id),
+                "idempotency_key": "typed-fast:claim:reply",
+                "seq": stream_seq,
+                "content": "bounded chunk",
+            },
+        }),
+        WebSocketDisconnect(),
+    ])
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    broadcast.assert_awaited_once()
+    assert broadcast.await_args.args[:2] == (str(project_id), event_name)
+    assert broadcast.await_args.args[2]["message"]["content"] == "bounded chunk"
+    assert broadcast.await_args.args[2].get("canonical_refetch_required") is not True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reject_kind",
+    ["session", "claim"],
+    ids=["session-fence", "completed-or-abandoned-claim-fence"],
+)
+async def test_agent_ws_conversation_delta_rejects_lost_authority(
+    mocker, reject_kind
+):
+    """A stale Fast frame cannot project after session or claim authority is lost."""
+    import json as _json
+    import app.routers.projects as projects_module
+    from fastapi import WebSocketDisconnect
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    claim_id = uuid.uuid4()
+    token = create_agent_token(str(task_id), "agent-vm-stale", project_id=str(project_id))
+    task = MagicMock(
+        id=task_id,
+        project_id=project_id,
+        vm_instance_id="agent-vm-stale",
+        status=TaskStatus.IN_PROGRESS,
+        context={"strategic_session_id": "session-live"},
+    )
+    auth_result = MagicMock()
+    auth_result.scalars.return_value.first.return_value = task
+    auth_session = AsyncMock()
+    auth_session.execute = AsyncMock(return_value=auth_result)
+    auth_cm = AsyncMock()
+    auth_cm.__aenter__.return_value = auth_session
+    auth_cm.__aexit__.return_value = None
+
+    relay_session = AsyncMock()
+    relay_session.get = AsyncMock(return_value=task)
+    relay_result = MagicMock()
+    relay_result.scalar_one_or_none.return_value = None
+    relay_session.execute = AsyncMock(return_value=relay_result)
+    relay_cm = AsyncMock()
+    relay_cm.__aenter__.return_value = relay_session
+    relay_cm.__aexit__.return_value = None
+    mocker.patch(
+        "app.routers.projects.AsyncSessionLocal",
+        side_effect=[auth_cm, relay_cm, relay_cm],
+    )
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.disconnect", new_callable=AsyncMock)
+    broadcast = mocker.patch(
+        "app.routers.projects.broadcast_to_project", new_callable=AsyncMock
+    )
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.receive_text = AsyncMock(side_effect=[
+        _json.dumps({
+            "type": "conversation_message_delta",
+            "payload": {
+                "session_id": "session-stale" if reject_kind == "session" else "session-live",
+                "task_id": str(task_id),
+                "claim_id": str(claim_id),
+                "idempotency_key": "typed-fast:claim:reply",
+                "seq": 0,
+                "content": "must not render",
+            },
+        }),
+        WebSocketDisconnect(),
+    ])
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_ws_conversation_terminal_relays_without_touching_the_db(mocker):
+    """A tombstone must survive the exact failures it exists to report.
+
+    Claim released, controller retired, task moved off IN_PROGRESS: those are
+    the states that most need the preview retracted, and they are precisely the
+    ones the liveness fence rejects. Gating the tombstone on the healthy path
+    strands a partial answer on screen that looks delivered and does not exist
+    server-side.
+
+    The relay's DB budget is pinned two ways at once. `AsyncSessionLocal` is
+    handed exactly TWO sessions — the auth one and the loop's own periodic
+    task recheck — so opening a third for the tombstone raises. And the recheck
+    session's `execute` is poisoned, so reusing it to run the claim fence
+    raises too. Either regression fails loudly instead of passing.
+    """
+    import json as _json
+    import app.routers.projects as projects_module
+    from fastapi import WebSocketDisconnect
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    claim_id = uuid.uuid4()
+    token = create_agent_token(str(task_id), "agent-vm-tomb", project_id=str(project_id))
+    task = MagicMock(
+        id=task_id,
+        project_id=project_id,
+        vm_instance_id="agent-vm-tomb",
+        status=TaskStatus.IN_PROGRESS,
+        context={"strategic_session_id": "session-tomb"},
+    )
+    auth_result = MagicMock()
+    auth_result.scalars.return_value.first.return_value = task
+    auth_session = AsyncMock()
+    auth_session.execute = AsyncMock(return_value=auth_result)
+    auth_cm = AsyncMock()
+    auth_cm.__aenter__.return_value = auth_session
+    auth_cm.__aexit__.return_value = None
+
+    # The receive loop rechecks the task row once per inbound frame. That
+    # session is expected; a query issued THROUGH it is not.
+    recheck_session = AsyncMock()
+    recheck_session.get = AsyncMock(return_value=task)
+    recheck_session.execute = AsyncMock(
+        side_effect=AssertionError("terminal relay must not query the claim fence")
+    )
+    recheck_session.scalar = AsyncMock(
+        side_effect=AssertionError("terminal relay must not read the sequence")
+    )
+    recheck_cm = AsyncMock()
+    recheck_cm.__aenter__.return_value = recheck_session
+    recheck_cm.__aexit__.return_value = None
+    mocker.patch(
+        "app.routers.projects.AsyncSessionLocal",
+        side_effect=[auth_cm, recheck_cm],
+    )
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.disconnect", new_callable=AsyncMock)
+    broadcast = mocker.patch(
+        "app.routers.projects.broadcast_to_project", new_callable=AsyncMock
+    )
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.receive_text = AsyncMock(side_effect=[
+        _json.dumps({
+            "type": "conversation_message_delta",
+            "payload": {
+                "session_id": "session-tomb",
+                "task_id": str(task_id),
+                "claim_id": str(claim_id),
+                "idempotency_key": "typed-fast:claim:reply",
+                "seq": 4,
+                "content": "",
+                "terminal": "failed",
+            },
+        }),
+        WebSocketDisconnect(),
+    ])
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    broadcast.assert_awaited_once()
+    payload = broadcast.await_args.args[2]
+    assert broadcast.await_args.args[:2] == (str(project_id), "message_updated")
+    assert payload["message"]["context"]["_conversation_streaming_terminal"] == "failed"
+    assert payload["message"]["context"]["_conversation_streaming_delta"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_ws_conversation_delta_rejects_unknown_terminal_state(mocker):
+    """An unrecognised terminal string is a malformed frame, not a delta.
+
+    Treating it as a delta would relay attacker-chosen text through the
+    tombstone path, which deliberately skips the liveness fence.
+    """
+    import json as _json
+    import app.routers.projects as projects_module
+    from fastapi import WebSocketDisconnect
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    token = create_agent_token(str(task_id), "agent-vm-bad", project_id=str(project_id))
+    task = MagicMock(
+        id=task_id,
+        project_id=project_id,
+        vm_instance_id="agent-vm-bad",
+        status=TaskStatus.IN_PROGRESS,
+        context={"strategic_session_id": "session-bad"},
+    )
+    auth_result = MagicMock()
+    auth_result.scalars.return_value.first.return_value = task
+    auth_session = AsyncMock()
+    auth_session.execute = AsyncMock(return_value=auth_result)
+    auth_cm = AsyncMock()
+    auth_cm.__aenter__.return_value = auth_session
+    auth_cm.__aexit__.return_value = None
+    # Auth session plus the loop's one periodic task recheck. A malformed frame
+    # is rejected before any relay DB work, so nothing else may open a session.
+    recheck_session = AsyncMock()
+    recheck_session.get = AsyncMock(return_value=task)
+    recheck_session.execute = AsyncMock(
+        side_effect=AssertionError("a malformed frame must not reach the relay query")
+    )
+    recheck_cm = AsyncMock()
+    recheck_cm.__aenter__.return_value = recheck_session
+    recheck_cm.__aexit__.return_value = None
+    mocker.patch(
+        "app.routers.projects.AsyncSessionLocal",
+        side_effect=[auth_cm, recheck_cm],
+    )
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.disconnect", new_callable=AsyncMock)
+    broadcast = mocker.patch(
+        "app.routers.projects.broadcast_to_project", new_callable=AsyncMock
+    )
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.receive_text = AsyncMock(side_effect=[
+        _json.dumps({
+            "type": "conversation_message_delta",
+            "payload": {
+                "session_id": "session-bad",
+                "task_id": str(task_id),
+                "claim_id": str(uuid.uuid4()),
+                "idempotency_key": "typed-fast:claim:reply",
+                "seq": 0,
+                "content": "attacker text",
+                "terminal": "delivered",
+            },
+        }),
+        WebSocketDisconnect(),
+    ])
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    broadcast.assert_not_awaited()
+
+
+def test_streaming_preview_attempt_partitions_the_projected_identity():
+    """A retried attempt must project as a DIFFERENT preview.
+
+    A provider crash re-runs the same receipt, so attempt 2 carries the same
+    `idempotency_key` while its text is a new answer rather than a continuation.
+    Sharing one preview id let the client weld the retry's tail onto the
+    abandoned partial. The `idempotency_key` FIELD stays un-namespaced so the
+    durable reply still replaces the preview by receipt identity.
+    """
+    from app.conversation_streaming import (
+        build_streaming_reply_message,
+        streaming_reply_message_id,
+    )
+
+    project_id = uuid.uuid4()
+    key = "typed-fast:claim-1:reply-1"
+    common = dict(
+        project_id=project_id,
+        task_id=uuid.uuid4(),
+        session_id="session-1",
+        claim_id=uuid.uuid4(),
+        idempotency_key=key,
+        content="text",
+        sequence=4,
+    )
+
+    first = build_streaming_reply_message(**common, attempt=0)
+    retry = build_streaming_reply_message(**common, attempt=1)
+
+    assert first.id == streaming_reply_message_id(project_id, key)
+    assert first.id == streaming_reply_message_id(project_id, key, 0)
+    assert retry.id != first.id
+    assert retry.id == streaming_reply_message_id(project_id, key, 1)
+    # Receipt identity is untouched: the durable reply replaces either preview.
+    assert first.idempotency_key == retry.idempotency_key == key
+
+
+def test_streaming_preview_chunk_cap_matches_agent_constant():
+    """The agent's wire cap and the relay's drop threshold are ONE contract.
+
+    A chunk longer than the relay's cap is DROPPED silently, so drift between
+    the two constants deletes text out of a live reply with nothing logged
+    anywhere. The backend value is pinned as a literal on purpose — asserting it
+    against the constant it guards would move with any change and certify
+    itself.
+    """
+    import re as _re
+
+    from app.routers.projects import _STREAMING_PREVIEW_MAX_CHUNK_CHARS
+
+    assert _STREAMING_PREVIEW_MAX_CHUNK_CHARS == 1200
+
+    source = None
+    for root in (
+        Path(os.getenv("AGENT_SRC_ROOT") or "/agent/src"),
+        Path(__file__).resolve().parents[2] / "agent" / "src",
+    ):
+        candidate = root / "handlers" / "conversation-message-streamer.ts"
+        if candidate.exists():
+            source = candidate
+            break
+    if source is None:
+        pytest.skip("agent/src is not mounted in this backend test image")
+
+    match = _re.search(
+        r"export const STREAM_DELTA_MAX_CHARS = ([0-9_]+);",
+        source.read_text(encoding="utf-8"),
+    )
+    assert match is not None, "agent STREAM_DELTA_MAX_CHARS declaration not found"
+    assert int(match.group(1).replace("_", "")) == _STREAMING_PREVIEW_MAX_CHUNK_CHARS
+
+
+@pytest.mark.asyncio
 async def test_agent_ws_closes_on_termination_without_messages(mocker):
     """
     Regression: WS must close ≤5s after task termination even when no messages
@@ -15290,6 +15690,92 @@ async def test_runtime_unavailable_local_runner_records_decline_without_retry_bu
     assert restore_resident_binding.await_args.kwargs["excluded_runner_ids"] == {
         str(runner_id)
     }
+
+    _terminated_task_ids.pop(task_id, None)
+
+
+@pytest.mark.asyncio
+async def test_branchless_fix_payload_is_platform_terminal_not_a_retried_code_error(
+    client: AsyncClient, db_session, mocker
+):
+    """A ``fix`` payload with no ``branch`` is a spawner defect, not agent work.
+
+    Production 2026-08-23 (Blueprint tasks 4fdd6113 / 9bfa5831 / 50531efe /
+    b4121926): each was spawned with ``type: "fix"`` and no ``branch``, so the
+    agent's ``handleFix`` threw ``branch is required`` before doing anything.
+    All four were charged ``[CODE_ERROR] Retries exhausted (3/3)`` — blaming the
+    agent for a malformed payload AND burning three more VMs re-reading the
+    identical unrunnable row.
+
+    Two properties are asserted here, both of which the old behaviour violated:
+      * the class is the platform class, never CODE_ERROR; and
+      * the task is terminal on FIRST detection — the retry budget is untouched
+        and the operator message says why instead of "Retries exhausted".
+    """
+    from app.failure_classification import MALFORMED_TASK_PAYLOAD
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="Branchless Fix Payload",
+        user_id="test-user-branchless-fix",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "vm-branchless-fix"
+    task = Task(
+        project_id=project.id,
+        title="fix: resolve recurring vitest:agent baseline failure",
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "Remove the named inherited guard failure.",
+            }
+        ],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        created_by="SYSTEM_AUTO_REMEDIATION",
+        context={"spawned_by": "guard_suppression_remediation"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    _terminated_task_ids.pop(task_id, None)
+    token = create_agent_token(task_id, vm_id)
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": task_id,
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "Fatal error: branch is required",
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] != "retrying"
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.FAILED
+    assert task.context["failure_category"] == MALFORMED_TASK_PAYLOAD
+    assert task.context["failure_class"] == MALFORMED_TASK_PAYLOAD
+    assert task.attempt_count == 0, (
+        "a payload that is deterministically unrunnable must not consume a "
+        "retry: every retry re-reads the same malformed row"
+    )
+    msg = task.latest_status_message or ""
+    assert "retries exhausted" not in msg.lower(), msg
+    assert "branch" in msg.lower(), msg
 
     _terminated_task_ids.pop(task_id, None)
 

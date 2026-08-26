@@ -70,6 +70,7 @@ from app.shared_state import (
     get_project_promotion_target,
     get_project_task_branch_namespace,
 )
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +254,7 @@ async def get_auto_remediation_config(
             "title": t.title or "",
             "status": t.status,
             "branch": branch_by_id.get(t.id, ""),
-            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "created_at": utc_iso(t.created_at),
         }
         for t in preview_tasks
     ]
@@ -1832,7 +1833,7 @@ async def update_playbook_entry(
         raise HTTPException(status_code=404, detail=f"Playbook entry '{key}' not found")
 
     entry = dict(doc[full_key])
-    now_iso = _utcnow().isoformat()
+    now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
 
     if action == "promote":
         entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1

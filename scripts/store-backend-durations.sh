@@ -27,14 +27,47 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "=== Regenerating backend/.test_durations (time-balanced shard seeding) ==="
-echo "This runs the full backend test suite — expect 15-20 minutes."
+if [ "$#" -eq 0 ]; then
+  echo "This runs the full backend test suite — expect 15-20 minutes."
+else
+  echo "This runs only the explicitly selected backend tests."
+fi
 echo ""
 
-# Pass 'testing/ --store-durations' as explicit args so test-backend.sh runs
-# pytest against the full testing/ directory with duration recording enabled.
-# pytest-split writes .test_durations to the rootdir (/app inside Docker),
-# which is bind-mounted from backend/, so the file lands at backend/.test_durations.
-"$SCRIPT_DIR/test-backend.sh" testing/ --store-durations "$@"
+BACKEND_DIR="${DURATION_BACKEND_DIR:-$SCRIPT_DIR/../backend}"
+TEST_BACKEND_SCRIPT="${DURATION_TEST_BACKEND_SCRIPT:-$SCRIPT_DIR/test-backend.sh}"
+MERGE_SRC_DIR=""
+PARTIAL_ROOT=""
+EMPTY_SRC_DIR=""
+cleanup() {
+  [ -z "$EMPTY_SRC_DIR" ] || rm -rf "$EMPTY_SRC_DIR"
+  [ -z "$PARTIAL_ROOT" ] || rm -rf "$PARTIAL_ROOT"
+}
+trap cleanup EXIT
+
+if [ "$#" -eq 0 ]; then
+  echo "=== Refresh mode: full testing/ duration inventory ==="
+  # pytest-split writes .test_durations to the rootdir (/app inside Docker),
+  # which is bind-mounted from backend/, so the file lands on the host at the
+  # committed artifact path.
+  "$TEST_BACKEND_SCRIPT" testing/ --store-durations
+else
+  echo "=== Refresh mode: targeted duration inventory ($*) ==="
+  # Keep targeted output separate: pytest-split's direct artifact writer would
+  # otherwise replace the complete baseline with only the selected tests.
+  # A relative path is valid both from the backend checkout and from Docker's
+  # /app backend mount.
+  # Each invocation owns a distinct directory.  A stable directory caused
+  # concurrent targeted refreshes to overwrite or delete each other's raw
+  # measurement before merge_durations.py could consume it.
+  PARTIAL_ROOT="$(mktemp -d "$BACKEND_DIR/.duration_refresh.XXXXXX")"
+  PARTIAL_DIR="$PARTIAL_ROOT/target"
+  mkdir -p "$PARTIAL_DIR"
+  MERGE_SRC_DIR="$PARTIAL_ROOT"
+  PARTIAL_PATH="$(basename "$PARTIAL_ROOT")/target/durations.json"
+  "$TEST_BACKEND_SCRIPT" "$@" --store-durations \
+    --durations-path "$PARTIAL_PATH"
+fi
 
 # pytest-split's raw --store-durations output charges fixture/setup cost
 # (e.g. a Postgres cold-start billed to the first test of a batch) directly
@@ -47,7 +80,13 @@ echo ""
 # produces no partial-recording files, so pass an empty source directory:
 # merge() then reads backend/.test_durations as its baseline, sanitizes it,
 # and rewrites it in place.
-BACKEND_DIR="$SCRIPT_DIR/../backend"
 EMPTY_SRC_DIR="$(mktemp -d)"
-trap 'rm -rf "$EMPTY_SRC_DIR"' EXIT
-python3 "$SCRIPT_DIR/merge_durations.py" "$EMPTY_SRC_DIR" "$BACKEND_DIR/.test_durations"
+if [ -z "$MERGE_SRC_DIR" ]; then
+  MERGE_SRC_DIR="$EMPTY_SRC_DIR"
+fi
+# Individual measurement directories may run concurrently, but their final
+# read-modify-write merge must be serialized so neither invocation loses the
+# other's completed measurement.  The lock file is deliberately retained: it
+# is only a flock handle and may have existed before this invocation.
+flock "$BACKEND_DIR/.duration_refresh.lock" \
+  python3 "$SCRIPT_DIR/merge_durations.py" "$MERGE_SRC_DIR" "$BACKEND_DIR/.test_durations"

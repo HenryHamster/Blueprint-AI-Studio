@@ -16,6 +16,7 @@ from sqlmodel import select
 from app.database import get_session
 from app.models import OrchestratorErrorAck, _utcnow
 from app.auth import get_current_user, require_admin
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -167,16 +168,25 @@ def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
                 if source_line
                 else source_file,
                 "count": 1,
-                "first_seen_iso": ts.isoformat(),
-                "last_seen_iso": ts.isoformat(),
+                "first_seen_iso": utc_iso(ts),
+                "last_seen_iso": utc_iso(ts),
                 "sample_message": sample,
             }
             continue
         bucket["count"] += 1
-        if ts.isoformat() < bucket["first_seen_iso"]:
-            bucket["first_seen_iso"] = ts.isoformat()
-        if ts.isoformat() > bucket["last_seen_iso"]:
-            bucket["last_seen_iso"] = ts.isoformat()
+        # Must match the seed above, which normalises through utc_iso. These
+        # bounds are widened by a LEXICOGRAPHIC string compare, so a bucket
+        # holding a utc_iso seed and a raw-offset update would compare two
+        # different renderings of the same instant and stop widening
+        # correctly -- and mis-rank the response, which sorts on
+        # last_seen_iso. Identical today only because Cloud Logging emits
+        # UTC; before #17890 both sides were ts.isoformat() and could not
+        # disagree at all.
+        ts_iso = utc_iso(ts)
+        if ts_iso < bucket["first_seen_iso"]:
+            bucket["first_seen_iso"] = ts_iso
+        if ts_iso > bucket["last_seen_iso"]:
+            bucket["last_seen_iso"] = ts_iso
     ranked = sorted(
         buckets.values(),
         key=lambda b: (b["count"], b["last_seen_iso"]),

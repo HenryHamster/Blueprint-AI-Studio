@@ -6,19 +6,30 @@ other entries untouched; the rewritten JSON preserves structure and re-checks
 clean; section scoping works; absent-tree sections are skipped not errored.
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-
 import pytest
 
 import app.size_limit_policy as slp
 from app.size_limit_policy import bump_size_limit, stale_cap_limit
+
+# Importing the checker is what puts the repo ``scripts/`` dir on ``sys.path``
+# (``check_size_limits.resolve_scripts_dir_from_env``), which is what makes the
+# receipt-writer imports in the tests below resolve. Do NOT re-add a fixed
+# ``../../scripts`` walk here: in the Docker test image the backend tree is
+# ``/app`` with no ``scripts/`` sibling, so it pointed at a nonexistent
+# ``/scripts`` and the receipt tests passed only when
+# ``test_check_gate_fail_closed.py`` was collected first and inserted
+# ``/repo/scripts`` as a side effect.
 from testing import check_size_limits as csl
+from testing import repo_scripts_path as rsp
+from testing.git_checkout_probe import git_readable_repo_root
 
 
 def _read(path: str) -> str:
@@ -71,8 +82,41 @@ def _build_repo(tmp_path, *, backend=None, agent=None, frontend=None, scripts=No
     return str(repo), str(json_path)
 
 
+class _ExitStatus(int):
+    """A checker exit status that reports WHY in the assertion itself.
+
+    ``assert _run(...) == 0`` used to fail as a bare ``assert 1 == 0``: the
+    checker's refusal reason reached only captured stdout, so the six red
+    ``--fix`` tests on promotion PR #17914 were undiagnosable from the
+    assertion line alone.  ``int`` semantics are unchanged -- only ``repr``,
+    which is exactly what pytest's assertion rewriter prints.
+    """
+
+    reason = ""
+
+    def __repr__(self) -> str:
+        if not self.reason:
+            return f"exit {int(self)}"
+        # One line, deliberately: pytest escapes a newline inside an assertion
+        # repr, so a multi-line reason arrives as a literal backslash-n and
+        # reads worse than the space it replaces.
+        return f"exit {int(self)} — check_size_limits said: {self.reason}"
+
+
 def _run(json_path, repo_root, *extra):
-    return csl.main(["--json", json_path, "--repo-root", repo_root, *extra])
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        rc = csl.main(["--json", json_path, "--repo-root", repo_root, *extra])
+    captured = buffer.getvalue()
+    # Replay so capsys-based assertions still see the checker's own output.
+    print(captured, end="")
+    status = _ExitStatus(rc)
+    # Drop "[skip] <section>: source tree not present" noise and keep the HEAD of
+    # what is left: pytest truncates a long assertion message in the middle, so a
+    # short reason is a fully readable one.
+    said = [ln for ln in captured.splitlines() if ln.strip() and not ln.startswith("[skip]")]
+    status.reason = " / ".join(said)[:240]
+    return status
 
 
 @pytest.mark.parametrize(
@@ -781,19 +825,20 @@ def test_fix_chronic_git_read_failure_refuses_bump(tmp_path, capsys, mocker):
     Unreadable bump history is NOT the same as "no bumps on record"; a possibly
     chronic offender must not receive a silent routine bump when its history
     cannot be read (e.g. a truncated task-VM clone). The git-failure path is
-    only taken when ``_REPO_ROOT`` is a git checkout, so this pins that
-    precondition deterministically (in the CI harness ``_REPO_ROOT`` is a
-    non-checkout and would otherwise use the ledger fallback).
+    only taken when the CHECKED root is a git checkout, so this pins that
+    precondition deterministically (in the CI harness it is a non-checkout and
+    would otherwise use the ledger fallback).
     """
     # Distinct key from the other real-subprocess tests so the module TTL cache
     # cannot leak a genuinely-empty history into this unreadable-history case.
     slp._bump_history_cache.clear()
     repo, jp = _build_repo(tmp_path, backend={"big_unreadable.py": (1720, 1600)})
 
-    # Pin the real-checkout precondition: git on PATH + _REPO_ROOT is a checkout.
-    checkout = tmp_path / "checkout"
-    (checkout / ".git").mkdir(parents=True)
-    mocker.patch("app.size_limit_policy._REPO_ROOT", str(checkout))
+    # Pin the real-checkout precondition on the CHECKED root: the classifier
+    # reads the history of the root it is handed, not the ambient one, so the
+    # .git marker belongs there. Ambient stays a non-checkout deliberately.
+    os.makedirs(os.path.join(repo, ".git"))
+    mocker.patch("app.size_limit_policy._REPO_ROOT", str(tmp_path / "not_a_checkout"))
 
     # Simulate git subprocess failing entirely.
     with mocker.patch(
@@ -1048,6 +1093,130 @@ def test_base_root_unreadable_baseline_fails_closed(tmp_path, capsys):
     assert rc == 1
     assert "[baseline] unavailable" in out
     assert "[breach] backend/big.py" in out
+
+
+# --- repo scripts/ resolution: guarded under BOTH layouts, not just the live one
+
+
+def _plant_scripts_dir(root):
+    """Create a ``scripts/`` dir carrying the sentinel the resolver probes for."""
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / rsp.SCRIPTS_DIR_SENTINEL).write_text("# stand-in\n")
+    return os.path.normpath(str(scripts))
+
+
+def test_scripts_dir_resolves_under_developer_checkout_layout(tmp_path):
+    """Developer checkout: ``<repo>/backend`` IS a sibling of ``<repo>/scripts``."""
+    repo = tmp_path / "checkout"
+    (repo / "backend").mkdir(parents=True)
+    scripts = _plant_scripts_dir(repo)
+
+    resolved, reason = rsp.resolve_scripts_dir(
+        str(repo / "backend"), container_repo_root=str(tmp_path / "no-such-mount")
+    )
+
+    assert resolved == scripts
+    assert reason == ""
+
+
+def test_scripts_dir_resolves_under_container_layout_with_no_sibling(tmp_path):
+    """Docker image: backend is ``/app``, no ``scripts/`` sibling, repo at ``/repo``."""
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    mount = tmp_path / "repo"
+    scripts = _plant_scripts_dir(mount)
+    # The exact shape of the old defect: the relative walk has nowhere to land.
+    assert not (tmp_path / "scripts").exists()
+
+    resolved, reason = rsp.resolve_scripts_dir(
+        str(app_dir), container_repo_root=str(mount)
+    )
+
+    assert resolved == scripts
+    assert reason == ""
+
+
+def test_scripts_dir_absent_returns_named_reason_not_a_nonexistent_path(tmp_path):
+    """Neither layout present: a NAMED reason, never a path that does not exist."""
+    resolved, reason = rsp.resolve_scripts_dir(
+        str(tmp_path / "app"), container_repo_root=str(tmp_path / "absent")
+    )
+
+    assert resolved is None
+    assert "verification_receipt.py" in reason
+    assert "BLUEPRINT_SCRIPTS_DIR" in reason
+
+
+def test_scripts_dir_ignores_a_directory_without_the_sentinel(tmp_path):
+    """A bare ``scripts/`` dir is not the repo's — resolution must not accept it."""
+    repo = tmp_path / "checkout"
+    (repo / "backend").mkdir(parents=True)
+    (repo / "scripts").mkdir()
+
+    resolved, _reason = rsp.resolve_scripts_dir(
+        str(repo / "backend"), container_repo_root=str(tmp_path / "absent")
+    )
+
+    assert resolved is None
+
+
+def test_scripts_dir_env_override_wins_over_both_layouts(tmp_path):
+    override = _plant_scripts_dir(tmp_path / "override")
+    mount = tmp_path / "repo"
+    _plant_scripts_dir(mount)
+
+    resolved, reason = rsp.resolve_scripts_dir(
+        str(tmp_path / "app"),
+        container_repo_root=str(mount),
+        env_override=str(tmp_path / "override" / "scripts"),
+    )
+
+    assert resolved == override
+    assert reason == ""
+
+
+def test_live_scripts_dir_resolution_is_not_vacuous():
+    """The resolution THIS environment made must be real, on sys.path, usable.
+
+    The layout tests above could all pass against synthetic trees while live
+    resolution still pointed nowhere. Counting the writers found keeps this
+    guard from passing while scanning nothing.
+    """
+    assert csl._SCRIPTS_DIR is not None, csl._SCRIPTS_DIR_UNAVAILABLE
+    assert csl._SCRIPTS_DIR_UNAVAILABLE == ""
+    assert os.path.isdir(csl._SCRIPTS_DIR)
+    assert csl._SCRIPTS_DIR in sys.path
+    writers = [
+        name
+        for name in ("verification_receipt.py", "guard_suppression_receipt.py")
+        if os.path.isfile(os.path.join(csl._SCRIPTS_DIR, name))
+    ]
+    assert len(writers) == 2, f"only found {writers} under {csl._SCRIPTS_DIR}"
+
+
+def test_checker_alone_makes_the_receipt_writers_importable():
+    """Importing the checker — and nothing else — must supply the scripts path.
+
+    The ordering-dependency pin: the receipt tests used to pass only because
+    ``test_check_gate_fail_closed.py`` was collected first, and a fresh
+    interpreter is the one place that dependency cannot hide.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import testing.check_size_limits as csl;"
+            "assert csl._SCRIPTS_DIR, csl._SCRIPTS_DIR_UNAVAILABLE;"
+            "import guard_suppression_receipt, verification_receipt",
+        ],
+        cwd=csl._BACKEND_DIR,
+        env={**os.environ, "PYTHONPATH": csl._BACKEND_DIR},
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
 
 
 def _configure_baseline_receipts(tmp_path, monkeypatch):
@@ -1960,3 +2129,211 @@ def test_report_mode_zero_headroom_breach_names_paired_raise_not_fix(tmp_path, c
     out = capsys.readouterr().out
     assert rc == 1 and "backend/app/governed_over_rpt.py" in out and "module_size_limits.json" in out
     assert "Run with --fix to bump the breached caps" not in out and "use --force-chronic" not in out
+
+
+# --- Cap-bump history: safe.directory hardening + repo-root hermeticity ---
+# Promotion PR #17914 went red because ``_read_git_bump_history``'s ``git log``
+# ran WITHOUT ``-c safe.directory=`` while ``_mainline_git_ref``'s probe ran WITH
+# it: CI binds the checkout into a ROOT container the runner user owns (``-v
+# "$PWD:/repo:ro"``, no ``--user``), so the probe resolved a mainline ref and the
+# read then died with "dubious ownership" (exit 128), read as genuine evidence loss.
+
+# Literal argv pins. Never replace these with the constants they check.
+_SAFE_DIR_FLAG = "-c"
+_SAFE_DIR_PREFIX = "safe.directory="
+_DUBIOUS_OWNERSHIP_RC = 128
+
+
+def _history_checkout(root, key, caps, section="backend"):
+    """A COMPLETE checkout on ``automain`` whose module_size_limits.json history holds one bump record
+    per rise in ``caps``. Any pre-existing limits JSON is restored, so this can add history to a tree."""
+    jp = os.path.join(root, "backend", "testing", "module_size_limits.json")
+    os.makedirs(os.path.dirname(jp), exist_ok=True)
+    preserved = _read(jp) if os.path.exists(jp) else None
+
+    def git(*argv):
+        subprocess.run(("git", *argv), check=True, capture_output=True)
+
+    git("init", "-q", "-b", "automain", root)
+    git("-C", root, "config", "user.email", "t@example.com")
+    git("-C", root, "config", "user.name", "T")
+    for cap in caps:
+        with open(jp, "w") as f:
+            json.dump({"_doc": "fixture", section: {key: cap}}, f, indent=2)
+        git("-C", root, "add", "-A")
+        git("-C", root, "commit", "-q", "-m", f"cap {cap}")
+    if preserved is not None:
+        with open(jp, "w") as f:
+            f.write(preserved)
+    return root
+
+
+def _foreign_owned_git_or_skip(root):
+    """Stage CI's bind-mount ownership condition without needing a second uid. Skips unless git BOTH
+    refuses the unhardened read with the dubious-ownership exit code AND accepts the ``-c safe.directory``
+    one -- the exact asymmetry the fix relies on. Requiring both means a git build that cannot stage the condition skips instead of passing vacuously."""
+    env = {**os.environ, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+    kw = {"cwd": root, "capture_output": True, "text": True, "env": env}
+    bare = subprocess.run(["git", "log", "-1"], **kw)
+    safe = subprocess.run(["git", _SAFE_DIR_FLAG, _SAFE_DIR_PREFIX + root, "log", "-1"], **kw)
+    if bare.returncode != _DUBIOUS_OWNERSHIP_RC or safe.returncode != 0:
+        pytest.skip("this git cannot stage the dubious-ownership condition here")
+    assert "dubious ownership" in bare.stderr, bare.stderr
+
+
+def test_read_git_bump_history_argv_pins_safe_directory_to_the_ref_probe(tmp_path, mocker):
+    """The history READ must carry the ref PROBE's exact safe.directory argv."""
+    root = str(tmp_path / "checkout")
+    os.makedirs(os.path.join(root, ".git"))
+    slp._bump_history_cache.clear()
+    mocker.patch("app.size_limit_policy.shutil.which", return_value="/usr/bin/git")
+    calls: list = []
+
+    def record(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    mocker.patch("app.size_limit_policy.subprocess.run", side_effect=record)
+
+    slp._read_git_bump_history("big.py", root)
+
+    probes = [c for c in calls if "rev-parse" in c and "--verify" in c]
+    reads = [c for c in calls if "log" in c]
+    assert len(probes) == 1 and len(reads) == 1, calls
+    assert reads[0][:4] == ["git", _SAFE_DIR_FLAG, _SAFE_DIR_PREFIX + root, "log"]
+    assert reads[0][:3] == probes[0][:3]  # pinned: the two can never drift apart
+
+
+def test_fix_bumps_when_the_checked_root_is_foreign_owned(tmp_path, capsys, monkeypatch):
+    """The exact promotion-gate symptom: --fix must not refuse the bump."""
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 800)})
+    _history_checkout(repo, "big.py", [100])
+    _foreign_owned_git_or_skip(repo)
+    slp._bump_history_cache.clear()
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+
+    rc = _run(jp, repo, "--fix", "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert f"git log exited {_DUBIOUS_OWNERSHIP_RC}" not in out, out
+    assert rc == 0, out
+    assert json.loads(_read(jp))["backend"]["big.py"] == bump_size_limit(1720, "big.py", "backend", repo)
+
+
+def test_fix_reads_bump_history_from_the_checked_root_not_the_ambient_one(tmp_path, capsys, mocker):
+    """--fix --repo-root X classifies from X's history, never the ambient one."""
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 800)})
+    _history_checkout(repo, "big.py", [100, 200, 300, 400])  # chronic: 3 bumps
+    clean = _history_checkout(str(tmp_path / "ambient"), "big.py", [100])
+    mocker.patch("app.size_limit_policy._REPO_ROOT", clean)
+    slp._bump_history_cache.clear()
+
+    rc = _run(jp, repo, "--fix", "--sections", "backend")
+
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert "[chronic] backend/big.py" in out and "3 cap bumps on record" in out
+    assert json.loads(_read(jp))["backend"]["big.py"] == 800  # refused, not bumped
+
+
+def test_bump_history_cache_cannot_poison_another_root(tmp_path):
+    """The TTL cache is keyed by ROOT: one root's read never answers another's."""
+    chronic = _history_checkout(str(tmp_path / "chronic"), "big.py", [100, 200, 300])
+    clean = _history_checkout(str(tmp_path / "clean"), "big.py", [100])
+    slp._bump_history_cache.clear()
+
+    assert len(slp.parse_bump_history("big.py", "backend", chronic)) == 2
+    # Same (module_key, section), different root, inside the 60s TTL.
+    assert slp.parse_bump_history("big.py", "backend", clean) == []
+    assert len(slp.parse_bump_history("big.py", "backend", chronic)) == 2
+    assert sorted(k[2] for k in slp._bump_history_cache) == sorted([chronic, clean])
+
+
+# --------------------------------------------------------------------------
+# Determinism: the AMBIENT checkout must not change an explicitly-rooted run.
+# The #17914 flake was not "git is broken in CI" -- it was that the verdict for
+# a ``--repo-root X`` run depended on the shape of whatever OTHER checkout
+# happened to be on disk.  Persistent runners share one workspace and
+# guard-data.yml's ``fetch-depth: 0`` can unshallow it between jobs, flipping
+# ``_git_history_is_truncated`` and so deciding whether the ambient git read
+# was attempted at all; the container bind mount decides whether it then
+# succeeds.  Both variables produced DIFFERENT verdicts for the same input.
+# --------------------------------------------------------------------------
+
+_AMBIENT_SHAPES = ("complete", "shallow", "unreadable")
+
+
+def _ambient_checkout(tmp_path, shape: str) -> str:
+    """A stand-in ambient ``_REPO_ROOT`` in one of the three shapes CI produces."""
+    root = str(tmp_path / f"ambient-{shape}")
+    if shape == "unreadable":
+        # A .git FILE whose gitdir does not exist: every git call exits 128.
+        # This is what CI's "dubious ownership" and a linked worktree bound
+        # into a container both look like to the reader -- exit 128, no data.
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, ".git"), "w") as f:
+            f.write(f"gitdir: {os.path.join(root, 'no-such-gitdir')}\n")
+        return root
+    # A COMPLETE checkout whose history says "chronic offender" -- the verdict
+    # that must never leak into a run rooted somewhere else.
+    _history_checkout(root, "big.py", [100, 200, 300, 400])
+    if shape == "shallow":
+        head = subprocess.run(
+            ["git", "-C", root, "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        with open(os.path.join(root, ".git", "shallow"), "w") as f:
+            f.write(head + "\n")  # boundary IS an ancestor of the mainline ref
+    return root
+
+
+def _assert_ambient_shape(root: str, shape: str) -> None:
+    """Guard the guard: prove each shape really is the condition it claims.
+
+    Readability is decided by the canonical probe
+    ``testing.git_checkout_probe.git_readable_repo_root`` rather than a private
+    re-spelling of it, so this fixture and the guards it models stay on one
+    definition of "git can read this root".
+    """
+    readable = git_readable_repo_root(root)
+    probe = subprocess.run(
+        ["git", "-c", f"safe.directory={root}", "log", "-1", "--format=%H"],
+        cwd=root, capture_output=True, text=True,
+    )
+    if shape == "unreadable":
+        assert readable is None, (
+            "the 'unreadable' fixture is readable after all, so this "
+            "parametrisation would prove nothing"
+        )
+        assert probe.returncode == _DUBIOUS_OWNERSHIP_RC, probe.stderr
+        assert not slp._git_history_is_truncated(root)
+        return
+    assert readable == root, f"git cannot read the '{shape}' fixture at {root}"
+    assert probe.returncode == 0, probe.stderr
+    assert slp._git_history_is_truncated(root) is (shape == "shallow")
+    assert len(slp.parse_bump_history("big.py", "backend", root)) == (
+        0 if shape == "shallow" else 3
+    ), "the ambient fixture must really carry a chronic history"
+
+
+@pytest.mark.parametrize("shape", _AMBIENT_SHAPES)
+def test_fix_verdict_is_independent_of_the_ambient_checkout(tmp_path, shape, mocker):
+    """Same input, three ambient shapes, one verdict.
+
+    Before the root threading these gave THREE different answers: 'complete'
+    read the ambient chronic history and refused, 'unreadable' hit exit 128 and
+    refused as evidence loss, and 'shallow' skipped git entirely and bumped.
+    """
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 800)})
+    ambient = _ambient_checkout(tmp_path, shape)
+    slp._bump_history_cache.clear()
+    _assert_ambient_shape(ambient, shape)
+    mocker.patch("app.size_limit_policy._REPO_ROOT", ambient)
+    slp._bump_history_cache.clear()
+
+    rc = _run(jp, repo, "--fix", "--sections", "backend")
+
+    assert rc == 0
+    assert json.loads(_read(jp))["backend"]["big.py"] == bump_size_limit(
+        1720, "big.py", "backend", repo
+    )

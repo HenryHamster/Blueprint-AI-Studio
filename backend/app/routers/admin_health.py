@@ -21,6 +21,7 @@ from app.digest_precompute import (
     PRECOMPUTE_STALE_FALLBACK_SECONDS,
     annotate_precompute_metadata,
     get_health_precompute_cache,
+    payload_age_seconds,
     read_shared,
     shared_cache_key,
 )
@@ -45,6 +46,7 @@ from app.fleet_utilization import get_fleet_utilization_snapshot
 from app.pipeline_health import compute_pipeline_health_summary
 from app.routers.admin_debug import _build_stuck_tasks
 from app.deploy_identity import project_is_deploy_repo
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +124,7 @@ async def get_health_overview(
         return annotate_precompute_metadata(
             shared.payload,
             precomputed=True,
-            precomputed_at=shared.computed_at.isoformat(),
+            precomputed_at=utc_iso(shared.computed_at),
             precompute_age_seconds=max(
                 0.0, (_utcnow() - shared.computed_at).total_seconds()
             ),
@@ -149,15 +151,7 @@ async def get_health_overview(
         ),
     )
     generated_at = result.get("generated_at") if isinstance(result, dict) else None
-    age_seconds: float | None = None
-    if generated_at:
-        try:
-            age_seconds = max(
-                0.0,
-                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
-            )
-        except (ValueError, TypeError):
-            age_seconds = None
+    age_seconds = payload_age_seconds(generated_at)
     annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
@@ -197,9 +191,7 @@ async def get_null_branch_config_diagnostics(
             "github_owner": project.github_owner,
             "github_repo": project.github_repo,
             "is_self_repo": project.is_self_repo,
-            "created_at": project.created_at.isoformat()
-            if project.created_at
-            else None,
+            "created_at": utc_iso(project.created_at),
         }
         if project_is_deploy_repo(project) and project.integration_branch is None:
             self_repo_skipped.append(item)
@@ -790,7 +782,7 @@ async def _compute_health_overview(
         # precompute/shared-cache provenance annotation above. A served-stale
         # payload keeps its original (old) generated_at, so the endpoint can
         # derive a large precompute_age_seconds and the card dims it.
-        "generated_at": now.isoformat(),
+        "generated_at": utc_iso(now),
     }
 
 
@@ -821,15 +813,7 @@ async def get_warm_vm_state(
         lambda: _compute_warm_vm_state(session=session),
     )
     generated_at = result.get("generated_at") if isinstance(result, dict) else None
-    age_seconds: float | None = None
-    if generated_at:
-        try:
-            age_seconds = max(
-                0.0,
-                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
-            )
-        except (ValueError, TypeError):
-            age_seconds = None
+    age_seconds = payload_age_seconds(generated_at)
     annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
@@ -1026,7 +1010,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 "warm_claim_origin": timing.get("warm_claim_origin"),
                 "prior_role_vm_id": timing.get("prior_role_vm_id"),
                 "setup_secs": timing.get("setup_secs"),
-                "started_at": cur.started_at.isoformat() if cur.started_at else None,
+                "started_at": utc_iso(cur.started_at),
                 "pr_number": _pr_number(cur),
                 "project_id": str(cur.project_id) if cur.project_id else None,
             }
@@ -1049,9 +1033,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             {
                 "id": str(t.id),
                 "task_type": _payload_type(t),
-                "completed_at": t.last_heartbeat.isoformat()
-                if t.last_heartbeat
-                else None,
+                "completed_at": utc_iso(t.last_heartbeat),
                 "status": t.status.value
                 if hasattr(t.status, "value")
                 else str(t.status),
@@ -1062,7 +1044,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         active_vms_out.append(
             {
                 "vm_instance_id": vm_id,
-                "last_heartbeat": last_hb.isoformat() if last_hb else None,
+                "last_heartbeat": utc_iso(last_hb),
                 "is_alive": bool(is_alive),
                 "current_task": cur_out,
                 "warm_pinned_queued": pinned_out,
@@ -1140,16 +1122,12 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             "active_chain_continuity_claims": active_chain_continuity_claims,
             "pool_origin_share": pool_origin_share,
             "circuit_breaker_suppressed": cb_suppressed,
-            "suppressed_until": suppressed_until.isoformat()
-            if suppressed_until
-            else None,
+            "suppressed_until": utc_iso(suppressed_until),
             "clear_rate_threshold": int(
                 _shared_state.runtime_config.get("warm_pin_clear_rate_threshold", 10)
             ),
             "backlog_reuse_circuit_breaker_suppressed": backlog_cb_suppressed,
-            "backlog_reuse_suppressed_until": backlog_suppressed_until.isoformat()
-            if backlog_suppressed_until
-            else None,
+            "backlog_reuse_suppressed_until": utc_iso(backlog_suppressed_until),
             "backlog_reuse_failures_last_hour": _shared_state.count_recent_backlog_reuse_failures(
                 3600
             ),
@@ -1196,7 +1174,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         "spawn_pin_funnel": _get_spawn_pin_funnel(),
         "backlog_reuse_funnel": await _get_backlog_reuse_funnel(session),
         "pool_metrics": await _get_pool_metrics(session),
-        "generated_at": now.isoformat(),
+        "generated_at": utc_iso(now),
     }
 
 
@@ -1406,15 +1384,7 @@ async def get_fleet_utilization(
         lambda: _compute_fleet_utilization(session=session),
     )
     generated_at = result.get("generated_at") if isinstance(result, dict) else None
-    age_seconds: float | None = None
-    if generated_at:
-        try:
-            age_seconds = max(
-                0.0,
-                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
-            )
-        except (ValueError, TypeError):
-            age_seconds = None
+    age_seconds = payload_age_seconds(generated_at)
     annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
@@ -1442,7 +1412,7 @@ async def _compute_fleet_utilization(*, session: AsyncSession) -> Dict[str, Any]
     return {
         **snapshot,
         "saturation": saturation,
-        "generated_at": now.isoformat(),
+        "generated_at": utc_iso(now),
         "fleet_sizing_reading": latest_reading,
     }
 

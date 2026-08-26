@@ -15,6 +15,7 @@ from sqlalchemy import or_
 from sqlmodel import select
 
 from app.models import Task, TaskStatus
+from app.runner_pull_skip import LLM_ROUTE_BLOCKER_KIND
 
 BLOCKED_RETRY_PRECONDITION_RECEIPT_KEY = "_blocked_retry_precondition_receipt"
 _VIEWPORT_ADVISORY_POLICY_RECEIPT = {
@@ -162,6 +163,21 @@ async def file_conflict_precondition_cleared(task: Task, session) -> bool:
         if named_files.intersection(blocker_files):
             return False
     return True
+
+
+def llm_route_precondition_cleared(task: Task) -> bool:
+    """True once the account pool can serve this task's routed provider/model.
+
+    Read-only probe against the live in-process pool; no slots, no lock, no
+    network. Fails CLOSED (stay blocked) when the pool is empty or the probe
+    cannot answer, because requeuing into the same dead route would just burn
+    another ~75 minutes of skip cycles before blocking again.
+    """
+    # Local imports: max_plan_pool is heavy and this module is imported early.
+    from app.max_plan_pool import task_route_has_eligible_account
+    from app.shared_state import runtime_config
+
+    return task_route_has_eligible_account(task, runtime_config)
 
 
 async def pending_rollup_precondition_cleared(task: Task, session) -> bool:
@@ -336,6 +352,16 @@ async def blocked_precondition_state(
             return "clear"
     if task.blocker_kind == "pending_rollup":
         if not await pending_rollup_precondition_cleared(task, session):
+            return "waiting"
+        if not deps:
+            return "clear"
+    if task.blocker_kind == LLM_ROUTE_BLOCKER_KIND:
+        # A task blocked because no enabled account could serve its routed model
+        # unblocks itself the moment the pool can serve it again — re-enabling
+        # the account, or widening the routing, is the whole recovery. Without
+        # this the block would trade an unbounded PROVISIONING orbit for an
+        # unbounded BLOCKED one, which is not an improvement.
+        if not llm_route_precondition_cleared(task):
             return "waiting"
         if not deps:
             return "clear"

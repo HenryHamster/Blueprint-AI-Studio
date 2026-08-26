@@ -353,6 +353,7 @@ async def test_claim_fence_retargets_closed_rollup_fix_to_replacement(
     assert loop["reviewed_head_sha"] == "old-head"
     assert loop["review_history"] == [{"verdict": "REQUEST_CHANGES"}]
     assert loop["iteration"] == 4
+    assert loop["superseded_pr_numbers"] == [str(old_pr)]
     assert (task.context or {}).get("rollup_pr_number") == new_pr
     assert "review history and iteration state preserved" in (
         task.latest_status_message or ""

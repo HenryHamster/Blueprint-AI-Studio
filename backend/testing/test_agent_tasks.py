@@ -768,3 +768,419 @@ async def test_list_tasks_descendants_do_not_leak_cross_project(
     assert str(own_strategic.id) in ids
     assert str(strategic2.id) not in ids
     assert str(child2.id) not in ids
+
+
+# ---------------------------------------------------------------------------
+# GET /api/agent/projects/{project_id}/task-census
+#
+# The lineage list above seeds on created_by="STRATEGIC_AGENT". Nearly all
+# pipeline work is authored as "ORCHESTRATOR", so the census exists to show the
+# agent what the lineage view structurally cannot.
+# ---------------------------------------------------------------------------
+
+
+async def _make_census_task(
+    db_session,
+    project: Project,
+    *,
+    created_by: str,
+    status: TaskStatus = TaskStatus.QUEUED,
+    task_type: str = "research",
+    title: str = "census task",
+    created_at=None,
+    latest_status_message: str | None = None,
+    blocked_reason: str | None = None,
+    blocker_kind: str | None = None,
+    park_reason: str | None = None,
+) -> Task:
+    kwargs = {
+        "project_id": project.id,
+        "payloads": [{"type": task_type}],
+        "title": title,
+        "status": status,
+        "created_by": created_by,
+        "latest_status_message": latest_status_message,
+        "blocked_reason": blocked_reason,
+        "blocker_kind": blocker_kind,
+        "park_reason": park_reason,
+    }
+    if created_at is not None:
+        kwargs["created_at"] = created_at
+    task = Task(**kwargs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_task_census_sees_orchestrator_work_the_lineage_list_cannot(
+    client: AsyncClient, db_session
+):
+    """The census counts every author; the lineage list still counts only its own.
+
+    Both endpoints are asserted in one test on purpose: the census is only
+    valuable because the lineage list omits exactly these rows, and pinning the
+    omission here means a future widening of the lineage filter cannot make this
+    test pass for the wrong reason.
+    """
+    project, calling_task = await _make_project_and_task(db_session, name="Census Authors")
+    orchestrated = await _make_census_task(
+        db_session,
+        project,
+        created_by="ORCHESTRATOR",
+        status=TaskStatus.IN_PROGRESS,
+        task_type="direction_lifecycle",
+        title="orchestrator-authored work",
+    )
+    strategist = await _make_strategic_task(
+        db_session, project, status=TaskStatus.QUEUED, task_type="research"
+    )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    census = await client.get(
+        f"/api/agent/projects/{project.id}/task-census",
+        headers={"x-agent-token": token},
+    )
+    assert census.status_code == 200, census.text
+    data = census.json()["data"]
+
+    by_author = data["non_terminal_by_created_by"]
+    # The calling task itself is a real queued row authored "USER"; it is
+    # counted like any other, which is the point — no author is filtered out.
+    assert by_author.get("ORCHESTRATOR") == 1
+    assert by_author.get("STRATEGIC_AGENT") == 1
+    assert by_author.get("USER") == 1
+    assert data["non_terminal_by_status"]["IN_PROGRESS"] == 1
+    assert data["non_terminal_by_type"]["direction_lifecycle"] == {"IN_PROGRESS": 1}
+    census_ids = {row["id"] for row in data["oldest_non_terminal"]}
+    assert str(orchestrated.id) in census_ids
+    assert str(strategist.id) in census_ids
+
+    # The lineage list is unchanged and still cannot see the orchestrator row.
+    lineage = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert lineage.status_code == 200, lineage.text
+    lineage_ids = {item["id"] for item in lineage.json()["data"]}
+    assert str(strategist.id) in lineage_ids
+    assert str(orchestrated.id) not in lineage_ids
+
+
+@pytest.mark.asyncio
+async def test_task_census_orders_oldest_first_and_carries_block_reasons(
+    client: AsyncClient, db_session
+):
+    """Oldest non-terminal first, with age and the blocked/parked reason."""
+    from datetime import datetime, timedelta, timezone
+
+    project, calling_task = await _make_project_and_task(db_session, name="Census Ordering")
+    now = datetime.now(timezone.utc)
+    stranded = await _make_census_task(
+        db_session,
+        project,
+        created_by="ORCHESTRATOR",
+        status=TaskStatus.BLOCKED,
+        title="stranded for days",
+        created_at=now - timedelta(days=4),
+        blocked_reason="waiting on an unresolved upstream prerequisite",
+        blocker_kind="dependency",
+    )
+    parked = await _make_census_task(
+        db_session,
+        project,
+        created_by="ORCHESTRATOR",
+        status=TaskStatus.PARKED,
+        title="parked yesterday",
+        created_at=now - timedelta(days=1),
+        park_reason="review loop parked",
+    )
+    fresh = await _make_census_task(
+        db_session,
+        project,
+        created_by="ORCHESTRATOR",
+        status=TaskStatus.QUEUED,
+        title="queued just now",
+        created_at=now,
+    )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/task-census",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    rows = res.json()["data"]["oldest_non_terminal"]
+    by_id = {row["id"]: row for row in rows}
+    mine = [row["id"] for row in rows if row["id"] in {
+        str(stranded.id), str(parked.id), str(fresh.id)
+    }]
+    assert mine == [str(stranded.id), str(parked.id), str(fresh.id)]
+
+    assert by_id[str(stranded.id)]["blocked_reason"] == (
+        "waiting on an unresolved upstream prerequisite"
+    )
+    assert by_id[str(stranded.id)]["blocker_kind"] == "dependency"
+    # ~4 days old; the point is that it reads as stranded, not as fresh.
+    assert by_id[str(stranded.id)]["age_hours"] >= 90
+    assert by_id[str(parked.id)]["park_reason"] == "review loop parked"
+    # Reason fields are attached per status, not blanket-emitted.
+    assert "blocked_reason" not in by_id[str(fresh.id)]
+    assert "park_reason" not in by_id[str(stranded.id)]
+
+
+@pytest.mark.asyncio
+async def test_task_census_counts_recent_terminal_work(client: AsyncClient, db_session):
+    """A 24h terminal breakdown separates a standing queue from a stalled one."""
+    project, calling_task = await _make_project_and_task(db_session, name="Census Terminal")
+    done_ids = set()
+    for status in (TaskStatus.COMPLETED, TaskStatus.COMPLETED, TaskStatus.FAILED):
+        task = await _make_census_task(
+            db_session, project, created_by="ORCHESTRATOR", status=status
+        )
+        done_ids.add(str(task.id))
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/task-census",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["recent_terminal"]["window_hours"] == 24
+    assert data["recent_terminal"]["by_status"] == {"COMPLETED": 2, "FAILED": 1}
+    # Terminal rows are counted, never listed: only the queued calling task is.
+    assert data["non_terminal_total"] == 1
+    assert data["non_terminal_by_status"] == {"QUEUED": 1}
+    listed = {row["id"] for row in data["oldest_non_terminal"]}
+    assert listed == {str(calling_task.id)}
+    assert not (listed & done_ids)
+
+
+@pytest.mark.asyncio
+async def test_task_census_is_hard_capped_and_sheds_rows_not_counts(
+    client: AsyncClient, db_session
+):
+    """The byte ceiling is load-bearing, so it is pinned twice over.
+
+    A response larger than a quarter of MAX_CANONICAL_ENVELOPE_BYTES can push the
+    strategic envelope past the coreless-stub threshold and livelock the reclaim
+    loop (PR #17424). This asserts the literal ceiling, asserts the transmitted
+    body actually fits under it with worst-case free text, and asserts that what
+    got shed was detail rows — never the aggregate counts.
+    """
+    import json as _json
+
+    from app.agent_read_budget import AGENT_READ_MAX_RESPONSE_BYTES
+
+    # Literal pin. If MAX_CANONICAL_ENVELOPE_BYTES moves, this must be re-derived
+    # deliberately rather than tracking it silently.
+    assert AGENT_READ_MAX_RESPONSE_BYTES == 16384
+
+    project, calling_task = await _make_project_and_task(db_session, name="Census Cap")
+    long_title = "T" * 4000
+    long_message = "M" * 4000
+    for index in range(40):
+        await _make_census_task(
+            db_session,
+            project,
+            created_by="ORCHESTRATOR",
+            status=TaskStatus.BLOCKED,
+            task_type=f"type_{index % 3}",
+            title=long_title,
+            latest_status_message=long_message,
+            blocked_reason=long_message,
+        )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/task-census?oldest=100",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    body_bytes = len(
+        _json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    assert body_bytes <= AGENT_READ_MAX_RESPONSE_BYTES, body_bytes
+    assert data["bounds"]["max_response_bytes"] == AGENT_READ_MAX_RESPONSE_BYTES
+    assert data["bounds"]["truncated"] is True
+    assert data["bounds"]["truncated_sections"] == ["oldest_non_terminal"]
+
+    # Counts describe every row (40 blocked + the queued calling task) even
+    # though far fewer rows were returned.
+    assert data["non_terminal_total"] == 41
+    assert data["non_terminal_by_status"]["BLOCKED"] == 40
+    assert sum(data["non_terminal_by_status"].values()) == 41
+    assert data["bounds"]["oldest_returned"] == len(data["oldest_non_terminal"])
+    assert data["bounds"]["oldest_returned"] < 40
+
+    # Per-field clipping happened before the whole-response clamp.
+    clipped = 0
+    for row in data["oldest_non_terminal"]:
+        for field in ("title", "latest_status_message", "blocked_reason"):
+            value = row.get(field)
+            if value is None:
+                continue
+            assert len(value.encode("utf-8")) <= 244, (field, len(value))
+            clipped += 1
+    assert clipped, "expected at least one clipped free-text field"
+
+
+@pytest.mark.asyncio
+async def test_task_census_survives_unbounded_task_type_cardinality(
+    client: AsyncClient, db_session
+):
+    """Regression: the aggregate maps alone used to blow through the ceiling.
+
+    ``clamp_read_response`` can only shed rows from the keys named in its trim
+    order, and the census names exactly one: ``oldest_non_terminal``. The three
+    aggregate maps are untrimmable by design — a census that has lost its
+    counts is worthless. That was fine for ``non_terminal_by_status`` (a
+    TaskStatus enum) and for ``non_terminal_by_created_by`` (``chk_task_created_by``,
+    alembic 0067, bounds it to 11 values), but NOT for ``non_terminal_by_type``:
+    the type is read straight out of payload JSONB, where the only constraint
+    is ``chk_task_payloads_size`` on total bytes. Nothing bounds the key
+    vocabulary, so a project with a few hundred distinct in-flight types
+    returned multiples of the cap with ``oldest_non_terminal`` already emptied
+    and ``truncated: True`` as the only signal — a bound that reported success
+    while missing by 2x.
+
+    The construction is asserted to genuinely breach before the response is
+    checked, so removing ``bound_counts`` from the endpoint fails this test
+    rather than merely making it less meaningful.
+    """
+    import json as _json
+
+    from app.agent_read_budget import (
+        AGENT_READ_AGGREGATE_TOP_N,
+        AGENT_READ_MAX_KEY_BYTES,
+        AGENT_READ_MAX_RESPONSE_BYTES,
+        serialized_bytes,
+    )
+
+    project, calling_task = await _make_project_and_task(
+        db_session, name="Census Cardinality"
+    )
+
+    distinct = 400
+    type_names = [f"pipeline_maintenance_followup_stage_{i:03d}" for i in range(distinct)]
+    # The unfolded map, with ZERO detail rows, does not fit. This is the defect.
+    assert (
+        serialized_bytes({name: {"QUEUED": 1} for name in type_names})
+        > AGENT_READ_MAX_RESPONSE_BYTES
+    )
+
+    # A single free-string key is also unbounded in length, so one type is long
+    # enough to matter on its own. Three tasks so it ranks into the kept set and
+    # the emitted key can be inspected rather than folded away.
+    long_type = "L" * 4000
+    for name in type_names + [long_type] * 3:
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": name}],
+                title="census cardinality",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+            )
+        )
+    await db_session.commit()
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/task-census?oldest=100",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    body_bytes = len(
+        _json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    assert body_bytes <= AGENT_READ_MAX_RESPONSE_BYTES, body_bytes
+    # The positive statement: the ceiling was reached, not merely aimed at.
+    assert data["bounds"]["over_budget"] is False
+
+    by_type = data["non_terminal_by_type"]
+    assert len(by_type) <= AGENT_READ_AGGREGATE_TOP_N + 1
+    assert "other" in by_type
+    # Every key is bounded in length as well as in number.
+    assert max(len(key.encode("utf-8")) for key in by_type) <= (
+        AGENT_READ_MAX_KEY_BYTES + 3
+    )
+
+    # 400 named types + the long one + the calling task's typeless payload.
+    assert data["bounds"]["distinct_types"] == distinct + 2
+    assert data["bounds"]["aggregate_top_n"] == AGENT_READ_AGGREGATE_TOP_N
+
+    # The fold is arithmetically exact: hiding the vocabulary must not lose a
+    # single task, or the census stops being a census.
+    assert data["non_terminal_total"] == distinct + 4
+    folded_total = sum(
+        sum(bucket.values()) if isinstance(bucket, dict) else bucket
+        for bucket in by_type.values()
+    )
+    assert folded_total == data["non_terminal_total"]
+    assert sum(data["non_terminal_by_created_by"].values()) == data["non_terminal_total"]
+    assert sum(data["non_terminal_by_status"].values()) == data["non_terminal_total"]
+
+
+def test_task_census_route_is_read_only():
+    """Asserted on the route, not the router — the router-wide sweep is vacuous here.
+
+    ``test_agent_pipeline_visibility.test_every_visibility_route_is_read_only``
+    sweeps ``visibility_router``, which is read-only end to end. The census is
+    registered on the ``agent_tasks`` router instead, which already carries
+    POST/PATCH task verbs, so the same sweep applied here would pass on a
+    mutating census. The route is located by path and its existence asserted,
+    so a rename cannot make this pass by absence.
+    """
+    from app.routers.agent_tasks import router as agent_tasks_router
+
+    census_path = "/api/agent/projects/{project_id}/task-census"
+    matches = [
+        route
+        for route in agent_tasks_router.routes
+        if getattr(route, "path", None) == census_path
+    ]
+    assert len(matches) == 1, sorted(
+        getattr(route, "path", "") for route in agent_tasks_router.routes
+    )
+    methods = set(getattr(matches[0], "methods", set()) or set())
+    assert methods <= {"GET", "HEAD"}, methods
+
+
+@pytest.mark.asyncio
+async def test_task_census_cross_project_is_404(client: AsyncClient, db_session):
+    """Cross-project probing is hidden the same way the other agent reads hide it."""
+    _project1, calling_task = await _make_project_and_task(db_session, name="Census P1")
+    project2 = Project(name="Census P2", user_id="other-user-census")
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project2.id}/task-census",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404, res.text
+
+
+@pytest.mark.asyncio
+async def test_task_census_requires_agent_token(client: AsyncClient, db_session):
+    project, _ = await _make_project_and_task(db_session, name="Census Auth")
+
+    # A forged token is rejected outright.
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/task-census",
+        headers={"x-agent-token": "not-a-real-token"},
+    )
+    assert res.status_code == 401, res.text
+
+    # No token at all never reaches the handler either.
+    res = await client.get(f"/api/agent/projects/{project.id}/task-census")
+    assert res.status_code in (401, 403, 422), res.text

@@ -28,7 +28,13 @@ Bounded against runaway re-firing ("infinite stacking") by construction:
   at most one refresh-driven bypass per window per project, regardless of triggers;
 * **breaker** — the consumer gates the bypass on the existing ``_strategic_failures``
   counter (>= 3 → suppressed, 48 h decay), so a *broken* request whose spawned
-  cycles keep failing stops bypassing and parks instead of looping.
+  cycles keep failing stops bypassing and parks instead of looping. The one
+  ``strategic_cycle_starvation`` recovery arm (armed by the reaper sweep to wake
+  a *halted* loop) raises that ceiling to
+  ``autonomous_research._STARVATION_BYPASS_FAILURE_CAP`` and also crosses the
+  research circuit breaker — but only for the strategic recovery spawn, and only
+  until the raised failure ceiling is hit, after which it parks like any other
+  request.
 
 Only genuine, rare events set the marker (a resolved qualification verdict — at
 most one per qualification attempt), so even the *setter* is naturally bounded.

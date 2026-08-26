@@ -26,7 +26,14 @@ from backend.testing.estate_inventory import (  # noqa: E402
 from backend.testing.identity_extraction import (  # noqa: E402
     extract_python_test_ids_from_file,
     extract_typescript_test_ids,
+    frozen_typescript_tree,
 )
+
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from scripts.utf8_io import force_utf8_streams  # noqa: E402
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
 
 QUEUE_PATH = "test-estate-ranked-queue.md"
 MANIFEST_PATH = "backend/testing/conversational_workday_manifest.json"
@@ -124,7 +131,7 @@ def _record(
     if area == "backend":
         test_count = len(extract_python_test_ids_from_file(path))
     else:
-        test_count = len(extract_typescript_test_ids(source))
+        test_count = len(extract_typescript_test_ids(source, path))
     threshold, priority = _threshold(len(source.splitlines()))
     return TestFile(
         area=area,
@@ -139,32 +146,42 @@ def _record(
 
 
 def collect_test_files(root: Path) -> tuple[TestFile, ...]:
-    """Collect all three current test inventories with canonical test counts."""
+    """Collect all three current test inventories with canonical test counts.
+
+    The sweep is read-only, so it runs under ``frozen_typescript_tree()``:
+    resolving one Vitest file's transitive imports is the same work for
+    hundreds of entry points, and revalidating each cached module with a stat
+    every time costs ~46 stats per file actually read. See that context
+    manager for the measurement.
+    """
     protected = _load_protected_counts(root)
     records: list[TestFile] = []
     backend_costs = _backend_costs(root)
-    for path in iter_backend_test_files(root):
-        records.append(
-            _record(
-                "backend",
-                path,
-                path.relative_to(root).as_posix(),
-                protected,
-                backend_costs,
-            )
-        )
-    for suite in ("admin-ui", "agent"):
-        costs = _vitest_costs(root, suite)
-        for path in iter_vitest_test_files(root, suite):
+    with frozen_typescript_tree():
+        for path in iter_backend_test_files(root):
             records.append(
                 _record(
-                    suite,
+                    "backend",
                     path,
                     path.relative_to(root).as_posix(),
                     protected,
-                    costs,
+                    backend_costs,
                 )
             )
+        for suite in ("admin-ui", "admin-ui-viewport", "agent"):
+            costs = (
+                _vitest_costs(root, suite) if suite in VITEST_DURATION_PATHS else {}
+            )
+            for path in iter_vitest_test_files(root, suite):
+                records.append(
+                    _record(
+                        suite,
+                        path,
+                        path.relative_to(root).as_posix(),
+                        protected,
+                        costs,
+                    )
+                )
     return tuple(records)
 
 
@@ -184,7 +201,7 @@ def _summary(records: tuple[TestFile, ...]) -> str:
         "| Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |",
         "|------|------:|---------:|----------------:|--------------:|-------------------:|",
     ]
-    for area in ("backend", "admin-ui", "agent"):
+    for area in ("backend", "admin-ui", "admin-ui-viewport", "agent"):
         group = [record for record in records if record.area == area]
         measured = [record.cost_seconds for record in group if record.cost_seconds is not None]
         lines.append(
@@ -226,11 +243,13 @@ def render_queue(root: Path) -> str:
         "> GENERATED FILE. Do not hand-edit mutable estate facts.\n"
         "> Regenerate with `python3 scripts/generate_test_estate_ranked_queue.py --write`;\n"
         "> validate with `python3 scripts/generate_test_estate_ranked_queue.py --check`.\n"
+        "> On Windows the interpreter is `python`: the python.org installer ships\n"
+        "> no `python3`, so the two commands above cannot run there as written.\n"
         "> Policy and threshold definitions: `test-estate-rubric.md`.\n\n"
         "## Estate summary\n\n"
         + _summary(records)
         + "\n\n"
-        "The queue includes every currently collected backend, admin-ui, and agent test file. "
+        "The queue includes every currently collected backend, admin-ui unit, admin-ui viewport, and agent test file. "
         "Backend duration coverage is partial: an `unknown` cost is intentionally not treated "
         "as zero or ranked as cheap. Admin-ui and agent costs are complete directional signals "
         "from their committed artifacts. Protected Workday counts are copied verbatim from the "
@@ -254,7 +273,8 @@ def _check(root: Path, output: Path) -> int:
     )
     print(
         "Test-estate queue is stale. Regenerate it with "
-        "`python3 scripts/generate_test_estate_ranked_queue.py --write`.\n"
+        "`python3 scripts/generate_test_estate_ranked_queue.py --write` "
+        "(`python` on Windows, which ships no `python3`).\n"
         + "".join(diff),
         file=sys.stderr,
     )
@@ -262,6 +282,7 @@ def _check(root: Path, output: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--write", action="store_true", help="write the derived queue")
@@ -271,7 +292,10 @@ def main(argv: list[str] | None = None) -> int:
     root = args.root.resolve()
     output = root / QUEUE_PATH
     if args.write:
-        output.write_text(render_queue(root), encoding="utf-8")
+        # newline="" suppresses platform newline translation: a Windows
+        # --write otherwise emits CRLF for every one of the ~1200 rows,
+        # a whole-file diff that conflicts with every concurrent branch.
+        output.write_text(render_queue(root), encoding="utf-8", newline="")
         return 0
     return _check(root, output)
 

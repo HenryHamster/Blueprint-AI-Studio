@@ -19,7 +19,12 @@ from durations_quality import (
     in_band_setup_artifacts,
     quality_ok,
 )
-from merge_durations import filter_current_entries, load_duration_baseline
+from merge_durations import (
+    filter_current_entries,
+    load_duration_baseline,
+    sanitize_fresh_entries,
+)
+from utf8_io import force_utf8_streams
 
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
 os.chdir(BACKEND)
@@ -56,7 +61,17 @@ def docker_run(cmd, timeout=600):
     full_cmd = ["docker", "run", "--rm", "-v", f"{os.getcwd()}:/app",
                  "--network", NETWORK] + ENV_BASE + [DEPS_IMAGE] + cmd
     try:
-        r = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
+        # errors="replace" on EXTERNAL tool output: pytest draws box rules and
+        # check marks, and a container that emits one stray non-utf-8 byte must
+        # cost a mangled character in the log, never the whole 90-minute run.
+        r = subprocess.run(
+            full_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
         return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:
         return -1, "", "timeout"
@@ -74,7 +89,7 @@ def get_coverage():
             merged.update(existing)
 
     for p in sorted(glob.glob(".durations_partial_*.json")):
-        with open(p) as f:
+        with open(p, encoding="utf-8") as f:
             merged.update(filter_current_entries(json.load(f), os.getcwd()))
 
     files = set()
@@ -100,15 +115,28 @@ def write_merged():
             outlier_count += 1
             del merged[k]
 
+    # Fresh partial observations accumulate separately: the setup-plateau
+    # sanitizer must judge them on their own evidence, because a historical
+    # in-gap observation in the baseline would otherwise vouch for a freshly
+    # recorded plateau and persist it as the new baseline.
+    fresh: dict = {}
     for p in sorted(glob.glob(".durations_partial_*.json")):
-        with open(p) as f:
+        with open(p, encoding="utf-8") as f:
             data = json.load(f)
         data = filter_current_entries(data, root)
         for k, v in data.items():
             if v > OUTLIER_CAP:
                 outlier_count += 1
             else:
-                merged[k] = v
+                fresh[k] = v
+
+    fresh, fresh_band_artifacts = sanitize_fresh_entries(fresh)
+    if fresh_band_artifacts:
+        print(
+            f"  Dropped {len(fresh_band_artifacts)} in-band setup artifacts from the "
+            "fresh observations (fixture-setup misattribution)"
+        )
+    merged.update(fresh)
 
     if not merged:
         print("  No partial data to merge")
@@ -122,7 +150,9 @@ def write_merged():
         del merged[key]
     if band_artifacts:
         print(f"  Dropped {len(band_artifacts)} in-band setup artifacts (fixture-setup misattribution)")
-    with open(td, "w") as f:
+    # .test_durations is tracked and pinned `text eol=lf`; newline="" keeps a
+    # Windows regeneration from rewriting all ~9k lines as CRLF.
+    with open(td, "w", encoding="utf-8", newline="") as f:
         json.dump(merged, f, indent=2, sort_keys=True)
         f.write("\n")
 
@@ -136,6 +166,10 @@ def write_merged():
     return len(merged)
 
 def main():
+    # This script prints U+2713/U+2717 status marks and echoes pytest output;
+    # cp1252 cannot encode either, so without this the run dies partway with
+    # UnicodeEncodeError after burning up to 90 minutes of container time.
+    force_utf8_streams()
     # Start Postgres + run migrations if needed
     subprocess.run(["docker", "network", "create", NETWORK], capture_output=True)
     subprocess.run(["docker", "rm", "-f", PG_NAME], capture_output=True)
@@ -177,7 +211,7 @@ def main():
         # Write a temporary merge and check quality guards
         temp_merged = load_duration_baseline(".test_durations")
         for p in sorted(glob.glob(".durations_partial_*.json")):
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 temp_merged.update(filter_current_entries(json.load(f), os.getcwd()))
 
         import statistics
@@ -220,7 +254,7 @@ def main():
         # Check if file was created
         src = f".durations_partial_b{batch_num}.json"
         if os.path.exists(src):
-            with open(src) as f:
+            with open(src, encoding="utf-8") as f:
                 d = json.load(f)
             files_in_batch = set()
             for k in d:
@@ -235,7 +269,7 @@ def main():
         else:
             print("    -> No durations file produced (tests may have all failed)")
             # Remove these files from consideration by writing an empty partial
-            with open(src, "w") as f:
+            with open(src, "w", encoding="utf-8", newline="") as f:
                 json.dump({}, f)
 
     # Final merge
@@ -247,7 +281,7 @@ def main():
 
     print("\n=== Complete ===")
     # Load final merged data for quality guard check
-    with open(".test_durations") as f:
+    with open(".test_durations", encoding="utf-8") as f:
         final_data = json.load(f)
     import statistics
     vs = list(final_data.values())

@@ -30,6 +30,7 @@ from app.routers.admin_notifications import (
 )
 from app.routers.admin_project_config import get_project_resource_summary
 from app.schemas import redact_command_log_text
+from app.time_utils import utc_iso
 
 
 router = APIRouter(prefix="/api/agent-access/v1", tags=["agent-access"])
@@ -784,6 +785,10 @@ def _project_agent_task_list(
         "parent_task_id",
         "depends_on",
         "created_at",
+        # Freshness. Without it a caller cannot separate a task that moved
+        # seconds ago from one frozen for hours -- the first question asked
+        # when diagnosing a wedge from this projection.
+        "updated_at",
         "started_at",
         "last_heartbeat",
         "blocker_kind",
@@ -1254,9 +1259,7 @@ async def get_agent_access_profile(
             "name": credential.name,
             "principal_user_id": credential.principal_user_id,
             "scopes": credential.scopes,
-            "expires_at": (
-                credential.expires_at.isoformat() if credential.expires_at else None
-            ),
+            "expires_at": utc_iso(credential.expires_at),
         },
         credential_state,
         serialized_strings=True,

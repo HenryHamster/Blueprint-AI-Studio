@@ -2767,11 +2767,20 @@ async def test_all_children_genuinely_cancelled_marks_parent_failed(cleanup_db, 
 async def test_infra_failed_review_awaiting_resurrection_keeps_parent_evaluating(
     cleanup_db, mocker
 ):
-    """A recent infra-failed review is still live recovery work.
+    """A recent infra-failed review the sweep WILL resurrect is live work.
 
     The reaper may resurrect it once. Rollup must not terminalize the parent
     from the cancelled direct work child during the short FAILED -> QUEUED
     handoff window.
+
+    The child deliberately carries no ``pr_number``: reaper Step 5 refuses
+    outright to generically resurrect a review/fix task that has one (it must
+    be re-driven through canonical review admission instead), so holding the
+    parent for that shape waits on a handoff that never comes. This test
+    originally built exactly that shape and asserted the hold, which is why the
+    stranding survived — see testing/test_evaluating_parent_convergence.py,
+    which pins both halves: the sweep really does refuse a PR-pipeline review
+    child, and the parent must converge rather than hold for it.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mock_alert = mocker.patch(
@@ -2813,8 +2822,7 @@ async def test_infra_failed_review_awaiting_resurrection_keeps_parent_evaluating
         payloads=[
             {
                 "type": "review",
-                "prompt": "Review the implementation PR",
-                "pr_number": 15220,
+                "prompt": "Review the implementation",
             }
         ],
     )
@@ -2997,8 +3005,10 @@ def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadb
         new_callable=AsyncMock,
         return_value=False,
     )
-    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
-        return SizeCapPreflightResult("ok", None, expected_head_sha)
+    async def _bound_ok(*_args, expected_head_sha=None, expected_base_sha=None, **_kwargs):
+        return SizeCapPreflightResult(
+            "ok", None, expected_head_sha, base_sha=expected_base_sha
+        )
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
@@ -4121,8 +4131,10 @@ async def test_merge_conflict_empty_mergeability_repoll_resolves_and_merges(
     )
     # Suppress the asyncio.sleep so the test runs instantly.
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
-    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
-        return SizeCapPreflightResult("ok", None, expected_head_sha)
+    async def _bound_ok(*_args, expected_head_sha=None, expected_base_sha=None, **_kwargs):
+        return SizeCapPreflightResult(
+            "ok", None, expected_head_sha, base_sha=expected_base_sha
+        )
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
@@ -4254,8 +4266,10 @@ async def test_merge_conflict_empty_mergeability_defers_when_repoll_exhausted(
         return_value=(None, None),
     )
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
-    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
-        return SizeCapPreflightResult("ok", None, expected_head_sha)
+    async def _bound_ok(*_args, expected_head_sha=None, expected_base_sha=None, **_kwargs):
+        return SizeCapPreflightResult(
+            "ok", None, expected_head_sha, base_sha=expected_base_sha
+        )
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",

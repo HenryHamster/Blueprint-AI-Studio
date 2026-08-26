@@ -62,6 +62,7 @@ from app.problem_model import (
     reconcile_gaps_for_retired_directions,
 )
 from app.routers.admin_discovery_cycles import router as discovery_cycles_router
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -348,13 +349,13 @@ async def get_directions(
                 "outcome_kind_breakdown": generalized_state["outcome_kind_breakdown"],
                 "held": bool(hold_info["held"]),
                 "held_reason": hold_info["reason"] if hold_info["held"] else None,
-                "held_at": held_at.isoformat()
+                "held_at": utc_iso(held_at)
                 if isinstance(held_at, datetime)
                 else None,
-                "held_until": held_until.isoformat()
+                "held_until": utc_iso(held_until)
                 if isinstance(held_until, datetime)
                 else None,
-                "refractory_until": refractory_until.isoformat()
+                "refractory_until": utc_iso(refractory_until)
                 if isinstance(refractory_until, datetime)
                 else None,
                 "refractory_reason": refractory_reason,
@@ -373,11 +374,7 @@ async def get_directions(
         "directions": enriched,
         "autonomous_enabled": project.autonomous_enabled,
         "running_update": project.running_update or None,
-        "running_update_acknowledged_at": (
-            project.running_update_acknowledged_at.isoformat()
-            if project.running_update_acknowledged_at
-            else None
-        ),
+        "running_update_acknowledged_at": utc_iso(project.running_update_acknowledged_at),
         "is_self_repo": bool(project.is_self_repo),
         "enable_self_improvement": project.enable_self_improvement,
     }
@@ -469,12 +466,12 @@ async def add_direction(
         "text": payload.text,
         "priority": payload.priority,
         "paths": payload.paths or [],
-        "added_at": _utcnow().isoformat(),
+        "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
         "status": "staged" if payload.staged else "active",
     }
     if payload.staged:
         direction["staged_for_version"] = staged_for_version
-        direction["staged_at"] = _utcnow().isoformat()
+        direction["staged_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     if payload.category:
         direction["category"] = payload.category
     if payload.completion_criteria:
@@ -595,7 +592,7 @@ async def replace_directions(
         if not entry.get("id"):
             entry["id"] = f"d-{uuid.uuid4().hex[:8]}"
         if not entry.get("added_at"):
-            entry["added_at"] = _utcnow().isoformat()
+            entry["added_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
         if entry.get("priority") not in ("high", "medium", "low"):
             raise HTTPException(
                 status_code=400, detail=f"Invalid priority: {entry.get('priority')}"
@@ -718,7 +715,7 @@ async def _remove_direction_impl(
                     "status": "rejected",
                     "rejected_at": datetime.now(timezone.utc)
                     .replace(tzinfo=None)
-                    .isoformat(),
+                    .isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                 }
                 rejected = [d for d in remaining if d.get("status") == "rejected"]
                 non_rejected = [d for d in remaining if d.get("status") != "rejected"]
@@ -1369,7 +1366,7 @@ async def resurrect_direction_endpoint(
     from app.shared_state import runtime_config as _runtime_config
 
     max_active = _runtime_config.get("max_active_directions", 10)
-    now_iso = _utcnow().isoformat()
+    now_iso = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
 
     resurrected_holder: list[dict] = []
     staffing_holder: list[dict[str, Any]] = []

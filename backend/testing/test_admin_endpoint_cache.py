@@ -351,7 +351,12 @@ async def test_health_overview_on_demand_stamps_live_freshness(
         "actionable_issues": [],
         "direction_portfolio": {},
         "queue_depth": {"queued": 0, "active": 0, "evaluating": 0},
-        "generated_at": _utcnow().isoformat(),
+        # Zone-carrying, matching what utc_iso() actually puts on the wire.
+        # A bare .isoformat() here would feed the annotate path a format the
+        # real endpoint no longer produces -- which is exactly why this test
+        # stayed green while /api/admin/health-overview was returning a null
+        # precompute_age_seconds in production.
+        "generated_at": _utcnow().isoformat() + "+00:00",
     }
     spy = AsyncMock(return_value=payload)
     mocker.patch.object(_admin_health, "_compute_health_overview", spy)

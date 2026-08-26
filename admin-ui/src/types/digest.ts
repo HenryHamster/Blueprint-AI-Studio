@@ -751,6 +751,7 @@ export interface DigestData<DP = unknown> {
   merge_early_exit_count?: number | null;
   review_cap_exhaustion_summary?: {
     count: number;
+    distinct_direction_count?: number;
     avg_iterations: number | null;
     total_cost_usd: number;
     avg_cost_usd: number | null;

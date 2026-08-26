@@ -8,9 +8,11 @@ timestamps, and empty context handling do not drift route-by-route.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any, Iterable, Mapping
 
 from app.models import ProjectMessage
+from app.time_utils import utc_iso
 from app.workbench_state import (
     sanitize_strategic_session_snapshot,
     strategic_session_snapshot_has_signal,
@@ -46,6 +48,10 @@ DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     "_workday_consultation_requested",
     "_workday_consultation_atomic_reply_id",
     "_resident_activation_prompt",
+    "_conversation_streaming_preview",
+    "_conversation_streaming_delta",
+    "_conversation_streaming_seq",
+    "_conversation_streaming_terminal",
 )
 
 # Compact set of context keys rendered by the list UI (grouping, severity badges,
@@ -138,7 +144,11 @@ def enum_value(value: Any) -> str:
 
 
 def _isoformat(value: Any) -> str | None:
-    return value.isoformat() if value else None
+    if isinstance(value, datetime):
+        # Columns are naive UTC; the wire form must carry the offset or a
+        # JS `new Date()` reads it as local time.
+        return utc_iso(value)
+    return value.isoformat() if value else None  # utc-iso-ok: non-datetime (date) value -- no zone applies
 
 
 def _message_context(message: ProjectMessage) -> dict[str, Any]:
@@ -605,6 +615,7 @@ def message_preview_dict(
         if key in {
             "_resident_activation_prompt",
             "_workday_consultation_requested",
+            "_conversation_streaming_preview",
         }:
             # This is a typed server marker, not display text. Stringifying it
             # would defeat the UI's strict boolean suppression guard.

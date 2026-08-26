@@ -60,6 +60,13 @@ interface DiscoveryReviewValidationContext {
   evidenceCount: number;
   decisionReceiptIds: ReadonlySet<string>;
   requiredEvidenceOmitted: boolean;
+  /** The packet lets this reviewer commission work without an operator. */
+  bindingDecisionAllowed?: boolean;
+  /** Reject an evidence-acquisition escalation so the model can re-author it
+   *  as a bounded bet. Only the first attempt sets this: if the model insists,
+   *  the decision is accepted and the server converts it, because failing the
+   *  task strands the direction exactly as the escalation would have. */
+  escalationRepairable?: boolean;
 }
 
 const UUID_PATTERN =
@@ -238,6 +245,22 @@ export function validateDiscoveryReviewShape(
       detail: 'missing required evidence permits only a concrete operator question',
     };
   }
+  // ask_operator is for questions only the operator can answer -- preference,
+  // authority, scope, priority. It is not an evidence-acquisition channel: a
+  // packet that grants binding authority already lets this reviewer commission
+  // the measurement it says is missing, so escalating instead parks a live
+  // direction behind a human for nothing.
+  if (context.bindingDecisionAllowed
+      && context.escalationRepairable
+      && raw.action === 'ask_operator') {
+    return {
+      ok: false,
+      reason: 'parsed_object_schema_mismatch',
+      detail: 'this packet grants binding authority, so ask_operator is not '
+        + 'available; if evidence is missing, advance with a bounded measure '
+        + 'bet that acquires it instead of handing the question back',
+    };
+  }
 
   if (raw.action === 'advance') {
     if (!validateNextBet(raw.next_bet)
@@ -297,6 +320,24 @@ export function normalizeDiscoveryReviewResult(
   };
 }
 
+/** Does this frozen packet let the reviewer commission work by itself? */
+export function packetGrantsBindingAuthority(
+  payload: Record<string, unknown>,
+): boolean {
+  const packet = Array.isArray(payload.evidence_packet)
+    ? payload.evidence_packet
+    : [];
+  if (packet.length === 0) {
+    return false;
+  }
+  const manifest = payload.evidence_packet_manifest;
+  if (!isPlainObject(manifest)) {
+    return true;
+  }
+  return manifest.binding_decision_allowed !== false
+    && manifest.required_evidence_omitted !== true;
+}
+
 function reviewContractError(payload: Record<string, unknown>): string | null {
   const cycleId = strVal(payload.cycle_id).trim();
   const expectedRevision = payload.expected_revision;
@@ -336,6 +377,30 @@ export function buildDiscoveryReviewPrompt(
   const packet = Array.isArray(payload.evidence_packet)
     ? payload.evidence_packet
     : [];
+  const bindingAllowed = packetGrantsBindingAuthority(payload);
+  const actionVocabulary = bindingAllowed
+    ? 'advance|park|stop'
+    : 'advance|park|stop|ask_operator';
+  const escalationRule = bindingAllowed
+    ? `- \`ask_operator\` is NOT available for this packet. The manifest grants
+  binding authority, which means you may commission work yourself. \`ask_operator\`
+  is reserved for questions only the operator can answer -- a preference,
+  authority, scope, or priority call ("is this direction still wanted", "which
+  goal matters more"). It is never the way to obtain evidence.
+
+If the packet does not actually establish the claim, do NOT guess a pass or a
+fail and do NOT hand the question back. \`advance\` with a \`measure\` (or
+\`research\`) next_bet whose decision_question is exactly the question you could
+not answer -- running the named tests, reading the named file, or looking up the
+named receipt is work this engine dispatches for itself.`
+    : `- \`ask_operator\`: required evidence is absent, evidence conflicts, or a real
+  human choice is needed. Ask one concrete question that would unblock the
+  decision.`;
+  const missingEvidenceRule = bindingAllowed
+    ? `Never state a pass or fail you did not observe in this packet: if the
+evidence is not here, advance with a bounded bet that goes and gets it.`
+    : `If the manifest reports required evidence omitted, or the packet contains no
+evidence, ask the operator a concrete question instead of guessing.`;
   return `# Research outcome decision
 
 You are making one bounded decision after a completed research parent. Judge
@@ -390,15 +455,13 @@ Choose exactly one action:
 - \`park\`: further work is not justified now but a concrete future condition
   would justify resuming. Supply both park_reason and resume_condition.
 - \`stop\`: the evidence argues against further work on this bet or direction.
-- \`ask_operator\`: required evidence is absent, evidence conflicts, or a real
-  human choice is needed. Ask one concrete question that would unblock the
-  decision. There is no inconclusive or null action.
+${escalationRule}
+
+There is no inconclusive or null action.
 
 The summary must state what the evidence establishes and why the selected
 action follows. Advance, park, and stop must cite the current parent_outcome
-receipt, not only the packet manifest. If the
-manifest reports required evidence omitted, or the packet contains no evidence,
-ask the operator a concrete question instead of guessing.
+receipt, not only the packet manifest. ${missingEvidenceRule}
 
 Output ONLY one JSON object with exactly these keys:
 
@@ -406,7 +469,7 @@ Output ONLY one JSON object with exactly these keys:
 {
   "cycle_id": "${cycleId}",
   "reviewed_revision": ${revision},
-  "action": "advance|park|stop|ask_operator",
+  "action": "${actionVocabulary}",
   "summary": "evidence-backed decision and rationale",
   "evidence_citations": ["evidence UUIDs from the packet only"],
   "next_bet": null,
@@ -537,6 +600,7 @@ export async function handleDiscoveryReview(
         }
       }
     }
+    const bindingDecisionAllowed = packetGrantsBindingAuthority(payload);
     const validationContext: DiscoveryReviewValidationContext = {
       cycleId,
       expectedRevision,
@@ -547,7 +611,13 @@ export async function handleDiscoveryReview(
         isPlainObject(payload.evidence_packet_manifest)
         && payload.evidence_packet_manifest.required_evidence_omitted === true
       ),
+      bindingDecisionAllowed,
     };
+    // The first attempt gets one rejection for escalating a question it has the
+    // authority to answer, so the model re-authors it as a bounded bet. A
+    // second insistence is accepted rather than failed: the server converts it,
+    // and failing the task here would strand the direction just as badly.
+    let decisionAttempt = 0;
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
       requiredKeys: [...DISCOVERY_RESULT_KEYS],
@@ -558,7 +628,12 @@ export async function handleDiscoveryReview(
         + `research outcome decision JSON object. Use `
         + `cycle_id "${cycleId}" and reviewed_revision ${expectedRevision}. `
         + `Include exactly these keys: ${DISCOVERY_RESULT_KEYS.join(', ')}. `
-        + `Action must be advance, park, stop, or ask_operator. Evidence citations `
+        + `Action must be ${
+          bindingDecisionAllowed
+            ? 'advance, park, or stop -- ask_operator is not available for this '
+              + 'packet, so acquire missing evidence with a bounded next_bet'
+            : 'advance, park, stop, or ask_operator'
+        }. Evidence citations `
         + `may only use these IDs: ${[...evidenceIds].join(', ') || '(none)'}. `
         + `No markdown, code fences, prose, phase, limits, verdict, or confirmation fields.`,
       ws,
@@ -568,8 +643,14 @@ export async function handleDiscoveryReview(
       run: runPacketOnly,
       retryStatus: 'Repairing research outcome decision JSON...',
       schemaLabel: 'discovery_review',
-      validateParsedValue: value =>
-        validateDiscoveryReviewShape(value, validationContext),
+      validateParsedValue: value => {
+        const escalationRepairable = decisionAttempt === 0;
+        decisionAttempt += 1;
+        return validateDiscoveryReviewShape(value, {
+          ...validationContext,
+          escalationRepairable,
+        });
+      },
     });
 
     if (repaired.value === null) {

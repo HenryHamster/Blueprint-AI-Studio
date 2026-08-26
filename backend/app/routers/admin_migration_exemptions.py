@@ -238,7 +238,7 @@ async def add_migration_exemption(
         "created_table": created_table,
         "integration_revision": integration_revision,
         "added_by": actor,
-        "added_at": _utcnow().isoformat(),
+        "added_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
         "reason": reason,
     }
 

@@ -442,6 +442,71 @@ async def attempt_merge_with_authority(
     """
     merge_project_id = str(task.project_id)
     merge_task_id = task.id
+
+    # ── Rollup child-deliverable gate (pre-lock, pre-PUT) ──────────────────
+    # This function is the single choke point every merge path funnels through
+    # (attempt_policy_bound_merge, attempt_explicit_human_merge, and the direct
+    # ci_completion call), so placing the gate here means no merge path can be
+    # added later that quietly skips it. It runs BEFORE enforce_merge_authority
+    # takes the base/PR/Task locks: the check may make one GitHub get_pr_files
+    # call, and held-lock GitHub I/O is its own incident class.
+    #
+    # Fail-open and free for non-rollup merges: a dict lookup on the task's
+    # rollup identity answers first. explicit_review_override does NOT bypass it
+    # — that flag bypasses model-review POLICY, never target/lock/fix SAFETY, and
+    # silently destroying a merged child's deliverable is a safety condition.
+    from app.rollup_deliverable_guard import (
+        enforce_premerge_rollup_deliverable_guard,
+    )
+
+    _deliverable = await enforce_premerge_rollup_deliverable_guard(
+        task,
+        session,
+        pr_number=pr_number,
+        gh_token=gh_token,
+        owner=owner,
+        repo=repo,
+        ci_loop=ci_loop,
+        branch=branch,
+        base_branch=base_branch,
+    )
+    if not _deliverable.allowed:
+        # Re-arm the CI/merge poll through the canonical helper so the hold can
+        # never write the identity-less {ci_waiting} shape the merge poll skips
+        # (see ci_merge_helpers.arm_ci_wait). The hold IS a wait, so a fresh
+        # ci_wait_started is correct, and PREMERGE_HOLD_CAP bounds how many
+        # times it can be reset.
+        from app.ci_merge_helpers import arm_ci_wait
+
+        held_loop = arm_ci_wait(
+            dict(ci_loop),
+            pr_number=pr_number,
+            base_branch=base_branch,
+            now_iso=_utcnow().isoformat(),
+            pause_baseline=float(ci_loop.get("ci_wait_pause_baseline") or 0.0),
+        )
+        held_loop["rollup_deliverable_hold_reason_code"] = _deliverable.reason_code
+        task.context = {**(task.context or {}), "review_loop": held_loop}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.error(
+            "[MERGE-AUTHORITY] merge held for PR #%s on task %s: %s (%s)",
+            pr_number,
+            task.id,
+            _deliverable.reason,
+            _deliverable.reason_code,
+        )
+        return (
+            MergeAuthorityDecision(
+                False,
+                str(checked_head_sha or ""),
+                str(checked_base_sha or ""),
+                held_loop,
+            ),
+            None,
+        )
+
     for attempt in range(4 if retry_nonterminal else 1):
         if attempt:
             await asyncio.sleep(5 * (3 ** (attempt - 1)))

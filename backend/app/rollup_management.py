@@ -21,6 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal, resolve_dialect_name
+from app.closed_pr_reconciliation import (
+    _owns_superseded_review_wait_approval_hold,
+    append_superseded_pr_number,
+    reset_pr_attempt_state,
+)
 from app.rollup_locking import (  # noqa: F401 — re-exported for callers/tests
     _ParentMutatedDuringPRCreation,
     _capture_rollup_parent_snapshot,
@@ -2018,29 +2023,45 @@ async def _check_and_trigger_rollup(
     # CANCELLED, mark the parent FAILED ("All N subtasks were cancelled"), and
     # then watch the review child auto-resurrect seconds later — leaving live
     # recovery work underneath a terminal parent.
-    from app.failure_classification import INFRA_CLASSES
+    # Eligibility is the SHARED predicate the sweep itself gates on
+    # (failure_classification.infra_resurrection_block_reason), never a local
+    # copy of its rules. A local copy is how this became a permanent wedge: it
+    # omitted the sweep's outright refusal to resurrect a review/fix task
+    # carrying a pr_number, so a parent whose PR review child failed on an
+    # infra class held here for the full window waiting on a flip the sweep
+    # would never perform — with every child already terminal, nothing else
+    # could advance it. Hold only for a recovery that can actually arrive.
+    from app.failure_classification import infra_resurrection_block_reason
 
     _infra_resurrection_cutoff = _utcnow() - timedelta(hours=2)
+    _recovery_pending_child = None
     for c in all_children:
         if (c.first_payload).get("type") not in ("review", "fix"):
             continue
         if c.status == TaskStatus.FAILED:
             ctx = c.context or {}
-            failure_category = ctx.get("failure_category")
+            _block_reason = infra_resurrection_block_reason(c)
             resurrection_pending = (
-                failure_category in INFRA_CLASSES
-                and int(ctx.get("_resurrection_count", 0)) < 1
+                _block_reason is None
                 and c.updated_at is not None
                 and c.updated_at >= _infra_resurrection_cutoff
-                and ctx.get("timeout_subtype") != "oom"
-                and ctx.get("pr_closed_unmerged") is not True
-                and ctx.get("pr_closed_empty") is not True
-                and ctx.get("pr_rejected") is not True
             )
             if resurrection_pending:
                 pipeline_active = True
                 pipeline_recovery_pending = True
+                _recovery_pending_child = c
                 break
+            if _block_reason is not None:
+                logger.info(
+                    "[ROLLUP] Parent %s not holding for infra-failed %s child "
+                    "%s: the recovery sweep will never resurrect it "
+                    "(reason=%s, class=%s) — converging via the rollup path",
+                    str(parent.id)[:8],
+                    (c.first_payload).get("type"),
+                    str(c.id)[:8],
+                    _block_reason,
+                    ctx.get("failure_category") or "unknown",
+                )
             continue
         if c.status not in (
             TaskStatus.QUEUED,
@@ -2129,9 +2150,18 @@ async def _check_and_trigger_rollup(
     # Don't rollup if there are still active tasks or active review/fix pipeline
     if active_count > 0 or pipeline_active:
         if pipeline_recovery_pending:
+            # Name the child and its class: an operator reading a held parent
+            # must be able to go straight to the task the hold is waiting on.
+            _rc = _recovery_pending_child
             parent.latest_status_message = (
                 "Recovering: infrastructure-failed review/fix task is eligible "
                 "for auto-resurrection"
+                + (
+                    f" (child {str(_rc.id)[:8]}, "
+                    f"{(_rc.context or {}).get('failure_category') or 'unknown'})"
+                    if _rc is not None
+                    else ""
+                )
             )
             session.add(parent)
             await session.commit()
@@ -3412,11 +3442,46 @@ async def _check_and_trigger_rollup(
                                 logger.warning(
                                     f"[ROLLUP] PR #{existing_pr} was closed without merge — clearing marker, will retry"
                                 )
+                                old_review_loop = parent_ctx.get("review_loop") or {}
+                                release_owned_review_wait_hold = (
+                                    _owns_superseded_review_wait_approval_hold(
+                                        parent,
+                                        old_review_loop,
+                                        pr_number=existing_pr,
+                                        pr_data=pr_state,
+                                    )
+                                )
+                                superseded_pr_numbers = append_superseded_pr_number(
+                                    old_review_loop, existing_pr
+                                )
                                 parent.context = {
                                     k: v
                                     for k, v in parent_ctx.items()
                                     if k not in ("rollup_pr_number", "rollup_pr_url")
                                 }
+                                # A replacement PR is a new review attempt. Keep
+                                # only audited chain metadata so approvals, CI,
+                                # verifier, and retry latches from the dead PR
+                                # cannot make its successor appear reviewed.
+                                successor_loop = reset_pr_attempt_state(old_review_loop)
+                                successor_loop["superseded_pr_numbers"] = (
+                                    superseded_pr_numbers
+                                )
+                                parent.context["review_loop"] = successor_loop
+                                parent.context.pop("blueprint_review_verdict", None)
+                                from app.admin_approval_authority import (
+                                    APPROVAL_FOLLOWUP_CLAIM_KEY,
+                                )
+
+                                # The operator follow-up receipt belongs to the
+                                # closed PR attempt and cannot authorize its
+                                # replacement. Only the exact review-wait
+                                # backstop hold may release requires_approval;
+                                # independent/manual holds remain in force.
+                                parent.context.pop(APPROVAL_FOLLOWUP_CLAIM_KEY, None)
+                                if release_owned_review_wait_hold:
+                                    parent.requires_approval = False
+                                    parent.context.pop("_approval_set_at", None)
                                 # Durable ownership survives the volatile marker
                                 # clear: a requeue-clone on a foreign-named branch
                                 # whose rollup_pr_number is being dropped here to
@@ -3890,10 +3955,13 @@ async def _check_and_trigger_rollup(
                     _rollup_candidate_head = str(
                         (pr_detail.get("head") or {}).get("sha") or ""
                     )
-                    if not _rollup_candidate_head:
+                    _rollup_base_sha = str(
+                        (pr_detail.get("base") or {}).get("sha") or ""
+                    )
+                    if not _rollup_candidate_head or not _rollup_base_sha:
                         size_cap_result = SizeCapPreflightResult(
                             "defer",
-                            "rollup PR head unavailable for size-cap evaluation",
+                            "rollup PR identity unavailable for size-cap evaluation",
                         )
                     else:
                         size_cap_result = await preflight_rollup_size_caps(
@@ -3905,6 +3973,8 @@ async def _check_and_trigger_rollup(
                             project_id=str(project_id_local) if project_id_local else None,
                             commit_bump=_sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP,
                             expected_head_sha=_rollup_candidate_head,
+                            target_branch=target_branch,
+                            expected_base_sha=_rollup_base_sha,
                         )
                     if not isinstance(size_cap_result, SizeCapPreflightResult):
                         size_cap_result = SizeCapPreflightResult(
@@ -3913,6 +3983,11 @@ async def _check_and_trigger_rollup(
                         )
                     size_cap_status = size_cap_result.status
                     size_cap_reason = size_cap_result.reason
+                    if size_cap_status == "ok" and size_cap_reason:
+                        logger.warning(
+                            f"[ROLLUP] PR #{rollup_pr_number} size-cap preflight "
+                            f"reports inherited debt without blocking: {size_cap_reason}"
+                        )
 
                     # ── K7: post the security-scan report HERE, while the parent
                     # lock is still released (2026-07-12 concurrency audit).
@@ -4528,11 +4603,12 @@ async def _check_and_trigger_rollup(
                     if (
                         not _rollup_checked_head
                         or _rollup_checked_head != _rollup_candidate_head
+                        or size_cap_result.base_sha != _rollup_checked_base
                         or not _rollup_checked_base
                     ):
                         parent.latest_status_message = (
                             f"Rollup PR #{rollup_pr_number} merge held — could not "
-                            "bind the size-cap verdict to the immutable merge head"
+                            "bind the size-cap verdict to the immutable merge head and base"
                         )[:500]
                         session.add(parent)
                         await session.commit()
@@ -5807,6 +5883,20 @@ async def _check_and_trigger_rollup(
                                 f"4. Otherwise resolve conflicts and git push --force-with-lease."
                             )
                         else:
+                            # A rollup's payload IS the union of its children's
+                            # already-reviewed, already-merged deliverables, and
+                            # `parent_goal` is a <=500-char blurb naming none of
+                            # their files. The old step 3 said "{target} is the
+                            # source of truth; re-apply only the changes that
+                            # serve the rollup goal" — under which every
+                            # unexplained child file is deletable. That is what
+                            # erased 12/12 files of child PR #17707 from rollup
+                            # PR #17804 (2026-08-24). Structure vs content are
+                            # now split, and a self-check names the failure.
+                            from app.rollup_deliverable_guard import (
+                                build_must_preserve_prompt_block,
+                            )
+
                             fix_prompt = (
                                 f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
                                 f"Error: {merge_msg}\n\n"
@@ -5815,10 +5905,17 @@ async def _check_and_trigger_rollup(
                                 f"Steps to resolve:\n"
                                 f"1. Run: git fetch origin {target_branch}\n"
                                 f"2. Run: git rebase origin/{target_branch}\n"
-                                f"3. Resolve any conflicts — {target_branch} is the source of truth. Keep its refactors and restructuring.\n"
-                                f"   Re-apply only the changes that serve the rollup goal (described above) on top of {target_branch}'s current state.\n"
-                                f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
-                                f"4. Run: git rebase --continue after resolving each file"
+                                f"3. Resolve conflicts by COMBINING both sides. {target_branch} is authoritative for\n"
+                                f"   STRUCTURE (refactors, moves, renames) — adapt this branch's changes to it.\n"
+                                f"   This rollup branch is authoritative for CONTENT: it carries several child PRs\n"
+                                f"   that were each reviewed and merged, and the one-line rollup goal above does not\n"
+                                f"   name their files. NEVER delete a change just because the goal does not explain\n"
+                                f"   it, and never resolve a file to {target_branch}'s version wholesale.\n"
+                                f"4. Run: git rebase --continue after resolving each file\n"
+                                f"5. Before pushing, run: git diff --name-only origin/{target_branch}...HEAD\n"
+                                f"   Every file listed above must still appear. One that vanished means your\n"
+                                f"   resolution reverted a child's work — restore it before you push."
+                                f"{build_must_preserve_prompt_block(parent)}"
                                 f"{migration_guidance}"
                             )
                         fix_task, _ = await _spawn_pipeline_task(

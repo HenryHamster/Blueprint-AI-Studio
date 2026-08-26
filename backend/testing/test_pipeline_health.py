@@ -3185,9 +3185,16 @@ def test_first_attempt_measurement_pre_post_split():
     assert result["pre_split"]["rate"] == 0.5
     assert result["post_split"]["sample_size"] == 3
     assert result["post_split"]["rate"] == 1.0
-    # Window boundaries
-    assert result["pre_split"]["window_end"] == split.isoformat()
-    assert result["post_split"]["window_start"] == split.isoformat()
+    # Window boundaries. `split` is naive UTC (from _utcnow()); the response
+    # renders it with the UTC offset attached so a consumer cannot read it as
+    # local time. Spelled out here instead of calling the production helper.
+    assert result["pre_split"]["window_end"] == split.replace(
+        tzinfo=timezone.utc
+    ).isoformat()
+    assert result["post_split"]["window_start"] == split.replace(
+        tzinfo=timezone.utc
+    ).isoformat()
+    assert result["pre_split"]["window_end"].endswith("+00:00")
 
 
 def test_first_attempt_measurement_by_category_breakdown():

@@ -45,12 +45,33 @@ Contract
   and surface-glob drift sentinels last. This is what lets the merge gate's
   ``--limit``-style cap keep the tests most likely to catch a contract break.
   Empty set -> no output, exit 0. Optional ``--limit N`` truncates to the first
-  N (most relevant); the overflow is reported to STDERR as
-  ``deferred-unverified:`` lines (never silently dropped).
+  N (most relevant); the overflow is reported to STDERR as ``deferred-rank:``
+  lines (never silently dropped).
 * ``--mandatory-output PATH`` writes the matched surface sentinels to a
   separate newline-delimited file while ``--limit`` applies only to ordinary
   selectors. This is the merge-gate protocol: mandatory sentinels are carried
   past the ordinary cap, and the output file is written fail-closed.
+* ``--budget-seconds N`` additionally caps the ordinary set by SUMMED MEASURED
+  COST, read from ``backend/.test_durations`` (override with ``--durations``).
+  A count cap alone cannot bound runtime: the eight heaviest files in the
+  committed estate sum to ~42 minutes, so an eight-selector gate can exceed any
+  timeout it is given and be cascade-killed while perfectly healthy. Selection
+  walks in relevance order, SKIPPING (not stopping at) an entry that does not
+  fit, so one expensive high-rank file cannot starve the cheaper files behind
+  it. Mandatory sentinels are charged against the budget but never dropped. The
+  most relevant entry is kept even when it alone exceeds the budget — selecting
+  nothing is the one outcome a merge gate must never produce — so the true
+  bound is ``budget + cost of the single heaviest selected file``. Budgeting is
+  fail-open: with no usable measurements it does not apply and says so on
+  STDERR, because "requested and skipped" and "applied and dropped nothing"
+  are otherwise indistinguishable on STDOUT. Its overflow is reported as
+  ``deferred-budget:`` — a DIFFERENT token from the rank cap's on purpose. The
+  two classes read alike and matter very differently: a ``deferred-rank:``
+  entry is the long tail the protocol deliberately does not run (hundreds of
+  files for a core module), while a ``deferred-budget:`` entry was ranked in
+  as relevant and dropped only for time. Conflating them buries the handful
+  that deserve attention under the tail that never did. Anything matching
+  ``deferred-`` was not run here.
 * Robust on partial trees: any listed path absent on disk is skipped (deletions),
   and the reverse-dep scan is skipped gracefully when ``backend/testing`` is
   absent.
@@ -293,6 +314,30 @@ def _glob_to_regex(glob: str) -> "re.Pattern":
     return re.compile("^" + "".join(out) + "$")
 
 
+def _surface_manifest_path(repo_root: str) -> str:
+    """Where the drift-sentinel manifest lives for ``repo_root``.
+
+    Docker test harness: the backend tree is copied with app/ and testing/ as
+    siblings and no enclosing backend/ directory, so the dev-checkout-relative
+    ``_SURFACE_MANIFEST_REL`` does not resolve. The manifest is co-located with
+    this module; fall back to it -- but only for the DEFAULT root, so hermetic
+    fixture roots stay strictly self-contained (a fixture without a manifest
+    must read as no manifest, never as the repository's own).
+
+    Shared by every manifest reader. A second reader that re-derived this path
+    would work in a developer checkout and read nothing under the harness every
+    backend CI shard uses -- passing while proving nothing, which is the
+    vacuous-guard shape this file's own sentinels exist to catch.
+    """
+    manifest_path = os.path.join(repo_root, _SURFACE_MANIFEST_REL)
+    if not os.path.isfile(manifest_path) and repo_root == _DEFAULT_REPO_ROOT:
+        manifest_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "drift_sentinel_surfaces.json",
+        )
+    return manifest_path
+
+
 def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]":
     """Load and compile the drift-sentinel surface manifest (fail-open).
 
@@ -301,18 +346,7 @@ def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]
     yields no pairs rather than raising, so a broken manifest can never crash the
     merge gate (mirroring the module's "robust on partial trees" contract).
     """
-    manifest_path = os.path.join(repo_root, _SURFACE_MANIFEST_REL)
-    if not os.path.isfile(manifest_path) and repo_root == _DEFAULT_REPO_ROOT:
-        # Docker test harness: the backend tree is copied with app/ and
-        # testing/ as siblings and no enclosing backend/ directory, so the
-        # dev-checkout-relative _SURFACE_MANIFEST_REL does not resolve. The
-        # manifest is co-located with this module; fall back to it — but only
-        # for the DEFAULT root, so hermetic fixture roots stay strictly
-        # self-contained (a fixture without a manifest must compile to []).
-        manifest_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "drift_sentinel_surfaces.json",
-        )
+    manifest_path = _surface_manifest_path(repo_root)
     try:
         with open(manifest_path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -354,6 +388,78 @@ def load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]
     prefix/glob list that can silently drift out of sync with this manifest.
     """
     return _load_surface_manifest(repo_root)
+
+
+def _is_backend_surface(glob: str) -> bool:
+    """Whether a manifest surface glob lies entirely under ``backend/``.
+
+    Compared on a path SEGMENT boundary, never as a bare string prefix, so
+    ``backend-other/**`` is not mistaken for a backend surface.
+    """
+    return glob == "backend" or glob.startswith("backend/")
+
+
+def corpus_lane_required_sentinels(repo_root: str) -> "list[str]":
+    """Registered sentinels that the standalone corpus lane must carry.
+
+    WHY THIS IS DERIVED RATHER THAN LISTED
+    --------------------------------------
+    The corpus lane (``scripts/test-backend.sh --standalone``) is the only lane
+    that runs on a diff containing no backend Python file, so it is the only
+    place a sentinel guarding ``admin-ui/``, ``agent/``, ``scripts/`` or a
+    derived artifact can be reached. A sentinel every one of whose registered
+    surfaces lies under ``backend/`` is in the opposite position: the only
+    diffs that select it are backend diffs, and every backend diff already
+    resolves selectors through the backend-authoring lane. Demanding a roster
+    seat for it buys nothing.
+
+    That distinction used to live as a hand-maintained four-name set inside
+    ``scripts/test_guard_gate_left_shift.py``. It went stale the moment a new
+    backend-only sentinel was registered without someone remembering to extend
+    it -- which is how ``test_scripts_dir_resolution_guard.py`` (registered on
+    ``backend/**/*.py``, and whose own manifest entry states in writing that it
+    is deliberately kept OUT of the standalone lane because it reads the whole
+    backend tree over a bind mount under a 30s timeout) turned a correct
+    registration into a red promotion matrix.
+
+    Reading it off the manifest closes that: to make a sentinel exempt you now
+    have to take its non-backend surface away, which visibly shrinks what the
+    sentinel guards and is reviewable at the line where it happens -- not here,
+    and not in the test that consumes this.
+
+    Fails CLOSED. A sentinel is dropped from the required set only on positive
+    evidence that all of its surfaces are backend surfaces. An unreadable
+    manifest yields no sentinels at all upstream, which callers must treat as
+    the vacuous case rather than as "nothing required".
+    """
+    surfaces_by_sentinel: "dict[str, list[str]]" = {}
+    try:
+        with open(_surface_manifest_path(repo_root), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    entries = data.get("surfaces")
+    if not isinstance(entries, list):
+        return []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        glob = entry.get("glob")
+        sentinels = entry.get("sentinels")
+        if not isinstance(glob, str) or not glob:
+            continue
+        if not isinstance(sentinels, list):
+            continue
+        for sentinel in sentinels:
+            if isinstance(sentinel, str) and sentinel:
+                surfaces_by_sentinel.setdefault(sentinel, []).append(glob)
+    return sorted(
+        sentinel
+        for sentinel, globs in surfaces_by_sentinel.items()
+        if not all(_is_backend_surface(glob) for glob in globs)
+    )
 
 
 def sentinel_file(sentinel: str) -> str:
@@ -596,6 +702,87 @@ def resolve_impacted_partition(
     return ordinary, mandatory
 
 
+def load_test_file_costs(durations_path: str) -> "dict[str, float]":
+    """Return ``{repo-relative test file: measured seconds}``.
+
+    Reads a pytest-split ``.test_durations`` file, whose keys are node ids
+    relative to the pytest rootdir (``backend/``) — ``testing/test_x.py::test_y``
+    — and sums each file's nodes.
+
+    FAIL-OPEN, deliberately. A missing, unreadable or malformed durations file
+    yields ``{}``, and ``apply_cost_budget`` then declines to budget at all. The
+    alternative — treating "no measurements" as "everything is free" or
+    "everything costs the maximum" — would either not bound the gate or select
+    nothing, and selecting nothing is the vacuous-guard failure this module
+    exists to avoid.
+    """
+    try:
+        with open(durations_path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    costs: "dict[str, float]" = {}
+    for node_id, seconds in raw.items():
+        if not isinstance(node_id, str):
+            continue
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError):
+            continue
+        rel = "backend/" + node_id.split("::", 1)[0]
+        costs[rel] = costs.get(rel, 0.0) + value
+    return costs
+
+
+def apply_cost_budget(
+    ordinary,
+    costs: "dict[str, float]",
+    budget_seconds,
+    reserved_seconds: float = 0.0,
+) -> "tuple[list[str], list[str], float]":
+    """Return ``(kept, deferred, kept_seconds)`` for a wall-clock budget.
+
+    Why this exists at all: a selector-COUNT cap cannot bound runtime. Measured
+    against the committed estate, the eight heaviest test files sum to ~42
+    minutes — above any budget a merge gate can be given. The gate's own
+    timeout would then fire on healthy work and the surrounding task would be
+    cascade-killed by the CI backstop. That is the harness-budget-inversion
+    class, and a count cap walks straight into it.
+
+    Items are taken in relevance order while budget remains, and one that does
+    not fit is SKIPPED rather than terminating the walk, so a single expensive
+    high-rank file cannot starve every cheaper file behind it.
+
+    A file with no measurement is charged the mean of the measured files rather
+    than zero: an unmeasured file is usually a NEW one, and charging it nothing
+    would let an unbounded number of them past the budget.
+    """
+    ordinary = list(ordinary)
+    if not costs or not budget_seconds or budget_seconds <= 0:
+        return ordinary, [], 0.0
+
+    unknown_cost = sum(costs.values()) / len(costs)
+    remaining = float(budget_seconds) - reserved_seconds
+    kept: "list[str]" = []
+    deferred: "list[str]" = []
+    spent = 0.0
+    for rel in ordinary:
+        cost = costs.get(rel, unknown_cost)
+        if kept and cost > remaining:
+            deferred.append(rel)
+            continue
+        # The first selector is kept even if it alone exceeds the budget:
+        # running the single most relevant test slowly beats running no test at
+        # all, and a gate that can select nothing is exactly the failure mode
+        # this module is built to prevent.
+        kept.append(rel)
+        remaining -= cost
+        spent += cost
+    return kept, deferred, spent
+
+
 def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
     """Return sorted, deduplicated first-party mock.patch() string targets from tests.
 
@@ -652,6 +839,29 @@ def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
     return sorted(targets)
 
 
+# Between two adjacent tokens of a Python call, the grammar admits only
+# whitespace (newlines included, inside the call's parentheses), a
+# backslash line-continuation, and comments. So a file whose text does not
+# match this cannot tokenize to NAME(create) OP(=) NAME(True), and therefore
+# cannot produce the ``keyword(arg='create', value=Constant(True))`` node the
+# scan below looks for. That makes the prefilter sound by construction rather
+# than by inspection -- see
+# ``test_create_true_prefilter_admits_every_spelling_the_ast_scan_accepts``,
+# which pins each spelling this must not reject.
+#
+# ``**{"create": True}`` needs no coverage: dict-unpacking produces
+# ``keyword(arg=None)``, which the AST scan already declines to match.
+#
+# The alternation branches start with disjoint characters ("#" is not in
+# ``[\s\\]``) and the group is atomic, so there is no backtracking blowup on
+# the long non-matching runs that dominate a real source tree; measured at
+# 0.002s against an adversarial 40KB input.
+_CREATE_TRUE_TOKEN_GAP = r"(?>[\s\\]|\#[^\n]*)*"
+_CREATE_TRUE_HINT = re.compile(
+    "create" + _CREATE_TRUE_TOKEN_GAP + "=" + _CREATE_TRUE_TOKEN_GAP + "True"
+)
+
+
 def collect_create_true_patch_targets(testing_dir: str) -> "list[tuple[str, str]]":
     """Return sorted ``(test_file, target)`` pairs for ``create=True`` patch calls.
 
@@ -678,6 +888,19 @@ def collect_create_true_patch_targets(testing_dir: str) -> "list[tuple[str, str]
         try:
             with open(fpath, encoding="utf-8", errors="replace") as fh:
                 source = fh.read()
+            # Cheap textual prefilter before the expensive parse. Reading the
+            # whole ``backend/testing`` tree costs 0.16s; AST-parsing all of it
+            # costs 10.77s, and only 9 of 627 files can contribute a pair at
+            # all. Skipping the parse for the other 618 takes this scan from
+            # 10.93s to 0.74s (14.8x) on the current checkout.
+            #
+            # This is a false-failure fix, not a nicety. The standalone lane
+            # runs with ``--timeout=30``; over the Docker-on-Windows bind mount
+            # the 10.9s native scan crosses it, and the guard then dies on a
+            # timeout rather than its assertion -- reporting "slow filesystem"
+            # while claiming to report a redundant-patch defect.
+            if not _CREATE_TRUE_HINT.search(source):
+                continue
             tree = ast.parse(source, filename=fname)
         except (SyntaxError, OSError, UnicodeDecodeError):
             continue
@@ -756,14 +979,38 @@ def main(argv=None) -> int:
         default=None,
         help="repo root used to resolve on-disk paths (default: inferred)",
     )
+    parser.add_argument(
+        "--budget-seconds",
+        dest="budget_seconds",
+        type=float,
+        default=None,
+        help=(
+            "cap the emitted set by SUMMED MEASURED COST as well as by count; "
+            "overflow is logged to STDERR (never dropped). A count cap alone "
+            "cannot bound runtime -- the eight heaviest files in the estate "
+            "are ~42 minutes"
+        ),
+    )
+    parser.add_argument(
+        "--durations",
+        dest="durations",
+        default=None,
+        help=(
+            "pytest-split durations file backing --budget-seconds "
+            "(default: <repo-root>/backend/.test_durations)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     repo_root = args.repo_root if args.repo_root is not None else _DEFAULT_REPO_ROOT
     changed = _read_changed(args.paths, sys.stdin)
+    mandatory: "list[str]" = []
     if args.mandatory_output is not None:
         ordinary, mandatory = resolve_impacted_partition(changed, repo_root)
         try:
-            with open(args.mandatory_output, "w", encoding="utf-8") as fh:
+            with open(
+                args.mandatory_output, "w", encoding="utf-8", newline=""
+            ) as fh:
                 for rel in mandatory:
                     fh.write(rel + "\n")
         except OSError as exc:
@@ -780,7 +1027,49 @@ def main(argv=None) -> int:
         overflow = impacted[args.limit :]
         impacted = impacted[: args.limit]
         for rel in overflow:
-            print(f"deferred-unverified: {rel}", file=sys.stderr)
+            print(f"deferred-rank: {rel}", file=sys.stderr)
+        # A count for consumers that summarise rather than list. A change to a
+        # core module puts HUNDREDS of files in this tail, so a reader needs the
+        # magnitude without the roll.
+        print(
+            f"rank-cap: {len(overflow)} impacted file(s) beyond --limit "
+            f"{args.limit} deferred",
+            file=sys.stderr,
+        )
+
+    if args.budget_seconds is not None:
+        durations_path = args.durations or os.path.join(
+            repo_root, "backend", ".test_durations"
+        )
+        costs = load_test_file_costs(durations_path)
+        if not costs:
+            # Say so. "Budgeting was requested and did not happen" and
+            # "budgeting happened and nothing was dropped" produce identical
+            # STDOUT, and a caller that sized its timeout around the budget
+            # needs to know which one it got.
+            print(
+                "budget: no usable measurements in "
+                f"{durations_path} — cost budget NOT applied",
+                file=sys.stderr,
+            )
+        else:
+            # Mandatory sentinels are never dropped (they are the surface-drift
+            # contract, and they are cheap -- ~6s for a typical match), but
+            # they do consume wall clock, so charge them against the budget
+            # rather than pretending the gate is only as slow as its ordinary
+            # selectors.
+            reserved = sum(costs.get(rel, 0.0) for rel in mandatory)
+            impacted, budget_overflow, spent = apply_cost_budget(
+                impacted, costs, args.budget_seconds, reserved
+            )
+            for rel in budget_overflow:
+                print(f"deferred-budget: {rel}", file=sys.stderr)
+            print(
+                f"budget: {spent + reserved:.0f}s of {args.budget_seconds:.0f}s "
+                f"({len(impacted)} ordinary + {len(mandatory)} mandatory, "
+                f"{len(budget_overflow)} deferred)",
+                file=sys.stderr,
+            )
 
     for rel in impacted:
         print(rel)

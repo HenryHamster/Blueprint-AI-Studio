@@ -53,8 +53,10 @@ import contextlib
 import hashlib
 import importlib.util
 import json
+import ntpath
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -62,10 +64,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 from urllib.request import urlopen
 
@@ -1001,6 +1005,17 @@ _PROJECT_OPERATOR_WRITE_COMMANDS = frozenset(
 )
 
 
+# Verbs that are, by contract, "no orchestrator, no DB, no GCP". They must not
+# be routed through credential resolution at all: `compute run` used to reach
+# load_config() via _enforce_scoped_cli_command -> _using_scoped_service_credential
+# and die telling the operator to `gcloud auth login` before a purely local
+# experiment could start. Declared structurally, as an exact (command,
+# subcommand) set, so exempting a verb is a visible one-line change here and not
+# a string match scattered across call sites. Adding a verb that DOES touch the
+# API to this set would bypass the ServiceCredential fence — never do that.
+_LOCAL_ONLY_CLI_COMMANDS = frozenset({("compute", "run")})
+
+
 def _scoped_command_key(args: argparse.Namespace) -> tuple[str, str | None]:
     command = str(getattr(args, "command", ""))
     subcommand_attr = {
@@ -1010,6 +1025,7 @@ def _scoped_command_key(args: argparse.Namespace) -> tuple[str, str | None]:
         "directions": "directions_cmd",
         "messages": "messages_cmd",
         "strategic": "strategic_cmd",
+        "compute": "compute_cmd",
     }.get(command)
     subcommand = getattr(args, subcommand_attr, None) if subcommand_attr else None
     # Bare `projects` and `projects list` are the same read, so both map to the
@@ -1036,10 +1052,39 @@ def _scoped_service_profile() -> dict:
     return _SCOPED_PROFILE_CACHE[1]
 
 
+def _is_local_only_cli_command(args: argparse.Namespace) -> bool:
+    """True for verbs that never touch the orchestrator, DB, or GCP."""
+    return _scoped_command_key(args) in _LOCAL_ONLY_CLI_COMMANDS
+
+
 def _enforce_scoped_cli_command(args: argparse.Namespace) -> None:
-    """Deny unsupported ServiceCredential commands before any local side effect."""
-    if not _using_scoped_service_credential():
+    """Deny unsupported ServiceCredential commands before any local side effect.
+
+    The credential-free contract for local-only verbs (#17889) is "never DIE on
+    a missing config", NOT "never READ the config". Those are different, and
+    conflating them opened a hole: `compute` is a host command that
+    CLAUDE.md requires to fail closed for the project-operator profile, but the
+    local-only exemption used to be taken BEFORE the scoped check, so a scoped
+    ServiceCredential ran `compute run` unfenced. You cannot decide whether a
+    scoped credential is selected without looking at the config, so the probe
+    happens here and only a genuinely unresolvable config is waved through.
+    """
+    try:
+        scoped = _using_scoped_service_credential()
+    except (APIError, OSError, ValueError):
+        # No resolvable Blueprint config: absent (APIError), unreadable
+        # (OSError), or malformed (ValueError, which json.JSONDecodeError
+        # subclasses). A local-only verb is credential-free by contract and
+        # must still run; every other verb reaches its own load_config()
+        # moments later and fails there with the actionable setup hint.
+        # Waving THIS case through cannot grant a scoped credential anything,
+        # because a config that will not resolve holds no usable credential.
         return
+    if not scoped:
+        return
+    # A scoped ServiceCredential IS selected. Local-only verbs get no exemption
+    # from here down: the allowlists below are the whole authority, and
+    # ("compute", "run") is deliberately absent from both.
     key = _scoped_command_key(args)
     profile = _scoped_service_profile()
     scopes = set((profile.get("credential") or {}).get("scopes") or [])
@@ -4714,7 +4759,7 @@ def _render_health_activity(data: dict) -> None:
 # ── analytics ────────────────────────────────────────────────────────────────
 
 def cmd_analytics(args: argparse.Namespace) -> None:
-    """Dispatch analytics subcommands: cost / duration / pause-stats / failing-types."""
+    """Dispatch analytics subcommands: cost / duration / pause-stats / failing-types / platform-kills."""
     sub = getattr(args, "analytics_cmd", None) or "cost"
     pid = get_project_id(getattr(args, "project_id", None))
 
@@ -4749,6 +4794,16 @@ def cmd_analytics(args: argparse.Namespace) -> None:
             print(f"ERROR: {err}", file=sys.stderr)
             return
         _emit(args, data, _render_analytics_failing_types)
+
+    elif sub == "platform-kills":
+        days = getattr(args, "days", 7)
+        data, err = _safe_read(
+            f"/api/admin/platform-kill-metrics?project_id={pid}&days={days}"
+        )
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return
+        _emit(args, data, _render_analytics_platform_kills)
 
     else:
         print(
@@ -4820,6 +4875,67 @@ def _render_analytics_failing_types(data: dict) -> None:
         rate = g.get("failure_rate", 0)
         n = g.get("sample_size", 0)
         print(f"  {tt:20}  failure_rate={rate:.1%}  n={n}")
+
+
+def _render_analytics_platform_kills(data: dict) -> None:
+    """Render the platform-kill rate, its class breakdown, and its unknowns.
+
+    The unclassified share is printed next to the headline rate on purpose: a
+    zero rate with a low classified fraction means "not measured", not "no
+    defects", and an operator must not be able to read one without the other.
+    """
+    days = data.get("window_days", "?")
+    kills = data.get("platform_kill_count", 0)
+    per_day = data.get("platform_kills_per_day", 0.0)
+    recovered = data.get("platform_kills_recovered", 0)
+    terminal = data.get("terminal_task_count", 0)
+    unclassified = data.get("unclassified_count", 0)
+    frac = data.get("classified_fraction")
+
+    print(f"=== PLATFORM KILLS (last {days}d, since {data.get('window_start','?')}) ===")
+    print(f"  platform kills/day : {per_day}   ({kills} kills over {days}d)")
+    print(f"    of which retried : {recovered}  (work continued under a replacement)")
+    print(f"  terminal tasks     : {terminal}")
+    print(f"  work outcomes      : {data.get('work_outcome_count', 0)}")
+    print(f"  not-a-death        : {data.get('not_a_death_count', 0)}")
+
+    if frac is None:
+        print("  classified         : n/a (no terminal tasks in window)")
+    else:
+        print(f"  classified         : {frac:.1%}   ({unclassified} unclassified)")
+        if frac < 0.9:
+            print(
+                f"  !! {1 - frac:.0%} of terminal tasks could not be classified — "
+                "read the rate above as a FLOOR, not a measurement."
+            )
+
+    by_class = data.get("by_class") or []
+    if by_class:
+        print("  --- by class (WHY it counted as a platform kill) ---")
+        for row in by_class:
+            cls = row.get("kill_class", "?")
+            n = row.get("count", 0)
+            rec = row.get("recovered_count", 0)
+            suffix = f", {rec} retried" if rec else ""
+            print(f"  {cls:38} {n:4d}{suffix}")
+            print(f"      why: {row.get('reason','')}")
+    else:
+        print("  (no platform kills classified in this window)")
+
+    daily = data.get("daily") or []
+    if daily:
+        print("  --- per day (kills / terminal) ---")
+        for row in daily:
+            print(
+                f"  {row.get('date','?')}  {row.get('platform_kills',0):4d}"
+                f" / {row.get('terminal_tasks',0):4d}"
+            )
+
+    reasons = data.get("unclassified_reasons") or []
+    if reasons:
+        print("  --- unclassified: WHY we could not tell ---")
+        for row in reasons:
+            print(f"  {row.get('count',0):5d}x  {row.get('reason','')}")
 
 
 # ── vision ────────────────────────────────────────────────────────────────────
@@ -5644,6 +5760,63 @@ def _sweep_metric_value(verdict: dict) -> "float | str | None":
 _ACTIVE_COMPUTE_STATUSES = frozenset({"QUEUED", "STARTING", "RUNNING", "POLLING"})
 
 
+def _fmt_window_minutes(minutes) -> str:
+    """Render a --include-finished window the way an operator said it."""
+    try:
+        m = int(minutes)
+    except (TypeError, ValueError):
+        return "the default window"
+    if m <= 0:
+        return "0m (active jobs only)"
+    if m >= 1440 and m % 1440 == 0:
+        return f"{m // 1440}d"
+    if m >= 60 and m % 60 == 0:
+        return f"{m // 60}h"
+    return f"{m}m"
+
+
+def _compute_criterion_cell(j: dict) -> str:
+    """Render the SCIENTIFIC verdict, which is not the execution status.
+
+    The backend derives ``criterion_status`` (NOT_DECLARED / MET / NOT_MET /
+    UNMEASURED / INVALID) and serves it on every compute-job payload. Prefer it:
+    ``criterion_verdict.met`` is a bool, so it collapses "the threshold was
+    measured and missed" and "the metric was never measured at all" into the
+    same ``met=False`` — and a job in the second case reads as a clean
+    scientific failure when it is actually an unmeasured run.
+
+    Falls back to the raw verdict for a pre-upgrade backend that does not serve
+    the derived field.
+    """
+    cv = j.get("criterion_verdict") if isinstance(j.get("criterion_verdict"), dict) else None
+    metric = cv.get("metric") if cv else None
+    value = cv.get("value") if cv else None
+    measurement = f" ({metric}={value})" if metric and value is not None else ""
+    crit = j.get("criterion_status")
+    if isinstance(crit, str) and crit:
+        if crit == "NOT_DECLARED":
+            return ""
+        return f"  crit={crit}{measurement}"
+    if cv is not None:
+        return f"  met={cv.get('met')}{measurement}"
+    return ""
+
+
+def _compute_watchdog_cell(j: dict) -> str:
+    """Surface an in-flight no-progress cut on the list row.
+
+    ``watchdog_state == 'cutting'`` means the no-progress condition holds right
+    now and the next poll pass terminates the job. An operator scanning the list
+    should not have to open the job to learn that.
+    """
+    if j.get("status") not in _ACTIVE_COMPUTE_STATUSES:
+        return ""
+    if j.get("watchdog_state") != "cutting":
+        return ""
+    reason = j.get("watchdog_cut_reason") or "no_progress"
+    return f"  ⚠ watchdog cutting ({reason})"
+
+
 def _compute_job_burn_rate(j: dict, now: "datetime") -> "float | None":
     """Return $/hr burn rate for an active job; None if data is insufficient (<60s elapsed or no accrued cost)."""
     if j.get("status") not in _ACTIVE_COMPUTE_STATUSES:
@@ -5680,7 +5853,7 @@ def _compute_job_projected_spend(j: dict, burn_rate: "float | None", now: "datet
     return accrued + burn_rate * (remaining_sec / 3600)
 
 
-def cmd_compute(args: argparse.Namespace) -> None:
+def cmd_compute(args: argparse.Namespace) -> int | None:
     """Dispatch compute subcommands: list / show / kill / analyze / run / launch."""
     sub = getattr(args, "compute_cmd", None) or "list"
     if sub == "kill":
@@ -5690,7 +5863,8 @@ def cmd_compute(args: argparse.Namespace) -> None:
     elif sub == "show":
         _compute_show(args)
     elif sub == "run":
-        _compute_run_local(args)
+        # Propagate the local run's exit contract to the process exit code.
+        return _compute_run_local(args)
     elif sub == "launch":
         _compute_launch(args)
     else:
@@ -5701,19 +5875,42 @@ def _compute_list(args: argparse.Namespace) -> None:
     pid = get_project_id(getattr(args, "project_id", None))
     limit = getattr(args, "limit", 20)
     status_filter = getattr(args, "status_filter", None)
-    if getattr(args, "all_terminal", False):
+    all_terminal = bool(getattr(args, "all_terminal", False))
+    finished = getattr(args, "include_finished", 360)
+    if all_terminal:
         resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
                    f"?all_terminal=true&limit={limit}")
     else:
-        finished = getattr(args, "include_finished", 360)
         resp = api("GET", f"/api/admin/projects/{pid}/compute-jobs"
                    f"?include_finished_minutes={finished}&limit={limit}")
     jobs = resp.get("compute_jobs", []) if isinstance(resp, dict) else resp
     has_more = resp.get("has_more", False) if isinstance(resp, dict) else False
     summary = resp.get("summary") if isinstance(resp, dict) else None
     if status_filter:
-        jobs = [j for j in jobs if j.get("status", "").upper() == status_filter.upper()]
-    _emit(args, {"compute_jobs": jobs, "has_more": has_more, "summary": summary, "status_filter": status_filter}, _render_compute_list)
+        wanted = status_filter.upper()
+        # Match either the execution status or the derived experiment status, so
+        # `--status CRITERION_UNMEASURED` is askable without the caller having to
+        # know that those jobs are all filed under SUCCEEDED.
+        jobs = [
+            j for j in jobs
+            if (j.get("status") or "").upper() == wanted
+            or (j.get("experiment_status") or "").upper() == wanted
+        ]
+    _emit(
+        args,
+        {
+            "compute_jobs": jobs,
+            "has_more": has_more,
+            "summary": summary,
+            "status_filter": status_filter,
+            "window": {
+                "all_terminal": all_terminal,
+                "include_finished_minutes": None if all_terminal else finished,
+                "limit": limit,
+            },
+        },
+        _render_compute_list,
+    )
 
 
 def _render_compute_list(data: dict) -> None:
@@ -5721,6 +5918,19 @@ def _render_compute_list(data: dict) -> None:
     print(f"=== COMPUTE JOBS ({len(jobs)}) ===")
     if not jobs:
         print("  (none)")
+        # An empty list is a claim about a WINDOW, not about the project. Say
+        # which window produced it, or the reader concludes there is no compute.
+        window = data.get("window") or {}
+        if window.get("all_terminal"):
+            print("  (searched every terminal job; none matched)")
+        else:
+            print(
+                "  (window: active jobs plus those finished in the last "
+                f"{_fmt_window_minutes(window.get('include_finished_minutes'))} — "
+                "widen with --include-finished <minutes> or --all-terminal)"
+            )
+        if data.get("status_filter"):
+            print(f"  (filtered to status={data['status_filter']})")
         return
     now = datetime.now(timezone.utc)
     for j in jobs:
@@ -5730,21 +5940,22 @@ def _render_compute_list(data: dict) -> None:
         task_type = j.get("task_type") or "?"
         cost = j.get("final_cost_usd")
         cost_str = f"  ${cost:.2f}" if cost is not None else ""
-        cv = j.get("criterion_verdict") if isinstance(j.get("criterion_verdict"), dict) else None
-        if cv is not None:
-            metric = cv.get("metric")
-            value = cv.get("value")
-            if metric and value is not None:
-                verdict_str = f"  met={cv.get('met')} ({metric}={value})"
-            else:
-                verdict_str = f"  met={cv.get('met')}"
-        else:
-            verdict_str = ""
+        verdict_str = _compute_criterion_cell(j)
         exp = (j.get("experiment") or "")[:20]
         exp_str = f"  exp={exp}" if exp else ""
         burn = _compute_job_burn_rate(j, now)
         burn_str = f"  burn=${burn:.2f}/hr" if burn is not None else ""
-        print(f"  {jid}  {status:12} [{task_type}]  {title}{cost_str}{verdict_str}{exp_str}{burn_str}")
+        watchdog_str = _compute_watchdog_cell(j)
+        terminal_reason = (j.get("terminal_reason") or "").strip()
+        reason_str = (
+            f"  reason={terminal_reason[:60]}"
+            if terminal_reason and status not in _ACTIVE_COMPUTE_STATUSES
+            else ""
+        )
+        print(
+            f"  {jid}  {status:12} [{task_type}]  {title}"
+            f"{cost_str}{verdict_str}{exp_str}{burn_str}{watchdog_str}{reason_str}"
+        )
     status_filter = data.get("status_filter")
     if data.get("has_more") and not status_filter:
         print("  (more jobs available; increase --limit, --include-finished, or use --all-terminal)")
@@ -5806,6 +6017,18 @@ def _render_compute_show(data: dict) -> None:
     print(f"=== COMPUTE JOB: {j.get('id', '?')} ===")
     status = j.get("status", "?")
     print(f"  status    : {status}")
+    # status is EXECUTION truth only. The backend fuses it with the criterion
+    # verdict into experiment_status, which is what actually answers "did this
+    # experiment work?" — a SUCCEEDED job can be CRITERION_UNMEASURED.
+    experiment_status = j.get("experiment_status")
+    if experiment_status and experiment_status != status:
+        print(f"  result    : {experiment_status}")
+    outcome = j.get("outcome")
+    if outcome:
+        print(f"  outcome   : {outcome}")
+    criterion_status = j.get("criterion_status")
+    if criterion_status and criterion_status != "NOT_DECLARED":
+        print(f"  criterion : {criterion_status}")
     print(f"  title     : {j.get('task_title') or j.get('title') or '—'}")
     print(f"  type      : {j.get('task_type', '?')}")
     experiment = j.get("experiment")
@@ -5834,6 +6057,21 @@ def _render_compute_show(data: dict) -> None:
         deadline = j.get("wall_clock_deadline")
         if deadline:
             print(f"  deadline  : {deadline}")
+        wd_state = j.get("watchdog_state")
+        if wd_state:
+            timeout = j.get("no_progress_timeout_seconds")
+            t_str = f" (cut at {timeout}s no-progress)" if timeout else ""
+            if wd_state == "cutting":
+                reason = j.get("watchdog_cut_reason") or "no_progress"
+                print(f"  watchdog  : ⚠ CUTTING NOW — {reason}{t_str}")
+            elif wd_state == "protected":
+                last = j.get("last_progress_at")
+                last_str = f", last progress {last}" if last else ""
+                print(f"  watchdog  : protected{t_str}{last_str}")
+            else:
+                inert = j.get("watchdog_inert_reason")
+                inert_str = f" — {inert}" if inert else ""
+                print(f"  watchdog  : {wd_state}{inert_str}{t_str}")
     else:
         cost = j.get("final_cost_usd")
         if cost is not None:
@@ -6081,6 +6319,30 @@ def _detect_local_gpu() -> dict:
 
 _COMPUTE_STDERR_MAX_BYTES = 2048
 
+# ── `compute run` exit-code contract ─────────────────────────────────────────
+# `compute run` is meant to gate loops and CI, so its process exit code has to
+# distinguish the three outcomes an operator reacts to differently. Collapsing
+# them to 0 (the pre-fix behaviour) makes the verb unscriptable.
+_COMPUTE_EXIT_OK = 0                  # ran, measured, criterion MET (or none given)
+_COMPUTE_EXIT_COMMAND_FAILED = 1      # the experiment command itself exited non-zero
+_COMPUTE_EXIT_HARNESS_FAILED = 2      # nothing was measured: bad spec/env/result file
+_COMPUTE_EXIT_CRITERION_NOT_MET = 3   # measured cleanly, criterion evaluated NOT MET
+
+# Exit status the injected shell prologue uses to report that the Blueprint file
+# contract never reached the experiment shell. Distinct from any status the
+# harness itself returns so the reason can be classified exactly.
+_COMPUTE_CONTRACT_BREACH_EXIT = 97
+
+_COMPUTE_RUN_EXIT_CODE_HELP = """exit codes:
+  0  ran, measured, and the success criterion was MET (or none was given)
+  1  the experiment command itself exited non-zero
+  2  harness failure: nothing was measured -- bad spec, a broken environment
+     contract, or a missing/unparseable/metric-less result file. A run that
+     declared a metric or a criterion and did not capture it NEVER exits 0
+     and is NEVER reported SUCCEEDED.
+  3  measured cleanly, but the success criterion evaluated NOT MET
+"""
+
 
 def _compute_arm_failure_reason(
     exit_code: int | None,
@@ -6088,20 +6350,27 @@ def _compute_arm_failure_reason(
     *,
     result_missing: bool,
     metric_missing: bool,
+    subject: str = "arm",
 ) -> str:
+    if exit_code == _COMPUTE_CONTRACT_BREACH_EXIT:
+        return (
+            f"{subject} never received the Blueprint file contract "
+            "(BLUEPRINT_RESULT_FILE was empty or unwritable in the experiment shell); "
+            "see stderr for the exact breach"
+        )
     if exit_code == 124:
-        return "arm timed out (exit 124)"
+        return f"{subject} timed out (exit 124)"
     if result_missing:
         if exit_code is not None and exit_code != 0:
-            return f"arm crashed (exit {exit_code}): result file not written"
-        return "arm result file not written (arm may have failed)"
+            return f"{subject} crashed (exit {exit_code}): result file not written"
+        return f"{subject} result file not written ({subject} may have failed)"
     if metric_missing:
         metric_name = declared_metric or "<unknown>"
         if exit_code is not None and exit_code != 0:
-            return f"arm crashed (exit {exit_code}): metric '{metric_name}' not found in result"
+            return f"{subject} crashed (exit {exit_code}): metric '{metric_name}' not found in result"
         return f"unmeasured criterion: metric '{metric_name}' not found in result"
     if exit_code is not None and exit_code != 0:
-        return f"arm crashed (exit {exit_code})"
+        return f"{subject} crashed (exit {exit_code})"
     return "unknown failure"
 
 
@@ -6115,6 +6384,274 @@ def _read_arm_stderr_excerpt(path: str) -> str | None:
         return tail.decode(errors="replace").strip() or None
     except Exception:  # noqa: BLE001
         return None
+
+
+# ── local experiment shell resolution ────────────────────────────────────────
+# On Windows, ``subprocess.run(["bash", ...])`` is resolved by CreateProcess,
+# whose documented search order puts ``%SystemRoot%\System32`` AHEAD of PATH.
+# On any Windows host with the WSL optional component installed, the bare name
+# therefore launches ``System32\bash.exe`` — the WSL launcher — even though
+# ``shutil.which("bash")`` (PATH order only) reports Git Bash. The two disagree
+# deterministically, and WSL does not inherit the Windows environment block, so
+# BLUEPRINT_RESULT_FILE / BLUEPRINT_ARTIFACT_DIR / BLUEPRINT_LOCAL_GPU arrived
+# EMPTY in the child and the Windows result path was unwritable from Linux: the
+# run measured nothing while reporting SUCCEEDED. Resolve the interpreter
+# explicitly, translate the contract paths for WSL, and carry the contract in
+# the command string rather than trusting environment inheritance.
+
+_COMPUTE_SHELL_POSIX = "posix"
+_COMPUTE_SHELL_WSL = "wsl"
+
+
+class _ShellPlan(NamedTuple):
+    """How this host will launch the experiment shell."""
+
+    exe: str             # "bash" on POSIX; an absolute interpreter path on Windows
+    kind: str            # _COMPUTE_SHELL_POSIX | _COMPUTE_SHELL_WSL
+    label: str           # human-readable description for diagnostics
+
+    @property
+    def argv(self) -> list[str]:
+        """Argv prefix for an inline (``-lc``) program."""
+        return [self.exe, "-lc"]
+
+    @property
+    def is_wsl(self) -> bool:
+        return self.kind == _COMPUTE_SHELL_WSL
+
+
+def _windows_path_to_wsl(path: str) -> str:
+    """Translate a Windows path to the WSL ``/mnt/<drive>`` view of the same file.
+
+    Returns the input unchanged when it is not a drive-letter path (UNC shares
+    and already-POSIX paths) — the contract prologue then fails loudly in the
+    child rather than the run silently measuring nothing.
+    """
+    # ntpath, not os.path: this translates a WINDOWS path and must give the
+    # same answer on any host (the tests that pin it run on Linux CI too).
+    absolute = ntpath.normpath(path) if ntpath.isabs(path) else os.path.abspath(path)
+    normalized = absolute.replace("\\", "/")
+    match = re.match(r"^([A-Za-z]):/(.*)$", normalized)
+    if not match:
+        return normalized
+    drive, rest = match.group(1).lower(), match.group(2)
+    return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
+
+
+def _compute_resolve_shell(*, _name: str | None = None, _isfile=None, _which=None) -> _ShellPlan:
+    """Resolve the POSIX shell this host will actually launch, deterministically.
+
+    Never returns the bare name ``bash`` on Windows: the whole defect class is
+    that the bare name resolves differently from what ``shutil.which`` reports.
+    """
+    name = _name if _name is not None else os.name
+    isfile = _isfile or os.path.isfile
+    which = _which or shutil.which
+
+    if name != "nt":
+        return _ShellPlan("bash", _COMPUTE_SHELL_POSIX, "bash")
+
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    # ntpath.join: this is a Windows path even when the guard runs on Linux CI.
+    wsl_bash = ntpath.join(system_root, "System32", "bash.exe")
+    if isfile(wsl_bash):
+        # This is the binary CreateProcess would have picked for bare "bash".
+        # Name it explicitly and treat it as WSL so the contract is translated.
+        return _ShellPlan(wsl_bash, _COMPUTE_SHELL_WSL, f"WSL bash ({wsl_bash})")
+
+    resolved = which("bash")
+    if resolved:
+        return _ShellPlan(resolved, _COMPUTE_SHELL_POSIX, f"bash ({resolved})")
+    return _ShellPlan("bash", _COMPUTE_SHELL_POSIX, "bash (unresolved)")
+
+
+# Runs inside the experiment shell before the operator's command. Turns a
+# broken environment contract into an immediate, named failure with a distinct
+# exit status instead of a command that runs and measures nothing.
+_COMPUTE_CONTRACT_PROLOGUE = "\n".join(
+    [
+        '[ -n "${BLUEPRINT_RESULT_FILE:-}" ] || { printf "%s\\n" '
+        '"blueprint: BLUEPRINT_RESULT_FILE did not reach the experiment shell" >&2; '
+        f'exit {_COMPUTE_CONTRACT_BREACH_EXIT}; }}',
+        ': > "$BLUEPRINT_RESULT_FILE.bpprobe" 2>/dev/null || { printf "%s\\n" '
+        '"blueprint: cannot write the result file at $BLUEPRINT_RESULT_FILE from the experiment shell" >&2; '
+        f'exit {_COMPUTE_CONTRACT_BREACH_EXIT}; }}',
+        'rm -f "$BLUEPRINT_RESULT_FILE.bpprobe"',
+    ]
+)
+
+
+def _compute_shell_command(
+    plan: _ShellPlan,
+    command: str,
+    contract: dict[str, str],
+    *,
+    capture_environment: bool = True,
+) -> str:
+    """Build the shell program: contract exports (WSL only), guard, command, capture.
+
+    Under WSL the Windows environment block is not inherited, so the contract is
+    re-established with explicit ``export`` statements carrying ``/mnt``-
+    translated paths. Everywhere else the exports are unnecessary — ``execve``
+    carries ``env`` — but the guard still runs so a breach can never be silent.
+    """
+    lines: list[str] = []
+    if plan.is_wsl:
+        for key, value in contract.items():
+            if value is None:
+                continue
+            translated = (
+                _windows_path_to_wsl(value)
+                if key in ("BLUEPRINT_RESULT_FILE", "BLUEPRINT_ARTIFACT_DIR")
+                else value
+            )
+            lines.append(f"export {key}={shlex.quote(translated)}")
+    lines.append(_COMPUTE_CONTRACT_PROLOGUE)
+    if capture_environment:
+        # Runs INSIDE the experiment shell, so what it records is the
+        # environment that actually ran -- after setup_step, inside the
+        # container. Installed before the command so it still fires when the
+        # command exits the shell itself; see _COMPUTE_ENVIRONMENT_CAPTURE.
+        lines.append(_COMPUTE_ENVIRONMENT_CAPTURE)
+    lines.append(command)
+    return "\n".join(lines)
+
+
+def _compute_shell_invocation(
+    plan: _ShellPlan,
+    command: str,
+    contract: dict,
+    *,
+    script_path: str,
+) -> list[str]:
+    """Build the full argv that runs *command* under *plan*.
+
+    On POSIX the program is passed inline to ``bash -lc``. Under WSL it is NOT:
+    the ``System32\\bash.exe`` launcher hands its ``-c`` string to WSL through a
+    layer that expands ``$VAR`` ONE MORE TIME before bash ever parses it, so an
+    inline program loses every variable it sets — even inside single quotes
+    (``echo 'literal $HOME'`` prints the operator's home directory). Writing the
+    program to a real script file and executing that file removes the extra
+    expansion pass entirely, which is also what this repo's guidance on
+    generating one language from another prescribes.
+    """
+    program = _compute_shell_command(plan, command, contract)
+    if not plan.is_wsl:
+        return [*plan.argv, program]
+    with open(script_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(program + "\n")
+    return [plan.exe, "-l", _windows_path_to_wsl(script_path)]
+
+
+def _compute_arm_slug(name: str) -> str:
+    """Filesystem-safe per-arm token for result files and artifact directories."""
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", str(name)).strip("._-")
+    return slug or "arm"
+
+
+def _compute_run_exit_code(
+    *,
+    exit_code: int | None,
+    measurement_failed: bool,
+    verdict: dict | None,
+) -> int:
+    """Map a finished local run onto the documented `compute run` exit contract."""
+    if exit_code == _COMPUTE_CONTRACT_BREACH_EXIT:
+        return _COMPUTE_EXIT_HARNESS_FAILED
+    if exit_code is not None and exit_code != 0:
+        return _COMPUTE_EXIT_COMMAND_FAILED
+    if measurement_failed:
+        return _COMPUTE_EXIT_HARNESS_FAILED
+    if verdict:
+        if verdict.get("verdict") == "NOT MET":
+            return _COMPUTE_EXIT_CRITERION_NOT_MET
+        if verdict.get("verdict") != "MET":
+            return _COMPUTE_EXIT_HARNESS_FAILED
+    return _COMPUTE_EXIT_OK
+
+
+def _render_criterion_verdict(verdict: dict | None) -> None:
+    """Human render of a success-criterion verdict, shared by both run paths."""
+    if not verdict:
+        return
+    vstr = verdict["verdict"]
+    val = verdict.get("value")
+    op = verdict.get("operator")
+    thr = verdict.get("threshold")
+    mn = verdict.get("metric")
+    arm = verdict.get("arm")
+    suffix = f" [arm {arm}]" if arm else ""
+    if val is not None:
+        print(f"verdict     : {vstr}  ({mn}={val} {op} {thr}){suffix}")
+    else:
+        print(f"verdict     : {vstr}  ({mn} not evaluable){suffix}")
+
+
+def _run_capturing_stderr(argv: list[str], *, env=None, cwd=None, stderr_path: str):
+    """Run *argv* with stderr both streamed live and captured to *stderr_path*.
+
+    The arms path already captured stderr into a file so a failed arm could
+    report a ``stderr_excerpt``; the single-command path had no diagnostics at
+    all. Capturing through an ``os.pipe`` pumped by a reader thread gives the
+    single-command path the same excerpt WITHOUT taking away the live stderr an
+    operator watching a training loop depends on (logging and tqdm both write
+    there). ``subprocess.run`` is kept as the launcher so the call site stays
+    interchangeable with the rest of this module.
+    """
+    read_fd, write_fd = os.pipe()
+
+    def _pump() -> None:
+        try:
+            with os.fdopen(read_fd, "rb", closefd=True) as reader:
+                for line in reader:
+                    try:
+                        sink.write(line)
+                    except Exception:  # noqa: BLE001 — never let capture kill the run
+                        pass
+                    try:
+                        sys.stderr.buffer.write(line)
+                        sys.stderr.flush()
+                    except Exception:  # noqa: BLE001 — a closed/replaced stderr is not fatal
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    with open(stderr_path, "wb") as sink:
+        pump = threading.Thread(target=_pump, daemon=True)
+        pump.start()
+        try:
+            proc = subprocess.run(argv, env=env, cwd=cwd, stderr=write_fd)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(write_fd)
+            pump.join(timeout=10)
+    return proc
+
+
+def _evaluate_criterion_across_arms(arm_metrics_by_name: dict, criterion: dict) -> dict:
+    """Evaluate one success criterion over every arm of a local sweep.
+
+    A sweep asks "does any arm clear the bar", so the overall verdict is MET
+    when at least one arm meets it. Per-arm verdicts are kept under ``arms`` so
+    a NOT MET sweep still shows which arm came closest to being evaluable.
+    """
+    per_arm = {
+        name: _evaluate_criterion(metrics, criterion)
+        for name, metrics in arm_metrics_by_name.items()
+    }
+    met = [name for name, v in per_arm.items() if v.get("met")]
+    evaluable = [name for name, v in per_arm.items() if v.get("verdict") in ("MET", "NOT MET")]
+    if met:
+        chosen, verdict = met[0], "MET"
+    elif evaluable:
+        chosen, verdict = evaluable[0], "NOT MET"
+    else:
+        chosen, verdict = None, "NOT EVALUABLE"
+    base = dict(per_arm[chosen]) if chosen else dict(_evaluate_criterion(None, criterion))
+    base["verdict"] = verdict
+    base["arm"] = chosen
+    base["arms"] = per_arm
+    return base
 
 
 def _compute_docker_login(auth: dict, *, _subprocess_run=None) -> bool:
@@ -6155,12 +6692,467 @@ def _compute_docker_login(auth: dict, *, _subprocess_run=None) -> bool:
         return False
 
 
-def _compute_run_local(args: argparse.Namespace) -> None:
+# ── local environment contract: images, spec fields, realised environment ────
+# The gaps this block closes all share one shape: the local path QUIETLY did
+# something other than what the spec said.
+#
+#   * ``docker pull`` ran unconditionally and a failed pull was fatal, so an
+#     image BUILT ON THIS MACHINE -- the ordinary way to get a clean, pinned
+#     environment onto your own hardware -- could never be used: a tag that
+#     exists in no registry can never be pulled.
+#   * ``setup_step`` is part of the compute-experiment payload and the local
+#     path dropped it on the floor, so a run whose dependencies came from the
+#     setup step measured nothing and blamed the command.
+#   * nothing recorded what actually ran, so a finished run could not be
+#     reproduced from what was written down.
+_COMPUTE_PULL_POLICIES = ("missing", "always", "never")
+_COMPUTE_DOCKER_INSPECT_TIMEOUT = 20
+
+# Written by the experiment shell ITSELF (see _COMPUTE_ENVIRONMENT_CAPTURE) so
+# the capture reflects the environment AFTER setup_step ran, not a pristine
+# second container that never saw it.
+_COMPUTE_PACKAGES_FILENAME = "blueprint_python_packages.txt"
+_COMPUTE_ENVIRONMENT_FILENAME = "blueprint_environment.json"
+_COMPUTE_MAX_RECORDED_PACKAGES = 4000
+
+# Installed as an EXIT trap BEFORE the command rather than appended after it.
+# An experiment command that ends in `exit 1` -- or that any `set -e` aborts --
+# terminates the shell on the spot, so an appended epilogue would simply never
+# run and the environment of exactly the runs you most want to explain would go
+# unrecorded. The trap fires on every exit path.
+#
+# $? is captured on the first line of the handler and returned on the last, so
+# the recording can never change the status the experiment reported.
+_COMPUTE_ENVIRONMENT_CAPTURE = "\n".join(
+    [
+        "__bp_capture_environment() {",
+        "  __bp_status=$?",
+        '  if [ -n "${BLUEPRINT_ARTIFACT_DIR:-}" ]; then',
+        '    mkdir -p "$BLUEPRINT_ARTIFACT_DIR" 2>/dev/null',
+        "    { python3 -m pip freeze || python -m pip freeze || pip freeze; } "
+        '> "$BLUEPRINT_ARTIFACT_DIR/' + _COMPUTE_PACKAGES_FILENAME + '" 2>/dev/null',
+        "  fi",
+        "  return $__bp_status",
+        "}",
+        "trap __bp_capture_environment EXIT",
+    ]
+)
+
+# Spec fields the LOCAL path reads.
+_COMPUTE_LOCAL_SPEC_HONOURED = frozenset({
+    "command", "arms", "declared_metric", "success_criterion", "setup_step",
+    "container_image", "container_registry_auth", "env", "cwd", "repo_clone",
+})
+
+# Cloud ComputeExperimentPayload fields that describe how the PLATFORM
+# provisions, bills, or annotates a run. A local run provisions nothing, so
+# they cannot apply -- but every one of them is NAMED on the way past rather
+# than dropped in silence.
+_COMPUTE_LOCAL_SPEC_CLOUD_ONLY = frozenset({
+    "accelerator", "backend_name", "benchmark", "container_image_digest_pinned",
+    "deadline_seconds", "experiment", "hypothesis", "live_proof",
+    "live_proof_marker", "machine_type", "metric", "no_progress_timeout_seconds",
+    "provisioning_model", "repo_token", "require_durable_artifact",
+    "spend_cap_usd", "sweep_id",
+})
+
+# Fields that change WHAT IS MEASURED or WHAT CODE RUNS. Ignoring one of these
+# yields a confidently wrong answer, so the local run refuses BY NAME instead
+# of quietly running a different experiment.
+_COMPUTE_LOCAL_SPEC_UNSUPPORTED = {
+    "success_criteria": (
+        "declares measurements this local runner does not evaluate; pass the "
+        "one criterion as 'success_criterion' instead"
+    ),
+    "input_artifact_job_id": (
+        "rehydrates a prior cloud job's artifact bundle, which a local run "
+        "cannot fetch; the command would start from an empty workspace"
+    ),
+}
+
+
+def _compute_spec_field_report(spec: dict) -> "tuple[list[str], list[str]]":
+    """Split spec keys into (refuse, report-and-continue).
+
+    Nothing falls through unnamed: a key is either honoured, fatal, or
+    reported.
+    """
+    fatal: list[str] = []
+    ignored: list[str] = []
+    for key in spec:
+        if key in _COMPUTE_LOCAL_SPEC_HONOURED:
+            continue
+        if key in _COMPUTE_LOCAL_SPEC_UNSUPPORTED:
+            fatal.append(str(key))
+        else:
+            ignored.append(str(key))
+    return sorted(fatal), sorted(ignored)
+
+
+def _compute_spec_ignored_warning(key: str) -> str:
+    if key in _COMPUTE_LOCAL_SPEC_CLOUD_ONLY:
+        return (
+            f"warning: spec field {key!r} configures a CLOUD launch and has no "
+            f"effect on a local run"
+        )
+    return (
+        f"warning: spec field {key!r} is not read by `blueprint compute run` "
+        f"and was ignored"
+    )
+
+
+def _compute_fold_setup_step(command: str, setup_step: "str | None") -> str:
+    """Run *setup_step* before *command*, in the SAME shell and boundary.
+
+    Matches ``local_runner._run_compute_job``: brace groups joined by ``&&`` so
+    a failed setup aborts before the command and surfaces the setup's exit
+    code, and so an ``export`` or a ``cd`` in the setup step is visible to the
+    command.
+    """
+    if not setup_step:
+        return command
+    return "{\n" + setup_step + "\n} && {\n" + command + "\n}"
+
+
+def _compute_image_repo_name(image: str) -> str:
+    """Strip tag and digest from an image reference, leaving the repository."""
+    ref = image.split("@", 1)[0]
+    head, sep, tail = ref.rpartition(":")
+    # A tag can never contain "/", so a colon after the last slash is a tag and
+    # a colon before one is a registry port.
+    if sep and "/" not in tail:
+        return head
+    return ref
+
+
+def _compute_inspect_local_image(image: str, *, _subprocess_run=None) -> "dict | None":
+    """Return the realised identity of *image* when it is already on this host.
+
+    ``None`` means "not usable from the local image store" -- including when
+    docker itself is absent -- so the caller falls through to the pull path and
+    reports docker's own error instead of a synthesized one.
+    """
+    _run = _subprocess_run if _subprocess_run is not None else subprocess.run
+    try:
+        proc = _run(
+            [
+                "docker", "image", "inspect", image,
+                "--format", "{{.Id}}|{{json .RepoDigests}}",
+            ],
+            capture_output=True, text=True,
+            timeout=_COMPUTE_DOCKER_INSPECT_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001 -- no docker means "not present", not a crash
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    # getattr, not proc.stdout: a caller may hand this a stub result object,
+    # and "could not read the image identity" is a fallthrough, not a crash.
+    lines = [ln for ln in (getattr(proc, "stdout", "") or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    image_id, _, raw_digests = lines[0].strip().partition("|")
+    try:
+        repo_digests = json.loads(raw_digests) if raw_digests else []
+    except ValueError:
+        repo_digests = []
+    if not isinstance(repo_digests, list):
+        repo_digests = []
+    return {
+        "id": image_id or None,
+        "repo_digests": [d for d in repo_digests if isinstance(d, str)],
+    }
+
+
+def _compute_realised_image_digest(image: str, identity: dict) -> "str | None":
+    """The digest that makes this exact image re-runnable.
+
+    A repo digest (``repo@sha256:...``) is preferred because another host can
+    pull it. The local image id is the fallback for an image that was built
+    here and pushed nowhere -- still worth recording, because it pins what ran.
+    """
+    repo = _compute_image_repo_name(image)
+    digests = identity.get("repo_digests") or []
+    for digest in digests:
+        if digest.split("@", 1)[0] == repo:
+            return digest
+    if digests:
+        return digests[0]
+    return identity.get("id")
+
+
+def _compute_resolve_image(
+    image: str,
+    *,
+    policy: str = "missing",
+    registry_auth: "dict | None" = None,
+    quiet: bool = False,
+    _subprocess_run=None,
+    _inspect=None,
+    _login=None,
+) -> dict:
+    """Make *image* runnable on this host and describe what was resolved.
+
+    THE FIX: a local image is preferred when it is already here, a pull happens
+    only when one is needed, and a failed pull is fatal ONLY when there is no
+    usable image. ``docker pull`` of a locally built tag fails by definition --
+    it exists in no registry -- and that used to end the run.
+
+    ``error`` in the returned block means "no usable image", and the caller
+    must treat it as a harness failure. Everything else in the block is
+    recorded in the run result so the run can be reproduced from what was
+    written down.
+    """
+    _run = _subprocess_run if _subprocess_run is not None else subprocess.run
+    inspect = _inspect if _inspect is not None else _compute_inspect_local_image
+    login = _login if _login is not None else _compute_docker_login
+
+    block: dict = {
+        "reference": image,
+        "pull_policy": policy,
+        # The cloud payload's ``container_image_digest_pinned`` is a claim
+        # about the REFERENCE. It fails open to a mutable tag, which is why the
+        # realised digest below is recorded regardless of what it says.
+        "digest_pinned_reference": "@sha256:" in image,
+    }
+    local = inspect(image, _subprocess_run=_run)
+
+    if policy == "never":
+        if local is None:
+            block["error"] = (
+                f"image {image!r} is not in this host's docker image store and "
+                f"--pull never forbids fetching it"
+            )
+            return block
+        block["source"] = "local"
+    elif policy == "always" or local is None:
+        if registry_auth and registry_auth.get("password"):
+            if not login(registry_auth):
+                block["error"] = f"docker login failed for image {image!r}"
+                return block
+        if not quiet:
+            print(f"docker pull : {image}")
+        pull_rc = 1
+        try:
+            pull = _run(
+                ["docker", "pull", image],
+                stdout=subprocess.DEVNULL if quiet else None,
+            )
+            pull_rc = getattr(pull, "returncode", 1)
+        except Exception as exc:  # noqa: BLE001 -- docker absent/unreachable
+            block["pull_error"] = str(exc)
+        if pull_rc != 0:
+            if local is None:
+                block["error"] = (
+                    f"docker pull {image!r} failed (exit {pull_rc}) and no local "
+                    f"copy of the image exists to run instead"
+                )
+                return block
+            # A locally BUILT image is in no registry, so this pull failure is
+            # expected and harmless: the image that will run is already here.
+            block["pull_failed_exit_code"] = pull_rc
+            block["source"] = "local"
+            if not quiet:
+                print(
+                    f"docker pull : failed (exit {pull_rc}); running the local "
+                    f"image already present"
+                )
+        else:
+            block["source"] = "pulled"
+            local = inspect(image, _subprocess_run=_run)
+    else:
+        block["source"] = "local"
+        if not quiet:
+            print("docker pull : skipped (image already present on this host)")
+
+    identity = local or {}
+    block["image_id"] = identity.get("id")
+    block["repo_digests"] = identity.get("repo_digests") or []
+    block["digest"] = _compute_realised_image_digest(image, identity) if identity else None
+    digest = block.get("digest") or ""
+    block["reproduce_reference"] = digest if "@sha256:" in digest else (
+        block.get("image_id") or image
+    )
+    return block
+
+
+def _compute_git_repo_state(start_dir: str, *, _subprocess_run=None) -> dict:
+    """Describe the working tree a local ``repo_clone`` actually mounts.
+
+    Asks git whether it can read a repository rather than looking for a
+    ``.git`` DIRECTORY: in a linked worktree ``.git`` is a FILE, so an isdir
+    probe reports "not a repo" and skips silently.
+    """
+    _run = _subprocess_run if _subprocess_run is not None else subprocess.run
+
+    # Every call here is a local plumbing read (rev-parse / status) against a
+    # tree already on disk. 5s is ample, and it keeps this well inside the
+    # per-file budget the scripts lane grants the test that drives it -- a 20s
+    # step would be most of that budget for a question git answers in
+    # milliseconds.
+    _GIT_READ_TIMEOUT = 5
+
+    def _git(*a) -> "str | None":
+        try:
+            proc = _run(
+                ["git", "-C", start_dir, *a],
+                capture_output=True, text=True, timeout=_GIT_READ_TIMEOUT,
+            )
+        except Exception:  # noqa: BLE001 -- no git is "unknown", not a crash
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        return (proc.stdout or "").strip()
+
+    root = _git("rev-parse", "--show-toplevel")
+    state: dict = {
+        "root": root or os.path.abspath(start_dir),
+        "resolved_by": "git" if root else "cwd",
+        "commit": None,
+        "ref": None,
+        "dirty": None,
+    }
+    if root:
+        state["commit"] = _git("rev-parse", "HEAD")
+        state["ref"] = _git("rev-parse", "--abbrev-ref", "HEAD")
+        status = _git("status", "--porcelain")
+        state["dirty"] = bool(status) if status is not None else None
+    return state
+
+
+def _compute_repo_clone_warnings(declared: dict, state: dict) -> "list[str]":
+    """Name every way the mounted tree differs from what the spec declared.
+
+    The local path MOUNTS this checkout; it does not clone ``owner/repo@ref``
+    the way the cloud backend and the runner do. Saying so is the difference
+    between a reproducible record and a confident lie about which ref ran.
+    """
+    warnings: list[str] = []
+    commit = state.get("commit")
+    ref = state.get("ref")
+    declared_ref = str(declared.get("ref") or "").strip() or None
+    owner = str(declared.get("owner") or "").strip()
+    repo = str(declared.get("repo") or "").strip()
+    if owner or repo:
+        warnings.append(
+            f"warning: repo_clone names {owner or '?'}/{repo or '?'}, but a local "
+            f"run MOUNTS this checkout ({state.get('root')}) instead of cloning"
+        )
+    if (
+        declared_ref
+        and commit
+        and declared_ref not in (ref, commit)
+        and not commit.startswith(declared_ref)
+    ):
+        warnings.append(
+            f"warning: repo_clone declares ref {declared_ref!r} but the mounted "
+            f"tree is at {ref or '?'} ({(commit or '')[:12]})"
+        )
+    if state.get("dirty"):
+        warnings.append(
+            "warning: the mounted working tree has uncommitted changes, so the "
+            "recorded commit does not fully describe what ran"
+        )
+    if state.get("resolved_by") != "git":
+        warnings.append(
+            f"warning: {state.get('root')} is not a readable git repository; "
+            f"no commit was recorded for this run"
+        )
+    return warnings
+
+
+def _compute_read_python_packages(artifact_dir: str) -> "list[str] | None":
+    """Read the freeze the experiment shell wrote, in the environment that ran."""
+    path = os.path.join(artifact_dir, _COMPUTE_PACKAGES_FILENAME)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return None
+    return lines[:_COMPUTE_MAX_RECORDED_PACKAGES] or None
+
+
+def _compute_write_environment(artifact_dir: str, environment: dict) -> "str | None":
+    """Persist the realised environment next to the artifacts. Never fatal."""
+    path = os.path.join(artifact_dir, _COMPUTE_ENVIRONMENT_FILENAME)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(environment, fh, indent=2, sort_keys=True, default=str)
+    except OSError:
+        return None
+    return path
+
+
+def _compute_environment_block(
+    *,
+    shell_plan: "_ShellPlan",
+    gpu_info: dict,
+    image_block: "dict | None",
+    repo_state: "dict | None",
+    setup_step: "str | None",
+    spec_env: "dict[str, str] | None",
+    python_packages: "list[str] | None" = None,
+    python_packages_by_arm: "dict | None" = None,
+) -> dict:
+    """The REALISED environment: what actually ran, not what was requested.
+
+    ``container_image_digest_pinned`` in the cloud payload is a label on the
+    REFERENCE and fails open to a mutable tag whose layers can change between
+    runs. This block instead records the digest docker resolved, the commit of
+    the tree that was mounted, and the package set frozen inside the
+    environment AFTER setup_step -- enough to re-create the run from what was
+    written down.
+    """
+    return {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "host": {
+            "platform": sys.platform,
+            "python": sys.version.split()[0],
+            "shell": shell_plan.label,
+        },
+        "gpu": gpu_info,
+        "container_image": image_block,
+        "repo": repo_state,
+        "setup_step": setup_step,
+        # KEY NAMES ONLY. An env override routinely carries a token, and this
+        # block is written to disk and printed; the names are enough to explain
+        # the run without turning the record into a credential leak.
+        "env_override_keys": sorted(spec_env or {}),
+        "python_packages": python_packages,
+        "python_packages_by_arm": python_packages_by_arm,
+    }
+
+
+def _render_realised_environment(result: dict) -> None:
+    """Human render of the recorded environment, shared by both run paths."""
+    environment = result.get("environment") or {}
+    image = environment.get("container_image") or {}
+    if image.get("digest"):
+        print(f"image sha   : {image['digest']}")
+    repo = environment.get("repo") or {}
+    if repo.get("commit"):
+        dirty = "  (dirty working tree)" if repo.get("dirty") else ""
+        print(f"repo commit : {repo['commit'][:12]}{dirty}")
+    packages = environment.get("python_packages")
+    if packages:
+        print(f"packages    : {len(packages)} python packages recorded")
+    by_arm = environment.get("python_packages_by_arm") or {}
+    captured_arms = [name for name, pkgs in by_arm.items() if pkgs]
+    if captured_arms:
+        print(f"packages    : recorded for {len(captured_arms)} arm(s)")
+    if result.get("environment_file"):
+        print(f"environment : {result['environment_file']}")
+
+
+def _compute_run_local(args: argparse.Namespace) -> int:
     """Execute a compute_experiment command locally without the orchestrator.
 
     Sets BLUEPRINT_RESULT_FILE and BLUEPRINT_ARTIFACT_DIR so the command can
     emit metrics and artifacts via the standard file-contract, then reports the
     result inline.
+
+    Returns the documented `compute run` exit code (see _COMPUTE_EXIT_*). A run
+    that could not measure what it declared is never SUCCEEDED and never 0.
     """
     declared_metric: str | None = None
     success_criterion: dict | None = None
@@ -6170,6 +7162,16 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     spec_env: dict[str, str] | None = None
     spec_cwd: str | None = None
     spec_repo_clone: dict | None = None
+    setup_step: str | None = None
+    # Every spec field the local path does not act on is reported here and
+    # echoed into the result. A silently dropped field is how a run ends up
+    # measuring something other than what its author declared.
+    spec_warnings: list[str] = []
+
+    def _warn(message: str) -> None:
+        spec_warnings.append(message)
+        print(message, file=sys.stderr)
+
     if getattr(args, "local_spec", None):
         # --local <spec.json>: read spec file; validate_backend_name is bypassed
         # because we call subprocess.run directly (no DB-backed flow).
@@ -6180,19 +7182,32 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                 spec = json.load(f)
         except Exception as exc:  # noqa: BLE001
             print(f"error: could not read spec file {args.local_spec!r}: {exc}")
-            sys.exit(1)
+            sys.exit(_COMPUTE_EXIT_HARNESS_FAILED)
+        if not isinstance(spec, dict):
+            print("error: spec JSON must be a JSON object")
+            sys.exit(_COMPUTE_EXIT_HARNESS_FAILED)
+        fatal_fields, ignored_fields = _compute_spec_field_report(spec)
+        for key in fatal_fields:
+            print(
+                f"error: spec field {key!r} {_COMPUTE_LOCAL_SPEC_UNSUPPORTED[key]}",
+                file=sys.stderr,
+            )
+        if fatal_fields:
+            sys.exit(_COMPUTE_EXIT_HARNESS_FAILED)
+        for key in ignored_fields:
+            _warn(_compute_spec_ignored_warning(key))
         arms = spec.get("arms") or None
         command = spec.get("command")
         if not command and not arms:
             print("error: spec JSON must contain a 'command' field (or an 'arms' list)")
-            sys.exit(1)
+            sys.exit(_COMPUTE_EXIT_HARNESS_FAILED)
         declared_metric = spec.get("declared_metric")
         raw_sc = spec.get("success_criterion")
         if isinstance(raw_sc, dict):
             success_criterion = raw_sc
         elif raw_sc is not None:
             print("error: spec 'success_criterion' must be an object with metric/operator/threshold")
-            sys.exit(1)
+            sys.exit(_COMPUTE_EXIT_HARNESS_FAILED)
         container_image = spec.get("container_image") or None
         raw_auth = spec.get("container_registry_auth")
         if isinstance(raw_auth, dict):
@@ -6206,6 +7221,20 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         raw_repo_clone = spec.get("repo_clone")
         if isinstance(raw_repo_clone, dict):
             spec_repo_clone = raw_repo_clone
+        raw_setup = spec.get("setup_step")
+        if isinstance(raw_setup, str) and raw_setup.strip():
+            setup_step = raw_setup
+        elif raw_setup is not None:
+            print("error: spec 'setup_step' must be a non-empty shell command string")
+            sys.exit(_COMPUTE_EXIT_HARNESS_FAILED)
+        for i, raw_arm in enumerate(arms or []):
+            if not isinstance(raw_arm, dict):
+                continue
+            for key in sorted(set(raw_arm) - {"name", "command", "setup_step"}):
+                _warn(
+                    f"warning: arm {raw_arm.get('name', i)!r} field {key!r} is not "
+                    f"read by `blueprint compute run` and was ignored"
+                )
     else:
         command = args.run_command
         container_image = getattr(args, "container_image", None) or None
@@ -6220,7 +7249,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
 
     if command is None and not arms:
         print("error: provide a run command or --local <spec.json>")
-        sys.exit(1)
+        sys.exit(_COMPUTE_EXIT_HARNESS_FAILED)
 
     tmpdir = tempfile.mkdtemp(prefix="blueprint-compute-run-")
     artifact_dir = os.path.join(tmpdir, "artifacts")
@@ -6235,26 +7264,51 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     else:
         env["BLUEPRINT_LOCAL_GPU"] = "none"
 
+    # Resolve the experiment shell ONCE, explicitly. Never launch the bare name
+    # "bash" on Windows — see _compute_resolve_shell for why that silently lands
+    # in WSL with an empty environment block.
+    shell_plan = _compute_resolve_shell()
+
+    image_block: dict | None = None
     if container_image:
-        if container_registry_auth and isinstance(container_registry_auth, dict):
-            if container_registry_auth.get("password"):
-                if not _compute_docker_login(container_registry_auth):
-                    sys.exit(1)
-        if not _json_mode(args):
+        quiet = _json_mode(args)
+        if not quiet:
             print(f"image       : {container_image}")
-            print("docker pull : pulling...")
-        pull_result = subprocess.run(
-            ["docker", "pull", container_image],
-            stdout=subprocess.DEVNULL if _json_mode(args) else None,
+        image_block = _compute_resolve_image(
+            container_image,
+            policy=(getattr(args, "pull_policy", None) or "missing"),
+            registry_auth=container_registry_auth,
+            quiet=quiet,
         )
-        if pull_result.returncode != 0:
-            print(f"error: docker pull {container_image!r} failed (exit {pull_result.returncode})")
-            sys.exit(pull_result.returncode)
+        if image_block.get("error"):
+            print(f"error: {image_block['error']}", file=sys.stderr)
+            sys.exit(_COMPUTE_EXIT_HARNESS_FAILED)
+        if not quiet:
+            print(
+                f"digest      : {image_block.get('digest') or 'unknown'}  "
+                f"(source: {image_block.get('source')})"
+            )
+
+    # A local run MOUNTS this checkout for repo_clone rather than cloning
+    # owner/repo@ref. Resolve the real repository root -- not whatever the
+    # current directory happens to be -- and record which commit it was at.
+    repo_state: dict | None = None
+    repo_mount_root: str | None = None
+    if spec_repo_clone is not None:
+        repo_state = _compute_git_repo_state(os.path.abspath("."))
+        repo_mount_root = repo_state["root"]
+        for message in _compute_repo_clone_warnings(spec_repo_clone, repo_state):
+            _warn(message)
+    if setup_step and not _json_mode(args):
+        print(f"setup_step  : {setup_step}")
 
     if arms:
         arm_names = [a.get("name", f"arm_{i}") for i, a in enumerate(arms)]
         if not _json_mode(args):
             print(f"arms        : {arm_names}")
+            print(f"artifacts   : {artifact_dir}")
+            if setup_step:
+                print(f"setup_step  : {setup_step}")
             if gpu_info["detected"]:
                 print(f"gpu         : {env['BLUEPRINT_LOCAL_GPU']}")
             else:
@@ -6264,25 +7318,43 @@ def _compute_run_local(args: argparse.Namespace) -> None:
             print("running arms...")
 
         arm_results: dict[str, dict] = {}
+        arm_metrics_by_name: dict[str, dict | None] = {}
+        arm_python_packages: dict[str, list[str] | None] = {}
         overall_exit_code = 0
+        any_arm_failed = False
         for i, arm in enumerate(arms):
             arm_name = arm.get("name", f"arm_{i}")
-            arm_cmd = arm.get("command", "")
-            arm_result_file = os.path.join(tmpdir, f"result_{arm_name}.json")
-            arm_stderr_file = os.path.join(tmpdir, f"stderr_{arm_name}.txt")
+            arm_slug = _compute_arm_slug(arm_name)
+            arm_result_file = os.path.join(tmpdir, f"result_{arm_slug}.json")
+            arm_stderr_file = os.path.join(tmpdir, f"stderr_{arm_slug}.txt")
+            # Per-arm artifact directory: sharing one directory across arms let
+            # two arms writing the same filename silently clobber each other —
+            # the identical defect already fixed for per-arm result files.
+            arm_artifact_dir = os.path.join(artifact_dir, arm_slug)
+            os.makedirs(arm_artifact_dir, exist_ok=True)
+            # setup_step runs in the SAME shell and the SAME boundary as the
+            # command; the spec-level step runs before any arm-level one.
+            arm_cmd = _compute_fold_setup_step(
+                _compute_fold_setup_step(
+                    arm.get("command", ""), arm.get("setup_step")
+                ),
+                setup_step,
+            )
             arm_env = env.copy()
             arm_env["BLUEPRINT_RESULT_FILE"] = arm_result_file
+            arm_env["BLUEPRINT_ARTIFACT_DIR"] = arm_artifact_dir
 
             if not _json_mode(args):
                 print(f"  [{arm_name}] running...")
             with open(arm_stderr_file, "wb") as arm_stderr_fh:
                 if container_image:
-                    container_result = f"/tmp/blueprint_out/result_{arm_name}.json"
+                    container_result = f"/tmp/blueprint_out/result_{arm_slug}.json"
+                    container_artifacts = f"/tmp/blueprint_out/artifacts/{arm_slug}"
                     docker_arm_cmd = ["docker", "run", "--rm"]
                     if gpu_info["detected"]:
                         docker_arm_cmd += ["--gpus", "all"]
                     if spec_repo_clone:
-                        _repo_root = os.path.abspath(".")
+                        _repo_root = repo_mount_root or os.path.abspath(".")
                         docker_arm_cmd += ["-v", f"{_repo_root}:/workspace"]
                         docker_arm_cmd += ["-e", "PYTHONPATH=/workspace"]
                         docker_arm_cmd += ["-w", "/workspace"]
@@ -6293,17 +7365,37 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                     docker_arm_cmd += [
                         "-v", f"{tmpdir}:/tmp/blueprint_out",
                         "-e", f"BLUEPRINT_RESULT_FILE={container_result}",
-                        "-e", "BLUEPRINT_ARTIFACT_DIR=/tmp/blueprint_out/artifacts",
-                        container_image, "bash", "-lc", arm_cmd,
+                        "-e", f"BLUEPRINT_ARTIFACT_DIR={container_artifacts}",
+                        container_image, "bash", "-lc",
+                        _compute_shell_command(
+                            _ShellPlan("bash", _COMPUTE_SHELL_POSIX, "container bash"),
+                            arm_cmd,
+                            {},
+                        ),
                     ]
                     arm_proc = subprocess.run(docker_arm_cmd, stderr=arm_stderr_fh)
                 else:
                     arm_env.update(spec_env or {})
+                    arm_contract = {
+                        "BLUEPRINT_RESULT_FILE": arm_result_file,
+                        "BLUEPRINT_ARTIFACT_DIR": arm_artifact_dir,
+                        "BLUEPRINT_LOCAL_GPU": arm_env["BLUEPRINT_LOCAL_GPU"],
+                        **(spec_env or {}),
+                    }
                     arm_proc = subprocess.run(
-                        ["bash", "-lc", arm_cmd], env=arm_env, cwd=spec_cwd or None,
+                        _compute_shell_invocation(
+                            shell_plan, arm_cmd, arm_contract,
+                            script_path=os.path.join(tmpdir, f"run_{arm_slug}.sh"),
+                        ),
+                        env=arm_env, cwd=spec_cwd or None,
                         stderr=arm_stderr_fh,
                     )
             arm_exit_code = arm_proc.returncode
+            # Each arm may install its own dependencies, so the freeze is
+            # per-arm: one shared answer would describe at most one of them.
+            arm_python_packages[arm_name] = _compute_read_python_packages(
+                arm_artifact_dir
+            )
             if arm_exit_code != 0:
                 overall_exit_code = arm_exit_code
 
@@ -6318,6 +7410,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                     if not _json_mode(args):
                         print(f"  [{arm_name}] warning: could not parse result file: {exc}")
                     result_missing = True
+            arm_metrics_by_name[arm_name] = arm_metrics
 
             metric_missing = (
                 declared_metric is not None
@@ -6329,6 +7422,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
             # Build canonical per-arm entry
             is_failure = arm_exit_code != 0 or result_missing or metric_missing
             if is_failure:
+                any_arm_failed = True
                 reason = _compute_arm_failure_reason(
                     arm_exit_code,
                     declared_metric,
@@ -6347,11 +7441,31 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                 arm_entry["exit_code"] = arm_exit_code
                 arm_results[arm_name] = arm_entry
 
-        status = "SUCCEEDED" if overall_exit_code == 0 else "FAILED"
+        # A sweep whose arms exited 0 but measured nothing is not a success —
+        # that was the same silent-green defect the single-command path had.
+        status = "SUCCEEDED" if overall_exit_code == 0 and not any_arm_failed else "FAILED"
         metrics: dict | None = {"arms": arm_results}
+        # The arms path used to hardcode verdict=None, so a multi-arm sweep —
+        # the exact shape a real hypothesis test uses — could never produce a
+        # verdict locally. Reuse the single-command evaluator, per arm.
         verdict: dict | None = None
+        if success_criterion is not None:
+            verdict = _evaluate_criterion_across_arms(arm_metrics_by_name, success_criterion)
+        environment = _compute_environment_block(
+            shell_plan=shell_plan,
+            gpu_info=gpu_info,
+            image_block=image_block,
+            repo_state=repo_state,
+            setup_step=setup_step,
+            spec_env=spec_env,
+            python_packages_by_arm=arm_python_packages,
+        )
         result = {"status": status, "exit_code": overall_exit_code, "metrics": metrics,
-                  "declared_metric": declared_metric, "verdict": verdict, "gpu": gpu_info}
+                  "declared_metric": declared_metric, "verdict": verdict, "gpu": gpu_info,
+                  "artifact_dir": artifact_dir,
+                  "environment": environment,
+                  "environment_file": _compute_write_environment(artifact_dir, environment),
+                  "spec_warnings": spec_warnings}
 
         def _render(r: dict) -> None:
             print(f"status      : {r['status']} (exit_code={r['exit_code']})")
@@ -6376,16 +7490,28 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                         print(f"  [{aname}] {ametrics}")
             else:
                 print("metrics     : (none emitted)")
+            _render_criterion_verdict(r.get("verdict"))
+            _render_realised_environment(r)
 
         _emit(args, result, _render)
-        return
+        return _compute_run_exit_code(
+            exit_code=overall_exit_code,
+            measurement_failed=any_arm_failed,
+            verdict=verdict,
+        )
 
     result_file = os.path.join(tmpdir, "result.json")
     env["BLUEPRINT_RESULT_FILE"] = result_file
 
+    stderr_file = os.path.join(tmpdir, "stderr.txt")
+
+    effective_command = _compute_fold_setup_step(command, setup_step)
+
     if not _json_mode(args):
         print(f"command     : {command}")
         print(f"result_file : {result_file}")
+        print(f"artifacts   : {artifact_dir}")
+        print(f"shell       : {shell_plan.label}")
         if gpu_info["detected"]:
             print(f"gpu         : {env['BLUEPRINT_LOCAL_GPU']}")
         else:
@@ -6403,7 +7529,7 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         if gpu_info["detected"]:
             docker_single_cmd += ["--gpus", "all"]
         if spec_repo_clone:
-            _repo_root = os.path.abspath(".")
+            _repo_root = repo_mount_root or os.path.abspath(".")
             docker_single_cmd += ["-v", f"{_repo_root}:/workspace"]
             docker_single_cmd += ["-e", "PYTHONPATH=/workspace"]
             docker_single_cmd += ["-w", "/workspace"]
@@ -6415,30 +7541,94 @@ def _compute_run_local(args: argparse.Namespace) -> None:
             "-v", f"{tmpdir}:/tmp/blueprint_out",
             "-e", "BLUEPRINT_RESULT_FILE=/tmp/blueprint_out/result.json",
             "-e", "BLUEPRINT_ARTIFACT_DIR=/tmp/blueprint_out/artifacts",
-            container_image, "bash", "-lc", command,
+            container_image, "bash", "-lc",
+            _compute_shell_command(
+                _ShellPlan("bash", _COMPUTE_SHELL_POSIX, "container bash"),
+                effective_command,
+                {},
+            ),
         ]
-        proc = subprocess.run(docker_single_cmd)
+        proc = _run_capturing_stderr(docker_single_cmd, stderr_path=stderr_file)
         result_file = os.path.join(tmpdir, "result.json")
     else:
         env.update(spec_env or {})
-        proc = subprocess.run(["bash", "-lc", command], env=env, cwd=spec_cwd or None)
+        contract = {
+            "BLUEPRINT_RESULT_FILE": result_file,
+            "BLUEPRINT_ARTIFACT_DIR": artifact_dir,
+            "BLUEPRINT_LOCAL_GPU": env["BLUEPRINT_LOCAL_GPU"],
+            **(spec_env or {}),
+        }
+        proc = _run_capturing_stderr(
+            _compute_shell_invocation(
+                shell_plan, effective_command, contract,
+                script_path=os.path.join(tmpdir, "run.sh"),
+            ),
+            env=env, cwd=spec_cwd or None, stderr_path=stderr_file,
+        )
     exit_code = proc.returncode
-    status = "SUCCEEDED" if exit_code == 0 else "FAILED"
 
     metrics = None
-    if os.path.exists(result_file):
+    result_missing = not os.path.exists(result_file)
+    if not result_missing:
         try:
             with open(result_file) as f:
                 metrics = json.load(f)
         except Exception as exc:  # noqa: BLE001
             print(f"  warning: could not parse result file: {exc}")
+            result_missing = True
+    if metrics is not None and not isinstance(metrics, dict):
+        # A result file that is not a flat JSON object cannot carry a metric.
+        metrics = None
+        result_missing = True
 
     verdict = None
     if success_criterion is not None:
         verdict = _evaluate_criterion(metrics, success_criterion)
 
+    metric_missing = (
+        declared_metric is not None
+        and (metrics is None or _find_metric_case_insensitive(metrics, declared_metric) is None)
+    )
+    # THE INVARIANT: a run that declared something to measure and did not
+    # capture it is a FAILURE with a reason, on every platform. Reporting
+    # SUCCEEDED here is what let a Windows/WSL run that structurally could not
+    # write its result file be announced as a success with "(none emitted)".
+    measurement_expected = declared_metric is not None or success_criterion is not None
+    measurement_failed = measurement_expected and (
+        result_missing
+        or metric_missing
+        or (verdict is not None and verdict.get("verdict") == "NOT EVALUABLE")
+    )
+    status = "SUCCEEDED" if exit_code == 0 and not measurement_failed else "FAILED"
+
+    environment = _compute_environment_block(
+        shell_plan=shell_plan,
+        gpu_info=gpu_info,
+        image_block=image_block,
+        repo_state=repo_state,
+        setup_step=setup_step,
+        spec_env=spec_env,
+        python_packages=_compute_read_python_packages(artifact_dir),
+    )
     result = {"status": status, "exit_code": exit_code, "metrics": metrics,
-              "declared_metric": declared_metric, "verdict": verdict, "gpu": gpu_info}
+              "declared_metric": declared_metric, "verdict": verdict, "gpu": gpu_info,
+              "artifact_dir": artifact_dir,
+              "environment": environment,
+              "environment_file": _compute_write_environment(artifact_dir, environment),
+              "spec_warnings": spec_warnings}
+    if status == "FAILED":
+        # Match the arms path's diagnostics: a classified reason plus the tail
+        # of stderr, instead of a bare "FAILED, exit_code=1".
+        result["error"] = _compute_arm_failure_reason(
+            exit_code,
+            declared_metric,
+            result_missing=result_missing and measurement_expected,
+            metric_missing=metric_missing,
+            subject="command",
+        )
+        excerpt = _read_arm_stderr_excerpt(stderr_file)
+        if excerpt:
+            result["stderr_excerpt"] = excerpt
 
     def _render(r: dict) -> None:
         print(f"status      : {r['status']} (exit_code={r['exit_code']})")
@@ -6447,26 +7637,28 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         if m:
             print(f"metrics     : {m}")
             if dm:
-                val = m.get(dm)
+                val = _find_metric_case_insensitive(m, dm)
                 if val is not None:
                     print(f"  {dm} (declared) : {val}")
                 else:
                     print(f"  {dm} (declared) : NOT CAPTURED")
         else:
             print("metrics     : (none emitted)")
-        v = r.get("verdict")
-        if v:
-            vstr = v["verdict"]
-            val = v.get("value")
-            op = v.get("operator")
-            thr = v.get("threshold")
-            mn = v.get("metric")
-            if val is not None:
-                print(f"verdict     : {vstr}  ({mn}={val} {op} {thr})")
-            else:
-                print(f"verdict     : {vstr}  ({mn} not evaluable)")
+        err = r.get("error")
+        if err:
+            print(f"error       : {err}")
+            excerpt = r.get("stderr_excerpt")
+            if excerpt:
+                print(f"stderr      : {excerpt[:400]}")
+        _render_criterion_verdict(r.get("verdict"))
+        _render_realised_environment(r)
 
     _emit(args, result, _render)
+    return _compute_run_exit_code(
+        exit_code=exit_code,
+        measurement_failed=measurement_failed,
+        verdict=verdict,
+    )
 
 
 # No-repo substrate probe command (inlined from launch_compute_experiment.py).
@@ -7572,6 +8764,12 @@ def build_parser() -> argparse.ArgumentParser:
     analytics_sub.add_parser("failing-types", parents=[common],
                              help="Task types currently gated by high failure rate.")
 
+    p_analytics_kills = analytics_sub.add_parser(
+        "platform-kills", parents=[common],
+        help="Platform-killed tasks per day, by class, with the unclassified share.")
+    p_analytics_kills.add_argument("--days", type=int, default=7,
+                                   help="Window in days (default 7).")
+
     # vision
     p_vision = sub.add_parser("vision", parents=[common],
                               help="Show product vision and design document.")
@@ -7733,17 +8931,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a compute_experiment command locally (no orchestrator, no DB, no GCP).",
         description="Execute a compute_experiment command locally on this machine. "
                     "Sets BLUEPRINT_RESULT_FILE and BLUEPRINT_ARTIFACT_DIR so the command "
-                    "can emit metrics via the standard file contract, then reports the result.")
+                    "can emit metrics via the standard file contract, then reports the result. "
+                    "Requires no Blueprint API config, credential, or network access.",
+        epilog=_COMPUTE_RUN_EXIT_CODE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p_compute_run.add_argument(
         "run_command", nargs="?", default=None,
         help="Bash command string to execute. "
              "Write a flat JSON object of {metric: value} to $BLUEPRINT_RESULT_FILE to report metrics.")
     p_compute_run.add_argument(
         "--local", dest="local_spec", metavar="SPEC_JSON",
-        help="Path to a spec JSON file. The JSON must contain 'command' (str), and "
-             "optionally 'declared_metric' (str) and 'success_criterion' (object with "
-             "metric/operator/threshold). Runs the command locally without the orchestrator."
+        help="Path to a spec JSON file. The JSON must contain 'command' (str) or "
+             "'arms' (list), and optionally 'declared_metric' (str), "
+             "'success_criterion' (metric/operator/threshold), 'setup_step' (shell "
+             "run before the command in the same shell), 'container_image', 'env', "
+             "'cwd', and 'repo_clone' (mounts this checkout at /workspace). Any "
+             "other field is reported by name, never dropped in silence. "
+             "See docs/COMPUTE_RUN_LOCAL.md."
     )
+    p_compute_run.add_argument(
+        "--pull", dest="pull_policy", choices=_COMPUTE_PULL_POLICIES, default="missing",
+        help="When to docker pull --image. 'missing' (default) runs an image that is "
+             "already on this host and pulls only when there is none, which is what "
+             "makes a LOCALLY BUILT image usable; 'always' refreshes a mutable tag "
+             "first; 'never' fails rather than reaching the network.")
     p_compute_run.add_argument(
         "--image", dest="container_image", default=None, metavar="IMAGE_URI",
         help="Container image URI to run the command inside "
@@ -9216,8 +10427,18 @@ def main(argv: list | None = None) -> int:
         # ServiceCredentials are machine principals, not ambient admin keys.
         # Fence the complete CLI before project resolution or handler dispatch so
         # a denied command cannot reach subprocess, Docker, gcloud, git, SSH, or
-        # even an unintended API route.
+        # even an unintended API route. This runs BEFORE the local-only fast path
+        # below: a local verb still performs host work, so "needs no credential"
+        # must not mean "escapes the fence". The fence is a no-op when no scoped
+        # credential is selected, including when no config resolves at all.
         _enforce_scoped_cli_command(args)
+        if _is_local_only_cli_command(args):
+            # `compute run` is documented as "no orchestrator, no DB, no GCP".
+            # Skip project/task-id resolution — every one of those paths calls
+            # load_config()/api(), which is why a local run died on a missing
+            # Blueprint config it never needed.
+            local_result = handler(args)
+            return local_result if isinstance(local_result, int) else 0
         # Resolve --project <name> to an id once, up front, so every
         # get_project_id(args.project_id) call site targets it. An explicit
         # --project-id wins if both are supplied.

@@ -28,6 +28,7 @@ from app.digest_metrics import (
     compute_migration_slot_contention_summary,
     _MIGRATION_SLOT_HOLD_ALERT_SECONDS,
     compute_narrative_summary,
+    compute_review_cap_exhaustion_summary,
     compute_outer_loop_convergence,
     compute_lane_waste_diagnostics,
     compute_dependency_health_signals,
@@ -3288,8 +3289,8 @@ class TestDigestMetricsModuleSeams:
 # ── Lane-waste convergence evidence ────────────────────────────────────────
 
 
-def test_lane_waste_reports_retarget_rereview_scope_and_converged_review_counts():
-    """Lane waste distinguishes stale re-review scope and counts only merged chains."""
+def test_lane_waste_reports_retarget_scope_and_exact_convergence_stats():
+    """Lane waste keeps exact merged-chain stats without serializing raw samples."""
     window_start = _utcnow() - timedelta(days=1)
     direction_id = "direction-retargeted"
 
@@ -3331,6 +3332,10 @@ def test_lane_waste_reports_retarget_rereview_scope_and_converged_review_counts(
                 "pr_number": 901,
                 "iteration": 3,
                 "retarget_scope": "full",
+                "head_drift_retargeted_from": {
+                    "pr_number": 900,
+                    "head_sha": "a" * 40,
+                },
             },
         },
     )
@@ -3362,9 +3367,12 @@ def test_lane_waste_reports_retarget_rereview_scope_and_converged_review_counts(
         window_start,
     )
 
+    # ``stale_head_discard_count`` is driven by the ``_review_stale_head``
+    # marker, independently of the ``retarget_scope`` field that feeds
+    # ``retarget_review_scope_counts`` — this task carries both.
     assert result["stale_head_discard_count"] == 1
     assert result["retarget_review_scope_counts"] == {"delta": 1, "full": 2}
-    assert result["converged_review_counts"] == [2]
+    assert "converged_review_counts" not in result
     assert result["reviews_to_converge"] == {"count": 1, "median": 2, "p95": 2}
 
     merged_chain = next(
@@ -3374,6 +3382,282 @@ def test_lane_waste_reports_retarget_rereview_scope_and_converged_review_counts(
     assert merged_chain["review_count"] == 2
     assert merged_chain["reviews_to_converge"] == 2
     assert merged_chain["task_count"] == 3
+
+
+def test_lane_waste_splits_reviews_to_converge_by_supersede_and_counts_cap_lost_directions():
+    """Supersedes stay one chain, while cap loss counts each attributed direction once."""
+    window_start = _utcnow() - timedelta(days=1)
+
+    def _chain(*, pr_numbers, outcome, direction_id=None, direction_text=None, rollup=False):
+        original_context = {"_is_rollup_review": True} if rollup else {}
+        if outcome == "merged":
+            original_context["pr_merged"] = True
+        if direction_id is not None:
+            original_context["direction_id"] = direction_id
+        if direction_text is not None:
+            original_context["direction_text"] = direction_text
+        original = make_task(status=TaskStatus.COMPLETED, context=original_context)
+        tasks = [original]
+        for index, pr_number in enumerate(pr_numbers, start=1):
+            is_terminal_cap = outcome == "cap_exhausted" and index == len(pr_numbers)
+            context = {
+                "review_loop": {
+                    "original_task_id": str(original.id),
+                    "pr_number": pr_number,
+                    "iteration": index,
+                }
+            }
+            if rollup:
+                context["rollup_pr_number"] = pr_number
+            if is_terminal_cap:
+                context["failure_detail"] = "review_cap_exhausted"
+            if direction_id is not None:
+                context["direction_id"] = direction_id
+            if direction_text is not None:
+                context["direction_text"] = direction_text
+            tasks.append(
+                make_task(
+                    status=TaskStatus.FAILED if is_terminal_cap else TaskStatus.COMPLETED,
+                    payloads=[{"type": "review", "pr_number": pr_number}],
+                    context=context,
+                )
+            )
+        return tasks
+
+    superseded = _chain(pr_numbers=["901", "902"], outcome="merged", rollup=True)
+    same_pr = _chain(pr_numbers=["903", "903"], outcome="merged")
+    same_pr[2].context["review_loop"]["head_drift_retargeted_from"] = {
+        "pr_number": 700,
+        "head_sha": "a" * 40,
+    }
+    cap_one = _chain(
+        pr_numbers=["904"],
+        outcome="cap_exhausted",
+        direction_id="d-shared",
+        direction_text="Shared cap direction",
+    )
+    cap_two = _chain(
+        pr_numbers=["905"],
+        outcome="cap_exhausted",
+        direction_id="d-shared",
+        direction_text="Shared cap direction",
+    )
+    cap_missing = _chain(pr_numbers=["906"], outcome="cap_exhausted")
+    control = _chain(pr_numbers=["907"], outcome="merged", rollup=True)
+
+    all_tasks = superseded + same_pr + cap_one + cap_two + cap_missing + control
+    result = compute_lane_waste_diagnostics(all_tasks, window_start)
+
+    assert result["supersede_affected_chain_count"] == 2
+    assert result["supersede_affected_reviews_to_converge"] == {
+        "count": 2,
+        "sample_count": 2,
+        "median": 2,
+        "p95": 2,
+    }
+    assert result["cap_exhausted_chain_count"] == 3
+    assert result["cap_exhausted_direction_count"] == 1
+    assert result["cap_exhausted_directions"] == [
+        {"direction_id": "d-shared", "direction_text": "Shared cap direction"}
+    ]
+    assert result["rollup_chain_count"] == 2
+    assert result["rollup_supersede_affected_chain_count"] == 1
+    assert result["rollup_supersede_unaffected_chain_count"] == 1
+    assert result["rollup_supersede_affected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 2,
+        "p95": 2,
+    }
+    assert result["rollup_supersede_unaffected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 1,
+        "p95": 1,
+    }
+    cap_summary = compute_review_cap_exhaustion_summary(
+        [task for task in all_tasks if task.status == TaskStatus.FAILED],
+        window_start=window_start,
+    )
+    assert cap_summary["distinct_direction_count"] == 1
+    superseded_row = next(
+        row for row in result["chains"] if row["pr_number"] == "901"
+    )
+    assert superseded_row["supersede_affected"] is True
+    assert superseded_row["review_loop_pr_numbers"] == ["901", "902"]
+    same_pr_row = next(row for row in result["chains"] if row["pr_number"] == "903")
+    assert same_pr_row["supersede_affected"] is True
+    assert same_pr_row["review_loop_pr_numbers"] == ["700", "903"]
+
+
+def test_lane_waste_retained_supersede_lineage_survives_window_boundary():
+    """A replacement that converges next version remains supersede-affected."""
+    window_start = _utcnow()
+    original = make_task(
+        status=TaskStatus.COMPLETED,
+        created_at=window_start - timedelta(days=1),
+        context={"pr_merged": True},
+    )
+    replacement_review = make_task(
+        status=TaskStatus.COMPLETED,
+        created_at=window_start + timedelta(minutes=1),
+        payloads=[{"type": "review", "pr_number": 902}],
+        context={
+            "review_loop": {
+                "original_task_id": str(original.id),
+                "pr_number": 902,
+                "iteration": 5,
+                "superseded_pr_numbers": ["901"],
+            }
+        },
+    )
+
+    result = compute_lane_waste_diagnostics(
+        [original, replacement_review], window_start
+    )
+
+    assert result["supersede_affected_chain_count"] == 1
+    assert result["supersede_affected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 1,
+        "p95": 1,
+    }
+    assert result["chains"][0]["review_loop_pr_numbers"] == ["901", "902"]
+
+
+def test_lane_waste_supersede_percentiles_include_all_affected_chains():
+    """Percentiles stay population metrics above the former 1,000-row cap."""
+    window_start = _utcnow() - timedelta(days=1)
+    tasks = []
+    for chain_number in range(1_060):
+        original = make_task(status=TaskStatus.COMPLETED, context={"pr_merged": True})
+        tasks.append(original)
+        review_count = 1 if chain_number < 1_000 else 10
+        tasks.extend(
+            make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "review", "pr_number": chain_number + 2_000}],
+                context={
+                    "review_loop": {
+                        "original_task_id": str(original.id),
+                        "pr_number": chain_number + 2_000,
+                        "iteration": iteration + 1,
+                        "superseded_pr_numbers": [str(chain_number + 1_000)],
+                    }
+                },
+            )
+            for iteration in range(review_count)
+        )
+
+    result = compute_lane_waste_diagnostics(tasks, window_start)
+
+    assert result["supersede_affected_reviews_to_converge"] == {
+        "count": 1_060,
+        "sample_count": 1_060,
+        "median": 1,
+        "p95": 10,
+    }
+
+
+def test_outer_loop_supersede_percentiles_include_all_affected_chains():
+    """Convergence percentiles must not truncate durable snapshot inputs."""
+    window_start = _utcnow() - timedelta(days=1)
+    tasks = []
+    for chain_number in range(1_060):
+        original = make_task(status=TaskStatus.COMPLETED, context={"pr_merged": True})
+        tasks.append(original)
+        review_count = 1 if chain_number < 1_000 else 10
+        tasks.extend(
+            make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "review", "pr_number": chain_number + 4_000}],
+                context={
+                    "review_loop": {
+                        "original_task_id": str(original.id),
+                        "pr_number": chain_number + 4_000,
+                        "iteration": iteration + 1,
+                        "superseded_pr_numbers": [str(chain_number + 3_000)],
+                    }
+                },
+            )
+            for iteration in range(review_count)
+        )
+
+    result = compute_outer_loop_convergence(
+        all_tasks=tasks, escalation_alerts=[], window_start=window_start
+    )
+
+    assert result["supersede_affected_reviews_to_converge"] == {
+        "count": 1_060,
+        "sample_count": 1_060,
+        "median": 1,
+        "p95": 10,
+    }
+
+
+def test_convergence_fold_emits_identical_arms_for_both_consumers():
+    """Both reducers use one fold for merged-only rollup convergence arms."""
+    window_start = _utcnow() - timedelta(days=1)
+
+    def _rollup_chain(pr_numbers, *, merged):
+        original_context = {"_is_rollup_review": True}
+        if merged:
+            original_context["pr_merged"] = True
+        original = make_task(status=TaskStatus.COMPLETED, context=original_context)
+        tasks = [original]
+        for iteration, pr_number in enumerate(pr_numbers, start=1):
+            tasks.append(
+                make_task(
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "review", "pr_number": pr_number}],
+                    context={
+                        "rollup_pr_number": pr_number,
+                        "review_loop": {
+                            "original_task_id": str(original.id),
+                            "pr_number": pr_number,
+                            "iteration": iteration,
+                        },
+                    },
+                )
+            )
+        return tasks
+
+    tasks = (
+        _rollup_chain([901, 902], merged=True)
+        + _rollup_chain([903], merged=True)
+        + _rollup_chain([904, 905], merged=False)
+    )
+    convergence = compute_outer_loop_convergence(
+        all_tasks=tasks, escalation_alerts=[], window_start=window_start
+    )
+    lane_waste = compute_lane_waste_diagnostics(tasks, window_start)
+    arm_keys = (
+        "rollup_chain_count",
+        "rollup_supersede_affected_chain_count",
+        "rollup_supersede_unaffected_chain_count",
+        "rollup_supersede_affected_reviews_to_converge",
+        "rollup_supersede_unaffected_reviews_to_converge",
+    )
+
+    assert {key: convergence[key] for key in arm_keys} == {
+        key: lane_waste[key] for key in arm_keys
+    }
+    assert convergence["rollup_chain_count"] == 3
+    assert convergence["rollup_supersede_affected_chain_count"] == 2
+    assert convergence["rollup_supersede_unaffected_chain_count"] == 1
+    assert convergence["rollup_supersede_affected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 2,
+        "p95": 2,
+    }
+    assert convergence["rollup_supersede_unaffected_reviews_to_converge"] == {
+        "count": 1,
+        "sample_count": 1,
+        "median": 1,
+        "p95": 1,
+    }
 
 
 # ── Auto-pause epidemic summary ────────────────────────────────────────────

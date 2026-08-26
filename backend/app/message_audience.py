@@ -618,6 +618,7 @@ _WEBHOOK_EVENT_AUDIENCE: dict[str, str] = {
     "MERGE_UNVERIFIED": OPERATOR_ACTION_NEEDED,
     "SPEND_HOLD_CREATED": OPERATOR_ACTION_NEEDED,
     "SPEND_HOLD_EXPIRING": OPERATOR_ACTION_NEEDED,
+    "STRATEGIC_ENGINE_HALTED": OPERATOR_ACTION_NEEDED,
     # --- Runner-health fleet incidents — operator-actionable outages. ---
     "RUNNER_DEACTIVATED": OPERATOR_ACTION_NEEDED,
     "RUNNER_DEGRADED": OPERATOR_FYI,
@@ -670,6 +671,7 @@ _LOGICAL_EVENT_PAIRS: dict[str, str] = {
     "runner.degraded": "RUNNER_DEGRADED",
     "runner.low_disk": "RUNNER_LOW_DISK",
     "runner.low_memory": "RUNNER_LOW_MEMORY",
+    "research.strategic_cycle_liveness": "STRATEGIC_ENGINE_HALTED",
 }
 
 

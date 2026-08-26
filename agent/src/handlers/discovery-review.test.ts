@@ -217,6 +217,48 @@ describe('research outcome decision contract', () => {
     ).toBe(false);
   });
 
+  it('refuses to escalate a question the packet already authorises answering', () => {
+    // Direction d-1210b978 cycle 81ba8010 asked the operator for permission to
+    // re-dispatch a verification task it was already authorised to dispatch,
+    // and sat blocked for ~16 hours. ask_operator is for preference, authority,
+    // scope, and priority calls only -- never for acquiring evidence.
+    const askOperator = validAdvance({
+      action: 'ask_operator',
+      evidence_citations: [],
+      next_bet: null,
+      operator_question:
+        'Should we re-dispatch a direct verification task before grading?',
+    });
+    const bindingContext = {
+      ...validationContext,
+      bindingDecisionAllowed: true,
+      escalationRepairable: true,
+    };
+    const rejected = validateDiscoveryReviewShape(askOperator, bindingContext);
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.detail).toContain('ask_operator is not');
+    // The same packet still accepts every disposition the reviewer can execute.
+    expect(
+      validateDiscoveryReviewShape(validAdvance(), bindingContext),
+    ).toEqual({ ok: true });
+    // A second insistence is accepted, not failed: the server converts it into
+    // a bounded evidence bet, and failing here would strand the direction too.
+    expect(
+      validateDiscoveryReviewShape(askOperator, {
+        ...bindingContext,
+        escalationRepairable: false,
+      }),
+    ).toEqual({ ok: true });
+    // A packet that does not grant binding authority keeps ask_operator.
+    expect(
+      validateDiscoveryReviewShape(askOperator, {
+        ...bindingContext,
+        bindingDecisionAllowed: false,
+        requiredEvidenceOmitted: true,
+      }),
+    ).toEqual({ ok: true });
+  });
+
   it('requires exact cycle identity and forces it during normalization', () => {
     expect(
       validateDiscoveryReviewShape(
@@ -246,16 +288,35 @@ describe('packet-only decision prompt and handler', () => {
   });
 
   it('contains only the frozen decision packet and total action vocabulary', () => {
+    // This packet grants binding authority, so the vocabulary is exactly the
+    // dispositions the reviewer can execute itself.
     const prompt = buildDiscoveryReviewPrompt(payload());
     expect(prompt).toContain(EVIDENCE_ID);
     expect(prompt).toContain('only IDs allowed in evidence_citations');
-    expect(prompt).toContain('advance|park|stop|ask_operator');
+    expect(prompt).toContain('"action": "advance|park|stop"');
+    expect(prompt).not.toContain('advance|park|stop|ask_operator');
+    expect(prompt).toContain('`ask_operator` is NOT available for this packet');
     expect(prompt).toContain('There is no inconclusive or null action');
     expect(prompt).toContain('not inspect a repository');
     expect(prompt).not.toContain('a'.repeat(40));
     expect(prompt).not.toContain('confirmation_proposal');
     expect(prompt).not.toContain('recommended_phase');
     expect(prompt).not.toContain('recommended_limits');
+  });
+
+  it('offers ask_operator only when the packet withholds binding authority', () => {
+    const blocked = buildDiscoveryReviewPrompt(payload({
+      evidence_packet_manifest: {
+        required_evidence_omitted: true,
+        binding_decision_allowed: false,
+      },
+    }));
+    expect(blocked).toContain('"action": "advance|park|stop|ask_operator"');
+    expect(blocked).toContain('a real\n  human choice is needed');
+    expect(blocked).not.toContain('`ask_operator` is NOT available');
+    // An empty packet has no receipt to bind a decision to either.
+    const empty = buildDiscoveryReviewPrompt(payload({ evidence_packet: [] }));
+    expect(empty).toContain('"action": "advance|park|stop|ask_operator"');
   });
 
   it('bounds decision snapshots when the prompt helper is called directly', () => {

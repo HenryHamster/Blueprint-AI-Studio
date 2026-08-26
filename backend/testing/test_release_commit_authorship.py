@@ -393,10 +393,8 @@ async def test_bot_shaped_commit_requires_full_verified_github_identity(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_github_merge_committer_trusts_a_non_bot_authored_commit(monkeypatch):
-    """A GitHub PR-merge commit (committer=web-flow, verified) is trusted
-    regardless of the author identity — this is the fix under test: the
-    merge-committer branch must not be gated behind a bot-shaped author."""
+async def test_non_bot_github_author_identity_is_an_offender(monkeypatch):
+    """A bot-looking raw author is not enough when GitHub identifies a user."""
     from app import github
 
     base, head = "a" * 40, "b" * 40
@@ -414,15 +412,15 @@ async def test_github_merge_committer_trusts_a_non_bot_authored_commit(monkeypat
     report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
 
     assert report["state"] == "resolved"
-    assert report["count"] == 0
-    assert report["offenders"] == []
+    assert report["count"] == 1
+    assert report["offenders"] == [
+        {"sha": head[:12], "author": "blueprintagentorchestrator[bot]"}
+    ]
 
 
 @pytest.mark.asyncio
-async def test_human_authored_pr_merge_is_trusted_and_a_raw_push_still_counts(monkeypatch):
-    """Regression pin for the measured defect: a human-authored commit merged
-    through GitHub (committer=web-flow, verified) is trusted, while a raw
-    push by the same human (no PR-merge committer proof) still counts."""
+async def test_web_flow_committer_does_not_mask_operator_authorship(monkeypatch):
+    """A human author counts whether GitHub merged or directly committed it."""
     from app import github
 
     base, head_merged, head_raw = "a" * 40, "b" * 40, "c" * 40
@@ -457,8 +455,11 @@ async def test_human_authored_pr_merge_is_trusted_and_a_raw_push_still_counts(mo
     report = await count_non_bot_authored_commits(base, head_raw, session=object(), project=project)
 
     assert report["state"] == "resolved"
-    assert report["count"] == 1
-    assert report["offenders"] == [{"sha": head_raw[:12], "author": "Henry Hamster"}]
+    assert report["count"] == 2
+    assert report["offenders"] == [
+        {"sha": head_merged[:12], "author": "Henry Hamster"},
+        {"sha": head_raw[:12], "author": "Henry Hamster"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -489,9 +490,8 @@ async def test_github_merge_committer_without_valid_verification_still_counts(mo
 
 
 @pytest.mark.asyncio
-async def test_spoofed_display_author_with_unchanged_committer_still_counts(monkeypatch):
-    """A commit that spoofs only the display author/login while leaving the
-    committer fields as a raw (non-web-flow) push must still count."""
+async def test_human_committer_does_not_override_verified_bot_author(monkeypatch):
+    """A human committer cannot override a verified Blueprint author."""
     from app import github
 
     base, head = "a" * 40, "b" * 40
@@ -519,7 +519,8 @@ async def test_spoofed_display_author_with_unchanged_committer_still_counts(monk
     report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
 
     assert report["state"] == "resolved"
-    assert report["count"] == 1
+    assert report["count"] == 0
+    assert report["offenders"] == []
 
 
 @pytest.mark.asyncio
@@ -546,7 +547,7 @@ async def test_fully_verified_blueprint_bot_commit_is_not_an_offender(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_direct_blueprint_bot_committer_requires_immutable_top_level_identity(monkeypatch):
+async def test_direct_blueprint_bot_author_requires_immutable_top_level_identity(monkeypatch):
     from app import github
 
     base, head = "a" * 40, "b" * 40
@@ -578,7 +579,7 @@ async def test_direct_blueprint_bot_committer_requires_immutable_top_level_ident
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("committer", [None, {"login": "web-flow", "id": 1, "type": "User"}])
-async def test_merge_committer_null_or_wrong_id_is_not_trusted(monkeypatch, committer):
+async def test_bot_author_identity_is_not_gated_by_committer_identity(monkeypatch, committer):
     from app import github
 
     base, head = "a" * 40, "b" * 40
@@ -590,6 +591,7 @@ async def test_merge_committer_null_or_wrong_id_is_not_trusted(monkeypatch, comm
         verified=True,
     )
     commit["committer"] = committer
+    commit["commit"].pop("committer")
     project = Project(id="release-authorship-wrong-committer", github_owner="owner", github_repo="repo")
     monkeypatch.setattr("app.release_promotion._resolve_github_with_session", AsyncMock(return_value=("token", "owner", "repo")))
     monkeypatch.setattr(github, "_github_request", AsyncMock(return_value=_GitHubResponse(200, _compare(base, head, [commit]))))
@@ -597,12 +599,12 @@ async def test_merge_committer_null_or_wrong_id_is_not_trusted(monkeypatch, comm
     report = await count_non_bot_authored_commits(base, head, session=object(), project=project)
 
     assert report["state"] == "resolved"
-    assert report["count"] == 1
+    assert report["count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_bot_looking_author_with_human_committer_is_an_offender(monkeypatch):
-    """A human-signed commit cannot spoof the Blueprint App identity."""
+async def test_bot_looking_author_with_human_raw_author_is_an_offender(monkeypatch):
+    """A top-level bot identity cannot contradict the signed raw author."""
     from app import github
 
     base, head = "a" * 40, "b" * 40
@@ -614,6 +616,10 @@ async def test_bot_looking_author_with_human_committer_is_an_offender(monkeypatc
         verified=True,
     )
     spoof["commit"]["committer"] = {
+        "name": "Henry Hamster",
+        "email": "henry@example.com",
+    }
+    spoof["commit"]["author"] = {
         "name": "Henry Hamster",
         "email": "henry@example.com",
     }
@@ -635,7 +641,7 @@ async def test_bot_looking_author_with_human_committer_is_an_offender(monkeypatc
     assert report["state"] == "resolved"
     assert report["count"] == 1
     assert report["offenders"] == [
-        {"sha": head[:12], "author": "blueprintagentorchestrator[bot]"}
+        {"sha": head[:12], "author": "Henry Hamster"}
     ]
 
 

@@ -17,6 +17,10 @@ from app.digest_outer_loop import (
     _group_outer_loop_chains,
     _outer_loop_chain_observation,
     _outer_loop_pct,
+    _outer_loop_review_stats,
+    _new_rollup_convergence_fold,
+    _fold_rollup_convergence_arm,
+    _bounded_direction_records,
     _outer_loop_terminal_outcome,
     _scan_escalation_alerts,
 )
@@ -173,6 +177,11 @@ def compute_lane_waste_diagnostics(
     stale_head_discard_count = 0
     retarget_review_scope_counts = {"delta": 0, "full": 0}
     converged_review_counts: List[int] = []
+    supersede_affected_chain_count = 0
+    supersede_affected_merged_review_counts: List[int] = []
+    cap_exhausted_direction_ids: set[str] = set()
+    cap_exhausted_direction_records: Dict[str, Optional[str]] = {}
+    rollup_convergence = _new_rollup_convergence_fold()
     chain_rows: List[Dict[str, Any]] = []
 
     alert_reasons_by_chain = {}
@@ -218,8 +227,20 @@ def compute_lane_waste_diagnostics(
         cap_exhausted = outcome == "cap_exhausted"
         if cap_exhausted:
             cap_exhausted_chain_count += 1
+            if obs["direction_id"]:
+                cap_exhausted_direction_ids.add(obs["direction_id"])
+                cap_exhausted_direction_records.setdefault(
+                    obs["direction_id"], obs.get("direction_text")
+                )
         if obs["reviews_to_converge"] is not None:
             converged_review_counts.append(obs["reviews_to_converge"])
+        if obs["supersede_affected"]:
+            supersede_affected_chain_count += 1
+            if outcome == "merged" and obs["reviews_to_converge"] is not None:
+                supersede_affected_merged_review_counts.append(
+                    obs["reviews_to_converge"]
+                )
+        _fold_rollup_convergence_arm(rollup_convergence, obs)
 
         # Newest-first drilldown rows within the chain.
         task_rows.sort(key=lambda r: r["created_at"] or "", reverse=True)
@@ -228,6 +249,8 @@ def compute_lane_waste_diagnostics(
                 "chain_key": key,
                 "original_task_id": obs["original_task_id"],
                 "pr_number": obs["pr_number"],
+                "review_loop_pr_numbers": obs["review_loop_pr_numbers"],
+                "supersede_affected": obs["supersede_affected"],
                 "project_id": obs["project_id"],
                 "direction_id": obs["direction_id"],
                 "terminal_outcome": outcome,
@@ -260,9 +283,32 @@ def compute_lane_waste_diagnostics(
         "cap_excluded_task_count": waste_task_count - cap_counted_total,
         "chain_count": len(chains),
         "cap_exhausted_chain_count": cap_exhausted_chain_count,
+        "cap_exhausted_direction_count": len(cap_exhausted_direction_ids),
+        "cap_exhausted_directions": _bounded_direction_records(
+            cap_exhausted_direction_records
+        ),
+        "supersede_affected_chain_count": supersede_affected_chain_count,
+        "supersede_affected_reviews_to_converge": {
+            "count": len(supersede_affected_merged_review_counts),
+            "sample_count": len(supersede_affected_merged_review_counts),
+            "median": _outer_loop_pct(supersede_affected_merged_review_counts, 50),
+            "p95": _outer_loop_pct(supersede_affected_merged_review_counts, 95),
+        },
+        "rollup_chain_count": rollup_convergence["chain_count"],
+        "rollup_supersede_affected_chain_count": rollup_convergence[
+            "supersede_affected_chain_count"
+        ],
+        "rollup_supersede_unaffected_chain_count": rollup_convergence[
+            "supersede_unaffected_chain_count"
+        ],
+        "rollup_supersede_affected_reviews_to_converge": _outer_loop_review_stats(
+            rollup_convergence["supersede_affected_review_counts"]
+        ),
+        "rollup_supersede_unaffected_reviews_to_converge": _outer_loop_review_stats(
+            rollup_convergence["supersede_unaffected_review_counts"]
+        ),
         "stale_head_discard_count": stale_head_discard_count,
         "retarget_review_scope_counts": retarget_review_scope_counts,
-        "converged_review_counts": sorted(converged_review_counts),
         "reviews_to_converge": {
             "count": len(converged_review_counts),
             "median": _outer_loop_pct(converged_review_counts, 50),
@@ -308,9 +354,10 @@ def compute_lane_baseline_trend(
         threshold_rel: float | None = None,
         threshold_abs: float | None = None,
         lower_is_better: bool = True,
+        classify: bool = True,
     ) -> Dict[str, Any]:
         delta = (curr - prev) if (curr is not None and prev is not None) else None
-        if delta is None:
+        if delta is None or not classify:
             classification: str | None = None
         elif threshold_rel is not None:
             if prev == 0:
@@ -356,6 +403,10 @@ def compute_lane_baseline_trend(
             "prior": prev,
             "delta": delta,
             "classification": classification,
+            "availability": {
+                "latest": "available" if curr is not None else "unavailable",
+                "prior": "available" if prev is not None else "unavailable",
+            },
         }
 
     relay_curr = latest.get("relay_medians") or {}
@@ -398,12 +449,24 @@ def compute_lane_baseline_trend(
 
     waste_curr = (latest.get("lane_waste") or {}).get("waste_taxonomy") or {}
     waste_prev = (prior.get("lane_waste") or {}).get("waste_taxonomy") or {}
-    total_curr = (latest.get("lane_waste") or {}).get("waste_task_count") or 0
-    total_prev = (prior.get("lane_waste") or {}).get("waste_task_count") or 0
+    total_curr = (latest.get("lane_waste") or {}).get("waste_task_count")
+    total_prev = (prior.get("lane_waste") or {}).get("waste_task_count")
     waste_trend: Dict[str, Any] = {}
     for cat in LANE_WASTE_CATEGORIES:
-        share_curr = (waste_curr.get(cat, 0) / total_curr) if total_curr > 0 else None
-        share_prev = (waste_prev.get(cat, 0) / total_prev) if total_prev > 0 else None
+        share_curr = (
+            (waste_curr[cat] / total_curr)
+            if isinstance(total_curr, (int, float))
+            and total_curr > 0
+            and cat in waste_curr
+            else None
+        )
+        share_prev = (
+            (waste_prev[cat] / total_prev)
+            if isinstance(total_prev, (int, float))
+            and total_prev > 0
+            and cat in waste_prev
+            else None
+        )
         waste_trend[cat] = _block(
             share_curr,
             share_prev,
@@ -414,14 +477,38 @@ def compute_lane_baseline_trend(
     crw_curr = latest.get("checkpoint_recovery_waste") or {}
     crw_prev = prior.get("checkpoint_recovery_waste") or {}
     crw_trend = _block(
-        float(crw_curr.get("total", 0)),
-        float(crw_prev.get("total", 0)),
+        float(crw_curr["total"]) if "total" in crw_curr else None,
+        float(crw_prev["total"]) if "total" in crw_prev else None,
         threshold_abs=1.0,
         lower_is_better=True,
     )
 
     convergence_curr = latest.get("outer_loop_convergence") or {}
     convergence_prev = prior.get("outer_loop_convergence") or {}
+
+    def _direction_records(convergence: Dict[str, Any]) -> List[Dict[str, Optional[str]]]:
+        """Normalize persisted cap-loss records for the trend contract."""
+        records = convergence.get("cap_exhausted_directions")
+        if not isinstance(records, list):
+            return []
+        normalized: List[Dict[str, Optional[str]]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            direction_id = record.get("direction_id")
+            if not isinstance(direction_id, str) or not direction_id:
+                continue
+            direction_text = record.get("direction_text")
+            normalized.append(
+                {
+                    "direction_id": direction_id,
+                    "direction_text": (
+                        direction_text if isinstance(direction_text, str) else None
+                    ),
+                }
+            )
+        return normalized
+
     convergence_trend = {
         "iteration_median": _block(
             convergence_curr.get("iteration_median"),
@@ -447,9 +534,108 @@ def compute_lane_baseline_trend(
             threshold_abs=0.5,
             lower_is_better=True,
         ),
+        "cap_exhausted_direction_count": _block(
+            convergence_curr.get("cap_exhausted_direction_count"),
+            convergence_prev.get("cap_exhausted_direction_count"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "cap_exhausted_directions": {
+            "latest": _direction_records(convergence_curr),
+            "prior": _direction_records(convergence_prev),
+        },
+        "supersede_affected_reviews_to_converge_median": _block(
+            convergence_curr.get("supersede_affected_reviews_to_converge_median"),
+            convergence_prev.get("supersede_affected_reviews_to_converge_median"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "supersede_affected_reviews_to_converge_p95": _block(
+            convergence_curr.get("supersede_affected_reviews_to_converge_p95"),
+            convergence_prev.get("supersede_affected_reviews_to_converge_p95"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "rollup_supersede_affected_reviews_to_converge_median": _block(
+            convergence_curr.get("rollup_supersede_affected_reviews_to_converge_median"),
+            convergence_prev.get("rollup_supersede_affected_reviews_to_converge_median"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "rollup_supersede_affected_reviews_to_converge_p95": _block(
+            convergence_curr.get("rollup_supersede_affected_reviews_to_converge_p95"),
+            convergence_prev.get("rollup_supersede_affected_reviews_to_converge_p95"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "rollup_supersede_unaffected_reviews_to_converge_median": _block(
+            convergence_curr.get("rollup_supersede_unaffected_reviews_to_converge_median"),
+            convergence_prev.get("rollup_supersede_unaffected_reviews_to_converge_median"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+        "rollup_supersede_unaffected_reviews_to_converge_p95": _block(
+            convergence_curr.get("rollup_supersede_unaffected_reviews_to_converge_p95"),
+            convergence_prev.get("rollup_supersede_unaffected_reviews_to_converge_p95"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
     }
 
-    return {
+    lane_waste_curr = latest.get("lane_waste") or {}
+    lane_waste_prev = prior.get("lane_waste") or {}
+    reviews_curr = lane_waste_curr.get("reviews_to_converge") or {}
+    reviews_prev = lane_waste_prev.get("reviews_to_converge") or {}
+    scopes_curr = lane_waste_curr.get("retarget_review_scope_counts") or {}
+    scopes_prev = lane_waste_prev.get("retarget_review_scope_counts") or {}
+    retarget_convergence_trend = {
+        "reviews_to_converge": {
+            # Sample size, not cost: this is how many chains CONVERGED
+            # (merged) in the window. Fewer converged chains is a throughput
+            # drop, not an improvement, and more is not a regression, so this
+            # row carries the delta without a direction verdict.
+            "count": _block(
+                reviews_curr.get("count"),
+                reviews_prev.get("count"),
+                threshold_abs=0.5,
+                classify=False,
+            ),
+            "median": _block(
+                reviews_curr.get("median"),
+                reviews_prev.get("median"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+            "p95": _block(
+                reviews_curr.get("p95"),
+                reviews_prev.get("p95"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+        },
+        "retarget_review_scope_counts": {
+            "delta": _block(
+                scopes_curr.get("delta"),
+                scopes_prev.get("delta"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+            "full": _block(
+                scopes_curr.get("full"),
+                scopes_prev.get("full"),
+                threshold_abs=0.5,
+                lower_is_better=True,
+            ),
+        },
+        "stale_head_discard_count": _block(
+            lane_waste_curr.get("stale_head_discard_count"),
+            lane_waste_prev.get("stale_head_discard_count"),
+            threshold_abs=0.5,
+            lower_is_better=True,
+        ),
+    }
+
+    trend = {
         "latest_version": latest.get("version_number"),
         "prior_version": prior.get("version_number"),
         "relay_medians": relay_trend,
@@ -457,4 +643,50 @@ def compute_lane_baseline_trend(
         "waste_taxonomy_shares": waste_trend,
         "checkpoint_recovery_waste_total": crw_trend,
         "outer_loop_convergence": convergence_trend,
+        "retarget_convergence": retarget_convergence_trend,
     }
+
+    def _availability(
+        baseline: Dict[str, Any], path: str, value: Any
+    ) -> str:
+        """Classify a value without mistaking a real zero for missing data."""
+        dropped = baseline.get("dropped_fields") or []
+        if any(
+            isinstance(field, str)
+            and (path == field or path.startswith(f"{field}."))
+            for field in dropped
+        ):
+            return "evicted"
+        return "available" if value is not None else "unavailable"
+
+    def _set_availability(
+        block: Dict[str, Any], path: str
+    ) -> None:
+        block["availability"] = {
+            "latest": _availability(latest, path, block.get("latest")),
+            "prior": _availability(prior, path, block.get("prior")),
+        }
+
+    for key, block in relay_trend.items():
+        _set_availability(block, f"relay_medians.{key}")
+    for lane, lane_block in lane_iter_trend.items():
+        for percentile, block in lane_block.items():
+            _set_availability(
+                block, f"lane_iteration_distribution.{lane}.{percentile}_iterations"
+            )
+    for category, block in waste_trend.items():
+        _set_availability(block, f"lane_waste.waste_taxonomy.{category}")
+    _set_availability(crw_trend, "checkpoint_recovery_waste.total")
+    for key, block in convergence_trend.items():
+        if key != "cap_exhausted_directions" and isinstance(block, dict):
+            _set_availability(block, f"outer_loop_convergence.{key}")
+    for key, block in retarget_convergence_trend["reviews_to_converge"].items():
+        _set_availability(block, f"lane_waste.reviews_to_converge.{key}")
+    for key, block in retarget_convergence_trend["retarget_review_scope_counts"].items():
+        _set_availability(block, f"lane_waste.retarget_review_scope_counts.{key}")
+    _set_availability(
+        retarget_convergence_trend["stale_head_discard_count"],
+        "lane_waste.stale_head_discard_count",
+    )
+
+    return trend

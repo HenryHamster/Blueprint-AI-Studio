@@ -128,23 +128,140 @@ def test_websocket_emitter_inventory_entries_are_classified():
     assert "legacy_review_required" in classifications
 
 
+def _tree_drift(before: dict[str, str], app_dir: Path) -> list[str]:
+    """Re-read ``app_dir`` and report the paths that changed since ``before``.
+
+    Used only to attribute a mismatch. The disk-walk leg of the equivalence test
+    below reads the tree a second time, so a writer touching the checkout mid-run
+    (a concurrent ``git checkout``, an editor save, a parallel worktree sync) can
+    make the two legs disagree for reasons that have nothing to do with the
+    builder. Naming those paths turns a ~5000-line "the builder diverged" diff
+    into a one-line, correct diagnosis.
+    """
+    after = read_app_sources(app_dir)
+    changed = set(before) ^ set(after)
+    changed |= {key for key in set(before) & set(after) if before[key] != after[key]}
+    return sorted(changed)
+
+
 def test_build_from_sources_matches_disk_walk():
     """The content-injectable builder must never diverge from the disk walk.
 
     This is the safety property that lets an at-ref evaluator trust
     ``build_from_sources`` (fed git-tree blobs) to produce the same inventory the
-    disk-walking guard test produces from a checkout. Read the sources
-    independently (in arbitrary dict order) to prove the injectable path is
-    byte-identical AND order-independent, not merely reusing the same read.
+    disk-walking guard test produces from a checkout.
+
+    Three distinct claims, asserted separately so a failure says which one broke:
+
+    1. ``build_from_sources`` is order-independent -- decided against a SINGLE
+       read, so the claim is settled by the builder alone and cannot be muddied
+       by the tree changing between two reads.
+    2. ``read_app_sources`` enumerates in the same order ``build_from_sources``
+       sorts by, so read order and build order agree by construction.
+    3. The disk walk agrees with the injectable path. This leg necessarily reads
+       the tree a second time; if it disagrees, drift is ruled out explicitly
+       before the builder is blamed.
     """
-    disk = build_websocket_event_inventory(_app_dir())
-
-    # Independent read; reversed insertion order to exercise the internal sort.
     sources = read_app_sources(_app_dir())
-    shuffled = dict(reversed(list(sources.items())))
-    injectable = build_from_sources(shuffled)
+    baseline = build_from_sources(sources)
+    assert baseline, "Expected at least one websocket emitter under backend/app."
 
-    assert injectable == disk
+    # (1) Reversed insertion order must not move a single record. The builder
+    # sorts by the mapping key, which is unique per file, so that sort is total.
+    shuffled = dict(reversed(list(sources.items())))
+    assert build_from_sources(shuffled) == baseline, (
+        "build_from_sources is order-dependent: reversing the mapping's insertion "
+        "order changed the emitted records. Its sort key must be TOTAL, so that no "
+        "tie is ever broken by insertion order -- otherwise an at-ref evaluator "
+        "fed git-tree blobs computes a different inventory than this guard."
+    )
+
+    # (2) Read order == build order.
+    assert list(sources) == sorted(sources), (
+        "read_app_sources enumerated in a different order than build_from_sources "
+        "sorts by. Sort the walk by the emitted source_path key, not by Path."
+    )
+
+    # (3) Disk walk == injectable path.
+    disk = build_websocket_event_inventory(_app_dir())
+    if disk != baseline:
+        drift = _tree_drift(sources, _app_dir())
+        assert not drift, (
+            "backend/app changed on disk while this test ran, so the two reads saw "
+            "different trees. This is NOT a builder divergence -- re-run against a "
+            f"quiescent checkout. Paths that changed: {drift[:20]}\n"
+            + format_offender_marker(drift)
+        )
+        assert disk == baseline, (
+            "build_websocket_event_inventory diverged from build_from_sources over "
+            "the same, verified-unchanged sources."
+        )
+
+
+_SYNTHETIC_EMITTER_SOURCE = """from app.broadcast import broadcast_to_project
+
+
+async def handler(project_id):
+    await broadcast_to_project(project_id, "task_updated", {"task_id": 1})
+    await broadcast_to_project(project_id, "task_updated", {"task_id": 1})
+"""
+
+
+def test_source_path_sort_is_total_across_tree_shapes(tmp_path):
+    """Pin the total ordering: enumeration and build both key off ``source_path``.
+
+    ``build_from_sources`` sorts its string keys, which is a TOTAL order. The
+    tempting way to walk the disk -- ``sorted(app_dir.rglob("*.py"))`` -- is a
+    DIFFERENT order: on Python 3.11 (the CI interpreter) ``PurePath`` compares
+    component lists, so ``app/routers/agent.py`` sorts before ``app/routers.py``
+    while the string keys sort the other way round (``.`` < ``/``). Today's
+    ``backend/app`` happens to contain no ``X/`` + ``X.py`` pair, which is the
+    only reason the two orders have ever agreed; an unremarkable new module would
+    split them.
+
+    So this builds that adversarial shape explicitly and pins the emitted order.
+    Narrowing the key -- sorting by ``Path``, by stem, by directory-then-file --
+    fails here loudly instead of silently reordering the real inventory later.
+    """
+    app_dir = tmp_path / "backend" / "app"
+    for relative in (
+        "routers.py",
+        "routers/agent.py",
+        "sub.py",
+        "sub/x.py",
+        "__pycache__/ignored.py",
+    ):
+        target = app_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_SYNTHETIC_EMITTER_SOURCE, encoding="utf-8")
+
+    expected_keys = [
+        "backend/app/routers.py",
+        "backend/app/routers/agent.py",
+        "backend/app/sub.py",
+        "backend/app/sub/x.py",
+    ]
+
+    sources = read_app_sources(app_dir)
+    assert list(sources) == expected_keys, (
+        "read_app_sources enumerated in the wrong order. It must order by the "
+        "emitted source_path key (the same key build_from_sources sorts by), not "
+        f"by Path. Got: {list(sources)}"
+    )
+    assert sorted(sources) == expected_keys
+    assert "backend/app/__pycache__/ignored.py" not in sources
+
+    records = build_from_sources(sources)
+    assert [record["source_path"] for record in records] == [
+        key for key in expected_keys for _ in range(2)
+    ], "Emitted record order does not follow the total source_path order."
+    assert [record["occurrence"] for record in records] == [1, 2] * len(expected_keys), (
+        "Repeated identical call sites must be numbered per file, in file order."
+    )
+
+    # The two public entry points agree on this shape, in both insertion orders.
+    assert build_websocket_event_inventory(app_dir) == records
+    assert build_from_sources(dict(reversed(list(sources.items())))) == records
 
 
 def test_regen_round_trip_snapshot_matches_source(tmp_path):
@@ -193,4 +310,39 @@ def test_regen_preserves_lineno_for_unchanged_signature():
     rebuilt = build_fixture(app_dir, existing=stale)
     assert rebuilt["emitters"][0]["lineno"] == 987654, (
         "Line number was rewritten despite an unchanged signature (churn)."
+    )
+
+
+def test_disk_walk_mismatch_is_attributed_to_tree_drift(tmp_path):
+    """A tree that changes between reads must be named as drift, not as divergence.
+
+    The disk-walk equivalence check above reads ``backend/app`` twice. A writer
+    touching the checkout in between (a concurrent ``git checkout``, an editor
+    save, a parallel worktree sync) makes the two reads disagree for reasons that
+    have nothing to do with the builder -- and because ``inventory_signature``
+    drops ``lineno``, a pure line-shift slips past the snapshot gate while
+    breaking full-record equality. That is exactly the confusing shape this
+    attribution exists to name, so pin it.
+    """
+    app_dir = tmp_path / "backend" / "app"
+    app_dir.mkdir(parents=True)
+    target = app_dir / "dispatch.py"
+    target.write_text(_SYNTHETIC_EMITTER_SOURCE, encoding="utf-8")
+
+    before = read_app_sources(app_dir)
+    baseline = build_from_sources(before)
+    assert _tree_drift(before, app_dir) == [], "A quiescent tree must report no drift."
+
+    # A pure line shift: same emitters, same signatures, different line numbers.
+    target.write_text("# inserted\n" + _SYNTHETIC_EMITTER_SOURCE, encoding="utf-8")
+
+    shifted = build_websocket_event_inventory(app_dir)
+    assert shifted != baseline, "Expected the line shift to move the records."
+    assert [inventory_signature(record) for record in shifted] == [
+        inventory_signature(record) for record in baseline
+    ], "A line shift must leave the signatures -- and so the snapshot gate -- intact."
+
+    assert _tree_drift(before, app_dir) == ["backend/app/dispatch.py"], (
+        "Tree drift must be attributed to the changed path, so a mid-run edit is "
+        "not misreported as a builder divergence."
     )

@@ -23,7 +23,10 @@ from app.auth import get_current_user, require_admin
 from app.database import get_session, resolve_dialect_name
 from app.field_encryption import decrypt_field, encrypt_field
 from app.digest_cache import DigestCache, get_digest_cache
-from app.digest_precompute import annotate_precompute_metadata
+from app.digest_precompute import (
+    annotate_precompute_metadata,
+    payload_age_seconds,
+)
 from app.models import (
     Alert,
     AlertSeverity,
@@ -39,6 +42,7 @@ from app.models import (
 from app.providers.registry import get_provider
 from app.rate_limit_cooldown import cooldown_seconds_for_info
 from app.shared_state import limiter
+from app.time_utils import utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -246,15 +250,7 @@ def _annotate_response_freshness(
     additive; the existing ``accounts`` / ``rows`` payload is untouched.
     """
     generated_at = result.get("generated_at") if isinstance(result, dict) else None
-    age_seconds: float | None = None
-    if generated_at:
-        try:
-            age_seconds = max(
-                0.0,
-                (_utcnow() - datetime.fromisoformat(generated_at)).total_seconds(),
-            )
-        except (ValueError, TypeError):
-            age_seconds = None
+    age_seconds = payload_age_seconds(generated_at)
     annotated = annotate_precompute_metadata(
         result,
         precomputed=False,
@@ -284,7 +280,11 @@ def _invalidate_pool_account_digests(cache: DigestCache, user_id: str) -> None:
 
 
 def _iso_or_none(value: Any) -> str | None:
-    return value.isoformat() if hasattr(value, "isoformat") else None
+    if isinstance(value, datetime):
+        return utc_iso(value)
+    # Callers also pass already-serialized strings and plain dates out of
+    # persisted JSON blobs; those carry no zone to normalize.
+    return value.isoformat() if hasattr(value, "isoformat") else None  # utc-iso-ok: non-datetime (date) value -- no zone applies
 
 
 def _serialize_disabled_models(raw: Any) -> dict[str, dict[str, Any]]:
@@ -595,7 +595,7 @@ async def get_max_plan_accounts(
     return {
         "accounts": accounts,
         "total": total,
-        "generated_at": _utcnow().isoformat(),
+        "generated_at": utc_iso(_utcnow()),
     }
 
 
@@ -783,7 +783,7 @@ async def _compute_account_health_summary(
             }
         )
 
-    return {"accounts": accounts, "generated_at": now.isoformat()}
+    return {"accounts": accounts, "generated_at": utc_iso(now)}
 
 
 @router.get("/max-plan-accounts/provider-model-breakdown")
@@ -817,7 +817,7 @@ async def get_provider_model_breakdown(
     user_acct_id_strs = [str(aid) for aid in user_acct_ids]
     if not user_acct_id_strs:
         return _annotate_response_freshness(
-            {"rows": [], "generated_at": _utcnow().isoformat()}, served_stale=False
+            {"rows": [], "generated_at": utc_iso(_utcnow())}, served_stale=False
         )
 
     cache_key = (
@@ -851,7 +851,7 @@ async def _compute_provider_model_breakdown(
     rows = await compute_provider_model_breakdown(
         session, account_ids, expand_accounts=expand_accounts, project_id=project_id
     )
-    return {"rows": rows, "generated_at": _utcnow().isoformat()}
+    return {"rows": rows, "generated_at": utc_iso(_utcnow())}
 
 
 @router.get("/pool-accounts/project-usage")
@@ -887,7 +887,7 @@ async def get_project_pool_usage(
         "accounts_at_cap": accounts_at_cap,
         "total_accounts": len(accounts),
         "accounts": accounts,
-        "generated_at": _utcnow().isoformat(),
+        "generated_at": utc_iso(_utcnow()),
     }
 
 
@@ -909,7 +909,7 @@ async def get_project_pool_summary(
     projects = await get_user_project_pool_summary(user_id, session)
     return {
         "projects": projects,
-        "generated_at": _utcnow().isoformat(),
+        "generated_at": utc_iso(_utcnow()),
     }
 
 
@@ -1018,7 +1018,7 @@ async def add_max_plan_account(
         "enabled": db_account.enabled,
         "active_tasks": 0,
         "total_tasks": db_account.total_tasks,
-        "token_created_at": now.isoformat(),
+        "token_created_at": now.isoformat(),  # utc-iso-ok: in-memory pool cache entry, not a wire field
         "daily_task_cap": db_account.daily_task_cap,
         "max_concurrent_tasks": db_account.max_concurrent_tasks,
         "auto_disable_after_rate_limits": db_account.auto_disable_after_rate_limits,
@@ -1382,7 +1382,7 @@ async def update_max_plan_account(
                     normalized_secret,
                 )
                 mem_account["token_created_at"] = (
-                    db_account.token_created_at.isoformat()
+                    db_account.token_created_at.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     if db_account.token_created_at
                     else None
                 )
@@ -1571,7 +1571,7 @@ async def reset_account_rate_limits(
         # Keep a durable generation tombstone. A failure observed before this
         # click but persisted later by another pod must not resurrect the local
         # cooldown; genuinely later failures carry a newer event timestamp.
-        db_account.rate_limit_state = {"cooldown_reset_at": reset_at.isoformat()}
+        db_account.rate_limit_state = {"cooldown_reset_at": reset_at.isoformat()}  # utc-iso-ok: persisted JSON round-trip compared via datetime.fromisoformat; an offset here would break that comparison
         if blueprint_cooldown_disable:
             db_account.enabled = True
             db_account.disabled_reason = None

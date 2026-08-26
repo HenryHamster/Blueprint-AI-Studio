@@ -137,7 +137,7 @@ const {
     'recordToolResultBytes',
     'recordToolUse',
     'refreshRuntimeState',
-    'registerSizeCapMergeDriver',
+    'registerDerivedArtifactMergeDrivers',
     'replayLogBufferRateLimited',
     'requiredProviderConfigFiles',
     'resetFormatComplianceTelemetry',
@@ -4305,6 +4305,12 @@ describe('handleResearch — structured findings completion contract', () => {
     ['a coercible array success operator', {
       success_criterion: { metric: 'latency_ms', operator: ['>='], threshold: 10 },
     }],
+    ['an explicit metric-kind criterion with no metric', {
+      success_criterion: { kind: 'metric', operator: '>=', threshold: 10 },
+    }],
+    ['an unknown success criterion kind', {
+      success_criterion: { kind: 'vibes', operator: '>=', threshold: 10 },
+    }],
     ['a literal escaped newline command', { command: "python -c '\\nprint(1)'" }],
     ['a trailing-newline environment key', { env: { 'GOOD\n': 'value' } }],
     ['a coercible no-progress timeout', { no_progress_timeout_seconds: '30' }],
@@ -4346,6 +4352,58 @@ describe('handleResearch — structured findings completion contract', () => {
     const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(posted.status).toBe('FAILED');
     expect(posted.failure_category).toBe('research_output_invalid');
+  });
+
+  it.each([
+    ['a singular artifact_produced criterion', {
+      success_criterion: { kind: 'artifact_produced', min_file_count: 2 },
+    }],
+    ['a singular artifact_produced criterion with no file count', {
+      success_criterion: { kind: 'artifact_produced' },
+    }],
+    ['a plural artifact_produced criterion', {
+      success_criteria: [{ kind: 'artifact_produced', min_file_count: 1 }],
+    }],
+    ['no success criterion at all', {}],
+  ])('accepts a compute finding whose result is its output: %s', async (_caseName, launchOverride) => {
+    // The runtime has always evaluated kind="artifact_produced" (rewritten to
+    // durable_file_count >= min_file_count), and the plural branch has always
+    // accepted it -- but the SINGULAR branch demanded a metric, and singular is
+    // the form every authoring prompt teaches. The artifact goal was therefore
+    // unreachable through the only door authors are shown, which is why the
+    // corpus is full of metrics that merely restate delivery.
+    const valid = JSON.stringify([{
+      type: 'compute_experiment',
+      title: 'train the baseline policy',
+      prompt: 'Run the bounded training loop and keep the checkpoints.',
+      actionability_grade: 'HIGH',
+      work_class: 'confirmatory',
+      stop_or_pivot_condition: 'Stop when the checkpoints are written.',
+      compute_experiment: {
+        command: 'python3 -m testing.train_baseline',
+        spend_cap_usd: 2,
+        deadline_seconds: 300,
+        smoke_sample: {
+          exit_code: 0,
+          startup_ok: true,
+          metric_captured: true,
+          timed_out: false,
+          error_excerpt: '',
+        },
+        ...launchOverride,
+      },
+    }]);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: valid,
+      lastResultText: valid,
+    });
+
+    await handleResearch(TASK_ID, PAYLOAD, TASK, 'token', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const posted = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(posted.status).toBe('COMPLETED');
   });
 
   it('accepts the launch_contract alias when compute_experiment is empty', async () => {
@@ -5131,7 +5189,13 @@ describe('normalizePlanSubtaskTypes', () => {
 // RESEARCH_PROMPT_BYTE_CEILING: measured 25 505 bytes on first landing; set
 // to 31 000 (≈21% headroom) for the same reason.
 const PLAN_PROMPT_BYTE_CEILING = 19_600;
-const RESEARCH_PROMPT_BYTE_CEILING = 31_000;
+// Bumped 31_000 -> 32_000 when the compute_experiment schema doc gained the
+// $BLUEPRINT_PROGRESS_FILE heartbeat rule and the $BLUEPRINT_PYTHON contract.
+// Baseline before that change was 30_877 bytes, i.e. only 123 bytes of
+// headroom remained, so any correction to this doc had to move the ratchet.
+// The added text is ~908 bytes and closes a defect that silently KILLED long
+// compute jobs (watchdog reads the progress file's mtime, not declared_metric).
+const RESEARCH_PROMPT_BYTE_CEILING = 32_000;
 
 describe('research/plan prompt byte-budget ratchet', () => {
   const RB_TASK_ID = 'rb-task-001';

@@ -246,6 +246,92 @@ NO_PROGRESS_TIMEOUT = "no_progress_timeout"
 # command.  Keeping it adjacent to the canonical failure class prevents backend
 # emitters and the completion taxonomy from drifting apart.
 NO_PROGRESS_TIMEOUT_TERMINAL_REASON = NO_PROGRESS_TIMEOUT
+
+# ── Shell-level environment exit codes ─────────────────────────────────────────
+# POSIX reserves two exit statuses for the SHELL's own verdict on whether the
+# command could be run at all. A command body can never choose them: a Python
+# traceback exits 1, pytest exits 1-5, a SIGKILL surfaces as 137. So observing
+# one of these is direct evidence that the execution ENVIRONMENT did not have
+# what the command needed -- no interpreter on PATH, a binary that is not
+# executable, a noexec mount, a wrong-arch shim. That is a provisioning fault,
+# not a defect in the experiment's algorithm.
+#
+# Why this matters: every compute backend used to launder its failure into the
+# prose string "compute job failed" / "local subprocess exited with code N",
+# which classify_compute_terminal_reason substring-matches against nothing and
+# therefore returned CODE_ERROR -- the class reserved for a genuine work defect.
+# Exit 127 ("no working pip found", "python3: command not found") is the single
+# commonest bootstrap death on self-hosted runners, and every one of them burned
+# the owning task's retry budget and blamed the experiment's author, producing
+# rounds of hand-patching retries instead of one platform fix.
+ENVIRONMENT_EXIT_CODES: dict[int, str] = {
+    126: "command found but not executable",
+    127: "command not found",
+}
+# Exact sentinel the compute backends prefix onto a terminal reason when they
+# observe an environment exit code. classify_compute_terminal_reason keys on
+# this constant BEFORE its generic substring rules, so emitter and classifier
+# share one source of truth and cannot silently drift the way the 125 /
+# no_progress_timeout pair nearly did. The word "provisioning" is also present so
+# the generic rule below (and any not-yet-deployed reader) still routes it
+# correctly during a rolling deploy.
+ENVIRONMENT_FAILURE_TERMINAL_REASON = "environment provisioning failed"
+
+
+def is_environment_exit_code(exit_code: object) -> bool:
+    """True when ``exit_code`` is a shell-reserved environment-failure status.
+
+    ``bool`` is an ``int`` subclass, so a stray ``True`` must not read as 1.
+    """
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return False
+    return exit_code in ENVIRONMENT_EXIT_CODES
+
+
+def environment_failure_terminal_reason(
+    exit_code: int, existing_reason: str | None = None
+) -> str:
+    """Build the terminal reason a backend records for an environment exit code.
+
+    The substrate's own reason (when it carries anything beyond the generic
+    default) is appended after the sentinel so the reclassification discards no
+    diagnostic evidence.
+    """
+    detail = ENVIRONMENT_EXIT_CODES.get(exit_code, "environment unusable")
+    base = f"{ENVIRONMENT_FAILURE_TERMINAL_REASON}: {detail} (exit {exit_code})"
+    trimmed = (existing_reason or "").strip()
+    if trimmed and trimmed.lower() not in base.lower():
+        return f"{base}; {trimmed}"
+    return base
+
+
+# ── VM self-destruct clock terminal reasons ────────────────────────────────────
+# The GCP startup script arms a TWO-PHASE self-destruct clock. Phase 1 bounds
+# provisioning (boot, repo clone, image pull, checkpoint hydration, setup step);
+# phase 2, armed at the same point as the no-progress watchdog, bounds the
+# experiment's own runtime. Each phase records a DIFFERENT terminal reason so the
+# taxonomy can tell "we never got the experiment started" apart from "the
+# experiment ran and exceeded its declared deadline".
+#
+# Named here, next to the classes they map to, for the same reason as the 125 /
+# no_progress_timeout pair above: the emitter (compute_backends) and the consumer
+# (classify_compute_terminal_reason) must not drift. They HAD drifted, on the
+# VM-side token specifically: the classifier's prose rule "runtime deadline"
+# covers the SERVER-side deadline cuts (compute_jobs.py emits the literal
+# "compute job exceeded runtime deadline" from three call sites: the poll-status
+# timeout branch, the terminate-and-record path, and the poll-failure deadline
+# check), but the GCP startup script's phase-2 token ``runtime_ttl`` shares no
+# substring with that prose and fell through every rule to CODE_ERROR. An
+# intentional platform kill was therefore billed to the experiment's author as a
+# work defect.
+#
+# Do NOT "clean up" the prose rule as dead: deleting it would re-bill every
+# server-side runtime-deadline kill to the author. Both spellings are live and
+# both are load-bearing.
+PROVISIONING_TTL_TERMINAL_REASON = "provisioning_ttl"
+RUNTIME_TTL_TERMINAL_REASON = "runtime_ttl"
+
+
 # Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
 # for longer than the scope-aware threshold (8 min small / 12 min medium /
 # 18 min large). Detected by the reaper's progress-staleness sweep, which
@@ -303,6 +389,28 @@ DEAD_AUTH = "DEAD_AUTH"
 # treated as CODE_ERROR, PR_REJECTED, or direction-health damage.
 APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
 
+# A rollup PR merged (or was about to merge) while a constituent child PR's
+# ENTIRE verified deliverable had been erased from the rollup branch by a
+# conflict-fix intervention. This is a PLATFORM defect, not a work defect: the
+# child did the work, its PR was reviewed and merged into the staging branch,
+# and the pipeline's own conflict resolution discarded it (the rollup
+# conflict-fix prompt tells the agent the target branch is the source of truth
+# and to keep only "changes that serve the rollup goal" — a 500-char blurb that
+# names none of the children's files). Charging this to CODE_ERROR burns the
+# retry budget, spawns a pointless diagnosis task, and penalises the direction's
+# health for damage the engine inflicted on itself. Production case 2026-08-24:
+# rollup PR #17804 dropped 12/12 files of child PR #17707 and research task
+# 78ad7812 was FAILED as CODE_ERROR.
+#
+# Deliberately in INFRA_ANALYTICS_CLASSES (analytics/erosion bucket) but NOT in
+# INFRA_CLASSES — same reasoning as UNPLACEABLE_EXECUTION_SITE: the
+# reaper_infra_recovery Step 5 resurrection sweep flips INFRA_CLASSES members
+# back to QUEUED, and a blind requeue of a rollup parent whose PR already merged
+# would re-drive rollup creation without the dropped work being restored. The
+# targeted recovery is the pre-merge hold + restore fix in
+# ``app.rollup_deliverable_guard``, not a generic resurrection.
+ROLLUP_DELIVERABLE_DROPPED = "ROLLUP_DELIVERABLE_DROPPED"
+
 # A compute_experiment declared a kind=metric success_criterion but produced NO
 # numeric value for that metric (the experiment ran, yet the hypothesis was never
 # measured). Written by ``task_completion._handle_compute_experiment_completion``
@@ -343,6 +451,151 @@ COMPUTE_JOB_FAILED = "compute_job_failed"
 # mismatch is diagnosable without reading source.
 UNPLACEABLE_EXECUTION_SITE = "UNPLACEABLE_EXECUTION_SITE"
 
+# The task's OWN payload cannot satisfy the contract its declared task type
+# requires — a required field is absent or malformed.  Canonical case: a ``fix``
+# payload with no ``branch``, which the agent's ``handleFix``
+# (agent/src/handlers/review-fix.ts) rejects on its first line of real work with
+# ``Fatal error: branch is required`` before any model call happens.
+#
+# This is a PLATFORM defect in whatever SPAWNED the task, not a defect in the
+# agent's work.  Charging it to CODE_ERROR misattributes a spawner bug to the
+# agent and feeds that misattribution into failure-attribution and the
+# research/erosion scoring.  It is also DETERMINISTIC in the persisted row:
+# every retry re-reads the same malformed payload and dies identically, so a
+# retry can never succeed — the class is in ``NON_RETRYABLE_PLATFORM_CLASSES``
+# and terminal on FIRST detection.
+#
+# Deliberately OUTSIDE INFRA_CLASSES (the reaper's Step 5 resurrection sweep
+# flips only INFRA_CLASSES members back to QUEUED, and re-queuing walks straight
+# back into the same dead end) but INSIDE INFRA_ANALYTICS_CLASSES and
+# ALL_FAILURE_CLASSES, so the platform kill stays VISIBLE to operators and is
+# bucketed as a platform condition rather than an agent code defect — the same
+# shape as UNPLACEABLE_EXECUTION_SITE above.
+#
+# Production 2026-08-23 (Blueprint project 37d445e1): four
+# ``guard_suppression_remediation`` tasks (4fdd6113 / 9bfa5831 / 50531efe /
+# b4121926) each carried a branchless ``fix`` payload, provisioned four VMs
+# apiece, and all four died ``[CODE_ERROR] Retries exhausted (3/3)``.
+MALFORMED_TASK_PAYLOAD = "MALFORMED_TASK_PAYLOAD"
+
+# Failure classes that a retry can never clear because the cause is a permanent
+# property of the task ROW, not of the attempt.  The agent-status retry gate
+# refuses to re-queue these: the task lands terminal on first detection with a
+# reason instead of burning the whole budget on identical deaths.
+NON_RETRYABLE_PLATFORM_CLASSES: frozenset[str] = frozenset(
+    {
+        MALFORMED_TASK_PAYLOAD,
+    }
+)
+
+
+# The RUNNER-ENTRY contract, mirrored field-for-field from the agent handlers.
+# These are the fields a handler dereferences and hard-throws on BEFORE any
+# model call, clone, or useful work — i.e. the payload defects that make a task
+# unrunnable by construction rather than merely under-specified.
+#
+# This is deliberately NARROWER than the authoring schema in
+# app.payload_schemas.validate_task_payload. The authoring schema also enforces
+# planning-quality fields (acceptance_evidence, prompt length caps, research
+# envelopes) whose absence produces a WORSE task, not an IMPOSSIBLE one, and
+# many legitimately-created historical rows omit them. Terminalizing on the
+# authoring schema would kill runnable work; terminalizing on the runner-entry
+# contract kills only tasks that were already guaranteed to die.
+#
+# Keep in lockstep with the agent. Each entry cites its throw site:
+#   fix     branch      agent/src/handlers/review-fix.ts:1350 validateBranchName
+#           pr_number   agent/src/handlers/review-fix.ts:1354 Invalid pr_number
+#           prompt      agent/src/handlers/review-fix.ts:1359 missing prompt
+#   review  pr_number   agent/src/handlers/review-fix.ts:670  Invalid pr_number
+#           branch      agent/src/handlers/review-fix.ts:671  validateBranchName
+# (validateBranchName itself: agent/src/index.ts:2892.)
+_REQ_BRANCH = "branch_name"
+_REQ_POSITIVE_INT = "positive_int"
+_REQ_NON_EMPTY_STR = "non_empty_str"
+
+_RUNNER_ENTRY_CONTRACT: dict[str, tuple[tuple[str, str], ...]] = {
+    "fix": (
+        ("branch", _REQ_BRANCH),
+        ("pr_number", _REQ_POSITIVE_INT),
+        ("prompt", _REQ_NON_EMPTY_STR),
+    ),
+    "review": (
+        ("pr_number", _REQ_POSITIVE_INT),
+        ("branch", _REQ_BRANCH),
+    ),
+}
+
+# Same character class the agent's validateBranchName enforces
+# (agent/src/index.ts:2893).
+_AGENT_BRANCH_RE = re.compile(r"^[a-zA-Z0-9_./-]+$")
+
+
+def _runner_entry_field_defect(value: object, kind: str) -> str | None:
+    """Reason this value fails the agent's entry check, or None if it passes."""
+    if kind == _REQ_BRANCH:
+        if not isinstance(value, str) or not value:
+            return "is required"
+        if not _AGENT_BRANCH_RE.match(value):
+            return "has characters the agent rejects"
+        if ".." in value or value.startswith("-"):
+            return "is not a valid branch name"
+        return None
+    if kind == _REQ_POSITIVE_INT:
+        # The agent does Number(payload.pr_number) then Number.isInteger(...) &&
+        # > 0, so a numeric string passes there too.
+        try:
+            if isinstance(value, bool) or value is None or value == "":
+                return "is required"
+            as_int = int(str(value).strip())
+        except (TypeError, ValueError):
+            return "is not a positive integer"
+        return None if as_int > 0 else "is not a positive integer"
+    if kind == _REQ_NON_EMPTY_STR:
+        if not isinstance(value, str) or not value.strip():
+            return "is required"
+        return None
+    return None
+
+
+def malformed_task_payload_reason(task: "Task") -> str | None:
+    """One-line reason the payload can never clear the agent's entry checks.
+
+    Returns None when the payload is runnable, and also when the payload does
+    not DECLARE a task type this contract covers — an unknown or absent type is
+    a different question and must not be terminalized by this class.
+
+    Never raises: a classifier that can crash is worse than one that declines to
+    reclassify.
+    """
+    try:
+        payload = getattr(task, "first_payload", None)
+        if not isinstance(payload, dict):
+            return None
+        declared_type = payload.get("type")
+        if not isinstance(declared_type, str):
+            return None
+        contract = _RUNNER_ENTRY_CONTRACT.get(declared_type.strip().lower())
+        if not contract:
+            return None
+        defects = [
+            f"{field} {defect}"
+            for field, kind in contract
+            if (defect := _runner_entry_field_defect(payload.get(field), kind))
+        ]
+        if not defects:
+            return None
+        return (
+            f"{declared_type} payload cannot satisfy the agent's entry contract: "
+            + "; ".join(defects)
+        )
+    except Exception as exc:  # classification must never crash
+        logger.warning(
+            "[FAILURE_CLASS] malformed_task_payload_reason failed on task %s: %s",
+            getattr(task, "id", "?"),
+            exc,
+        )
+        return None
+
 
 def classify_compute_terminal_reason(
     terminal_reason: "str | None",
@@ -356,11 +609,19 @@ def classify_compute_terminal_reason(
 
     Mapping rules (first match wins):
     - vm_phase == "provisioning" → PROVISION_FAILURE (VM never started)
-    - reason contains "provisioning" → PROVISION_FAILURE (launch/RPC failure)
-    - reason contains "runtime deadline" or "spend cap" → AGENT_TIMEOUT
-      (intentional platform kills; these should normally PASS the gate, but if
-      they somehow reach a failure branch the class must be AGENT_TIMEOUT, not
-      CODE_ERROR)
+    - reason contains ``ENVIRONMENT_FAILURE_TERMINAL_REASON`` → PROVISION_FAILURE
+      (the shell reported exit 126/127: the execution environment did not have
+      what the command needed. Pinned on the exact constant, ahead of the generic
+      substring rule, so a rename of the sentinel cannot silently drop the
+      mapping back to CODE_ERROR)
+    - reason contains "provisioning" → PROVISION_FAILURE (launch/RPC failure,
+      the ``provisioning_ttl`` phase-1 self-destruct expiry, and the runner's own
+      "cannot establish a Python interpreter" bootstrap reasons, which all carry
+      the same word)
+    - reason contains ``RUNTIME_TTL_TERMINAL_REASON``, "runtime deadline" or
+      "spend cap" → AGENT_TIMEOUT (intentional platform kills; these should
+      normally PASS the gate, but if they somehow reach a failure branch the
+      class must be AGENT_TIMEOUT, not CODE_ERROR)
     - reason contains "cancelled" or "operator" → ADMIN_CANCEL
     - reason contains ``NO_PROGRESS_TIMEOUT_TERMINAL_REASON`` → NO_PROGRESS_TIMEOUT
       (job was cut early by the no-progress watchdog — a configurable platform
@@ -371,9 +632,17 @@ def classify_compute_terminal_reason(
         return PROVISION_FAILURE
     if terminal_reason:
         lower = terminal_reason.lower()
+        if ENVIRONMENT_FAILURE_TERMINAL_REASON in lower:
+            return PROVISION_FAILURE
+        if PROVISIONING_TTL_TERMINAL_REASON in lower:
+            return PROVISION_FAILURE
         if "provisioning" in lower:
             return PROVISION_FAILURE
-        if "runtime deadline" in lower or "spend cap" in lower:
+        if (
+            RUNTIME_TTL_TERMINAL_REASON in lower
+            or "runtime deadline" in lower
+            or "spend cap" in lower
+        ):
             return AGENT_TIMEOUT
         if "cancelled" in lower or "operator" in lower:
             return ADMIN_CANCEL
@@ -837,7 +1106,92 @@ INFRA_CLASSES: frozenset[str] = frozenset(
 # transient-retry semantics must keep using INFRA_CLASSES.
 INFRA_ANALYTICS_CLASSES: frozenset[str] = INFRA_CLASSES | {
     UNPLACEABLE_EXECUTION_SITE,
+    # Conflict resolution destroyed a landed child deliverable — a platform
+    # defect, so it must not depress direction health / erosion scoring.  Kept
+    # OUT of INFRA_CLASSES for the same resurrection reason as the entry above.
+    ROLLUP_DELIVERABLE_DROPPED,
+    MALFORMED_TASK_PAYLOAD,
 }
+
+# ── Infra-resurrection eligibility: ONE predicate, two call sites ────────────
+#
+# Two places decide whether a FAILED task will be auto-resurrected by the
+# reaper's Step 5 infra-recovery sweep:
+#
+#   * ``reaper_infra_recovery.run_infra_recovery_and_hold_maintenance`` — the
+#     sweep that performs the FAILED -> QUEUED flip, and
+#   * ``rollup_management._check_and_trigger_rollup`` — which HOLDS an
+#     EVALUATING parent ("Recovering: … eligible for auto-resurrection") while
+#     one of its review/fix children waits for that flip.
+#
+# They used to carry two hand-copied predicates, and those had drifted into
+# being DISJOINT rather than merely unequal: the sweep refuses outright to
+# resurrect a review/fix task carrying a ``pr_number`` (it must be re-driven
+# through canonical review admission, not a generic QUEUED flip), while the
+# rollup's copy never learned that rule — and the rollup's copy only ever looks
+# at review/fix children. So an EVALUATING parent whose review/fix child failed
+# on an infra class was held for the full recovery window waiting on a
+# resurrection the other side guaranteed would never happen, with every child
+# already terminal: a permanent wedge, advertised to the operator as recovery
+# in progress. Naming the predicate ONCE makes that divergence unrepresentable.
+#
+# Reason codes rather than a bare bool: a caller that declines to act has to be
+# able to say why, in logs and in operator-facing status.
+RESURRECTION_BLOCK_PR_PIPELINE_TASK = "pr_pipeline_requires_review_admission"
+RESURRECTION_BLOCK_NOT_INFRA_CLASS = "failure_class_not_infra"
+RESURRECTION_BLOCK_ALREADY_RESURRECTED = "already_resurrected"
+RESURRECTION_BLOCK_PR_TERMINAL_CLOSURE = "pr_terminal_closure"
+RESURRECTION_BLOCK_OOM = "oom_not_transient"
+
+
+def infra_resurrection_block_reason(task: "Task") -> str | None:
+    """Why Step 5 will not resurrect ``task``, or ``None`` if it may.
+
+    Intrinsic reasons only — properties of the task itself, stable across
+    cycles. Situational gates that can flip between cycles (upstream API health
+    zone availability, a live duplicate holding the idempotency key, the task
+    being a parent) stay in the sweep: a caller that HOLDS on this predicate is
+    asserting the block is permanent, and must not hold on a transient one.
+    """
+    ctx = task.context or {}
+    payload = task.first_payload or {}
+
+    # PR review/fix failures must be re-driven from current GitHub state
+    # through canonical review admission. A generic FAILED -> QUEUED flip can
+    # resurrect a stale review target or writer and wastes an agent even though
+    # the claim fence would ultimately reject it.
+    if payload.get("type") in {"review", "fix"} and payload.get("pr_number"):
+        return RESURRECTION_BLOCK_PR_PIPELINE_TASK
+
+    # Only infra-class failures are resurrectable at all.
+    if ctx.get("failure_category", "") not in INFRA_CLASSES:
+        return RESURRECTION_BLOCK_NOT_INFRA_CLASS
+
+    # At most one resurrection per task, ever.
+    if int(ctx.get("_resurrection_count", 0) or 0) >= 1:
+        return RESURRECTION_BLOCK_ALREADY_RESURRECTED
+
+    # Terminal PR-closure outcomes. classify_failure routes "closed without
+    # merging" / empty-rollup closures into EXTERNAL_API (it shares the
+    # merge-blocking GitHub bank), but operator rejection and empty-rollup
+    # short-circuit are not infrastructure failures — re-running produces the
+    # same rejected/empty PR. Mirrors the closure markers documented in
+    # services._pr_possibly_open.
+    if (
+        ctx.get("pr_closed_unmerged") is True
+        or ctx.get("pr_closed_empty") is True
+        or ctx.get("pr_rejected") is True
+    ):
+        return RESURRECTION_BLOCK_PR_TERMINAL_CLOSURE
+
+    # Process crashes and heartbeat timeouts are transient per-VM issues. OOM
+    # kills are NOT: the task scope hasn't changed and it will OOM again on the
+    # same VM type. Let scope reduction handle it.
+    if ctx.get("timeout_subtype") == "oom":
+        return RESURRECTION_BLOCK_OOM
+
+    return None
+
 
 # Cause frozensets for adversarial grader non-response routing.  Each set
 # names the cause categories (from classify_grader_nonresponse_cause) that
@@ -894,6 +1248,8 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     APPROVED_CAP_PR_CLOSED,
     ADMIN_CANCEL,
     UNPLACEABLE_EXECUTION_SITE,
+    ROLLUP_DELIVERABLE_DROPPED,
+    MALFORMED_TASK_PAYLOAD,
 )
 
 
@@ -959,6 +1315,10 @@ def classify_failure_taxonomy(task: "Task") -> str:
     # resurrection sweep never re-queues it), but it is an infra/routing
     # condition, not a code defect — keep it in the infra analytics bucket.
     if base == UNPLACEABLE_EXECUTION_SITE:
+        return TAXONOMY_INFRA_RELATED
+    # MALFORMED_TASK_PAYLOAD is likewise outside INFRA_CLASSES (terminal, never
+    # resurrected) but is a spawner/platform defect, not agent-written code.
+    if base == MALFORMED_TASK_PAYLOAD:
         return TAXONOMY_INFRA_RELATED
     # Migration errors are code defects (the schema is wrong / migration missing),
     # not review-quality or scope issues — route to code_defect bucket directly.
@@ -1192,6 +1552,12 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # registry-declared execution site has no eligible runner. Canonical terminal
     # class outside INFRA_CLASSES so the resurrection sweep never re-queues it.
     "unplaceable_execution_site": UNPLACEABLE_EXECUTION_SITE,
+    # ``malformed_task_payload`` — the task row's own payload cannot satisfy its
+    # declared type contract. Canonicalized here so the label round-trips; the
+    # generic-``fatal`` branch of normalize_agent_failure_category also DERIVES
+    # this class from the payload itself, because the agent reports only
+    # ``fatal`` when its handler rejects a missing required field.
+    "malformed_task_payload": MALFORMED_TASK_PAYLOAD,
 }
 
 
@@ -2163,6 +2529,17 @@ def normalize_agent_failure_category(
     mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
     if mapped:
         if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
+            # The task's own payload is checked FIRST. A payload that violates
+            # its declared type contract is unrunnable no matter what else the
+            # attempt hit: no provider rotation, backoff or retry can clear it,
+            # and blaming the agent for a spawner's missing required field
+            # poisons failure-attribution and erosion scoring. A PRECISE agent
+            # label (test_failed / lint_failed / ...) is a real verdict about
+            # the work and never reaches this branch, so this cannot overwrite
+            # one.
+            _malformed_payload = malformed_task_payload_reason(task)
+            if _malformed_payload:
+                return MALFORMED_TASK_PAYLOAD
             # Structured agent error report — the PRIMARY signal. A report
             # proving a provider-layer death (CLI died without completing a
             # model run) routes to the RATE_LIMIT requeue path (account

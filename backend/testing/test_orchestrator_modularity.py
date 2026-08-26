@@ -374,6 +374,12 @@ class TestRunnerDispatchSiblingModulesImportLeafFirst:
     one way.
     """
 
+    # Each parametrisation spawns an interpreter that imports one backend
+    # module; measured worst case 12.73s
+    # (app.orchestrator_compute_experiment_dispatch) on an idle host against
+    # the lanes' --timeout=30. 120s leaves ~9x headroom and stays above the
+    # inner subprocess timeout so a genuinely hung import reports as itself.
+    @pytest.mark.timeout(120)
     @pytest.mark.parametrize("module_name", sorted(DISPATCH_EXTRACTED_SYMBOLS))
     def test_leaf_module_imports_standalone(self, module_name: str):
         import subprocess
@@ -385,7 +391,10 @@ class TestRunnerDispatchSiblingModulesImportLeafFirst:
             cwd=repo_backend,
             capture_output=True,
             text=True,
-            timeout=120,
+            # Half the marker above, so a genuinely hung import raises
+            # TimeoutExpired here -- naming the module -- instead of being
+            # killed by pytest-timeout with no attribution.
+            timeout=60,
         )
         assert proc.returncode == 0, (
             f"{module_name} could not be imported on its own — the extracted "

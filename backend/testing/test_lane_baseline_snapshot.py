@@ -14,6 +14,7 @@ from app.lane_baseline_snapshot import (
     _MAX_BASELINES_STORED,
     _compute_checkpoint_recovery_waste,
     _compute_relay_medians,
+    _slim_baseline,
     backfill_missing_lane_baselines,
     persist_version_lane_baseline,
     read_version_lane_baseline,
@@ -129,6 +130,146 @@ class TestReadVersionLaneBaseline:
         result = read_version_lane_baseline(project, 9)
         assert result == baseline
 
+    def test_slimming_keeps_flat_convergence_scalars_without_lane_waste(self):
+        baseline = {
+            "version_number": 11,
+            "outer_loop_convergence": {
+                "cap_exhausted_direction_count": 2,
+                "supersede_affected_reviews_to_converge_median": 3,
+                "supersede_affected_reviews_to_converge_p95": 5,
+            },
+        }
+        result = _slim_baseline(baseline)
+        assert "lane_waste" not in result
+        assert result["outer_loop_convergence"]["cap_exhausted_direction_count"] == 2
+        assert result["outer_loop_convergence"]["supersede_affected_reviews_to_converge_median"] == 3
+        assert result["outer_loop_convergence"]["supersede_affected_reviews_to_converge_p95"] == 5
+
+    def test_slimming_keeps_retarget_convergence_counters(self):
+        baseline = {
+            "version_number": 11,
+            "lane_waste": {
+                "reviews_to_converge": {"count": 3, "median": 2, "p95": 5},
+                "converged_review_counts": [1, 2, 3],
+                "retarget_review_scope_counts": {"delta": 1, "full": 2},
+                "stale_head_discard_count": 4,
+                "chains": [{"task_count": 99}],
+            },
+        }
+
+        result = _slim_baseline(baseline)
+
+        lane_waste = result["lane_waste"]
+        assert lane_waste["reviews_to_converge"]["median"] == 2
+        assert "converged_review_counts" not in lane_waste
+        assert lane_waste["retarget_review_scope_counts"] == {"delta": 1, "full": 2}
+        assert lane_waste["stale_head_discard_count"] == 4
+        assert "chains" not in lane_waste
+        assert "dropped_fields" not in result
+
+    def test_slim_retains_lane_waste_at_snapshot_chain_ceiling(self):
+        """A 5,000-sample legacy payload cannot evict durable lane-waste data."""
+        baseline = {
+            "version_number": 12,
+            "lane_waste": {
+                "reviews_to_converge": {
+                    "count": 5_000,
+                    "median": 2_500.5,
+                    "p95": 4_750,
+                },
+                "converged_review_counts": list(range(1, 5_001)),
+                "retarget_review_scope_counts": {"delta": 1_234, "full": 567},
+                "stale_head_discard_count": 89,
+                "chains": [{"task_count": 99}] * 100,
+            },
+            "outer_loop_convergence": {
+                "iteration_median": 3,
+                "convergence_rate": 0.75,
+            },
+        }
+
+        result = _slim_baseline(baseline)
+
+        assert len(json.dumps(result).encode()) <= _MAX_BASELINE_ENTRY_BYTES
+        lane_waste = result["lane_waste"]
+        assert "converged_review_counts" not in lane_waste
+        assert "chains" not in lane_waste
+        assert lane_waste["reviews_to_converge"] == {
+            "count": 5_000,
+            "median": 2_500.5,
+            "p95": 4_750,
+        }
+        assert lane_waste["retarget_review_scope_counts"] == {
+            "delta": 1_234,
+            "full": 567,
+        }
+        assert lane_waste["stale_head_discard_count"] == 89
+
+    def test_overflow_shed_preserves_direction_grading_metrics(self):
+        """Overflow records its eviction while retaining retarget evidence."""
+        baseline = {
+            "version_number": 13,
+            "lane_waste": {
+                "retarget_review_scope_counts": {"delta": 7, "full": 3},
+                "stale_head_discard_count": 2,
+                "future_detail": "x" * (_MAX_BASELINE_ENTRY_BYTES * 2),
+            },
+            "lane_iteration_distribution": {"review": {"p50_iterations": 2}},
+        }
+
+        result = _slim_baseline(baseline)
+
+        assert len(json.dumps(result).encode()) <= _MAX_BASELINE_ENTRY_BYTES
+        assert result["dropped_fields"] == [
+            "lane_iteration_distribution",
+            "lane_waste.future_detail",
+        ]
+        assert result["lane_waste"]["retarget_review_scope_counts"] == {
+            "delta": 7,
+            "full": 3,
+        }
+        assert result["lane_waste"]["stale_head_discard_count"] == 2
+
+    def test_trend_provenance_distinguishes_evicted_absent_and_zero(self):
+        """Trend consumers can tell eviction, no measurement, and a real zero apart."""
+        from app.digest_metrics import compute_lane_baseline_trend
+
+        latest = {
+            "version_number": 13,
+            "dropped_fields": ["lane_waste.retarget_review_scope_counts"],
+            "lane_waste": {"stale_head_discard_count": 0},
+        }
+        prior = {
+            "version_number": 12,
+            "lane_waste": {
+                "retarget_review_scope_counts": {"delta": 0, "full": 0},
+                "stale_head_discard_count": 0,
+            },
+        }
+
+        trend = compute_lane_baseline_trend([latest, prior])
+
+        assert trend is not None
+        delta = trend["retarget_convergence"]["retarget_review_scope_counts"]["delta"]
+        assert delta["latest"] is None
+        assert delta["prior"] == 0
+        assert delta["availability"] == {
+            "latest": "evicted",
+            "prior": "available",
+        }
+        stale = trend["retarget_convergence"]["stale_head_discard_count"]
+        assert stale["latest"] == 0
+        assert stale["prior"] == 0
+        assert stale["availability"] == {
+            "latest": "available",
+            "prior": "available",
+        }
+        recovery = trend["checkpoint_recovery_waste_total"]
+        assert recovery["availability"] == {
+            "latest": "unavailable",
+            "prior": "unavailable",
+        }
+
 
 # ---------------------------------------------------------------------------
 # DB-backed tests
@@ -136,6 +277,152 @@ class TestReadVersionLaneBaseline:
 
 
 class TestPersistVersionLaneBaseline:
+    @pytest.mark.asyncio
+    async def test_persisted_convergence_reports_both_supersede_arms(
+        self, db_session
+    ):
+        """Persisted convergence separates rollup supersede and control arms."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        opened = now - timedelta(days=7)
+        closed = now - timedelta(days=1)
+        original = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            created_at=opened - timedelta(days=1),
+        )
+        db_session.add(original)
+        await db_session.flush()
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "review", "pr_number": 902}],
+                context={
+                    "rollup_pr_number": 902,
+                    "review_loop": {
+                        "original_task_id": str(original.id),
+                        "pr_number": 902,
+                        "iteration": 1,
+                        "superseded_pr_numbers": ["901"],
+                    }
+                },
+                created_at=opened + timedelta(hours=1),
+            )
+        )
+        unaffected_original = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True, "_is_rollup_review": True},
+            created_at=opened - timedelta(days=1),
+        )
+        db_session.add(unaffected_original)
+        await db_session.flush()
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "review", "pr_number": 903}],
+                context={
+                    "rollup_pr_number": 903,
+                    "review_loop": {
+                        "original_task_id": str(unaffected_original.id),
+                        "pr_number": 903,
+                        "iteration": 1,
+                    }
+                },
+                created_at=opened + timedelta(hours=2),
+            )
+        )
+        await db_session.commit()
+
+        result = await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=9,
+            opened_at=opened,
+            closed_at=closed,
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        assert result is not None
+        convergence = result["outer_loop_convergence"]
+        assert convergence["supersede_affected_chain_count"] == 1
+        assert convergence["supersede_affected_reviews_to_converge_count"] == 1
+        assert convergence["supersede_affected_reviews_to_converge_median"] == 1
+        assert convergence["rollup_chain_count"] == 2
+        assert convergence["rollup_supersede_affected_chain_count"] == 1
+        assert convergence["rollup_supersede_unaffected_chain_count"] == 1
+        assert convergence["rollup_supersede_affected_reviews_to_converge_count"] == 1
+        assert convergence["rollup_supersede_unaffected_reviews_to_converge_count"] == 1
+        assert convergence["rollup_supersede_affected_reviews_to_converge_median"] == 1
+        assert convergence["rollup_supersede_unaffected_reviews_to_converge_median"] == 1
+
+    @pytest.mark.asyncio
+    async def test_persist_keeps_supersede_percentiles_above_one_thousand_chains(
+        self, db_session
+    ):
+        """The durable snapshot retains full-population convergence percentiles."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        opened = now - timedelta(days=7)
+        closed = now - timedelta(days=1)
+        tasks = []
+        for chain_number in range(1_060):
+            original = make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                created_at=opened + timedelta(hours=1),
+            )
+            tasks.append(original)
+            review_count = 1 if chain_number < 1_000 else 10
+            tasks.extend(
+                make_task(
+                    project_id=project.id,
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "review", "pr_number": chain_number + 5_000}],
+                    context={
+                        "review_loop": {
+                            "original_task_id": str(original.id),
+                            "pr_number": chain_number + 5_000,
+                            "iteration": iteration + 1,
+                            "superseded_pr_numbers": [str(chain_number + 4_000)],
+                        }
+                    },
+                    created_at=opened + timedelta(hours=2),
+                )
+                for iteration in range(review_count)
+            )
+        db_session.add_all(tasks)
+        await db_session.commit()
+
+        await persist_version_lane_baseline(
+            db_session,
+            project_id=project.id,
+            version_number=9,
+            opened_at=opened,
+            closed_at=closed,
+            terminal_status="promoted",
+        )
+        await db_session.commit()
+
+        stored = await _read_lane_baseline_row(db_session, project.id, 9)
+        assert stored is not None
+        convergence = stored["outer_loop_convergence"]
+        assert convergence["supersede_affected_reviews_to_converge_count"] == 1_060
+        assert convergence["supersede_affected_reviews_to_converge_sample_count"] == 1_060
+        assert convergence["supersede_affected_reviews_to_converge_median"] == 1
+        assert convergence["supersede_affected_reviews_to_converge_p95"] == 10
+
     @pytest.mark.asyncio
     async def test_version_baseline_persists_and_trends_convergence_counters(
         self, db_session
@@ -156,7 +443,10 @@ class TestPersistVersionLaneBaseline:
             original = make_task(
                 project_id=project.id,
                 status=TaskStatus.COMPLETED,
-                context={"pr_merged": True},
+                context={
+                    "pr_merged": True,
+                    "direction_id": f"direction-{version}",
+                },
                 created_at=opened + timedelta(hours=1),
             )
             db_session.add(original)
@@ -168,7 +458,11 @@ class TestPersistVersionLaneBaseline:
                     payloads=[{"type": "review", "prompt": "baseline"}],
                     context={
                         "review_loop": {
-                            "pr_number": str(version),
+                            "pr_number": (
+                                str(version)
+                                if iteration < merged_iteration
+                                else f"{version}-replacement"
+                            ),
                             "original_task_id": str(original.id),
                             "iteration": iteration,
                         }
@@ -182,7 +476,7 @@ class TestPersistVersionLaneBaseline:
                 cap_original = make_task(
                     project_id=project.id,
                     status=TaskStatus.COMPLETED,
-                    context={},
+                    context={"direction_id": f"direction-cap-{version}"},
                     created_at=opened + timedelta(hours=10),
                 )
                 db_session.add(cap_original)
@@ -215,7 +509,7 @@ class TestPersistVersionLaneBaseline:
                 terminal_status="promoted",
             )
             assert result is not None
-            assert result["baseline_def_version"] == "v2"
+            assert result["baseline_def_version"] == "v5"
             assert result["outer_loop_convergence"]["iteration_median"] is not None
             assert "chains" not in result["lane_waste"]
 
@@ -224,6 +518,12 @@ class TestPersistVersionLaneBaseline:
         assert latest is not None and prior is not None
         assert latest["outer_loop_convergence"]["iteration_median"] == 2
         assert prior["outer_loop_convergence"]["cap_exhausted_chain_count"] == 1
+        assert prior["outer_loop_convergence"]["cap_exhausted_direction_count"] == 1
+        assert prior["outer_loop_convergence"]["supersede_affected_chain_count"] == 1
+        assert prior["outer_loop_convergence"]["supersede_affected_reviews_to_converge_count"] == 1
+        assert prior["outer_loop_convergence"]["supersede_affected_reviews_to_converge_sample_count"] == 1
+        assert prior["outer_loop_convergence"]["supersede_affected_reviews_to_converge_median"] == 4
+        assert prior["outer_loop_convergence"]["supersede_affected_reviews_to_converge_p95"] == 4
         assert prior["outer_loop_convergence"]["terminal_outcome_counts"]["cap_exhausted"] == 1
 
         trend = compute_lane_baseline_trend([latest, prior])
@@ -232,6 +532,8 @@ class TestPersistVersionLaneBaseline:
         assert trend["outer_loop_convergence"]["convergence_rate"]["latest"] == 1.0
         assert trend["outer_loop_convergence"]["convergence_rate"]["classification"] == "improving"
         assert trend["outer_loop_convergence"]["cap_exhausted_chain_count"]["delta"] == -1
+        assert trend["outer_loop_convergence"]["cap_exhausted_direction_count"]["delta"] == -1
+        assert trend["outer_loop_convergence"]["supersede_affected_reviews_to_converge_median"]["classification"] == "improving"
 
     @pytest.mark.asyncio
     async def test_persist_writes_baseline_to_table(self, db_session):
@@ -543,9 +845,9 @@ class TestBackfillMissingLaneBaselines:
         assert "relay_medians" in stored
 
     @pytest.mark.asyncio
-    async def test_backfill_skips_already_stored_version(self, db_session):
-        """backfill_missing_lane_baselines is a no-op for versions already present
-        in the dedicated project_lane_baseline table."""
+    @pytest.mark.parametrize("definition", ["v5", "v6"])
+    async def test_backfill_skips_already_stored_version(self, db_session, definition):
+        """Current table definitions remain first-write-wins during backfill."""
         from testing.conftest import USE_POSTGRES
 
         if not USE_POSTGRES:
@@ -562,7 +864,7 @@ class TestBackfillMissingLaneBaselines:
             project.id,
             9,
             now,
-            "v1",
+            definition,
             {"version_number": 9, "captured_at": "2026-01-01T00:00:00"},
         )
         version = ReleaseVersion(
@@ -584,7 +886,7 @@ class TestBackfillMissingLaneBaselines:
 
     @pytest.mark.asyncio
     async def test_backfill_preserves_legacy_design_doc_version(self, db_session):
-        """A retained historical fallback is data, not a recomputation gap."""
+        """A refresh leaves the retained legacy fallback untouched."""
         legacy = {
             "version_number": 9,
             "captured_at": "2026-01-01T00:00:00",
@@ -608,10 +910,116 @@ class TestBackfillMissingLaneBaselines:
 
         backfilled = await backfill_missing_lane_baselines(project_id=project.id)
 
-        assert backfilled == []
-        assert await _read_lane_baseline_row(db_session, project.id, 9) is None
+        assert backfilled == [9]
+        refreshed = await _read_lane_baseline_row(db_session, project.id, 9)
+        assert refreshed is not None
+        assert refreshed["baseline_def_version"] == "v5"
         await db_session.refresh(project)
         assert project.design_doc[DESIGN_DOC_KEY]["9"] == legacy
+
+    @pytest.mark.asyncio
+    async def test_backfill_refreshes_stale_definition_for_rollup_arms(self, db_session):
+        """Stale retained rows gain rollup arms and produce a usable trend."""
+        from testing.conftest import USE_POSTGRES
+        from app.digest_metrics import compute_lane_baseline_trend
+
+        if not USE_POSTGRES:
+            pytest.skip("project_lane_baseline refresh uses Postgres row metadata")
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        windows = [
+            (9, now - timedelta(days=30), now - timedelta(days=20), 1),
+            (10, now - timedelta(days=19), now - timedelta(days=10), 2),
+        ]
+        for version_number, opened, closed, review_count in windows:
+            original = make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+                created_at=opened - timedelta(hours=1),
+            )
+            db_session.add(original)
+            await db_session.flush()
+            db_session.add_all(
+                [
+                    make_task(
+                        project_id=project.id,
+                        status=TaskStatus.COMPLETED,
+                        payloads=[
+                            {"type": "review", "pr_number": str(version_number)}
+                        ],
+                        context={
+                            "rollup_pr_number": version_number,
+                            "review_loop": {
+                                "original_task_id": str(original.id),
+                                "pr_number": version_number,
+                                "iteration": iteration,
+                                "superseded_pr_numbers": [version_number - 1],
+                            },
+                        },
+                        created_at=opened + timedelta(hours=iteration),
+                    )
+                    for iteration in range(1, review_count + 1)
+                ]
+            )
+            db_session.add(
+                ReleaseVersion(
+                    project_id=project.id,
+                    version_number=version_number,
+                    status="promoted",
+                    opened_at=opened,
+                    promoted_at=closed,
+                )
+            )
+            await _upsert_lane_baseline_row(
+                db_session,
+                project.id,
+                version_number,
+                now,
+                "v4",
+                {
+                    "version_number": version_number,
+                    "captured_at": "2026-01-01T00:00:00",
+                    "baseline_def_version": "v4",
+                },
+            )
+        await db_session.commit()
+
+        backfilled = await backfill_missing_lane_baselines(project_id=project.id)
+
+        assert backfilled == [10, 9]
+        latest = await _read_lane_baseline_row(db_session, project.id, 10)
+        prior = await _read_lane_baseline_row(db_session, project.id, 9)
+        assert latest is not None and prior is not None
+        assert latest["baseline_def_version"] == "v5"
+        assert prior["baseline_def_version"] == "v5"
+        assert (
+            latest["outer_loop_convergence"]
+            ["rollup_supersede_affected_reviews_to_converge_median"]
+            == 2
+        )
+        assert (
+            prior["outer_loop_convergence"]
+            ["rollup_supersede_affected_reviews_to_converge_median"]
+            == 1
+        )
+
+        trend = compute_lane_baseline_trend([latest, prior])
+        assert trend is not None
+        assert (
+            trend["outer_loop_convergence"]
+            ["rollup_supersede_affected_reviews_to_converge_median"]["delta"]
+            == 1
+        )
+        assert (
+            trend["outer_loop_convergence"]
+            ["rollup_supersede_affected_reviews_to_converge_p95"]["classification"]
+            == "declining"
+        )
 
     @pytest.mark.asyncio
     async def test_backfill_respects_max_versions_cap(self, db_session):

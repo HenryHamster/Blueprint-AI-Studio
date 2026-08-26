@@ -4469,8 +4469,8 @@ async def _maybe_retry_workday_auto_start(
 ) -> None:
     """Post-commit: retry Workday auto-start when a blocking strategic cycle finishes.
 
-    When the project is in Workday (continuous) mode, has no live resident session,
-    and its last recorded blocked reason is ``cycle_in_flight`` — meaning a batch
+    When the project is in Workday (continuous) mode, has no healthy resident
+    worker, and its last recorded blocked reason is ``cycle_in_flight`` — meaning a batch
     strategic cycle was in flight when the operator entered Workday — re-run the
     Workday auto-start now that the blocking cycle has completed. Runs on a
     dedicated fresh session; any failure is logged and swallowed so strategic
@@ -4487,9 +4487,27 @@ async def _maybe_retry_workday_auto_start(
             project = await fresh.get(Project, project_id)
             if project is None:
                 return
-            # Only retry when no live resident session is running.
-            if _srs.resident_session_is_active(
-                _srs.read_resident_session(project.vision)
+            # Only retry when no HEALTHY resident worker is running.
+            #
+            # ``resident_session_is_active`` reads a status-only, operator-facing
+            # projection. That blob outlives its worker: it stays "active" after
+            # the task goes terminal, can name a superseded generation, and can
+            # retain a stale heartbeat. Gating this recovery on it alone means a
+            # dead Resident permanently suppresses the very retry that exists to
+            # restart it, so the Workday auto-start never happens. Use the same
+            # identity + bounded-freshness contract the liveness sweep uses.
+            resident_blob = _srs.read_resident_session(project.vision)
+            resident_task = None
+            resident_task_id = (resident_blob or {}).get("task_id")
+            if resident_task_id:
+                try:
+                    resident_task = await fresh.get(
+                        Task, uuid.UUID(str(resident_task_id))
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    resident_task = None
+            if _srs.resident_worker_is_healthy(
+                resident_blob, resident_task, _utcnow()
             ):
                 return
             # Only retry when the blocked reason is specifically cycle_in_flight.

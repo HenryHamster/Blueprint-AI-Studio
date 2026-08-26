@@ -198,7 +198,9 @@ class PostgresCutoverIntegrationTests(unittest.TestCase):
             ["docker", "info"],
             capture_output=True,
             text=True,
-            timeout=30,
+            # Below the lane's --timeout=30 so this probe can report its own
+            # failure rather than being killed by the harness first.
+            timeout=20,
             check=False,
         )
         if daemon.returncode != 0:
@@ -256,7 +258,10 @@ class PostgresCutoverIntegrationTests(unittest.TestCase):
             subprocess.run(
                 ["docker", "rm", "--force", container],
                 capture_output=True,
-                timeout=30,
+                # Below the lane's --timeout=30. A helper cannot carry a
+                # pytest-timeout marker on behalf of its callers, so its own
+                # budget has to fit inside the smallest lane budget.
+                timeout=20,
                 check=False,
             )
         cls._containers = []

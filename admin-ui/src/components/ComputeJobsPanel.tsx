@@ -1923,6 +1923,22 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const watchdogState = job.watchdog_state
                   ?? (job.watchdog_active ? 'protected' : 'legacy_unprotected');
                 const protectedNow = watchdogState === 'protected';
+                // 'cutting' is not a shade of unprotected: the no-progress
+                // condition holds right now and the next poll pass terminates
+                // the job. Rendering it in the amber "will not currently cut
+                // this job" branch told the operator the opposite of what was
+                // about to happen.
+                const cuttingNow = watchdogState === 'cutting';
+                const cutReason = job.watchdog_cut_reason;
+                const cutExplanation = cutReason === 'plateau'
+                  ? `its declared metric has not moved${timeoutSec != null ? ` for ${fmtDuration(timeoutSec)}` : ''}`
+                  : cutReason === 'stale_telemetry'
+                    ? 'its declared metric stopped being reported before the start of the no-progress window'
+                    : cutReason === 'no_telemetry'
+                      ? 'its declared metric has never been reported'
+                      : cutReason === 'malformed_history'
+                        ? 'its progress samples cannot be read — the ingestion path is producing unusable telemetry'
+                        : (cutReason ?? 'no progress');
                 const stateLabel = watchdogState === 'warming_up'
                   ? 'Warming up'
                   : watchdogState === 'insufficient_history'
@@ -1950,7 +1966,34 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 }
                 return (
                   <div className="mb-1.5" data-testid="compute-watchdog-status">
-                    {protectedNow ? (
+                    {cuttingNow ? (
+                      <>
+                        <div className="flex flex-wrap items-center gap-1.5 text-ui-sm">
+                          <span
+                            className="rounded border border-red-500/40 bg-red-500/10 px-1.5 py-0.5 text-ui-xs font-semibold text-red-300"
+                            data-testid="compute-watchdog-cutting"
+                          >
+                            Cutting now
+                          </span>
+                          {lastProgressAgo && (
+                            <span className="text-neutral-500 font-mono">
+                              · last progress {lastProgressAgo}
+                            </span>
+                          )}
+                        </div>
+                        <div
+                          className="mt-1 rounded border border-red-500/30 bg-red-500/8 px-2 py-1.5 text-ui-sm text-red-200"
+                          data-testid="compute-watchdog-cutting-warning"
+                        >
+                          <div className="flex items-start gap-1.5">
+                            <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                            <span>
+                              The no-progress watchdog is terminating this job: {cutExplanation}.
+                            </span>
+                          </div>
+                        </div>
+                      </>
+                    ) : protectedNow ? (
                       <div className="flex flex-wrap items-center gap-1.5 text-ui-sm">
                         <span
                           className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-ui-xs font-semibold text-emerald-300"

@@ -23,6 +23,7 @@ from app.digest_precompute import (
     annotate_precompute_metadata,
     get_health_precompute_cache,
     get_precompute_cache,
+    payload_age_seconds,
     run_precompute_tick,
 )
 from app.routers import admin_digest as _admin_digest
@@ -117,6 +118,66 @@ def test_annotate_precompute_metadata_does_not_mutate_source():
     assert out["precomputed_at"] == "2026-05-31T00:00:00"
     assert out["precompute_age_seconds"] == 12.3  # rounded to 1dp
     assert out["completed_count"] == 3  # original payload preserved
+
+
+# ---------------------------------------------------------------------------
+# payload_age_seconds — the wire-stamp round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_payload_age_seconds_parses_the_zone_carrying_wire_format():
+    """Regression (#17890 fallout): a ``generated_at`` written by ``utc_iso``
+    carries ``+00:00``, and the age math compares it against naive
+    ``_utcnow()``. Subtracting aware from naive raises TypeError, which every
+    call site swallowed via ``except (ValueError, TypeError)`` -- so the bug
+    surfaced as a permanently ``None`` ``precompute_age_seconds`` on four
+    admin endpoints rather than as an error.
+
+    The offset is pinned as a literal here on purpose. Deriving the input from
+    ``utc_iso()`` would make this test agree with whatever format the code
+    happens to emit, which is exactly the self-certifying shape that cannot
+    catch the next format change.
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    stamped = (_utcnow() - timedelta(seconds=30)).isoformat() + "+00:00"
+    age = payload_age_seconds(stamped)
+
+    assert age is not None, "zone-carrying stamp must not fall through to None"
+    assert 29.0 <= age <= 31.0, age
+
+
+def test_payload_age_seconds_still_reads_legacy_zone_less_stamps():
+    """Payloads cached before the zone-carrying format rolled out still hold a
+    zone-less stamp. Those must keep reporting a real age across the rollout
+    window rather than going None until the cache turns over."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    stamped = (_utcnow() - timedelta(seconds=30)).isoformat()
+    assert "+00:00" not in stamped  # guard: this really is the legacy shape
+    age = payload_age_seconds(stamped)
+
+    assert age is not None
+    assert 29.0 <= age <= 31.0, age
+
+
+def test_payload_age_seconds_clamps_future_stamps_and_rejects_junk():
+    """A clock-skewed future stamp clamps to 0 rather than going negative;
+    absent/unparseable stamps are the only inputs that yield None."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    future = (_utcnow() + timedelta(hours=1)).isoformat() + "+00:00"
+    assert payload_age_seconds(future) == 0.0
+
+    assert payload_age_seconds(None) is None
+    assert payload_age_seconds("") is None
+    assert payload_age_seconds("not-a-timestamp") is None
 
 
 # ---------------------------------------------------------------------------

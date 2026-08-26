@@ -45,8 +45,24 @@ def _default_no_migration_pr(mocker):
     from unittest.mock import AsyncMock
 
     mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
-    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
-        return SizeCapPreflightResult("ok", None, expected_head_sha)
+    async def _bound_ok(
+        *_args,
+        expected_head_sha=None,
+        target_branch=None,
+        expected_base_sha=None,
+        **_kwargs,
+    ):
+        # Mirror preflight_rollup_size_caps: a real verdict is stamped with
+        # the exact head, base, and target it evaluated. A double that binds
+        # only the head models a retired one-sided contract and is refused
+        # by the merge chokepoint's is_bound_to() check.
+        return SizeCapPreflightResult(
+            "ok",
+            None,
+            expected_head_sha,
+            target_branch=target_branch,
+            base_sha=expected_base_sha,
+        )
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",

@@ -8,7 +8,10 @@ These tests pin both the call-count economics and the conservative tri-state
 degradation.
 """
 
+import asyncio
 import base64
+import io
+import tarfile
 import time
 
 import pytest
@@ -16,6 +19,7 @@ import pytest
 import app.github_repo_snapshot as snapshot
 import app.shared_state as shared_state
 from app.github_repo_snapshot import (
+    authoritative_texts_at_commit,
     file_text_on_branch,
     glob_exists_on_branch,
     path_exists_on_branch,
@@ -28,9 +32,11 @@ BLOB_B = "b" * 40
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, payload=None):
+    def __init__(self, status_code: int, payload=None, content: bytes = b""):
         self.status_code = status_code
         self._payload = payload or {}
+        self.content = content
+        self.text = ""
 
     def json(self):
         return self._payload
@@ -60,6 +66,242 @@ def _blob_response(text="def real_symbol():\n    pass\n"):
     )
 
 
+def _tarball(**texts: str) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path, text in texts.items():
+            data = text.encode()
+            member = tarfile.TarInfo(f"owner-repo-sha/{path}")
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_exact_sha_read_uses_one_archive_without_quota_gate(mocker):
+    """Merge reads are exact-SHA archive reads, independent of advisory quota reserve."""
+    shared_state.github_quota.update({"remaining": 0, "reset_at": int(time.time()) + 60})
+    calls = _patch_requests(
+        mocker,
+        [
+            _FakeResponse(
+                200,
+                content=_tarball(
+                    **{"backend/app/x.py": "x\n", "caps.json": "{}\n"}
+                ),
+            )
+        ],
+    )
+
+    texts = await authoritative_texts_at_commit(
+        {"backend/app/x.py", "caps.json"},
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=COMMIT_SHA,
+    )
+
+    assert texts == {"backend/app/x.py": "x\n", "caps.json": "{}\n"}
+    assert calls == [
+        ("GET", f"https://api.github.com/repos/acme/widget/tarball/{COMMIT_SHA}")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authoritative_archive_bytes_reused_for_different_path_sets(mocker):
+    """One immutable archive serves independent extraction contracts."""
+    calls = _patch_requests(
+        mocker,
+        [
+            _FakeResponse(
+                200,
+                content=_tarball(
+                    **{"backend/app/x.py": "x\n", "caps.json": "{}\n"}
+                ),
+            )
+        ],
+    )
+
+    first = await authoritative_texts_at_commit(
+        {"backend/app/x.py"},
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=COMMIT_SHA,
+    )
+    strict = await authoritative_texts_at_commit(
+        {"caps.json", "missing.py"},
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=COMMIT_SHA,
+    )
+    second = await authoritative_texts_at_commit(
+        {"caps.json", "missing.py"},
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=COMMIT_SHA,
+        allow_missing_paths=True,
+    )
+
+    assert first == {"backend/app/x.py": "x\n"}
+    assert strict is None
+    assert second == {"caps.json": "{}\n"}
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_authoritative_archive_fetch_is_single_flight_per_exact_sha(mocker):
+    """Concurrent callers for one archive share the in-flight download."""
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+    response = _FakeResponse(
+        200, content=_tarball(**{"backend/app/x.py": "x\n"})
+    )
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        return response
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    first_task = asyncio.create_task(
+        authoritative_texts_at_commit(
+            {"backend/app/x.py"},
+            token="ghs_test",
+            owner="acme",
+            repo="widget",
+            commit_sha=COMMIT_SHA,
+        )
+    )
+    await started.wait()
+    second_task = asyncio.create_task(
+        authoritative_texts_at_commit(
+            {"backend/app/x.py"},
+            token="ghs_test",
+            owner="acme",
+            repo="widget",
+            commit_sha=COMMIT_SHA,
+        )
+    )
+    await asyncio.sleep(0)
+    assert len(calls) == 1
+    release.set()
+
+    assert await first_task == {"backend/app/x.py": "x\n"}
+    assert await second_task == {"backend/app/x.py": "x\n"}
+
+
+@pytest.mark.asyncio
+async def test_authoritative_archive_failure_shares_one_flight_and_never_caches(mocker):
+    """Concurrent failed archive reads share one failed request and retry later."""
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        return _FakeResponse(503)
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    tasks = [
+        asyncio.create_task(
+            authoritative_texts_at_commit(
+                {"backend/app/x.py"},
+                token="ghs_test",
+                owner="acme",
+                repo="widget",
+                commit_sha=COMMIT_SHA,
+            )
+        )
+        for _ in range(3)
+    ]
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(*tasks) == [None, None, None]
+    assert len(calls) == 1
+    assert snapshot._archive_cache == {}
+    assert snapshot._archive_cache_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_authoritative_oversize_archive_shares_one_flight_without_caching(mocker):
+    """Concurrent oversized archives share one fetch but remain outside the cache."""
+    archive = _tarball(**{"backend/app/x.py": "x\n"})
+    mocker.patch.object(snapshot, "_ARCHIVE_CACHE_MAX_BYTES", len(archive) - 1)
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+    response = _FakeResponse(200, content=archive)
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        return response
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    tasks = [
+        asyncio.create_task(
+            authoritative_texts_at_commit(
+                {"backend/app/x.py"},
+                token="ghs_test",
+                owner="acme",
+                repo="widget",
+                commit_sha=COMMIT_SHA,
+            )
+        )
+        for _ in range(3)
+    ]
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(*tasks) == [
+        {"backend/app/x.py": "x\n"}
+    ] * 3
+    assert len(calls) == 1
+    assert snapshot._archive_cache == {}
+    assert snapshot._archive_cache_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_authoritative_archive_cache_is_scoped_to_repository_and_sha(mocker):
+    """Different immutable repositories or commits never share archive bytes."""
+    archive = _tarball(**{"backend/app/x.py": "x\n"})
+    calls = _patch_requests(
+        mocker,
+        [
+            _FakeResponse(200, content=archive),
+            _FakeResponse(200, content=archive),
+            _FakeResponse(200, content=archive),
+        ],
+    )
+
+    for repo, sha in (
+        ("widget", COMMIT_SHA),
+        ("other", COMMIT_SHA),
+        ("widget", "d" * 40),
+    ):
+        texts = await authoritative_texts_at_commit(
+            {"backend/app/x.py"},
+            token="ghs_test",
+            owner="acme",
+            repo=repo,
+            commit_sha=sha,
+        )
+        assert texts == {"backend/app/x.py": "x\n"}
+
+    assert len(calls) == 3
+
+
 @pytest.fixture(autouse=True)
 def _reset_snapshot_state():
     """Each test starts with cold caches and a healthy quota observation."""
@@ -67,7 +309,11 @@ def _reset_snapshot_state():
     snapshot._tree_cache.clear()
     snapshot._blob_cache.clear()
     snapshot._blob_cache_bytes = 0
-    snapshot._tree_fetch_locks.clear()
+    snapshot._archive_cache.clear()
+    snapshot._archive_cache_bytes = 0
+    snapshot._tree_fetch_tasks.clear()
+    snapshot._branch_sha_fetch_tasks.clear()
+    snapshot._archive_fetch_tasks.clear()
     saved = dict(shared_state.github_quota)
     shared_state.github_quota.update(
         {"remaining": 4000, "limit": 5000, "reset_at": int(time.time()) + 1800}
@@ -132,6 +378,39 @@ async def test_tree_reused_across_branch_tip_refreshes(mocker):
     snapshot._branch_sha_cache[key] = (sha, fetched_at - 10_000)
     assert await path_exists_on_branch("backend/app/y.py", **CTX) is True
     assert len(calls) == 3  # ref, tree, ref — no second tree fetch
+
+
+@pytest.mark.asyncio
+async def test_tree_snapshot_failure_shares_one_flight_per_exact_sha(mocker):
+    """A failed exact-SHA tree fetch is shared, then retried on a later call."""
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        return _FakeResponse(503) if len(calls) == 1 else _tree_response()
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    tasks = [asyncio.create_task(snapshot._get_snapshot_at_sha(
+        "ghs_test", "acme", "widget", COMMIT_SHA
+    )) for _ in range(3)]
+    await started.wait()
+    while len(snapshot._tree_fetch_tasks) != 1:
+        await asyncio.sleep(0)
+    assert len(calls) == 1
+    release.set()
+
+    assert await asyncio.gather(*tasks) == [None, None, None]
+    assert snapshot._tree_cache == {}
+
+    retry = await snapshot._get_snapshot_at_sha(
+        "ghs_test", "acme", "widget", COMMIT_SHA
+    )
+    assert retry == ({"backend/app/x.py": BLOB_A, "backend/app/y.py": BLOB_B}, False)
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
@@ -393,6 +672,76 @@ async def test_get_branch_sha_caches_by_default(mocker):
     ref_calls = [c for c in calls if "/git/ref/heads/automain" in c[1]]
     assert len(ref_calls) == 1
     assert shared_state.github_cache_hits.get("branch_sha_snapshot", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_branch_tip_failure_shares_one_flight_and_retries(mocker):
+    """Concurrent cache-default ref failures share one request and do not cache."""
+    from app.github import get_branch_sha
+
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        if len(calls) == 1:
+            return _FakeResponse(503)
+        return _ref_response()
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    tasks = [asyncio.create_task(
+        get_branch_sha("ghs_test", "acme", "widget", "automain")
+    ) for _ in range(3)]
+    await started.wait()
+    while len(snapshot._branch_sha_fetch_tasks) != 1:
+        await asyncio.sleep(0)
+    assert len(calls) == 1
+    release.set()
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    from fastapi import HTTPException
+
+    assert all(isinstance(result, HTTPException) for result in results), repr(results)
+    assert snapshot._branch_sha_cache == {}
+
+    assert (
+        await get_branch_sha("ghs_test", "acme", "widget", "automain")
+        == COMMIT_SHA
+    )
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_branch_tip_single_flight_is_shared_with_snapshot_resolution(mocker):
+    """The direct and snapshot APIs share the same cold-cache ref request."""
+    from app.github import get_branch_sha
+
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url))
+        started.set()
+        await release.wait()
+        return _ref_response()
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+    direct = asyncio.create_task(
+        get_branch_sha("ghs_test", "acme", "widget", "automain")
+    )
+    snapshot_read = asyncio.create_task(
+        snapshot._resolve_branch_sha("ghs_test", "acme", "widget", "automain")
+    )
+    await started.wait()
+    assert len(calls) == 1
+    release.set()
+
+    assert await asyncio.gather(direct, snapshot_read) == [COMMIT_SHA, COMMIT_SHA]
+    assert len(calls) == 1
 
 
 # ── list_dir_children_on_branch ──────────────────────────────────────────────

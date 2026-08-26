@@ -10,6 +10,7 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -492,6 +493,25 @@ def test_is_breach_attributes_only_new_or_grown_breaches(
 def test_is_breach_missing_baseline_fails_closed():
     """No baseline evidence keeps an absolute breach blocking."""
     assert slp.is_breach(1201, 1200, base_count=None)
+
+
+@pytest.mark.parametrize(
+    ("base_count", "base_effective_cap", "expected"),
+    [
+        (None, 1200, None),
+        (1200, None, None),
+        (1200, 1200, None),
+        (1199, 1200, None),
+        (1201, 1200, 1201),
+    ],
+)
+def test_eligible_baseline_count_requires_a_base_tree_breach(
+    base_count, base_effective_cap, expected
+):
+    """The shared policy permits only a base-side effective-cap breach."""
+    assert (
+        slp.eligible_baseline_count(base_count, base_effective_cap) == expected
+    )
 
 
 def test_classify_size_record_delegates_breach_to_policy():
@@ -1063,16 +1083,67 @@ def test_restored_cap_bumps_keep_strategic_resident_session_chronic():
 
 
 def _real_repo_checkout() -> str | None:
-    """Return a path to a real git checkout of this repo, or None."""
+    """Return a path to a repo git can actually READ from here, or None.
+
+    Presence of ``.git`` is not the predicate, in either direction:
+
+    * ``os.path.isdir`` was the original check, and in a LINKED WORKTREE
+      ``.git`` is a FILE holding ``gitdir: <path>`` -- so it silently returned
+      None and skipped this guard in every agent and dev worktree. It only ever
+      ran in a real clone, and a green local run proved nothing about it.
+    * ``os.path.exists`` fixes that but overshoots: the standalone lane mounts
+      the checkout at ``/repo`` inside a container, and a worktree's ``gitdir:``
+      line names a HOST path that does not exist there. git then dies with
+      ``fatal: not a git repository: /repo/D:/.../.git/worktrees/<name>`` and
+      the guard errors instead of skipping.
+
+    So ask git, with the cheapest question that fails exactly when the later
+    ``git log`` would: reachable gitdir, readable object store, resolvable HEAD.
+    """
     candidates = [slp._REPO_ROOT]
-    if os.path.isdir("/repo/.git"):
+    if os.path.exists("/repo/.git"):
         candidates.append("/repo")
     for root in candidates:
-        if os.path.isdir(os.path.join(root, ".git")):
+        if not os.path.exists(os.path.join(root, ".git")):
+            continue
+        try:
+            probe = subprocess.run(
+                ["git", "-c", f"safe.directory={root}", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                # Two orders of magnitude under the lanes' --timeout=30: this
+                # reads one ref. A budget that could not fire is the bug class
+                # backend/testing/test_harness_timeout_budgets.py guards.
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and probe.stdout.strip():
             return root
     return None
 
 
+# `git log -p -- backend/testing/module_size_limits.json` materialises a diff
+# for every commit that ever touched a large, constantly-churned file, on a
+# runner already carrying eight parallel shards. The inner subprocess budget
+# below is 30s and the CI lanes run pytest with --timeout=30 -- identical
+# numbers, so any work before or after the call guarantees the harness kill
+# lands first and this guard reds as an unreproducible flake (CI run
+# 32805982004, backend shard 8).
+#
+# 120s, down from a deliberately oversized 900s. The `git log -p` above is
+# NOT where the time went -- measured, it is ~1s. The cost was
+# `phantom_ledger_records` forking git FOUR TIMES PER LEDGER RECORD for every
+# SHA the (shallow, on CI) log cannot serve: ~2,660 spawns, measured at
+# 683.69s on a truncated clone. #17888 batched those probes into a constant
+# number of forks -- measured 5.37s over the same 714 records with an
+# element-wise identical phantom list -- so the whole file now runs in 15.49s
+# under the lanes' --timeout=30. 120s is ~8x headroom over the file and ~22x
+# over this test; it stays a marker because the lane budget is 30s and a
+# shallow-clone cold cache is still slower than a warm one.
+@pytest.mark.timeout(120)
 def test_cap_bump_history_ledger_matches_git():
     """The committed cap-bump-history ledger must mirror the git-recorded bumps.
 
@@ -1108,7 +1179,13 @@ def test_cap_bump_history_ledger_matches_git():
     """
     repo_root = _real_repo_checkout()
     if repo_root is None:
-        pytest.skip("no git checkout of this repo available for the ledger guard")
+        pytest.skip(
+            "no git-readable checkout of this repo is reachable from here, so the "
+            "ledger guard has nothing to compare against. Most often a LINKED "
+            "WORKTREE mounted into the standalone lane's container: its .git file "
+            "names a host gitdir that does not exist inside the container. CI runs "
+            "this guard in a real clone, where it executes rather than skipping."
+        )
     # The CI backend shards bind the checkout read-only at /repo into a root
     # container while the runner user owns the files, so git inside the
     # container refuses every command with "detected dubious ownership" (exit
@@ -1764,9 +1841,19 @@ def test_mainline_ref_scope_excludes_non_ancestor_bumps(tmp_path, mocker):
         "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
     ):
         assert slp._mainline_git_ref() == "main"
+        real_run = subprocess.run
+        git_calls = []
+
+        def record_git_call(args, *call_args, **call_kwargs):
+            if args and args[0] == "git":
+                git_calls.append(args)
+            return real_run(args, *call_args, **call_kwargs)
+
+        mocker.patch.object(slp.subprocess, "run", side_effect=record_git_call)
         records = slp._read_git_bump_history("m.py")
         assert records is not None
         assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
+        assert ["-c", f"safe.directory={repo}"] == git_calls[-1][1:3]
 
         # Prove the test would have caught the old --all behavior: the abandoned
         # branch bump is visible under --all but must stay out of the
@@ -2034,3 +2121,55 @@ def test_unresolvable_cap_says_so_instead_of_printing_none() -> None:
 
     assert "no cap resolved" in message
     assert "None" not in message
+
+
+# Literal pins. Never replace these with the constants they check.
+_SAFE_DIRECTORY_OPTION = "safe.directory="
+_GIT_INVOCATIONS_FLOOR = 16
+
+
+def test_every_literal_git_argv_in_the_size_guard_is_safe_directory_hardened():
+    """Every literal ``git`` argv in the size-guard modules carries ``-c safe.directory=``.
+
+    The CI backend shards bind the checkout read-only at /repo into a ROOT
+    container while the runner user owns the files (``-v "$PWD:/repo:ro"``, no
+    ``--user``), so an unhardened git call exits 128 with "dubious ownership".
+
+    Promotion PR #17914 went red on exactly that: ``_read_git_bump_history``
+    lacked the option its own ref probe in ``_mainline_git_ref`` already
+    carried, so the probe resolved a mainline ref and the read then died --
+    read as genuine evidence loss, refusing every cap bump in the shard.  A
+    SECOND read, in ``rebuild_cap_bump_history_ledger``, lacked it too but
+    fails OPEN: it would have gone on silently reconciling the ledger from zero
+    git evidence and never reddened anything.
+
+    So pin the whole module surface rather than those two call sites.  A
+    partially hardened module is the defect; "hardened the probe but not the
+    read it gates" is the class.
+    """
+    unhardened: list[tuple[str, int, str]] = []
+    scanned = 0
+    for module in (slp, csl):
+        path = Path(module.__file__)
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            if ast.unparse(node.func) not in ("subprocess.run", "subprocess.check_output"):
+                continue
+            argv = node.args[0] if node.args else None
+            parts = [ast.unparse(elt) for elt in getattr(argv, "elts", None) or []]
+            if not parts or "git" not in parts[0]:
+                continue
+            scanned += 1
+            if not any(_SAFE_DIRECTORY_OPTION in part for part in parts):
+                unhardened.append((path.name, node.lineno, " ".join(parts[:6])))
+
+    # Guard the guard: a scan that silently matched nothing would pass vacuously.
+    assert scanned >= _GIT_INVOCATIONS_FLOOR, (
+        f"only {scanned} literal git invocations found across "
+        f"{[Path(m.__file__).name for m in (slp, csl)]}; the scan itself is broken"
+    )
+    assert not unhardened, (
+        "git invocations missing -c safe.directory= (they exit 128 under CI's "
+        f"root-container /repo bind mount): {unhardened}"
+    )

@@ -1495,80 +1495,159 @@ def _watchdog_metric_name_mismatch(job: ComputeJob) -> list[str]:
     return sorted(observed)
 
 
-def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
-    """True when a declared-metric job has stopped making measurable progress.
+# ── No-progress watchdog: ONE definition, two consumers ─────────────────────────
+# The poller asks "cut this job?"; the operator surface asks "why, and what
+# happens next?".  Both go through _classify_watchdog, so a job can never be
+# reported unprotected in the same breath the poller terminates it.
+#
+# States:
+#   'inert'                 the watchdog cannot fire for this job at all — no
+#                           declared metric, a non-positive timeout, or the job
+#                           reports progress only under a name it never declared
+#   'warming_up'            still inside the grace period
+#   'insufficient_history'  armed, but not yet enough usable history to judge
+#                           (or the start time needed to judge grace is absent)
+#   'protected'             armed, watching, and the metric is still moving
+#   'cutting'               the no-progress condition holds RIGHT NOW; the next
+#                           poll pass terminates the job
+_WATCHDOG_CUTTING = "cutting"
+_WATCHDOG_ENFORCING_STATES = frozenset({"protected", _WATCHDOG_CUTTING})
 
-    Fail-open: returns False unless ALL of the following hold, so a job that emits
-    no progress telemetry is never affected —
 
-    * the job declares a metric to watch;
-    * the job has been running longer than the grace period (never cut a job
-      before it has had a fair chance to start converging);
-    * the metric history spans at least a full window (the oldest recorded
-      sample is at least ``WINDOW`` seconds old) — so a job that has only just
-      begun reporting is never cut on a few seconds of data;
-    * at least ``COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES`` samples of that metric fall
-      inside the trailing ``[now - WINDOW, now]`` window (a stale buffer whose
-      last sample predates the window contributes nothing and cannot fire); and
-    * the spread (max - min) of the metric across that window is within a small
-      relative tolerance of the metric's magnitude — a sustained plateau.
+def _watchdog_effective_seconds(job: ComputeJob) -> tuple[float, float]:
+    """Return ``(window_seconds, grace_seconds)`` for this job.
 
-    Direction-agnostic: a flat metric is "no progress" whether higher or lower
-    is better, so the check never needs to know the metric's polarity.
-
-    Per-job override: if ``no_progress_timeout_seconds`` is stored in the job's
-    ``polling_metadata`` (set at job-creation time from the experiment contract),
-    it is used as both the grace period and the plateau-detection window instead
-    of the global env-var defaults.
+    A per-job ``no_progress_timeout_seconds`` (stamped into polling_metadata at
+    creation from the validated experiment contract) overrides BOTH the
+    plateau-detection window and the grace period. A malformed value falls back
+    to the global env-var defaults.
     """
-    meta = job.polling_metadata or {}
-    raw_per_job = meta.get("no_progress_timeout_seconds")
+    raw_per_job = (job.polling_metadata or {}).get("no_progress_timeout_seconds")
+    per_job_seconds: float | None = None
     if raw_per_job is not None:
         try:
             per_job_seconds = float(raw_per_job)
         except (TypeError, ValueError):
             per_job_seconds = None
-    else:
-        per_job_seconds = None
+    if per_job_seconds is not None:
+        return per_job_seconds, per_job_seconds
+    return (
+        COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS,
+        COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS,
+    )
 
-    window_seconds = per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
-    grace_seconds = per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS
 
-    if window_seconds <= 0:
+def _raw_series_mentions_metric(job: ComputeJob, metric: str) -> bool:
+    """True when the bounded history holds a sample NAMED for the declared metric.
+
+    Used only to tell two empty-history cases apart once
+    :func:`_watched_progress_samples` has rejected everything: telemetry that
+    never arrived (``no_telemetry``) versus telemetry that arrived unusable —
+    a present-but-unparseable ``received_at``, or a non-numeric ``value``
+    (``malformed_history``). Both are cut; the operator needs to know which,
+    because one is a silent job and the other is a broken ingestion path.
+    """
+    series = (job.polling_metadata or {}).get("progress_series")
+    if not isinstance(series, list):
         return False
+    return any(
+        isinstance(sample, dict) and sample.get("name") == metric for sample in series
+    )
+
+
+def _classify_watchdog(job: ComputeJob, *, now: datetime) -> tuple[str, str | None]:
+    """The single definition of the no-progress watchdog's verdict.
+
+    Returns ``(state, reason)``. ``state == 'cutting'`` IS the kill condition:
+    :func:`_no_progress_stalled` is a thin alias for it and
+    :func:`derive_watchdog_protection_status` reports it, so the operator
+    surface cannot claim a job is unprotected while the poller is terminating
+    it for no progress.
+
+    Not fail-open in the "silence is safe" sense, and that is deliberate: a
+    declared watchdog is an enforcement promise, not telemetry decoration. Past
+    the grace window a job that never reported its declared metric is
+    ``cutting``/``no_telemetry`` — the same verdict as a plateau. What IS
+    fail-open is the *undeclared* case: no declared metric, a non-positive
+    timeout, or progress reported only under some other name is ``inert`` and
+    is never cut.
+    """
+    window_seconds, grace_seconds = _watchdog_effective_seconds(job)
+
     metric = _declared_progress_metric(job)
     if metric is None:
-        return False
-    if job.started_at is None:
-        return False
-    if (now - job.started_at).total_seconds() < grace_seconds:
-        return False
+        return "inert", "no_declared_metric"
+    if window_seconds <= 0:
+        return "inert", "timeout_disabled"
+
     samples = _watched_progress_samples(job, metric)
+
+    # Reporting under another name is a contract mismatch, not silence: the job
+    # IS emitting progress, so cutting it would be a false positive. Evaluated
+    # before grace because it is inert regardless of when the job started.
+    if not samples and _watchdog_metric_name_mismatch(job):
+        return "inert", "metric_name_mismatch"
+
+    started_at = getattr(job, "started_at", None)
+    if not isinstance(started_at, datetime):
+        started_at = _parse_naive_iso_datetime(started_at)
+    if started_at is None:
+        # Grace cannot be evaluated without a start time; never cut on a guess.
+        return "insufficient_history", "missing_start_time"
+    if (now - started_at).total_seconds() < grace_seconds:
+        return "warming_up", None
+
     if not samples:
-        # Reporting under another name is a contract mismatch, not silence.  It
-        # is surfaced as unprotected and must not be mistaken for a missing signal.
-        if _watchdog_metric_name_mismatch(job):
-            return False
-        # A declared watchdog is an enforcement promise, not merely telemetry
-        # decoration: after its grace window, missing telemetry is no progress.
-        return True
+        if _raw_series_mentions_metric(job, metric):
+            return _WATCHDOG_CUTTING, "malformed_history"
+        return _WATCHDOG_CUTTING, "no_telemetry"
+
     window_start = now - timedelta(seconds=window_seconds)
     if samples[-1][0] < window_start:
-        return True
+        return _WATCHDOG_CUTTING, "stale_telemetry"
     if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
-        return False
+        return "insufficient_history", "insufficient_window"
     # Enough history: the oldest recorded sample must be at least a full window
     # old, else we have not yet observed a window's worth of the metric.
     if (now - samples[0][0]).total_seconds() < window_seconds:
-        return False
+        return "insufficient_history", "insufficient_window"
     window = [(t, v) for (t, v) in samples if t >= window_start]
     if len(window) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
-        return False
+        return "insufficient_history", "insufficient_window"
     values = [v for (_, v) in window]
     spread = max(values) - min(values)
     reference = max((abs(v) for v in values), default=0.0)
     tolerance = COMPUTE_JOB_NO_PROGRESS_EPSILON * (reference if reference > 0 else 1.0)
-    return spread <= tolerance
+    if spread <= tolerance:
+        return _WATCHDOG_CUTTING, "plateau"
+    return "protected", None
+
+
+def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
+    """True when a declared-metric job has stopped making measurable progress.
+
+    A thin alias for ``_classify_watchdog(job, now=now)[0] == 'cutting'`` — see
+    that function for the full state table and for why the operator surface
+    shares it. Fires when, past the grace period, one of the following holds:
+
+    * the declared metric never arrived, or arrived unusable;
+    * the newest usable sample predates the trailing window; or
+    * the spread (max - min) of the metric across that window is within a small
+      relative tolerance of its magnitude — a sustained plateau.
+
+    Direction-agnostic: a flat metric is "no progress" whether higher or lower
+    is better, so the check never needs to know the metric's polarity.
+
+    Never fires for a job that declared no metric, whose effective timeout is
+    non-positive, that is still inside its grace period, that has no recorded
+    start time, that has not yet accumulated a full window of history, or that
+    reports progress under some metric name other than the one it declared.
+
+    Per-job override: ``no_progress_timeout_seconds`` in ``polling_metadata``
+    (set at job-creation time from the experiment contract) replaces both the
+    grace period and the plateau-detection window.
+    """
+    return _classify_watchdog(job, now=now)[0] == _WATCHDOG_CUTTING
 
 
 def derive_watchdog_protection_status(
@@ -1579,179 +1658,62 @@ def derive_watchdog_protection_status(
 ) -> dict:
     """Derive watchdog-protection status fields from a job's polling_metadata.
 
-    Intended for inclusion in serialized compute-job response payloads.  The
-    derivation mirrors ``_no_progress_stalled`` exactly so operators see the same
-    effective timeout the watchdog would use — there is no forked definition.
+    Intended for inclusion in serialized compute-job response payloads. The
+    verdict is :func:`_classify_watchdog` — the same call
+    :func:`_no_progress_stalled` makes — so there is genuinely no forked
+    definition. A job the poller is about to terminate for no progress reports
+    ``watchdog_state='cutting'`` with ``watchdog_active=True``, never "the
+    watchdog will not currently cut this job".
 
     Returns a dict with:
-      watchdog_state (str): High-level state — one of 'protected', 'warming_up',
-          'insufficient_history', 'stale_telemetry', 'inert'.
-      watchdog_active (bool): True only when watchdog_state == 'protected'.
+      watchdog_state (str): One of 'protected', 'cutting', 'warming_up',
+          'insufficient_history', 'inert'.
+      watchdog_active (bool): True when the watchdog is enforcing on this job
+          right now — 'protected' (armed and watching a moving metric) or
+          'cutting' (the no-progress condition holds and the next poll pass
+          terminates it).
       no_progress_timeout_seconds (int|None): Effective timeout in seconds
-          (per-job override if set, else global default). None when no metric declared.
-      last_progress_at (str|None): ISO timestamp of the most recent
-          progress_series sample matching the declared metric (server receipt time),
-          or None.
+          (per-job override if set, else global default). None when no metric
+          is declared.
+      last_progress_at (str|None): Receipt time of the newest sample the
+          watchdog actually enforces on, taken from the same series the cut is
+          computed from — so an operator reading it is reading the enforcement
+          clock, including the pre-upgrade ``t`` fallback. None when no usable
+          sample exists.
       watchdog_inert_reason (str|None): Granular reason the watchdog is not
-          firing. None when active.
+          firing. None whenever it is enforcing.
+      watchdog_cut_reason (str|None): Why the job is being cut — 'plateau',
+          'stale_telemetry', 'no_telemetry' or 'malformed_history'. None unless
+          the state is 'cutting'.
     """
     from types import SimpleNamespace
 
     _now = now if now is not None else _utcnow()
-
     meta = polling_metadata or {}
-    _job = SimpleNamespace(polling_metadata=meta)
 
-    # Normalise started_at: accept datetime or ISO string from JSON-serialised payloads.
+    # Accept a datetime or an ISO string from JSON-serialised payloads.
     _started_at: datetime | None = None
     if isinstance(started_at, datetime):
         _started_at = started_at
     elif isinstance(started_at, str) and started_at:
         _started_at = _parse_naive_iso_datetime(started_at)
 
-    # Resolve effective timeout — identical to the resolution in _no_progress_stalled.
-    raw_per_job = meta.get("no_progress_timeout_seconds")
-    per_job_seconds: float | None = None
-    if raw_per_job is not None:
-        try:
-            per_job_seconds = float(raw_per_job)
-        except (TypeError, ValueError):
-            pass
-    effective_seconds = (
-        per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
-    )
-    grace_seconds = (
-        per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS
-    )
+    _job = SimpleNamespace(polling_metadata=meta, started_at=_started_at)
 
+    state, reason = _classify_watchdog(_job, now=_now)
+    enforcing = state in _WATCHDOG_ENFORCING_STATES
+
+    window_seconds, _grace_seconds = _watchdog_effective_seconds(_job)
     metric = _declared_progress_metric(_job)
-
-    if metric is None:
-        return {
-            "watchdog_state": "inert",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": None,
-            "last_progress_at": None,
-            "watchdog_inert_reason": "no_declared_metric",
-        }
-
-    if effective_seconds <= 0:
-        return {
-            "watchdog_state": "inert",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": None,
-            "watchdog_inert_reason": "timeout_disabled",
-        }
-
-    # Collect matching samples using server receipt time (received_at).
-    series = meta.get("progress_series")
-    last_received_at: str | None = None
-    last_received_ts: datetime | None = None
-    has_any_sample = False
-    has_valid_received_at = False
-
-    if isinstance(series, list):
-        for sample in series:
-            if not isinstance(sample, dict) or sample.get("name") != metric:
-                continue
-            has_any_sample = True
-            recv_str = sample.get("received_at")
-            ts = _parse_naive_iso_datetime(recv_str)
-            if ts is None:
-                continue
-            has_valid_received_at = True
-            if last_received_ts is None or ts > last_received_ts:
-                last_received_ts = ts
-                last_received_at = recv_str
-
-    # Metric-name mismatch is deterministic: samples exist for OTHER metrics
-    # but none match the declared one.  Surface this before grace/start-time checks
-    # because it is always inert regardless of when the job started.
-    if not has_any_sample and _watchdog_metric_name_mismatch(_job):
-        return {
-            "watchdog_state": "inert",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": None,
-            "watchdog_inert_reason": "metric_name_mismatch",
-        }
-
-    # When started_at is absent we cannot evaluate the grace period — surface that
-    # honestly as insufficient_history/missing_start_time.
-    if _started_at is None:
-        return {
-            "watchdog_state": "insufficient_history",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": last_received_at,
-            "watchdog_inert_reason": "missing_start_time",
-        }
-    if (_now - _started_at).total_seconds() < grace_seconds:
-        return {
-            "watchdog_state": "warming_up",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": last_received_at,
-            "watchdog_inert_reason": None,
-        }
-
-    # No samples for the declared metric (and no mismatch detected above).
-    if not has_any_sample:
-        return {
-            "watchdog_state": "insufficient_history",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": None,
-            "watchdog_inert_reason": "no_telemetry",
-        }
-
-    # Samples exist for the declared metric but none have a valid received_at.
-    if not has_valid_received_at:
-        return {
-            "watchdog_state": "insufficient_history",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": None,
-            "watchdog_inert_reason": "malformed_history",
-        }
-
-    # All samples are older than the effective window — stale telemetry.
-    window_start = _now - timedelta(seconds=effective_seconds)
-    if last_received_ts is not None and last_received_ts < window_start:
-        return {
-            "watchdog_state": "stale_telemetry",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": last_received_at,
-            "watchdog_inert_reason": "stale_telemetry",
-        }
-
-    # Samples exist and are fresh — check whether we have a full window of history.
-    samples = _watched_progress_samples(_job, metric)
-    if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
-        return {
-            "watchdog_state": "insufficient_history",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": last_received_at,
-            "watchdog_inert_reason": "insufficient_window",
-        }
-    if samples and ((_now - samples[0][0]).total_seconds() < effective_seconds):
-        return {
-            "watchdog_state": "insufficient_history",
-            "watchdog_active": False,
-            "no_progress_timeout_seconds": int(effective_seconds),
-            "last_progress_at": last_received_at,
-            "watchdog_inert_reason": "insufficient_window",
-        }
+    samples = _watched_progress_samples(_job, metric) if metric is not None else []
 
     return {
-        "watchdog_state": "protected",
-        "watchdog_active": True,
-        "no_progress_timeout_seconds": int(effective_seconds),
-        "last_progress_at": last_received_at,
-        "watchdog_inert_reason": None,
+        "watchdog_state": state,
+        "watchdog_active": enforcing,
+        "no_progress_timeout_seconds": None if metric is None else int(window_seconds),
+        "last_progress_at": samples[-1][0].isoformat() if samples else None,
+        "watchdog_inert_reason": None if enforcing else reason,
+        "watchdog_cut_reason": reason if state == _WATCHDOG_CUTTING else None,
     }
 
 
@@ -2080,6 +2042,24 @@ def _no_data_terminal_reason(
     )
 
 
+def _criterion_free_terminal_reason(artifact_reference: Any | None) -> str:
+    """Say which way a criterion-free experiment's result contract resolved.
+
+    Two outcomes share this branch and they are opposites, so the reason has to
+    distinguish them: durable output satisfies the contract, nothing at all does
+    not. Callers must only reach here for a run that finished CLEAN -- a
+    criterion-free job that exited non-zero failed for its own reason, and
+    reporting "declared no metric" over the top of that hides the real cause.
+    """
+    if artifact_reference is None:
+        return _NO_CRITERION_EXPERIMENT_REASON
+    return (
+        "compute_experiment declared no metric; durable artifacts satisfy the "
+        f"result contract (uri={artifact_reference.uri}, "
+        f"file_count={artifact_reference.file_count})"
+    )
+
+
 def _job_expects_data(job: ComputeJob, task: Task | None) -> bool:
     """True when the job declared it should produce a metric or arms output.
 
@@ -2110,12 +2090,20 @@ def _job_expects_data(job: ComputeJob, task: Task | None) -> bool:
 def _is_criterion_free_experiment(job: "ComputeJob", task: Task | None) -> bool:
     """True for compute_experiment tasks that declared no metric and no criterion.
 
-    A compute_experiment is a measurement task by definition — finishing with no
-    declared metric, no arms, and no success_criterion is never a clean SUCCESS.
-    The run produced nothing evaluable, so it must be reclassified as FAILURE rather
-    than silently benefiting from the _job_expects_data carve-out that was designed
-    for pure side-effect commands. Non-experiment task types (research, plan, …) are
-    unaffected: they are legitimate side-effect jobs and the carve-out stays intact.
+    Such a run still has to produce SOMETHING, but the caller decides what counts:
+    a criterion-free experiment finishing with neither a number nor a durable
+    artifact is reclassified as FAILURE, while one that wrote durable output is a
+    clean SUCCESS. (The artifact half of that rule lives at the ``no_data``
+    computation in ``_process_single_compute_job``, which is where the artifact
+    reference is available.) Without the carve-out these jobs would silently
+    inherit the ``_job_expects_data`` exemption designed for pure side-effect
+    commands and complete clean having produced nothing at all.
+
+    Not every run worth doing emits a scalar — a training loop that writes
+    checkpoints has done its job — which is why durable output satisfies the
+    contract instead of an invented stand-in metric. Non-experiment task types
+    (research, plan, …) are unaffected: they are legitimate side-effect jobs and
+    the carve-out stays intact.
 
     Checks both the task payload AND the job's polling_metadata for a stamped
     declared_metric so a job created with an explicit declared_metric kwarg (which
@@ -3528,7 +3516,7 @@ async def _process_single_compute_job(
             and _job_expects_data(job, task)
             and _declared_metric_unmeasured(job, status)
         )
-        no_data = (
+        _measurement_missing = (
             not timeout_like
             and not no_usable_gpu
             and status.status == ComputeJobStatus.SUCCEEDED
@@ -3544,8 +3532,37 @@ async def _process_single_compute_job(
             )
         )
         terminal_artifact_reference = (
-            await collect_terminal_artifact_reference(job) if no_data else None
+            await collect_terminal_artifact_reference(job) if _measurement_missing else None
         )
+        # A criterion-free experiment is satisfied by DURABLE OUTPUT.
+        #
+        # Not every run worth doing emits a scalar. A training loop that runs for
+        # three hours and writes checkpoints has produced exactly what was asked
+        # of it, and failing it for lacking an accuracy number is the contract
+        # being wrong about the work, not the work being wrong. The corpus shows
+        # what that costs: with a scalar mandatory, 127 of 197 declared metrics
+        # are delivery plumbing rather than science -- the single commonest is
+        # "did my artifacts come back", declared 58 times. That metric is the
+        # author routing around this gate, so make the gate ask for the thing
+        # directly instead of accepting a number that restates it.
+        #
+        # Scope is deliberately narrow. Only the criterion-free branch is
+        # relaxed, and it is disjoint from the `_job_expects_data` branch by
+        # construction (criterion-free requires no declared_metric and no arms;
+        # _job_expects_data requires one of them). A job that DECLARED a metric
+        # and failed to report it is still `no_data` -- an unfulfilled promise is
+        # a different thing from never having made one, and artifacts do not
+        # excuse it.
+        #
+        # An empty artifact location still fails: a run that produced no number
+        # AND no output produced nothing, which is the case this gate was
+        # actually built for. `collect_terminal_artifact_reference` is fail-soft
+        # (any detection error degrades to None), so the failure direction on a
+        # detection fault is unchanged from today.
+        _criterion_free_satisfied_by_artifacts = bool(
+            _criterion_free_experiment and terminal_artifact_reference
+        )
+        no_data = _measurement_missing and not _criterion_free_satisfied_by_artifacts
         if timeout_like or no_progress_like:
             outcome = ComputeJobOutcome.TIMED_OUT
         elif no_usable_gpu or no_data:
@@ -3576,8 +3593,17 @@ async def _process_single_compute_job(
                     _NO_USABLE_GPU_TERMINAL_REASON
                     if no_usable_gpu
                     else (
-                        _NO_CRITERION_EXPERIMENT_REASON
-                        if _criterion_free_experiment
+                        # Gated on `_measurement_missing`, not on
+                        # `_criterion_free_experiment` alone. Being criterion-free is
+                        # a property of the JOB, not a cause of death: a
+                        # criterion-free run that exited non-zero must report the
+                        # failure it actually hit, not "declared no metric" over the
+                        # top of it. `_measurement_missing` is true here exactly when
+                        # the run finished clean and the result contract is what is
+                        # being judged -- which is both the no-artifact failure and
+                        # the artifact-satisfied success.
+                        _criterion_free_terminal_reason(terminal_artifact_reference)
+                        if _criterion_free_experiment and _measurement_missing
                         else (
                             _no_data_terminal_reason(
                                 terminal_artifact_reference,

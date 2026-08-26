@@ -41,7 +41,7 @@ from app.qualification_state_resolver import (
     resolve_dimension_states_from_ledger,
     patch_qualification_state_from_dimension_states,
 )
-from app.time_utils import _coerce_naive_utc
+from app.time_utils import _coerce_naive_utc, utc_iso
 from app import release_version as _release_version
 from app import compute as _compute
 from app.digest_cache import DigestCache
@@ -90,7 +90,7 @@ def _compose_serving_block(
             for e in artifacts
             if e.get("serving_status") == "serving_confirmed" and e.get("served_at")
         ),
-        version.served_at.isoformat() if version.served_at else None,
+        utc_iso(version.served_at),
     )
     return {
         "status": aggregate_status,
@@ -157,9 +157,7 @@ async def get_retirement_critiques(
                     "pattern_that_produced_it": c.get("pattern_that_produced_it", ""),
                     "lesson": c.get("lesson", ""),
                     "cycle_id": cycle.id,
-                    "cycle_created_at": cycle.created_at.isoformat()
-                    if cycle.created_at
-                    else None,
+                    "cycle_created_at": utc_iso(cycle.created_at),
                 }
             )
             if len(critiques_out) >= limit:
@@ -298,8 +296,8 @@ async def _serialize_version_history_entry(
         "version_number": version.version_number,
         "status": version.status,
         "phase": version.phase,
-        "opened_at": version.opened_at.isoformat(),
-        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
+        "opened_at": utc_iso(version.opened_at),
+        "promoted_at": utc_iso(version.promoted_at),
         "promoted_sha": version.promoted_sha,
         "qualification_attempts": version.qualification_attempts,
         "qualification_retry_episode": getattr(version, "qualification_retry_episode", 0),
@@ -315,17 +313,13 @@ async def _serialize_version_history_entry(
         # promotion from one that actually shipped (additive fields).
         "serving_status": version.serving_status,
         "served_sha": version.served_sha,
-        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "served_at": utc_iso(version.served_at),
         "deploy_failure_reason": version.deploy_failure_reason,
-        "deploy_confirm_deadline": version.deploy_confirm_deadline.isoformat()
-        if version.deploy_confirm_deadline
-        else None,
+        "deploy_confirm_deadline": utc_iso(version.deploy_confirm_deadline),
         # Approved-activation control state (additive; NULL until an operator
         # approves activation).  activation_requested_at NULL + unconfirmed is
         # "awaiting approval"; set + unconfirmed is "approved-but-not-yet-executed".
-        "activation_requested_at": version.activation_requested_at.isoformat()
-        if version.activation_requested_at
-        else None,
+        "activation_requested_at": utc_iso(version.activation_requested_at),
         "activation_requested_by": version.activation_requested_by,
         "aggregate_serving_status": aggregate["serving_status"],
         "aggregate_deploy_failure_reason": aggregate["reason_code"],
@@ -655,9 +649,12 @@ async def get_version_lifecycle(
                     in_flight=_lq_status == "pending",
                     promotion_check_wait=bool(_lq.get("promotion_pending")),
                     rubric_redrive_count=int(_lq.get("rubric_redrive_count") or 0),
+                    promotion_failure_count=int(
+                        _lq.get("promotion_failure_count") or 0
+                    ),
                     last_attempt=_lq if _lq else None,
                     knob=_get_trigger_mode(),
-                    evaluated_at=_utcnow().isoformat(),
+                    evaluated_at=utc_iso(_utcnow()),
                 )
             except Exception:
                 logger.exception(
@@ -797,17 +794,13 @@ async def get_version_lifecycle(
             current_version_out = {
                 "version_number": open_row.version_number,
                 "phase": open_row.phase,
-                "phase_changed_at": open_row.phase_changed_at.isoformat()
-                if open_row.phase_changed_at
-                else None,
+                "phase_changed_at": utc_iso(open_row.phase_changed_at),
                 "phase_reasoning": open_row.phase_reasoning,
                 "goal": open_row.goal,
-                "goal_updated_at": open_row.goal_updated_at.isoformat()
-                if open_row.goal_updated_at
-                else None,
+                "goal_updated_at": utc_iso(open_row.goal_updated_at),
                 "goal_editor_info": open_row.goal_editor_info,
                 "live_current_focus": live_current_focus,
-                "opened_at": open_row.opened_at.isoformat(),
+                "opened_at": utc_iso(open_row.opened_at),
                 "qualification_attempts": open_row.qualification_attempts,
                 "qualification_retry_episode": open_row.qualification_retry_episode,
                 "active_qualification_attempt_id": (
@@ -873,16 +866,12 @@ async def get_version_lifecycle(
                 # version is itself promoted — normally NULL for a still-open one).
                 "serving_status": open_row.serving_status,
                 "served_sha": open_row.served_sha,
-                "served_at": open_row.served_at.isoformat()
-                if open_row.served_at
-                else None,
+                "served_at": utc_iso(open_row.served_at),
                 "deploy_failure_reason": open_row.deploy_failure_reason,
                 # Approved-activation control state (additive; normally NULL for a
                 # still-open version — populated once an operator approves activation
                 # of the promoted row this version becomes).
-                "activation_requested_at": open_row.activation_requested_at.isoformat()
-                if open_row.activation_requested_at
-                else None,
+                "activation_requested_at": utc_iso(open_row.activation_requested_at),
                 "activation_requested_by": open_row.activation_requested_by,
                 "aggregate_serving_status": aggregate_serving["serving_status"],
                 "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
@@ -890,9 +879,7 @@ async def get_version_lifecycle(
                 "serving": _compose_serving_block(
                     aggregate_serving, artifact_evidence, open_row
                 ),
-                "deploy_confirm_deadline": open_row.deploy_confirm_deadline.isoformat()
-                if open_row.deploy_confirm_deadline
-                else None,
+                "deploy_confirm_deadline": utc_iso(open_row.deploy_confirm_deadline),
                 # Out-of-band promotion provenance (nullable). Non-null only when an
                 # operator force-merged this version outside normal qualification flow.
                 # Degrades gracefully when the model column is absent on this branch.
@@ -1118,9 +1105,7 @@ async def set_version_phase(
     return {
         "version_number": open_ver.version_number,
         "phase": open_ver.phase,
-        "phase_changed_at": open_ver.phase_changed_at.isoformat()
-        if open_ver.phase_changed_at
-        else None,
+        "phase_changed_at": utc_iso(open_ver.phase_changed_at),
         "phase_reasoning": open_ver.phase_reasoning,
     }
 
@@ -1179,9 +1164,7 @@ async def set_version_goal(
     return {
         "version_number": open_ver.version_number,
         "goal": open_ver.goal,
-        "goal_updated_at": open_ver.goal_updated_at.isoformat()
-        if open_ver.goal_updated_at
-        else None,
+        "goal_updated_at": utc_iso(open_ver.goal_updated_at),
         "goal_editor_info": open_ver.goal_editor_info,
     }
 
@@ -1263,9 +1246,7 @@ async def cut_version(
             "version_number": new_version.version_number,
             "phase": new_version.phase,
             "goal": new_version.goal,
-            "opened_at": new_version.opened_at.isoformat()
-            if new_version.opened_at
-            else None,
+            "opened_at": utc_iso(new_version.opened_at),
         },
     }
 
@@ -1389,9 +1370,7 @@ async def get_audit_findings(
         return {
             "findings": get_latest_qualification_audit_findings(open_row, verdict),
             "audit_missing_reason": verdict.audit_missing_reason,
-            "finalized_at": verdict.finalized_at.isoformat()
-            if verdict.finalized_at
-            else None,
+            "finalized_at": utc_iso(verdict.finalized_at),
             "source": "qualification_verdict",
         }
 
@@ -1540,12 +1519,10 @@ async def get_version_summary(
         "status": version.status,
         "goal": version.goal,
         # Timestamps (isoformat, null-safe)
-        "opened_at": version.opened_at.isoformat() if version.opened_at else None,
-        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
-        "served_at": version.served_at.isoformat() if version.served_at else None,
-        "phase_changed_at": version.phase_changed_at.isoformat()
-        if version.phase_changed_at
-        else None,
+        "opened_at": utc_iso(version.opened_at),
+        "promoted_at": utc_iso(version.promoted_at),
+        "served_at": utc_iso(version.served_at),
+        "phase_changed_at": utc_iso(version.phase_changed_at),
         # Merged work
         "merged_count": merged_count,
         "merged_task_count": merged_count,  # backward-compat alias
@@ -1838,7 +1815,7 @@ async def clear_deploy_failed(
         "version_number": version.version_number,
         "serving_status": version.serving_status,
         "served_sha": version.served_sha,
-        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "served_at": utc_iso(version.served_at),
         "deploy_failure_reason": version.deploy_failure_reason,
         "clear_mode": clear_mode,
         "operator_attested": clear_mode == "operator_attested",
@@ -1933,7 +1910,7 @@ async def approve_activation(
             "version_number": version.version_number,
             "project_id": str(project_id),
             "promoted_sha": version.promoted_sha,
-            "activation_requested_at": version.activation_requested_at.isoformat(),
+            "activation_requested_at": utc_iso(version.activation_requested_at),
             "activation_requested_by": version.activation_requested_by,
             "serving_status": version.serving_status,
         }
@@ -1944,7 +1921,7 @@ async def approve_activation(
     qual["activation_approval"] = {
         "mode": "in_product_approval",
         "operator": operator_id,
-        "approved_at": now.isoformat(),
+        "approved_at": utc_iso(now),
         "approved_sha": version.promoted_sha,
     }
     version.last_qualification = qual
@@ -1957,7 +1934,7 @@ async def approve_activation(
         "version_number": version.version_number,
         "project_id": str(project_id),
         "promoted_sha": version.promoted_sha,
-        "activation_requested_at": version.activation_requested_at.isoformat(),
+        "activation_requested_at": utc_iso(version.activation_requested_at),
         "activation_requested_by": version.activation_requested_by,
         "serving_status": version.serving_status,
     }
@@ -2118,7 +2095,7 @@ async def record_activation_receipt(
             "version_number": version.version_number,
             "serving_status": version.serving_status,
             "served_sha": version.served_sha,
-            "served_at": version.served_at.isoformat() if version.served_at else None,
+            "served_at": utc_iso(version.served_at),
             "deploy_failure_reason": version.deploy_failure_reason,
             "receipt": {
                 "mode": receipt_mode,
@@ -2151,7 +2128,7 @@ async def record_activation_receipt(
         "version_number": version.version_number,
         "serving_status": version.serving_status,
         "served_sha": version.served_sha,
-        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "served_at": utc_iso(version.served_at),
         "deploy_failure_reason": version.deploy_failure_reason,
         "receipt": receipt,
     }
@@ -2234,12 +2211,10 @@ async def get_release_version_summary(
         "status": version.status,
         "goal": version.goal,
         # Timestamps (isoformat, null-safe)
-        "opened_at": version.opened_at.isoformat() if version.opened_at else None,
-        "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
-        "served_at": version.served_at.isoformat() if version.served_at else None,
-        "phase_changed_at": version.phase_changed_at.isoformat()
-        if version.phase_changed_at
-        else None,
+        "opened_at": utc_iso(version.opened_at),
+        "promoted_at": utc_iso(version.promoted_at),
+        "served_at": utc_iso(version.served_at),
+        "phase_changed_at": utc_iso(version.phase_changed_at),
         # Merged work
         "merged_count": merged_count,
         "acceptance_aggregate": acceptance_aggregate,

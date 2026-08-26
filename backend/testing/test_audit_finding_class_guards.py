@@ -47,14 +47,19 @@ Safe to run standalone (``pytest --standalone --no-postgres``): no DB imports.
 from __future__ import annotations
 
 import ast
+import os
 import re
-import subprocess
 import textwrap
 from pathlib import Path
 
 import pytest
 
 from testing.fixgate_attribution import format_offender_marker
+from testing.repo_checkout import (
+    git_command,
+    require_git_readable_repo_root,
+    require_repo_root,
+)
 from testing.identity_extraction import extract_python_test_nodes
 
 # Canonical registry for the MissingGreenlet fidelity growth ratchet lives in
@@ -79,15 +84,15 @@ from app.greenlet_fidelity import (
 
 _THIS_DIR = Path(__file__).resolve().parent
 _BACKEND_ROOT = _THIS_DIR.parent
+# NOTE: correct only in a plain checkout. Every containerised lane mounts
+# backend/ at /app and the repo root separately at /repo, so this resolves to
+# ``/``. Guards that need the repo root must go through
+# ``testing.repo_checkout`` (which tries /repo first and FAILS rather than
+# skipping); this name is kept for the paths that legitimately want the
+# sibling-of-backend spelling and already handle its absence.
 _REPO_ROOT = _BACKEND_ROOT.parent
 _VERSIONS_DIR = _BACKEND_ROOT / "alembic" / "versions"
 _RECONCILIATION_PATH = _BACKEND_ROOT / "app" / "migration_reconciliation.py"
-
-
-def _repo_root_available() -> bool:
-    """True when the repo root .git checkout is accessible (not the CI
-    backend-only Docker context)."""
-    return (_REPO_ROOT / ".git").is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +340,46 @@ _EXCLUDE_RE = re.compile(
     r"|[/\\]test_audit_finding_class_guards\.py$"  # this file references the term in comments
 )
 
+# Directory names never descended into. Every one of these is already excluded
+# by ``_EXCLUDE_RE`` above, so pruning changes no result -- it only stops the
+# walk from enumerating and stat-ing a subtree whose every entry it would then
+# throw away. ``node_modules`` is the expensive one: the scan below used to
+# spend an ``is_file()`` stat on each of its ~200k entries *before* consulting
+# the exclusion, which is the same defect PR #17853 fixed in the Vitest
+# inventory walk.
+#
+# ``alembic/versions`` is deliberately NOT here: it needs both path components
+# to match, and pruning a bare ``versions`` directory would over-exclude. It
+# stays with the regex, where it costs nothing.
+#
+# Kept a strict subset of ``_EXCLUDE_RE`` by
+# ``test_pruned_directories_are_all_already_excluded``, so the two cannot drift
+# into the walk silently skipping a tree the guard is supposed to cover.
+_PRUNED_DIR_NAMES = frozenset(
+    {".git", "node_modules", "__pycache__", ".venv", "build", "dist", "coverage"}
+)
+
+
+def _iter_scannable_files(search_dir: Path):
+    """Yield candidate files under *search_dir*, skipping excluded subtrees.
+
+    ``os.walk`` rather than ``rglob("*")`` for two reasons, both cost:
+
+    * it separates directories from files without a ``stat`` per entry, where
+      ``Path.is_file()`` is a syscall each time; and
+    * pruning ``dirnames`` in place stops the descent at the top of an excluded
+      subtree instead of walking all of it and rejecting entry by entry.
+
+    The suffix test is pure string work and is applied before anything touches
+    the filesystem.
+    """
+    for dirpath, dirnames, filenames in os.walk(search_dir):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNED_DIR_NAMES]
+        for filename in filenames:
+            if os.path.splitext(filename)[1] not in _CODE_EXTENSIONS:
+                continue
+            yield Path(dirpath) / filename
+
 # Column name dropped in migration 0351
 _DROPPED_COLUMN = "theme" + "_delivery"  # split to avoid self-match
 
@@ -416,11 +461,7 @@ class TestDroppedColumnResidualAbsent:
 
         for search_dir in _resolve_search_dirs():
             checked_dirs.append(search_dir)
-            for path in search_dir.rglob("*"):
-                if not path.is_file():
-                    continue
-                if path.suffix not in _CODE_EXTENSIONS:
-                    continue
+            for path in _iter_scannable_files(search_dir):
                 path_str = str(path)
                 if _EXCLUDE_RE.search(path_str):
                     continue
@@ -454,6 +495,54 @@ class TestDroppedColumnResidualAbsent:
             + "\n".join(f"  - {h}" for h in sorted(hits)) + "\n" + format_offender_marker(str(offender) for offender in hits)
         )
 
+    def test_pruned_directories_are_all_already_excluded(self):
+        """Pruning must never remove a tree the guard is supposed to search.
+
+        ``_iter_scannable_files`` stops descending at ``_PRUNED_DIR_NAMES`` for
+        speed. That is only sound while every pruned name is one ``_EXCLUDE_RE``
+        would have rejected anyway — otherwise the walk silently stops covering a
+        tree and the guard reports "no residual references" because it never
+        looked, which is indistinguishable from a pass.
+
+        The two lists are separate declarations and can drift, so assert the
+        implication directly rather than trusting adjacency.
+        """
+        for name in _PRUNED_DIR_NAMES:
+            probe = f"/repo/admin-ui/{name}/some_file.py"
+            assert _EXCLUDE_RE.search(probe), (
+                f"'{name}' is pruned from the walk but _EXCLUDE_RE does not "
+                f"exclude it — pruning it drops files the guard must scan. "
+                f"Either remove it from _PRUNED_DIR_NAMES or add it to "
+                f"_EXCLUDE_RE."
+            )
+
+        assert "node_modules" in _PRUNED_DIR_NAMES, (
+            "node_modules must stay pruned. Re-admitting it restores the ~200k "
+            "wasted stat calls that made this guard fail as a 30s timeout on the "
+            "Docker-on-Windows bind mount instead of on its assertion."
+        )
+
+    def test_scan_skips_pruned_subtrees_but_still_finds_real_files(self, tmp_path):
+        """The walk must ignore an excluded subtree and still collect its peers.
+
+        A decoy under ``node_modules`` proves the prune is live; the sibling
+        proves the prune did not take the whole tree with it.
+        """
+        (tmp_path / "app").mkdir()
+        real = tmp_path / "app" / "real.py"
+        real.write_text("x = 1", encoding="utf-8")
+
+        decoy_dir = tmp_path / "node_modules" / "pkg"
+        decoy_dir.mkdir(parents=True)
+        (decoy_dir / "decoy.py").write_text("x = 1", encoding="utf-8")
+
+        (tmp_path / "app" / "notes.rst").write_text("x", encoding="utf-8")
+
+        found = {p.name for p in _iter_scannable_files(tmp_path)}
+        assert "real.py" in found
+        assert "decoy.py" not in found, "node_modules subtree was descended into"
+        assert "notes.rst" not in found, "extension filter stopped applying"
+
 
 # ---------------------------------------------------------------------------
 # 4. .test_durations freshness — must be committed, valid JSON, and not stale
@@ -485,7 +574,11 @@ class TestTestDurationsCommittedAndFresh:
         bash scripts/store-backend-durations.sh
     then commit the updated backend/.test_durations.
 
-    Skipped when the repo root is unavailable (CI backend-only Docker context).
+    Resolves the repo root through ``testing.repo_checkout``: the old
+    ``(_BACKEND_ROOT.parent / ".git").is_dir()`` precondition resolved to
+    ``/.git`` inside every containerised lane, so this guard reported SKIPPED
+    on every CI run and had never enforced anything. A missing checkout now
+    FAILS instead of skipping.
     """
 
     def test_test_durations_committed_valid_and_covers_collection(self):
@@ -493,31 +586,28 @@ class TestTestDurationsCommittedAndFresh:
         import json
         import random
 
-        gitignore_path = _REPO_ROOT / ".gitignore"
+        repo_root = require_repo_root()
+        gitignore_path = repo_root / ".gitignore"
         durations_path = _BACKEND_ROOT / ".test_durations"
 
-        if not _repo_root_available():
-            pytest.skip(
-                "repo root .git not available in this test environment "
-                "(CI docker context is ./backend; run locally or via "
-                "scripts/test-backend.sh from a checkout for enforcement)"
-            )
-
         # (a) .gitignore must NOT contain the pattern
-        if gitignore_path.exists():
-            lines = gitignore_path.read_text().splitlines()
-            assert "backend/.test_durations" not in lines, (
-                ".gitignore still lists 'backend/.test_durations'. "
-                "Remove the line so the committed durations file can be tracked. "
-                "Time-balanced CI shard splitting requires this file to be committed."
-            )
+        assert gitignore_path.is_file(), (
+            f"{gitignore_path} is missing from the checkout at {repo_root}; "
+            "this guard cannot report clean without reading it."
+        )
+        lines = gitignore_path.read_text().splitlines()
+        assert "backend/.test_durations" not in lines, (
+            ".gitignore still lists 'backend/.test_durations'. "
+            "Remove the line so the committed durations file can be tracked. "
+            "Time-balanced CI shard splitting requires this file to be committed."
+        )
 
         # (b) File must be tracked by git
-        result = subprocess.run(
-            ["git", "ls-files", "backend/.test_durations"],
-            cwd=str(_REPO_ROOT),
-            capture_output=True,
-            text=True,
+        git_root = require_git_readable_repo_root()
+        result = git_command(git_root, "ls-files", "backend/.test_durations")
+        assert result.returncode == 0, (
+            f"git ls-files failed in {git_root} (exit {result.returncode}): "
+            f"{result.stderr.strip()}"
         )
         tracked_paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         assert tracked_paths, (
@@ -602,8 +692,10 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
     contain references to removed components, preventing future implementers
     from following stale guidance.
 
-    Skipped only when the repo root is unavailable (CI backend-only Docker
-    context that doesn't have the docs/ directory mounted).
+    Resolves the repo root through ``testing.repo_checkout`` -- the previous
+    ``_REPO_ROOT / "docs"`` spelling looked at ``/docs`` inside every
+    containerised lane, so this scan reported SKIPPED on every CI run. An
+    absent docs/ tree is now a FAILURE, not a skip.
     """
 
     def test_long_lived_docs_do_not_reference_removed_code_paths(self):
@@ -631,23 +723,23 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
             )
 
         # Scan documentation directories
-        docs_root = _REPO_ROOT / "docs"
-        if not docs_root.is_dir():
-            pytest.skip(
-                "docs/ directory not available in this test environment "
-                "(CI docker context may not mount the docs directory)"
-            )
+        repo_root = require_repo_root()
+        docs_root = repo_root / "docs"
+        assert docs_root.is_dir(), (
+            f"{docs_root} is missing from the checkout at {repo_root}; the "
+            "removed-code scan below would be vacuous, so it must not report "
+            "clean."
+        )
 
         # Collect all .md files in docs/ and docs/plans/
         doc_files: list[Path] = []
         for pattern in ["*.md", "plans/*.md"]:
             doc_files.extend(docs_root.glob(pattern))
 
-        if not doc_files:
-            pytest.skip(
-                "No .md files found in docs/ or docs/plans/. "
-                "Cannot verify removed code references."
-            )
+        assert doc_files, (
+            f"No .md files found under {docs_root} or its plans/ subdirectory "
+            "-- the removed-code scan would be vacuous."
+        )
 
         # Scan each doc file for references to removed code
         violations: list[str] = []
@@ -657,7 +749,7 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
             except OSError:
                 continue
 
-            rel_path = doc_path.relative_to(_REPO_ROOT)
+            rel_path = doc_path.relative_to(repo_root)
             for removed_ref in removed_refs:
                 violations.extend(
                     f"{rel_path}: contains '{pattern}' "
@@ -1083,27 +1175,24 @@ class TestStandaloneRosterIncludesGuardModule:
         assert guard_classes, "Guard classes must be defined in this module"
 
         # Verify the standalone roster includes the guard module so audit-finding
-        # guards run in all test contexts (including CI backend-only Docker where
-        # repo root is unavailable and guards would otherwise skip).
-        # In Docker, the repo root is mounted at /repo; check there first.
-        script_path = Path("/repo") / "scripts" / "test-backend.sh"
-        if not script_path.exists():
-            script_path = _REPO_ROOT / "scripts" / "test-backend.sh"
-        if not script_path.exists():
-            pytest.skip(
-                "scripts/test-backend.sh not found in this environment "
-                "(repo root not available in CI backend-only Docker context)"
-            )
+        # guards run in all test contexts. ``require_repo_root`` tries the /repo
+        # bind mount first and FAILS rather than skipping when no checkout is
+        # visible -- a roster check that reports clean without reading the
+        # roster is exactly the defect this module guards.
+        script_path = require_repo_root() / "scripts" / "test-backend.sh"
+        assert script_path.is_file(), (
+            f"{script_path} is missing; the standalone roster cannot be read."
+        )
 
         content = script_path.read_text()
         assert "testing/test_audit_finding_class_guards.py" in content, (
             "testing/test_audit_finding_class_guards.py must be included in the "
             "STANDALONE_ARGS array in scripts/test-backend.sh. The guards check for "
             "module-size violations, migration divergences, dropped-column residuals, "
-            ".test_durations freshness, and stale documentation references. Three of "
-            "these guards silently skip when the repo root is unavailable; including "
-            "this module in --standalone ensures all guards run in CI backend-only "
-            "Docker context and catch regressions on every commit."
+            ".test_durations freshness, and stale documentation references. They "
+            "resolve the checkout through testing/repo_checkout.py and FAIL rather "
+            "than skip when none is visible; including this module in --standalone "
+            "is what puts them in front of every commit."
         )
 
 

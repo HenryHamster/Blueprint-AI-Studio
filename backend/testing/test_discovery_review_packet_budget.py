@@ -192,6 +192,7 @@ def test_progressive_degradation_retains_partial_detail_when_it_fits_budget():
         "landed_outcomes": small_collection("landed", 4),
         "experiment_outcomes": bulky_experiment_outcomes(6),
         "verification_summaries": small_collection("verification", 6),
+        "withheld_findings": small_collection("withheld", 6),
     }
     source_parent = {
         "task_id": "source-task",
@@ -231,6 +232,7 @@ def test_progressive_degradation_retains_partial_detail_when_it_fits_budget():
         "landed_outcomes": 2,
         "experiment_outcomes": 3,
         "verification_summaries": 3,
+        "withheld_findings": 3,
     }
     reduced_included, reduced_coverage = p._evidence_coverage_for_level(
         collections, level_one_counts, level=1
@@ -310,6 +312,7 @@ def test_zeroed_nonempty_categories_get_a_floor_and_a_degradation_marker():
         "landed_outcomes": bulky("landed", 5),
         "experiment_outcomes": [],
         "verification_summaries": [],
+        "withheld_findings": [],
     }
     zero_counts = {name: 0 for name in collections}
     included, evidence_coverage = p._evidence_coverage_for_level(
@@ -350,6 +353,7 @@ def test_genuinely_empty_categories_stay_empty_without_a_marker():
         "landed_outcomes": [],
         "experiment_outcomes": [],
         "verification_summaries": [],
+        "withheld_findings": [],
     }
     zero_counts = {name: 0 for name in collections}
     included, evidence_coverage = p._evidence_coverage_for_level(
@@ -390,6 +394,7 @@ def test_under_budget_receipt_is_unchanged_without_a_marker():
         "landed_outcomes": [{"id": "l-0", "note": "small"}],
         "experiment_outcomes": [],
         "verification_summaries": [],
+        "withheld_findings": [],
     }
     included, evidence_coverage = p._evidence_coverage_for_level(
         collections, p._COLLECTION_BASE_DETAIL_COUNTS, level=0
@@ -1085,6 +1090,10 @@ _DIGEST_COLLECTION_NAMES = (
     "landed_outcomes",
     "experiment_outcomes",
     "verification_summaries",
+    # Findings the cycle produced but routed or filtered instead of turning
+    # into work. It degrades in lockstep with every other collection, so the
+    # digest fixtures must carry it too.
+    "withheld_findings",
 )
 
 

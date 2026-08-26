@@ -1956,8 +1956,12 @@ def _patch_common_rollup_mocks(mocker):
     # fetches the caps JSON and changed-file contents at the staging branch.
     # Default to "ok" so the guard is a no-op; tests exercising breach cases
     # override this.
-    async def _bound_ok(*_args, expected_head_sha=None, **_kwargs):
-        return SizeCapPreflightResult("ok", None, expected_head_sha)
+    async def _bound_ok(
+        *_args, expected_head_sha=None, expected_base_sha=None, **_kwargs
+    ):
+        return SizeCapPreflightResult(
+            "ok", None, expected_head_sha, base_sha=expected_base_sha
+        )
 
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",

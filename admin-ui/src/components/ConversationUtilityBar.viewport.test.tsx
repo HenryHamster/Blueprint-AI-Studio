@@ -6,6 +6,7 @@ import {
   type ConversationWorkdayStatus,
 } from '../utils/conversationWorkdayStatus';
 import type { StrategicChatLiveState } from '../utils/strategicSessionLive';
+import type { Alert } from '../types/alert';
 import { ConversationUtilityBar } from './ConversationUtilityBar';
 import { expectNoOverflowAt } from '../test/viewport';
 
@@ -30,6 +31,7 @@ describe('ConversationUtilityBar — viewport regression', () => {
     searchQuery?: string;
     workdayStatus?: ConversationWorkdayStatus;
     chatLiveState?: StrategicChatLiveState;
+    alerts?: Alert[];
   }) {
     host = document.createElement('div');
     host.style.width = '100%';
@@ -46,6 +48,7 @@ describe('ConversationUtilityBar — viewport regression', () => {
           onSearchChange={() => {}}
           workdayStatus={props.workdayStatus}
           chatLiveState={props.chatLiveState}
+          alerts={props.alerts}
         />,
       );
     });
@@ -176,5 +179,24 @@ describe('ConversationUtilityBar — viewport regression', () => {
     expect(line?.textContent).toContain('Replying');
     expect(line?.textContent).toContain('5m ago');
     expect(line?.className).not.toContain('hidden');
+  });
+
+  test('an actionable long operator alert remains contained at 375px', async () => {
+    await expectNoOverflowAt(375, () => renderBar({
+      expanded: false,
+      alerts: [{
+        id: 'alert-1',
+        project_id: 'project-1',
+        severity: 'ERROR',
+        title: 'Strategic cycle needs immediate operator attention after a long runner failure',
+        message: 'The active cycle cannot continue because its assigned runner stopped reporting before it completed the required recovery work.',
+        task_id: 'task-1',
+        created_at: '2026-08-15T00:00:00Z',
+        dismissed_at: null,
+        acknowledged_at: null,
+      }],
+    }));
+    expect(host?.querySelector('[data-testid="conversation-utility-alert"]')?.textContent)
+      .toContain('Strategic cycle needs immediate operator attention');
   });
 });

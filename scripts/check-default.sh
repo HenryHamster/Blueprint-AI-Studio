@@ -74,6 +74,20 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "[check] python3 is absent on PATH; routing python3 to $_PY3_FALLBACK"
 fi
 
+# Interpreter ENCODING, the companion to the interpreter identity above. Python
+# picks the host locale codec for print(), open() and `subprocess(text=True)`.
+# On Linux and in CI that is UTF-8; on the Windows developer host it is cp1252,
+# so the SAME guard behaves differently on the two hosts: it emits byte 0x97
+# where CI emits an em dash (the captured lane output then fails a strict UTF-8
+# decode), and it dies with UnicodeEncodeError the moment it echoes tool output
+# containing a character cp1252 lacks -- the box drawing, arrows and check marks
+# that pytest/tsc/vitest print. A guard that cannot print its own verdict
+# reports nothing. UTF-8 mode makes every python-backed lane below, including
+# the inline `python3 -c` helpers, behave the way CI already does. No-op on a
+# UTF-8 host.
+PYTHONUTF8=1
+export PYTHONUTF8
+
 WITH_TESTS=0
 FULL_SCOPE=0
 for arg in "$@"; do
@@ -167,6 +181,43 @@ run() {
 
 source scripts/backend-test-route.sh
 
+# Derived-artifact freshness, and repair of what may be repaired.
+#
+# The size ledger below is ONE derived artifact whose guard happens to be a
+# standalone checker, so it was the only one this gate enforced
+# unconditionally; every OTHER derived artifact in this repo (the websocket
+# emitter inventory fixture, the hand-kept WEBSOCKET_EMITTER_INVENTORY dict, the
+# conversational-Workday per-file test counts, the ranked-queue and durations
+# artifacts) is guarded by a pytest drift sentinel. Stale guard data is
+# self-concealing — it is attributable on exactly the one PR that introduces it
+# and inherited-then-warn-passed on every PR after — so anything it slips past
+# lands on the automain->main promotion matrix, which is what killed promotion
+# PRs #17738 and #17764. This lane runs only the sentinels registered for the
+# surfaces THIS diff touches, attributed against base, so it never blocks on
+# inherited drift.
+#
+# `--fix` and the position matter, and both are load-bearing:
+#
+#  * `--fix` regenerates a drifted artifact that derived_artifact_repair
+#    registers as decision-free (today: test-estate-ranked-queue.md, a pure
+#    report with no consumer but its own guard) and then RE-RUNS the sentinel to
+#    prove the drift cleared. Ratchets, floors, snapshots, caps and measured
+#    durations are never regenerated. Reporting alone was not enough: three
+#    hand-written repair commits landed in three days, each after a promotion PR
+#    had already gone red.
+#  * It runs on BOTH paths, and BEFORE the static corpus rather than after.
+#    Under `./check test` the corpus runs the whole roster, so a repair that
+#    happened after it would be graded against the pre-repair tree and still
+#    fail the gate. Ordering it first costs one scoped harness run and makes the
+#    corpus see the tree the PR will actually carry.
+if [ -f scripts/sentinel_freshness.py ]; then
+  run "derived-artifact freshness (registered drift sentinels)" \
+    python3 scripts/sentinel_freshness.py --fix --base "$BASE" --repo-root "$PWD"
+else
+  echo "[check] derived-artifact freshness helper is missing — refusing to skip the gate"
+  FAILED+=("sentinel freshness helper missing")
+fi
+
 # The database-free size guard is part of every publication gate. The
 # baseline-aware size-only path covers all five governed sections and never
 # invokes --fix or changes the cap ledger. ./check test additionally runs the
@@ -182,29 +233,6 @@ else
   FAILED+=("static release guard helper missing")
 fi
 
-# Derived-artifact freshness. The size ledger above is ONE derived artifact
-# whose guard happens to be a standalone checker, so it is the only one this
-# gate enforced unconditionally; every OTHER derived artifact in this repo (the
-# websocket emitter inventory fixture, the hand-kept WEBSOCKET_EMITTER_INVENTORY
-# dict, the conversational-Workday per-file test counts, the ranked-queue and
-# durations artifacts) is guarded by a pytest drift sentinel that ran only under
-# `./check test`. Stale guard data is self-concealing — it is attributable on
-# exactly the one PR that introduces it and inherited-then-warn-passed on every
-# PR after — so anything it slips past lands on the automain->main promotion
-# matrix, which is what killed promotion PRs #17738 and #17764. This lane runs
-# only the sentinels registered for the surfaces THIS diff touches, attributed
-# against base, so it never blocks on inherited drift.
-# Skipped under `./check test`: the attributed static corpus above already runs
-# every sentinel in the roster, so running them twice would only cost time.
-if [ "$WITH_TESTS" != "1" ]; then
-  if [ -f scripts/sentinel_freshness.py ]; then
-    run "derived-artifact freshness (registered drift sentinels)" \
-      python3 scripts/sentinel_freshness.py --base "$BASE" --repo-root "$PWD"
-  else
-    echo "[check] derived-artifact freshness helper is missing — refusing to skip the gate"
-    FAILED+=("sentinel freshness helper missing")
-  fi
-fi
 
 # Idempotent npm install guarded by package-lock IDENTITY, not the mere
 # existence of node_modules. A warm/reused VM carries a populated
@@ -337,6 +365,28 @@ if touches "backend/"; then
   fi
   if [ -n "$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do case "$f" in backend/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]; then
     # required backend-authoring verification. No skip can mint this receipt.
+    _VERIFICATION_DIR='backend'
+    _VERIFICATION_HARNESS='scripts/test-backend.sh'
+    _record_backend_abort() {
+      local state="$1" reason="$2"
+      if [ -r scripts/verification_receipt.py ]; then
+        python3 scripts/verification_receipt.py backend-pytest-diagnosis \
+          --receipt "$_VERIFY_RECEIPT" --task-id "$_VERIFY_TASK_ID" \
+          --directory "$_VERIFICATION_DIR" --state "$state" --reason "$reason" \
+          --current-exit-code 1 >/dev/null 2>&1 || true
+      elif python3 -c 'import json,sys; out,task,directory,state,reason,code=sys.argv[1:];
+try:
+    payload=json.load(open(out,encoding="utf-8"))
+except (OSError,ValueError):
+    payload={}
+lanes=payload.get("lanes") if isinstance(payload.get("lanes"),dict) else {}
+lanes["backend-pytest"]={"lane":"backend-pytest","state":state,"blocking":True,"current_exit_code":int(code),"error":reason,"new_failures":{},"suppressed_failures":{},"disappeared_failures":{},"skipped_failures":{}}
+payload["version"]=1; payload["lanes"]=lanes
+open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' \
+          "$_VERIFY_RECEIPT" "$_VERIFY_TASK_ID" "$_VERIFICATION_DIR" "$state" "$reason" 1; then
+        :
+      fi
+    }
     _VERIFICATION_ROUTE_HELPER_OK=0
     unset -f select_backend_test_route 2>/dev/null || true
     if [ -r scripts/backend-test-route.sh ] \
@@ -346,10 +396,9 @@ if touches "backend/"; then
       _VERIFICATION_ROUTE_HELPER_OK=1
     else
       echo "[check] required backend verification FAILED — route helper unavailable or invalid"
+      _record_backend_abort route_helper_unavailable "route helper unavailable or invalid"
       FAILED+=("backend verification route helper")
     fi
-    _VERIFICATION_DIR='backend'
-    _VERIFICATION_HARNESS='scripts/test-backend.sh'
     _VERIFICATION_CHANGED=$(mktemp /tmp/check_verification_changed.XXXXXX)
     : >"$_VERIFICATION_CHANGED"
     printf '%s\n' "$CHANGED" | grep -E '^backend/.*\.py$' | while IFS= read -r f; do
@@ -358,6 +407,7 @@ if touches "backend/"; then
     _VERIFICATION_RUFF_OK=0
     if [ ! -s "$_VERIFICATION_CHANGED" ]; then
       echo "[check] required backend verification FAILED — no changed Python file in $_VERIFICATION_DIR"
+      _record_backend_abort target_unavailable "no changed Python file in $_VERIFICATION_DIR"
       FAILED+=("$_VERIFICATION_DIR verification: no Python target")
     else
       echo "[check] $_VERIFICATION_DIR required ruff..."
@@ -366,6 +416,7 @@ if touches "backend/"; then
         _VERIFICATION_RUFF_OK=1
       else
         echo "[check] $_VERIFICATION_DIR required ruff FAILED"
+        _record_backend_abort lint_failure "required ruff failed"
         FAILED+=("$_VERIFICATION_DIR required ruff")
       fi
     fi
@@ -405,6 +456,7 @@ if touches "backend/"; then
       if [ "$_verification_resolver_rc" -ne 0 ]; then
         echo "[check] required backend verification resolver FAILED (exit $_verification_resolver_rc)" >&2
         cat "$_verification_stderr" >&2
+        _record_backend_abort resolver_failure "backend verification resolver failed (exit $_verification_resolver_rc)"
         FAILED+=("$_VERIFICATION_DIR verification resolver")
       fi
       _VERIFICATION_ORDINARY_SELECTORS=$(
@@ -432,12 +484,14 @@ if touches "backend/"; then
     fi
     if [ "$_VERIFICATION_RUFF_OK" = "1" ] && [ -z "$_VERIFICATION_SELECTORS" ]; then
       echo "[check] required backend verification FAILED — no impacted pytest file/node was resolved"
+      _record_backend_abort selector_unavailable "no impacted pytest file/node was resolved"
       FAILED+=("$_VERIFICATION_DIR verification: no impacted pytest")
     elif [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
       _verification_ordinary_count=$(printf '%s\n' "$_VERIFICATION_ORDINARY_SELECTORS" | grep -c . || true)
       _verification_mandatory_count=$(printf '%s\n' "$_VERIFICATION_MANDATORY_SELECTORS" | grep -c . || true)
       if [ "$_verification_ordinary_count" -gt 8 ]; then
         echo "[check] required backend verification FAILED — resolver exceeded ordinary selector cap: $_verification_ordinary_count"
+        _record_backend_abort selector_cap_exceeded "resolver exceeded ordinary selector cap: $_verification_ordinary_count"
         FAILED+=("$_VERIFICATION_DIR verification: ordinary selector cap")
       fi
       if [ "$_verification_mandatory_count" -gt 0 ]; then
@@ -453,12 +507,14 @@ if touches "backend/"; then
       _verification_postgres_flag=""
       if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
         echo "[check] required backend verification FAILED — sanctioned harness missing: $_VERIFICATION_HARNESS"
+        _record_backend_abort harness_unavailable "sanctioned harness missing: $_VERIFICATION_HARNESS"
         FAILED+=("$_VERIFICATION_DIR verification: harness missing")
       elif [ "$_VERIFICATION_ROUTE_HELPER_OK" = "1" ]; then
         if _verification_postgres_flag="$(select_backend_test_route)"; then
           :
         else
           echo "[check] required backend verification state=runtime_unavailable — PostgreSQL runtime unavailable"
+          _record_backend_abort runtime_unavailable "PostgreSQL runtime unavailable"
           _verification_capability_tmp="${_VERIFY_CAPABILITY_RECEIPT}.$$"
           if ( umask 077; printf 'backend_verification:runtime_unavailable:v1:%s\n' \
             "$_VERIFY_TASK_ID" >"$_verification_capability_tmp" ) \
@@ -467,6 +523,7 @@ if touches "backend/"; then
           else
             echo "[check] unable to record backend verification capability receipt" >&2
             rm -f "$_verification_capability_tmp" "$_VERIFY_CAPABILITY_RECEIPT"
+            _record_backend_abort capability_receipt_failure "unable to record backend verification capability receipt"
             FAILED+=("$_VERIFICATION_DIR verification: capability receipt")
           fi
           FAILED+=("$_VERIFICATION_DIR verification: runtime_unavailable")

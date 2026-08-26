@@ -390,6 +390,38 @@ def annotate_precompute_metadata(
     return annotated
 
 
+def payload_age_seconds(generated_at: str | None) -> float | None:
+    """Seconds elapsed since a cached payload's own ``generated_at`` stamp.
+
+    Endpoints that serve a ``DigestCache`` payload derive freshness from the
+    payload's OWN wire stamp rather than the cache entry's wall age, so a
+    served-stale payload reports its true (old) age instead of looking fresh.
+
+    That stamp is written by ``utc_iso(...)``, which since #17890 carries a
+    ``+00:00`` offset, while ``_utcnow()`` is naive UTC. Subtracting the two
+    directly raises ``TypeError: can't subtract offset-naive and offset-aware
+    datetimes``. Every call site had wrapped that subtraction in
+    ``except (ValueError, TypeError)``, so the breakage surfaced not as an
+    error but as a permanently ``None`` ``precompute_age_seconds`` -- the
+    admin UI's staleness dimmer silently going dead on every affected card.
+
+    Parsing is normalised through ``_coerce_naive_utc`` so BOTH formats work:
+    the zone-carrying stamp written now, and the zone-less one still sitting
+    in any payload cached before this change rolled out.
+
+    Returns ``None`` only when the stamp is absent or genuinely unparseable.
+    """
+    from app.time_utils import _coerce_naive_utc, _utcnow
+
+    if not generated_at:
+        return None
+    try:
+        parsed = _coerce_naive_utc(datetime.fromisoformat(generated_at))
+    except (ValueError, TypeError):
+        return None
+    return max(0.0, (_utcnow() - parsed).total_seconds())
+
+
 async def _active_project_ids(session) -> List[uuid.UUID]:
     """Return ids of ACTIVE projects worth priming a digest for.
 

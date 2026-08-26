@@ -39,6 +39,10 @@ function classificationLabel(c: LaneBaselineTrendBlock['classification']): strin
   return '—';
 }
 
+function liveCount(value: number | null | undefined): string | number {
+  return value == null ? '—' : value;
+}
+
 function WasteTaxonomyTable({ taxonomy }: { taxonomy: LaneWasteTaxonomy }) {
   const total = Object.values(taxonomy).reduce((a, b) => a + b, 0);
   if (total === 0) return <p className="text-xs text-neutral-500">No waste data available.</p>;
@@ -61,6 +65,90 @@ function WasteTaxonomyTable({ taxonomy }: { taxonomy: LaneWasteTaxonomy }) {
       })}
       <p className="text-xs text-neutral-500 pt-1">Total waste tasks: {total}</p>
     </div>
+  );
+}
+
+function RetargetConvergenceTable({
+  laneWaste,
+}: {
+  laneWaste: LaneDiagResponse['lane_waste'];
+}) {
+  const affected = laneWaste.rollup_supersede_affected_reviews_to_converge
+    ?? laneWaste.supersede_affected_reviews_to_converge;
+  const unaffected = laneWaste.rollup_supersede_unaffected_reviews_to_converge;
+  const capDirections = laneWaste.cap_exhausted_directions ?? [];
+  return (
+    <table className="w-full text-xs">
+      <thead>
+        <tr className="text-neutral-500 border-b border-neutral-800">
+          <th className="text-left py-1 font-normal">Metric</th>
+          <th className="text-right py-1 font-normal">Count</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Reviews to converge</td>
+          <td className="py-1 text-right text-neutral-200">
+            {laneWaste.reviews_to_converge?.count ?? 0}{' '}
+            <span className="text-neutral-500">
+              (median {laneWaste.reviews_to_converge?.median ?? '—'}, P95 {laneWaste.reviews_to_converge?.p95 ?? '—'})
+            </span>
+          </td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Superseded-rollup reviews to converge</td>
+          <td className="py-1 text-right text-neutral-200">
+            {affected?.median ?? '—'}{' '}
+            <span className="text-neutral-500">
+              (median of {affected?.count ?? 0} merged of{' '}
+              {laneWaste.rollup_supersede_affected_chain_count
+                ?? laneWaste.supersede_affected_chain_count
+                ?? 0} superseded rollup chains, P95 {affected?.p95 ?? '—'})
+            </span>
+          </td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Rollup control reviews to converge</td>
+          <td className="py-1 text-right text-neutral-200">
+            {unaffected?.median ?? '—'}{' '}
+            <span className="text-neutral-500">
+              (median of {unaffected?.count ?? 0} merged of{' '}
+              {laneWaste.rollup_supersede_unaffected_chain_count ?? 0} unaffected rollup chains, P95{' '}
+              {unaffected?.p95 ?? '—'})
+            </span>
+          </td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Directions lost to the review cap</td>
+          <td className="py-1 text-right text-neutral-200">
+            {laneWaste.cap_exhausted_direction_count ?? 0}{' '}
+            <span className="text-neutral-500">
+              ({laneWaste.cap_exhausted_chain_count ?? 0} chains)
+            </span>
+          </td>
+        </tr>
+        {capDirections.length > 0 && (
+          <tr className="border-b border-neutral-800/50">
+            <td className="py-1 text-neutral-300">Cap-loss directions</td>
+            <td className="py-1 text-right text-neutral-500">
+              {capDirections.map((direction) => direction.direction_text || direction.direction_id).join(', ')}
+            </td>
+          </tr>
+        )}
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Delta-scope retargets</td>
+          <td className="py-1 text-right text-neutral-200">{liveCount(laneWaste.retarget_review_scope_counts?.delta)}</td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Full-scope retargets</td>
+          <td className="py-1 text-right text-neutral-200">{liveCount(laneWaste.retarget_review_scope_counts?.full)}</td>
+        </tr>
+        <tr className="border-b border-neutral-800/50">
+          <td className="py-1 text-neutral-300">Stale-head discards</td>
+          <td className="py-1 text-right text-neutral-200">{liveCount(laneWaste.stale_head_discard_count)}</td>
+        </tr>
+      </tbody>
+    </table>
   );
 }
 
@@ -178,18 +266,61 @@ function TrendRow({
   block: LaneBaselineTrendBlock | undefined;
   fmt?: (v: number) => string;
 }) {
-  const display = (v: number | null | undefined) =>
-    v == null ? '—' : fmtVal ? fmtVal(v) : v.toFixed(1);
+  const display = (side: 'prior' | 'latest') => {
+    const value = block?.[side];
+    const availability = block?.availability?.[side]
+      ?? (value == null ? 'unavailable' : 'available');
+    if (availability === 'evicted') return 'Evicted';
+    if (availability === 'unavailable') return 'Unavailable';
+    return fmtVal ? fmtVal(value as number) : (value as number).toFixed(1);
+  };
 
   return (
     <tr className="border-b border-neutral-800/50">
       <td className="py-1 text-neutral-300">{label}</td>
-      <td className="py-1 text-right text-neutral-400">{display(block?.prior)}</td>
-      <td className="py-1 text-right text-neutral-200">{display(block?.latest)}</td>
+      <td className="py-1 text-right text-neutral-400">{display('prior')}</td>
+      <td className="py-1 text-right text-neutral-200">{display('latest')}</td>
       <td className={`py-1 text-right font-medium ${classificationBadge(block?.classification ?? null)}`}>
         {classificationLabel(block?.classification ?? null)}
       </td>
     </tr>
+  );
+}
+
+function CapLossDirectionTrend({ trend }: { trend: LaneBaselineTrend }) {
+  const directions = trend.outer_loop_convergence?.cap_exhausted_directions;
+  const versions = [
+    { key: 'prior', label: `Prior (v${trend.prior_version})` },
+    { key: 'latest', label: `Latest (v${trend.latest_version})` },
+  ] as const;
+
+  return (
+    <div className="mt-2 rounded border border-neutral-800/70 p-2" data-testid="cap-loss-direction-trend">
+      <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+        Cap-loss directions by version
+      </p>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {versions.map(({ key, label }) => {
+          const records = directions?.[key] ?? [];
+          return (
+            <div key={key}>
+              <p className="text-xs text-neutral-500">{label}</p>
+              {records.length === 0 ? (
+                <p className="text-xs text-neutral-500">None</p>
+              ) : (
+                <ul className="text-xs text-neutral-300 list-disc list-inside">
+                  {records.map((direction) => (
+                    <li key={direction.direction_id}>
+                      {direction.direction_text || direction.direction_id}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -323,6 +454,69 @@ function CrossVersionTrendPanel({ trend }: { trend: LaneBaselineTrend }) {
               label="Cap-exhausted chains"
               block={trend.outer_loop_convergence?.cap_exhausted_chain_count}
             />
+            <TrendRow
+              label="Directions lost to cap"
+              block={trend.outer_loop_convergence?.cap_exhausted_direction_count}
+            />
+            <TrendRow
+              label="Superseded reviews to converge (median)"
+              block={trend.outer_loop_convergence?.supersede_affected_reviews_to_converge_median}
+            />
+            <TrendRow
+              label="Superseded reviews to converge (P95)"
+              block={trend.outer_loop_convergence?.supersede_affected_reviews_to_converge_p95}
+            />
+            <TrendRow
+              label="Rollup affected reviews (median)"
+              block={trend.outer_loop_convergence?.rollup_supersede_affected_reviews_to_converge_median}
+            />
+            <TrendRow
+              label="Rollup control reviews (median)"
+              block={trend.outer_loop_convergence?.rollup_supersede_unaffected_reviews_to_converge_median}
+            />
+          </tbody>
+        </table>
+        <CapLossDirectionTrend trend={trend} />
+      </div>
+
+      <div>
+        <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">
+          Retarget Convergence
+        </p>
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-neutral-500 border-b border-neutral-800">
+              <th className="text-left py-1 font-normal">Metric</th>
+              <th className="text-right py-1 font-normal">Prior</th>
+              <th className="text-right py-1 font-normal">Latest</th>
+              <th className="text-right py-1 font-normal">Trend</th>
+            </tr>
+          </thead>
+          <tbody>
+            <TrendRow
+              label="Converged chains (sample size)"
+              block={trend.retarget_convergence?.reviews_to_converge.count}
+            />
+            <TrendRow
+              label="Reviews to converge (median)"
+              block={trend.retarget_convergence?.reviews_to_converge.median}
+            />
+            <TrendRow
+              label="Reviews to converge (P95)"
+              block={trend.retarget_convergence?.reviews_to_converge.p95}
+            />
+            <TrendRow
+              label="Delta-scope retargets"
+              block={trend.retarget_convergence?.retarget_review_scope_counts.delta}
+            />
+            <TrendRow
+              label="Full-scope retargets"
+              block={trend.retarget_convergence?.retarget_review_scope_counts.full}
+            />
+            <TrendRow
+              label="Stale-head discards"
+              block={trend.retarget_convergence?.stale_head_discard_count}
+            />
           </tbody>
         </table>
       </div>
@@ -401,6 +595,13 @@ export function LaneDiagPanel({ projectId }: LaneDiagPanelProps) {
           Waste Taxonomy
         </h4>
         <WasteTaxonomyTable taxonomy={data.lane_waste.waste_taxonomy} />
+      </div>
+
+      <div>
+        <h4 className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">
+          Retarget Convergence
+        </h4>
+        <RetargetConvergenceTable laneWaste={data.lane_waste} />
       </div>
 
       <div>

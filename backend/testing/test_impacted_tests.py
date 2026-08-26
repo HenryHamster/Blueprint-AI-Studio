@@ -407,6 +407,97 @@ def test_malformed_surface_manifest_is_graceful(tmp_path):
     assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
 
 
+def test_corpus_lane_requirement_is_derived_from_the_registered_surfaces(tmp_path):
+    """A sentinel needs a corpus-lane seat only if it guards a NON-backend surface.
+
+    The corpus lane is the only lane that runs on a diff holding no backend
+    Python file. A sentinel registered exclusively against backend surfaces is
+    therefore selected only by backend diffs, which already resolve selectors
+    through the backend-authoring lane; one registered against admin-ui/,
+    agent/, scripts/ or a derived artifact is reachable nowhere else.
+    """
+    root = str(tmp_path)
+    _write_surface_manifest(
+        root,
+        [
+            {"glob": "backend/app/**/*.py", "sentinels": ["backend/testing/test_be.py"]},
+            {"glob": "admin-ui/src/**", "sentinels": ["backend/testing/test_fe.py"]},
+            # A sentinel on BOTH surfaces still needs the seat: the non-backend
+            # half of its job is unreachable without one.
+            {"glob": "backend/**/*.py", "sentinels": ["backend/testing/test_both.py"]},
+            {"glob": "agent/**", "sentinels": ["backend/testing/test_both.py"]},
+        ],
+    )
+    required = impacted_tests.corpus_lane_required_sentinels(root)
+    assert required == [
+        "backend/testing/test_both.py",
+        "backend/testing/test_fe.py",
+    ]
+
+
+def test_corpus_lane_requirement_compares_on_a_path_segment_boundary(tmp_path):
+    """``backend-other/`` is not a backend surface.
+
+    A bare string-prefix test would silently exempt a sentinel guarding a
+    sibling directory whose name merely starts with ``backend``.
+    """
+    root = str(tmp_path)
+    _write_surface_manifest(
+        root,
+        [{"glob": "backend-other/**", "sentinels": ["backend/testing/test_x.py"]}],
+    )
+    assert impacted_tests.corpus_lane_required_sentinels(root) == [
+        "backend/testing/test_x.py"
+    ]
+
+
+def test_corpus_lane_requirement_yields_nothing_without_a_manifest(tmp_path):
+    """No manifest means no registrations at all, not "nothing is required".
+
+    Callers must treat an empty result as the vacuous case and say so; the
+    left-shift guard does exactly that with an explicit non-emptiness assertion
+    before it compares anything against the roster.
+    """
+    assert impacted_tests.corpus_lane_required_sentinels(str(tmp_path)) == []
+    _write(str(tmp_path), "backend/testing/drift_sentinel_surfaces.json", "{not json")
+    assert impacted_tests.corpus_lane_required_sentinels(str(tmp_path)) == []
+
+
+def test_live_corpus_lane_requirement_reproduces_the_hand_maintained_exemptions():
+    """The derived rule matches what the hand-kept name set used to encode.
+
+    That set named four backend-only sentinels as exempt. It carried no
+    mechanism to notice a fifth, and did not: ``test_scripts_dir_resolution_
+    guard.py`` was registered on ``backend/**/*.py`` -- backend-only, exempt by
+    the same reasoning -- and reddened the promotion matrix because the list had
+    to be edited by hand and was not. Pinning both directions here keeps the
+    derivation honest: it must still exempt every name that set exempted, and
+    must not have quietly started exempting a sentinel that guards a
+    non-backend surface.
+    """
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    registered: set[str] = set()
+    for _regex, sentinels in impacted_tests._load_surface_manifest(repo_root):
+        registered.update(sentinels)
+    assert registered, "live drift_sentinel_surfaces.json registered no sentinels"
+    required = set(impacted_tests.corpus_lane_required_sentinels(repo_root))
+    assert required <= registered
+    formerly_exempt = {
+        "backend/testing/test_direction_referential_guard.py",
+        "backend/testing/test_size_limits_checker.py",
+        "backend/testing/test_migration_0621_safe_encrypt_backfill.py",
+        "backend/testing/test_migration_0626_safe_encrypt_backfill.py",
+    }
+    assert not (required & formerly_exempt)
+    # And the sentinel whose omission from that set was the actual defect.
+    assert (
+        "backend/testing/test_scripts_dir_resolution_guard.py" not in required
+    )
+    # Non-vacuity: something is still required, so this is not passing because
+    # the rule exempted everything.
+    assert "backend/testing/test_vitest_durations_freshness.py" in required
+
+
 def test_live_surface_manifest_is_valid_and_registers_websocket_sentinel():
     """The committed manifest is well-formed and lists on-disk sentinels only.
 
@@ -656,7 +747,10 @@ def test_main_limit_defers_overflow_to_stderr(tmp_path, capsys):
         "backend/testing/test_mod0.py",
         "backend/testing/test_mod1.py",
     ]
-    assert stderr == ["deferred-unverified: backend/testing/test_mod2.py"]
+    assert stderr == [
+        "deferred-rank: backend/testing/test_mod2.py",
+        "rank-cap: 1 impacted file(s) beyond --limit 2 deferred",
+    ]
 
 
 def test_capped_impacted_selection_retains_surface_sentinels(tmp_path, capsys):
@@ -710,8 +804,8 @@ def test_capped_impacted_selection_retains_surface_sentinels(tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out.splitlines() == ordinary[:8]
     assert captured.err.splitlines() == [
-        f"deferred-unverified: {path}" for path in ordinary[8:]
-    ]
+        f"deferred-rank: {path}" for path in ordinary[8:]
+    ] + [f"rank-cap: {len(ordinary) - 8} impacted file(s) beyond --limit 8 deferred"]
     with open(mandatory_output, encoding="utf-8") as fh:
         assert fh.read().splitlines() == mandatory
 
@@ -1075,3 +1169,354 @@ def test_node_id_sentinel_collapses_into_a_whole_file_selection(tmp_path):
     )
     assert mandatory == ["backend/testing/test_guard.py"]
     assert ordinary == []
+
+
+# ---------------------------------------------------------------------------
+# create=True prefilter soundness
+# ---------------------------------------------------------------------------
+
+
+def test_create_true_prefilter_admits_every_spelling_the_ast_scan_accepts(tmp_path):
+    """The textual prefilter must never reject a file the AST scan would flag.
+
+    ``collect_create_true_patch_targets`` skips ``ast.parse`` for any file whose
+    text does not match ``_CREATE_TRUE_HINT``. That is a 14.8x saving and a
+    silent-vacuity risk in the same edit: a prefilter that is too narrow makes
+    the redundant-create=True invariant stop seeing real offenders, and nothing
+    fails to say so.
+
+    The soundness argument is that between two adjacent Python tokens the
+    grammar admits only whitespace, a backslash line-continuation, and comments
+    -- so ``create=True`` cannot be spelled in a way that defeats a pattern
+    which allows exactly those three. This pins the argument against the
+    scanner: every spelling below must be BOTH admitted by the prefilter AND
+    reported by the collector, so the two can never drift apart.
+    """
+    spellings = {
+        "plain": 'mocker.patch("app.m.a", create=True)',
+        "spaces_around_equals": 'mocker.patch("app.m.a", create = True)',
+        "newline_before_value": 'mocker.patch("app.m.a", create=\n        True)',
+        "newline_after_name": 'mocker.patch("app.m.a", create\n        =True)',
+        "comment_after_equals": 'mocker.patch("app.m.a", create=  # why\n        True)',
+        "comment_before_equals": 'mocker.patch("app.m.a", create  # c\n        =True)',
+        "line_continuation": 'mocker.patch("app.m.a", create=\\\n        True)',
+        "tab_separated": 'mocker.patch("app.m.a", create\t=\tTrue)',
+    }
+
+    for label, call in spellings.items():
+        source = f"def test_x(mocker):\n    {call}\n"
+
+        assert impacted_tests._CREATE_TRUE_HINT.search(source), (
+            f"prefilter REJECTS the {label!r} spelling of create=True. The "
+            "collector would skip the parse and the redundant-create=True "
+            "invariant would go silently vacuous for files written that way."
+        )
+
+        target_dir = tmp_path / label
+        target_dir.mkdir()
+        (target_dir / "test_probe.py").write_text(source, encoding="utf-8")
+        pairs = impacted_tests.collect_create_true_patch_targets(str(target_dir))
+        assert pairs == [("test_probe.py", "app.m.a")], (
+            f"collector no longer reports the {label!r} spelling; the prefilter "
+            "assertion above is measuring nothing."
+        )
+
+
+def test_create_true_prefilter_skips_files_with_nothing_to_find(tmp_path):
+    """A file the prefilter rejects must genuinely have no pair to report.
+
+    The other half of the pin: prefilter and scanner must agree on the negative
+    case too, or the saving is coming from somewhere it should not.
+    """
+    source = (
+        "def test_x(mocker):\n"
+        '    mocker.patch("app.m.a")\n'
+        '    mocker.patch("app.m.b", autospec=True)\n'
+        "    create_something(True)\n"
+    )
+    (tmp_path / "test_probe.py").write_text(source, encoding="utf-8")
+
+    assert not impacted_tests._CREATE_TRUE_HINT.search(source)
+    assert impacted_tests.collect_create_true_patch_targets(str(tmp_path)) == []
+
+
+def test_create_true_prefilter_does_not_backtrack_on_adversarial_input():
+    """The token-gap group is atomic, so a long non-match cannot blow up.
+
+    ``(?>[\\s\\\\]|\\#[^\\n]*)*`` after a literal ``create`` would be a classic
+    catastrophic-backtracking shape if the group were not atomic: a file full of
+    ``create`` followed by megabytes of whitespace that never reaches ``=``.
+    A regression to a non-atomic group would hang the whole standalone lane
+    rather than merely slow it, so this pins the property directly.
+    """
+    import time
+
+    adversarial = "create" + (" \n\t" * 12000) + "x"
+    start = time.perf_counter()
+    assert impacted_tests._CREATE_TRUE_HINT.search(adversarial) is None
+    # round() rather than a bare subtraction: the standalone offender-identity
+    # guard reads any ``x = a - b`` as a set difference, so a plain elapsed
+    # time would be mistaken for an offender collection owing a marker.
+    elapsed_seconds = round(time.perf_counter() - start, 3)
+    assert elapsed_seconds < 1.0, (
+        f"prefilter took {elapsed_seconds}s on a 40KB non-matching input; the "
+        "token gap has lost its atomic group and is backtracking."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cost budgeting.
+#
+# A selector COUNT cap cannot bound this gate's wall time, and that is measured
+# rather than assumed: costed against the committed backend/.test_durations,
+# the eight heaviest backend test files sum to ~42.6 minutes, so an eight-file
+# selection can outlast any timeout it is given and be cascade-killed while
+# perfectly healthy -- the harness-budget-inversion class. These cover the
+# duration budget that actually bounds it.
+# ---------------------------------------------------------------------------
+
+
+def _write_durations(root, mapping):
+    path = os.path.join(root, "durations.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(mapping, fh)
+    return path
+
+
+def test_load_test_file_costs_sums_node_ids_into_repo_relative_files(tmp_path):
+    path = _write_durations(
+        str(tmp_path),
+        {
+            "testing/test_a.py::test_one": 1.5,
+            "testing/test_a.py::test_two": 2.5,
+            "testing/test_b.py::test_only": 4.0,
+        },
+    )
+    costs = impacted_tests.load_test_file_costs(path)
+    # Per-node measurements roll up per FILE, because selection is per file.
+    assert costs == {
+        "backend/testing/test_a.py": 4.0,
+        "backend/testing/test_b.py": 4.0,
+    }
+
+
+def test_load_test_file_costs_is_fail_open_on_unusable_input(tmp_path):
+    missing = os.path.join(str(tmp_path), "nope.json")
+    assert impacted_tests.load_test_file_costs(missing) == {}
+
+    not_a_mapping = os.path.join(str(tmp_path), "list.json")
+    with open(not_a_mapping, "w", encoding="utf-8") as fh:
+        json.dump(["testing/test_a.py::test_one"], fh)
+    assert impacted_tests.load_test_file_costs(not_a_mapping) == {}
+
+    malformed = os.path.join(str(tmp_path), "bad.json")
+    with open(malformed, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    assert impacted_tests.load_test_file_costs(malformed) == {}
+
+    # A single unusable VALUE is skipped without discarding the usable rows.
+    mixed = _write_durations(
+        str(tmp_path),
+        {"testing/test_a.py::test_one": "slow", "testing/test_b.py::test_x": 3.0},
+    )
+    assert impacted_tests.load_test_file_costs(mixed) == {
+        "backend/testing/test_b.py": 3.0
+    }
+
+
+def test_apply_cost_budget_skips_rather_than_stops_at_an_oversized_entry():
+    ordinary = ["a", "big", "b", "c"]
+    costs = {"a": 10.0, "big": 500.0, "b": 10.0, "c": 10.0}
+    kept, deferred, spent = impacted_tests.apply_cost_budget(ordinary, costs, 100.0)
+    # Walking must CONTINUE past an entry that does not fit: one expensive
+    # high-rank file must not starve every cheaper file ranked behind it.
+    assert kept == ["a", "b", "c"]
+    assert deferred == ["big"]
+    assert spent == 30.0
+
+
+def test_apply_cost_budget_keeps_the_top_entry_even_when_it_alone_overruns():
+    kept, deferred, spent = impacted_tests.apply_cost_budget(
+        ["heaviest", "cheap"], {"heaviest": 900.0, "cheap": 1.0}, 600.0
+    )
+    # Selecting NOTHING is the one outcome a merge gate must never produce, so
+    # the most relevant entry is exempt. This is why the honest bound is
+    # `budget + cost of the single heaviest selected file`, not `budget`.
+    assert kept == ["heaviest"]
+    assert deferred == ["cheap"]
+    assert spent == 900.0
+
+
+def test_apply_cost_budget_charges_mandatory_sentinels_against_the_budget():
+    ordinary = ["a", "b"]
+    costs = {"a": 60.0, "b": 60.0}
+    unreserved, _, _ = impacted_tests.apply_cost_budget(ordinary, costs, 100.0)
+    assert unreserved == ["a"]
+    kept, deferred, _ = impacted_tests.apply_cost_budget(
+        ordinary, costs, 100.0, reserved_seconds=90.0
+    )
+    # Mandatory sentinels are never dropped, but they do burn wall clock; a
+    # budget that ignored them would understate the gate's real runtime.
+    assert kept == ["a"]
+    assert deferred == ["b"]
+
+
+def test_apply_cost_budget_declines_when_it_cannot_measure():
+    ordinary = ["a", "b", "c"]
+    # No measurements, and a zero/absent budget: fail OPEN in both cases.
+    # Dropping coverage because a data file was missing would be the vacuous
+    # -guard shape this module exists to avoid.
+    assert impacted_tests.apply_cost_budget(ordinary, {}, 1.0) == (ordinary, [], 0.0)
+    assert impacted_tests.apply_cost_budget(ordinary, {"a": 1.0}, 0) == (
+        ordinary,
+        [],
+        0.0,
+    )
+    assert impacted_tests.apply_cost_budget(ordinary, {"a": 1.0}, None) == (
+        ordinary,
+        [],
+        0.0,
+    )
+
+
+def test_main_budget_defers_under_a_distinct_token_from_the_rank_cap(tmp_path, capsys):
+    root = str(tmp_path)
+    _make_tree(root)
+    for index in range(4):
+        _write(
+            root,
+            f"backend/testing/test_mod{index}.py",
+            "from app.foo import bar\n",
+        )
+    durations = _write_durations(
+        root,
+        {
+            "testing/test_mod0.py::t": 10.0,
+            "testing/test_mod1.py::t": 10.0,
+            "testing/test_mod2.py::t": 500.0,
+            "testing/test_mod3.py::t": 10.0,
+        },
+    )
+    rc = impacted_tests.main(
+        [
+            "backend/app/foo.py",
+            "--limit",
+            "3",
+            "--budget-seconds",
+            "100",
+            "--durations",
+            durations,
+            "--repo-root",
+            root,
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "backend/testing/test_mod0.py",
+        "backend/testing/test_mod1.py",
+    ]
+    # The two deferral classes carry DIFFERENT tokens on purpose. A rank
+    # deferral is the long tail the protocol deliberately declines to run (for
+    # a core module that is hundreds of files); a budget deferral was ranked in
+    # as relevant and dropped only for wall clock. Reported alike, the handful
+    # that deserve attention are buried under the tail that never did.
+    assert captured.err.splitlines() == [
+        "deferred-rank: backend/testing/test_mod3.py",
+        "rank-cap: 1 impacted file(s) beyond --limit 3 deferred",
+        "deferred-budget: backend/testing/test_mod2.py",
+        "budget: 20s of 100s (2 ordinary + 0 mandatory, 1 deferred)",
+    ]
+
+
+def test_main_budget_says_so_when_it_could_not_measure(tmp_path, capsys):
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(root, "backend/testing/test_mod0.py", "from app.foo import bar\n")
+    absent = os.path.join(root, "absent.json")
+    rc = impacted_tests.main(
+        [
+            "backend/app/foo.py",
+            "--budget-seconds",
+            "100",
+            "--durations",
+            absent,
+            "--repo-root",
+            root,
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["backend/testing/test_mod0.py"]
+    # "Budgeting was requested and did not happen" and "budgeting happened and
+    # dropped nothing" are identical on STDOUT. A caller that sized its timeout
+    # around the budget has to be able to tell them apart, so the fail-open
+    # path announces that it fell open.
+    assert captured.err.splitlines() == [
+        f"budget: no usable measurements in {absent} — cost budget NOT applied"
+    ]
+
+
+def test_main_budget_charges_mandatory_sentinels_and_never_defers_them(
+    tmp_path, capsys
+):
+    root = str(tmp_path)
+    _make_tree(root)
+    for index in range(3):
+        _write(
+            root,
+            f"backend/testing/test_mod{index}.py",
+            "from app.foo import bar\n",
+        )
+    _write(root, "backend/testing/test_tree_sentinel.py", "def test_i(): pass\n")
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/**/*.py",
+                "sentinels": ["backend/testing/test_tree_sentinel.py"],
+            }
+        ],
+    )
+    durations = _write_durations(
+        root,
+        {
+            "testing/test_tree_sentinel.py::t": 80.0,
+            "testing/test_mod0.py::t": 10.0,
+            "testing/test_mod1.py::t": 30.0,
+            "testing/test_mod2.py::t": 30.0,
+        },
+    )
+    mandatory_output = os.path.join(root, "mandatory.txt")
+    rc = impacted_tests.main(
+        [
+            "backend/app/foo.py",
+            "--limit",
+            "8",
+            "--budget-seconds",
+            "100",
+            "--durations",
+            durations,
+            "--mandatory-output",
+            mandatory_output,
+            "--repo-root",
+            root,
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    # 80s of the 100s budget is spent before an ordinary selector is
+    # considered, so only the 10s file fits -- but the sentinel itself is
+    # carried regardless, because surface drift is the contract this gate
+    # cannot trade away for speed.
+    assert captured.out.splitlines() == ["backend/testing/test_mod0.py"]
+    with open(mandatory_output, encoding="utf-8") as fh:
+        assert fh.read().splitlines() == ["backend/testing/test_tree_sentinel.py"]
+    err = captured.err.splitlines()
+    assert "deferred-budget: backend/testing/test_mod1.py" in err
+    assert "deferred-budget: backend/testing/test_mod2.py" in err
+    assert not any(
+        line.startswith("deferred") and line.endswith("test_tree_sentinel.py")
+        for line in err
+    )
+    assert err[-1] == "budget: 90s of 100s (1 ordinary + 1 mandatory, 2 deferred)"

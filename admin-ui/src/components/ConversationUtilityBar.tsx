@@ -5,10 +5,15 @@ import {
 } from '../utils/conversationWorkdayStatus';
 import type { StrategicChatLiveState } from '../utils/strategicSessionLive';
 import { timeAgo } from '../utils/time';
+import { AlertsBanner } from './AlertsBanner';
+import type { Alert } from '../types/alert';
+
+const STRATEGIC_CYCLE_LIVENESS_EVENT_TYPE = 'research.strategic_cycle_liveness';
 
 /**
  * Compact, collapsible search bar shown above the strategist conversation.
- * Attention and operational alerts intentionally stay out of the Chat surface.
+ * Search, awareness, and a bounded operator alert signal shown above the
+ * strategist conversation.
  */
 export function ConversationUtilityBar({
   expanded,
@@ -21,6 +26,11 @@ export function ConversationUtilityBar({
   interactionMode,
   detailRevealed,
   onToggleDetail,
+  alerts,
+  onDismissAlert,
+  onViewAlertTask,
+  projectId,
+  canOperateProject = false,
 }: {
   expanded: boolean;
   onExpand: () => void;
@@ -34,6 +44,12 @@ export function ConversationUtilityBar({
   interactionMode?: string | null;
   detailRevealed?: boolean;
   onToggleDetail?: (value: boolean) => void;
+  /** Existing open alerts; Chat prioritizes the liveness signal until Details is opened. */
+  alerts?: Alert[];
+  onDismissAlert?: (id: string) => void;
+  onViewAlertTask?: (taskId: string) => void;
+  projectId?: string;
+  canOperateProject?: boolean;
 }) {
   // The chat reply chip and the Workday readout share one slot. In Workday
   // mode `computeStrategicChatLiveState` is non-null for exactly the lifecycles
@@ -51,6 +67,16 @@ export function ConversationUtilityBar({
   const chatAge = chatChip?.lastActivityMs != null
     ? timeAgo(chatChip.lastActivityMs)
     : null;
+  const chatIsActive = chatChip?.phase === 'streaming' || chatChip?.phase === 'working';
+  const chatNeedsAttention = chatChip?.phase === 'stuck' || chatChip?.phase === 'stale';
+  // Details owns the full multi-alert triage banner. The clean Chat surface
+  // keeps one actionable signal visible, without a second alert lifecycle.
+  // The liveness alert is the engine-halt signal this surface exists to expose,
+  // so zone-health and newer persisted alerts must not mask it.
+  const compactAlert = detailRevealed ? null : (
+    alerts?.find(alert => alert.event_type === STRATEGIC_CYCLE_LIVENESS_EVENT_TYPE)
+    ?? alerts?.[0]
+  );
   return (
     <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4">
       <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-wrap items-center gap-2">
@@ -119,22 +145,27 @@ export function ConversationUtilityBar({
             {...(workdayStatus && !chatChip ? { 'data-workday-state': workdayStatus.state } : {})}
             {...(chatChip ? { 'data-chat-live-phase': chatChip.phase } : {})}
             aria-label={chatChip
-              ? (chatChip.phase === 'stuck' ? 'Strategic status' : 'Strategic reply status')
+              ? (chatNeedsAttention ? 'Strategic status' : 'Strategic reply status')
               : undefined}
             title={chatChip
               ? [chatChip.label, chatChip.detail].filter(Boolean).join(' · ')
               : workdayStatus?.title}
             className="ml-auto flex min-w-0 max-w-full flex-1 items-center justify-end gap-1.5 whitespace-nowrap rounded-md border border-neutral-800/80 bg-workbench-shell/45 px-2 py-1 text-ui-md sm:flex-initial"
           >
-            {chatChip?.phase === 'stuck' ? (
+            {chatNeedsAttention ? (
               <CircleAlert
                 className="h-3.5 w-3.5 shrink-0 text-amber-300"
                 aria-hidden="true"
               />
-            ) : chatChip ? (
+            ) : chatIsActive ? (
               <LoaderCircle
                 className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-300"
                 aria-hidden="true"
+              />
+            ) : chatChip ? (
+              <span
+                aria-hidden="true"
+                className="h-1.5 w-1.5 shrink-0 rounded-full bg-workbench-control"
               />
             ) : (
               <span
@@ -143,7 +174,7 @@ export function ConversationUtilityBar({
               />
             )}
             <span className={`min-w-0 truncate font-medium ${chatChip
-              ? (chatChip.phase === 'stuck' ? 'text-amber-300' : 'text-emerald-300')
+              ? (chatNeedsAttention ? 'text-amber-300' : chatIsActive ? 'text-emerald-300' : 'text-neutral-300')
               : workdayPresentation?.text}`}>
               {chatChip ? chatChip.label : workdayStatus?.compactLabel ? (
                 <>
@@ -194,6 +225,21 @@ export function ConversationUtilityBar({
           </div>
         )}
       </div>
+      {compactAlert && (
+        <div
+          className="mx-auto mt-1.5 w-full max-w-[940px] min-w-0"
+          data-testid="conversation-utility-alert"
+        >
+          <AlertsBanner
+            alerts={[compactAlert]}
+            onDismiss={onDismissAlert ?? (() => {})}
+            onViewTask={onViewAlertTask}
+            projectId={projectId}
+            canMutate={canOperateProject}
+            compact
+          />
+        </div>
+      )}
     </div>
   );
 }

@@ -94,7 +94,7 @@ from app.strategic_workday_handoff_recovery import (
     recover_retired_private_handoff as _recover_retired_private_handoff,
     retire_unavailable_private_handoff as _retire_unavailable_private_handoff,
 )
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, utc_iso
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.shared_state import limiter
@@ -1119,7 +1119,7 @@ async def claim_public_conversation_turn(
         "owner": owner,
         "message_ids": [str(row.id) for row in claim.rows],
         "attempt": claim.attempt,
-        "lease_expires_at": claim.lease_expires_at.isoformat(),
+        "lease_expires_at": utc_iso(claim.lease_expires_at),
         "envelope": envelope.model_dump(mode="json"),
     }
 
@@ -1440,7 +1440,7 @@ def _workday_consultation_packet_response(
     return {
         "packet_id": str(packet.id),
         "workday_claim_id": str(workday_claim_id),
-        "lease_expires_at": lease_expires_at.isoformat(),
+        "lease_expires_at": utc_iso(lease_expires_at),
         "attempt": attempt,
         "claim_id": context.get("claim_id"),
         "delivery_key": context.get("delivery_key"),
@@ -1756,7 +1756,7 @@ async def renew_workday_consultation(
     await session.commit()
     return {
         "workday_claim_id": str(renewed.workday_claim_id),
-        "lease_expires_at": renewed.lease_expires_at.isoformat(),
+        "lease_expires_at": utc_iso(renewed.lease_expires_at),
         "attempt": renewed.attempt,
     }
 
@@ -1772,7 +1772,7 @@ def _workday_continuation_response(
     return {
         "result_packet_id": str(packet.id),
         "continuation_claim_id": str(claim.continuation_claim_id),
-        "lease_expires_at": claim.lease_expires_at.isoformat(),
+        "lease_expires_at": utc_iso(claim.lease_expires_at),
         "attempt": claim.attempt,
         "claim_id": context.get("claim_id"),
         "delivery_key": context.get("delivery_key"),
@@ -2142,7 +2142,7 @@ async def renew_workday_continuation(
     await session.commit()
     return {
         "continuation_claim_id": str(renewed.continuation_claim_id),
-        "lease_expires_at": renewed.lease_expires_at.isoformat(),
+        "lease_expires_at": utc_iso(renewed.lease_expires_at),
         "attempt": renewed.attempt,
     }
 
@@ -2905,7 +2905,7 @@ async def claim_resident_messages(
     return {
         "claim_id": str(claim.claim_id),
         "message_ids": [str(row.id) for row in claim.rows],
-        "lease_expires_at": claim.lease_expires_at.isoformat(),
+        "lease_expires_at": utc_iso(claim.lease_expires_at),
         "attempt": claim.attempt,
         "incarnation_supported": True,
         "incarnation_id": str(
@@ -3435,7 +3435,7 @@ async def agent_poll_messages(
 
     return {
         "messages": projected_messages,
-        "server_time": server_time.isoformat(),
+        "server_time": utc_iso(server_time),
         "open_message_cursor_floor": open_message_cursor_floor,
         # New agents must atomically claim the exact materialized batch before
         # giving it to a provider. Older agents ignore this additive field during

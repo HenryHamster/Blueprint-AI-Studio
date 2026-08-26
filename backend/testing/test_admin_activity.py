@@ -1,6 +1,6 @@
 """Tests for /api/admin/activity PR impact annotations on TASK_COMPLETED events."""
 
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
@@ -190,7 +190,13 @@ async def test_terminal_task_created_before_window_uses_completed_at(
     assert resp.status_code == 200
     terminal_events = [e for e in resp.json()["events"] if e["type"] == event_type]
     assert [event["task_id"] for event in terminal_events] == [str(task.id)]
-    assert terminal_events[0]["timestamp"] == completed_at.isoformat()
+    # completed_at is naive UTC in the column; the wire form must carry the
+    # zone. Spell the expected offset out here rather than calling the
+    # production helper, so this pins the format and not the helper.
+    assert terminal_events[0]["timestamp"] == completed_at.replace(
+        tzinfo=timezone.utc
+    ).isoformat()
+    assert terminal_events[0]["timestamp"].endswith("+00:00")
 
 
 @pytest.mark.asyncio
@@ -239,7 +245,10 @@ async def test_terminal_task_without_completed_at_uses_updated_at_not_status_log
     assert resp.status_code == 200
     completed = [e for e in resp.json()["events"] if e["type"] == "TASK_COMPLETED"]
     assert [event["task_id"] for event in completed] == [str(task.id)]
-    assert completed[0]["timestamp"] == updated_at.isoformat()
+    assert completed[0]["timestamp"] == updated_at.replace(
+        tzinfo=timezone.utc
+    ).isoformat()
+    assert completed[0]["timestamp"].endswith("+00:00")
 
 
 @pytest.mark.asyncio

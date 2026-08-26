@@ -2107,3 +2107,114 @@ async def fail_unplaceable_non_generic_site_task(
                 exc_info=True,
             )
     return True
+
+
+async def filter_malformed_payloads(
+    eligible_ids: list[uuid.UUID],
+    candidate_tasks: list[Task],
+    session,
+    broadcast_fn: Callable[..., Coroutine[Any, Any, None]],
+) -> list[uuid.UUID]:
+    """Terminally fail a task whose payload can never clear the agent's entry checks.
+
+    A ``fix`` payload with no ``branch`` (or no ``pr_number``, or no ``prompt``)
+    is rejected by ``handleFix`` on its first line of real work
+    (agent/src/handlers/review-fix.ts:1350) with ``Fatal error: branch is
+    required``. The defect is a permanent property of the persisted row, so
+    every attempt dies identically. Dispatching such a task provisions a VM,
+    boots the agent, and burns a project VM slot to learn something the row
+    already stated.
+
+    2026-08-23 (Blueprint project 37d445e1): four guard-suppression remediation
+    tasks (4fdd6113 / 9bfa5831 / 50531efe / b4121926) each did this four times —
+    16 VM provisions, ~717s claim latency apiece, queued behind "5/5 project VM
+    slots are already in use" — and all four died
+    ``[CODE_ERROR] Retries exhausted (3/3). fatal — Fatal error: branch is
+    required``. Zero of the work was ever possible.
+
+    This filter is the seam that spends none of that. It lands the task FAILED
+    (not CANCELLED: this IS a platform kill and must stay visible in the failure
+    feed) with MALFORMED_TASK_PAYLOAD and a message naming the exact field, and
+    it does not touch ``attempt_count`` — there is no retry to budget for.
+
+    CALL SITE. Unlike its neighbours in this module, this is NOT a pre-ranking
+    bulk pass. The orchestrator calls it from inside the per-task dispatch loop
+    with a single locked task, at the point where every reversible gate has
+    already declined to defer and the only thing left is PLACEMENT. Its verdict
+    is terminal and MALFORMED_TASK_PAYLOAD sits outside INFRA_CLASSES, so the
+    reaper never resurrects it; running it ahead of the slot budget, the row
+    lock, the approval flag, the capability fence or the per-project
+    VM-cap/spend/budget deferral would convert "wait your turn" into
+    "permanently dead" and would judge every scanned candidate at once rather
+    than only the rows actually being placed. See the block comment at the call
+    site in orchestrator.py for the full rationale. It still runs before every
+    placement path, so the "zero VMs spent" guarantee is unchanged.
+    """
+    if not eligible_ids:
+        return eligible_ids
+
+    from app.failure_classification import (
+        MALFORMED_TASK_PAYLOAD,
+        malformed_task_payload_reason,
+        persist_failure_category,
+    )
+
+    dropped: set[uuid.UUID] = set()
+    for candidate in candidate_tasks:
+        if candidate.id not in eligible_ids:
+            continue
+        reason = malformed_task_payload_reason(candidate)
+        if not reason:
+            continue
+        msg = (
+            f"{MALFORMED_TASK_PAYLOAD}: {reason}. The agent would reject this "
+            "payload before doing any work, and every retry would read the same "
+            "row — failed here without spending a VM. This is a defect in the "
+            "spawner that created the task, not in the agent."
+        )
+        candidate.status = TaskStatus.FAILED
+        candidate.latest_status_message = msg
+        persist_failure_category(candidate, MALFORMED_TASK_PAYLOAD)
+        session.add(candidate)
+        # Commit the terminal transition BEFORE broadcasting, so the websocket
+        # never announces a status the API has not persisted and never emits an
+        # event a later rollback discards. Same discipline as
+        # filter_scope_empty above; expire_on_commit is False (database.py) so
+        # the other in-memory candidates downstream steps read stay valid.
+        _project_id = str(candidate.project_id)
+        _task_id = str(candidate.id)
+        try:
+            await session.commit()
+        except Exception:
+            # A failed terminal commit must never take down the dispatch cycle.
+            # Roll back and leave the task QUEUED: it is still malformed, so the
+            # next cycle re-derives the same verdict. Same posture as
+            # fail_unplaceable_non_generic_site_task above.
+            logger.exception(
+                "[DISPATCH] failed to commit MALFORMED_TASK_PAYLOAD for task %s",
+                _task_id,
+            )
+            await session.rollback()
+            continue
+        dropped.add(candidate.id)
+        try:
+            await broadcast_fn(
+                _project_id,
+                "task_updated",
+                {"task_id": _task_id, "status": "FAILED", "message": msg},
+            )
+        except Exception:  # noqa: BLE001 — a websocket hiccup must not undo a committed terminal transition
+            logger.debug(
+                f"Failed to broadcast MALFORMED_TASK_PAYLOAD for {_task_id}",
+                exc_info=True,
+            )
+        logger.error(
+            "[DISPATCH] MALFORMED_TASK_PAYLOAD: refusing to dispatch task %s — "
+            "%s (spawner defect; no VM spent, no retry budget consumed)",
+            candidate.id,
+            reason,
+        )
+
+    if not dropped:
+        return eligible_ids
+    return [tid for tid in eligible_ids if tid not in dropped]

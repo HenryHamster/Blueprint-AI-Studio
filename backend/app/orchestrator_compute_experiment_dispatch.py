@@ -139,6 +139,47 @@ _COMPUTE_CAP_DEFER_ALERT_AFTER_DEFERS = 8
 
 _COMPUTE_CAP_DEFER_ALERT_TITLE = "Compute experiment stalled at project job cap"
 
+# task.context key recording that a compute_experiment launched with NO container
+# image — its command ran against whatever toolchain the claiming host happened to
+# have, OUTSIDE any environment contract. That is the path producing the corpus's
+# commonest terminal log (`no working pip found (tried "-m pip" and PATH)`, plus
+# exit-127/126), so it must be ATTRIBUTABLE per job rather than a warning in a log
+# nobody reads. STAMPED on every image-less launch, CLEARED when a job does launch
+# under an image so it can never make a stale claim about a contracted job. NOT a
+# hold marker — the task is LAUNCHING, so no bounded-wait sweep reads it and it is
+# deliberately absent from COMPUTE_RUNNER_HOLD_CONTEXT_KEYS.
+HOST_TOOLCHAIN_FALLBACK_CONTEXT_KEY = "compute_host_toolchain_fallback"
+
+# Why a job reached launch image-less. Both mean "ran bare on the host", but they are
+# different operator actions, so they must not collapse into one reason.
+#   no_project_compute_image — no ``compute.image`` in ``.blueprint/tools.json`` (or
+#       no manifest): the contract does not EXIST yet, and the fix is to declare one.
+#       The majority case today, and previously 100% silent — not even a log line.
+#   project_compute_image_unresolvable — an image IS declared and did not resolve
+#       (commonly: build recipe declared, not built yet). A declared contract that is
+#       not applied is strictly more alarming than none. A payload declaring an
+#       accelerator fails CLOSED instead (``baked_image_unresolvable``); this covers
+#       the bare payload that degrades.
+HOST_TOOLCHAIN_FALLBACK_NO_PROJECT_IMAGE = "no_project_compute_image"
+HOST_TOOLCHAIN_FALLBACK_IMAGE_UNRESOLVABLE = "project_compute_image_unresolvable"
+
+
+def _host_toolchain_fallback_changed(prior, record) -> bool:
+    """Whether the fallback stamp needs rewriting this cycle.
+
+    Compared on the STABLE fields only (reason code + detail): ``recorded_at`` is
+    volatile, so full-record comparison would rewrite the task row on every
+    re-dispatch of an unchanged condition — the churn ``_pin_hold_stable_key``
+    already avoids for the strict-pin hold.
+    """
+    if not isinstance(prior, dict):
+        return True
+    return (prior.get("reason_code"), prior.get("detail")) != (
+        record.get("reason_code"),
+        record.get("detail"),
+    )
+
+
 def _build_compute_launch_kwargs(
     payload: dict,
     *,
@@ -495,6 +536,23 @@ async def _maybe_alert_saturated_compute_cap_defer(
         )
 
 
+def _image_provenance(container_image: str, payload_declared: bool) -> str:
+    """Describe the held job's image AND where it came from.
+
+    A job can now reach the container-capable-runner gate without having asked
+    for a container: when the payload declares no image, dispatch supplies the
+    project's declared one. Saying "job declares container_image=..." over the
+    top of that sends an operator to read a payload that mentions no image at
+    all, so the two cases have to read differently.
+    """
+    if payload_declared:
+        return f"job declares container_image={container_image!r}"
+    return (
+        f"the project environment contract supplies container_image="
+        f"{container_image!r} (the payload declared none)"
+    )
+
+
 async def _dispatch_compute_experiment_directly(
     session: AsyncSession,
     task: Task,
@@ -601,14 +659,33 @@ async def _dispatch_compute_experiment_directly(
     # below. An explicit payload container_image is left untouched; projects with
     # no manifest compute image keep today's image-less behavior.
     #
-    # Gated on `accelerator`: a task declaring neither accelerator nor
-    # container_image must dispatch bare. Attaching a default image to such a
-    # task arms the runner's fatal GPU-arch pre-flight (it fires whenever
-    # assigned_gpus and (accelerator_type or container_image)) even though the
-    # task never asked for a GPU, aborting CPU-only work on GPU-host runners
-    # whose default image doesn't match the host arch.
+    # NOT gated on `accelerator`. It used to be, and that gate was the reason the
+    # environment contract did not exist in practice: the large majority of
+    # compute_experiment jobs declare no accelerator, so they skipped image
+    # resolution entirely and ran as a bare `bash -lc` against whatever toolchain
+    # the claiming host happened to have. That is what produced the commonest
+    # terminal log in the corpus -- `no working pip found (tried "-m pip" and
+    # PATH) - cannot provision the runtime` -- along with the exit-127
+    # (command not found) and exit-126 (not executable) failures. A project that
+    # declares an image means it for all of its work, not only its GPU work.
+    #
+    # The gate existed to dodge a downstream defect, not to express a policy:
+    # attaching an image armed the runner's GPU-arch pre-flight (which fires on
+    # `assigned_gpus and (accelerator_type or container_image)`, and
+    # `assigned_gpus` comes from the HOST having GPUs, not from the job wanting
+    # them), so CPU-only work landing on a GPU host died on an arch mismatch it
+    # had no stake in. That is fixed at the root in `local_runner.py`: a job that
+    # declared no accelerator now RELEASES the unusable device and re-plans
+    # CPU-only instead of aborting. With the kill gone the workaround is not
+    # needed, and the contract can apply to every job as intended.
     resolved_default_container_image: str | None = None
-    if not container_image and accelerator:
+    payload_declared_image = bool(container_image)
+    # Reason this job ends up with no container image, when it does. Recorded on the
+    # task at launch (see the fallback stamp below) so a bare host-toolchain run is
+    # attributable per job instead of being visible only as a log warning.
+    host_toolchain_fallback_reason: str | None = None
+    host_toolchain_fallback_detail: str = ""
+    if not container_image:
         from app.compute_backends import resolve_project_baked_image_strict
 
         project = await session.get(Project, task.project_id)
@@ -616,11 +693,50 @@ async def _dispatch_compute_experiment_directly(
             await resolve_project_baked_image_strict(session, project)
         )
         if image_error is not None:
-            return await _fail_compute_experiment_task(
-                session,
-                task,
-                "baked_image_unresolvable",
+            # Fail CLOSED only for a payload that actually asked for an
+            # accelerator. Those jobs need the declared image to mean anything,
+            # and running them on the host toolchain is a reproducibility
+            # failure the operator must see.
+            #
+            # A BARE payload degrades to image-less instead. The commonest
+            # reason a declared image does not resolve is that it has not been
+            # built YET, and that window is transient project state -- letting
+            # it terminal-fail every CPU-only job in the project would turn a
+            # pending build into an outage for work that never asked for an
+            # image. Applying the contract where it resolves and degrading
+            # where it does not is what makes it safe to apply the contract to
+            # every job at all.
+            if accelerator:
+                return await _fail_compute_experiment_task(
+                    session,
+                    task,
+                    "baked_image_unresolvable",
+                    image_error,
+                )
+            logger.warning(
+                "[RUNNERS] compute_experiment %s: project image unresolvable "
+                "(%s) — the payload declared no accelerator, so it launches "
+                "image-less rather than failing on a contract it never invoked "
+                "(recorded as %s=%s)",
+                task.id,
                 image_error,
+                HOST_TOOLCHAIN_FALLBACK_CONTEXT_KEY,
+                HOST_TOOLCHAIN_FALLBACK_IMAGE_UNRESOLVABLE,
+            )
+            host_toolchain_fallback_reason = (
+                HOST_TOOLCHAIN_FALLBACK_IMAGE_UNRESOLVABLE
+            )
+            host_toolchain_fallback_detail = str(image_error)
+            resolved_default_container_image = None
+        elif not resolved_default_container_image:
+            # The project declares no compute image at all — previously the ONLY
+            # fully silent branch (no failure, no warning, no record) and the one
+            # the large majority of jobs take, since a repo with no
+            # `.blueprint/tools.json` compute.image has no contract to apply.
+            host_toolchain_fallback_reason = HOST_TOOLCHAIN_FALLBACK_NO_PROJECT_IMAGE
+            host_toolchain_fallback_detail = (
+                "project declares no compute.image in .blueprint/tools.json; the "
+                "command runs against whatever toolchain the claiming host has"
             )
         if resolved_default_container_image:
             container_image = resolved_default_container_image
@@ -925,8 +1041,9 @@ async def _dispatch_compute_experiment_directly(
         )
         if disk_blocked:
             hold_msg = (
-                "Waiting for a runner with enough capacity: job declares "
-                f"container_image={container_image!r} (a multi-GB image pull) but "
+                "Waiting for a runner with enough capacity: "
+                f"{_image_provenance(container_image, payload_declared_image)} "
+                "(a multi-GB image pull) but "
                 "every container-capable runner reports workspace or container "
                 "image-store capacity below its reserve "
                 f"(workspace={workspace_floor} bytes, "
@@ -1035,7 +1152,7 @@ async def _dispatch_compute_experiment_directly(
             gpu_req = "an accelerator" if accelerator else f"vram_gb={vram_gb!r}"
             hold_msg = (
                 "Waiting for a runner that can expose a GPU inside the container: "
-                f"job declares both container_image={container_image!r} and "
+                f"job runs under container_image={container_image!r} with "
                 f"{gpu_req}, but no selected runtime has functional passthrough "
                 f"proof ({'; '.join(blockers[:3])})."
             )
@@ -1100,16 +1217,16 @@ async def _dispatch_compute_experiment_directly(
         if project_runners:
             if any(_runner_has_container_capability(r) for r in project_runners):
                 hold_msg = (
-                    "Waiting for an eligible container-capable runner: job declares "
-                    f"container_image={container_image!r}; a container runtime is "
-                    "present, but every such runner is at capacity or fails another "
-                    "job requirement."
+                    "Waiting for an eligible container-capable runner: "
+                    f"{_image_provenance(container_image, payload_declared_image)}; "
+                    "a container runtime is present, but every such runner is at "
+                    "capacity or fails another job requirement."
                 )
             else:
                 hold_msg = (
-                    "Waiting for a container-capable runner: job declares "
-                    f"container_image={container_image!r} but no live runner "
-                    "has docker_usable capability."
+                    "Waiting for a container-capable runner: "
+                    f"{_image_provenance(container_image, payload_declared_image)} "
+                    "but no live runner has docker_usable capability."
                 )
             ctx = dict(task.context or {})
             changed = ctx.pop("runner_target_id", None) is not None
@@ -1324,6 +1441,43 @@ async def _dispatch_compute_experiment_directly(
         task.context = _launched_ctx
         session.add(task)
 
+    # ── Attribute a HOST-TOOLCHAIN launch on the task ─────────────────────────
+    # The job launched. Image-less means its command runs as a bare `bash -lc` on
+    # the claiming host, so stamp WHY: the degrade becomes queryable per job
+    # (``context->'compute_host_toolchain_fallback'``) instead of a log warning.
+    # Clearing on a contracted launch keeps a retry that now resolves an image from
+    # carrying a stale claim. Written after create_compute_job so it survives that
+    # call's ``populate_existing`` re-lock, and rides the park commit below.
+    _fallback_ctx = dict(task.context or {})
+    _prior_fallback = _fallback_ctx.get(HOST_TOOLCHAIN_FALLBACK_CONTEXT_KEY)
+    _fallback_reason = host_toolchain_fallback_reason or (
+        HOST_TOOLCHAIN_FALLBACK_NO_PROJECT_IMAGE
+    )
+    if container_image:
+        if _prior_fallback is not None:
+            _fallback_ctx.pop(HOST_TOOLCHAIN_FALLBACK_CONTEXT_KEY, None)
+            task.context = _fallback_ctx
+            session.add(task)
+    else:
+        # ``accelerator_declared`` can be True here. Only ONE of the two
+        # image-less paths fails closed on an accelerator: the branch where a
+        # DECLARED image failed to resolve (``baked_image_unresolvable``
+        # above). The other -- a project that declares no compute image at all
+        # (``no_project_image``) -- has no accelerator gate, so a GPU payload
+        # in such a project launches image-less and stamps
+        # ``accelerator_declared: True``. That is the reproducibility-worst
+        # case, which is exactly why the flag is recorded rather than assumed.
+        _fallback_record = {
+            "reason_code": _fallback_reason,
+            "detail": host_toolchain_fallback_detail[:300],
+            "accelerator_declared": bool(accelerator),
+            "recorded_at": _utcnow().isoformat(),
+        }
+        if _host_toolchain_fallback_changed(_prior_fallback, _fallback_record):
+            _fallback_ctx[HOST_TOOLCHAIN_FALLBACK_CONTEXT_KEY] = _fallback_record
+            task.context = _fallback_ctx
+            session.add(task)
+
     # ── Park the task on the job-terminal wake (releases its slot now) ─────────
     meta = job.polling_metadata or {}
     park_deadline_seconds = meta.get("park_deadline_seconds")
@@ -1359,9 +1513,12 @@ async def _dispatch_compute_experiment_directly(
             task.id,
         )
     logger.info(
-        "[ORCHESTRATOR] Launched compute_experiment %s as job %s (%s); task PARKED",
+        "[ORCHESTRATOR] Launched compute_experiment %s as job %s (%s, %s); task PARKED",
         task.id,
         job.id,
         f"runner {runner.id}" if runner is not None else "cloud backend",
+        f"image {container_image}"
+        if container_image
+        else f"NO image — host toolchain, {_fallback_reason}",
     )
     return "launched"

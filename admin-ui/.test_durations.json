@@ -1568,6 +1568,13 @@
       "flaky": false
     },
     {
+      "file": "src/test/composition-root-wiring.test.ts",
+      "duration_ms": 5,
+      "tests": 5,
+      "measured": true,
+      "flaky": false
+    },
+    {
       "file": "src/App.test.tsx",
       "duration_ms": 4,
       "tests": 4,

@@ -268,6 +268,93 @@ def test_gcp_startup_script_no_progress_watchdog_inert_when_unset():
     assert "_NP_TIMEOUT_SECONDS=0" in script
 
 
+def test_gcp_self_destruct_clock_is_two_phase_so_bootstrap_is_not_billed():
+    """Provisioning must not be paid for out of the experiment's runtime budget.
+
+    The startup script used to arm ONE self-destruct clock at the very top with
+    the experiment's own ``runtime_deadline_seconds + 30``. Boot, repo clone,
+    container image pull, checkpoint hydration and setup_step all ran inside that
+    window, so a slow bootstrap silently shortened the run to "deadline minus
+    however long provisioning took" and, when it overran, recorded ``runtime_ttl``
+    — blaming the experiment for time it never got. The no-progress watchdog
+    already avoided exactly this asymmetry by arming AFTER setup; the TTL did not.
+
+    The clock is now two-phase, and each phase carries its OWN terminal reason so
+    the taxonomy can tell the two apart:
+      phase 1 — ``_BOOT_TTL_SECS``  → ``provisioning_ttl`` → PROVISION_FAILURE
+      phase 2 — ``TTL_SECONDS``     → ``runtime_ttl``      → AGENT_TIMEOUT
+    """
+    from app.failure_classification import (
+        AGENT_TIMEOUT,
+        PROVISION_FAILURE,
+        classify_compute_terminal_reason,
+    )
+
+    # Literal pin on the provisioning ceiling: an orphaned compute VM is the
+    # costliest leak on the platform, so this bound must stay explicit and small
+    # enough to read. Asserting it against the constant it names would be
+    # self-certifying.
+    assert compute_backends_module._GCP_BOOTSTRAP_TTL_SECONDS == 3600
+
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        no_progress_timeout_seconds=600,
+        repo_clone={"owner": "o", "repo": "r", "ref": "main"},
+        repo_token="tok",
+        setup_step="pip install -r requirements.txt",
+        container_image="ghcr.io/x/y:1",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    # Both budgets are declared at the top; the runtime one is unchanged
+    # (300 + 30) and is NOT the value the bootstrap phase sleeps on.
+    assert "TTL_SECONDS=330" in script
+    assert "_BOOT_TTL_SECS=3600" in script
+
+    phase1_idx = script.index('sleep "$_BOOT_TTL_SECS"')
+    phase2_idx = script.index('sleep "$TTL_SECONDS"')
+    clone_idx = script.index("repo_clone_failed")
+    setup_idx = script.index("setup_step_failed")
+    pull_idx = script.index("container_image_pull_failed")
+    arm_idx = script.index("_NP_WATCHDOG_PID=$!")
+    command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+
+    # Phase 1 covers every provisioning phase; phase 2 starts only once they are
+    # done, at the same point the no-progress watchdog arms.
+    assert phase1_idx < clone_idx < phase2_idx
+    assert phase1_idx < setup_idx < phase2_idx
+    assert phase1_idx < pull_idx < phase2_idx
+    assert phase2_idx < arm_idx < command_idx, (
+        "the runtime clock must start with the experiment, not before it"
+    )
+
+    # Phase 1 must be DISARMED before phase 2 forks, or two clocks race and the
+    # bootstrap one can still poweroff a healthy running experiment.
+    disarm = 'kill "$TTL_PID" 2>/dev/null || true'
+    assert disarm in script
+    assert script.index(disarm) < phase2_idx
+    # TTL_PID is reassigned so the existing cleanup kills target the LIVE clock.
+    assert script.count("TTL_PID=$!") == 2
+
+    # Distinct, correctly-classifying terminal reasons for the two phases.
+    assert "FAILED 124 provisioning_ttl" in script
+    assert "FAILED 124 runtime_ttl" in script
+    assert (
+        classify_compute_terminal_reason("provisioning_ttl", "runtime")
+        == PROVISION_FAILURE
+    ), "a VM that died bootstrapping must not burn the experiment's retry budget"
+    assert (
+        classify_compute_terminal_reason("runtime_ttl", "runtime") == AGENT_TIMEOUT
+    ), "an intentional platform deadline kill is not a defect in the command"
+
+
 def test_gcp_startup_script_resume_hydration_is_fail_closed():
     """Cross-job resume must FAIL CLOSED on download/extract failure — aborting the
     run with a durable terminal record — mirroring the in-process backend's

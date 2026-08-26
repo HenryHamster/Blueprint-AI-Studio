@@ -39,6 +39,7 @@ from app.admin_helpers import (
     _user_project_ids,
 )
 from app.task_locking import lock_project_or_429
+from app.time_utils import utc_iso
 from app.message_convergence import LINKED_STATUS, NEEDS_ACTION_MESSAGE_TYPES, RESOLVED_STATUS
 from app.message_audience import operator_visible_alert_filter, operator_visible_message_audience_filter
 from app.project_message_creation import (
@@ -403,8 +404,9 @@ _SEED_ENTRIES: Dict[str, dict] = {
     },
     "admin-auth": {
         "content": (
-            "New admin endpoints require @require_project_access or @require_role decorators. "
-            "Follow the pattern in admin.py using _get_user_project_with_role()."
+            "New admin endpoints are authorized with dependencies, not decorators: "
+            "there is no @require_project_access or @require_role in this codebase. "
+            "Use Depends(require_admin), then _get_user_project_with_role() in the body."
         ),
         "applicable_types": ["create", "fix"],
     },
@@ -481,10 +483,10 @@ async def get_alerts(
             "source": a.source,
             "dedupe_key": a.dedupe_key,
             "occurrence_count": a.occurrence_count,
-            "last_seen_at": a.last_seen_at.isoformat() if a.last_seen_at else None,
+            "last_seen_at": utc_iso(a.last_seen_at),
             "task_id": str(a.task_id) if a.task_id else None,
-            "created_at": a.created_at.isoformat(),
-            "dismissed_at": a.dismissed_at.isoformat() if a.dismissed_at else None,
+            "created_at": utc_iso(a.created_at),
+            "dismissed_at": utc_iso(a.dismissed_at),
         }
         for a in alerts
     ]
@@ -1772,7 +1774,7 @@ async def admin_playbook_set(
     new_entry: dict = {
         "content": payload.value,
         "source_task_id": None,
-        "updated_at": _utcnow().isoformat(),
+        "updated_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
         "confirmed_count": existing.get("confirmed_count", 0)
         if isinstance(existing, dict)
         else 0,
@@ -1798,7 +1800,7 @@ async def admin_playbook_set(
 
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1
-    meta["last_updated"] = _utcnow().isoformat()
+    meta["last_updated"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
     meta["updated_by"] = "admin"
     doc["_meta"] = meta
 

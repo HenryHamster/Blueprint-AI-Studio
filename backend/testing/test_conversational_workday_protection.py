@@ -13,6 +13,7 @@ no conftest imports. Added to the standalone smoke set via the normal
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 from typing import cast
@@ -24,6 +25,7 @@ from testing.identity_extraction import (
     count_python_test_ids,
     extract_python_test_ids,
     extract_typescript_test_ids,
+    frozen_typescript_tree,
 )
 
 MANIFEST_PATH = Path(__file__).resolve().parent / "conversational_workday_manifest.json"
@@ -55,7 +57,7 @@ def _extract_test_ids(path: str, source: str) -> set[str]:
     if path.endswith(".py"):
         return extract_python_test_ids(source)
     if path.endswith((".ts", ".tsx")):
-        return extract_typescript_test_ids(source)
+        return extract_typescript_test_ids(source, REPO_ROOT / path)
     return set()
 
 
@@ -112,7 +114,7 @@ def _protected_test_count(path: str, source: str) -> int | None:
     if path.endswith(".py"):
         return count_python_test_ids(source)
     if path.endswith((".ts", ".tsx")):
-        return len(extract_typescript_test_ids(source))
+        return len(extract_typescript_test_ids(source, REPO_ROOT / path))
     return None
 
 
@@ -275,7 +277,14 @@ def test_all_protect_test_ids_exist_in_their_files():
     check closes that gap.
     """
     manifest = _load_manifest()
-    missing = _find_existence_violations(manifest, REPO_ROOT)
+    # Read-only bulk sweep over every protected file, so the
+    # per-reference TypeScript revalidation stat cannot tell us
+    # anything -- see frozen_typescript_tree() (PR #17853) for the
+    # measurement. Without it this guard took 30.00s over the
+    # Docker-on-Windows bind mount and died on the lane's 30s timeout,
+    # reporting a slow filesystem as a deleted protected test.
+    with frozen_typescript_tree():
+        missing = _find_existence_violations(manifest, REPO_ROOT)
 
     assert not missing, (
         "The following PROTECT-listed test_ids no longer exist in their files. "
@@ -338,7 +347,9 @@ def test_every_protected_file_meets_declared_test_count():
     so adding or deleting an undeclared test fails without hardcoding paths.
     """
     manifest = _load_manifest()
-    mismatches = _find_test_count_mismatches(manifest, REPO_ROOT)
+    # Same read-only sweep, same reason; measured 29.25s unfrozen.
+    with frozen_typescript_tree():
+        mismatches = _find_test_count_mismatches(manifest, REPO_ROOT)
 
     assert not mismatches, (
         "Protected test files must match their declared test-count snapshot; "
@@ -355,10 +366,14 @@ def test_new_floor_slack_relative_to_integration_branch_fails():
         item for item in manifest["protect"]
         if item["path"] == "backend/testing/test_reaper.py"
     )
-    actual = _protected_test_count(
-        entry["path"],
-        (REPO_ROOT / entry["path"]).read_text(encoding="utf-8"),
-    )
+    # Both this count and the mismatch sweep below read the same
+    # unchanging tree; one freeze covers the pair. Measured 27.66s
+    # unfrozen over the bind mount against a 30s budget.
+    with frozen_typescript_tree():
+        actual = _protected_test_count(
+            entry["path"],
+            (REPO_ROOT / entry["path"]).read_text(encoding="utf-8"),
+        )
     assert actual is not None and actual > 1
 
     integration_branch_manifest = json.loads(json.dumps(manifest))
@@ -368,9 +383,13 @@ def test_new_floor_slack_relative_to_integration_branch_fails():
     )
     integration_entry["test_count"] = actual - 1
 
-    assert _find_test_count_mismatches(
-        integration_branch_manifest, REPO_ROOT
-    ) == [f"{entry['path']}: actual={actual}, declared_exact={actual - 1}"]
+    with frozen_typescript_tree():
+        mismatches = _find_test_count_mismatches(
+            integration_branch_manifest, REPO_ROOT
+        )
+    assert mismatches == [
+        f"{entry['path']}: actual={actual}, declared_exact={actual - 1}"
+    ]
 
 
 def test_python_identity_extraction_includes_unittest_subclass_methods():
@@ -449,20 +468,49 @@ def test_removed_backend_resident_seams_are_absent():
     py_files = list(backend_app_dir.rglob("*.py"))
     assert py_files, f"No .py files found under {backend_app_dir}"
 
-    reintroduced = []
-    for class_name in DELETED_RESIDENT_CLASSES:
-        # Match "class StrategicResident(" or "class StrategicResident:" but
-        # not substrings of longer names (e.g. StrategicResidentCheckpoint
-        # must not match a StrategicResidentCheckpointSomething guard).
-        pattern = re.compile(
-            r"^\s*class\s+" + re.escape(class_name) + r"\s*[\(:]",
-            re.MULTILINE,
+    # One pass over the tree, not one per class name. The read used to sit
+    # inside the class-name loop, so this scanned 8 x 568 = 4,544 files to
+    # inspect 568. Over the Docker-on-Windows bind mount that is the difference
+    # between a fast guard and one that trips the standalone lane's 30s
+    # pytest-timeout -- reporting a slow filesystem as a resident-class
+    # regression.
+    #
+    # Match "class StrategicResident(" or "class StrategicResident:" but not
+    # substrings of longer names (e.g. StrategicResident must not swallow a
+    # StrategicResidentCheckpoint definition). Alternatives are ordered
+    # longest-first so the longest class name wins outright rather than by
+    # backtracking out of a shorter prefix.
+    pattern = re.compile(
+        r"^\s*class\s+("
+        + "|".join(
+            re.escape(name)
+            for name in sorted(DELETED_RESIDENT_CLASSES, key=len, reverse=True)
         )
-        for py_file in py_files:
-            source = py_file.read_text(encoding="utf-8")
-            if pattern.search(source):
-                rel = py_file.relative_to(REPO_ROOT)
-                reintroduced.append(f"{class_name} in {rel}")
+        + r")\s*[\(:]",
+        re.MULTILINE,
+    )
+
+    # Derived from the class list rather than written out, so it cannot drift
+    # into excluding a name the guard is supposed to catch: a file that does
+    # not contain the prefix every deleted class name shares cannot define one.
+    common_prefix = os.path.commonprefix(DELETED_RESIDENT_CLASSES)
+    assert common_prefix, "class list must share a prefix for the scan prefilter"
+
+    hits_by_class: dict[str, list[str]] = {}
+    for py_file in py_files:
+        source = py_file.read_text(encoding="utf-8")
+        if common_prefix not in source:
+            continue
+        for match in pattern.finditer(source):
+            rel = py_file.relative_to(REPO_ROOT)
+            hits_by_class.setdefault(match.group(1), []).append(str(rel))
+
+    # Emit in declared-class order so the failure message stays stable.
+    reintroduced = [
+        f"{class_name} in {rel}"
+        for class_name in DELETED_RESIDENT_CLASSES
+        for rel in hits_by_class.get(class_name, [])
+    ]
 
     assert not reintroduced, (
         "The following shadow-turn ORM classes were reintroduced into backend "
@@ -788,7 +836,8 @@ def test_protect_entries_marked_complete_have_all_tests():
     the manifest silently stale.
     """
     manifest = _load_manifest()
-    violations = _find_completeness_violations(manifest, REPO_ROOT)
+    with frozen_typescript_tree():
+        violations = _find_completeness_violations(manifest, REPO_ROOT)
 
     assert not violations, (
         "The following complete protect entries do not exactly match their "
@@ -832,6 +881,69 @@ def test_extract_test_ids_dispatches_python_and_typescript():
         'test("test case", () => {})\n'
         "test.each([[1]])(`test each $value`, () => {})\n",
     ) == {"it case", "each %s", "test case", "test each $value"}
+
+
+def test_extractor_uses_describe_paths_and_expands_parameter_rows():
+    """Canonical IDs retain suite ancestry, escapes, duplicates, and each rows."""
+    source = r'''
+describe("outer suite", () => {
+  describe(
+    'inner \'suite\'',
+    () => {
+      it("same label", () => {});
+      it("same label", () => {});
+      it.each([
+        ["first", { nested: true }],
+        ["second", { nested: false }],
+      ])(
+        'row %s',
+        (name) => {}
+      );
+    },
+  );
+});
+'''
+
+    assert extract_typescript_test_ids(source) == {
+        "outer suite > inner 'suite' > same label",
+        "outer suite > inner 'suite' > same label [duplicate 2]",
+        "outer suite > inner 'suite' > row %s [case 1]",
+        "outer suite > inner 'suite' > row %s [case 2]",
+    }
+
+
+def test_typescript_identity_resolves_local_referenced_each_arrays():
+    """A statically declared table expands to the rows Vitest collects."""
+    source = """
+const CASES = [['first'], ['second'], ['third']];
+describe('suite', () => {
+  it.each(CASES)('case %s', () => {});
+});
+"""
+
+    assert extract_typescript_test_ids(source) == {
+        "suite > case %s [case 1]",
+        "suite > case %s [case 2]",
+        "suite > case %s [case 3]",
+    }
+
+
+def test_typescript_identity_counts_match_the_runtime_vitest_inventory():
+    """Protected TS counts agree with the committed Vitest runtime inventory."""
+    artifact = json.loads(
+        (REPO_ROOT / "agent" / ".test_durations.json").read_text(encoding="utf-8")
+    )
+    runtime_counts = {
+        entry["file"]: entry["tests"]
+        for entry in artifact["files"]
+        if entry["file"] in {
+            "src/handlers/index.test.ts",
+            "src/handlers/strategic-helpers.test.ts",
+        }
+    }
+    for relative, runtime_count in runtime_counts.items():
+        path = REPO_ROOT / "agent" / relative
+        assert len(extract_typescript_test_ids(path.read_text(encoding="utf-8"), path)) == runtime_count
 
 
 def test_completeness_checker_ignores_partial_and_reports_missing_and_extra(tmp_path):
@@ -1094,7 +1206,10 @@ def test_ts_it_each_label_extraction_double_quoted():
         "  ])(\"handles %s in double quotes\", (val) => { expect(val).toBeTruthy() })\n"
     )
     labels = extract_typescript_test_ids(source)
-    assert labels == {"handles %s in double quotes"}, (
+    assert labels == {
+        "handles %s in double quotes [case 1]",
+        "handles %s in double quotes [case 2]",
+    }, (
         f"Expected double-quoted it.each template captured, got {labels!r}"
     )
 
@@ -1107,7 +1222,10 @@ def test_ts_it_each_label_extraction_backtick():
         "  ])(`handles %s in backticks`, (val) => { expect(val).toBeTruthy() })\n"
     )
     labels = extract_typescript_test_ids(source)
-    assert labels == {"handles %s in backticks"}, (
+    assert labels == {
+        "handles %s in backticks [case 1]",
+        "handles %s in backticks [case 2]",
+    }, (
         f"Expected backtick it.each template captured, got {labels!r}"
     )
 

@@ -65,9 +65,18 @@ def extract_guard_suppression_identities(
     longer than the window — or an agent VM whose clock skews ``recorded_at``
     slightly into the future — must not strand its chain permanently open.
     """
+    if not isinstance(receipt, Mapping):
+        return None
+    status = receipt.get("status")
+    if not isinstance(status, str):
+        return None
+    baseline_unavailable = (
+        status == "failed"
+        and _receipt_has_baseline_unavailable_lane(receipt)
+    )
     if (
-        not isinstance(receipt, Mapping)
-        or not str(receipt.get("status") or "").startswith("passed")
+        not status.startswith("passed")
+        and not baseline_unavailable
         or (require_fresh and not _guard_suppression_receipt_is_fresh(receipt))
         or not _guard_suppression_receipt_is_parseable(receipt)
     ):
@@ -84,6 +93,8 @@ def extract_guard_suppression_identities(
         for raw_lane, raw_lane_record in guard.items():
             if not isinstance(raw_lane, str) or not raw_lane or not isinstance(raw_lane_record, Mapping):
                 return None
+            if raw_lane_record.get("state") == "baseline_unavailable":
+                extracted.add((raw_lane, "baseline_unavailable"))
             for bucket in ("suppressed", "disappeared", "skipped"):
                 entries = raw_lane_record.get(bucket)
                 if entries is None and bucket != "suppressed":
@@ -100,7 +111,10 @@ def extract_guard_suppression_identities(
                     or truncated
                 ):
                     return None
-            for identity in raw_lane_record["suppressed"]:
+            suppressed = raw_lane_record.get("suppressed")
+            if not isinstance(suppressed, Mapping):
+                return None
+            for identity in suppressed:
                 if not isinstance(identity, str) or not identity:
                     return None
                 extracted.add((raw_lane, identity))
@@ -134,6 +148,15 @@ def extract_guard_suppression_identities(
             # discarded an unknown number of legacy identities.
             return None
     return sorted(extracted)
+
+
+def _receipt_has_baseline_unavailable_lane(receipt: Mapping[str, Any]) -> bool:
+    """Return whether a blocked receipt names an unavailable baseline lane."""
+    guard = receipt.get("guard_suppressions")
+    return isinstance(guard, Mapping) and any(
+        isinstance(record, Mapping) and record.get("state") == "baseline_unavailable"
+        for record in guard.values()
+    )
 
 
 def _has_complete_count(

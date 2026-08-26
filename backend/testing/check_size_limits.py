@@ -72,9 +72,25 @@ import sys
 _BACKEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
-_SCRIPTS_DIR = os.path.normpath(os.path.join(_BACKEND_DIR, "..", "scripts"))
-if _SCRIPTS_DIR not in sys.path:
+# The shared receipt writers live in the repo's ``scripts/`` dir, which is NOT
+# a sibling of ``_BACKEND_DIR`` in every environment: the Docker test image
+# carries the backend tree as ``/app`` with no ``scripts/`` sibling and mounts
+# the repo root at ``/repo``. The old fixed ``<_BACKEND_DIR>/../scripts`` walk
+# resolved to a nonexistent ``/scripts`` there, so every receipt import failed
+# with nothing naming why. Probe both layouts, and keep the miss REASON so the
+# fail-open receipt warnings below can report it instead of a bare ImportError.
+from testing.repo_scripts_path import resolve_scripts_dir_from_env
+
+_SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(_BACKEND_DIR)
+_SCRIPTS_DIR_HINT = f" — {_SCRIPTS_DIR_UNAVAILABLE}" if _SCRIPTS_DIR_UNAVAILABLE else ""
+if _SCRIPTS_DIR is not None and _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
+
+try:  # absent from the backend-only Docker context, which has no scripts/
+    from utf8_io import force_utf8_streams
+except ImportError:  # pragma: no cover - that context is a UTF-8 host already
+    def force_utf8_streams() -> None:
+        return None
 
 # Inserting ``_BACKEND_DIR`` at the front of ``sys.path`` only wins the
 # ``app.size_limit_policy`` import when ``<_BACKEND_DIR>/app`` is a REGULAR
@@ -504,8 +520,13 @@ def scan_governed_missing_cap(
 
 
 def load_limits(json_path: str) -> dict:
-    """Load the size-limits JSON, preserving key order (dicts are ordered)."""
-    with open(json_path) as f:
+    """Load the size-limits JSON, preserving key order (dicts are ordered).
+
+    Strict utf-8, NOT ``errors="replace"`` like :func:`count_lines`: ``--fix``
+    writes back what it read, so replacing here would launder mojibake into the
+    committed ledger. An undecodable ledger must fail loudly instead.
+    """
+    with open(json_path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -514,8 +535,11 @@ def write_limits(json_path: str, data: dict) -> None:
 
     Uses the same formatting as the tracked file (2-space indent, ASCII-escaped,
     trailing newline) so a --fix diff shows only the changed cap numbers.
+
+    ``newline=""`` stops a Windows ``--fix`` rewriting every line of this ledger
+    as CRLF -- a whole-file diff that defeats its ``sizecap`` merge driver.
     """
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8", newline="") as f:
         json.dump(data, f, indent=2, ensure_ascii=True)
         f.write("\n")
 
@@ -595,12 +619,16 @@ def _collect_baseline_offenders(
     except (OSError, ValueError) as exc:
         return {}, {}, f"cannot read {base_json}: {exc}"
     checked, _skipped = evaluate(base_data, sections, base_root, use_env_overrides=False)
-    breached = {
-        (section, rec["rel"]): rec["count"]
-        for section, recs in checked.items()
-        for rec in recs
-        if rec["breach"]
-    }
+    from app.size_limit_policy import eligible_baseline_count
+
+    breached: dict = {}
+    for section, recs in checked.items():
+        for rec in recs:
+            base_count = eligible_baseline_count(
+                rec.get("count"), rec.get("effective_cap", rec.get("cap"))
+            )
+            if base_count is not None:
+                breached[(section, rec["rel"])] = base_count
     uncapped: dict = {}
     for section in sections:
         root = resolve_section_root(section, base_root, use_env_overrides=False)
@@ -877,8 +905,8 @@ def detect_unjustified_cap_raises(
     return raises
 
 
-def _cap_bump_history_for(section: str, rel: str) -> list:
-    """Return the cap-bump history ledger records for ``(section, rel)``.
+def _cap_bump_history_for(section: str, rel: str, repo_root: str | None = None) -> list:
+    """Return the cap-bump history ledger records for ``(section, rel)`` in ``repo_root``.
 
     Delegates to ``app.size_limit_policy.parse_bump_history`` — the same source
     the chronic-offender verdict and the --fix regenerator use — so a raise is
@@ -890,7 +918,7 @@ def _cap_bump_history_for(section: str, rel: str) -> list:
     from app.size_limit_policy import BumpHistoryUnavailableError, parse_bump_history
 
     try:
-        return parse_bump_history(rel, section)
+        return parse_bump_history(rel, section, repo_root)
     except BumpHistoryUnavailableError:
         return []
 
@@ -984,7 +1012,8 @@ def _record_baseline_attribution(
         )
     except Exception as exc:  # receipt evidence is fail-open
         print(
-            f"[verification-receipt] WARN could not record {_SIZE_LIMITS_LANE}: {exc}",
+            f"[verification-receipt] WARN could not record {_SIZE_LIMITS_LANE}: "
+            f"{exc}{_SCRIPTS_DIR_HINT}",
             file=sys.stderr,
         )
 
@@ -999,7 +1028,8 @@ def _record_baseline_attribution(
         )
     except Exception as exc:  # receipt evidence is fail-open
         print(
-            f"[guard-suppression] WARN could not record {_SIZE_LIMITS_LANE}: {exc}",
+            f"[guard-suppression] WARN could not record {_SIZE_LIMITS_LANE}: "
+            f"{exc}{_SCRIPTS_DIR_HINT}",
             file=sys.stderr,
         )
 
@@ -1030,6 +1060,7 @@ def _parse_repair_target(raw: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(
         description="Check (and optionally --fix) module size-limit guardrails."
     )
@@ -1108,6 +1139,9 @@ def main(argv: list[str] | None = None) -> int:
     repo_root_explicit = args.repo_root is not None
     if args.repo_root is None:
         args.repo_root = _DEFAULT_REPO_ROOT
+    # Explicit roots only: _DEFAULT_REPO_ROOT is "/" inside the backend image,
+    # while size_limit_policy._REPO_ROOT knows CI's /repo bind mount.
+    policy_repo_root = args.repo_root if repo_root_explicit else None
 
     data = load_limits(args.json_path)
     # The environment-specific frontend escape hatches (ADMIN_UI_SRC /
@@ -1336,7 +1370,10 @@ def main(argv: list[str] | None = None) -> int:
             if bumped or added or pruned:
                 write_limits(args.json_path, data)
             for source_path, source_text in source_rewrites:
-                with open(source_path, "w", encoding="utf-8") as source_file:
+                # newline="": source_text was read with universal newlines, so
+                # without it a Windows --fix rewrites the WHOLE tracked source
+                # file as CRLF to change one cap constant.
+                with open(source_path, "w", encoding="utf-8", newline="") as source_file:
                     source_file.write(source_text)
             if bumped or pruned or phantoms or missing_ledger_records:
                 # Keep the committed cap-bump-history ledger (the deployed
@@ -1350,6 +1387,7 @@ def main(argv: list[str] | None = None) -> int:
                 rebuild_cap_bump_history_ledger(
                     caps_json_path=args.json_path,
                     ledger_path=ledger_path,
+                    repo_root=policy_repo_root,
                     pending=[
                         (section, rec["rel"], rec["cap"], new_cap)
                         for section, rec, new_cap in bumped
@@ -1631,7 +1669,7 @@ def main(argv: list[str] | None = None) -> int:
             data,
             mainline_data,
             args.sections,
-            history_for=_cap_bump_history_for,
+            history_for=lambda sec, rel: _cap_bump_history_for(sec, rel, policy_repo_root),
         )
         if unjustified_raises:
             for section, rel, old_cap, new_cap in unjustified_raises:

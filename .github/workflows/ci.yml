@@ -49,6 +49,37 @@ jobs:
       backend: ${{ steps.result.outputs.backend }}
       agent: ${{ steps.result.outputs.agent }}
     steps:
+      # Self-heal a workspace that a previous job left root-owned, BEFORE
+      # checkout -- because checkout is exactly what breaks.
+      #
+      # Self-hosted runners share _work/<repo>/<repo> across every workflow on
+      # that runner. A container that bind-mounts the tree read-write and runs
+      # as root leaves __pycache__, .pytest_cache and .testmondata the runner
+      # user cannot delete, and the next actions/checkout dies in seconds:
+      #
+      #   warning: failed to remove backend/app/routers/__pycache__/...pyc: Permission denied
+      #   ##[warning]Unable to clean or reset the repository. The repository will be recreated instead.
+      #   ##[error]File was unable to be removed Error: EACCES: permission denied,
+      #     unlink '.../backend/.pytest_cache/.gitignore'
+      #
+      # It presents as a landing lottery: the identical SHA is red on one
+      # runner and green on the next, so it reads as a flaky test rather than a
+      # broken host. That is expensive here specifically -- this workflow is
+      # what gates the automain->main promotion PR, and a red run deletes that
+      # PR and its release branch.
+      #
+      # scripts/test-backend.sh was the producer and is fixed (#17868 runs the
+      # container as the calling uid). This step is the consumer-side guard: it
+      # costs ~1s, it is idempotent, and it means ANY future producer -- another
+      # repo on this runner, an agent VM harness, a hand-run container -- cannot
+      # silently red the promotion. guard-data.yml carries the same pair.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
@@ -105,6 +136,14 @@ jobs:
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -154,6 +193,14 @@ jobs:
       matrix:
         shard: [1, 2]
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -199,6 +246,14 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -392,6 +447,14 @@ jobs:
     outputs:
       reqhash: ${{ steps.hash.outputs.reqhash }}
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - name: Compute deps hash
@@ -497,6 +560,14 @@ jobs:
       POSTGRES_CONTAINER: blueprint-ci-postgres-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
       TEST_DB_URL: postgresql+asyncpg://test:test@postgres:5432/test_blueprint
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       # Persistent runners are not discarded after every job. Each runner owns
@@ -566,14 +637,50 @@ jobs:
             -e POSTGRES_PASSWORD=test \
             -e POSTGRES_DB=test_blueprint \
             postgres:15
-          for i in $(seq 1 30); do
+          # Require the readiness probe to hold, and trust the loop's own
+          # result instead of re-running the check afterwards.
+          #
+          # Observed on run 32804531811, backend shard 3: the loop printed
+          # "PostgreSQL ready after 3 check(s)" and the job then failed with
+          # "PostgreSQL did not become ready" 0.14s later, on a database that
+          # was healthy -- the dumped container logs still showed initdb doing
+          # post-bootstrap initialization. So the first probe went true against
+          # a server that was about to go away, and the confirmation probe
+          # landed in that window.
+          #
+          # Two independent defects, and both are fixed here:
+          #
+          #  1. The confirmation re-ran pg_isready instead of recording what
+          #     the loop already determined. That re-poll can only ever turn a
+          #     success into a failure, never the reverse -- it is pure
+          #     downside. A $ready flag removes it.
+          #
+          #  2. A single successful probe was treated as settled. Requiring
+          #     two consecutive successes means a probe that goes true against
+          #     a server that is about to restart does not latch, which also
+          #     stops the suite from starting against one.
+          #
+          # This reds a random shard of a healthy candidate, so on the
+          # promotion PR -- where a red run deletes the PR and its release
+          # branch -- it presents as an unreproducible flake. It is not: it is
+          # a control-flow bug that fires whenever the probe and the restart
+          # overlap.
+          ready=
+          streak=0
+          for i in $(seq 1 60); do
             if docker exec "$POSTGRES_CONTAINER" pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
-              echo "PostgreSQL ready after $i check(s)"
-              break
+              streak=$((streak + 1))
+              if [ "$streak" -ge 2 ]; then
+                ready=1
+                echo "PostgreSQL ready after $i check(s)"
+                break
+              fi
+            else
+              streak=0
             fi
             sleep 2
           done
-          if ! docker exec "$POSTGRES_CONTAINER" pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
+          if [ -z "$ready" ]; then
             echo "::error::PostgreSQL did not become ready"
             docker logs "$POSTGRES_CONTAINER" || true
             exit 1
@@ -795,12 +902,24 @@ jobs:
       - name: Migration linter
         if: matrix.shard == 1
         run: |
+          set -euo pipefail
           BASE_BRANCH="${{ github.event.pull_request.base.ref || 'main' }}"
-          NEW_MIGRATIONS=$(git diff --name-only --diff-filter=A origin/$BASE_BRANCH -- backend/alembic/versions/*.py 2>/dev/null || true)
+          # This step was vacuous for its entire life. actions/checkout@v4
+          # defaults to fetch-depth 1, so origin/$BASE_BRANCH does not exist in
+          # this workspace; the diff below died, `2>/dev/null || true` swallowed
+          # the error, NEW_MIGRATIONS came back empty, and EVERY run printed
+          # "No new migrations — skipping" and exited 0 — including runs that
+          # did add migrations. Fetch the base ref explicitly and let a failure
+          # fail the job: a guard against a class that bricks a deploy must
+          # never report "clean" because it could not look.
+          git -c "safe.directory=$PWD" fetch --no-tags --depth=1 origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+          NEW_MIGRATIONS=$(git -c "safe.directory=$PWD" diff --name-only --diff-filter=A "origin/$BASE_BRANCH" -- 'backend/alembic/versions/*.py')
           if [ -z "$NEW_MIGRATIONS" ]; then
             echo "No new migrations — skipping"
             exit 0
           fi
+          echo "New migrations under review:"
+          echo "$NEW_MIGRATIONS"
           VIOLATIONS=$(echo "$NEW_MIGRATIONS" | xargs grep -l "nullable=False" 2>/dev/null | xargs grep -L "server_default" 2>/dev/null || true)
           if [ -n "$VIOLATIONS" ]; then
             echo "Migration safety violation: nullable=False without server_default in:"
@@ -844,6 +963,14 @@ jobs:
     needs: detect
     if: needs.detect.outputs.agent == 'true'
     steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4

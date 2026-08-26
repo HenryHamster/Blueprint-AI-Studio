@@ -17,6 +17,7 @@ from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
 from app.models import Direction, DirectionEvent
+from app.time_utils import utc_iso
 
 router = APIRouter(prefix="/api/admin")
 logger = logging.getLogger(__name__)
@@ -94,7 +95,7 @@ async def list_direction_events(
             "actor": row.actor,
             "reason": row.reason,
             "snapshot_data": row.snapshot_data,
-            "recorded_at": row.recorded_at.isoformat() if row.recorded_at else None,
+            "recorded_at": utc_iso(row.recorded_at),
         }
         for row in rows
     ]

@@ -826,6 +826,7 @@ export async function handleStrategic(
       'efficiency_snapshot':        './fetch efficiency-snapshot',
       'ci_compliance':              './fetch ci-compliance',
       'open_completion_debt':       './fetch completion-debt',
+      'operator_attention':         './fetch attention',
       // sections-type keys: served by /api/agent/projects/{id}/sections/{name}.
       // retirement_deferrals is intentionally omitted: it has no recovery path
       // (SECTION_FETCH_INVENTORY maps it to None), so advertising any fetch
@@ -1386,10 +1387,16 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       protocols/APIs/vendors); produces a citation-grounded doc
 #   design            — codebase-grounded design exploration for a subsystem before
 #                       implementation; produces a design document
-#   compute_experiment — run a command and measure a declared metric to resolve a
-#                       falsifiable hypothesis; requires command, spend_cap_usd,
-#                       deadline_seconds; optional success_criterion {metric,
-#                       operator (<|>|<=|>=), threshold}, accelerator (T4|L4|V100
+#   compute_experiment — run a command on real hardware, either to measure a
+#                       conjecture or to PRODUCE something (train a model, build a
+#                       dataset, capture a profile); requires command,
+#                       spend_cap_usd, deadline_seconds; optional success_criterion,
+#                       in EITHER form: {metric, operator (<|>|<=|>=), threshold}
+#                       for a measured goal, or {kind: "artifact_produced",
+#                       min_file_count: N} when the run's value IS its output;
+#                       optional input_artifact_job_id (start from a previous job's
+#                       artifacts — see the chaining note below),
+#                       accelerator (T4|L4|V100
 #                       — requests ONE GPU, no machine_type needed), container_image
 #                       (run command INSIDE a docker image — if a project-baked image
 #                       is listed in the Self-hosted compute section above, OMIT this
@@ -1400,12 +1407,21 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       natively, else the command runs BARE and dies
 #                       ModuleNotFoundError), container_registry_auth
 #                       {server,username,password} (private/gated registries only),
-#                       setup_step (host-level prep run as bare bash -lc OUTSIDE the
-#                       container; container-dependent installs go in command, NOT
-#                       here). The command MUST write the declared metric as JSON to
-#                       $BLUEPRINT_RESULT_FILE (or print it as the last stdout line)
-#                       — a run that exits 0 without it loses the metric and the
-#                       criterion fails unmeasured (compute_unmeasured_criterion).
+#                       setup_step (WHERE it runs is BACKEND-DEPENDENT and not
+#                       selectable: inside the sandbox, same shell as command,
+#                       on the local-runner fleet; outside the container on the
+#                       cloud/docker backends — so never put anything command
+#                       depends on here; installs go in command).
+#                       WHEN YOU DECLARE A METRIC the command MUST write it as
+#                       JSON to $BLUEPRINT_RESULT_FILE (or print it as the last stdout
+#                       line) — a run that exits 0 without it loses the metric and
+#                       the criterion fails unmeasured (compute_unmeasured_criterion).
+#                       When the run's value IS its output, declare NO metric and no
+#                       criterion: exit 0 with durable artifacts is then the result,
+#                       and an empty delivery fails. NEVER invent a metric that merely
+#                       restates delivery (artifacts_returned >= 2, files_written >= 1)
+#                       — it is met whenever the job ran at all, which measures the
+#                       platform rather than the hypothesis.
 #                       Reliability conventions (experiments die from env drift and
 #                       lost metrics, not wrong hypotheses): PIN dependency versions
 #                       in the command (e.g. jax==0.6.2 — an unpinned brax install
@@ -1427,6 +1443,30 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # this directory, and require_durable_artifact makes a missing/empty delivery a
 # loud failed result. Do not invent a second training or upload path; keep only
 # the useful, bounded files (artifact upload cap is about 25 MiB).
+# Chaining runs (input_artifact_job_id): an experiment can START from a previous
+# job's output instead of from scratch. Set input_artifact_job_id to a TERMINAL
+# compute job's id and the platform rehydrates that job's durable bundle INTO
+# '$BLUEPRINT_ARTIFACT_DIR' before the command runs, so the checkpoint is simply
+# already there and the command reads and writes the same directory. Use it for
+# train-then-evaluate, for continuing a run that hit its deadline, and for a sweep
+# sharing one expensive preprocessing step. A crashed run that still checkpointed is
+# a legal source (terminal + a bundle is the whole requirement). A resumed run MUST
+# also declare declared_metric and no_progress_timeout_seconds: resumed runs are long
+# by nature and need the stall watchdog armed. The launch is refused without that
+# pair. NOTE declared_metric is NOT the watchdog signal -- it only names the result
+# key used for scoring/arm comparison. The no-progress watchdog polls the MTIME of
+# the file named by '$BLUEPRINT_PROGRESS_FILE'; any advance counts as progress and
+# no advance within the window KILLS the job (exit 125, reason no_progress_timeout).
+# So the command must append one JSON line per step to it, e.g. in Python
+#   print(json.dumps({"metric": "loss", "value": v}),
+#         file=open(os.environ["BLUEPRINT_PROGRESS_FILE"], "a"), flush=True)
+# or from shell: echo '{"metric":"step","value":1}' >> "$BLUEPRINT_PROGRESS_FILE"
+# Append and flush, never rewrite. A command that emits its metric but never writes
+# this file is killed at exactly no_progress_timeout_seconds however healthy it is.
+# Python: on the imageless lane the runner exports '$BLUEPRINT_PYTHON' /
+# '$BLUEPRINT_PIP' / '$BLUEPRINT_VENV' for a provisioned per-job venv; inside a
+# container_image they are ABSENT. Use the both-lane fallback form
+# "\${BLUEPRINT_PYTHON:-python3}" and "\${BLUEPRINT_PIP:-pip3}", not bare python/pip.
 # Project compute-image environment (only when a workload actually needs a
 # container-only runtime such as CUDA/framework libraries): run
 # 'compute-image status' before authoring the launch. It returns one of four
@@ -1467,7 +1507,13 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "web_research", "title": "...", "prompt": "What external knowledge to gather...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
-./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable claim with a concrete threshold>", "command": "<command that writes the declared metric as JSON to $BLUEPRINT_RESULT_FILE>", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
+./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<claim the measurement settles>", "command": "<command that writes the declared metric as JSON to $BLUEPRINT_RESULT_FILE>", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": <the number that decides it>}, "direction_id": "d-xxx"}'
+# Production variant — the run's value IS its output (a trained model, a dataset, a
+# profile). Declare NO metric and NO success_criterion: exit 0 with durable artifacts in
+# $BLUEPRINT_ARTIFACT_DIR is the result, and an empty delivery fails. Add
+# success_criterion {"kind": "artifact_produced", "min_file_count": N} only to require a
+# specific count. Do NOT invent a metric that restates delivery.
+./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<what this run produces and what it is for>", "command": "<command that writes its outputs into $BLUEPRINT_ARTIFACT_DIR before exiting>", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "direction_id": "d-xxx"}'
 # GPU / containerized variant — accelerator requests one GPU; container_image runs
 # the command INSIDE a CUDA/NGC image. If a project-baked compute image is listed in
 # the "Self-hosted compute" section above, OMIT container_image — the platform
@@ -1475,8 +1521,10 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # you need a DIFFERENT stack the baked image does not cover, or for projects with no
 # baked image where the runtime is not pip-installable (else the command runs bare
 # and dies ModuleNotFoundError). Add container_registry_auth only for a private
-# registry; setup_step is host-level prep run OUTSIDE the container.
-./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable GPU claim with a concrete threshold>", "command": "<command — installs+run go HERE, inside the image; must write the metric JSON to $BLUEPRINT_RESULT_FILE>", "accelerator": "T4", "container_image": "nvcr.io/nvidia/tensorflow:25.01", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
+# registry. setup_step placement is BACKEND-DEPENDENT and not selectable: inside the
+# sandbox (same shell as command) on the local-runner fleet, outside the container on
+# the cloud/docker backends — so never put anything command depends on there.
+./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<GPU claim the measurement settles>", "command": "<command — installs+run go HERE, inside the image; must write the metric JSON to $BLUEPRINT_RESULT_FILE>", "accelerator": "T4", "container_image": "nvcr.io/nvidia/tensorflow:25.01", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": <the number that decides it>}, "direction_id": "d-xxx"}'
 # Multi-arm variant: use "arms" + "declared_metric" instead of a single "command".
 # Each arm writes its declared_metric key to $BLUEPRINT_RESULT_FILE as usual; the
 # platform isolates each arm in its own result path and assembles the comparison

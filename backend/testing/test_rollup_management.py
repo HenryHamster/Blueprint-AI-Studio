@@ -154,7 +154,9 @@ def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=SizeCapPreflightResult("ok", None, "reviewed-rollup-head"),
+        return_value=SizeCapPreflightResult(
+            "ok", None, "reviewed-rollup-head", base_sha="base-sha"
+        ),
     )
     return mock_merge, mock_spawn
 
@@ -623,6 +625,8 @@ async def test_assembled_rollup_size_breach_cannot_merge(cleanup_db, mocker):
 
     preflight.assert_awaited_once()
     assert preflight.await_args.kwargs["expected_head_sha"] == "reviewed-rollup-head"
+    assert preflight.await_args.kwargs["target_branch"] == "research/conflict-base"
+    assert preflight.await_args.kwargs["expected_base_sha"] == "base-sha"
     mock_merge.assert_not_awaited()
     await cleanup_db.refresh(parent)
     assert parent.requires_approval is True
@@ -870,7 +874,9 @@ async def test_clean_pr_sha_mismatch_skips_update_branch(cleanup_db, mocker):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=SizeCapPreflightResult("ok", None, "head-sha-111"),
+        return_value=SizeCapPreflightResult(
+            "ok", None, "head-sha-111", base_sha="base-sha"
+        ),
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -1428,7 +1434,7 @@ async def test_rollup_behind_fix_prompt_includes_noop_guidance(cleanup_db, mocke
 # mirroring the other three handlers. These tests lock that in.
 
 
-def _mock_rollup_resume_closed_pr(mocker, *, merged=False):
+def _mock_rollup_resume_closed_pr(mocker, *, merged=False, closed_pr_data=None):
     """Mock just enough of the resume path so control reaches the closed-state
     branch with a closed-not-merged existing rollup PR. ``create_pull_request``
     is mocked so the duplicate-PR side effect is observable."""
@@ -1451,7 +1457,8 @@ def _mock_rollup_resume_closed_pr(mocker, *, merged=False):
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": merged, "state": "closed"},
+        return_value=closed_pr_data
+        or {"merged": merged, "state": "closed"},
     )
     # If the markers are (wrongly) cleared, the code falls through to create a
     # NEW rollup PR — this mock makes that duplicate observable.
@@ -1506,14 +1513,20 @@ async def test_rollup_resume_closed_pending_reopen_preserves_marker_no_duplicate
 
 
 @pytest.mark.asyncio
-async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
+async def test_superseded_rollup_recreate_records_lineage_and_releases_dead_hold(
     cleanup_db, mocker
 ):
-    """C4 4th-site counterpart: a closed-not-merged rollup PR with NO pending_reopen
-    marker is a genuine abandonment — the resume path clears the markers (will
-    retry by creating a fresh PR), preserving the pre-fix behavior for real
-    closures."""
-    _mock_rollup_resume_closed_pr(mocker, merged=False)
+    """Recreate records the dead PR and releases only its review-wait hold."""
+    _mock_rollup_resume_closed_pr(
+        mocker,
+        merged=False,
+        closed_pr_data={
+            "merged": False,
+            "state": "closed",
+            "head": {"sha": "dead-pr-head"},
+            "base": {"sha": "dead-pr-base"},
+        },
+    )
 
     from app.rollup_management import _check_and_trigger_rollup
 
@@ -1521,8 +1534,38 @@ async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
     parent = await _make_rollup_parent_with_pr(
         cleanup_db,
         project.id,
-        extra_context={"review_loop": {"pr_number": 4242, "ci_waiting": True}},
+        extra_context={
+            "blueprint_review_verdict": "APPROVE",
+            "review_loop": {
+                "pr_number": 4242,
+                "branch": "research/old-rollup",
+                "base_branch": "automain",
+                "iteration": 3,
+                "max_iterations": 16,
+                "issue_ledger": {"old": "finding"},
+                "review_approved": True,
+                "review_verdict": "APPROVE",
+                "ci_passed": True,
+                "ci_waiting": True,
+                "ci_checked_head_sha": "dead-pr-head",
+                "verifier_status": "passed",
+                "merge_attempted": True,
+                "review_wait_approval_hold": {
+                    "owner": "ci_review_wait_backstop",
+                    "project_id": str(project.id),
+                    "pr_number": 4242,
+                    "head_sha": "dead-pr-head",
+                    "base_sha": "dead-pr-base",
+                    "set_at": "dead-hold-at",
+                },
+            },
+            "_approval_set_at": "dead-hold-at",
+            "_operator_approval_followup_claim": {"pr_number": 4242},
+        },
     )
+    parent.requires_approval = True
+    cleanup_db.add(parent)
+    await cleanup_db.commit()
     child = await _make_merged_child(cleanup_db, project.id, parent.id)
 
     await _check_and_trigger_rollup(child, cleanup_db)
@@ -1534,6 +1577,82 @@ async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
         "so the rollup is retried."
     )
     assert "rollup_pr_url" not in ctx
+    assert "blueprint_review_verdict" not in ctx
+    assert parent.requires_approval is False
+    assert "_approval_set_at" not in ctx
+    assert "_operator_approval_followup_claim" not in ctx
+
+    successor_loop = ctx.get("review_loop") or {}
+    assert successor_loop["superseded_pr_numbers"] == ["4242"]
+    assert successor_loop.get("review_approved") is None
+    assert successor_loop.get("review_verdict") is None
+    assert successor_loop.get("ci_passed") is None
+    assert successor_loop.get("ci_waiting") is None
+    assert successor_loop.get("ci_checked_head_sha") is None
+    assert successor_loop.get("verifier_status") is None
+    assert successor_loop.get("merge_attempted") is None
+    assert successor_loop["branch"] == "research/old-rollup"
+    assert successor_loop["base_branch"] == "automain"
+    assert successor_loop["iteration"] == 3
+    assert successor_loop["max_iterations"] == 16
+    assert successor_loop["issue_ledger"] == {"old": "finding"}
+
+
+@pytest.mark.asyncio
+async def test_superseded_rollup_recreate_preserves_independent_approval_hold(
+    cleanup_db, mocker
+):
+    """A newer independent hold is not released while the old claim is cleared."""
+    _mock_rollup_resume_closed_pr(
+        mocker,
+        merged=False,
+        closed_pr_data={
+            "merged": False,
+            "state": "closed",
+            "head": {"sha": "dead-pr-head"},
+            "base": {"sha": "dead-pr-base"},
+        },
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            "review_loop": {
+                "pr_number": 4242,
+                "branch": "research/old-rollup",
+                "base_branch": "automain",
+                "review_wait_approval_hold": {
+                    "owner": "ci_review_wait_backstop",
+                    "project_id": str(project.id),
+                    "pr_number": 4242,
+                    "head_sha": "dead-pr-head",
+                    "base_sha": "dead-pr-base",
+                    "set_at": "dead-hold-at",
+                },
+            },
+            "_approval_set_at": "independent-hold-at",
+            "approval_hold_reason": "spend_budget",
+            "_operator_approval_followup_claim": {"pr_number": 4242},
+        },
+    )
+    parent.requires_approval = True
+    cleanup_db.add(parent)
+    await cleanup_db.commit()
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert parent.requires_approval is True
+    assert ctx["_approval_set_at"] == "independent-hold-at"
+    assert ctx["approval_hold_reason"] == "spend_budget"
+    assert "_operator_approval_followup_claim" not in ctx
+    assert (ctx.get("review_loop") or {})["superseded_pr_numbers"] == ["4242"]
 
 
 # ── Duplicate-create guard (rollup_pr_creating_at claim) ──────────────────────
@@ -3116,7 +3235,7 @@ def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=SizeCapPreflightResult("ok", None, "deadbeef"),
+        return_value=SizeCapPreflightResult("ok", None, "deadbeef", base_sha="base-sha"),
     )
 
 
@@ -3264,7 +3383,7 @@ def _mock_repoll_or_escalation_landing_deps(mocker, *, get_pr_side_effect, merge
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         new_callable=AsyncMock,
-        return_value=SizeCapPreflightResult("ok", None, "deadbeef"),
+        return_value=SizeCapPreflightResult("ok", None, "deadbeef", base_sha="base-sha"),
     )
     return merge
 
@@ -6105,4 +6224,3 @@ def test_park_abandoned_child_is_not_retried_by_the_parent_requeue():
     # real retry budget for failures a fresh attempt can actually fix.
     assert not _child_failure_is_terminal_for_requeue(_failed_child("agent_timeout"))
     assert not _child_failure_is_terminal_for_requeue(_failed_child(None))
-

@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 import runner_isolation as iso
 
@@ -507,6 +509,44 @@ class TestEnvAllowlist(unittest.TestCase):
         self.assertEqual(env["LD_LIBRARY_PATH"], "/usr/local/cuda/lib64")
         self.assertEqual(env["MY_HP"], "0.1")
         self.assertEqual(env["BLUEPRINT_RESULT_FILE"], "/workspace/result.json")
+
+    def test_compute_env_path_includes_bound_tool_dirs(self):
+        """The compute lane must put BOUND tool dirs on PATH, like the agent lane.
+
+        Regression pin for the imageless-compute defect: ``build_compute_env``
+        hardcoded ``PATH`` to the default sandbox list while
+        ``build_agent_env`` rebuilt it from the bound tool dirs. The sandbox
+        therefore bound the host's ``python3``/``uv`` into the jail and left
+        their directories off PATH, which is the ``no working pip found``
+        / exit-127 corpus.
+        """
+        env = iso.build_compute_env(
+            {},
+            {},
+            {"PATH": "/usr/bin"},
+            ["/opt/toolchain/bin", "/opt/uv/bin"],
+        )
+        entries = env["PATH"].split(":")
+        self.assertIn("/opt/toolchain/bin", entries)
+        self.assertIn("/opt/uv/bin", entries)
+        # Bound dirs come FIRST, and the default sandbox PATH is still present.
+        self.assertEqual(entries[:2], ["/opt/toolchain/bin", "/opt/uv/bin"])
+        for default in iso._DEFAULT_SANDBOX_PATH.split(":"):
+            self.assertIn(default, entries)
+
+    def test_compute_env_job_path_cannot_shadow_bound_tool_dirs(self):
+        """A job-declared PATH is honoured but never precedes the platform's."""
+        env = iso.build_compute_env(
+            {"PATH": "/job/bin"},
+            {},
+            {"PATH": "/usr/bin"},
+            ["/opt/toolchain/bin"],
+        )
+        entries = env["PATH"].split(":")
+        self.assertIn("/job/bin", entries)
+        self.assertLess(
+            entries.index("/opt/toolchain/bin"), entries.index("/job/bin")
+        )
 
     def test_forbidden_keys_stripped_even_if_injected(self):
         env = iso.build_agent_env(
@@ -1465,6 +1505,76 @@ class TestComputePlan(unittest.TestCase):
         # /sys is GPU-only: non-GPU sandboxes must stay /sys-free.
         self.assertNotIn(" /sys", " ".join(plan.argv))
 
+    def test_bwrap_plan_path_carries_resolved_tool_dirs(self):
+        """End-to-end pin: resolved compute tools reach the sandbox PATH."""
+        with mock.patch.object(
+            iso, "resolve_tools", return_value=["/opt/hosttools/bin/python3"]
+        ):
+            plan = self._common()
+        self.assertEqual(plan.backend, iso.BACKEND_BWRAP)
+        self.assertIn("/opt/hosttools/bin", plan.env["PATH"].split(":"))
+
+    def _runtime(self):
+        return iso.ComputePythonRuntime(
+            python_path="/home/r/.blueprint/compute-runtime/venv/bin/python",
+            site_packages=(
+                "/home/r/.blueprint/compute-runtime/venv/lib/python3.11/site-packages"
+            ),
+            base_python="/usr/bin/python3.11",
+            python_version="3.11.9",
+            pip_version="24.0",
+            provisioner="venv",
+        )
+
+    def test_bwrap_plan_exports_job_venv_interpreter_contract(self):
+        runtime = self._runtime()
+        with mock.patch.object(iso, "resolve_tools", return_value=[]):
+            plan = self._common(
+                python_runtime=runtime,
+                job_venv_host="/tmp/bp_x/.bp-venv",
+            )
+        # The contract an authored experiment can rely on, in-sandbox paths.
+        self.assertEqual(plan.env["BLUEPRINT_PYTHON"], "/workspace/.bp-venv/bin/python")
+        self.assertEqual(plan.env["BLUEPRINT_PIP"], "/workspace/.bp-venv/bin/pip")
+        self.assertEqual(plan.env["BLUEPRINT_VENV"], "/workspace/.bp-venv")
+        self.assertEqual(plan.env["VIRTUAL_ENV"], "/workspace/.bp-venv")
+        # ...and its bin dir is FIRST on PATH, so bare `python`/`pip` hit it.
+        self.assertEqual(plan.env["PATH"].split(":")[0], "/workspace/.bp-venv/bin")
+        # The shared runtime is bound read-only so the job venv's .pth link and
+        # the venv's base interpreter both resolve inside the jail.
+        joined = " ".join(plan.argv)
+        self.assertIn("/home/r/.blueprint/compute-runtime/venv", joined)
+
+    def test_bwrap_plan_falls_back_to_readonly_runtime_without_job_venv(self):
+        runtime = self._runtime()
+        with mock.patch.object(iso, "resolve_tools", return_value=[]):
+            plan = self._common(python_runtime=runtime, job_venv_host=None)
+        self.assertEqual(plan.env["BLUEPRINT_PYTHON"], runtime.python_path)
+        self.assertEqual(plan.env["PATH"].split(":")[0], runtime.bin_dir)
+        self.assertNotIn("BLUEPRINT_VENV", plan.env)
+        # In-sandbox Linux paths, never a host separator (the unit tests also
+        # run on Windows, where os.path.join would emit a backslash).
+        self.assertEqual(
+            plan.env["BLUEPRINT_PIP"],
+            "/home/r/.blueprint/compute-runtime/venv/bin/pip",
+        )
+
+    def test_bwrap_plan_without_runtime_is_unchanged(self):
+        """No runtime supplied (e.g. the GPU smoke) must inject nothing."""
+        with mock.patch.object(iso, "resolve_tools", return_value=[]):
+            plan = self._common()
+        for key in ("BLUEPRINT_PYTHON", "BLUEPRINT_PIP", "BLUEPRINT_VENV"):
+            self.assertNotIn(key, plan.env)
+
+    def test_bwrap_plan_runtime_never_leaks_runner_token(self):
+        with mock.patch.object(iso, "resolve_tools", return_value=[]):
+            plan = self._common(
+                python_runtime=self._runtime(),
+                job_venv_host="/tmp/bp_x/.bp-venv",
+            )
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", plan.env)
+        self.assertNotIn("SECRET", " ".join(plan.argv))
+
     def test_bwrap_gpu_exposes_only_assigned_nodes(self):
         plan = self._common(
             caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, gpu_indices=(0, 1, 2, 3)),
@@ -1820,6 +1930,9 @@ class TestProjectVerificationProbe(unittest.TestCase):
             self.assertNotIn("/var/run/docker.sock", argv)
             self.assertNotIn("/run/docker.sock", argv)
 
+    # Boots a live sandbox PostgreSQL, which the lanes' --timeout=30 cannot
+    # cover; the inner 90s budget could never fire without this marker.
+    @pytest.mark.timeout(180)
     def test_real_probe_runs_live_sandbox_postgres_when_installed(self):
         pg_config = shutil.which("pg_config")
         ruff_available = subprocess.run(

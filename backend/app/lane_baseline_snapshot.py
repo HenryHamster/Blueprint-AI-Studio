@@ -19,6 +19,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List
 
+from sqlalchemy.dialects.postgresql import insert as _pg_insert
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -26,11 +27,19 @@ from app.digest_metrics import (
     compute_lane_waste_diagnostics,
     compute_outer_loop_convergence,
 )
-from app.models import ImprovementLane, Project, Task, TaskStatus, _utcnow
+from app.models import (
+    ImprovementLane,
+    Project,
+    ProjectLaneBaseline,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
 from app.project_telemetry import (
     read_all_lane_baselines,
     upsert_lane_baseline,
 )
+from app.project_telemetry import _prune_lane_baselines
 from app.project_telemetry import (
     read_version_lane_baseline as _read_table_lane_baseline,
 )
@@ -47,7 +56,7 @@ from app.routers.admin_pipeline_observability import (
 logger = logging.getLogger(__name__)
 
 DESIGN_DOC_KEY = "lane_baselines"
-BASELINE_DEF_VERSION = "v2"
+BASELINE_DEF_VERSION = "v5"
 _SNAPSHOT_PR_BREAKDOWN_LIMIT = 100
 _MAX_TASKS_PER_SNAPSHOT = 5000
 _MAX_BASELINES_STORED = 20
@@ -57,12 +66,59 @@ _MAX_BASELINE_ENTRY_BYTES = 10_000
 # Fields dropped before persisting: large unread sub-blobs that inflate the entry.
 _SLIM_DROP_TOP_LEVEL = frozenset({"per_pr_phase_breakdown", "relay_counts_by_lane"})
 # Fallback fields to shed one-by-one if the entry still exceeds the byte budget after
-# the primary drops.  Ordered least-to-most critical for downstream readers.
+# the primary drops.  Lane waste is deliberately not in this list: its compact
+# grading counters are the durable evidence for the lane-retarget experiment.
 _SLIM_OVERFLOW_DROPPABLE = (
-    "lane_waste",
     "lane_iteration_distribution",
     "checkpoint_recovery_waste",
 )
+
+_LANE_WASTE_GRADING_FIELDS = frozenset(
+    {"retarget_review_scope_counts", "stale_head_discard_count"}
+)
+_LANE_WASTE_KNOWN_FIELDS = frozenset(
+    {
+        "waste_taxonomy",
+        "waste_task_count",
+        "cap_counted_task_count",
+        "cap_excluded_task_count",
+        "chain_count",
+        "cap_exhausted_chain_count",
+        "cap_exhausted_direction_count",
+        "cap_exhausted_directions",
+        "supersede_affected_chain_count",
+        "supersede_affected_reviews_to_converge",
+        "rollup_chain_count",
+        "rollup_supersede_affected_chain_count",
+        "rollup_supersede_unaffected_chain_count",
+        "rollup_supersede_affected_reviews_to_converge",
+        "rollup_supersede_unaffected_reviews_to_converge",
+        "reviews_to_converge",
+        "retarget_review_scope_counts",
+        "stale_head_discard_count",
+        "chain_limit",
+        "chains_truncated",
+        "chains",
+        "converged_review_counts",
+    }
+)
+
+
+def _baseline_definition_number(version: str | None) -> int:
+    """Return the numeric revision for a versioned snapshot definition."""
+    if isinstance(version, str) and version.startswith("v"):
+        try:
+            return int(version[1:])
+        except ValueError:
+            pass
+    return 0
+
+
+def _baseline_needs_refresh(row: ProjectLaneBaseline) -> bool:
+    """Whether *row* predates the current persisted snapshot definition."""
+    return _baseline_definition_number(row.baseline_def_version) < _baseline_definition_number(
+        BASELINE_DEF_VERSION
+    )
 
 
 def _slim_baseline(baseline: Dict[str, Any]) -> Dict[str, Any]:
@@ -75,27 +131,95 @@ def _slim_baseline(baseline: Dict[str, Any]) -> Dict[str, Any]:
 
     After the primary drops an entry should comfortably fit inside
     ``_MAX_BASELINE_ENTRY_BYTES``.  If it still exceeds the budget (e.g. because a
-    future heavy field was added), fields are shed in ``_SLIM_OVERFLOW_DROPPABLE``
-    order until the entry fits, and a warning is emitted so operators can diagnose.
+    future heavy field was added), fields are shed in
+    ``_SLIM_OVERFLOW_DROPPABLE`` order until the entry fits.  Overflow-only
+    removals are recorded in ``dropped_fields``; the primary drops above are
+    intentionally not reported as evictions.
     """
     entry = {k: v for k, v in baseline.items() if k not in _SLIM_DROP_TOP_LEVEL}
+    existing_dropped = {
+        field
+        for field in (baseline.get("dropped_fields") or [])
+        if isinstance(field, str) and field
+    }
+    if existing_dropped:
+        entry["dropped_fields"] = sorted(existing_dropped)
     if "lane_waste" in entry and isinstance(entry["lane_waste"], dict):
         lw = dict(entry["lane_waste"])
         lw.pop("chains", None)
+        # ``converged_review_counts`` was an unused unbounded legacy sample.
+        # Remove it before overflow shedding so it cannot evict durable metrics.
+        lw.pop("converged_review_counts", None)
         entry["lane_waste"] = lw
 
+    def _size() -> int:
+        return len(json.dumps(entry, default=str).encode())
+
+    def _record_drop(field: str) -> None:
+        existing_dropped.add(field)
+        entry["dropped_fields"] = sorted(existing_dropped)
+        logger.warning(
+            "[LANE_BASELINE] entry for v%s still over %d B after slim; dropping %s",
+            entry.get("version_number"),
+            _MAX_BASELINE_ENTRY_BYTES,
+            field,
+        )
+
     for field in _SLIM_OVERFLOW_DROPPABLE:
-        raw = json.dumps(entry, default=str)
-        if len(raw.encode()) <= _MAX_BASELINE_ENTRY_BYTES:
+        if _size() <= _MAX_BASELINE_ENTRY_BYTES:
             break
         if field in entry:
-            logger.warning(
-                "[LANE_BASELINE] entry for v%s still over %d B after slim; dropping %s",
-                entry.get("version_number"),
-                _MAX_BASELINE_ENTRY_BYTES,
-                field,
-            )
             entry.pop(field)
+            _record_drop(field)
+
+    # The lane-waste drilldown is the only large block that contains the
+    # direction-grading counters.  If it is the remaining source of overflow,
+    # remove nonessential nested additions first and retain all known scalar
+    # counters plus both retarget scope counts and stale-head discards.
+    while _size() > _MAX_BASELINE_ENTRY_BYTES:
+        lane_waste = entry.get("lane_waste")
+        if not isinstance(lane_waste, dict):
+            break
+        candidates = sorted(
+            key
+            for key in lane_waste
+            if key not in _LANE_WASTE_GRADING_FIELDS
+            and key not in {"dropped_fields"}
+            and (
+                key not in _LANE_WASTE_KNOWN_FIELDS
+                or isinstance(lane_waste[key], (dict, list, tuple))
+            )
+        )
+        if not candidates:
+            break
+        field = candidates[0]
+        lane_waste.pop(field)
+        _record_drop(f"lane_waste.{field}")
+
+    # Keep the byte bound future-proof for an unexpectedly large top-level
+    # addition.  Core baseline identity, convergence, and lane-waste grading
+    # evidence are retained; only non-core additions are eligible here.
+    mandatory = {
+        "captured_at",
+        "baseline_def_version",
+        "version_number",
+        "terminal_status",
+        "opened_at",
+        "closed_at",
+        "outer_loop_convergence",
+        "lane_waste",
+        "dropped_fields",
+    }
+    while _size() > _MAX_BASELINE_ENTRY_BYTES:
+        candidates = [field for field in entry if field not in mandatory]
+        if not candidates:
+            break
+        field = max(
+            candidates,
+            key=lambda key: (len(json.dumps(entry[key], default=str)), key),
+        )
+        entry.pop(field)
+        _record_drop(field)
 
     return entry
 
@@ -218,6 +342,34 @@ async def persist_version_lane_baseline(
     t_opened = _strip_tz(opened_at)
     t_closed = _strip_tz(closed_at)
 
+    # Lock an obsolete row for the duration of the recomputation.  Terminal
+    # hooks and the periodic sweep can overlap, but only the first writer for
+    # the current definition may win; a current or recognized newer row is
+    # returned before doing the expensive diagnostic queries.
+    existing_row = (
+        (
+            await session.execute(
+                select(ProjectLaneBaseline)
+                .where(
+                    ProjectLaneBaseline.project_id == project_id,
+                    ProjectLaneBaseline.version_number == version_number,
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing_row is not None and not _baseline_needs_refresh(existing_row):
+        logger.info(
+            "[LANE_BASELINE] v%d baseline already stored for project=%s "
+            "(definition=%s, first-write-wins, skip)",
+            version_number,
+            project_id,
+            existing_row.baseline_def_version,
+        )
+        return dict(existing_row.blob)
+
     _opts = load_only(*_TASK_SNAPSHOT_COLUMNS, raiseload=True)
     _proj_filter = [Task.project_id == project_id]
 
@@ -281,24 +433,25 @@ async def persist_version_lane_baseline(
     original_tasks = await _load_outer_loop_original_tasks(
         session, all_terminal_tasks, project_id=project_id
     )
+    all_tasks_with_originals = [
+        *all_terminal_tasks,
+        *[
+            task
+            for oid, task in original_tasks.items()
+            if oid not in {str(t.id) for t in all_terminal_tasks}
+        ],
+    ]
     alerts = await _load_escalation_alerts(
         session, cutoff=t_opened, project_id=project_id
     )
     diag["lane_waste"] = compute_lane_waste_diagnostics(
-        [
-            *all_terminal_tasks,
-            *[
-                task
-                for oid, task in original_tasks.items()
-                if oid not in {str(t.id) for t in all_terminal_tasks}
-            ],
-        ],
+        all_tasks_with_originals,
         t_opened,
         chain_limit=_SNAPSHOT_PR_BREAKDOWN_LIMIT,
         escalation_alerts=alerts,
     )
     convergence = compute_outer_loop_convergence(
-        all_tasks=all_terminal_tasks,
+        all_tasks=all_tasks_with_originals,
         escalation_alerts=alerts,
         window_start=t_opened,
     )
@@ -313,6 +466,61 @@ async def persist_version_lane_baseline(
         "cap_exhausted_chain_count": (
             (convergence.get("outcomes") or {}).get("cap_exhausted", 0)
         ),
+        "cap_exhausted_direction_count": convergence.get(
+            "cap_exhausted_direction_count", 0
+        ),
+        "cap_exhausted_directions": convergence.get(
+            "cap_exhausted_directions", []
+        ),
+        "supersede_affected_chain_count": convergence.get(
+            "supersede_affected_chain_count", 0
+        ),
+        "supersede_affected_merged_chain_count": convergence.get(
+            "supersede_affected_merged_chain_count", 0
+        ),
+        "supersede_affected_reviews_to_converge_count": (
+            convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("count", 0),
+        "supersede_affected_reviews_to_converge_sample_count": (
+            convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("sample_count", 0),
+        "supersede_affected_reviews_to_converge_median": (
+            convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("median"),
+        "supersede_affected_reviews_to_converge_p95": (
+            convergence.get("supersede_affected_reviews_to_converge") or {}
+        ).get("p95"),
+        "rollup_chain_count": convergence.get("rollup_chain_count", 0),
+        "rollup_supersede_affected_chain_count": convergence.get(
+            "rollup_supersede_affected_chain_count", 0
+        ),
+        "rollup_supersede_unaffected_chain_count": convergence.get(
+            "rollup_supersede_unaffected_chain_count", 0
+        ),
+        "rollup_supersede_affected_reviews_to_converge_count": (
+            convergence.get("rollup_supersede_affected_reviews_to_converge") or {}
+        ).get("count", 0),
+        "rollup_supersede_affected_reviews_to_converge_sample_count": (
+            convergence.get("rollup_supersede_affected_reviews_to_converge") or {}
+        ).get("sample_count", 0),
+        "rollup_supersede_affected_reviews_to_converge_median": (
+            convergence.get("rollup_supersede_affected_reviews_to_converge") or {}
+        ).get("median"),
+        "rollup_supersede_affected_reviews_to_converge_p95": (
+            convergence.get("rollup_supersede_affected_reviews_to_converge") or {}
+        ).get("p95"),
+        "rollup_supersede_unaffected_reviews_to_converge_count": (
+            convergence.get("rollup_supersede_unaffected_reviews_to_converge") or {}
+        ).get("count", 0),
+        "rollup_supersede_unaffected_reviews_to_converge_sample_count": (
+            convergence.get("rollup_supersede_unaffected_reviews_to_converge") or {}
+        ).get("sample_count", 0),
+        "rollup_supersede_unaffected_reviews_to_converge_median": (
+            convergence.get("rollup_supersede_unaffected_reviews_to_converge") or {}
+        ).get("median"),
+        "rollup_supersede_unaffected_reviews_to_converge_p95": (
+            convergence.get("rollup_supersede_unaffected_reviews_to_converge") or {}
+        ).get("p95"),
         "terminal_outcome_counts": convergence.get("terminal_outcome_histogram") or {},
     }
     diag["relay_medians"] = _compute_relay_medians(diag["per_pr_phase_breakdown"])
@@ -333,22 +541,6 @@ async def persist_version_lane_baseline(
 
     slimmed = _slim_baseline(baseline)
 
-    # First-write-wins: if a baseline already exists for this version in the
-    # dedicated project_lane_baseline table, leave it untouched and return it.
-    # New writes use the table exclusively, while readers retain a legacy
-    # design_doc fallback for historical rows. Existence for this new write is
-    # checked in the table; no Project row lock is needed because the row-scoped
-    # upsert below is sufficient.
-    existing = await _read_table_lane_baseline(session, project_id, version_number)
-    if existing is not None:
-        logger.info(
-            "[LANE_BASELINE] v%d baseline already stored for project=%s "
-            "(first-write-wins, skip)",
-            version_number,
-            project_id,
-        )
-        return existing
-
     # Project-existence guard (non-locking): a missing project cannot own a
     # baseline row (FK), and the legacy path returned None in that case.
     _exists = (
@@ -362,17 +554,44 @@ async def persist_version_lane_baseline(
         )
         return None
 
-    # Row-scoped ON CONFLICT upsert into the dedicated table; the accessor
-    # enforces the _LANE_BASELINE_VERSIONS_MAX retention cap (matching the former
-    # _MAX_BASELINES_STORED design_doc cap).
-    await upsert_lane_baseline(
-        session,
-        project_id=project_id,
-        version_number=version_number,
-        captured_at=now,
-        baseline_def_version=BASELINE_DEF_VERSION,
-        blob=slimmed,
-    )
+    if existing_row is not None:
+        # The row is locked above, so this overwrite cannot downgrade a newer
+        # definition or race another stale refresh.
+        await upsert_lane_baseline(
+            session,
+            project_id=project_id,
+            version_number=version_number,
+            captured_at=now,
+            baseline_def_version=BASELINE_DEF_VERSION,
+            blob=slimmed,
+        )
+    else:
+        # A terminal hook and a backfill can both observe an absent row.  Use
+        # DO NOTHING so the losing writer cannot replace the winner's current
+        # definition, then retain the normal table retention behavior.
+        stmt = _pg_insert(ProjectLaneBaseline).values(
+            id=uuid.uuid4(),
+            project_id=project_id,
+            version_number=version_number,
+            captured_at=now,
+            baseline_def_version=BASELINE_DEF_VERSION,
+            blob=slimmed,
+        )
+        await session.execute(
+            stmt.on_conflict_do_nothing(
+                index_elements=[
+                    ProjectLaneBaseline.project_id,
+                    ProjectLaneBaseline.version_number,
+                ]
+            )
+        )
+        await _prune_lane_baselines(session, project_id)
+
+        # If another writer won the insert race, return its blob and preserve
+        # its first-write-wins timestamp/content contract.
+        stored = await _read_table_lane_baseline(session, project_id, version_number)
+        if stored is not None:
+            slimmed = stored
 
     logger.info(
         "[LANE_BASELINE] persisted v%d lane baseline for project=%s "
@@ -394,9 +613,10 @@ async def backfill_missing_lane_baselines(
     """Backfill lane baselines for recently-closed versions that lack a stored entry.
 
     Queries up to ``max_versions`` closed (promoted or abandoned) ReleaseVersions
-    for the project, skips any version whose key already exists in
-    ``design_doc["lane_baselines"]``, and calls ``persist_version_lane_baseline``
-    for each gap.
+    for the project, skips only table rows at the current or a newer definition,
+    and calls ``persist_version_lane_baseline`` for each missing or obsolete
+    snapshot. Legacy ``design_doc["lane_baselines"]`` entries remain intact and
+    do not suppress a table refresh.
 
     Uses its own ``AsyncSessionLocal`` sessions per version so each persist
     commits independently and the populate_existing lock does not overwrite
@@ -417,19 +637,14 @@ async def backfill_missing_lane_baselines(
         if project_row is None:
             return []
 
-        # The sweep fills missing recent versions in the dedicated table. It is
-        # not a migration of the retained historical design_doc fallback.
-        existing_keys = {
-            str(row.version_number)
+        # Legacy design_doc rows are intentionally not included: they are the
+        # fallback being repaired, and the refreshed table row takes precedence
+        # without mutating the retained document.
+        current_table_versions = {
+            row.version_number
             for row in await read_all_lane_baselines(session, project_id)
+            if not _baseline_needs_refresh(row)
         }
-        legacy_baselines = (project_row.design_doc or {}).get(DESIGN_DOC_KEY) or {}
-        if isinstance(legacy_baselines, dict):
-            existing_keys.update(
-                str(key)
-                for key, value in legacy_baselines.items()
-                if isinstance(value, dict)
-            )
 
         versions = list(
             (
@@ -452,7 +667,7 @@ async def backfill_missing_lane_baselines(
     # release_version).
     backfilled: List[int] = []
     for version in versions:
-        if str(version.version_number) in existing_keys:
+        if version.version_number in current_table_versions:
             continue
 
         if version.status == "promoted":

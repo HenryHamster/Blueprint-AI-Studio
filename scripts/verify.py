@@ -13,6 +13,9 @@ import sys
 import os
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from utf8_io import force_utf8_streams  # noqa: E402
 
 # Python files to check (backend)
 BACKEND_FILES = [
@@ -30,8 +33,12 @@ BACKEND_FILES = [
 def _run(cmd, cwd=None, label=""):
     """Run a command and return (success, output)."""
     try:
+        # errors="replace" because this echoes EXTERNAL tool output: tsc and
+        # py_compile diagnostics carry curly quotes and box rules, and a
+        # verification run must survive printing the failure it just found.
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120,
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120,
             cwd=cwd or PROJECT_ROOT
         )
         if result.returncode != 0:
@@ -54,13 +61,17 @@ def _run(cmd, cwd=None, label=""):
 
 def _get_changed_files():
     """Get list of changed files (staged + unstaged)."""
+    # Paths come back as git wrote them; a non-ascii filename must not abort
+    # the verification pass with a locale decode error.
     result = subprocess.run(
         ["git", "diff", "--name-only", "HEAD"],
-        capture_output=True, text=True, cwd=PROJECT_ROOT
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=PROJECT_ROOT
     )
     staged = subprocess.run(
         ["git", "diff", "--name-only", "--cached"],
-        capture_output=True, text=True, cwd=PROJECT_ROOT
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=PROJECT_ROOT
     )
     files = set(result.stdout.strip().split("\n") + staged.stdout.strip().split("\n"))
     return [f for f in files if f]
@@ -125,6 +136,7 @@ def check_agent(only_changed=False):
 
 
 def main():
+    force_utf8_streams()
     args = sys.argv[1:]
     only_changed = "--changed" in args
     targets = [a for a in args if not a.startswith("-")]

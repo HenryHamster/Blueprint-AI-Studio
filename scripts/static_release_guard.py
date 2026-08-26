@@ -29,6 +29,12 @@ try:  # absent from synthetic fixtures that copy scripts/ piecemeal
 except ImportError:  # pragma: no cover - fixture trees are POSIX already
     bash_executable, posix_path = (lambda: "bash"), os.fspath  # noqa: E731
 
+try:  # absent from synthetic fixtures that copy scripts/ piecemeal
+    from utf8_io import force_utf8_streams  # noqa: E402
+except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
+    def force_utf8_streams() -> None:
+        return None
+
 try:
     from guard_suppression_receipt import record_classification  # noqa: E402
 except ImportError:  # pragma: no cover - emitting is fail-open by contract
@@ -166,7 +172,10 @@ SENTINEL_REPAIR_COMMANDS: dict[str, str] = {
         "and drift independently)"
     ),
     "backend/testing/test_test_estate_ranked_queue.py": (
-        "python3 scripts/generate_test_estate_ranked_queue.py --write"
+        # `python`, not `python3`, to match the sibling entries above and to
+        # stay runnable on the Windows developer host that runs this guard --
+        # the python.org installer publishes python.exe and no python3.
+        "python scripts/generate_test_estate_ranked_queue.py --write"
     ),
     "backend/testing/test_test_durations_freshness.py": (
         "regenerate backend/.test_durations from a full timed run "
@@ -485,6 +494,7 @@ def _record_suppressions(outcome: dict[str, object]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    force_utf8_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="automain")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -657,7 +667,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"[static guard] FAIL — {', '.join(failures)}",
                     file=sys.stderr,
                 )
-                return 1
+                return finish()
             print("[static guard] PASS (size-only)")
             return 0
 

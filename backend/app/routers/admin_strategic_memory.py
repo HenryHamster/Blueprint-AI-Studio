@@ -45,6 +45,7 @@ from app.strategic_memory_runtime import (
     PROJECT_MESSAGE_PRODUCER,
     backfill_project_message_receipts,
 )
+from app.time_utils import utc_iso
 
 
 router = APIRouter(
@@ -337,8 +338,8 @@ async def admin_repair_false_fast_claim_redactions(
                 "project_id": str(project_id),
                 "serving_revision": current_serving_revision(),
                 "buggy_serving_revision": body.buggy_serving_revision,
-                "window_start": audit.window_start.isoformat(),
-                "window_end": audit.window_end.isoformat(),
+                "window_start": utc_iso(audit.window_start),
+                "window_end": utc_iso(audit.window_end),
                 "candidate_count": audit.candidate_count,
                 "candidate_digest": audit.candidate_digest,
                 "content_returned": False,

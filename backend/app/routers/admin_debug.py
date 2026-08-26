@@ -56,6 +56,7 @@ from app.findings_index import (
     FINALIZED_RESEARCH_FINDINGS_KEY,
     finalized_research_findings_from_state,
 )
+from app.time_utils import utc_iso
 
 # ---------------------------------------------------------------------------
 # Canary spawn-gate probe
@@ -602,7 +603,7 @@ def _format_circuit_breaker(cb: dict) -> _CircuitBreakerInfo:
         "open_reason": cb.get("open_reason"),
         "cooldown_seconds": cb.get("cooldown_seconds", 1800),
         "cooldown_remaining_seconds": cooldown_remaining,
-        "opened_at": opened_at.isoformat() if opened_at else None,
+        "opened_at": utc_iso(opened_at),
     }
 
 
@@ -769,13 +770,13 @@ async def get_autonomy_debug(
         cooldown_end = raw_breaker["opened_at"] + timedelta(
             seconds=raw_breaker["cooldown_seconds"]
         )
-        cooldown_ends_at = cooldown_end.isoformat()
+        cooldown_ends_at = utc_iso(cooldown_end)
         if breaker_state == "OPEN" and now < cooldown_end:
             blocking_guards.append(
                 {
                     "guard": "circuit_breaker_open",
                     "reason": "Circuit breaker is OPEN and cooldown has not elapsed",
-                    "opened_at": raw_breaker["opened_at"].isoformat(),
+                    "opened_at": utc_iso(raw_breaker['opened_at']),
                     "cooldown_ends_at": cooldown_ends_at,
                     "failure_count": raw_breaker["failure_count"],
                 }
@@ -785,7 +786,7 @@ async def get_autonomy_debug(
         "state": breaker_state,
         "failure_count": raw_breaker["failure_count"],
         "success_count": raw_breaker["success_count"],
-        "opened_at": raw_breaker["opened_at"].isoformat()
+        "opened_at": utc_iso(raw_breaker['opened_at'])
         if raw_breaker.get("opened_at")
         else None,
         "cooldown_seconds": raw_breaker["cooldown_seconds"],
@@ -1057,9 +1058,7 @@ async def get_autonomy_debug(
                 "guard": "pipeline_paused",
                 "reason": f"Pipeline is PAUSED ({deploy_state.pause_reason or 'no reason recorded'})",
                 "pause_reason": deploy_state.pause_reason,
-                "paused_at": deploy_state.paused_at.isoformat()
-                if deploy_state.paused_at
-                else None,
+                "paused_at": utc_iso(deploy_state.paused_at),
             }
         )
 
@@ -1191,12 +1190,10 @@ async def get_autonomy_debug(
         interval_elapsed = (
             now - last_idle_check
         ).total_seconds() >= interval_minutes * 60
-        next_check_at = (
-            last_idle_check + timedelta(minutes=interval_minutes)
-        ).isoformat()
+        next_check_at = utc_iso(last_idle_check + timedelta(minutes=interval_minutes))
     else:
         interval_elapsed = True
-        next_check_at = now.isoformat()
+        next_check_at = utc_iso(now)
 
     if not interval_elapsed:
         secs_until_check = max(
@@ -1325,11 +1322,7 @@ async def get_strategic_debug(
         if problem_model_trim is not None:
             problem_model_trim["task_id"] = str(latest_strategic.id)
             problem_model_trim["task_status"] = latest_strategic.status
-            problem_model_trim["assembled_at"] = (
-                latest_strategic.created_at.isoformat()
-                if latest_strategic.created_at
-                else None
-            )
+            problem_model_trim["assembled_at"] = utc_iso(latest_strategic.created_at)
 
     # Trigger countdowns
     strategic_frequency = vision.get(
@@ -1378,7 +1371,7 @@ async def get_strategic_debug(
                     tzinfo=None
                 )
             decay_deadline = last_failure + timedelta(hours=48)
-            failures_decay_at_iso = decay_deadline.isoformat()
+            failures_decay_at_iso = utc_iso(decay_deadline)
             if strategic_failures >= 3 and now < decay_deadline:
                 blocking_guards.append(
                     {
@@ -1501,9 +1494,7 @@ async def get_strategic_debug(
             "id": str(active_strategic_task.id),
             "phase": active_phase,
             "status": active_strategic_task.status,
-            "started_at": active_strategic_task.started_at.isoformat()
-            if active_strategic_task.started_at
-            else None,
+            "started_at": utc_iso(active_strategic_task.started_at),
         }
         if active_strategic_task
         else None,
@@ -1940,7 +1931,7 @@ async def get_project_system_maturity(
             "score": r.score,
             "recommended_mode": r.recommended_mode,
             "top_issues": r.top_issues or [],
-            "last_audited_at": r.last_audited_at.isoformat(),
+            "last_audited_at": utc_iso(r.last_audited_at),
         }
         for r in rows
     ]
@@ -2039,7 +2030,7 @@ async def get_recent_findings(
                     "priority": f.get("priority", "medium"),
                     "actionability_grade": grade,
                     "direction_id": f.get("direction_id"),
-                    "researched_at": t.created_at.isoformat() if t.created_at else None,
+                    "researched_at": utc_iso(t.created_at),
                 }
             )
             if len(findings_out) >= limit:
@@ -2248,7 +2239,7 @@ async def get_operator_inbox_liveness(
                 {
                     "id": str(r.id),
                     "project_id": str(r.project_id),
-                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "created_at": utc_iso(r.created_at),
                     "age_seconds": int((now - r.created_at).total_seconds())
                     if r.created_at
                     else None,
@@ -2283,7 +2274,7 @@ async def get_operator_inbox_liveness(
                 "info_alert_noise": r.info_alert_noise,
                 "detail": r.detail,
                 "tick_number": r.tick_number,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "created_at": utc_iso(r.created_at),
             }
             for r in durable_rows
         ]
@@ -2312,7 +2303,7 @@ async def get_operator_inbox_liveness(
                 "project_id": str(m.project_id),
                 "content": m.content[:500] if m.content else "",
                 "context": m.context or {},
-                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "created_at": utc_iso(m.created_at),
             }
             for m in open_episodes
         ]

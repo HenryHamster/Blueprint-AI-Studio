@@ -12,9 +12,7 @@ Checks each *.viewport.test.tsx file in admin-ui/src/components/ for:
 Outputs structured JSON report to stdout.
 """
 
-import ast
 import json
-import os
 import re
 import sys
 from collections import defaultdict
@@ -109,7 +107,7 @@ def scan_file(filepath: Path) -> dict:
     }
 
     # Count test blocks
-    stats["total_tests"] = len(extract_typescript_test_ids(text))
+    stats["total_tests"] = len(extract_typescript_test_ids(text, filepath))
 
     # Count assertions
     stats["assertion_count"] = len(ASSERTION_PATTERNS.findall(text))

@@ -22,24 +22,22 @@ OUTLIER_CAP = 60.0  # seconds
 
 # A second fixture-attribution failure mode is smaller than the outlier cap:
 # when a worker's in-band setup cost is charged to a batch of tests, pytest-split
-# records a dense 15–21s plateau and no observations in the following 21.1–27.4s
-# interval.  Keep the detector deliberately conservative: the pattern must have
-# at least 100 entries and the diagnostic gap must be present.
-IN_BAND_SETUP_MIN = 15.0
-IN_BAND_SETUP_MAX = 21.1
+# records a dense 12–15s plateau and no observations through 27.4s. Keep the
+# detector deliberately conservative: the pattern must have at least 100 entries,
+# and the first observed value after the plateau must be beyond that diagnostic
+# gap. The current first post-gap observation is 27.430318s.
+IN_BAND_SETUP_MIN = 12.0
+IN_BAND_SETUP_MAX = 15.0
 IN_BAND_SETUP_MIN_COUNT = 100
-IN_BAND_SETUP_GAP_MAX = 27.5
+IN_BAND_SETUP_GAP_MAX = 27.4
 
 
 def derive_in_band_setup_gap_max(data: dict[str, float]) -> float:
-    """Return the true boundary of the post-plateau diagnostic gap.
+    """Return the first observed duration after the setup-attribution band.
 
-    IN_BAND_SETUP_GAP_MAX is a pin on "the next real observation after the
-    15-21s setup-attribution plateau" — it must always be at least the
-    smallest duration actually observed at or above IN_BAND_SETUP_MAX, or
-    the pinned literal has drifted below the data it is meant to bound.
-    Callers use this to validate the pin against a freshly regenerated
-    backend/.test_durations rather than trusting the literal blindly.
+    The first value at or above IN_BAND_SETUP_MAX is the data-derived end of
+    the empty gap. Callers compare it with IN_BAND_SETUP_GAP_MAX so a real
+    observation in the pinned gap keeps the sanitizer conservative.
     """
     following = [value for value in data.values() if value >= IN_BAND_SETUP_MAX]
     if not following:
@@ -56,9 +54,13 @@ def in_band_setup_artifacts(data: dict[str, float]) -> set[str]:
     }
     if len(band) < IN_BAND_SETUP_MIN_COUNT:
         return set()
-    has_following_gap = not any(
-        IN_BAND_SETUP_MAX <= value <= IN_BAND_SETUP_GAP_MAX
-        for value in data.values()
+    first_post_plateau = derive_in_band_setup_gap_max(data)
+    has_following_gap = (
+        first_post_plateau > IN_BAND_SETUP_GAP_MAX
+        and not any(
+            IN_BAND_SETUP_MAX <= value <= IN_BAND_SETUP_GAP_MAX
+            for value in data.values()
+        )
     )
     return band if has_following_gap else set()
 

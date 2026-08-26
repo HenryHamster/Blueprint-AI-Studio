@@ -77,10 +77,11 @@ from app.landed_signal import corroborate_and_apply_merged_landed_signal
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.task_lifecycle_completion_dispatch import run_completion_dispatch
 from app.task_lifecycle_fix_completion import run_fix_completion
+from app.task_lifecycle_post_commit_setup import run_post_commit_setup
 from app.task_lifecycle_post_commit_terminal import run_post_commit_terminal
 # Re-exported so the in-module call sites -- and any test that patches
 # ``task_lifecycle._resolve_live_review_target`` -- keep working unchanged.
-from app.review_target_drift import (  # noqa: F401
+from app.review_target_drift import (
     _base_move_invalidates_approval,
     _resolve_live_review_target,
 )
@@ -1802,298 +1803,31 @@ async def _process_post_commit(
         update_check_run,
     )
     from app.task_completion import _try_recover_memo_from_parse_failure
-    from app.strategic_completion import (
-        _record_strategic_task_failure,
-        strategic_completion_message_count,
-    )
-    from app.project_message_creation import reserve_project_message_sequences
+    from app.strategic_completion import _record_strategic_task_failure
     from app.discovery_review import block_failed_discovery_review
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
-        # WI-6 (deadlock remediation) + Round 3 C3/C4: the post-commit unit
-        # can lock BOTH the Project and the Task row — strategic tasks in their
-        # completion chain, and every other type via the downstream project-row
-        # writers reached from the completion handlers / rollup / spawn
-        # (with_vision_locked, with_design_doc_locked, with_directions_locked,
-        # project_lock, ...). The canonical order is **Project before Task,
-        # always** (docs/concurrency.md). Previously only strategic types used
-        # the canonical pair-locker; every other type locked the Task first
-        # (task-only FOR UPDATE) and reached the Project lock downstream — so
-        # two concurrent non-strategic post-commits in the same project took
-        # Task→Project while a strategic / dispatch / reaper path took
-        # Project→Task, and the opposite orders deadlocked (Postgres 40P01
-        # DeadlockDetected, ~6/hr on bursty concurrent agent-status callbacks).
-        # Acquire Project→Task up front for ALL types via the canonical
-        # pair-locker. The invariant this establishes is ORDER, not duration: the
-        # Project row is always acquired FIRST (before the Task), by every path.
-        # (The up-front locks are RELEASED at the Phase-B3 lock-release commit —
-        # "release the lock before slow GitHub calls" — so a downstream project
-        # lock taken after that commit is a fresh same-connection acquisition, not
-        # a held-through re-entrant no-op. A downstream lock taken while the up-front
-        # lock is still held IS re-entrant / non-blocking, but the deadlock freedom
-        # comes purely from Project-before-Task being universal, not from holding
-        # the row across the whole unit.)
-        _peek_row = (
-            await session.execute(
-                select(Task.project_id, Task.payloads).where(Task.id == task_id)
-            )
-        ).first()
-        if _peek_row is None:
-            return {"status": "accepted"}
-        _peek_project_id = _peek_row[0]
-        _peek_payloads = _peek_row[1] if isinstance(_peek_row[1], list) else []
-        _peek_task_type = (
-            str((_peek_payloads[0] or {}).get("type") or "")
-            if _peek_payloads and isinstance(_peek_payloads[0], dict)
-            else ""
+        _setup, _setup_response = await run_post_commit_setup(
+            task_id=task_id,
+            payload=payload,
+            session=session,
+            expected_childless_recovery_token=_expected_childless_recovery_token,
+            expected_research_spawn_recovery_token=_expected_research_spawn_recovery_token,
+            expected_post_commit_claim_token=_expected_post_commit_claim_token,
+            expected_post_commit_status=_expected_post_commit_status,
         )
-        _peek_capability = get_task_capability(_peek_task_type)
-        _peek_completion_handler = (
-            _peek_capability.completion_handler if _peek_capability else None
+        if _setup_response is not None:
+            return _setup_response
+        assert _setup is not None
+        task = _setup.task
+        locked_project = _setup.locked_project
+        _peek_capability = _setup.peek_capability
+        _peek_task_type = _setup.peek_task_type
+        preallocated_strategic_message_sequences = (
+            _setup.preallocated_strategic_message_sequences
         )
-        preallocated_strategic_message_sequences: list[int] = []
-        if _peek_completion_handler == "strategic":
-            message_count = strategic_completion_message_count(payload.logs or "")
-            if message_count:
-                preallocated_strategic_message_sequences = (
-                    await reserve_project_message_sequences(
-                        session,
-                        _peek_project_id,
-                        count=message_count,
-                        lock_timeout_ms=1_500,
-                    )
-                )
-                # Reservation gaps are harmless. Commit immediately so the
-                # counter row is never held while acquiring Project -> Task.
-                await session.commit()
-
-        # skip_locked + bounded retry: the row is typically only held briefly
-        # (by the agent_status early-commit path that just released it, or by a
-        # concurrent post-commit for the same task). A plain FOR UPDATE would
-        # queue behind GitHub API calls (15-120s) and hit the Postgres
-        # lock_timeout as LockNotAvailableError, which tears down the session.
-        task = None
-        # ``locked_project`` holds the canonically pre-locked Project (acquired
-        # BEFORE the task). The strategic-completion chain handlers
-        # (``completion_needs_locked_project``) receive it via ``project=`` so
-        # they skip their own (legacy) re-acquisition; non-strategic handlers
-        # ignore it and re-lock the same row re-entrantly under the held lock.
-        locked_project: Project | None = None
-        blocked_lock_scope = "task"
-        from app.task_locking import lock_project_then_task
-
-        for _attempt in range(3):
-            if _peek_project_id is not None:
-                # Canonical Project → Task ordering. The helper acquires
-                # Project first; if the task row is held it yields
-                # ``(project, None)`` and we retry; if the project is held it
-                # yields ``(None, None)`` and we retry as well.
-                async with lock_project_then_task(
-                    session,
-                    _peek_project_id,
-                    task_id,
-                    skip_locked=True,
-                ) as (_p, _t):
-                    if _t is not None:
-                        # Both locks acquired. Capture references and break.
-                        # SQLAlchemy session-level FOR UPDATE locks persist
-                        # past the contextmanager exit; the surrounding
-                        # ``async with factory() as session`` commit/rollback
-                        # at the end of post-commit releases both row locks.
-                        task = _t
-                        locked_project = _p
-                        break
-                    blocked_lock_scope = "project" if _p is None else "task"
-                    # Half-pair acquired (project but not task) or no pair
-                    # (project also held). Release any held lock before
-                    # retrying so we don't accumulate session-level locks
-                    # across retry iterations and don't hold a project lock
-                    # while a peer attempts the same task lock.
-                    if _p is not None:
-                        await session.rollback()
-            else:
-                # Defensive fallback only: Task.project_id is NOT NULL, so this
-                # fires solely if the peek raced a hard delete. Task-only lock.
-                task = (
-                    (
-                        await session.execute(
-                            select(Task)
-                            .where(Task.id == task_id)
-                            .with_for_update(skip_locked=True)
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
-                if task is not None:
-                    break
-            # Confirm the row still exists before retrying — if it's gone the
-            # peer holder is irrelevant.
-            exists = (
-                await session.execute(select(Task.id).where(Task.id == task_id))
-            ).first()
-            if exists is None:
-                return {"status": "accepted"}
-            await asyncio.sleep(2)
-        if task is None:
-            blocked_id = _peek_project_id if blocked_lock_scope == "project" else task_id
-            raise PostCommitLocked(
-                f"{blocked_lock_scope} {blocked_id} row held by peer after 3 retries "
-                f"while processing task {task_id}",
-                lock_scope=blocked_lock_scope,
-                resource_id=blocked_id,
-            )
-
-        # A marker-less recovery claim is only a lease, not authority to revive
-        # a task forever. Revalidate it while holding the canonical Project ->
-        # Task lifecycle locks, immediately before any completion handler can
-        # mutate state or spawn children. This closes the claim-to-dispatch race
-        # with cancel, archive, requeue, and a peer spawn.
-        if _expected_childless_recovery_token is not None:
-            recovery_meta = dict(
-                (task.context or {}).get("_childless_post_commit_recovery") or {}
-            )
-            plan_output = task.plan_output
-            claim_is_current = (
-                recovery_meta.get("claim_token")
-                == _expected_childless_recovery_token
-                and task.status == TaskStatus.EVALUATING
-                and not task.archived
-                and not task.post_commit_pending
-                and (task.first_payload or {}).get("type") == "plan"
-                and isinstance(plan_output, dict)
-                and isinstance(plan_output.get("subtasks"), list)
-                and bool(plan_output.get("subtasks"))
-            )
-            if claim_is_current:
-                child_id = (
-                    await session.execute(
-                        select(Task.id)
-                        .where(Task.parent_task_id == task_id)
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                claim_is_current = child_id is None
-            if not claim_is_current:
-                logger.info(
-                    "[POST_COMMIT SWEEP] Skipping stale marker-less recovery "
-                    "claim for task %s after lifecycle-lock revalidation",
-                    str(task_id)[:8],
-                )
-                return {"status": "accepted", "recovery_skipped": True}
-
-        # Sidecar-resumed research has no agent-status write-ahead marker.  Its
-        # dedicated marker-less recovery lease is exact-attempt authority only:
-        # revalidate the server-owned token, attempt identity, persisted routing
-        # input, terminal/progress state, and project pause boundary while the
-        # canonical Project -> Task locks are held.  A stale lease can never
-        # revive a cancelled/requeued attempt or create work while paused.
-        if _expected_research_spawn_recovery_token is not None:
-            from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
-            from app.recovery_research_spawn_pending import (
-                RESEARCH_SPAWN_RECOVERY_KEY,
-                research_spawn_recovery_attempt_identity,
-            )
-
-            recovery_meta = dict(
-                (task.context or {}).get(RESEARCH_SPAWN_RECOVERY_KEY) or {}
-            )
-            project_paused = bool(
-                locked_project is None
-                or locked_project.paused
-                or locked_project.archived
-            )
-            claim_is_current = bool(
-                recovery_meta.get("claim_token")
-                == _expected_research_spawn_recovery_token
-                and recovery_meta.get("attempt_identity")
-                == research_spawn_recovery_attempt_identity(task)
-                and task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING)
-                and not task.archived
-                and not task.post_commit_pending
-                and (task.first_payload or {}).get("type") == "research"
-                and (task.context or {}).get("_research_spawn_pending") is True
-                and (task.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY)
-                is not True
-                and isinstance(task.plan_output, list)
-            )
-            if project_paused or not claim_is_current:
-                reason = "project_paused" if project_paused else "stale_claim"
-                logger.info(
-                    "[POST_COMMIT SWEEP] Skipping marker-less research "
-                    "recovery for task %s (%s)",
-                    str(task_id)[:8],
-                    reason,
-                )
-                return {
-                    "status": "accepted",
-                    "recovery_skipped": True,
-                    "recovery_reason": reason,
-                }
-
-        # Marker-based recovery claims are leases too. Revalidate the exact
-        # claim while holding canonical Project -> Task locks immediately
-        # before any handler can spawn or mutate. Status/pending alone are not
-        # authority: a later completion can recreate the same values (ABA).
-        if _expected_post_commit_claim_token is not None:
-            pending_meta = dict(
-                (task.context or {}).get("_post_commit_pending_meta") or {}
-            )
-            claim_is_current = bool(
-                task.post_commit_pending
-                and not task.archived
-                and task.status == _expected_post_commit_status
-                and pending_meta.get("claim_token")
-                == _expected_post_commit_claim_token
-            )
-            if not claim_is_current:
-                logger.info(
-                    "[POST_COMMIT SWEEP] Skipping stale pending recovery claim "
-                    "for task %s after lifecycle-lock revalidation",
-                    str(task_id)[:8],
-                )
-                return {"status": "accepted", "recovery_skipped": True}
-
-        async def _rollback_and_refetch_task() -> Task | None:
-            """Recover the shared session after a failed post-commit section.
-
-            A handler/helper that died on a DB error (statement_timeout,
-            LockNotAvailableError, IntegrityError, ...) leaves the transaction
-            aborted: every later session use raises PendingRollbackError, so
-            one failed section poisons every section after it (prod bursts
-            2026-06-07 00:56 / 01:05). Roll back FIRST, then re-fetch ``task``
-            by its (plain, argument-supplied) id — rollback() expires every
-            loaded ORM instance even with expire_on_commit=False, so reading
-            ``task.<attr>`` without the re-fetch would issue a sync lazy
-            refresh and raise MissingGreenlet. Returns None when the row is
-            gone (archived/deleted mid-flight); callers bail out cleanly.
-
-            ``populate_existing`` discards any of the failed section's
-            rolled-back in-memory mutations still riding the identity-mapped
-            instance, and ``no_autoflush`` keeps the re-fetch itself from
-            flushing them back out (which could re-raise the original error).
-            """
-            try:
-                await session.rollback()
-            except Exception:
-                logger.exception(
-                    "[LIFECYCLE] Rollback after post-commit section failure "
-                    "failed for task %s",
-                    task_id,
-                )
-            with session.no_autoflush:
-                return (
-                    (
-                        await session.execute(
-                            select(Task)
-                            .where(Task.id == task_id)
-                            .execution_options(populate_existing=True)
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
+        _rollback_and_refetch_task = _setup.refetch
 
         # Phase 0 telemetry: persist warm-VM continuity timing fields into
         # task.context["_timing"] so cold-vs-warm setup cost is observable.
@@ -2873,6 +2607,125 @@ async def _process_post_commit(
                                 (_bypass_live_pr.get("head") or {}).get("sha") or ""
                             ),
                         }
+                        # ── CI gate for the review-BYPASS merge ──────────────
+                        # Until this gate existed, this path hard-coded
+                        # ``ci_passed=True`` below and merged WITHOUT EVER
+                        # QUERYING GITHUB. Because
+                        # ``review_policy.should_skip_initial_review`` returns
+                        # True for every non-intermediate PR, that is the path
+                        # every ordinary task PR into the integration branch
+                        # takes — so the policy's own justification ("CI and
+                        # promotion gate backstop review") was vacuous. PRs
+                        # #17933, #17936 and #17942 each merged into automain
+                        # carrying a RED ``Derived artifacts`` check; #17933
+                        # merged 15 s after its check STARTED and 85 s before it
+                        # finished, which is only possible with zero
+                        # consultation. #17936 shipped a regression that turned
+                        # every deferral/hold path into FAILED.
+                        #
+                        # Only a PRESENT check-run may hold this merge. A
+                        # definitive ``no_checks`` and any unresolved lookup
+                        # still merge exactly as before: a conflicted PR, a
+                        # path-filtered PR and a PR opened during an Actions
+                        # outage are all indistinguishable from "not registered
+                        # yet", and blocking them would strand tasks until
+                        # ``recovery_evaluating_ci_backstop`` FAILs the parent
+                        # and CANCELS every non-terminal child.
+                        from app.ci_resolution import (
+                            BYPASS_CI_BLOCKED_RED,
+                            BYPASS_CI_WAIT_PENDING,
+                            classify_bypass_merge_ci,
+                        )
+
+                        (
+                            _bypass_ci_verdict,
+                            _bypass_ci_detail,
+                        ) = await classify_bypass_merge_ci(
+                            pr_number,
+                            str(_bypass_live_target["head_sha"]),
+                            token=gh_token,
+                            owner=owner,
+                            repo=repo,
+                            project_id=str(task.project_id),
+                        )
+                        if _bypass_ci_verdict in (
+                            BYPASS_CI_BLOCKED_RED,
+                            BYPASS_CI_WAIT_PENDING,
+                        ):
+                            _bypass_ci_red = (
+                                _bypass_ci_verdict == BYPASS_CI_BLOCKED_RED
+                            )
+                            logger.warning(
+                                "[PIPELINE] Review-bypass merge withheld for PR "
+                                "#%s — CI %s (state=%s, source=%s); parking in "
+                                "CI-wait",
+                                pr_number,
+                                "FAILED" if _bypass_ci_red else "still running",
+                                _bypass_ci_detail.get("state"),
+                                _bypass_ci_detail.get("source"),
+                            )
+                            # Park in the shared CI-wait loop — never fail here.
+                            # A red means the work needs repair, not that the
+                            # task is worthless. ``orchestrator_ci_monitor``
+                            # polls EVALUATING + ``ci_waiting`` rows and routes a
+                            # red through ``ci_completion.handle_ci_completion``,
+                            # which spawns the ``fix`` recovery task
+                            # (``fix_reason="ci_failure"``); a green resolves and
+                            # merges through that same monitor. The task stays
+                            # recoverable and no child is cancelled. This mirrors
+                            # the deferred-bypass park already used below for a
+                            # non-``clean`` mergeable_state.
+                            #
+                            # ``review_not_required`` (carried in
+                            # ``_review_bypass_fields``) satisfies
+                            # ``ci_merge_helpers._review_approved``, so the
+                            # monitor retains merge authority once CI turns
+                            # green — the bypass decision itself is preserved,
+                            # only its CI blindness is removed.
+                            from app.ci_merge_helpers import arm_ci_wait
+
+                            _bypass_wait_loop = {
+                                **((task.context or {}).get("review_loop") or {}),
+                                "ci_passed": False,
+                                "review_approved": True,
+                                "branch": branch,
+                                "original_task_id": str(task.id),
+                                **_review_bypass_fields,
+                            }
+                            # orchestrator_ci_monitor SKIPS any row carrying
+                            # these latches, so a stale one inherited from an
+                            # earlier cycle would park this task where nothing
+                            # ever polls it — and an unpolled CI-wait row is
+                            # exactly what the backstop FAILs (cancelling its
+                            # children) an hour later. Scrub them on arm.
+                            for _latch in (
+                                "conflict_fix_spawned",
+                                "ci_fix_spawned",
+                                "merge_rule_blocked",
+                            ):
+                                _bypass_wait_loop.pop(_latch, None)
+                            arm_ci_wait(
+                                _bypass_wait_loop,
+                                pr_number=int(pr_number),
+                                head_sha=str(_bypass_live_target["head_sha"]),
+                                base_branch=base_branch,
+                                now_iso=_utcnow().isoformat(),
+                            )
+                            task.status = TaskStatus.EVALUATING
+                            task.latest_status_message = (
+                                f"PR #{pr_number} held: CI "
+                                f"{'failed' if _bypass_ci_red else 'in progress'}"
+                                " — parked for Blueprint's CI-gated merge"
+                            )
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": _bypass_wait_loop,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
+                            await session.commit()
+                            return {"status": "accepted"}
+
                         _bypass_loop = {
                             **((task.context or {}).get("review_loop") or {}),
                             "ci_passed": True,
@@ -4430,6 +4283,11 @@ async def _process_post_commit(
                                                 else None,
                                                 expected_head_sha=_peek_head,
                                                 target_branch=_peek_base,
+                                                expected_base_sha=str(
+                                                    _orig_peek_loop.get("ci_checked_base_sha")
+                                                    or _orig_peek_loop.get("base_sha")
+                                                    or ""
+                                                ),
                                             )
                                     except Exception as _pre_exc:
                                         logger.debug(

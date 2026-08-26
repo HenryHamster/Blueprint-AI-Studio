@@ -1397,8 +1397,9 @@ async def compute_requalification_readiness(
     return result
 
 
-# Gate-state vocabulary emitted by ``compute_promotion_ci_green_gate``.  Only
-# ``green`` clears the promotion_failed re-driver; every other state defers.
+# Gate-state vocabulary emitted by ``compute_promotion_ci_green_gate``.  The
+# promotion_failed re-driver holds on ``red`` / unresolvable ``head_sha``, but
+# must NOT require ``green``: an ordinary integration HEAD has no ci.yml run.
 _PROMOTION_CI_GATE_STATES = frozenset(
     "green pending red cancelled dispatched dispatch_rejected no_signal unavailable".split()
 )

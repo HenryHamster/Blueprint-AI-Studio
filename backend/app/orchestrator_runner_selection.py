@@ -60,6 +60,7 @@ from app.runner_eligibility import (
     _runner_has_project_verification,
     _runner_max_concurrent_compute,
     _runner_meets_min_compute_capability,
+    _runner_python_runtime_incapable,
 )
 from app.runner_health_monitors import (
     _RUNNER_DEGRADED_FAILURE_THRESHOLD,
@@ -165,7 +166,8 @@ async def _diagnose_strict_runner_pin_hold(
     Returns ``(reason_code, detail)``. The reason must be truthful and specific
     (runner id + why), never a generic no-runner message: reason codes are
     ``declined_recently`` / ``at_capacity`` / ``task_type_not_allowed`` /
-    ``missing_project_verification`` / ``missing_gpu`` / ``missing_container_runtime`` / ``insufficient_vram`` / ``not_eligible`` (live but
+    ``missing_project_verification`` / ``missing_gpu`` / ``missing_container_runtime`` / ``insufficient_vram`` /
+    ``missing_python_runtime`` / ``not_eligible`` (live but
     failed another gate) for runners in the live cache, and ``not_found`` /
     ``not_enrolled`` / ``offline`` for runners that are not live. The pair is
     stamped into ``task.context['runner_pin_hold']`` and the hold status message
@@ -290,6 +292,25 @@ async def _diagnose_strict_runner_pin_hold(
                     f"must clear {effective_workspace_floor} bytes and image store "
                     f"must clear {image_store_floor} bytes{legacy_detail}",
                 )
+        if (
+            task_type == "compute_experiment"
+            and not container_image
+            and _runner_python_runtime_incapable(snapshot)
+        ):
+            # Mirrors the imageless-compute gate in _eligible. Without this
+            # branch a pin held by that gate would report the generic
+            # "not_eligible" — the exact drift this module's two functions
+            # exist to prevent, and useless to an operator who then cannot
+            # tell a host misconfiguration from a scheduling one.
+            report = (snapshot.capabilities or {}).get("python_runtime") or {}
+            return (
+                "missing_python_runtime",
+                "runner reported it cannot provide a Python interpreter with a "
+                f"working pip for an imageless compute job: "
+                f"{report.get('reason') or 'no reason reported'}. Install "
+                "python3-venv or uv on that host (a container_image job would "
+                "not need this, since the image ships its own Python)",
+            )
         if min_compute_capability and not _runner_meets_min_compute_capability(
             snapshot, min_compute_capability
         ):
@@ -422,6 +443,11 @@ def _select_eligible_runner(
     ``gpu_compute_capabilities`` meets it — an older-arch box (a V100 for an
     ``sm_80`` image) is excluded so the job holds for compatible hardware instead
     of dying in the runner's reactive in-sandbox probe.
+    IMAGELESS ``compute_experiment`` work adds one EXCLUSION: a runner whose
+    heartbeat proved it cannot build a Python interpreter with a working pip
+    (``python_runtime.usable is False``) is dropped, because every bwrap compute
+    job on that host dies at provisioning. Absent or unreadable evidence is
+    treated as unknown and does NOT exclude — the gate only ever acts on proof.
     A preferred runner wins only after those eligibility checks pass; otherwise
     selection prefers the least EFFECTIVE load — heartbeat-reported active count
     plus pins already made to the runner this cycle — so a same-cycle burst spreads
@@ -525,6 +551,21 @@ def _select_eligible_runner(
                     container_image=container_image,
                 )
             ]
+        if task_type == "compute_experiment" and not container_image:
+            # Imageless (bwrap) compute needs the RUNNER to supply Python: the
+            # interpreter-with-pip guarantee in scripts/local_runner.py runs
+            # only on the bwrap path, because a container image ships its own.
+            # A host that already PROVED it cannot build one kills every such
+            # job at provisioning time — and it keeps getting them, because
+            # compute placement is PRE-PINNED via runner_target_id with a stable
+            # per-task dispatch_seed and a job that self-fails never records a
+            # DECLINE, so nothing rotates the pin. Excluding proven-unfit hosts
+            # is what lets the budget-exempt retry land somewhere else instead
+            # of re-running the same provisioning failure on the same box.
+            #
+            # Exclusion, not a requirement: a runner that has not reported the
+            # evidence is still eligible (see _runner_python_runtime_incapable).
+            out = [r for r in out if not _runner_python_runtime_incapable(r)]
         if _job_requires_gpu_in_container(accelerator, container_image, vram_gb):
             # Combined gate: when a container image is required AND the job asks
             # for a GPU (an explicit accelerator OR a positive vram_gb GPU-memory

@@ -28,6 +28,7 @@ from app.allowed_users import (
     normalize_allowed_user_email,
     resolve_allowed_user_by_email,
 )
+from app.time_utils import utc_iso
 
 router = APIRouter(
     prefix="/api/admin", tags=["admin-users"], dependencies=[Depends(get_current_user)]
@@ -128,7 +129,7 @@ def _member_response(
         "email": allowed_user.email if allowed_user else None,
         "role": member.role,
         "status": "pending" if pending else "active",
-        "created_at": member.created_at.isoformat() if member.created_at else None,
+        "created_at": utc_iso(member.created_at),
     }
 
 
@@ -457,10 +458,8 @@ async def list_users(
                 "email": u.email,
                 "role": u.role,
                 "display_name": u.display_name,
-                "last_login_at": u.last_login_at.isoformat()
-                if u.last_login_at
-                else None,
-                "created_at": u.created_at.isoformat() if u.created_at else None,
+                "last_login_at": utc_iso(u.last_login_at),
+                "created_at": utc_iso(u.created_at),
             }
             for u in users
         ],
@@ -504,7 +503,7 @@ async def add_user(
         "role": user.role,
         "display_name": user.display_name,
         "last_login_at": None,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "created_at": utc_iso(user.created_at),
     }
 
 
@@ -547,8 +546,8 @@ async def update_user(
         "email": user.email,
         "role": user.role,
         "display_name": user.display_name,
-        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_login_at": utc_iso(user.last_login_at),
+        "created_at": utc_iso(user.created_at),
     }
 
 

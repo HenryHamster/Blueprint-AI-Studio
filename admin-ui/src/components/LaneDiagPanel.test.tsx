@@ -59,9 +59,22 @@ const mockLaneDiagResponse = {
     cap_counted_task_count: 7,
     cap_excluded_task_count: 0,
     chain_count: 4,
-    cap_exhausted_chain_count: 0,
+    cap_exhausted_chain_count: 2,
+    cap_exhausted_direction_count: 1,
+    cap_exhausted_directions: [{ direction_id: 'd-cap', direction_text: 'Cap direction' }],
+    supersede_affected_chain_count: 3,
+    reviews_to_converge: { count: 3, median: 2, p95: 5 },
+    supersede_affected_reviews_to_converge: { count: 2, sample_count: 2, median: 6, p95: 9 },
+    rollup_chain_count: 3,
+    rollup_supersede_affected_chain_count: 2,
+    rollup_supersede_unaffected_chain_count: 1,
+    rollup_supersede_affected_reviews_to_converge: { count: 2, sample_count: 2, median: 6, p95: 9 },
+    rollup_supersede_unaffected_reviews_to_converge: { count: 1, sample_count: 1, median: 2, p95: 3 },
+    retarget_review_scope_counts: { delta: 1, full: 2 },
+    stale_head_discard_count: 0,
     chain_limit: 50,
     chains_truncated: false,
+    chains: [],
   },
   checkpoint_recovery_waste: {
     by_reason: { stale_context: 4, branch_reset: 2 },
@@ -116,6 +129,45 @@ const mockBaselinesResponse: LaneBaselinesResponse = {
       iteration_p95: { latest: 3, prior: 5, delta: -2, classification: 'improving' },
       convergence_rate: { latest: 1, prior: 0.5, delta: 0.5, classification: 'improving' },
       cap_exhausted_chain_count: { latest: 0, prior: 1, delta: -1, classification: 'improving' },
+      cap_exhausted_direction_count: { latest: 1, prior: 3, delta: -2, classification: 'improving' },
+      cap_exhausted_directions: {
+        latest: [
+          { direction_id: 'd-latest', direction_text: 'Latest cap loss' },
+          { direction_id: 'd-id-only', direction_text: null },
+        ],
+        prior: [{ direction_id: 'd-prior', direction_text: 'Prior cap loss' }],
+      },
+      supersede_affected_reviews_to_converge_median: {
+        latest: 6, prior: 4, delta: 2, classification: 'declining',
+      },
+      supersede_affected_reviews_to_converge_p95: {
+        latest: 9, prior: 7, delta: 2, classification: 'declining',
+      },
+      rollup_supersede_affected_reviews_to_converge_median: {
+        latest: 6, prior: 4, delta: 2, classification: 'declining',
+      },
+      rollup_supersede_affected_reviews_to_converge_p95: {
+        latest: 9, prior: 7, delta: 2, classification: 'declining',
+      },
+      rollup_supersede_unaffected_reviews_to_converge_median: {
+        latest: 2, prior: 3, delta: -1, classification: 'improving',
+      },
+      rollup_supersede_unaffected_reviews_to_converge_p95: {
+        latest: 3, prior: 4, delta: -1, classification: 'improving',
+      },
+    },
+    retarget_convergence: {
+      reviews_to_converge: {
+        // Sample size, not cost: the backend leaves this row unclassified.
+        count: { latest: 3, prior: 4, delta: -1, classification: null },
+        median: { latest: 2, prior: 4, delta: -2, classification: 'improving' },
+        p95: { latest: 5, prior: 7, delta: -2, classification: 'improving' },
+      },
+      retarget_review_scope_counts: {
+        delta: { latest: 1, prior: 3, delta: -2, classification: 'improving' },
+        full: { latest: 2, prior: 1, delta: 1, classification: 'declining' },
+      },
+      stale_head_discard_count: { latest: 0, prior: 2, delta: -2, classification: 'improving' },
     },
   },
 };
@@ -158,6 +210,8 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('Lost Reasoning')).toBeInTheDocument();
     // total waste tasks footer
     expect(screen.getByText(/Total waste tasks: 7/)).toBeInTheDocument();
+    expect(screen.getByText('Cap direction')).toBeInTheDocument();
+    expect(screen.getByText('Rollup control reviews to converge')).toBeInTheDocument();
   });
 
   it('renders checkpoint recovery waste section with by_reason breakdown', async () => {
@@ -215,6 +269,14 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('Outer-Loop Convergence')).toBeInTheDocument();
     expect(screen.getByText('Median cycles')).toBeInTheDocument();
     expect(screen.getByText('Cap-exhausted chains')).toBeInTheDocument();
+    expect(screen.getByTestId('cap-loss-direction-trend')).toBeInTheDocument();
+    expect(screen.getByText('Prior cap loss')).toBeInTheDocument();
+    expect(screen.getByText('Latest cap loss')).toBeInTheDocument();
+    expect(screen.getByText('d-id-only')).toBeInTheDocument();
+    expect(screen.getAllByText('Retarget Convergence')).not.toHaveLength(0);
+    expect(screen.getByText('Reviews to converge (median)')).toBeInTheDocument();
+    expect(screen.getAllByText('Delta-scope retargets')).not.toHaveLength(0);
+    expect(screen.getAllByText('Stale-head discards')).not.toHaveLength(0);
     // classification labels
     expect(screen.getAllByText('↓ improving').length).toBeGreaterThan(0);
   });
@@ -243,6 +305,145 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('LANE_CI')).toBeInTheDocument();
     expect(screen.getByText('LANE_CONFLICT')).toBeInTheDocument();
     expect(screen.getByText('LANE_REVIEW_CONVERGENCE')).toBeInTheDocument();
+  });
+
+  it('renders live retarget convergence counters', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getAllByText('Reviews to converge')).not.toHaveLength(0);
+    expect(screen.getAllByText('Delta-scope retargets')).not.toHaveLength(0);
+    expect(screen.getAllByText('Full-scope retargets')).not.toHaveLength(0);
+    expect(screen.getAllByText('Stale-head discards')).not.toHaveLength(0);
+  });
+
+  it('renders missing live retarget counters as unavailable instead of zero', async () => {
+    apiFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ...mockLaneDiagResponse,
+          lane_waste: {
+            ...mockLaneDiagResponse.lane_waste,
+            retarget_review_scope_counts: undefined,
+            stale_head_discard_count: undefined,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Delta-scope retargets').closest('tr')).toHaveTextContent('—');
+    expect(screen.getByText('Full-scope retargets').closest('tr')).toHaveTextContent('—');
+    expect(screen.getByText('Stale-head discards').closest('tr')).toHaveTextContent('—');
+  });
+
+  it('renders a genuine zero live retarget counter as zero', async () => {
+    apiFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ...mockLaneDiagResponse,
+          lane_waste: {
+            ...mockLaneDiagResponse.lane_waste,
+            retarget_review_scope_counts: { delta: 0, full: 0 },
+            stale_head_discard_count: 0,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Delta-scope retargets').closest('tr')).toHaveTextContent('0');
+    expect(screen.getByText('Full-scope retargets').closest('tr')).toHaveTextContent('0');
+    expect(screen.getByText('Stale-head discards').closest('tr')).toHaveTextContent('0');
+  });
+
+  it('surfaces the superseded-rollup median and the directions lost to the cap', async () => {
+    render(<LaneDiagPanel />);
+    await act(async () => { await Promise.resolve(); });
+
+    // The two numbers the lane-waste measurement exists to answer must be
+    // readable, not just computed and persisted.
+    expect(screen.getByText('Superseded-rollup reviews to converge')).toBeInTheDocument();
+    const affectedRow = screen.getByText('Superseded-rollup reviews to converge').closest('tr');
+    expect(affectedRow?.textContent).toContain('median of 2 merged of 2 superseded rollup chains, P95 9');
+    expect(screen.getByText('Directions lost to the review cap')).toBeInTheDocument();
+    expect(screen.getAllByText(/\(2 chains\)/).length).toBeGreaterThan(0);
+  });
+
+  it('renders the new convergence trend rows and leaves sample size unclassified', async () => {
+    render(<LaneDiagPanel projectId="project-1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Directions lost to cap')).toBeInTheDocument();
+    expect(
+      screen.getByText('Superseded reviews to converge (median)'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Superseded reviews to converge (P95)')).toBeInTheDocument();
+    // Converging fewer chains is a throughput drop, never an "improving" verdict.
+    const sampleRow = screen.getByText('Converged chains (sample size)').closest('tr');
+    if (!sampleRow) throw new Error('sample-size trend row was not rendered');
+    expect(sampleRow.textContent).not.toContain('improving');
+  });
+
+  it('renders evicted and unavailable trend provenance explicitly', async () => {
+    fetchLaneBaselines.mockResolvedValueOnce({
+      ...mockBaselinesResponse,
+      trend: {
+        ...mockBaselinesResponse.trend,
+        retarget_convergence: {
+          ...mockBaselinesResponse.trend.retarget_convergence,
+          retarget_review_scope_counts: {
+            delta: {
+              latest: null,
+              prior: 0,
+              delta: null,
+              classification: null,
+              availability: { latest: 'evicted', prior: 'available' },
+            },
+            full: {
+              latest: null,
+              prior: null,
+              delta: null,
+              classification: null,
+              availability: { latest: 'unavailable', prior: 'unavailable' },
+            },
+          },
+        },
+      },
+    });
+    render(<LaneDiagPanel projectId="project-1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const deltaTrendRow = screen
+      .getAllByText('Delta-scope retargets')
+      .find((element) => element.closest('tr')?.textContent?.includes('Evicted'));
+    const fullTrendRow = screen
+      .getAllByText('Full-scope retargets')
+      .find((element) => element.closest('tr')?.textContent?.includes('Unavailable'));
+    expect(deltaTrendRow?.closest('tr')).toHaveTextContent('Evicted');
+    expect(fullTrendRow?.closest('tr')).toHaveTextContent('Unavailable');
+  });
+
+  it('renders None for versions without persisted cap-loss directions', async () => {
+    fetchLaneBaselines.mockResolvedValueOnce({
+      ...mockBaselinesResponse,
+      trend: {
+        ...mockBaselinesResponse.trend,
+        outer_loop_convergence: {
+          ...mockBaselinesResponse.trend.outer_loop_convergence,
+          cap_exhausted_directions: { latest: [], prior: [] },
+        },
+      },
+    });
+    render(<LaneDiagPanel projectId="project-1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByTestId('cap-loss-direction-trend')).toHaveTextContent('None');
+    expect(screen.getAllByText('None')).toHaveLength(2);
   });
 
   it('renders per-PR phase breakdown sorted by total_seconds desc', async () => {

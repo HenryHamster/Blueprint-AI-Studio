@@ -94,6 +94,10 @@ from app.digest_outer_loop import (  # noqa: F401
     _TERMINAL_OUTCOME_KEYS,
     _ESCALATION_OUTCOME_KEYS,
     _outer_loop_pct,
+    _outer_loop_review_stats,
+    _new_rollup_convergence_fold,
+    _fold_rollup_convergence_arm,
+    _bounded_direction_records,
     _outer_loop_chain_key,
     _outer_loop_terminal_outcome,
     _group_outer_loop_chains,
@@ -118,6 +122,7 @@ from app.failure_classification import (
     AGENT_STALLED,
     AGENT_TIMEOUT,
     APPROVED_CAP_PR_CLOSED,
+    ROLLUP_DELIVERABLE_DROPPED,
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
     REPO_UNINITIALIZED,
@@ -141,6 +146,7 @@ from app.failure_classification import (
     TIMEOUT_PROCESS_CRASH,
     TIMEOUT_UNKNOWN,
     UNPLACEABLE_EXECUTION_SITE,
+    MALFORMED_TASK_PAYLOAD,
     VIEWPORT_REGRESSION,
 )
 
@@ -177,6 +183,11 @@ _FAILURE_CLASS_LABELS = {
     APPROVED_CAP_PR_CLOSED: "Approved Cap PR Closed — fix-loop cap hit post-approval",
     ADMIN_CANCEL: "Admin Cancel",
     UNPLACEABLE_EXECUTION_SITE: "Unplaceable — declared execution site has no dispatch path",
+    ROLLUP_DELIVERABLE_DROPPED: (
+        "Rollup deliverable dropped — conflict resolution erased a merged "
+        "child PR's work"
+    ),
+    MALFORMED_TASK_PAYLOAD: "Malformed payload — spawner omitted a field the runner requires",
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
@@ -1053,6 +1064,7 @@ def compute_review_cap_exhaustion_summary(
     ]
     return {
         "count": len(_cap_tasks),
+        "distinct_direction_count": len(_cap_dir_counts),
         "avg_iterations": (sum(_cap_iters) / len(_cap_iters)) if _cap_iters else None,
         "top_directions": [{"direction_id": d, "count": c} for d, c in _top_cap_dirs],
         "total_cost_usd": round(_cap_total_cost, 4),
@@ -1123,6 +1135,11 @@ def compute_outer_loop_convergence(
     standoff_pr_count = 0
     repeat_fingerprint_pr_count = 0
     overall_escalation_pr_count = 0
+    cap_exhausted_direction_ids: set[str] = set()
+    cap_exhausted_direction_records: Dict[str, Optional[str]] = {}
+    supersede_affected_chain_count = 0
+    supersede_affected_merged_review_counts: List[int] = []
+    rollup_convergence = _new_rollup_convergence_fold()
 
     # Parse escalation Alerts into per-chain reason sets + the deduped histogram.
     (
@@ -1176,6 +1193,11 @@ def compute_outer_loop_convergence(
         elif outcome == "cap_exhausted":
             cap_exhausted += 1
             rejected_chains.add(key)
+            if obs["direction_id"]:
+                cap_exhausted_direction_ids.add(obs["direction_id"])
+                cap_exhausted_direction_records.setdefault(
+                    obs["direction_id"], obs.get("direction_text")
+                )
         elif outcome == "repeat_fingerprint_halt":
             repeat_fingerprint_halt += 1
         if outcome == "stuck":
@@ -1187,6 +1209,13 @@ def compute_outer_loop_convergence(
         if outcome in _ESCALATION_OUTCOME_KEYS:
             overall_escalation_pr_count += 1
             escalated_chain_keys.add(key)
+        if obs["supersede_affected"]:
+            supersede_affected_chain_count += 1
+            if outcome == "merged" and obs["reviews_to_converge"] is not None:
+                supersede_affected_merged_review_counts.append(
+                    obs["reviews_to_converge"]
+                )
+        _fold_rollup_convergence_arm(rollup_convergence, obs)
 
         # Tally candidate non-convergence causes for the dominant-blocker ranking.
         # A chain is non-converged when it did NOT merge; it contributes to every
@@ -1270,6 +1299,33 @@ def compute_outer_loop_convergence(
         "escalation_total": len(escalated_task_ids),
         "escalation_by_reason": escalation_by_reason,
         "convergence_rate": convergence_rate,
+        "cap_exhausted_direction_count": len(cap_exhausted_direction_ids),
+        "cap_exhausted_directions": _bounded_direction_records(
+            cap_exhausted_direction_records
+        ),
+        "supersede_affected_chain_count": supersede_affected_chain_count,
+        "supersede_affected_merged_chain_count": len(
+            supersede_affected_merged_review_counts
+        ),
+        "supersede_affected_reviews_to_converge": {
+            "count": len(supersede_affected_merged_review_counts),
+            "sample_count": len(supersede_affected_merged_review_counts),
+            "median": _outer_loop_pct(supersede_affected_merged_review_counts, 50),
+            "p95": _outer_loop_pct(supersede_affected_merged_review_counts, 95),
+        },
+        "rollup_chain_count": rollup_convergence["chain_count"],
+        "rollup_supersede_affected_chain_count": rollup_convergence[
+            "supersede_affected_chain_count"
+        ],
+        "rollup_supersede_unaffected_chain_count": rollup_convergence[
+            "supersede_unaffected_chain_count"
+        ],
+        "rollup_supersede_affected_reviews_to_converge": _outer_loop_review_stats(
+            rollup_convergence["supersede_affected_review_counts"]
+        ),
+        "rollup_supersede_unaffected_reviews_to_converge": _outer_loop_review_stats(
+            rollup_convergence["supersede_unaffected_review_counts"]
+        ),
         "non_converged_total": non_converged_total,
         "dominant_blocker": dominant_blocker,
         # Non-code outcomes — ADDITIVE. Tasks without a review_loop context

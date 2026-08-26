@@ -102,7 +102,7 @@ from app.acceptance_gate import check_required_diff_paths
 from app.acceptance_gate import record_artifact_consumptions_for_task
 from app.acceptance_gate import stamp_changed_files_signal
 from app.acceptance_gate import stamp_premerge_acceptance_finding
-from app.time_utils import _utcnow, exponential_backoff, set_retry_after
+from app.time_utils import _utcnow, exponential_backoff, set_retry_after, utc_iso
 from app.agent_status_spawn import (
     _recover_poisoned_session,
     maybe_spawn_smoketest_fix,
@@ -2636,7 +2636,7 @@ async def update_agent_status(
                                     "effective": fallback_model,
                                     "provider": provider_name,
                                     "reason": "provider_model_config_rejection",
-                                    "at": _utcnow().isoformat(),
+                                    "at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                                 }
                                 ctx.pop("_api_failure_retries", None)
                                 task.retry_after_until = (
@@ -2874,9 +2874,9 @@ async def update_agent_status(
                             )
                             ctx["blacklisted_accounts"] = park_blacklisted
                             ctx["parked_for_retarget"] = True
-                            ctx["park_deadline"] = park_deadline.isoformat()
+                            ctx["park_deadline"] = park_deadline.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                             ctx["warm_target_vm_id"] = old_vm_id_rl
-                            ctx["warm_handoff_deadline"] = park_deadline.isoformat()
+                            ctx["warm_handoff_deadline"] = park_deadline.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
                             pr_number = _task_pr_number(task)
                             if pr_number is not None:
                                 ctx["warm_target_pr"] = pr_number
@@ -2902,8 +2902,8 @@ async def update_agent_status(
                             return {
                                 "status": "accepted",
                                 "action": "park",
-                                "retry_after_until": retry_after_deadline.isoformat(),
-                                "park_deadline": park_deadline.isoformat(),
+                                "retry_after_until": utc_iso(retry_after_deadline),
+                                "park_deadline": utc_iso(park_deadline),
                             }
 
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -3758,6 +3758,8 @@ async def update_agent_status(
         from app.failure_classification import (
             REASSIGNED,
             SCOPE_EMPTY,
+            NON_RETRYABLE_PLATFORM_CLASSES,
+            malformed_task_payload_reason,
             persist_failure_category,
         )
 
@@ -3805,6 +3807,14 @@ async def update_agent_status(
                 or task.attempt_count < _runtime_config["max_retries"]
             )
             and failure_class not in _NON_GENUINE_TERMINAL_CLASSES
+            # A failure whose cause is a permanent property of the task ROW
+            # (a payload that cannot satisfy the runner's entry contract) is
+            # re-read identically by every attempt. Retrying it three times
+            # produces three identical deaths, three VM provisions, and a
+            # "Retries exhausted (3/3)" message that reads like an agent that
+            # could not do the work. Land it terminal on the FIRST report with
+            # the real reason instead.
+            and failure_class not in NON_RETRYABLE_PLATFORM_CLASSES
         ):
             _current_attempt_ordinal = get_task_lifetime_attempt_ordinal(task)
             if (
@@ -4056,7 +4066,7 @@ async def update_agent_status(
                     ctx["orphaned_push"] = {
                         "branch": payload.pushed_branch,
                         "head_sha": payload.pushed_head_sha,
-                        "recorded_at": _utcnow().isoformat(),
+                        "recorded_at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     }
                     task.context = ctx
                     flag_modified(task, "context")
@@ -4064,7 +4074,23 @@ async def update_agent_status(
             elif payload.status == TaskStatus.FAILED:
                 max_r = _runtime_config["max_retries"]
                 existing_msg = task.latest_status_message or ""
-                if "retries exhausted" not in existing_msg:
+                if failure_class in NON_RETRYABLE_PLATFORM_CLASSES:
+                    # No retry was ever attempted or possible, so "Retries
+                    # exhausted (n/3)" would be a lie that reads as an agent
+                    # that kept trying and kept failing. State the actual
+                    # cause, and name the surface that owns the fix.
+                    _payload_reason = malformed_task_payload_reason(task)
+                    task.latest_status_message = (
+                        f"[{failure_class}] Not retried: the failure is a permanent "
+                        "property of this task's payload, so every attempt would "
+                        "die identically. "
+                        + (f"{_payload_reason}. " if _payload_reason else "")
+                        + "Fix the spawner that created this task; requeueing it "
+                        "unchanged cannot succeed. "
+                        + existing_msg[:200]
+                    ).strip()
+                    session.add(task)
+                elif "retries exhausted" not in existing_msg:
                     task.latest_status_message = (
                         f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r}). "
                         + existing_msg[:300]
@@ -4072,11 +4098,15 @@ async def update_agent_status(
                     session.add(task)
                 # Record CODE_ERROR-class failures to 7-day account success-rate tracking.
                 # RATE_LIMIT is tracked via disable_account_model; COMPLETED via record_completion_event.
+                # MALFORMED_TASK_PAYLOAD is excluded for the same reason: the
+                # account never got a runnable task, so dinging its success rate
+                # charges a spawner defect to whichever account happened to be
+                # holding the dead row.
                 if failure_class not in (
                     "RATE_LIMIT",
                     "EXTERNAL_API",
                     "PROVISION_FAILURE",
-                ):
+                ) and failure_class not in NON_RETRYABLE_PLATFORM_CLASSES:
                     _acct_id_outcome = get_task_llm_account_id(task)
                     if _acct_id_outcome:
                         try:
@@ -4804,7 +4834,7 @@ async def update_agent_status(
             task.context = {
                 **(task.context or {}),
                 "_post_commit_pending_meta": {
-                    "at": _utcnow().isoformat(),
+                    "at": _utcnow().isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                     "generation_token": uuid.uuid4().hex,
                     "reason": "inline_running",
                     "payload": _payload_dump,

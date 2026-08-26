@@ -1,4 +1,4 @@
-"""Event-driven qualification trigger resolver (Phase 0/1 — observe mode).
+"""Event-driven qualification trigger resolver.
 
 Pure decision module: ``resolve_qualification_trigger`` is a DB-free, side-effect-free
 function that maps the current qualification state of an open version to a fire/hold
@@ -16,9 +16,12 @@ The resolver implements the ordered rule table from the design doc (efbe4182):
     T3b infra_failure_redrive — transient infrastructure failure under per-candidate
                                 streak cap (separate from error-redrive cap)
     T4 post_dry_run_advance — dry_run + automain has advanced (+ CI-red gate)
-    T5 blockers_cleared — not_promoted readiness / promotion_failed / ci_unresolved
-    T5b deferred_unsynced_redrive — deferred deploy-sync re-entry (unconditional;
-                                   the sync gate is inside run_qualification)
+    T5 blockers_cleared — not_promoted readiness / promotion_failed / ci_unresolved,
+                          under the promotion-failure circuit-breaker cap
+    T5b deferred_unsynced_redrive — deferred deploy-sync re-entry (unconditional
+                                   here; the sync gate is inside
+                                   run_qualification, and the dedicated re-driver
+                                   applies the re-check interval + wait cap)
 
 All paths call the same ``run_qualification`` chokepoint (which is self-defending via
 a FOR-UPDATE lock); this module only decides *whether* to call it.
@@ -53,6 +56,17 @@ _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS: int = 3
 # consistent with that enforcement.
 _MAX_RUBRIC_REDRIVE_ATTEMPTS: int = 2
 
+# Circuit-breaker cap on autonomous re-qualify attempts after a promotion
+# failure.  Mirrors
+# ``release_qualifier_redrive._MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS``: every
+# ``_record_promotion_failure`` increments
+# ``last_qualification["promotion_failure_count"]``, and the dedicated re-driver
+# (``release_qualifier_redrive._redrive_promotion_failed_qualification``)
+# escalates to an operator Alert instead of re-driving once the count reaches
+# this cap.  This resolver mirror keeps the read surfaces honest ("capped", not
+# "armed") when the enforcement point has already halted.
+_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS: int = 3
+
 # CI state string representing a known-red build (from ci_resolution.py).
 _CI_RED = "red"
 
@@ -82,7 +96,8 @@ class TriggerDecision:
     reason:
         Machine-readable code for the decision (e.g. "ci_red", "in_flight",
         "wrong_phase", "criterion_not_met", "error_attempt_cap",
-        "infra_failure_attempt_cap", "armed", "not_applicable").
+        "infra_failure_attempt_cap", "promotion_failure_cap", "armed",
+        "not_applicable").
     blocking:
         Human-readable list of reasons why fire=False (empty when fire=True).
     """
@@ -128,6 +143,7 @@ def resolve_qualification_trigger(
     promotion_check_wait: bool,
     consecutive_infra_errors: int = 0,
     rubric_redrive_count: int = 0,
+    promotion_failure_count: int = 0,
     automain_head_quiet_seconds: float | None = None,
 ) -> TriggerDecision:
     """Return a fire/hold decision for the open version.
@@ -184,6 +200,14 @@ def resolve_qualification_trigger(
         candidate SHA changes or a non-infra verdict lands).  Read by the
         infra_failure_redrive tier against ``_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS``.
         Defaults to 0 so callers that don't resolve the streak still get a
+        safe (fire-eligible) decision.
+    promotion_failure_count:
+        ``last_qualification["promotion_failure_count"]`` — the number of
+        promotion attempts that have FAILED for this version (incremented by
+        every ``_record_promotion_failure``).  Read by T5 against
+        ``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS`` so the read surfaces
+        report "capped" once the dedicated re-driver has escalated instead of
+        re-driving.  Defaults to 0 so callers that don't resolve it still get a
         safe (fire-eligible) decision.
     automain_head_quiet_seconds:
         How long (seconds) the current ``automain_sha`` has been the observed
@@ -408,6 +432,23 @@ def resolve_qualification_trigger(
     # T5 — blockers_cleared: promotion failure remains a remediation-owned
     # re-drive. not_promoted is handled above solely by candidate identity.
     if status == "promotion_failed":
+        # Circuit breaker first: once the promotion-failure count reaches the
+        # cap the dedicated re-driver escalates to an operator Alert and stops.
+        # Reporting "armed" here would tell an operator a re-drive is coming
+        # when enforcement has already halted — the same read-surface lie the
+        # rubric cap mirror exists to prevent.
+        if promotion_failure_count >= _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS:
+            return TriggerDecision(
+                fire=False,
+                trigger="none",
+                reason="promotion_failure_cap",
+                blocking=[
+                    f"promotion_failed — {promotion_failure_count} failed "
+                    f"promotion attempt(s) reached the autonomous re-drive cap "
+                    f"({_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS}); operator "
+                    f"review or a changed audited candidate is required"
+                ],
+            )
         if requalification_ready is True:
             return TriggerDecision(
                 fire=True,
@@ -427,9 +468,12 @@ def resolve_qualification_trigger(
     # back-merge is still pending).  run_qualification re-snapshots the
     # integration-branch HEAD and re-evaluates the sync gate on every re-entry,
     # so a standing deferral is always eligible for re-entry — the real gate is
-    # inside run_qualification, not here.  Unconditional fire (no cap needed:
-    # each sweep costs one cheap run_qualification re-entry that either proceeds
-    # or re-defers).
+    # inside run_qualification, not here.  Unconditional at THIS layer: the
+    # dedicated re-driver
+    # (``release_qualifier_redrive._redrive_deferred_unsynced_qualification``)
+    # owns the re-check interval that keeps the re-entry cost bounded and the
+    # wait cap that escalates a deferral the sync-gate fall-through never
+    # released.
     if status == "deferred_unsynced":
         return TriggerDecision(
             fire=True,
@@ -469,6 +513,7 @@ def explain_qualification_trigger(
     qualification_provenance: dict[str, Any] | None = None,
     consecutive_infra_errors: int = 0,
     rubric_redrive_count: int = 0,
+    promotion_failure_count: int = 0,
     automain_head_quiet_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Return an operator-facing explanation of the qualification trigger state.
@@ -515,6 +560,7 @@ def explain_qualification_trigger(
         promotion_check_wait=promotion_check_wait,
         consecutive_infra_errors=consecutive_infra_errors,
         rubric_redrive_count=rubric_redrive_count,
+        promotion_failure_count=promotion_failure_count,
         automain_head_quiet_seconds=automain_head_quiet_seconds,
     )
 
@@ -529,6 +575,7 @@ def explain_qualification_trigger(
         "error_attempt_cap",
         "infra_failure_attempt_cap",
         "rubric_redrive_cap",
+        "promotion_failure_cap",
     ):
         auto_trigger = "capped"
     elif decision.reason == "not_applicable":
@@ -551,6 +598,7 @@ def explain_qualification_trigger(
         "error_attempt_cap": "operator_or_strategist_only",
         "infra_failure_attempt_cap": "operator_or_strategist_only",
         "rubric_redrive_cap": "operator_or_strategist_only",
+        "promotion_failure_cap": "operator_or_strategist_only",
         "ci_red": "new_candidate_commit",
         # Quiet-window hold self-resolves: a later sweep fires once the head
         # settles (or restarts the window if another merge lands first).

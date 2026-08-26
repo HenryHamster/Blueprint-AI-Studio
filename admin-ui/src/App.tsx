@@ -518,11 +518,24 @@ export default function App() {
     residentStrategicSessionRunners, strategicSessionSelectedRunnerId,
     savingStrategicWorkbench, strategicSessionBusy, persistStrategicWorkbench,
     handleSelectStrategicRunner, handleStartStrategicSession, handleStopStrategicSession,
+    checkingInStrategicSession, updateStrategicSessionRefs, handleStrategicCheckIn,
+    taskContextSessionProps,
   } = useStrategicSession({
     selectedProjectId, addToast: s.addToast, strategicReadModel,
     strategicLiveness: strategicLiveness.data,
     canOperateProject: s.selectedProjectAccess.canOperateProject,
   });
+  // The persisted interaction_mode is wider than the palette's union: legacy
+  // 'check_in'/'monitor' rows still exist in workbench state. Narrow it here
+  // rather than widening the prop -- an unrecognised mode maps to undefined (mode
+  // unknown), so no mode command is falsely marked/disabled as "Current mode".
+  const strategicPaletteMode: StrategicInteractionMode | undefined =
+    strategicInteractionMode === 'chat' || strategicInteractionMode === 'continuous'
+      ? strategicInteractionMode
+      : undefined;
+  const markStrategicChecked = useCallback(() => {
+    void handleStrategicCheckIn();
+  }, [handleStrategicCheckIn]);
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
   }, [persistStrategicWorkbench]);
@@ -972,6 +985,13 @@ export default function App() {
     hasDesignDoc: strategicReadModel.data?.design.has_design_doc,
     designRevision: strategicReadModel.data?.design.revision,
     strategicState: strategicReadModel.data ?? null,
+    strategicInteractionMode: strategicPaletteMode,
+    strategicWorkbenchState,
+    savingStrategicWorkbench,
+    checkingInStrategicSession,
+    switchStrategicInteractionMode: setStrategicInteractionMode,
+    markStrategicChecked,
+    updateStrategicSessionRefs,
     focusStrategicComposer,
     openStrategicContextTarget: openStrategicContextWorkspaceTarget,
     openStrategicContextWorkspace,
@@ -1569,6 +1589,7 @@ export default function App() {
             attentionTasks: backendAttentionTasks,
             localFallbackTasks: localAttentionTasks,
             trackedTaskIds: s.trackedTaskIds,
+            taskContextSessionProps,
             onOpenTask: handleOpenTaskDetails,
             onOpenPipeline: () => handleTabChange('pipeline'),
             onTrackTask: s.trackTask,
