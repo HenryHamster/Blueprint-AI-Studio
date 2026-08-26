@@ -520,10 +520,17 @@ jobs:
     # from the merge gate, which is worse than catching a hang 10 min later
     # (fail-fast is false, so a hung shard never blocks its siblings). The real
     # fix is committing .test_durations so pytest-split balances by time.
-    # pytest --timeout=30 uses the thread method, which CANNOT
-    # interrupt a non-Python block (real I/O / C-level / asyncio deadlock); GH
-    # Actions' default job timeout is 360 min, so without this a single hang
-    # stalls the runner for 6h and wedges the rollup. This is the catch-all.
+    # This ceiling is the CATCH-ALL, and it is the only thing standing between a
+    # non-interruptible block and GH Actions' 360-min default. Note the per-test
+    # budget below is --timeout=300 --timeout-method=signal: 300s (raised from
+    # 30s on 2026-08-26) is a HANG detector, not a performance budget. At 30s it
+    # was killing healthy whole-tree read+parse scans under host I/O contention
+    # and reding shards on candidates that had just gone green at the same sha
+    # -- on a promotion PR that deletes the release branch. The inner-operation
+    # ceiling that catches genuine budget inversions stayed at 30s; the two are
+    # now separate constants in backend/testing/test_harness_timeout_budgets.py
+    # and that guard fails if anyone moves them back together. A shard runs ~11
+    # min, so even a full 300s hang leaves real headroom under the 30-min cap.
     timeout-minutes: 30
     needs: [detect, backend-deps]
     if: needs.detect.outputs.backend == 'true'
@@ -768,7 +775,7 @@ jobs:
               -e WS_TICKET_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
               ${{ steps.deps.outputs.image }} \
               python -m pytest testing/ --splits 8 --group ${{ matrix.shard }} \
-                -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
+                -v --tb=short --timeout=300 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
             return ${PIPESTATUS[0]}
           }
           # Extract failed/erroring test IDs from pytest's "short test summary

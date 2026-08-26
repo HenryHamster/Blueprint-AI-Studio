@@ -1,6 +1,6 @@
 """
-Standalone guard: no test may wrap a subprocess in a timeout that is >= the
-pytest-timeout budget the CI lane runs it under.
+Standalone guard: no test may wrap a subprocess in a timeout at or above the
+inner-operation ceiling without declaring an explicit pytest-timeout marker.
 
 THE DEFECT CLASS THIS EXISTS TO PREVENT
 ---------------------------------------
@@ -46,14 +46,38 @@ from pathlib import Path
 
 import pytest
 
-# The pytest-timeout budget every backend CI lane passes on the command line.
+# TWO NUMBERS, TWO JOBS. These used to be a single constant at 30, which made
+# one literal do two incompatible things.
 #
-# Pinned as a literal ON PURPOSE. Reading it out of the config files would make
-# this guard self-certifying: bumping ci.yml would silently relax every
-# assertion below. Instead the literal is the authority and
+# 1. LANE_HANG_DETECTOR_SECONDS -- the pytest-timeout budget every backend CI
+#    lane passes on the command line. Its ONLY job is to catch a genuine hang
+#    (deadlock, lost socket, unbounded retry) before GitHub Actions' 360-min
+#    default stalls the runner for six hours. It is deliberately generous.
+#    At 30s it was ALSO acting as a per-test performance budget, and in that
+#    role it kept killing healthy work under host I/O contention: three
+#    distinct victims across two local standalone runs (never the same test
+#    twice, all whole-tree read+parse scans over 500-1000 files), plus the
+#    shard-4 red that blocked release v45 on a candidate that had gone green
+#    at the identical sha 40 minutes earlier. A hang detector that fires on
+#    contention is a flake generator, and on a promotion PR a flake deletes
+#    the release branch.
+#
+# 2. MAX_INNER_OPERATION_SECONDS -- the ceiling at or above which a single
+#    inner blocking call (subprocess / Event.wait / join / acquire) must
+#    declare itself with an explicit ``@pytest.mark.timeout(M)`` where M
+#    exceeds the inner timeout. This is the budget-inversion guard from the
+#    docstring above and it KEEPS ITS TEETH AT 30. Raising it alongside the
+#    hang detector is precisely the mistake this split exists to prevent: it
+#    has caught a promotion-killing class at least three times, and a 30s
+#    inner call is a code smell whether or not the harness now survives it.
+#
+# Both are pinned as literals ON PURPOSE. Reading them out of the config files
+# would make this guard self-certifying: bumping ci.yml would silently relax
+# every assertion below. Instead the literals are the authority and
 # ``test_declared_lane_budget_matches_the_pin`` proves the config still agrees
-# with it, so a deliberate bump has to touch this line and be reviewed.
-LANE_TIMEOUT_SECONDS = 30
+# with them, so a deliberate bump has to touch these lines and be reviewed.
+LANE_HANG_DETECTOR_SECONDS = 300
+MAX_INNER_OPERATION_SECONDS = 30
 
 _SUBPROCESS_CALLS = frozenset(
     {"run", "check_output", "check_call", "call", "Popen"}
@@ -197,16 +221,17 @@ class _Finding:
         if not self.owner_is_test:
             return (
                 f"{rel}:{self.lineno}: helper {self.owner}() wraps a subprocess "
-                f"in timeout={self.seconds:g}s, at or above the {LANE_TIMEOUT_SECONDS}s "
-                f"lane budget. A helper cannot carry a pytest-timeout marker that "
+                f"in timeout={self.seconds:g}s, at or above the "
+                f"{MAX_INNER_OPERATION_SECONDS}s inner-operation ceiling. A helper "
+                f"cannot carry a pytest-timeout marker that "
                 f"applies to its callers -- lower the inner timeout instead."
             )
         if self.budget is None:
             return (
                 f"{rel}:{self.lineno}: {self.owner}() wraps a subprocess in "
-                f"timeout={self.seconds:g}s under a {LANE_TIMEOUT_SECONDS}s lane budget "
-                f"with no @pytest.mark.timeout. The harness kills the call before "
-                f"its own timeout can fire."
+                f"timeout={self.seconds:g}s, at or above the "
+                f"{MAX_INNER_OPERATION_SECONDS}s inner-operation ceiling, with no "
+                f"@pytest.mark.timeout declaring the budget it needs."
             )
         return (
             f"{rel}:{self.lineno}: {self.owner}() wraps a subprocess in "
@@ -250,7 +275,7 @@ def _collect() -> tuple[list[_Finding], dict[str, dict[str, int]]]:
                 except (ValueError, TypeError, SyntaxError):
                     continue
                 counts["calls"] += 1
-                if seconds < LANE_TIMEOUT_SECONDS:
+                if seconds < MAX_INNER_OPERATION_SECONDS:
                     continue
                 enclosing = [
                     f for f in functions
@@ -335,9 +360,9 @@ def test_no_subprocess_timeout_exceeds_its_lane_budget() -> None:
         )
 
     assert not findings, (
-        f"{len(findings)} subprocess timeout(s) at or above the "
-        f"{LANE_TIMEOUT_SECONDS}s CI lane budget. The harness kills the call "
-        f"before its own timeout fires, so it reds as an unreproducible flake "
+        f"{len(findings)} blocking call(s) at or above the "
+        f"{MAX_INNER_OPERATION_SECONDS}s inner-operation ceiling with no explicit "
+        f"@pytest.mark.timeout. An undeclared long call reds as a flake "
         f"rather than a real failure:\n\n"
         + "\n\n".join(str(f) for f in findings)
     )
@@ -346,8 +371,8 @@ def test_no_subprocess_timeout_exceeds_its_lane_budget() -> None:
 def test_declared_lane_budget_matches_the_pin() -> None:
     """The pinned literal must still match what CI actually passes.
 
-    Without this, ``LANE_TIMEOUT_SECONDS`` could drift away from the real lane
-    budget and the guard above would police a number nothing uses.
+    Without this, ``LANE_HANG_DETECTOR_SECONDS`` could drift away from the real
+    lane budget and the guard above would police a number nothing uses.
     """
     declarations = {
         REPO_ROOT / ".github" / "workflows" / "ci.yml": None,
@@ -358,23 +383,61 @@ def test_declared_lane_budget_matches_the_pin() -> None:
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
+        # Comment lines are stripped before the scan. Both files are commented
+        # in the same syntax they execute, so a `# ... --timeout=300 ...` note
+        # explaining the budget would otherwise SATISFY this pin on its own --
+        # the vacuous-guard shape where prose, not the executed command, is what
+        # the guard reads. Proven by mutation: with comments counted, reverting
+        # the real ci.yml invocation to 30 reported `[30, 300]` (the 300 came
+        # from a comment); with them stripped the same mutation reports `[30]`.
+        executable = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
         values = {
-            int(m) for m in re.findall(r"--timeout=(\d+)\b", text)
+            int(m) for m in re.findall(r"--timeout=(\d+)\b", executable)
         }
         if not values:
             continue
         checked += 1
-        assert values == {LANE_TIMEOUT_SECONDS}, (
+        assert values == {LANE_HANG_DETECTOR_SECONDS}, (
             f"{path.name} passes --timeout={sorted(values)} but this guard is "
-            f"pinned to {LANE_TIMEOUT_SECONDS}. Update LANE_TIMEOUT_SECONDS "
-            f"deliberately (and re-check every marker it governs) rather than "
-            f"letting the pin drift."
+            f"pinned to {LANE_HANG_DETECTOR_SECONDS}. Update "
+            f"LANE_HANG_DETECTOR_SECONDS deliberately (and re-check every marker "
+            f"it governs) rather than letting the pin drift. This is the HANG "
+            f"DETECTOR, not MAX_INNER_OPERATION_SECONDS -- never move them "
+            f"together."
         )
     if REPO_ROOT.joinpath(".github").is_dir():
         assert checked >= 1, (
             "no lane declared a --timeout= at all; the pin above is now "
             "unanchored to anything CI runs."
         )
+
+
+def test_the_two_budgets_stay_ordered_and_distinct() -> None:
+    """The inner ceiling must stay strictly below the hang detector.
+
+    These are deliberately two numbers doing two jobs. If a later edit collapses
+    them -- by lowering the hang detector back onto the ceiling, or by dragging
+    the ceiling up with it -- the inversion guard silently becomes the hang
+    detector again, which is the exact conflation this split undid. Equality is
+    the failure mode, so it is asserted strictly.
+    """
+    assert MAX_INNER_OPERATION_SECONDS < LANE_HANG_DETECTOR_SECONDS, (
+        f"MAX_INNER_OPERATION_SECONDS ({MAX_INNER_OPERATION_SECONDS}) must stay "
+        f"strictly below LANE_HANG_DETECTOR_SECONDS "
+        f"({LANE_HANG_DETECTOR_SECONDS}). An inner blocking call may never be "
+        f"allowed to reach the harness ceiling: at that point the harness kills "
+        f"it before its own timeout can report, which is the promotion-killing "
+        f"flake this module exists to prevent."
+    )
+    # The ceiling is the number with teeth; pin it so a bump has to be
+    # deliberate and reviewed rather than drifting up with the detector.
+    assert MAX_INNER_OPERATION_SECONDS == 30, (
+        "MAX_INNER_OPERATION_SECONDS is the budget-inversion ceiling that has "
+        "caught a promotion-killing class at least three times. Changing it "
+        "needs its own justification, separate from any hang-detector change."
+    )
 
 
 def test_the_guard_rejects_a_known_bad_shape() -> None:
@@ -386,7 +449,7 @@ def test_the_guard_rejects_a_known_bad_shape() -> None:
     bad = ast.parse(
         "import subprocess\n"
         "def test_thing():\n"
-        f"    subprocess.run(['x'], timeout={LANE_TIMEOUT_SECONDS})\n"
+        f"    subprocess.run(['x'], timeout={MAX_INNER_OPERATION_SECONDS})\n"
     )
     calls = [
         n for n in ast.walk(bad)
@@ -396,7 +459,7 @@ def test_the_guard_rejects_a_known_bad_shape() -> None:
     ]
     assert len(calls) == 1
     seconds = float(ast.literal_eval(calls[0].keywords[0].value))
-    assert seconds >= LANE_TIMEOUT_SECONDS, (
+    assert seconds >= MAX_INNER_OPERATION_SECONDS, (
         "the equal-numbers case must be treated as an inversion, not a fit"
     )
 

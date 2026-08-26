@@ -102,14 +102,19 @@ def _run(repo: Path, **env_extra: str) -> subprocess.CompletedProcess[str]:
         env=env,
         capture_output=True,
         text=True,
-        timeout=300,
+        # Both process boundaries the lane crosses are stubs here (_HARNESS_STUB
+        # echoes and exits; _CLASSIFIER_STUB is three lines of python), so this
+        # is a millisecond run. The old 300s advertised a cost this test cannot
+        # incur and broke the 30s inner-operation ceiling for no benefit.
+        timeout=20,
     )
 
 
 @requires_bash
 def test_the_lane_is_syntactically_valid_bash() -> None:
+    # `bash -n` parses one script and exits without running it.
     result = subprocess.run(
-        [BASH, "-n", str(LANE)], capture_output=True, text=True, timeout=60
+        [BASH, "-n", str(LANE)], capture_output=True, text=True, timeout=20
     )
     assert result.returncode == 0, result.stderr
 
