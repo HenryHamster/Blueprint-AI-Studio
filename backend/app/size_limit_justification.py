@@ -18,9 +18,9 @@ it there.  ``rebuild_cap_bump_history_ledger`` reconstructs records from
 four cap fields, so without an explicit carry-forward every recorded approval
 would be dropped by the very next ``--fix``.
 
-It is a sibling of ``size_limit_policy`` rather than more code inside it
-because that module sits at its own line-count cap; the split also keeps the
-justification rules readable on their own and importable without the
+It is a sibling of ``size_limit_policy`` rather than more code inside it: that
+module is itself a chronic size-cap offender, and the justification rules are a
+self-contained concern, readable on their own and importable without the
 git-shelling ledger machinery.
 
 Stdlib-only and dependency-free, matching ``size_limit_policy``'s contract so
