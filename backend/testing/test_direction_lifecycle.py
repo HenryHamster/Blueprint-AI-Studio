@@ -4996,3 +4996,278 @@ def test_retired_diagnoses_archive_dedups_by_direction_id():
     assert doc["retired_diagnoses_archive"][0]["direction_id"] == "d-dedup-test-2"
     assert doc["retired_diagnoses_archive"][1]["direction_id"] == "d-dedup-test"
     assert "Third update" in doc["retired_diagnoses_archive"][1]["diagnosis"]
+
+
+# ---------------------------------------------------------------------------
+# Churn-retirement DECISION WINDOW (dud-culling fence).
+#
+# The recommendation-and-hold above is correct, but it had no terminal clock: a
+# recommended direction is skipped by BOTH the 72h needs_manual_intervention TTL
+# and the 48h auto-recovery cooldown, so with no decider it stayed paused,
+# non-terminal and gap-staffing forever — nursed, never culled. These tests pin
+# the fence that bounds the hold, and equally pin that the fence does NOT fire
+# early (a slow-but-good direction inside its window is untouched).
+# ---------------------------------------------------------------------------
+
+
+def _churn_recommended_direction(
+    *,
+    direction_id: str = "d-undecided",
+    recommended_hours_ago: float,
+    gap_id: str | None = "g-undecided",
+    stamp: object = "__default__",
+) -> dict:
+    """A direction already held at the churn-retirement recommendation fence."""
+    now = _utcnow()
+    recommended_at = (
+        (now - timedelta(hours=recommended_hours_ago)).isoformat()
+        if stamp == "__default__"
+        else stamp
+    )
+    d = {
+        "id": direction_id,
+        "text": "Zombie direction recommended for churn retirement",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Unproductive: 0 PRs merged across recent cycles",
+        "paused_at": (now - timedelta(hours=1)).isoformat(),
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": (now - timedelta(hours=1)).isoformat(),
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended: zombie loop",
+        "churn_retirement_evidence": {"summary": "2x churn-family auto-pause, 0 merges"},
+        "churn_family_pause_count": 2,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+        "gap_id": gap_id,
+    }
+    if recommended_at is not None:
+        d["churn_retirement_recommended_at"] = recommended_at
+    return d
+
+
+async def _churn_project(db_session, directions: list[dict], name: str) -> Project:
+    project = Project(
+        name=name,
+        user_id="u-undecided",
+        autonomous_enabled=True,
+        directions=directions,
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-undecided",
+                    "name": "Undecided gap",
+                    "status": "active",
+                    "active_moves": [
+                        d["id"] for d in directions if d.get("gap_id") == "g-undecided"
+                    ],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_churn_recommendation_undecided_window_auto_retires(db_session, mocker):
+    """NAMED acceptance test. A churn-retirement recommendation that goes
+    unanswered past its decision window is CULLED, not nursed: tick 1 flags the
+    two-tick designated retire and records a machine-readable decision blob (so an
+    operator never re-derives WHY), tick 2 applies the ladder's own recommended
+    retirement with the ``stopped`` outcome, reconciles the gap it was staffing,
+    and writes retired-memory under a distinct reason code."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = _utcnow()
+    # 8 days > the 7-day decision window.
+    direction = _churn_recommended_direction(recommended_hours_ago=8 * 24)
+    project = await _churn_project(db_session, [direction], "Churn Undecided Test")
+
+    # --- Tick 1: the fence flags, but does NOT terminate. ---
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-undecided")
+    assert d["status"] == "paused", (
+        "the fence must not terminate in the flag tick — the direction stays "
+        "visible in the strategist payload for one more tick"
+    )
+    assert d.get("auto_retire_pending") is True
+    assert d.get("auto_retire_pending_reason") == "churn_recommendation_undecided"
+
+    decision = d.get("churn_retirement_decision")
+    assert isinstance(decision, dict), "the WHY must be recorded machine-readably"
+    assert decision["decision"] == "retired"
+    assert decision["decided_by"] == "decision_window_expiry"
+    assert decision["reason_code"] == "churn_recommendation_undecided"
+    assert decision["window_days"] == 7
+    assert decision["undecided_hours"] >= 7 * 24
+    # The window's unit of derivation: guaranteed daily strategist opportunities.
+    assert decision["strategist_opportunities"] >= 7
+    assert decision["churn_family_pause_count"] == 2
+    assert decision["recommendation_summary"] == "2x churn-family auto-pause, 0 merges"
+    assert decision["recommended_at"] == direction["churn_retirement_recommended_at"]
+
+    # --- Tick 2: the designated retire pass applies the recommendation. ---
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(minutes=30)
+    )
+    await db_session.refresh(project)
+
+    remaining_ids = {x["id"] for x in (project.directions or [])}
+    assert "d-undecided" not in remaining_ids, (
+        "an undecided churn recommendation must be culled, not nursed forever"
+    )
+
+    retired_mem = (project.vision or {}).get("_recently_retired_directions") or []
+    mem_entry = next((m for m in retired_mem if m.get("id") == "d-undecided"), None)
+    assert mem_entry is not None, "the cull must record retired-direction memory"
+    assert mem_entry.get("reason") == "auto_retired_churn_undecided", (
+        f"reason should be 'auto_retired_churn_undecided', got {mem_entry.get('reason')!r}"
+    )
+
+    # Gap staffing reconciled — the recommendation-hold deliberately preserved it,
+    # so the cull is the thing that must release it.
+    gap = project.problem_model["gaps"][0]
+    assert "d-undecided" not in gap["active_moves"], (
+        "culled direction must be released from the gap it was staffing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_churn_recommendation_inside_window_is_still_held(db_session, mocker):
+    """The fence bounds the hold; it does not shorten it. A recommendation that is
+    still INSIDE its decision window is untouched — no retire flag, no decision
+    blob, still paused and still recommended. This is the ambition side of the
+    bar: a slow direction keeps its full window to be answered."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = _utcnow()
+    # 6 days < the 7-day window — and deliberately PAST both short clocks
+    # (48h auto-recovery cooldown, 72h intervention TTL) to prove the fence is a
+    # third, independent clock rather than either of those.
+    direction = _churn_recommended_direction(recommended_hours_ago=6 * 24)
+    project = await _churn_project(db_session, [direction], "Churn Inside Window Test")
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-undecided")
+
+    assert d["status"] == "paused"
+    assert d.get("churn_retirement_recommended") is True
+    assert "auto_retire_pending" not in d, (
+        "inside the decision window the fence must not fire"
+    )
+    assert "churn_retirement_decision" not in d
+    assert (project.vision or {}).get("_recently_retired_directions") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_churn_recommendation_without_stamp_is_never_culled(db_session, mocker):
+    """Never cull on a guess. A recommendation carrying no usable
+    ``churn_retirement_recommended_at`` (missing or malformed) has no decision
+    clock, so it keeps the old indefinite hold rather than being retired on an
+    assumed age."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = _utcnow()
+    missing = _churn_recommended_direction(
+        direction_id="d-nostamp", recommended_hours_ago=0, gap_id=None, stamp=None
+    )
+    malformed = _churn_recommended_direction(
+        direction_id="d-badstamp",
+        recommended_hours_ago=0,
+        gap_id=None,
+        stamp="not-a-timestamp",
+    )
+    project = await _churn_project(
+        db_session, [missing, malformed], "Churn Unstamped Test"
+    )
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    for did in ("d-nostamp", "d-badstamp"):
+        d = next(x for x in project.directions if x["id"] == did)
+        assert d["status"] == "paused", f"{did} must remain held, not culled"
+        assert d.get("churn_retirement_recommended") is True
+        assert "auto_retire_pending" not in d, (
+            f"{did} has no usable decision clock and must never be culled on a guess"
+        )
+        assert "churn_retirement_decision" not in d
+
+
+@pytest.mark.asyncio
+async def test_keep_decision_during_pending_tick_cancels_the_cull(db_session, mocker):
+    """A decision that lands during the final tick still wins. The fence flags the
+    two-tick retire; a sanctioned KEEP (operator PATCH / strategist reactivate)
+    before the designated pass consumes it clears auto_retire_pending through
+    _clear_direction_reactivation_state, so the direction survives ACTIVE and is
+    never retired."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.direction_lifecycle import apply_churn_retirement_keep
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = _utcnow()
+    direction = _churn_recommended_direction(recommended_hours_ago=8 * 24)
+    project = await _churn_project(db_session, [direction], "Churn Keep Race Test")
+
+    # Tick 1: fence flags the pending retire.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-undecided")
+    assert d.get("auto_retire_pending") is True
+
+    # Operator/strategist KEEP lands before the designated pass consumes the flag.
+    assert apply_churn_retirement_keep(d, allow_user_paused=False) is True
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Tick 2: the designated retire pass must find nothing to do.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(minutes=30)
+    )
+    await db_session.refresh(project)
+
+    survivor = next(
+        (x for x in (project.directions or []) if x["id"] == "d-undecided"), None
+    )
+    assert survivor is not None, "a KEEP decision must save the direction from the cull"
+    assert survivor["status"] == "active"
+    assert survivor.get("auto_completed") is not True
+    assert "churn_retirement_recommended" not in survivor
+    assert survivor.get("churn_family_pause_count") == 0
+
+    retired_mem = (project.vision or {}).get("_recently_retired_directions") or []
+    assert not any(m.get("id") == "d-undecided" for m in retired_mem), (
+        "a kept direction must never record retired memory"
+    )
