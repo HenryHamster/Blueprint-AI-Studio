@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 645 | 1,010,060 | 26,844 | 11,123.372s (643 files) | 2 |
+| backend | 645 | 1,010,069 | 26,844 | 11,123.372s (643 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 113,094 | 6,178 | 317.583s (129 files) | 0 |
@@ -216,7 +216,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 192 | P5 | agent | `agent/src/prompts/thinker.test.ts` | 1,904 | 101 | moderate (1500–2999 LOC) | 0.032s measured | — |
 | 193 | P5 | agent | `agent/src/prompt.format.test.ts` | 1,512 | 102 | moderate (1500–2999 LOC) | 0.029s measured | — |
 | 194 | P5 | agent | `agent/src/prompts/pr-helper.test.ts` | 2,353 | 41 | moderate (1500–2999 LOC) | 0.025s measured | — |
-| 195 | G | backend | `backend/testing/test_scripts_test_lane.py` | 380 | 3 | under 1500 LOC | 208.064s measured | — |
+| 195 | G | backend | `backend/testing/test_scripts_test_lane.py` | 389 | 3 | under 1500 LOC | 208.064s measured | — |
 | 196 | G | backend | `backend/testing/test_task_outcomes.py` | 1,375 | 108 | under 1500 LOC | 187.368s measured | — |
 | 197 | G | backend | `backend/testing/test_task_evaluators.py` | 1,172 | 79 | under 1500 LOC | 153.388s measured | — |
 | 198 | G | backend | `backend/testing/test_qualification_triggers.py` | 1,059 | 80 | under 1500 LOC | 143.296s measured | — |
