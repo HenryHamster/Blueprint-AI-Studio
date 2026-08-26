@@ -392,6 +392,10 @@
         "test_operator_send_serializes_with_resident_transition",
         "test_resident_mutations_reject_expired_continuation_but_messages_pass",
         "test_resident_mutations_reject_overlapping_one_shot_but_messages_pass",
+        "test_resident_mutation_fence_ignores_sibling_resident_process_row",
+        "test_resident_mutation_fence_ignores_never_started_one_shot",
+        "test_resident_lane_refusal_names_the_blocking_task",
+        "test_resident_continuation_refusal_carries_its_reason",
         "test_terminal_reconciler_ignores_requeued_worker",
         "test_terminal_reconciler_replaces_exact_continuous_generation",
         "test_terminal_reconciler_exposes_start_after_replacement_failure",
@@ -407,7 +411,7 @@
         "test_the_conversation_composer_marks_its_turns_as_conversation_turns",
         "test_server_authored_activation_turn_never_arms_a_cadence_cycle"
       ],
-      "test_count": 30
+      "test_count": 34
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
@@ -549,9 +553,11 @@
       "path": "agent/src/handlers/strategic-helpers.test.ts",
       "reason": "Protects generated Strategic helper provenance, stable mutation identity across retries, and the deliberate private-consultation qualification boundary.",
       "test_ids": [
-        "writeStrategicHelpers > injects stable typed-consultation provenance across transport retries"
+        "writeStrategicHelpers > injects stable typed-consultation provenance across transport retries",
+        "writeStrategicHelpers > live token resolution > _call surfaces a 409 as an explicit refusal, never as a zero-effect success",
+        "writeStrategicHelpers > live token resolution > _call keeps a 409 non-fatal so the refused turn survives to report it"
       ],
-      "test_count": 116
+      "test_count": 118
     },
     {
       "path": "agent/src/handlers/strategic-resident.test.ts",

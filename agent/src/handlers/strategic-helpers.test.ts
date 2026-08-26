@@ -790,6 +790,85 @@ curl() {
       expect(s).toContain('"$body" >&2');
     });
 
+    it('_call surfaces a 409 as an explicit refusal, never as a zero-effect success', () => {
+      // A 409 means the server REFUSED the mutation. The old arm printed the bare
+      // FastAPI error envelope on stdout and returned 0, so the Resident read a
+      // refusal as "applied, no effect": it could neither report the block to the
+      // operator nor retry it. Run the real generated script against a stubbed
+      // curl and assert on what the model actually sees.
+      const bashPath = (value: string): string => value
+        .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+        .replace(/\\/g, '/');
+      writeStrategicHelpers('task-refusal', 'project', testWorkspace);
+      const detail = 'Resident no longer owns the Strategic mutation lane: '
+        + 'one-shot design_doc_update task 11111111-1111-1111-1111-111111111111 '
+        + 'is IN_PROGRESS';
+      const bashEnv = path.join(testWorkspace, 'bash-env-refusal');
+      // The refusal body is a single-quoted bash literal; it contains no quote
+      // characters (JSON escapes none in this payload) so no requoting is needed.
+      const refusalBody = JSON.stringify({ detail });
+      expect(refusalBody).not.toContain("'");
+      fs.writeFileSync(
+        bashEnv,
+        `sleep() { :; }
+curl() {
+  cat >/dev/null
+  printf '%s\\n409\\n' '${refusalBody}'
+}
+`,
+      );
+      const bashExecutable = process.platform === 'win32'
+        ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+        : 'bash';
+      const executionPath = process.platform === 'win32'
+        ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+        : process.env.PATH ?? '';
+      const stdout = execFileSync(
+        bashExecutable,
+        [
+          bashPath(path.join(testWorkspace, 'strategic')),
+          'create-direction',
+          '--json',
+          JSON.stringify({ text: 'a write the fence refuses' }),
+        ],
+        {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'] as const,
+          env: {
+            ...process.env,
+            ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+            AGENT_API_TOKEN: 'test-token',
+            BASH_ENV: bashPath(bashEnv),
+            NODE_BINARY: bashPath(process.execPath),
+            PATH: executionPath,
+          },
+        },
+      );
+
+      // Unmistakably a refusal, naming the op that did not take effect...
+      expect(stdout).toContain('"status":"refused"');
+      expect(stdout).toContain('"applied":false');
+      expect(stdout).toContain('"op":"create_direction"');
+      expect(stdout).toContain('"http_status":409');
+      // ...carrying the server's REASON verbatim so the Resident can report WHY...
+      expect(stdout).toContain('no longer owns the Strategic mutation lane');
+      expect(stdout).toContain('design_doc_update');
+      // ...and never presented as the bare body a caller could read as a result.
+      expect(stdout.trimStart().startsWith('{"detail"')).toBe(false);
+      expect(stdout).not.toContain('"status":"ok"');
+    }, 15_000);
+
+    it('_call keeps a 409 non-fatal so the refused turn survives to report it', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // The [CONSTRAINT] marker is a real consumer (strategic.ts suppresses a
+      // wasteful direction retry on it) — keep it, but make it say NOT applied
+      // and carry the reason rather than the bare "rejected (HTTP 409)".
+      expect(s).toContain('[CONSTRAINT] $1 REFUSED (HTTP 409)');
+      expect(s).toContain('NOT applied. Reason: $body');
+      expect(s).not.toContain('[CONSTRAINT] $1 rejected (HTTP 409)');
+    });
+
     it('_call retries a curl transport failure (http_code 000) instead of treating it as permanent', () => {
       writeStrategicHelpers('t', 'p', testWorkspace);
       const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
