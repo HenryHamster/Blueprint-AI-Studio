@@ -174,7 +174,7 @@
         "test_strategic_create_message_note_type_not_grounded",
         "test_strategic_create_message_broadcasts_workbench_envelope"
       ],
-      "test_count": 139
+      "test_count": 140
     },
     {
       "path": "backend/testing/test_operator_workbench_contracts.py",
