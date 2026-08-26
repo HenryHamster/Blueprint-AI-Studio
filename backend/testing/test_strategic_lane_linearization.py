@@ -1048,3 +1048,253 @@ async def test_noop_discovery_keeps_project_usable_for_followup_redetection(db_s
     assert refreshed is not None
     assert refreshed.build_config["automatic_strategic_cycles_enabled"] is False
     assert refreshed.build_config["repo_is_empty"] is False
+
+
+# ---------------------------------------------------------------------------
+# Bounded, self-describing disable
+#
+# The defect these close: ``build_config.automatic_strategic_cycles_enabled``
+# was a bare boolean with no bound, no expiry, no reason and no actor, and the
+# scheduler short-circuited on it with no log line at all.  A project whose
+# entire automatic Strategic authoring lane was off therefore produced an alert
+# feed byte-identical to a deliberately quiet one -- for ten days.
+# ---------------------------------------------------------------------------
+
+
+class _LaneProject:
+    """Attribute carrier: the decoder only reads ``build_config``/``id``/``name``."""
+
+    def __init__(self, build_config, project_id="p-lane", name="lane project"):
+        self.build_config = build_config
+        self.id = project_id
+        self.name = name
+
+
+def _lane(value, *, now=None):
+    from app.strategic_cycle_admission import describe_automatic_strategic_cycles
+
+    return describe_automatic_strategic_cycles(
+        _LaneProject({"automatic_strategic_cycles_enabled": value}), now=now
+    )
+
+
+def test_legacy_bare_false_still_disables_the_lane_forever():
+    """A stored bare ``false`` must NOT be silently re-enabled by this change.
+
+    Existing projects carry the legacy form.  Widening the value to accept a
+    bounded window must not become a backdoor that re-enables anyone's
+    deliberate disable; whether to migrate a bare ``false`` is the operator's
+    call.  It is still reported as unbounded so the lint and the suppression
+    notice can say so.
+    """
+    from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+
+    admission = _lane(False)
+    assert admission.enabled is False
+    assert admission.legacy_bare_boolean is True
+    assert admission.explicitly_disabled is True
+    assert admission.bounded is False
+    assert admission.expired is False
+    assert "expires=never" in admission.describe()
+    assert (
+        automatic_strategic_cycles_enabled(
+            _LaneProject({"automatic_strategic_cycles_enabled": False})
+        )
+        is False
+    )
+
+
+def test_bounded_disable_window_lapses_on_its_own():
+    """``until`` in the past re-enables the lane; in the future it holds."""
+    lapsed = _lane(
+        {
+            "enabled": False,
+            "until": "2020-01-01T00:00:00Z",
+            "reason": "tactical canary",
+            "disabled_by": "henry",
+        }
+    )
+    assert lapsed.enabled is True
+    assert lapsed.expired is True
+    assert lapsed.bounded is True
+
+    holding = _lane(
+        {
+            "enabled": False,
+            "until": "2099-01-01T00:00:00Z",
+            "reason": "tactical canary",
+            "disabled_by": "henry",
+        }
+    )
+    assert holding.enabled is False
+    assert holding.expired is False
+    assert holding.bounded is True
+    described = holding.describe()
+    assert "reason='tactical canary'" in described
+    assert "disabled_by='henry'" in described
+    assert "2099-01-01T00:00:00" in described
+
+
+def test_bounded_window_boundary_uses_the_supplied_reference_clock():
+    """The reaper passes its own sweep ``now``; the decoder must honour it."""
+    from datetime import datetime, timedelta, timezone
+
+    until = datetime(2030, 6, 1, 12, 0, 0)
+    value = {"enabled": False, "until": until.isoformat() + "Z"}
+
+    assert _lane(value, now=until - timedelta(seconds=1)).enabled is False
+    assert _lane(value, now=until).enabled is True
+    # A tz-aware reference must be normalised, not compared raw (that raises).
+    aware = datetime(2030, 6, 1, 12, 0, 1, tzinfo=timezone.utc)
+    assert _lane(value, now=aware).enabled is True
+
+
+def test_malformed_until_leaves_an_explicit_disable_disabled_and_flagged():
+    """``enabled: false`` is unambiguous; a bad ``until`` must not re-enable it."""
+    admission = _lane({"enabled": False, "until": "next tuesday"})
+    assert admission.enabled is False
+    assert admission.malformed_until is True
+    assert admission.bounded is False
+    assert "unparseable until='next tuesday'" in admission.describe()
+
+
+def test_malformed_lane_shapes_still_fail_open():
+    """Unknown scalars and mappings without a real ``enabled`` stay enabled."""
+    assert _lane("no").enabled is True
+    assert _lane(1).enabled is True
+    assert _lane({"until": "2099-01-01T00:00:00Z"}).enabled is True
+    assert _lane({"enabled": "false"}).enabled is True
+    assert _lane(True).enabled is True
+
+    from app.strategic_cycle_admission import describe_automatic_strategic_cycles
+
+    assert describe_automatic_strategic_cycles(_LaneProject(None)).enabled is True
+    assert describe_automatic_strategic_cycles(_LaneProject({})).enabled is True
+
+
+def test_suppressed_lane_notice_is_loud_first_then_deduped(caplog):
+    """The suppressed path must emit a REASON, once, then throttle.
+
+    ~290 autonomous passes/day/project makes an unthrottled line spam; zero
+    lines is the ten-day silence this PR exists to close.  Loud on the first
+    suppressed pass per (project, trigger), then deduped with a count of the
+    throttled passes so the volume stays visible.
+    """
+    import logging
+
+    from app import strategic_cycle_admission as admission_mod
+
+    project = _LaneProject(
+        {
+            "automatic_strategic_cycles_enabled": {
+                "enabled": False,
+                "reason": "bounded tactical canary",
+                "disabled_by": "operator-patch",
+            }
+        },
+        project_id="p-suppression",
+    )
+    admission_mod.reset_strategic_lane_suppression_notices()
+    clock = {"t": 1000.0}
+    try:
+        with patch.object(admission_mod, "_monotonic", lambda: clock["t"]):
+            with caplog.at_level(
+                logging.WARNING, logger="app.strategic_cycle_admission"
+            ):
+                assert (
+                    admission_mod.note_automatic_strategic_cycles_suppressed(project)
+                    is True
+                )
+                for _ in range(50):
+                    clock["t"] += 1.0
+                    assert (
+                        admission_mod.note_automatic_strategic_cycles_suppressed(
+                            project
+                        )
+                        is False
+                    )
+                clock["t"] += (
+                    admission_mod.STRATEGIC_LANE_SUPPRESSION_NOTICE_INTERVAL_SECONDS
+                )
+                assert (
+                    admission_mod.note_automatic_strategic_cycles_suppressed(project)
+                    is True
+                )
+
+        messages = [r.getMessage() for r in caplog.records]
+        emitted = [m for m in messages if "SUPPRESSED" in m]
+        assert len(emitted) == 2, messages
+        assert "automatic_strategic_cycles_enabled" in emitted[0]
+        assert "bounded tactical canary" in emitted[0]
+        assert "expires=never" in emitted[0]
+        assert "trigger=autonomous_loop_pass" in emitted[0]
+        assert "throttled_passes_since_last_notice=0" in emitted[0]
+        assert "throttled_passes_since_last_notice=50" in emitted[1]
+    finally:
+        admission_mod.reset_strategic_lane_suppression_notices()
+
+
+def test_suppression_notice_throttle_is_per_project_and_per_trigger():
+    """Two projects (or two triggers) never share one throttle slot."""
+    from app import strategic_cycle_admission as admission_mod
+
+    value = {"automatic_strategic_cycles_enabled": False}
+    first = _LaneProject(value, project_id="p-a")
+    second = _LaneProject(value, project_id="p-b")
+    admission_mod.reset_strategic_lane_suppression_notices()
+    try:
+        with patch.object(admission_mod, "_monotonic", lambda: 500.0):
+            assert (
+                admission_mod.note_automatic_strategic_cycles_suppressed(first) is True
+            )
+            assert (
+                admission_mod.note_automatic_strategic_cycles_suppressed(first) is False
+            )
+            assert (
+                admission_mod.note_automatic_strategic_cycles_suppressed(second) is True
+            )
+            assert (
+                admission_mod.note_automatic_strategic_cycles_suppressed(
+                    first,
+                    trigger=admission_mod.SUPPRESSION_TRIGGER_CADENCE_DUE,
+                )
+                is True
+            )
+    finally:
+        admission_mod.reset_strategic_lane_suppression_notices()
+
+
+def test_build_config_schema_accepts_bounded_window_and_keeps_bare_boolean():
+    """The API contract must round-trip both forms and reject a bad ``until``."""
+    import pydantic
+
+    from app.schemas import BuildConfig
+
+    assert BuildConfig().automatic_strategic_cycles_enabled is True
+    assert (
+        BuildConfig(
+            automatic_strategic_cycles_enabled=False
+        ).automatic_strategic_cycles_enabled
+        is False
+    )
+
+    window = {
+        "enabled": False,
+        "until": "2099-01-01T00:00:00Z",
+        "reason": "canary",
+        "disabled_by": "henry",
+    }
+    parsed = BuildConfig(automatic_strategic_cycles_enabled=window)
+    dumped = parsed.model_dump(exclude_none=True)[
+        "automatic_strategic_cycles_enabled"
+    ]
+    assert dumped == window
+    assert _lane(dumped).enabled is False
+
+    with pytest.raises(pydantic.ValidationError):
+        BuildConfig(
+            automatic_strategic_cycles_enabled={
+                "enabled": False,
+                "until": "next tuesday",
+            }
+        )

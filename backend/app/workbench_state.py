@@ -45,12 +45,31 @@ SESSION_IDLE_TTL_SECONDS = 14_400  # 4 hours
 # This is only the FALLBACK default — the live value comes from the
 # ``strategic_continuation_ttl_seconds`` runtime setting (see
 # ``_strategic_local_continuation_ttl_seconds``). Replaces the old hardcoded 12h
-# (43200): the marker's freshness now renews on operator interaction OR an
-# applied strategic op (progress), NOT bare runner liveness, so an
-# opened-and-abandoned continuous local session self-heals within this short
-# window instead of pinning the project locally for 12h.
+# (43200) so an opened-and-abandoned continuous local session self-heals within
+# this short window instead of pinning the project locally for 12h.
+#
+# WHAT THIS TTL PROTECTS: the local-runner PIN, not operator presence. While the
+# marker is fresh ``strategic_local_runner`` stamps
+# ``strategic_local_runner_required`` on every Strategic spawn, so the cloud
+# cadence cannot reclaim the lane; the lapse is what hands the lane back. It is
+# NOT a mutation-authority credential — single-writer among Resident workers is
+# enforced by the session-id / worker-generation / process-incarnation checks in
+# ``admin_agent_ops.strategic_operation``, and single-writer against a one-shot
+# cycle by the Strategic-lane check in ``_enforce_resident_mutation_fence``.
+#
+# Renewal keys on WORK, never on a human being present: an operator interaction,
+# an applied strategic op, a Resident process heartbeat (including a quiet
+# ``continuous_liveness`` beat), or — via
+# ``renew_strategic_local_continuation_from_resident_work`` — a Strategic
+# mutation issued by the identity-verified live Resident. Bare runner liveness
+# still never renews (see
+# ``refresh_strategic_local_continuation_on_runner_heartbeat``), so an abandoned
+# session still releases the pin inside this window.
 STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS = 1_500  # 25 min lease window (default)
 STRATEGIC_LOCAL_CONTINUATION_RENEWAL_MIN_SECONDS = 60
+# Audit reason stamped on the marker when a Strategic mutation from the live,
+# identity-verified Resident is what renewed the lease.
+STRATEGIC_LOCAL_CONTINUATION_WORK_RENEWAL_REASON = "resident_strategic_mutation"
 
 
 def _strategic_local_continuation_ttl_seconds() -> int:
@@ -671,6 +690,113 @@ def apply_strategic_local_continuation_marker(
     if runner_id:
         marker["preferred_runner_id"] = runner_id
     vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+
+
+def strategic_local_continuation_work_renewal_is_due(
+    vision: dict[str, Any] | None,
+    *,
+    operator_user_id: str | None,
+    now: datetime | None = None,
+) -> bool:
+    """True when a Resident-work renewal would actually change the marker.
+
+    This is the SAME rule
+    ``renew_strategic_local_continuation_from_resident_work`` applies — that
+    function calls this one — so there is exactly one eligibility predicate and
+    no second copy to drift.
+
+    It is public because the pacing promise is only true if the CALLER can skip
+    the write. ``task_locking.with_vision_locked`` calls ``flag_modified`` on
+    ``project.vision`` unconditionally, so routing a no-op mutation through it
+    still emits a full JSONB ``UPDATE``. A caller that already holds the Project
+    row lock (and therefore already has the canonical vision in memory) asks
+    here first and enters the locked read-modify-write only when the answer is
+    yes; otherwise an op burst would rewrite the whole column once per op —
+    exactly what the pacing threshold exists to prevent.
+    """
+
+    operator_id = (
+        _string(str(operator_user_id), max_chars=160) if operator_user_id else None
+    )
+    if not operator_id:
+        return False
+    marker = (vision or {}).get(STRATEGIC_LOCAL_CONTINUATION_KEY)
+    if not isinstance(marker, dict):
+        return False
+    if marker.get("version") != 1 or marker.get("active") is not True:
+        return False
+    if _strategic_local_continuation_marker_owner_id(marker) != operator_id:
+        return False
+    return _timestamp_is_older_than(
+        marker.get("last_seen_at") or marker.get("updated_at"),
+        now=now if now is not None else _utcnow(),
+        seconds=STRATEGIC_LOCAL_CONTINUATION_RENEWAL_MIN_SECONDS,
+    )
+
+
+def renew_strategic_local_continuation_from_resident_work(
+    vision: dict[str, Any],
+    *,
+    operator_user_id: str | None,
+    reason: str = STRATEGIC_LOCAL_CONTINUATION_WORK_RENEWAL_REASON,
+) -> bool:
+    """Re-anchor an EXISTING owned continuation marker from Resident WORK.
+
+    What the continuation marker actually protects is the *local-runner pin*:
+    while it is fresh, ``strategic_local_runner`` stamps
+    ``strategic_local_runner_required`` on every Strategic spawn and the cloud
+    cadence cannot reclaim the lane. The dead-man's switch exists so an
+    opened-and-abandoned local session releases that pin instead of pinning the
+    project locally forever (see the ``STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS``
+    comment and ``refresh_strategic_local_continuation_on_runner_heartbeat``).
+
+    That property is about *whether anything is still working the lane*, not
+    about *whether a human is present*. An applied Strategic mutation from an
+    identity-verified live Resident is direct proof that something is still
+    working the lane — strictly stronger proof than the bare
+    ``continuous_liveness`` heartbeat that already renews this same anchor. So
+    this is a renewal path the Resident can satisfy by working.
+
+    Deliberately NARROW, so the dead-man's switch survives intact:
+
+    * It never MINTS a marker and never resurrects a popped one. A session that
+      stopped, left Continuous, or was never armed stays un-armed — Stop and the
+      Chat/Workday mode switch remain terminal.
+    * It never renews a marker owned by a DIFFERENT operator, so a foreign
+      still-fresh pin is never stolen and the ownership handover window is
+      unchanged.
+    * It renews only the freshness anchor and the audit fields; every other
+      marker field (owner, owner session, preferred runner) is preserved
+      as-is, so ``_strategic_local_continuation_marker_is_protected_*`` and the
+      heartbeat's ``authority_held`` comparison keep reading the same values.
+    * It is paced by ``STRATEGIC_LOCAL_CONTINUATION_RENEWAL_MIN_SECONDS`` — the
+      same pacing threshold the operator-save path uses — so an op burst does
+      not rewrite ``project.vision`` once per op. Callers holding the Project
+      lock must gate the locked write on
+      ``strategic_local_continuation_work_renewal_is_due``: returning ``False``
+      from here is NOT enough on its own, because ``with_vision_locked`` marks
+      the column dirty before it ever sees this result.
+
+    Returns ``True`` when ``vision`` was mutated.
+    """
+
+    now = _utcnow()
+    if not strategic_local_continuation_work_renewal_is_due(
+        vision,
+        operator_user_id=operator_user_id,
+        now=now,
+    ):
+        return False
+    marker = vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    now_iso = now.isoformat()
+    next_marker = dict(marker)
+    next_marker["last_seen_at"] = now_iso
+    next_marker["updated_at"] = now_iso
+    renewal_reason = _string(reason, max_chars=60)
+    if renewal_reason:
+        next_marker["last_renewal_reason"] = renewal_reason
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = next_marker
+    return True
 
 
 def strategic_local_continuation_status_from_vision(

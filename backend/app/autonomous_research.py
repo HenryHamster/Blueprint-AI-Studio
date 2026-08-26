@@ -67,7 +67,12 @@ from app.research_cycle_cadence import (
     record_strategic_cadence_fire,
     strategic_cadence_due,
 )
-from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+from app.strategic_cycle_admission import (
+    SUPPRESSION_TRIGGER_CADENCE_DUE,
+    SUPPRESSION_TRIGGER_LOOP_PASS,
+    describe_automatic_strategic_cycles,
+    note_automatic_strategic_cycles_suppressed,
+)
 from app.research_finding_policy import NON_SPAWNING_FINDING_TYPES
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
@@ -1027,7 +1032,21 @@ async def _spawn_research_task_inner(
     # cadence/force work is a separate operator-owned lane so a bounded tactical
     # canary can run without also releasing the strategist. Manual/operator
     # Strategic surfaces never enter this function and remain unaffected.
-    automatic_strategic_cycles_allowed = automatic_strategic_cycles_enabled(project)
+    _strategic_lane = describe_automatic_strategic_cycles(project)
+    automatic_strategic_cycles_allowed = _strategic_lane.enabled
+    if not automatic_strategic_cycles_allowed:
+        # Surface the REASON, not the state.  Every ``force_strategic`` setter,
+        # the wall-clock backstop, the starvation refresh and the pending-SR
+        # retry are all gated on this one flag, and the gate used to be a bare
+        # ``and`` with no log, no counter and no marker.  Emit here -- before
+        # any of the early returns below can starve the deeper call sites --
+        # so a suppressed lane can never again be indistinguishable from a
+        # healthy one.  The notice is throttled per project, not per pass.
+        note_automatic_strategic_cycles_suppressed(
+            project,
+            trigger=SUPPRESSION_TRIGGER_LOOP_PASS,
+            admission=_strategic_lane,
+        )
 
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
     # Blueprint pipeline repo and polluted new projects with wrong build/test
@@ -1977,7 +1996,7 @@ async def _spawn_research_task_inner(
     strategic_frequency = (project.vision or {}).get(
         "_strategic_frequency_override"
     ) or _runtime_config.get("strategic_research_frequency", 6)
-    is_strategic = automatic_strategic_cycles_allowed and (
+    _strategic_cadence_or_force = (
         strategic_cadence_due(
             research_spawn_count,
             (project.vision or {}).get(STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY),
@@ -1985,6 +2004,16 @@ async def _spawn_research_task_inner(
         )
         or force_strategic
     )
+    is_strategic = automatic_strategic_cycles_allowed and _strategic_cadence_or_force
+    if _strategic_cadence_or_force and not automatic_strategic_cycles_allowed:
+        # The strongest form of the signal: a Strategic cycle was actually DUE
+        # this pass and the lane flag ate it.  Its own throttle slot so the
+        # coarser per-pass notice above cannot swallow it.
+        note_automatic_strategic_cycles_suppressed(
+            project,
+            trigger=SUPPRESSION_TRIGGER_CADENCE_DUE,
+            admission=_strategic_lane,
+        )
     # 2026-05-03: gate strategic spawn on (a) no-active-strategic AND
     # (b) no recent strategic spawn (regardless of terminal state).
     #
@@ -2130,13 +2159,16 @@ async def _spawn_research_task_inner(
             session, project, force_strategic=force_strategic
         )
         if gate_decision.skip:
+            # Log the gate's OWN reason. This branch also carries the
+            # consecutive-stall cutoff, where "nothing meaningful changed" is
+            # actively false and hid the one line an operator needed.
             logger.info(
-                "[STRATEGIC] no-delta gate: skipping strategic cycle for project %s "
-                "(watermark=%s, signals=%s) — nothing meaningful changed since the "
-                "last cycle",
+                "[STRATEGIC] gate: skipping strategic cycle for project %s "
+                "(watermark=%s, signals=%s) — %s",
                 project.id,
                 gate_decision.watermark,
                 gate_decision.signals.as_dict(),
+                gate_decision.reason,
             )
             await record_no_delta_skip(
                 session,

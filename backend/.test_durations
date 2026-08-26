@@ -21366,7 +21366,6 @@
   "testing/test_workday_resident_invariants.py::test_operator_send_serializes_with_resident_transition[stop]": 0.43020359409274533,
   "testing/test_workday_resident_invariants.py::test_real_operator_input_supersedes_unclaimed_activation_before_poll": 0.9833061570534483,
   "testing/test_workday_resident_invariants.py::test_resident_fresh_attempt_restores_actual_runner_columns": 0.4887051850091666,
-  "testing/test_workday_resident_invariants.py::test_resident_mutations_reject_expired_continuation_but_messages_pass": 0.43709188495995477,
   "testing/test_workday_resident_invariants.py::test_resident_mutations_reject_overlapping_one_shot_but_messages_pass": 0.5952770750154741,
   "testing/test_workday_resident_invariants.py::test_resident_retry_does_not_restore_task_declined_runner": 0.47305564902490005,
   "testing/test_workday_resident_invariants.py::test_resident_retry_reloads_live_project_before_repinning": 0.41120699094608426,

@@ -243,6 +243,10 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "research.escalation_delivery_failed": OPERATOR_ACTION_NEEDED,
     "research.diagnosis_stalled": OPERATOR_ACTION_NEEDED,
     "research.strategic_cycle_liveness": OPERATOR_ACTION_NEEDED,
+    # Non-paging companion to the halt alert above: the automatic Strategic
+    # lane is deliberately off.  Operator-visible so a quiet portfolio stays
+    # VISIBLE, FYI so it never pages.
+    "research.strategic_lane_disabled": OPERATOR_FYI,
     "research.strategic_issue": OPERATOR_FYI,
     # Dedup / already-fixed deadlock diagnostics: internal pipeline health
     # signals handled by the strategic agent — not surfaced to the operator.

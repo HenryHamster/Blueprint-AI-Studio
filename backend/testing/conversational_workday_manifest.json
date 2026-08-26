@@ -182,7 +182,7 @@
       "test_ids": [
         "test_operator_workbench_current_state_contract_surfaces"
       ],
-      "test_count": 8
+      "test_count": 11
     },
     {
       "path": "admin-ui/src/components/MessageBubble.test.tsx",
@@ -390,7 +390,6 @@
         "test_all_three_fresh_attempt_paths_reapply_resident_binding",
         "test_resident_retry_reloads_live_project_before_repinning",
         "test_operator_send_serializes_with_resident_transition",
-        "test_resident_mutations_reject_expired_continuation_but_messages_pass",
         "test_resident_mutations_reject_overlapping_one_shot_but_messages_pass",
         "test_resident_mutation_fence_ignores_sibling_resident_process_row",
         "test_resident_mutation_fence_ignores_never_started_one_shot",
@@ -409,9 +408,14 @@
         "test_completion_retry_not_suppressed_by_active_blob_with_dead_worker",
         "test_completion_retry_suppressed_when_worker_generation_superseded",
         "test_the_conversation_composer_marks_its_turns_as_conversation_turns",
-        "test_server_authored_activation_turn_never_arms_a_cadence_cycle"
+        "test_server_authored_activation_turn_never_arms_a_cadence_cycle",
+        "test_resident_mutation_fence_never_resurrects_a_popped_continuation",
+        "test_resident_mutation_renews_a_stale_but_owned_continuation",
+        "test_resident_mutations_reject_unowned_continuation_but_messages_pass",
+        "test_unworked_continuation_still_lapses_and_releases_the_local_pin",
+        "test_fence_renewal_is_paced_at_the_call_site_not_only_in_the_helper"
       ],
-      "test_count": 34
+      "test_count": 38
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
@@ -1122,7 +1126,7 @@
         "test_classify_orphan_resident_session_exempt_from_progress_staleness",
         "test_classify_resident_session_warm_idle_not_reaped"
       ],
-      "test_count": 495
+      "test_count": 499
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",

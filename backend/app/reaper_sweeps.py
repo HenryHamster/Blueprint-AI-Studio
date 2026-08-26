@@ -642,6 +642,13 @@ async def sweep_stalled_strategic_cycles(
 
     _phase_cutoff = _step7_now - timedelta(hours=3)
     for c in _locked_cycles:
+        # Reset per iteration: a cycle with no linked task id would otherwise
+        # inherit the PREVIOUS cycle's task here and get diagnosed against it.
+        linked_task = None
+        # Diagnosis captured BEFORE this sweep force-terminates the task below.
+        # Read afterwards it would report the reaper's own FAILED write back as
+        # the cause, erasing the only evidence of why the phase never ran.
+        pre_kill_diagnosis: tuple[str, str] | None = None
         if c.outcome in (
             strategic_cycle.OUTCOME_IN_PROGRESS,
             strategic_cycle.OUTCOME_PHASE1_RUNNING,
@@ -754,6 +761,9 @@ async def sweep_stalled_strategic_cycles(
                     persist_failure_category,
                 )
 
+                pre_kill_diagnosis = strategic_cycle.describe_phase_stall(
+                    linked_task, phase=stalled_phase, now=_step7_now
+                )
                 persist_failure_category(linked_task, AGENT_STALLED)
                 linked_task.status = TaskStatus.FAILED
                 linked_task.latest_status_message = (
@@ -766,13 +776,39 @@ async def sweep_stalled_strategic_cycles(
                     f"{linked_task_id} linked to stalled cycle {c.id}"
                 )
 
+        # WHY the phase could not progress, read off the linked task while it
+        # still holds its pre-termination status. Recorded on the row so the
+        # next attempt, the operator alert, and the retry bound all name the
+        # same cause instead of re-deriving "stalled" from nothing.
+        stall_sig, stall_reason_text = (
+            pre_kill_diagnosis
+            or strategic_cycle.describe_phase_stall(
+                linked_task, phase=stalled_phase, now=_step7_now
+            )
+        )
+        # Consecutive same-cause stalls, counting this one. The prior run is
+        # read with this cycle excluded so the count does not depend on whether
+        # the outcome write below has been flushed yet.
+        _prior_streak = await strategic_cycle.consecutive_stall_streak(
+            session, c.project_id, exclude_cycle_id=c.id
+        )
+        if _prior_streak.count and _prior_streak.signature == stall_sig:
+            stall_streak = _prior_streak.count + 1
+        else:
+            stall_streak = 1
+        retry_exhausted = stall_streak >= strategic_cycle.MAX_CONSECUTIVE_STALLS
+
         if stalled_phase == "phase1":
             c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE1
         else:
             c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE2
+        strategic_cycle.record_stall_diagnosis(
+            c, signature=stall_sig, reason=stall_reason_text
+        )
         if c.failure_reason is None:
             c.failure_reason = (
-                f"reaper_stall: cycle in {stalled_phase} >3h with no completion"
+                f"reaper_stall (attempt {stall_streak}, cause {stall_sig}): "
+                f"{stall_reason_text}"
             )
         session.add(c)
         actually_stalled.append(c)
@@ -806,16 +842,49 @@ async def sweep_stalled_strategic_cycles(
             # CONDITION (project + phase); the cycle id stays in the message,
             # which ``_update_existing_alert`` refreshes on every re-fire along
             # with ``occurrence_count`` and ``last_seen_at``.
+            # Severity tracks the CONDITION, not the occurrence. While retries
+            # remain this is a WARNING that a cycle was lost; once the same
+            # cause has burned the retry budget the pipeline has stopped
+            # re-minting on its own and only a human can clear it, which is an
+            # ERROR. Re-firing through the stable dedupe key ESCALATES the one
+            # open row in place (``_update_existing_alert`` overwrites severity
+            # and bumps ``occurrence_count``) instead of minting a fresh
+            # WARNING every 3h — 19 identical rows was itself the defect.
+            if retry_exhausted:
+                _stall_severity = AlertSeverity.ERROR
+                _stall_title = (
+                    f"Strategic cycle stalled in {stalled_phase} — "
+                    f"automatic retry stopped"
+                )
+                _stall_tail = (
+                    f"This is stall {stall_streak} in a row from the SAME cause, "
+                    f"so automatic re-minting is now SUPPRESSED for this project "
+                    f"and no successor cycle will spawn until a human clears the "
+                    f"blocker (or sends an operator message, which releases the "
+                    f"cutoff). Retrying cannot fix this cause."
+                )
+            else:
+                _stall_severity = AlertSeverity.WARNING
+                _stall_title = f"Strategic cycle stalled in {stalled_phase}"
+                _stall_tail = (
+                    f"Stall {stall_streak} of "
+                    f"{strategic_cycle.MAX_CONSECUTIVE_STALLS} from this cause; "
+                    f"a successor cycle will retry. At "
+                    f"{strategic_cycle.MAX_CONSECUTIVE_STALLS} consecutive "
+                    f"same-cause stalls automatic retrying stops and this alert "
+                    f"escalates to ERROR."
+                )
             alert, alert_created, _decision = await create_project_alert_if_allowed(
                 session,
                 project_id=c.project_id,
                 event_type="research.diagnosis_stalled",
-                severity=AlertSeverity.WARNING,
-                title=f"Strategic cycle stalled in {stalled_phase}",
+                severity=_stall_severity,
+                title=_stall_title,
                 message=(
                     f"Cycle {c.id} has been in {stalled_phase} for >3h with no "
-                    f"completion handler update. Marking stalled — next strategic "
-                    f"cycle will spawn a fresh attempt. Phase1 task: {c.phase1_task_id}, "
+                    f"completion handler update. Cause [{stall_sig}]: "
+                    f"{stall_reason_text}. {_stall_tail} "
+                    f"Phase1 task: {c.phase1_task_id}, "
                     f"phase2 task: {c.phase2_task_id}."
                 ),
                 source="reaper",
@@ -828,7 +897,7 @@ async def sweep_stalled_strategic_cycles(
                         str(c.project_id),
                         {
                             "alert_id": str(alert.id),
-                            "severity": "WARNING",
+                            "severity": _stall_severity.value,
                             "title": alert.title,
                         },
                     )
@@ -2410,10 +2479,24 @@ _RESIDENT_LIVENESS_SUPPRESSION_BUDGET = 3
 
 
 def _recent_no_delta_skip_at(vision: dict | None, cutoff: datetime) -> datetime | None:
-    """Return the newest intentional no-delta receipt inside ``cutoff``."""
+    """Return the newest intentional no-delta receipt inside ``cutoff``.
+
+    Only an INTENTIONAL idle counts. The consecutive-stall cutoff also lands in
+    this log (it is a skip, and suppressing it there would lose the audit
+    trail), but it means the strategist is BLOCKED, not quiet — accepting it as
+    a healthy-idle receipt would let the cutoff silence the very starvation
+    alert that is supposed to notice a halted strategic loop.
+    """
+    from app.strategic_cycle import STALL_CUTOFF_REASON_PREFIX
+
     newest: datetime | None = None
     for entry in (vision or {}).get("_strategic_no_delta_skips") or []:
         if not isinstance(entry, dict):
+            continue
+        reason = entry.get("reason")
+        if isinstance(reason, str) and reason.startswith(
+            STALL_CUTOFF_REASON_PREFIX
+        ):
             continue
         raw = entry.get("skipped_at")
         if not isinstance(raw, str):
@@ -2505,6 +2588,57 @@ async def _retire_quiet_project_liveness_alerts(session, project_ids: list) -> i
     return retired
 
 
+async def _sync_strategic_lane_disabled_signals(
+    session,
+    project_candidates: list,
+    lane_admissions: dict,
+) -> int:
+    """Hold the deliberate-disable signal in step with the lane flag.
+
+    Returns the number of rows created.  Never raises into the sweep: a
+    visibility signal must not be able to break the liveness detector it
+    accompanies.
+    """
+    from app.alert_dispatch import (
+        _maybe_create_strategic_lane_disabled_alert,
+        _resolve_strategic_lane_disabled_alerts,
+    )
+
+    created = 0
+    live_lane_ids = [
+        project_id
+        for project_id, _vision, automatic_allowed, _blob in project_candidates
+        if automatic_allowed
+    ]
+    try:
+        await _resolve_strategic_lane_disabled_alerts(session, live_lane_ids)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "[STRATEGIC] Failed to retire lane-disabled signals for %d project(s)",
+            len(live_lane_ids),
+        )
+        await session.rollback()
+
+    for project_id, _vision, automatic_allowed, _blob in project_candidates:
+        if automatic_allowed:
+            continue
+        admission = lane_admissions.get(project_id)
+        if admission is None:
+            continue
+        try:
+            if await _maybe_create_strategic_lane_disabled_alert(
+                project_id, session, admission=admission
+            ):
+                created += 1
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[STRATEGIC] Failed to sync the lane-disabled signal for project %s",
+                project_id,
+            )
+            await session.rollback()
+    return created
+
+
 async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     """Detect a halted strategic loop and route one operator-visible alert.
 
@@ -2523,7 +2657,9 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         Project,
         StrategicCycle,
     )
-    from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+    from app.strategic_cycle_admission import (
+        describe_automatic_strategic_cycles,
+    )
     from app.shared_state import runtime_config as _runtime_config
     from app.strategic_cycle import OUTCOME_COMPLETED
     from app.strategic_resident_session import (
@@ -2571,6 +2707,9 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     automatic_cycles_allowed: dict = {}
     resident_blobs: dict[Any, dict[str, Any]] = {}
     project_candidates: list[tuple[Any, Any, bool, dict[str, Any] | None]] = []
+    # The decoded lane record per project, so the downgrade signal below can
+    # name the reason / actor / expiry instead of only the boolean state.
+    lane_admissions: dict = {}
     for (
         project_id,
         project_created_at,
@@ -2583,9 +2722,11 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
                 pc = pc.replace(tzinfo=None)
             if pc > cutoff:
                 continue
-        automatic_allowed = automatic_strategic_cycles_enabled(
-            SimpleNamespace(build_config=project_build_config)
+        lane_admission = describe_automatic_strategic_cycles(
+            SimpleNamespace(build_config=project_build_config), now=now
         )
+        lane_admissions[project_id] = lane_admission
+        automatic_allowed = lane_admission.enabled
         resident_blob = read_resident_session(project_vision)
         if resident_blob is not None:
             resident_blobs[project_id] = resident_blob
@@ -2649,6 +2790,21 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
             await _reset_resident_liveness_suppression(session, project_id)
         await session.commit()
         await _retire_quiet_project_liveness_alerts(session, quiet_project_ids)
+
+    # DOWNGRADE, not drop.  Retiring the halt WARNING above is right -- no cycle
+    # receipt can be expected from a lane that is off -- but on its own it made a
+    # wedged project and a deliberately quiet one produce byte-identical alert
+    # feeds, which is how a "bounded tactical canary" halted a whole strategic
+    # engine for ten days with zero operator signal.  Keep a low-severity,
+    # non-paging row for as long as the lane is off, and dismiss it the moment
+    # the lane is live again.  This runs over EVERY project the sweep looked at,
+    # not just the quiet ones, so a Resident-owned project with the automatic
+    # lane off is visible too.  The producer is dedupe-keyed and no-ops when the
+    # description is unchanged, so a short sweep cadence cannot turn this into
+    # the alert spam it exists to replace.
+    await _sync_strategic_lane_disabled_signals(
+        session, project_candidates, lane_admissions
+    )
 
     if not candidate_ids:
         return 0
