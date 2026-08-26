@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 644 | 1,005,360 | 26,737 | 11,116.778s (642 files) | 2 |
+| backend | 644 | 1,005,742 | 26,746 | 11,116.778s (642 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 112,976 | 6,174 | 314.283s (129 files) | 0 |
@@ -192,7 +192,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 168 | P5 | backend | `backend/testing/test_warm_vm_integration.py` | 2,999 | 28 | moderate (1500–2999 LOC) | 0.992s measured | — |
 | 169 | P5 | admin-ui | `admin-ui/src/hooks/useTaskModal.test.ts` | 1,698 | 79 | moderate (1500–2999 LOC) | 0.848s measured | — |
 | 170 | P5 | backend | `backend/testing/test_migration_chain.py` | 1,679 | 80 | moderate (1500–2999 LOC) | 0.714s measured | — |
-| 171 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,255 | 70 | moderate (1500–2999 LOC) | 0.565s measured | — |
+| 171 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,637 | 79 | moderate (1500–2999 LOC) | 0.565s measured | — |
 | 172 | P5 | backend | `backend/testing/test_dependency_contracts.py` | 1,804 | 44 | moderate (1500–2999 LOC) | 0.551s measured | — |
 | 173 | P5 | backend | `backend/testing/test_ci_resolution.py` | 2,942 | 165 | moderate (1500–2999 LOC) | 0.331s measured | — |
 | 174 | P5 | backend | `backend/testing/test_finding_deduplication.py` | 2,485 | 131 | moderate (1500–2999 LOC) | 0.286s measured | — |
