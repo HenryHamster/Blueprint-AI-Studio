@@ -314,6 +314,30 @@ def _glob_to_regex(glob: str) -> "re.Pattern":
     return re.compile("^" + "".join(out) + "$")
 
 
+def _surface_manifest_path(repo_root: str) -> str:
+    """Where the drift-sentinel manifest lives for ``repo_root``.
+
+    Docker test harness: the backend tree is copied with app/ and testing/ as
+    siblings and no enclosing backend/ directory, so the dev-checkout-relative
+    ``_SURFACE_MANIFEST_REL`` does not resolve. The manifest is co-located with
+    this module; fall back to it -- but only for the DEFAULT root, so hermetic
+    fixture roots stay strictly self-contained (a fixture without a manifest
+    must read as no manifest, never as the repository's own).
+
+    Shared by every manifest reader. A second reader that re-derived this path
+    would work in a developer checkout and read nothing under the harness every
+    backend CI shard uses -- passing while proving nothing, which is the
+    vacuous-guard shape this file's own sentinels exist to catch.
+    """
+    manifest_path = os.path.join(repo_root, _SURFACE_MANIFEST_REL)
+    if not os.path.isfile(manifest_path) and repo_root == _DEFAULT_REPO_ROOT:
+        manifest_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "drift_sentinel_surfaces.json",
+        )
+    return manifest_path
+
+
 def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]":
     """Load and compile the drift-sentinel surface manifest (fail-open).
 
@@ -322,18 +346,7 @@ def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]
     yields no pairs rather than raising, so a broken manifest can never crash the
     merge gate (mirroring the module's "robust on partial trees" contract).
     """
-    manifest_path = os.path.join(repo_root, _SURFACE_MANIFEST_REL)
-    if not os.path.isfile(manifest_path) and repo_root == _DEFAULT_REPO_ROOT:
-        # Docker test harness: the backend tree is copied with app/ and
-        # testing/ as siblings and no enclosing backend/ directory, so the
-        # dev-checkout-relative _SURFACE_MANIFEST_REL does not resolve. The
-        # manifest is co-located with this module; fall back to it — but only
-        # for the DEFAULT root, so hermetic fixture roots stay strictly
-        # self-contained (a fixture without a manifest must compile to []).
-        manifest_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "drift_sentinel_surfaces.json",
-        )
+    manifest_path = _surface_manifest_path(repo_root)
     try:
         with open(manifest_path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -375,6 +388,78 @@ def load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]
     prefix/glob list that can silently drift out of sync with this manifest.
     """
     return _load_surface_manifest(repo_root)
+
+
+def _is_backend_surface(glob: str) -> bool:
+    """Whether a manifest surface glob lies entirely under ``backend/``.
+
+    Compared on a path SEGMENT boundary, never as a bare string prefix, so
+    ``backend-other/**`` is not mistaken for a backend surface.
+    """
+    return glob == "backend" or glob.startswith("backend/")
+
+
+def corpus_lane_required_sentinels(repo_root: str) -> "list[str]":
+    """Registered sentinels that the standalone corpus lane must carry.
+
+    WHY THIS IS DERIVED RATHER THAN LISTED
+    --------------------------------------
+    The corpus lane (``scripts/test-backend.sh --standalone``) is the only lane
+    that runs on a diff containing no backend Python file, so it is the only
+    place a sentinel guarding ``admin-ui/``, ``agent/``, ``scripts/`` or a
+    derived artifact can be reached. A sentinel every one of whose registered
+    surfaces lies under ``backend/`` is in the opposite position: the only
+    diffs that select it are backend diffs, and every backend diff already
+    resolves selectors through the backend-authoring lane. Demanding a roster
+    seat for it buys nothing.
+
+    That distinction used to live as a hand-maintained four-name set inside
+    ``scripts/test_guard_gate_left_shift.py``. It went stale the moment a new
+    backend-only sentinel was registered without someone remembering to extend
+    it -- which is how ``test_scripts_dir_resolution_guard.py`` (registered on
+    ``backend/**/*.py``, and whose own manifest entry states in writing that it
+    is deliberately kept OUT of the standalone lane because it reads the whole
+    backend tree over a bind mount under a 30s timeout) turned a correct
+    registration into a red promotion matrix.
+
+    Reading it off the manifest closes that: to make a sentinel exempt you now
+    have to take its non-backend surface away, which visibly shrinks what the
+    sentinel guards and is reviewable at the line where it happens -- not here,
+    and not in the test that consumes this.
+
+    Fails CLOSED. A sentinel is dropped from the required set only on positive
+    evidence that all of its surfaces are backend surfaces. An unreadable
+    manifest yields no sentinels at all upstream, which callers must treat as
+    the vacuous case rather than as "nothing required".
+    """
+    surfaces_by_sentinel: "dict[str, list[str]]" = {}
+    try:
+        with open(_surface_manifest_path(repo_root), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    entries = data.get("surfaces")
+    if not isinstance(entries, list):
+        return []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        glob = entry.get("glob")
+        sentinels = entry.get("sentinels")
+        if not isinstance(glob, str) or not glob:
+            continue
+        if not isinstance(sentinels, list):
+            continue
+        for sentinel in sentinels:
+            if isinstance(sentinel, str) and sentinel:
+                surfaces_by_sentinel.setdefault(sentinel, []).append(glob)
+    return sorted(
+        sentinel
+        for sentinel, globs in surfaces_by_sentinel.items()
+        if not all(_is_backend_surface(glob) for glob in globs)
+    )
 
 
 def sentinel_file(sentinel: str) -> str:

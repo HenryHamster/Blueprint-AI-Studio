@@ -6650,17 +6650,25 @@ async def test_sweep_wires_promotion_failed_redriver(db_session, mocker):
 
     The regression guard for the dead end itself: the resolver arming a
     version is worthless if no sweep leg executes the decision.
+
+    Patched at ``release_qualifier_redrive``, where the re-driver is DEFINED,
+    rather than at the sweep's re-export: the dispatch loop lives beside the
+    re-drivers it dispatches, so a sweep-module patch would no longer be the
+    name the loop resolves and this guard would go quietly vacuous. The
+    assertion is unchanged and still end-to-end -- the call under test is
+    ``sweep_stuck_qualifications``, so a sweep that stopped dispatching still
+    fails here.
     """
     mocker.patch(
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
     )
     mock_redrive = mocker.patch(
-        "app.release_qualifier_sweep._redrive_promotion_failed_qualification",
+        "app.release_qualifier_redrive._redrive_promotion_failed_qualification",
         new=AsyncMock(return_value=True),
     )
     mocker.patch(
-        "app.release_qualifier_sweep._redrive_deferred_unsynced_qualification",
+        "app.release_qualifier_redrive._redrive_deferred_unsynced_qualification",
         new=AsyncMock(return_value=False),
     )
 
@@ -6868,11 +6876,11 @@ async def test_sweep_wires_deferred_unsynced_redriver(db_session, mocker):
         new=AsyncMock(return_value=None),
     )
     mocker.patch(
-        "app.release_qualifier_sweep._redrive_promotion_failed_qualification",
+        "app.release_qualifier_redrive._redrive_promotion_failed_qualification",
         new=AsyncMock(return_value=False),
     )
     mock_redrive = mocker.patch(
-        "app.release_qualifier_sweep._redrive_deferred_unsynced_qualification",
+        "app.release_qualifier_redrive._redrive_deferred_unsynced_qualification",
         new=AsyncMock(return_value=True),
     )
 

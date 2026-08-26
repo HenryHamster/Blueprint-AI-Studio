@@ -407,6 +407,97 @@ def test_malformed_surface_manifest_is_graceful(tmp_path):
     assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
 
 
+def test_corpus_lane_requirement_is_derived_from_the_registered_surfaces(tmp_path):
+    """A sentinel needs a corpus-lane seat only if it guards a NON-backend surface.
+
+    The corpus lane is the only lane that runs on a diff holding no backend
+    Python file. A sentinel registered exclusively against backend surfaces is
+    therefore selected only by backend diffs, which already resolve selectors
+    through the backend-authoring lane; one registered against admin-ui/,
+    agent/, scripts/ or a derived artifact is reachable nowhere else.
+    """
+    root = str(tmp_path)
+    _write_surface_manifest(
+        root,
+        [
+            {"glob": "backend/app/**/*.py", "sentinels": ["backend/testing/test_be.py"]},
+            {"glob": "admin-ui/src/**", "sentinels": ["backend/testing/test_fe.py"]},
+            # A sentinel on BOTH surfaces still needs the seat: the non-backend
+            # half of its job is unreachable without one.
+            {"glob": "backend/**/*.py", "sentinels": ["backend/testing/test_both.py"]},
+            {"glob": "agent/**", "sentinels": ["backend/testing/test_both.py"]},
+        ],
+    )
+    required = impacted_tests.corpus_lane_required_sentinels(root)
+    assert required == [
+        "backend/testing/test_both.py",
+        "backend/testing/test_fe.py",
+    ]
+
+
+def test_corpus_lane_requirement_compares_on_a_path_segment_boundary(tmp_path):
+    """``backend-other/`` is not a backend surface.
+
+    A bare string-prefix test would silently exempt a sentinel guarding a
+    sibling directory whose name merely starts with ``backend``.
+    """
+    root = str(tmp_path)
+    _write_surface_manifest(
+        root,
+        [{"glob": "backend-other/**", "sentinels": ["backend/testing/test_x.py"]}],
+    )
+    assert impacted_tests.corpus_lane_required_sentinels(root) == [
+        "backend/testing/test_x.py"
+    ]
+
+
+def test_corpus_lane_requirement_yields_nothing_without_a_manifest(tmp_path):
+    """No manifest means no registrations at all, not "nothing is required".
+
+    Callers must treat an empty result as the vacuous case and say so; the
+    left-shift guard does exactly that with an explicit non-emptiness assertion
+    before it compares anything against the roster.
+    """
+    assert impacted_tests.corpus_lane_required_sentinels(str(tmp_path)) == []
+    _write(str(tmp_path), "backend/testing/drift_sentinel_surfaces.json", "{not json")
+    assert impacted_tests.corpus_lane_required_sentinels(str(tmp_path)) == []
+
+
+def test_live_corpus_lane_requirement_reproduces_the_hand_maintained_exemptions():
+    """The derived rule matches what the hand-kept name set used to encode.
+
+    That set named four backend-only sentinels as exempt. It carried no
+    mechanism to notice a fifth, and did not: ``test_scripts_dir_resolution_
+    guard.py`` was registered on ``backend/**/*.py`` -- backend-only, exempt by
+    the same reasoning -- and reddened the promotion matrix because the list had
+    to be edited by hand and was not. Pinning both directions here keeps the
+    derivation honest: it must still exempt every name that set exempted, and
+    must not have quietly started exempting a sentinel that guards a
+    non-backend surface.
+    """
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    registered: set[str] = set()
+    for _regex, sentinels in impacted_tests._load_surface_manifest(repo_root):
+        registered.update(sentinels)
+    assert registered, "live drift_sentinel_surfaces.json registered no sentinels"
+    required = set(impacted_tests.corpus_lane_required_sentinels(repo_root))
+    assert required <= registered
+    formerly_exempt = {
+        "backend/testing/test_direction_referential_guard.py",
+        "backend/testing/test_size_limits_checker.py",
+        "backend/testing/test_migration_0621_safe_encrypt_backfill.py",
+        "backend/testing/test_migration_0626_safe_encrypt_backfill.py",
+    }
+    assert not (required & formerly_exempt)
+    # And the sentinel whose omission from that set was the actual defect.
+    assert (
+        "backend/testing/test_scripts_dir_resolution_guard.py" not in required
+    )
+    # Non-vacuity: something is still required, so this is not passing because
+    # the rule exempted everything.
+    assert "backend/testing/test_vitest_durations_freshness.py" in required
+
+
 def test_live_surface_manifest_is_valid_and_registers_websocket_sentinel():
     """The committed manifest is well-formed and lists on-disk sentinels only.
 

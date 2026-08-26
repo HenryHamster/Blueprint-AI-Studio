@@ -1619,11 +1619,22 @@ async def _redrive_deferred_unsynced_qualification(
     GitHub forever.  Reaching it means the sync gate's fall-through is disabled
     or broken, which is an operator condition.
 
-    COMMIT DISCIPLINE: commit on every outcome, like the error/infra/rubric
-    re-drivers.  A re-defer must persist -- it is what advances ``deferred_at``
-    (the re-check interval) while preserving ``first_deferred_at`` (the wait
-    cap).  There is no counter to protect here, so the promotion_failed
-    re-driver's rollback discipline does not apply.
+    COMMIT DISCIPLINE: commit the two outcomes that are progress -- a spawn, and
+    a re-defer -- and roll back everything else.  A re-defer must persist: it is
+    what advances ``deferred_at`` (the re-check interval) while carrying
+    ``first_deferred_at`` (the wait cap) forward.  Every OTHER outcome is a
+    record this re-driver cannot bound and must not keep.  ``run_qualification``
+    REBUILDS ``last_qualification`` from scratch on each of its early returns --
+    ``sha_error`` on a transient GitHub 503, ``external_blocker`` when promotion
+    is disabled, ``no_credentials`` -- and none of those rebuilds carries
+    ``first_deferred_at``.  Committing one would do two irreversible things at
+    once: destroy the wall-clock bound described above (the ONLY bound this
+    re-driver has), and move the version out of ``deferred_unsynced``, which is
+    the status this re-driver selects on -- so it would never look at the
+    version again.  A GitHub blip would thereby convert a candidate that is
+    merely waiting on a back-merge into one that is waiting on nobody.  There is
+    no counter to protect here, as the promotion_failed re-driver has, but there
+    is a clock and a status, and they need protecting for the same reason.
 
     Returns True only when the re-entry actually started a fresh qualification.
     """
@@ -1731,27 +1742,115 @@ async def _redrive_deferred_unsynced_qualification(
             requested_probes=qual.get("requested_probes"),
             auto_trigger=True,
         )
-        # COMMIT on every outcome: the re-defer record IS the progress here (it
-        # advances deferred_at and carries first_deferred_at forward).
-        await redrive_session.commit()
         result = result or {}
         result_status = str(result.get("status") or "none")
         spawned = result_status == "spawned"
-        try:
-            await redrive_session.refresh(version)
+        if spawned or result_status == "deferred_unsynced":
+            # PROGRESS -- persist it.  A re-defer is progress: it advances
+            # deferred_at and carries first_deferred_at forward, so the next
+            # sweep re-checks on schedule and the wait cap keeps accruing.
+            await redrive_session.commit()
+            try:
+                await redrive_session.refresh(version)
+                await _record_redrive_decision(
+                    redrive_session,
+                    version,
+                    _DEFERRED_UNSYNCED_DECISION_KEY,
+                    "fired" if spawned else "held",
+                    "sync_gate_cleared" if spawned else "still_unsynced",
+                    result_status=result_status,
+                )
+            except Exception:  # noqa: BLE001 -- provenance, never the verdict
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: deferred_unsynced re-drive for "
+                    "v%d could not stamp its provenance",
+                    version.version_number,
+                    exc_info=True,
+                )
+            return spawned
+
+        # NON-PROGRESS -- discard whatever run_qualification wrote.  See the
+        # COMMIT DISCIPLINE note above: keeping it would drop the version out of
+        # deferred_unsynced and take the wall-clock bound with it.
+        logger.info(
+            "[RELEASE_QUALIFIER] sweep: deferred_unsynced re-drive for v%d made "
+            "no progress (%s) -- discarding, the deferral stands",
+            version.version_number,
+            result_status,
+        )
+        await redrive_session.rollback()
+        version = await redrive_session.get(
+            release_version.ReleaseVersion, version_id
+        )
+        if version is not None:
+            # NOT "still_unsynced".  That is a claim about the world -- the
+            # back-merge has not landed -- and this branch establishes no such
+            # thing; it establishes only that re-entry did not get far enough to
+            # say.  Naming it still_unsynced would send an operator to inspect a
+            # back-merge that may already have landed.  The sibling
+            # promotion_failed re-driver records the same neutral reason for the
+            # same case, and result_status carries the specifics either way.
             await _record_redrive_decision(
                 redrive_session,
                 version,
                 _DEFERRED_UNSYNCED_DECISION_KEY,
-                "fired" if spawned else "held",
-                "sync_gate_cleared" if spawned else "still_unsynced",
+                "held",
+                "run_qualification_no_progress",
                 result_status=result_status,
             )
-        except Exception:  # noqa: BLE001 -- provenance, never the verdict
-            logger.warning(
-                "[RELEASE_QUALIFIER] sweep: deferred_unsynced re-drive for v%d "
-                "could not stamp its provenance",
-                version.version_number,
-                exc_info=True,
-            )
-        return spawned
+        return False
+
+
+async def run_redrive_legs(
+    version_ids,
+    *,
+    session_factory=None,
+    pre_sweep_statuses=None,
+) -> None:
+    """Dispatch the sweep's two re-driver-owned legs over every open version.
+
+    ``promotion_failed`` (T5, trigger ``blockers_cleared``) and
+    ``deferred_unsynced`` (T5b) are the two statuses whose resolver decisions
+    the sweep's auto-trigger executor discards as re-driver-owned.  Until the
+    re-drivers above existed both dead-ended: a version whose promotion PR went
+    red stayed parked even after the harvested remediation fix landed on the
+    integration branch, because nothing ever re-entered the qualifier for it.
+
+    Each re-driver is condition-gated (promotion readiness plus candidate
+    identity, or the live sync gate), bounded by its own cap with an operator
+    Alert at the ceiling, and records a structured reason for every outcome on
+    ``last_qualification``.  ``pre_sweep_status`` defers a state that an earlier
+    leg of THIS cycle produced to the next cycle, so two legs never chase one
+    version around a single sweep.
+
+    Lives here rather than inline in the sweep so the dispatch sits beside the
+    re-drivers it dispatches, and so ``release_qualifier_sweep.py`` stays under
+    the size cap its governance record pins.  A re-driver that raises is logged
+    and skipped: one version's failure must not stop the rest of the fleet's.
+    """
+    statuses = pre_sweep_statuses or {}
+    for redrive, label in (
+        (_redrive_promotion_failed_qualification, "promotion_failed"),
+        (_redrive_deferred_unsynced_qualification, "deferred_unsynced"),
+    ):
+        for version_id in version_ids:
+            try:
+                redriven = await redrive(
+                    version_id,
+                    session_factory=session_factory,
+                    pre_sweep_status=statuses.get(version_id),
+                )
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] sweep: %s re-drive failed for version %s",
+                    label,
+                    version_id,
+                )
+                continue
+            if redriven:
+                logger.info(
+                    "[RELEASE_QUALIFIER] sweep re-drove %s version %s "
+                    "(blocking condition cleared — qualifier re-entered)",
+                    label,
+                    version_id,
+                )
