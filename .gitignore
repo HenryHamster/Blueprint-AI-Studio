@@ -66,3 +66,14 @@ research-*.md
 
 # Local build sources and extracted trees; never commit scratch artifacts.
 /.scratch/
+
+# Duration-merge scratch. NOT backend/.test_durations itself -- that artifact is
+# committed and backend/testing/test_audit_finding_class_guards.py fails if this
+# file ever lists it.
+#   *.lock             the sidecar scripts/merge_durations.py takes its OS
+#                      advisory lock on; zero-length and reused across runs.
+#   .duration_refresh.* the raw pytest-split measurement scripts/store-backend-
+#                      durations.sh retains when a merge fails, so the run can
+#                      be merged again without re-measuring.
+backend/.test_durations.lock
+backend/.duration_refresh.*
