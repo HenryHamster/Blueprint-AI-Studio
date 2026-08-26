@@ -246,3 +246,217 @@ async def test_only_explicit_internal_barrier_message_wakes(db_session):
     # monotonic, so acknowledgement cannot revert to an older revision.
     assert resolved_rev == barrier_rev
     assert resolved_summary["pending_barriers"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Project-wide ambient activity
+#
+# The lineage walk is anchored on created_by='STRATEGIC_AGENT'. The orchestrator
+# authors nearly every real pipeline task as 'ORCHESTRATOR', so a Resident
+# watching only its own lineage reported a quiet system while the fleet was
+# busy. The project_* keys fix that WITHOUT touching the two things the lineage
+# keys drive: the wake fingerprint and the exploration-suppression gate.
+# ---------------------------------------------------------------------------
+
+
+def _orchestrator_task(
+    project: Project,
+    title: str,
+    *,
+    status: TaskStatus = TaskStatus.IN_PROGRESS,
+) -> Task:
+    return Task(
+        project_id=project.id,
+        title=title,
+        payloads=[{"type": "create"}],
+        status=status,
+        created_by="ORCHESTRATOR",
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_counts_see_orchestrator_work_the_lineage_walk_cannot(
+    db_session,
+):
+    """The exact reported blind spot: a busy ORCHESTRATOR fleet, a lineage that
+    owns nothing, and a heartbeat that used to report a quiet system."""
+    project = await _project(db_session)
+    host = _strategic_task(project, "Long-lived Resident")
+    db_session.add(host)
+    db_session.add_all(
+        [
+            _orchestrator_task(project, "Pipeline A"),
+            _orchestrator_task(project, "Pipeline B"),
+            _orchestrator_task(project, "Pipeline C", status=TaskStatus.QUEUED),
+            _orchestrator_task(project, "Pipeline D", status=TaskStatus.BLOCKED),
+            _orchestrator_task(project, "Pipeline E", status=TaskStatus.PARKED),
+        ]
+    )
+    await db_session.commit()
+
+    rev, summary = await _compute_resident_work_state(
+        db_session,
+        project.id,
+        resident_task_id=host.id,
+    )
+
+    # Lineage view: the Resident owns nothing. Unchanged.
+    assert summary["in_flight"] == 0
+    assert summary["blocked"] == 0
+    assert summary["parked"] == 0
+
+    # Project view: the fleet is plainly busy.
+    assert summary["project_in_flight"] == 3
+    assert summary["project_blocked"] == 1
+    assert summary["project_parked"] == 1
+    assert summary["project_scan_capped"] == 0
+
+    # And none of it moved the wake fingerprint.
+    assert rev is None
+
+
+@pytest.mark.asyncio
+async def test_project_activity_never_moves_the_wake_fingerprint(db_session):
+    """work_state_rev is a WAKE trigger: a changed rev runs a full model turn.
+
+    Estate-wide churn must not schedule turns, or the Resident wakes on every
+    ORCHESTRATOR transition anywhere in the project.
+    """
+    project = await _project(db_session)
+    host = _strategic_task(project, "Long-lived Resident")
+    owned = _strategic_task(project, "Owned work")
+    db_session.add_all([host, owned])
+    await db_session.commit()
+
+    rev_before, summary_before = await _compute_resident_work_state(
+        db_session,
+        project.id,
+        resident_task_id=host.id,
+    )
+
+    # Everything an orchestrator-authored task can do: start, fail, block, park.
+    failing = _orchestrator_task(project, "Fleet failure", status=TaskStatus.FAILED)
+    failing.completed_at = _utcnow()
+    blocking = _orchestrator_task(project, "Fleet blocker", status=TaskStatus.BLOCKED)
+    blocking.blocked_at = _utcnow()
+    parking = _orchestrator_task(project, "Fleet park", status=TaskStatus.PARKED)
+    parking.parked_at = _utcnow()
+    db_session.add_all([failing, blocking, parking])
+    await db_session.commit()
+
+    rev_after, summary_after = await _compute_resident_work_state(
+        db_session,
+        project.id,
+        resident_task_id=host.id,
+    )
+
+    assert rev_after == rev_before
+    # The counts still moved, so the Resident can SEE it without being WOKEN.
+    assert summary_after["project_blocked"] > summary_before["project_blocked"]
+    assert summary_after["project_parked"] > summary_before["project_parked"]
+    assert summary_after["project_terminal_since"] > summary_before[
+        "project_terminal_since"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_project_counts_do_not_reuse_the_pacing_gate_key_names(db_session):
+    """`in_flight` gates exploration suppression in the agent's
+    hasPendingOwnedWork. Widening THAT key in place would silence the Resident
+    for as long as the fleet had anything running, so the project-wide numbers
+    must live under distinct keys and leave the lineage keys at zero."""
+    project = await _project(db_session)
+    host = _strategic_task(project, "Long-lived Resident")
+    db_session.add(host)
+    db_session.add_all(
+        [_orchestrator_task(project, f"Fleet {i}") for i in range(4)]
+    )
+    await db_session.commit()
+
+    _, summary = await _compute_resident_work_state(
+        db_session,
+        project.id,
+        resident_task_id=host.id,
+    )
+    assert summary["in_flight"] == 0, (
+        "project-wide work must not leak into the lineage key the agent's "
+        "exploration-suppression gate reads"
+    )
+    assert summary["project_in_flight"] == 4
+
+
+@pytest.mark.asyncio
+async def test_project_counts_are_project_scoped(db_session):
+    """A busy neighbouring project must not read as this project's fleet."""
+    project = await _project(db_session)
+    other = Project(name="Other project", user_id="wake-test-user")
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+
+    host = _strategic_task(project, "Long-lived Resident")
+    db_session.add(host)
+    db_session.add_all(
+        [_orchestrator_task(other, f"Neighbour {i}") for i in range(3)]
+    )
+    await db_session.commit()
+
+    _, summary = await _compute_resident_work_state(
+        db_session,
+        project.id,
+        resident_task_id=host.id,
+    )
+    assert summary["project_in_flight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_project_counts_exclude_archived_and_terminal_rows(db_session):
+    """Only live work counts as in flight; archived rows are excluded outright."""
+    project = await _project(db_session)
+    host = _strategic_task(project, "Long-lived Resident")
+    db_session.add(host)
+    archived = _orchestrator_task(project, "Archived but running")
+    archived.archived = True
+    done = _orchestrator_task(project, "Finished", status=TaskStatus.COMPLETED)
+    done.completed_at = _utcnow()
+    live = _orchestrator_task(project, "Actually running")
+    db_session.add_all([archived, done, live])
+    await db_session.commit()
+
+    _, summary = await _compute_resident_work_state(
+        db_session,
+        project.id,
+        resident_task_id=host.id,
+    )
+    assert summary["project_in_flight"] == 1
+    # The terminal row is still visible as recent throughput, which is how a
+    # draining fleet is told apart from a stalled one.
+    assert summary["project_terminal_since"] == 1
+
+
+@pytest.mark.asyncio
+async def test_project_summary_returns_counts_not_rows(db_session):
+    """The heartbeat fires constantly and its output lands in the strategic
+    envelope, so this surface is bounded by construction: a fixed handful of
+    integers, never a task list. Row-level detail stays on the on-demand
+    ./fetch task-census pull."""
+    project = await _project(db_session)
+    host = _strategic_task(project, "Long-lived Resident")
+    db_session.add(host)
+    db_session.add_all(
+        [_orchestrator_task(project, f"Fleet {i}") for i in range(30)]
+    )
+    await db_session.commit()
+
+    _, summary = await _compute_resident_work_state(
+        db_session,
+        project.id,
+        resident_task_id=host.id,
+    )
+    project_keys = {k: v for k, v in summary.items() if k.startswith("project_")}
+    assert project_keys, "expected project-wide keys on the heartbeat summary"
+    for key, value in project_keys.items():
+        assert isinstance(value, int), f"{key} must be a count, got {type(value)}"
+    # Whole summary stays a flat scalar map regardless of how busy the fleet is.
+    for key, value in summary.items():
+        assert isinstance(value, int), f"{key} must be a scalar count"

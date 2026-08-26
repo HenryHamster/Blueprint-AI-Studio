@@ -2521,6 +2521,58 @@ def persist_failure_category(
         )
 
 
+def resolved_failure_class(task: "Task") -> str:
+    """Return the machine-readable failure class recorded for ``task``, or "".
+
+    THREE fields on a task carry a failure class and they are NOT
+    interchangeable. Reading the wrong one is itself a bug class -- it makes a
+    properly classified failure read as "we do not know", which is worse than an
+    honest unknown because it hides in the same bucket:
+
+    * ``context['failure_category']`` -- the CANONICAL value. Every
+      terminal-FAILED code path is required to stamp it via
+      :func:`persist_failure_category`, so this is the field actually populated
+      across the estate.
+    * ``context['failure_class']`` -- a SPARSE authoritative-verdict cache. Only
+      the reaper (``persist_authoritative_verdict``) writes it, so it is present
+      on a small minority of rows.
+    * :func:`classify_failure` -- derived at READ time from status text. A
+      useful last resort, but it is a derivation, not a record, so it ranks
+      below anything the terminalizing path actually persisted.
+
+    This ordering is the single backend-side definition of "which one wins". It
+    mirrors ``scripts/blueprint.py::_resolved_failure_class`` exactly on the
+    persisted fields, so the operator CLI and the agent-facing read surfaces can
+    never disagree about the same task. The CLI is a standalone HTTP client and
+    cannot import this module, so the two implementations are kept in step by
+    naming each other rather than by sharing code.
+
+    Side-effect-free. Returns "" when nothing is recorded and nothing derivable.
+    """
+    ctx = task.context or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+    persisted = str(
+        ctx.get("failure_category") or ctx.get("failure_class") or ""
+    ).strip()
+    if persisted:
+        return persisted
+    # Derivation is deliberately last AND guarded on there being text to derive
+    # from -- the same guard the admin projections use -- so an empty row does
+    # not acquire a confident-looking class out of nothing.
+    if not (task.latest_status_message or "").strip():
+        return ""
+    try:
+        return (classify_failure(task) or "").strip()
+    except Exception:  # pragma: no cover - a read surface never fails on this
+        logger.warning(
+            "[FAILURE_CLASS] classify_failure raised while resolving task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return ""
+
+
 def normalize_agent_failure_category(
     raw: str | None,
     task: "Task",

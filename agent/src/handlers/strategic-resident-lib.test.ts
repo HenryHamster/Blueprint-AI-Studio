@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { readFileSync } from 'fs';
 import { describe, it, expect, vi } from 'vitest';
 import {
   residentConfig, initialCursor, rewindCursorToOpenMessageFloor,
@@ -23,6 +24,7 @@ import {
   retainPendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   classifyOperatorDecisionReview,
   openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn, explorationWakeProjection,
+  hasPendingOwnedWork, formatWatchingWorkNote,
   AUTONOMOUS_EXPLORATION_INTERVAL_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
@@ -4246,5 +4248,75 @@ describe('formatDirectionGroundingText', () => {
     ]);
     expect(result).toContain('a'.repeat(120));
     expect(result).not.toContain('a'.repeat(121));
+  });
+});
+
+
+describe('project-wide ambient work state', () => {
+  // The heartbeat summary now carries two scopes: unprefixed keys are the
+  // Resident's own STRATEGIC_AGENT lineage, `project_*` keys are the whole
+  // project across every created_by (the orchestrator authors nearly all of it).
+  // These pin the separation, because collapsing it in either direction breaks
+  // something: dropping the project keys makes the Resident blind, and folding
+  // them into `in_flight` silences it.
+
+  it('hasPendingOwnedWork ignores project-wide activity', () => {
+    // If a busy fleet counted as owned work, unchanged-state exploration turns
+    // would stay suppressed for as long as anything was running anywhere in the
+    // project — the Resident would go dark exactly when it is needed.
+    expect(hasPendingOwnedWork({
+      in_flight: 0,
+      pending_watches: 0,
+      project_in_flight: 42,
+      project_blocked: 7,
+      project_parked: 3,
+    })).toBe(false);
+  });
+
+  it('hasPendingOwnedWork still suppresses on genuinely owned work', () => {
+    expect(hasPendingOwnedWork({ in_flight: 1, project_in_flight: 0 })).toBe(true);
+  });
+
+  it('watching note reports the fleet even when the lineage owns nothing', () => {
+    const note = formatWatchingWorkNote({
+      in_flight: 0,
+      project_in_flight: 12,
+      project_blocked: 2,
+      project_parked: 1,
+    });
+    expect(note).toContain('0 tasks in flight');
+    expect(note).toContain('12 project-wide');
+    expect(note).toContain('3 blocked/parked');
+  });
+
+  it('watching note stays one clause when the project matches the lineage', () => {
+    const note = formatWatchingWorkNote({
+      in_flight: 2,
+      project_in_flight: 2,
+      project_blocked: 0,
+      project_parked: 0,
+    });
+    expect(note).toBe('2 tasks in flight; ');
+  });
+
+  it('the idle watching line is actually built from the project-aware note', () => {
+    // The formatter above is pure and fully covered; this pins the ONE line of
+    // wiring that decides whether any of it reaches the operator. Without it the
+    // helper can be perfect and the status line can still say nothing, which is
+    // indistinguishable from the blindness this change exists to fix.
+    const source = readFileSync(
+      new URL('./strategic-resident.ts', import.meta.url),
+      'utf-8',
+    );
+    expect(source).toContain('formatWatchingWorkNote(currentWorkStateSummary)');
+    expect(source).toContain('`watching — ${taskNote}next review');
+  });
+
+  it('watching note degrades cleanly on an older backend', () => {
+    // No project_* keys at all (pre-widening server): behave exactly as before.
+    expect(formatWatchingWorkNote({ in_flight: 1 })).toBe('1 task in flight; ');
+    // No summary at all: no note, not a crash and not a fabricated zero.
+    expect(formatWatchingWorkNote(null)).toBe('');
+    expect(formatWatchingWorkNote({})).toBe('');
   });
 });
