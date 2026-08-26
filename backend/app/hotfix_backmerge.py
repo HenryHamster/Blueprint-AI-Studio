@@ -68,6 +68,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import github
 from app.broadcast import broadcast_to_project
+from app.derived_conflict_prompt import DERIVED_CONFLICT_PROMPT_BLOCK
 
 # release_qualifier does NOT import this module, so importing from it here is
 # safe — no circular import.  _resolve_github_with_session is the shared
@@ -1439,6 +1440,7 @@ async def _spawn_resolution_task(
         f"per-hunk decision per the rules above.\n"
         f"- In the PR body, list each non-trivial conflict and which side won "
         f"(or how you synthesized)."
+        f"{DERIVED_CONFLICT_PROMPT_BLOCK}"
     )
 
     payload: dict[str, Any] = {
