@@ -985,12 +985,10 @@ def evaluate_candidate_operator_authorship_gate(
     not the still-null stored column.  When omitted, behavior is unchanged.
 
     When NO active category declares an ``operator_authored_commits``
-    evidence contract, the gate does not manufacture a zero budget — that
-    would hard-block any candidate range containing so much as one
-    non-bot-authored commit (operator hotfixes to main are policy, not a
-    violation) the moment this gate is wired in, with no declared contract to
-    tell the operator a budget must be set.  Absent a declared contract the
-    gate reports a distinct, passing ``"not_applicable"`` status instead.
+    evidence contract, the gate does not manufacture a zero budget.  It
+    reports a distinct, non-passing ``"unconfigured"`` status instead: the
+    measured receipt remains visible, but the candidate cannot promote until
+    an explicit budget exists.
     """
     from app.release_commit_authorship import (
         authorship_receipt_for_measurement,
@@ -1037,18 +1035,18 @@ def evaluate_candidate_operator_authorship_gate(
     ]
     if not max_counts:
         # No active category declares an operator_authored_commits evidence
-        # contract at all — distinct from a declared contract with an
-        # explicit max_count of 0.  Fabricating a zero budget here would
-        # silently arm a hard blocker with nothing telling the operator a
-        # budget must be declared first.  Report a passing, non-blocking
-        # verdict instead so the gate stays inert until a contract exists.
+        # contract at all — distinct from a declared contract with an explicit
+        # max_count of 0.  Do not let an absent contract pass vacuously: retain
+        # the measured count and range while making the missing policy
+        # actionable through the existing evidence-missing blocker.
         return {
-            "status": "not_applicable",
-            "passed": True,
+            "status": "unconfigured",
+            "passed": False,
             "count": count,
             "max_count": None,
             "range": {"base_sha": base_sha, "head_sha": candidate_sha},
             "base_sha_provenance": base_sha_provenance,
+            "blocker": "candidate_operator_authorship_evidence_missing",
             "reason": "no_operator_authorship_contract_declared",
         }
     max_count = min(max_counts)
@@ -1307,7 +1305,7 @@ def compute_composite(
         if candidate_gate_status == "blocked":
             blocker = "candidate_operator_authorship_nonzero"
             failing_gates.append(blocker)
-        elif candidate_gate_status not in ("passed", "not_applicable"):
+        elif candidate_gate_status != "passed":
             blocker = "candidate_operator_authorship_evidence_missing"
             failing_gates.append(blocker)
     if env_preflight_enabled and env_preflight_score is None:

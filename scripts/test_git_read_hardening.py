@@ -95,6 +95,7 @@ _FLOOR = (
     "scripts/walkthrough_stack.py",
     "backend/app/size_limit_policy.py",
     "backend/testing/check_size_limits.py",
+    "scripts/release_authorship_report.py",
 )
 
 # ``git clone`` and ``git init`` CREATE the repository, so there is no existing

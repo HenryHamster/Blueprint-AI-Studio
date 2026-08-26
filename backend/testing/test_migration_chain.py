@@ -1442,6 +1442,7 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     - 0762 adds module finding-chain lifecycle fields
     - 0763 removes untouched implicit authorship contracts
     - 0764 adds the version goal-authoring compliance ledger
+    - 0765 persists force-promote provenance on qualification verdicts
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1575,6 +1576,9 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     goal_omission_ledger = (
         versions_dir / "0764_release_version_goal_omission_ledger.py"
     ).read_text()
+    force_promote_provenance = (
+        versions_dir / "0765_qualificationverdict_force_promote_provenance.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1680,10 +1684,14 @@ def test_schema_head_chains_through_0757_prepromotion_dispatch_outbox():
     assert "goal_omission_cycles" in goal_omission_ledger
     assert "goal_omission_last_cycle" in goal_omission_ledger
     assert "server_default=sa.text(\"0\")" in goal_omission_ledger
+    assert parse_revision_identifiers(force_promote_provenance) == ("0765", "0764")
+    assert '"forced_promote_by"' in force_promote_provenance
+    assert '"forced_promote_at"' in force_promote_provenance
+    assert '"forced_promote_reason"' in force_promote_provenance
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0764", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0764', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0765", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0765', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

@@ -639,6 +639,7 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         # lifecycle view also names WHY each category is unmet (additive).
         "category_verdicts",
         "residual_uncaptured_gap",
+        "candidate_operator_authorship_gate",
     )
     out = {key: qual.get(key) for key in keys if qual.get(key) is not None}
 
@@ -2106,6 +2107,7 @@ async def agent_fetch_qualification(
             "qualification_provenance": qualification_provenance,
             "dimension_states": qualification_dimension_states,
             "serving_sha": serving_sha,
+            "candidate_operator_authorship_gate": candidate_operator_authored_commits,
             "operator_authored_commits": operator_authored_commits,
             "serving_operator_authored_commits": serving_operator_authored_commits,
             "current_effective_policy": current_effective_policy,
@@ -2167,6 +2169,7 @@ async def agent_fetch_qualification(
         "qualification_provenance": qualification_provenance,
         "dimension_states": qualification_dimension_states,
         "serving_sha": serving_sha,
+        "candidate_operator_authorship_gate": candidate_operator_authored_commits,
         "operator_authored_commits": operator_authored_commits,
         "serving_operator_authored_commits": serving_operator_authored_commits,
         "current_effective_policy": current_effective_policy,

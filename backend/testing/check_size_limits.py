@@ -79,7 +79,7 @@ if _BACKEND_DIR not in sys.path:
 # resolved to a nonexistent ``/scripts`` there, so every receipt import failed
 # with nothing naming why. Probe both layouts, and keep the miss REASON so the
 # fail-open receipt warnings below can report it instead of a bare ImportError.
-from testing.repo_scripts_path import resolve_scripts_dir_from_env
+from testing.repo_scripts_path import resolve_scripts_dir_from_env  # noqa: E402
 
 _SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(_BACKEND_DIR)
 _SCRIPTS_DIR_HINT = f" — {_SCRIPTS_DIR_UNAVAILABLE}" if _SCRIPTS_DIR_UNAVAILABLE else ""

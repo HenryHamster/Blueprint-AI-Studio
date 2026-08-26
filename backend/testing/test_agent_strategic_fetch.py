@@ -1630,6 +1630,7 @@ async def test_operator_authorship_read_prefers_candidate_gate_and_preserves_ser
     assert report["count"] == 7
     assert report["max_count"] == 0
     assert report["range"] == {"base_sha": "e" * 40, "head_sha": "f" * 40}
+    assert body["candidate_operator_authorship_gate"] == report
     serving_report = body["serving_operator_authored_commits"]
     assert serving_report["state"] == "resolved"
     assert serving_report["count"] == 0
@@ -2760,6 +2761,14 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
         "sub_scores": {"audit": 0.4, "ci": 1.0},
         "blocker": "audit_findings",
         "finalized_at": "2026-06-02T09:45:00",
+        "candidate_operator_authorship_gate": {
+            "status": "unconfigured",
+            "passed": False,
+            "count": 0,
+            "max_count": None,
+            "blocker": "candidate_operator_authorship_evidence_missing",
+            "reason": "no_operator_authorship_contract_declared",
+        },
         "audit_findings": [
             {"severity": "HIGH", "summary": "Missing auth"},
             {"severity": "MEDIUM", "summary": "Weak test"},
@@ -2835,6 +2844,11 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     assert "challenger_refuted_audit_findings" not in qual
     assert qual["debt_enforce_confidence_preview"] == pytest.approx(0.52)
     assert qual["debt_enforce_weight_preview"] == pytest.approx(0.15)
+    assert qual["candidate_operator_authorship_gate"]["status"] == "unconfigured"
+    assert qual["candidate_operator_authorship_gate"]["max_count"] is None
+    assert qual["candidate_operator_authorship_gate"]["reason"] == (
+        "no_operator_authorship_contract_declared"
+    )
 
     recent = data["recent_versions"]
     assert len(recent) == 1

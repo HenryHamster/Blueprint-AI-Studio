@@ -1125,6 +1125,22 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(Text, nullable=True),
     )
 
+    # Operator force-promote provenance. These fields are copied from the
+    # force-promote base_record so the actor, time, and justification survive
+    # later overwrites of ReleaseVersion.last_qualification.
+    forced_promote_by: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True),
+    )
+    forced_promote_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    forced_promote_reason: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

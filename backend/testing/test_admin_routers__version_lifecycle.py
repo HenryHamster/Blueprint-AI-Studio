@@ -2613,6 +2613,14 @@ class TestVersionLifecycleGateLatch:
                 "blocker": "candidate_operator_authorship_nonzero",
                 "candidate_sha": "abc1234567890",
                 "finalized_at": "2026-05-27T00:00:00",
+                "candidate_operator_authorship_gate": {
+                    "status": "unconfigured",
+                    "passed": False,
+                    "count": 0,
+                    "max_count": None,
+                    "blocker": "candidate_operator_authorship_evidence_missing",
+                    "reason": "no_operator_authorship_contract_declared",
+                },
             },
         )
         db_session.add(version)
@@ -2670,6 +2678,14 @@ class TestVersionLifecycleGateLatch:
         assert resp.status_code == 200, resp.text
         cv = resp.json()["current_version"]
         assert cv["last_qualification"]["is_permanent_gate_incapacity"] is None
+        assert cv["last_qualification"]["candidate_operator_authorship_gate"] == {
+            "status": "unconfigured",
+            "passed": False,
+            "count": 0,
+            "max_count": None,
+            "blocker": "candidate_operator_authorship_evidence_missing",
+            "reason": "no_operator_authorship_contract_declared",
+        }
         assert cv["gate_latch"] is not None
         assert cv["gate_latch"]["gate"] == "candidate_operator_authorship_nonzero"
         assert cv["gate_latch"]["compare_range"] == "deadbeef...abc1234567890"

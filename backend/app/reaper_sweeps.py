@@ -475,7 +475,6 @@ async def sweep_stalled_strategic_cycles(
     """
     from app import strategic_cycle
     from app.models import (
-        Alert,
         AlertSeverity,
         Project,
         StrategicCycle,

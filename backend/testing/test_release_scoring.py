@@ -117,6 +117,32 @@ def test_candidate_authorship_gate_uses_the_complete_candidate_range():
     assert blocked_window["blocker"] == "candidate_operator_authorship_nonzero"
 
 
+def test_candidate_authorship_gate_without_budget_does_not_pass_vacuously():
+    """A measured candidate still needs an explicitly declared budget."""
+    candidate = {"base_sha": "a" * 40, "candidate_sha": "b" * 40}
+    gate = rs.evaluate_candidate_operator_authorship_gate(
+        candidate, _authorship_measurement("a" * 40, "b" * 40, 0)
+    )
+
+    result = rs.compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy=_POLICY,
+        candidate_operator_authorship_gate=gate,
+    )
+
+    assert gate["status"] == "unconfigured"
+    assert gate["passed"] is False
+    assert gate["count"] == 0
+    assert gate["max_count"] is None
+    assert gate["blocker"] == "candidate_operator_authorship_evidence_missing"
+    assert gate["reason"] == "no_operator_authorship_contract_declared"
+    assert result["promote"] is False
+    assert result["blocker"] == "candidate_operator_authorship_evidence_missing"
+
+
 # ---------------------------------------------------------------------------
 # compute_composite — the redesigned goal-verification gate
 # ---------------------------------------------------------------------------

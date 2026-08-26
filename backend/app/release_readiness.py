@@ -608,6 +608,15 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "promotion_pr_url": verdict.promotion_pr_url,
         "promotion_conflict": verdict.promotion_conflict,
         "promotion_error_detail": verdict.promotion_error_detail,
+        # Force-promote provenance is immutable per attempt; unlike the same
+        # keys on ReleaseVersion.last_qualification, it survives later writes.
+        "forced_promote_by": verdict.forced_promote_by,
+        "forced_promote_at": (
+            verdict.forced_promote_at.isoformat()
+            if verdict.forced_promote_at
+            else None
+        ),
+        "forced_promote_reason": verdict.forced_promote_reason,
         # --- Acceptance-window signal (additive; None on legacy rows without aggregate) -
         # acceptance_window_total / verified / fraction use the write-task-only population:
         # only task types that can declare acceptance evidence count in the denominator.
