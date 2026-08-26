@@ -16,6 +16,7 @@ from typing import Any
 
 from sqlalchemy import and_, delete, func, or_
 from sqlmodel import select
+from app.alert_policy import create_project_alert_if_allowed
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 
 from app.blocked_task_unblock_sweeps import (
@@ -481,6 +482,9 @@ async def sweep_stalled_strategic_cycles(
     )
     from app.broadcast import broadcast_to_project as _bcast
     from app.strategic_events import emit_strategic_cycle_completed
+    from app.orchestrator_runner_placement import (
+        task_is_local_only_placement_hold,
+    )
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
     from app.task_locking import project_lock, task_lock
 
@@ -676,6 +680,39 @@ async def sweep_stalled_strategic_cycles(
                     f"waiting for a local Strategic runner — skipping stall declaration"
                 )
                 continue
+            # Same rule for the broader project-level ``local_only`` contract.
+            # ``app.orchestrator_runner_placement`` promises such a task is held,
+            # never failed, for want of a runner and deliberately gives the wait
+            # no timeout; force-failing it here broke that promise from outside
+            # the module that made it.
+            #
+            # This was a LIVELOCK, not merely a contract violation: the QUEUED
+            # phase task is what holds ``_has_active_strategic_task`` closed, so
+            # this force-terminate was itself the event that let a fresh cycle be
+            # cut against the identical unsatisfiable condition — 16 consecutive
+            # cycles on one project, each reaped at 3h, converging on nothing.
+            # Leaving the task QUEUED keeps that admission guard closed, so the
+            # loop stops here rather than needing a new spawner-side backoff.
+            #
+            # This is not silent absorption, and it must never become that:
+            # staging an unsatisfiable hold raises the deduped, project-scoped
+            # ``placement.unsatisfiable_local_hold`` alert
+            # (``orchestrator_runner_placement.raise_unsatisfiable_local_placement_alert``),
+            # which ages WARNING -> ERROR while the block persists and is
+            # retired by the same module when a runner becomes eligible. The
+            # skip below is logged every sweep, and
+            # ``_sweep_strategic_cycle_starvation`` still reports "no completed
+            # cycle in window" once the 24h liveness window lapses. If that
+            # alert is ever removed, this skip must be reconsidered with it:
+            # trading a noisy livelock for a silent one is strictly worse.
+            if task_is_local_only_placement_hold(linked_task):
+                logger.info(
+                    f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
+                    f"but linked task {linked_task_id} is intentionally held "
+                    f"under the project's local_only execution-placement policy "
+                    f"— skipping stall declaration"
+                )
+                continue
             if linked_task is not None and linked_task.status in (
                 TaskStatus.QUEUED,
                 TaskStatus.PROVISIONING,
@@ -759,29 +796,44 @@ async def sweep_stalled_strategic_cycles(
                 )
             )
         try:
-            alert = Alert(
+            # Routed through the policy helper, NOT a raw ``Alert(...)`` insert.
+            # The raw insert bypassed ``ALERT_EVENT_POLICIES`` entirely -- the
+            # import-time retirement assertion iterates that dict's keys, so an
+            # unregistered event type was never checked -- and its title carried
+            # the CYCLE ID, i.e. occurrence identity, which can never dedupe.
+            # One immortal row per stalled cycle, forever, and (the cost people
+            # miss) ``created_at`` reset on every occurrence, so no age-based
+            # escalation could ever see the condition as old. Dedupe on the
+            # CONDITION (project + phase); the cycle id stays in the message,
+            # which ``_update_existing_alert`` refreshes on every re-fire along
+            # with ``occurrence_count`` and ``last_seen_at``.
+            alert, alert_created, _decision = await create_project_alert_if_allowed(
+                session,
                 project_id=c.project_id,
+                event_type="research.diagnosis_stalled",
                 severity=AlertSeverity.WARNING,
-                title=f"Strategic cycle {c.id} stalled in {stalled_phase}",
+                title=f"Strategic cycle stalled in {stalled_phase}",
                 message=(
                     f"Cycle {c.id} has been in {stalled_phase} for >3h with no "
                     f"completion handler update. Marking stalled — next strategic "
                     f"cycle will spawn a fresh attempt. Phase1 task: {c.phase1_task_id}, "
                     f"phase2 task: {c.phase2_task_id}."
                 ),
-                event_type="research.diagnosis_stalled",
+                source="reaper",
+                dedupe_key=f"research.diagnosis_stalled:{c.project_id}:{stalled_phase}",
+                broadcast=False,
             )
-            session.add(alert)
-            pending_broadcasts.append(
-                (
-                    str(c.project_id),
-                    {
-                        "alert_id": str(alert.id),
-                        "severity": "WARNING",
-                        "title": alert.title,
-                    },
+            if alert is not None and alert_created:
+                pending_broadcasts.append(
+                    (
+                        str(c.project_id),
+                        {
+                            "alert_id": str(alert.id),
+                            "severity": "WARNING",
+                            "title": alert.title,
+                        },
+                    )
                 )
-            )
         except Exception:
             logger.exception(
                 f"[REAPER] Failed to create stalled-cycle alert for {c.id}"
