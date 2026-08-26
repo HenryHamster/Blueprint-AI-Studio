@@ -72,17 +72,43 @@ def _live_target(
 
 
 def _cancel_pr_task(task: Task, reason: str) -> None:
+    """Terminalize ``task`` CANCELLED because the fence denied its claim.
+
+    Every one of this helper's call sites means the same thing: this row must
+    not execute, because either another row canonically owns the PR or the PR
+    target it was assigned to no longer exists. That is ``ADMIN_CANCEL`` by the
+    class's own definition ("orchestration path deliberately terminated the task
+    before it ran meaningful work ... or system supersession"), and it is why
+    the fence is safe to treat as a non-death: the work either continues under
+    the canonical owner or has become moot.
+
+    The stamp is load-bearing rather than cosmetic. Before it existed, all eight
+    denial sites left a CANCELLED row whose only reason lived under the bespoke
+    ``pr_execution_fence`` key, which the ground-truth reader
+    (``platform_kill_metrics``) does not consult — so a fence denial was
+    indistinguishable from a terminal row nobody bothered to explain. The
+    specific denial sentence stays in ``pr_execution_fence['reason']`` so an
+    operator gets the identity of the winning claimant, not just the bucket.
+    """
+    from app.failure_classification import (
+        ADMIN_CANCEL,
+        PR_EXECUTION_FENCE_DENIED_DETAIL,
+        persist_failure_category,
+    )
+
     context = dict(task.context or {})
     context["pr_execution_fence"] = {
         "allowed": False,
         "reason": reason,
         "checked_at": _utcnow().isoformat(),
     }
+    context["failure_detail"] = PR_EXECUTION_FENCE_DENIED_DETAIL
     task.context = context
-    flag_modified(task, "context")
     task.status = TaskStatus.CANCELLED
     task.completed_at = _utcnow()
     task.latest_status_message = f"Cancelled by PR execution fence: {reason}"[:500]
+    persist_failure_category(task, ADMIN_CANCEL)
+    flag_modified(task, "context")
 
 
 def _is_rollup_fix(task: Task, pr_number: int) -> bool:

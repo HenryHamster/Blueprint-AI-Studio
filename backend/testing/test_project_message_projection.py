@@ -187,6 +187,41 @@ def test_compatibility_wrappers_keep_existing_public_aliases():
     assert fetched["convergence_link"] == {"kind": "task", "id": "t-1"}
 
 
+def test_legacy_direction_projection_separates_answered_from_never_read():
+    """``status`` alone cannot tell "answered" from "nobody ever read it".
+
+    The stranded-message sweep terminalizes an unclaimed conversation message to
+    handling_state='failed' AND status='resolved'
+    (reaper_bug_message_sweeps.sweep_fail_stranded_pending_conversation_messages),
+    which is byte-identical in ``status`` to a message a runner actually answered.
+    This projection feeds the direction-messages route, so if it omits
+    handling_state its consumers are structurally unable to separate the two and
+    an operator's unread steer reads as resolved. Both rows are projected here so
+    the ONLY discriminator is exercised.
+    """
+    answered = _message(
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.RESPONDED,
+        status="resolved",
+        resolution="Answered by the strategist",
+    )
+    never_read = _message(
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.FAILED,
+        status="resolved",
+        resolution="stranded: no runner ever claimed this message",
+    )
+
+    answered_projection = legacy_direction_message_dict(answered)
+    stranded_projection = legacy_direction_message_dict(never_read)
+
+    # The trap: identical in the field operators actually read.
+    assert answered_projection["status"] == stranded_projection["status"] == "resolved"
+    # The fix: the delivery state travels with the resolution bookkeeping.
+    assert answered_projection["handling_state"] == "responded"
+    assert stranded_projection["handling_state"] == "failed"
+
+
 def test_message_preview_compacts_content_and_context_subset():
     msg = _message(
         content="A" * 400,
@@ -753,6 +788,12 @@ async def test_legacy_project_messages_endpoint_keeps_type_from_aliases(
         "content",
         "from",
         "status",
+        # Deliberately widened: ``status`` alone reports a never-read message
+        # (handling_state='failed' via the stranded-message sweep) identically to
+        # an answered one, so this route could not tell an operator whether
+        # anything picked their message up. The set stays exact so the widening
+        # is one reviewed key, not an open door.
+        "handling_state",
         "context",
         "created_at",
     }

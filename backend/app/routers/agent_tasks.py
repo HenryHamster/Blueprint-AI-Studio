@@ -26,6 +26,20 @@ back to the task it spawned.
 The response is a compact, agent-safe subset of the admin task detail:
 no cost, no billing, no other users' data.
 
+Terminal FAILED/CANCELLED rows carry a REASON, not just a state, on every one
+of these surfaces — the list included, which used to return the state alone:
+
+* ``failure_reason`` — prose (ERROR_LOG excerpt, else the status message);
+* ``failure_class`` — the recorded machine-readable class, resolved by
+  ``failure_classification.resolved_failure_class`` (canonical
+  ``context['failure_category']`` first, then the sparse
+  ``context['failure_class']`` verdict cache, then the read-time derivation).
+  Reading only the sparse cache reports UNKNOWN for most genuinely classified
+  failures, so the resolution order is shared rather than re-invented per
+  surface;
+* ``failure_detail`` — ``context['failure_detail']``, the finer-grained marker
+  the terminalizing path left behind.
+
 ``GET /projects/{project_id}/task-census`` is the deliberate exception to the
 strategist-lineage filter. Nearly all pipeline activity is authored with
 ``created_by="ORCHESTRATOR"`` (autonomous_research, direction_lifecycle,
@@ -54,6 +68,7 @@ from app.agent_read_budget import (
     clip_text,
 )
 from app.database import get_session
+from app.failure_classification import resolved_failure_class
 from app.models import Artifact, ArtifactType, Task, TaskStatus
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
@@ -71,6 +86,10 @@ _ANCESTOR_WALK_MAX_DEPTH = 20
 _TERMINAL_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
+# Terminal statuses that can carry a failure reason. COMPLETED is deliberately
+# excluded: a succeeded task must never acquire a failure class, and
+# ``classify_failure`` is a classifier, not a predicate for "did this fail".
+_FAILED_STATUSES = frozenset({TaskStatus.FAILED, TaskStatus.CANCELLED})
 
 # ── Project-wide census bounds ──────────────────────────────────────────────
 # Non-terminal work is what the census is for; terminal history is summarized
@@ -154,7 +173,73 @@ def _build_task_response(
         if error_summary:
             resp["failure_reason"] = error_summary
 
+    # Machine-readable WHY, on every failed/cancelled row. ``failure_reason``
+    # above is prose an operator reads; these two are the recorded taxonomy a
+    # reader can group, count and route on. Emitted as explicit keys (``None``
+    # when nothing was recorded) rather than omitted, so "nothing was recorded"
+    # is distinguishable from "this surface does not report it" — the ambiguity
+    # that made a FAILED row unreadable here in the first place.
+    if task.status in _FAILED_STATUSES:
+        ctx = task.context if isinstance(task.context, dict) else {}
+        resp["failure_class"] = resolved_failure_class(task) or None
+        resp["failure_detail"] = clip_text(ctx.get("failure_detail"))
+
     return resp
+
+
+async def _terminal_outcome_maps(
+    terminal_ids: list[uuid.UUID],
+    session: AsyncSession,
+) -> tuple[dict[uuid.UUID, str], dict[uuid.UUID, str]]:
+    """Return ``(pr_url_map, error_log_map)`` for the given terminal task ids.
+
+    One artifact query for both kinds. The list surfaces previously fetched only
+    PULL_REQUEST rows, which is why every task they returned carried an outcome
+    when it succeeded and nothing at all when it failed.
+
+    Error text is clipped to the shared per-field ceiling rather than the
+    500-char excerpt the single-task view uses: a list can return up to
+    ``_LIST_LIMIT_MAX`` parents plus their children, and unbounded free text on
+    every one of them is exactly the growth ``app.agent_read_budget`` exists to
+    stop.
+    """
+    pr_map: dict[uuid.UUID, str] = {}
+    err_map: dict[uuid.UUID, str] = {}
+    if not terminal_ids:
+        return pr_map, err_map
+
+    rows = (
+        await session.execute(
+            select(Artifact)
+            .where(
+                Artifact.task_id.in_(terminal_ids),
+                Artifact.artifact_type.in_(
+                    [ArtifactType.PULL_REQUEST, ArtifactType.ERROR_LOG]
+                ),
+            )
+            .order_by(Artifact.created_at.asc())
+        )
+    ).scalars().all()
+    for a in rows:
+        if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
+            pr_map.setdefault(a.task_id, a.pr_url)  # type: ignore[arg-type]
+        elif a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
+            clipped = clip_text(a.logs)
+            if clipped:
+                err_map.setdefault(a.task_id, clipped)  # type: ignore[arg-type]
+    return pr_map, err_map
+
+
+def _list_error_summary(task: Task, err_map: dict[uuid.UUID, str]) -> str | None:
+    """Failure prose for a task in a LIST response, error log first.
+
+    Mirrors the single-task view's precedence (ERROR_LOG artifact, else
+    ``latest_status_message``) so the two surfaces answer "why did this fail"
+    the same way, at the list surface's tighter text ceiling.
+    """
+    if task.status not in _FAILED_STATUSES:
+        return None
+    return err_map.get(task.id) or clip_text(task.latest_status_message)
 
 
 async def _fetch_children(
@@ -188,26 +273,19 @@ async def _fetch_children(
         return result
 
     terminal_child_ids = [c.id for c in child_rows if c.status in _TERMINAL_STATUSES]
-    child_pr_map: dict[uuid.UUID, str] = {}
-    if terminal_child_ids:
-        art_rows = (
-            await session.execute(
-                select(Artifact)
-                .where(
-                    Artifact.task_id.in_(terminal_child_ids),
-                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                    Artifact.pr_url.isnot(None),
-                )
-                .order_by(Artifact.created_at.asc())
-            )
-        ).scalars().all()
-        for a in art_rows:
-            child_pr_map.setdefault(a.task_id, a.pr_url)  # type: ignore[arg-type]
+    child_pr_map, child_err_map = await _terminal_outcome_maps(
+        terminal_child_ids, session
+    )
 
     for child in child_rows:
         pr_url = child_pr_map.get(child.id) if child.status in _TERMINAL_STATUSES else None
         # Children of children are not fetched inline; grandchildren stay at the top level (flat contract)
-        child_dict = _build_task_response(child, pr_url=pr_url, children=[])
+        child_dict = _build_task_response(
+            child,
+            pr_url=pr_url,
+            error_summary=_list_error_summary(child, child_err_map),
+            children=[],
+        )
         if child.parent_task_id in result:
             result[child.parent_task_id].append(child_dict)
 
@@ -335,6 +413,12 @@ async def agent_list_tasks(
     ``_ANCESTOR_WALK_MAX_DEPTH`` generations. Each item includes
     ``parent_task_id`` (null for strategist roots) so the agent can map
     descendants back to the task it spawned.
+
+    Terminal FAILED/CANCELLED items carry ``failure_reason`` (clipped to the
+    shared per-field text ceiling), ``failure_class`` and ``failure_detail`` —
+    see the module docstring. Before this, the list reported FAILED with no why
+    at all, so a reader had to re-fetch each row one at a time to learn anything
+    about it.
     """
     await _resolve_agent_project(project_id, token, session)
 
@@ -377,23 +461,11 @@ async def agent_list_tasks(
     id_order = {tid: idx for idx, tid in enumerate(task_ids)}
     rows = sorted(rows_unordered, key=lambda t: id_order.get(t.id, len(task_ids)))
 
-    # Fetch PR artifacts for terminal tasks in one query to avoid N+1.
+    # Fetch PR *and* ERROR_LOG artifacts for terminal tasks in one query to
+    # avoid N+1. Fetching only PR rows here was the reason a FAILED task in this
+    # list arrived with no reason attached at all.
     terminal_ids = [t.id for t in rows if t.status in _TERMINAL_STATUSES]
-    pr_map: dict[uuid.UUID, str] = {}
-    if terminal_ids:
-        art_rows = (
-            await session.execute(
-                select(Artifact)
-                .where(
-                    Artifact.task_id.in_(terminal_ids),
-                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                    Artifact.pr_url.isnot(None),
-                )
-                .order_by(Artifact.created_at.asc())
-            )
-        ).scalars().all()
-        for a in art_rows:
-            pr_map.setdefault(a.task_id, a.pr_url)  # type: ignore[arg-type]
+    pr_map, err_map = await _terminal_outcome_maps(terminal_ids, session)
 
     parent_ids = [t.id for t in rows]
     children_map = await _fetch_children(parent_ids, project_id, session)
@@ -401,7 +473,12 @@ async def agent_list_tasks(
     items = []
     for t in rows:
         pr_url = pr_map.get(t.id) if t.status in _TERMINAL_STATUSES else None
-        item = _build_task_response(t, pr_url=pr_url, children=children_map.get(t.id, []))
+        item = _build_task_response(
+            t,
+            pr_url=pr_url,
+            error_summary=_list_error_summary(t, err_map),
+            children=children_map.get(t.id, []),
+        )
         items.append(item)
 
     return {"status": "success", "data": items, "count": len(items)}

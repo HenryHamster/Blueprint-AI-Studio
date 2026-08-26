@@ -848,6 +848,50 @@ async def test_messages_reject_context_and_cross_project_answers(
     assert own_message.resolution == "Handled in the authorized project."
 
 
+def test_operator_message_receipt_carries_the_arming_verdict():
+    """The scoped operator receipt must not drop WHY a message will (not) be read.
+
+    ``arming`` is the server's serviceability verdict
+    (``strategic_trigger.maybe_arm_operator_refresh``): ``not_armed`` means the
+    message was durably stored but no strategic cycle will consume it and no
+    resident is listening. Filtering it out of this receipt left the operator CLI
+    structurally unable to tell a live steer from a dead one, so a send that goes
+    nowhere looked exactly like one that landed.
+    """
+    from app.routers.operator_access import _operator_message_receipt
+
+    project_id = uuid.uuid4()
+    receipt = _operator_message_receipt(
+        {
+            "id": "msg-1",
+            "status": "created",
+            "arming": "not_armed",
+            "wakeup_state": None,
+            # Not part of the operator contract; must still be filtered out.
+            "message": {"content": "unbounded projection"},
+        },
+        project_id=project_id,
+    )
+
+    assert receipt["arming"] == "not_armed"
+    assert receipt["id"] == "msg-1"
+    assert receipt["status"] == "created"
+    assert receipt["project_id"] == str(project_id)
+    # The allowlist still fences everything it fenced before.
+    assert "message" not in receipt
+
+
+def test_operator_message_receipt_omits_arming_when_the_source_has_none():
+    """Absent stays absent -- the filter must not invent a verdict."""
+    from app.routers.operator_access import _operator_message_receipt
+
+    receipt = _operator_message_receipt(
+        {"id": "msg-2", "status": "duplicate"}, project_id=uuid.uuid4()
+    )
+
+    assert "arming" not in receipt
+
+
 @pytest.mark.asyncio
 async def test_archived_project_rejects_every_work_starting_operator_action(
     override_get_session, db_session

@@ -40,7 +40,10 @@ import uuid
 import pytest
 from unittest.mock import AsyncMock
 
-from app.failure_classification import CO_DEFERRED_SHELVED
+from app.failure_classification import (
+    ALL_CHILDREN_SHELVED_DETAIL,
+    CO_DEFERRED_SHELVED,
+)
 from app.models import TaskStatus
 
 # Reuse the in-memory SQLite DB fixture + task builders.
@@ -159,6 +162,23 @@ async def test_parent_terminal_parity_all_non_death_cancelled(cleanup_db, mocker
     # Canonical verdict for an all-non-death-cancel set: CANCELLED, not FAILED.
     assert status_reaper == TaskStatus.CANCELLED
     assert category_reaper is None
+    # ... but "no failure class" must not mean "no reason". CANCELLED is a
+    # failure-terminal state, and a parent finalized here used to account for
+    # itself only in prose, matched by a literal substring in
+    # platform_kill_metrics._TERMINAL_MESSAGE_MARKERS — reword the sentence and
+    # the row silently becomes unclassifiable. The durable detail is stamped by
+    # the SHARED finalizer, so parity covers it: both paths must carry it.
+    rollup_parent = await session.get(
+        type(rollup_child), rollup_child.parent_task_id
+    )
+    await session.refresh(rollup_parent)
+    for finalized, label in ((reaper_parent, "reaper"), (rollup_parent, "rollup")):
+        assert (finalized.context or {}).get("failure_detail") == (
+            ALL_CHILDREN_SHELVED_DETAIL
+        ), (
+            f"{label} finalizer left a CANCELLED parent with no machine-readable "
+            "reason; the only account of why it ended was its status message"
+        )
     # Non-death cancels never ding direction health or raise a failure alert,
     # on EITHER path.
     record_failure.assert_not_called()

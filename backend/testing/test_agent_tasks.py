@@ -1184,3 +1184,210 @@ async def test_task_census_requires_agent_token(client: AsyncClient, db_session)
     # No token at all never reaches the handler either.
     res = await client.get(f"/api/agent/projects/{project.id}/task-census")
     assert res.status_code in (401, 403, 422), res.text
+
+
+# ---------------------------------------------------------------------------
+# Terminal rows carry a REASON, not just a state
+#
+# The list surface used to return FAILED with nothing attached: no
+# failure_reason, no class, no detail. A reader saw the state and had to
+# re-fetch every row one at a time to learn anything about it. These pin the
+# three fields and, just as importantly, the RESOLUTION ORDER between them --
+# reading the sparse verdict cache instead of the canonical category is what
+# made properly classified failures display as UNKNOWN.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_failed_item_carries_failure_reason_and_class(
+    client: AsyncClient, db_session
+):
+    """A FAILED row in the LIST reports prose, class and detail -- not bare state."""
+    project, calling_task = await _make_project_and_task(db_session, name="ListWhy")
+    failed = await _make_strategic_task(
+        db_session,
+        project,
+        status=TaskStatus.FAILED,
+        title="Broken",
+        latest_status_message="Agent terminated unexpectedly",
+    )
+    # EXTERNAL_API is deliberately NOT what classify_failure() would derive from
+    # this status message, so this pins the PERSISTED canonical field rather
+    # than accidentally agreeing with the read-time derivation.
+    failed.context = {
+        "failure_category": "EXTERNAL_API",
+        "failure_detail": "evaluation_gate_failed",
+    }
+    db_session.add(failed)
+    await db_session.commit()
+    await _add_artifact(
+        db_session,
+        failed,
+        artifact_type=ArtifactType.ERROR_LOG,
+        logs="Traceback: SyntaxError on line 42",
+    )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert_task_list_response_contract(body)
+    item = next(i for i in body["data"] if i["id"] == str(failed.id))
+
+    assert "Traceback" in (item["failure_reason"] or "")
+    assert item["failure_class"] == "EXTERNAL_API"
+    assert item["failure_detail"] == "evaluation_gate_failed"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_failed_item_falls_back_to_status_message(
+    client: AsyncClient, db_session
+):
+    """No ERROR_LOG artifact: the list still answers why, from the status message."""
+    project, calling_task = await _make_project_and_task(db_session, name="ListWhyFB")
+    failed = await _make_strategic_task(
+        db_session,
+        project,
+        status=TaskStatus.FAILED,
+        title="Broken no artifact",
+        latest_status_message="Build failed: test suite errors",
+    )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    item = next(i for i in res.json()["data"] if i["id"] == str(failed.id))
+    assert item["failure_reason"] == "Build failed: test suite errors"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_prefers_canonical_category_over_sparse_cache(
+    client: AsyncClient, db_session
+):
+    """failure_category (canonical) WINS over failure_class (sparse reaper cache).
+
+    Reading the sparse field first is the exact bug PR #17982 fixed in the
+    operator CLI; pinning the order here is what stops the CLI and the agent
+    read surface from disagreeing about the same task.
+    """
+    project, calling_task = await _make_project_and_task(db_session, name="ListPrec")
+    failed = await _make_strategic_task(
+        db_session,
+        project,
+        status=TaskStatus.FAILED,
+        title="Two classes",
+        latest_status_message="something went wrong",
+    )
+    failed.context = {
+        "failure_category": "RATE_LIMIT",
+        "failure_class": "CODE_ERROR",
+    }
+    db_session.add(failed)
+    await db_session.commit()
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    item = next(i for i in res.json()["data"] if i["id"] == str(failed.id))
+    assert item["failure_class"] == "RATE_LIMIT"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_completed_item_has_no_failure_class(
+    client: AsyncClient, db_session
+):
+    """A COMPLETED row must never acquire a failure class from the classifier."""
+    project, calling_task = await _make_project_and_task(db_session, name="ListDone")
+    done = await _make_strategic_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        title="Fine",
+        latest_status_message="All good",
+    )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    item = next(i for i in res.json()["data"] if i["id"] == str(done.id))
+    assert "failure_class" not in item
+    assert "failure_reason" not in item
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_failed_descendant_carries_its_own_reason(
+    client: AsyncClient, db_session
+):
+    """A failed CHILD in the inline children array reports why it failed too."""
+    project, calling_task = await _make_project_and_task(db_session, name="ChildWhy")
+    root = await _make_strategic_task(db_session, project, title="Root")
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        title="Failed child",
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=root.id,
+        latest_status_message="child blew up",
+        context={
+            "failure_category": "BLOCKED_PRECONDITION",
+            "failure_detail": "dependency_task_failed",
+        },
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    root_item = next(i for i in data if i["id"] == str(root.id))
+    child_item = next(c for c in root_item["children"] if c["id"] == str(child.id))
+    assert child_item["failure_reason"] == "child blew up"
+    assert child_item["failure_class"] == "BLOCKED_PRECONDITION"
+    assert child_item["failure_detail"] == "dependency_task_failed"
+
+
+@pytest.mark.asyncio
+async def test_get_task_failed_also_carries_class_and_detail(
+    client: AsyncClient, db_session
+):
+    """The single-task view gains the same machine-readable pair."""
+    project, calling_task = await _make_project_and_task(db_session, name="ShowWhy")
+    failed = await _make_strategic_task(
+        db_session,
+        project,
+        status=TaskStatus.FAILED,
+        latest_status_message="died",
+    )
+    failed.context = {
+        "failure_category": "PROVISION_FAILURE",
+        "failure_detail": "pr_execution_fence_denied",
+    }
+    db_session.add(failed)
+    await db_session.commit()
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{failed.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["failure_class"] == "PROVISION_FAILURE"
+    assert data["failure_detail"] == "pr_execution_fence_denied"

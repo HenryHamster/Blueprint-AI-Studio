@@ -4,11 +4,12 @@
   "protect": [
     {
       "path": "backend/testing/test_project_message_projection.py",
-      "reason": "Protects the bounded realtime/canonical preview fields that power the truthful non-interruptive Workday-consulted cue in Chat.",
+      "reason": "Protects the bounded realtime/canonical preview fields that power the truthful non-interruptive Workday-consulted cue in Chat, and the legacy direction-message projection that must keep handling_state alongside status \u2014 the only field separating a message a runner answered from one the stranded-message sweep terminalized because nothing ever read it.",
       "test_ids": [
-        "test_message_preview_preserves_bounded_workday_chat_provenance"
+        "test_message_preview_preserves_bounded_workday_chat_provenance",
+        "test_legacy_direction_projection_separates_answered_from_never_read"
       ],
-      "test_count": 29
+      "test_count": 30
     },
     {
       "path": "backend/testing/test_strategic_session_messages.py",
@@ -985,6 +986,12 @@
         "pending operator-decision review state machine > keeps an overflow sentinel until an explicit overflow outcome covers it",
         "pending operator-decision review state machine > queues multiple markerless exchanges and advances them one at a time",
         "pending operator-decision review state machine > round-trips the current exchange and ordered queue across a restart",
+        "project-wide ambient work state > hasPendingOwnedWork ignores project-wide activity",
+        "project-wide ambient work state > hasPendingOwnedWork still suppresses on genuinely owned work",
+        "project-wide ambient work state > the idle watching line is actually built from the project-aware note",
+        "project-wide ambient work state > watching note degrades cleanly on an older backend",
+        "project-wide ambient work state > watching note reports the fleet even when the lineage owns nothing",
+        "project-wide ambient work state > watching note stays one clause when the project matches the lineage",
         "re-exam change-gate (skip settled-clear, unchanged surfaces) > 1. skips a recently-cleared direction with NO change signal since that clear",
         "re-exam change-gate (skip settled-clear, unchanged surfaces) > 2. re-examines a direction with a NEW outcome/cycle/PR delta since its last clear",
         "re-exam change-gate (skip settled-clear, unchanged surfaces) > 2b. prioritizes a CHANGED direction ahead of a settled-clear, unchanged one (even if less recent)",
@@ -1072,7 +1079,7 @@
         "shouldRunAutonomousTurn (state-gated pacing) > runs the first-ever turn immediately, independent of exploration cadence",
         "shouldRunAutonomousTurn (state-gated pacing) > shouldRunAutonomousTurn does not fire on the loop's own applied ops"
       ],
-      "test_count": 304
+      "test_count": 310
     },
     {
       "path": "admin-ui/src/hooks/useStrategicLiveness.test.tsx",

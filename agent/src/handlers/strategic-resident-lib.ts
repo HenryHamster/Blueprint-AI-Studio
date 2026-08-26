@@ -2868,6 +2868,44 @@ export function explorationWakeProjection(
   };
 }
 
+/** The work note in the idle "watching — ..." line.
+ *
+ * The heartbeat summary carries TWO scopes and conflating them is the whole
+ * point of keeping them apart. The unprefixed keys are the Resident's OWN
+ * lineage (`created_by='STRATEGIC_AGENT'` and its descendants); the `project_*`
+ * keys are the whole project across every author. The orchestrator writes
+ * nearly all real pipeline work, so a line built from the lineage count alone
+ * announced "0 tasks in flight" while the fleet was saturated — a quiet system
+ * that was not quiet.
+ *
+ * Both numbers are shown, labelled, and the project figure is only added when
+ * it actually differs from the owned one, so an idle project still reads as one
+ * short clause. Purely cosmetic: it schedules nothing.
+ */
+export function formatWatchingWorkNote(
+  summary: Record<string, unknown> | null | undefined,
+): string {
+  const count = (key: string): number | null => {
+    const value = summary?.[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  };
+  const owned = count('in_flight');
+  if (owned === null) return '';
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const parts = [`${plural(owned, 'task')} in flight`];
+  const projectInFlight = count('project_in_flight');
+  if (projectInFlight !== null && projectInFlight !== owned) {
+    const blocked = count('project_blocked') ?? 0;
+    const parked = count('project_parked') ?? 0;
+    const stalled = blocked + parked;
+    parts.push(
+      `${projectInFlight} project-wide`
+      + (stalled > 0 ? `, ${stalled} blocked/parked` : ''),
+    );
+  }
+  return `${parts.join('; ')}; `;
+}
+
 /** Stable, order-independent identity for the actionable watch receipts in one
  * heartbeat. Receipt bodies may gain additive fields; ids/state are the agenda
  * identity and therefore the only pacing inputs. */
