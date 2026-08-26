@@ -88,6 +88,26 @@ fi
 PYTHONUTF8=1
 export PYTHONUTF8
 
+# Install the repo's custom merge drivers into THIS clone.
+#
+# .gitattributes maps backend/testing/module_size_limits.json and
+# backend/.test_durations to merge drivers, but git ignores that mapping unless
+# `merge.<name>.driver` is registered in the repository's own config — and a
+# clone does not carry git config. Until now the only installer was
+# agent/src/index.ts, at agent workspace-prep time, so the FLEET had the drivers
+# and a developer clone had them nowhere: on this host those two paths conflicted
+# textually on every merge even though the repo ships a correct mechanical merge
+# for both. This gate is the one command a developer runs before every
+# iteration, which makes it the reliable place to close that asymmetry.
+#
+# Deliberately never fatal and never in the changed-paths scope: it is workspace
+# setup, not a check, and failing to register only leaves merges behaving the way
+# they behave today. Runs before the diff below so a fresh clone is configured
+# even on a no-op ./check.
+if ! python3 scripts/derived_artifact_merge_resolve.py --register-drivers >/dev/null 2>&1; then
+  echo "[check] note: custom merge drivers not registered (merges of derived artifacts may conflict)"
+fi
+
 WITH_TESTS=0
 FULL_SCOPE=0
 for arg in "$@"; do
