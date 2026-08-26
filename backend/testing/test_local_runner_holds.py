@@ -17,6 +17,7 @@ compute_jobs defense-in-depth rejection that other modules own.
 
 import uuid
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock
 
 import pytest
@@ -871,7 +872,9 @@ class TestLocalOnlyUnsatisfiablePlacement:
 
         # An EMPTY active-runner pool for this project is the whole signal.
         assert await _try_runner_dispatch(db_session, task, {}, {}) is False
-        assert await _hold_task_for_local_only_placement(db_session, task) is True
+        assert await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={}
+        ) is True
 
         await db_session.refresh(task)
         ctx = task.context or {}
@@ -891,7 +894,10 @@ class TestLocalOnlyUnsatisfiablePlacement:
         assert "Waiting for local execution capacity" not in message
         # The task is still HELD, never failed and never sent to cloud.
         assert task.status == TaskStatus.QUEUED
-        # Transient dispatch marker is consumed once folded into the record.
+        # PIN on the chosen seam: the pool is passed as an argument, never
+        # stamped into ``task.context`` at dispatch.  A persisted marker would
+        # land in the context of every managed-cloud task, which takes this same
+        # "no runner" branch on every cycle.
         assert "placement_block_snapshot" not in ctx
 
     @pytest.mark.asyncio
@@ -924,7 +930,9 @@ class TestLocalOnlyUnsatisfiablePlacement:
         # Bound by the binding counter, yet absent from the ACTIVE pool.
         assert await count_runners_allowed_for_project(db_session, project.id) == 1
         assert await _try_runner_dispatch(db_session, task, {}, {}) is False
-        assert await _hold_task_for_local_only_placement(db_session, task) is True
+        assert await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={}
+        ) is True
 
         await db_session.refresh(task)
         wait = (task.context or {})[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY]
@@ -971,7 +979,9 @@ class TestLocalOnlyUnsatisfiablePlacement:
             await _try_runner_dispatch(db_session, task, {project.id: [busy]}, {})
             is False
         )
-        assert await _hold_task_for_local_only_placement(db_session, task) is True
+        assert await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={project.id: [busy]}
+        ) is True
 
         await db_session.refresh(task)
         ctx = task.context or {}
@@ -1003,7 +1013,9 @@ class TestLocalOnlyUnsatisfiablePlacement:
         seen = []
         for _ in range(3):
             await _try_runner_dispatch(db_session, task, {}, {})
-            await _hold_task_for_local_only_placement(db_session, task)
+            await _hold_task_for_local_only_placement(
+                db_session, task, active_runners_cache={}
+            )
             await db_session.refresh(task)
             seen.append((task.context or {})[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY])
 
@@ -1069,7 +1081,9 @@ class TestUnsatisfiablePlacementAlert:
         task = await self._queued_task(db_session, project.id)
 
         assert await _try_runner_dispatch(db_session, task, {}, {}) is False
-        assert await _hold_task_for_local_only_placement(db_session, task) is True
+        assert await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={}
+        ) is True
 
         alerts = await self._open_alerts(db_session, project.id)
         assert len(alerts) == 1
@@ -1096,7 +1110,9 @@ class TestUnsatisfiablePlacementAlert:
 
         for _ in range(3):
             await _try_runner_dispatch(db_session, task, {}, {})
-            await _hold_task_for_local_only_placement(db_session, task)
+            await _hold_task_for_local_only_placement(
+                db_session, task, active_runners_cache={}
+            )
 
         alerts = await self._open_alerts(db_session, project.id)
         assert len(alerts) == 1
@@ -1117,7 +1133,9 @@ class TestUnsatisfiablePlacementAlert:
         task = await self._queued_task(db_session, project.id)
 
         await _try_runner_dispatch(db_session, task, {}, {})
-        await _hold_task_for_local_only_placement(db_session, task)
+        await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={}
+        )
         alerts = await self._open_alerts(db_session, project.id)
         assert len(alerts) == 1
         assert alerts[0].severity == AlertSeverity.WARNING
@@ -1127,7 +1145,9 @@ class TestUnsatisfiablePlacementAlert:
         await db_session.commit()
 
         await _try_runner_dispatch(db_session, task, {}, {})
-        await _hold_task_for_local_only_placement(db_session, task)
+        await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={}
+        )
 
         alerts = await self._open_alerts(db_session, project.id)
         assert len(alerts) == 1
@@ -1144,7 +1164,9 @@ class TestUnsatisfiablePlacementAlert:
         task = await self._queued_task(db_session, project.id)
 
         await _try_runner_dispatch(db_session, task, {}, {})
-        await _hold_task_for_local_only_placement(db_session, task)
+        await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={}
+        )
         assert len(await self._open_alerts(db_session, project.id)) == 1
 
         runner = LocalRunner(
@@ -1185,7 +1207,9 @@ class TestUnsatisfiablePlacementAlert:
         task = await self._queued_task(db_session, project.id)
 
         await _try_runner_dispatch(db_session, task, {}, {})
-        await _hold_task_for_local_only_placement(db_session, task)
+        await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={}
+        )
         assert len(await self._open_alerts(db_session, project.id)) == 1
 
         busy = RunnerDispatchSnapshot(
@@ -1201,7 +1225,9 @@ class TestUnsatisfiablePlacementAlert:
             await _try_runner_dispatch(db_session, task, {project.id: [busy]}, {})
             is False
         )
-        assert await _hold_task_for_local_only_placement(db_session, task) is True
+        assert await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={project.id: [busy]}
+        ) is True
         assert await self._open_alerts(db_session, project.id) == []
 
     @pytest.mark.asyncio
@@ -1216,5 +1242,58 @@ class TestUnsatisfiablePlacementAlert:
 
         assert await _try_runner_dispatch(db_session, task, {}, {}) is False
         # Not a local_only project: the hold declines and nothing is staged.
-        assert await _hold_task_for_local_only_placement(db_session, task) is False
+        assert await _hold_task_for_local_only_placement(
+            db_session, task, active_runners_cache={}
+        ) is False
         assert await self._open_alerts(db_session, project.id) == []
+
+
+class TestUnsatisfiablePlacementSeamIsWired:
+    """Every production caller must hand the hold the live runner pool.
+
+    ``active_runners_cache`` is the ONLY authoritative signal that zero live
+    runners can serve a project -- the hold cannot re-derive it, because
+    "active" there means ``status='active'`` AND heartbeating, which is the
+    dispatcher's own pool-building rule. Omitting the argument is therefore not
+    a neutral default: it silently restores the exact behaviour that killed 16
+    NeurIPS cycles with no alert. It is spelled as an optional keyword so
+    non-dispatch callers can decline it explicitly, which makes this structural
+    pin the thing that stops a NEW caller from declining it by accident.
+    """
+
+    @staticmethod
+    def _app_dir():
+        return Path(__file__).resolve().parents[1] / "app"
+
+    def test_every_app_call_site_passes_the_runner_pool(self):
+        import ast
+
+        offenders: list[str] = []
+        checked = 0
+        for module in sorted(self._app_dir().rglob("*.py")):
+            tree = ast.parse(module.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute) else None
+                )
+                if name != "_hold_task_for_local_only_placement":
+                    continue
+                checked += 1
+                if not any(
+                    kw.arg == "active_runners_cache" for kw in node.keywords
+                ):
+                    offenders.append(f"{module.name}:{node.lineno}")
+        assert checked >= 2, (
+            "found no call sites to check -- the guard has gone vacuous "
+            "(renamed function?), which is worse than a failure"
+        )
+        assert offenders == [], (
+            "these callers hold a local_only task without observing the live "
+            "runner pool, so an unsatisfiable placement will park silently "
+            f"instead of paging: {offenders}"
+        )
