@@ -26,6 +26,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable, NamedTuple, TypedDict
 
+from app.size_limit_justification import apply_ledger_justifications
+
 
 class GovernanceCapExceededError(ValueError):
     """Raised when a file is already beyond its declared governing cap."""
@@ -1049,12 +1051,13 @@ def _read_cap_bump_history_ledger(section: str, module_key: str) -> list[BumpRec
     return records
 
 
+# A staged cap bump: 4 fields before its commit exists, 6 with git provenance.
+_PendingBump = tuple[str, str, int, int] | tuple[str, str, int, int, str, str]
+
+
 def ledger_with_pending_bumps(
     ledger_data: dict,
-    pending: list[
-        tuple[str, str, int, int]
-        | tuple[str, str, int, int, str, str]
-    ],
+    pending: list[_PendingBump],
 ) -> dict:
     """Return a copy of ``ledger_data`` with ``pending`` bumps reconciled.
 
@@ -1110,10 +1113,8 @@ def rebuild_cap_bump_history_ledger(
     *,
     caps_json_path: str | None = None,
     ledger_path: str | None = None,
-    pending: list[
-        tuple[str, str, int, int]
-        | tuple[str, str, int, int, str, str]
-    ] | None = None,
+    pending: list[_PendingBump] | None = None,
+    justifications: dict | None = None,
     repair_targets: set[tuple[str, str]] | None = None,
     repo_root: str | None = None,
 ) -> dict:
@@ -1142,10 +1143,11 @@ def rebuild_cap_bump_history_ledger(
     including truncated ones — the mirror is then self-healed by pruning only
     records that positive git evidence proves fabricated
     (:func:`phantom_ledger_records`). Missing or otherwise unverifiable evidence
-    is preserved, never treated as proof of fabrication. ``caps_json_path`` /
-    ``ledger_path``
-    default to the shipped files (under ``backend/testing/``); callers with a
-    hermetic fixture repo pass the fixture paths.
+    is preserved, never treated as proof of fabrication. ``justifications``
+    (``{(section, key, old_cap, new_cap): text}``) records operator approval on
+    those bumps and carries recorded ones forward. ``caps_json_path`` /
+    ``ledger_path`` default to the shipped files (under ``backend/testing/``);
+    callers with a hermetic fixture repo pass the fixture paths.
     """
     caps_path = caps_json_path or _MODULE_SIZE_LIMITS_PATH
     out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
@@ -1304,6 +1306,7 @@ def rebuild_cap_bump_history_ledger(
         "history": base_history,
     }
     ledger = ledger_with_pending_bumps(ledger, pending or [])
+    ledger = apply_ledger_justifications(ledger, existing_history, justifications)
     # newline="": this ledger is a tracked file, and platform newline
     # translation on a Windows --fix would rewrite every line as CRLF.
     with open(out_path, "w", encoding="utf-8", newline="") as f:

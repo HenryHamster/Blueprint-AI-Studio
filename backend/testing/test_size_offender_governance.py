@@ -2635,3 +2635,256 @@ def test_parse_bump_history_does_not_borrow_another_sections_bumps(tmp_path):
 
     assert testing_history == []
     assert [(r["old_cap"], r["new_cap"]) for r in scripts_history] == [(14250, 16650)]
+
+
+# ---------------------------------------------------------------------------
+# Operator-approval justification on ledger records.
+#
+# ``--force-chronic`` used to gate on the mere PRESENCE of
+# ``SIZE_CAP_OPERATOR_APPROVAL``: the value was never read or persisted, so a
+# chronic bump left no durable trace of who authorised it or why -- only a
+# commit message nothing validates and a squash can lose.  It is now stored as
+# the record's ``justification``.  Three load-bearing properties are pinned
+# here: the field is OPTIONAL (legacy records keep validating and are never
+# backfilled with a fabricated reason), it does not disturb the
+# (old_cap, new_cap) ratchet match, and it SURVIVES the git regeneration a
+# later ``--fix`` performs.
+# ---------------------------------------------------------------------------
+
+
+_TEST_JUSTIFICATION = "henry: m.py holds the promotion gate; decomposition is queued"
+
+
+def test_legacy_ledger_record_without_justification_still_validates(tmp_path, mocker):
+    """Absent means absent: a pre-field record parses AND justifies its raise.
+
+    Hundreds of committed records predate the field (184 written on 2026-08-26
+    alone).  They keep validating untouched -- no backfill with an invented
+    reason -- and keep satisfying the ratchet, which matches the exact pair.
+    """
+    slp._bump_history_cache.clear()
+    legacy = {
+        "commit_sha": "abc123def456",
+        "commit_date": "2026-08-26T00:00:00+00:00",
+        "old_cap": 100,
+        "new_cap": 200,
+    }
+    ledger_path = tmp_path / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps({"schema_version": 1, "history": {"backend": {"m.py": [legacy]}}}),
+        encoding="utf-8",
+    )
+    _deployed_layout(tmp_path, mocker, ledger_path=str(ledger_path))
+
+    history = parse_bump_history("m.py", "backend")
+
+    assert [(r["old_cap"], r["new_cap"]) for r in history] == [(100, 200)]
+    assert csl._record_justifies(history[0], 100, 200)
+    assert csl._record_justifies(legacy, 100, 200)
+    # The reader must not have invented a value for the missing field.
+    on_disk = json.loads(ledger_path.read_text())["history"]["backend"]["m.py"][0]
+    assert "justification" not in on_disk
+
+
+def test_ledger_record_with_justification_still_validates_and_justifies(
+    tmp_path, mocker
+):
+    """The new field is inert to every existing consumer of a record."""
+    slp._bump_history_cache.clear()
+    recorded = {
+        "commit_sha": "abc123def456",
+        "commit_date": "2026-08-26T00:00:00+00:00",
+        "old_cap": 100,
+        "new_cap": 200,
+        "justification": _TEST_JUSTIFICATION,
+    }
+    ledger_path = tmp_path / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps({"schema_version": 1, "history": {"backend": {"m.py": [recorded]}}}),
+        encoding="utf-8",
+    )
+    _deployed_layout(tmp_path, mocker, ledger_path=str(ledger_path))
+
+    history = parse_bump_history("m.py", "backend")
+
+    assert [(r["old_cap"], r["new_cap"]) for r in history] == [(100, 200)]
+    assert csl._record_justifies(recorded, 100, 200)
+    # ...and only the exact pair, so the ratchet is unchanged by the new key.
+    assert not csl._record_justifies(recorded, 100, 300)
+
+
+def test_ledger_with_pending_bumps_preserves_a_recorded_justification():
+    """A re-staged bump must not erase the approval already on its record."""
+    ledger = {
+        "schema_version": 1,
+        "history": {
+            "backend": {
+                "m.py": [
+                    {
+                        "commit_sha": UNATTRIBUTED_COMMIT_SHA,
+                        "commit_date": "2026-01-01T00:00:00+00:00",
+                        "old_cap": 100,
+                        "new_cap": 200,
+                        "justification": _TEST_JUSTIFICATION,
+                    }
+                ]
+            }
+        },
+    }
+
+    deduped = slp.ledger_with_pending_bumps(ledger, [("backend", "m.py", 100, 200)])
+    attributed = slp.ledger_with_pending_bumps(
+        ledger,
+        [("backend", "m.py", 100, 200, "realsha", "2026-02-03T04:05:06+00:00")],
+    )
+
+    assert deduped["history"]["backend"]["m.py"][0]["justification"] == (
+        _TEST_JUSTIFICATION
+    )
+    upgraded = attributed["history"]["backend"]["m.py"][0]
+    assert upgraded["commit_sha"] == "realsha"
+    assert upgraded["justification"] == _TEST_JUSTIFICATION
+
+
+def test_apply_ledger_justifications_never_overwrites_or_invents():
+    """Stamping is additive only: first authorisation wins, absent stays absent."""
+    from app.size_limit_justification import apply_ledger_justifications
+
+    ledger = {
+        "history": {
+            "backend": {
+                "m.py": [
+                    {
+                        "commit_sha": "s1",
+                        "commit_date": "2026-01-01T00:00:00+00:00",
+                        "old_cap": 100,
+                        "new_cap": 200,
+                        "justification": _TEST_JUSTIFICATION,
+                    },
+                    {
+                        "commit_sha": "s2",
+                        "commit_date": "2026-01-02T00:00:00+00:00",
+                        "old_cap": 200,
+                        "new_cap": 300,
+                    },
+                ]
+            }
+        }
+    }
+
+    result = apply_ledger_justifications(
+        ledger,
+        None,
+        {("backend", "m.py", 100, 200): "someone else: a later, different reason"},
+    )
+    records = result["history"]["backend"]["m.py"]
+
+    assert records[0]["justification"] == _TEST_JUSTIFICATION
+    assert "justification" not in records[1]
+
+
+def test_rebuild_carries_a_recorded_justification_across_git_regeneration(
+    tmp_path, mocker
+):
+    """The durability hole this field exists to close.
+
+    On a complete checkout ``rebuild_cap_bump_history_ledger`` rebuilds every
+    record from ``git log -p``, which knows only the four cap fields, so
+    without a carry-forward the approval would be dropped by the next
+    ``--fix`` -- persisted in name only.
+    """
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "bump to 200", date="2026-01-02T00:00:00+00:00")
+    bump_sha = _hermetic_head_sha(repo)
+
+    recorded = {
+        "commit_sha": bump_sha,
+        "commit_date": "2026-01-02T00:00:00+00:00",
+        "old_cap": 100,
+        "new_cap": 200,
+        "justification": _TEST_JUSTIFICATION,
+    }
+    ledger_path = tmp_path / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps({"schema_version": 1, "history": {"backend": {"m.py": [recorded]}}}),
+        encoding="utf-8",
+    )
+
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        slp.rebuild_cap_bump_history_ledger(
+            caps_json_path=str(Path(repo) / "module_size_limits.json"),
+            ledger_path=str(ledger_path),
+        )
+
+    records = json.loads(ledger_path.read_text())["history"]["backend"]["m.py"]
+    assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
+    assert records[0]["justification"] == _TEST_JUSTIFICATION
+
+
+def test_rebuild_stamps_a_new_operator_justification_on_its_pending_bump(
+    tmp_path, mocker
+):
+    """``justifications`` reaches the record the run just staged, and no other."""
+    caps_path = tmp_path / "module_size_limits.json"
+    caps_path.write_text(
+        json.dumps({"backend": {"m.py": 300, "other.py": 300}}), encoding="utf-8"
+    )
+    ledger_path = tmp_path / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps({"schema_version": 1, "history": {}}), encoding="utf-8"
+    )
+    mocker.patch("app.size_limit_policy._git_reads_history_here", return_value=False)
+
+    ledger = slp.rebuild_cap_bump_history_ledger(
+        caps_json_path=str(caps_path),
+        ledger_path=str(ledger_path),
+        pending=[("backend", "m.py", 200, 300), ("backend", "other.py", 200, 300)],
+        justifications={("backend", "m.py", 200, 300): _TEST_JUSTIFICATION},
+    )
+
+    on_disk = json.loads(ledger_path.read_text())["history"]["backend"]
+    assert ledger["history"]["backend"]["m.py"][0]["justification"] == (
+        _TEST_JUSTIFICATION
+    )
+    assert on_disk["m.py"][0]["justification"] == _TEST_JUSTIFICATION
+    assert set(on_disk["m.py"][0]) == {
+        "commit_sha",
+        "commit_date",
+        "old_cap",
+        "new_cap",
+        "justification",
+    }
+    # An unapproved bump staged in the same run stays unjustified.
+    assert "justification" not in on_disk["other.py"][0]
+
+
+def test_phantom_ledger_records_ignores_the_justification_field(tmp_path, mocker):
+    """The reverse ledger guard adjudicates cap pairs, not the new key."""
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "bump to 200", date="2026-01-02T00:00:00+00:00")
+    bump_sha = _hermetic_head_sha(repo)
+
+    justified = {
+        "commit_sha": bump_sha,
+        "commit_date": "2026-01-02T00:00:00+00:00",
+        "old_cap": 100,
+        "new_cap": 200,
+        "justification": _TEST_JUSTIFICATION,
+    }
+
+    justified_and_true = _phantom_ledger(repo, "m.py", dict(justified))
+    # A justification cannot launder a phantom: a wrong old_cap still fails.
+    justified_but_phantom = _phantom_ledger(
+        repo, "m.py", {**justified, "old_cap": 50}
+    )
+
+    assert justified_and_true == []
+    assert len(justified_but_phantom) == 1
