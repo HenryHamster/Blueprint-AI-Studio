@@ -4590,18 +4590,25 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     assert any("status=all" in path for _, path, _ in mock_api)
 
     # --- send posts correct body and type ---
+    # The shared mock replies ``arming: not_armed`` -- a message that was stored
+    # but that nothing will ever read. The send must therefore FAIL loudly; it
+    # used to exit 0, which is precisely how a dead steer looked like a live one.
     mock_api.clear()
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
     monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
-    rc = blueprint.main(["messages", "send", "hello world", "--type", "NOTE"])
-    assert rc == 0
+    with pytest.raises(SystemExit) as unserviced:
+        blueprint.main(["messages", "send", "hello world", "--type", "NOTE"])
+    assert unserviced.value.code == 1
     post_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/messages" in p]
     assert len(post_calls) == 1
     _, _, body = post_calls[0]
     assert body["content"] == "hello world"
     assert body["message_type"] == "NOTE"
-    out = capsys.readouterr().out
-    assert "msg-abc" in out
+    captured = capsys.readouterr()
+    # The message id still reaches the operator: the row exists, so a blind
+    # re-send would duplicate it.
+    assert "msg-abc" in captured.out
+    assert "NOT armed" in captured.err
 
     # --- read-only config refuses send ---
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
@@ -4670,6 +4677,180 @@ def test_messages_list_scoped_credential_uses_operator_projection(
     rendered = capsys.readouterr().out
     assert "[BLOCK]" in rendered
     assert "system" in rendered
+
+
+def _install_arming_cli(monkeypatch, arming):
+    """Point the CLI at a fake API whose message POST returns ``arming``.
+
+    Matches both send routes: the plain lane ends ``/messages`` and the
+    strategic lane ends ``strategic-session/messages`` (or ``strategic/messages``
+    under a scoped credential).
+    """
+    calls = []
+
+    def api_fake(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "POST" and path.endswith("/messages"):
+            receipt = {"id": "msg-arm", "status": "created"}
+            if arming is not None:
+                receipt["arming"] = arming
+            return receipt
+        return {}
+
+    monkeypatch.setattr(
+        blueprint, "load_config", lambda: {"api_url": "x", "api_key": "operator-key"}
+    )
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "operator-key"}
+    )
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _value=None: "project-1")
+    monkeypatch.setattr(blueprint, "api", api_fake)
+    return calls
+
+
+def test_messages_send_fails_loudly_when_nothing_will_read_the_message(
+    monkeypatch, capsys
+):
+    """``not_armed`` = stored but unconsumed. It must exit non-zero, not 0.
+
+    This is the operator-input defect in one assertion: an accepted message that
+    no strategic cycle will consume and no resident is listening for must never
+    be reported as a successful steer.
+    """
+    _install_arming_cli(monkeypatch, "not_armed")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["messages", "send", "please refocus on the auth bug"])
+    assert exc.value.code == 1
+
+    err = capsys.readouterr().err
+    assert "NOT armed" in err
+    # The reason must name what to use instead, not merely report a state.
+    assert "blueprint strategic send" in err
+
+
+def test_messages_send_json_mode_keeps_stdout_parseable_and_still_fails(
+    monkeypatch, capsys
+):
+    """The verdict travels on stderr so ``--json`` stdout stays machine-readable."""
+    _install_arming_cli(monkeypatch, "not_armed")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["--json", "messages", "send", "steer me"])
+    assert exc.value.code == 1
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["arming"] == "not_armed"
+    assert "NOT armed" in captured.err
+
+
+def test_messages_send_reports_a_serviced_steer(monkeypatch, capsys):
+    """A steer that armed the strategist reports WHY it is serviced."""
+    _install_arming_cli(monkeypatch, "steering")
+
+    rc = blueprint.main(["messages", "send", "please refocus on the auth bug"])
+    assert rc == 0
+    assert "steering" in capsys.readouterr().err
+
+
+def test_messages_send_warns_when_a_passive_note_wakes_nobody(monkeypatch, capsys):
+    """A passive NOTE is recorded but wakes nothing -- the operator must be told."""
+    _install_arming_cli(monkeypatch, "passive_note")
+
+    rc = blueprint.main(["messages", "send", "fyi", "--type", "NOTE"])
+    # Deliberate and legitimate, so it stays exit 0 -- but never silent.
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "nothing will act on this message" in err
+
+
+def test_strategic_send_does_not_warn_on_passive_note(monkeypatch, capsys):
+    """The strategic lane binds a Workday session, so arming is not the whole story.
+
+    That endpoint passes ``precreate_ensure``, which can bind the message to a live
+    session that reads the thread directly. A ``passive_note`` there means only
+    "no strategic cycle was armed", so the plain lane's unserviced WARNING must
+    not fire and scare the operator off the lane that works -- while the report
+    must still stop short of claiming the message was delivered.
+    """
+    _install_arming_cli(monkeypatch, "passive_note")
+
+    rc = blueprint.main(["strategic", "send", "continue the current strategy"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" not in err
+    assert "passive_note" in err
+    assert "delivery depends on the Workday" in err
+
+
+def test_strategic_send_reports_but_does_not_kill_an_unarmed_send(monkeypatch, capsys):
+    """``not_armed`` on the strategic lane is reported, never turned into exit 1.
+
+    Arming is the SOLE gate only on the plain ``messages`` lane. On the strategic
+    lane a bound Workday session reads the thread whatever the arming outcome, so
+    failing the send here would be the CLI guessing -- and guessing wrong would
+    push the operator off the serviced lane. Report loudly, exit 0.
+    """
+    _install_arming_cli(monkeypatch, "not_armed")
+
+    rc = blueprint.main(["strategic", "send", "change the plan"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "not_armed" in err
+    assert "WARNING" in err
+    assert "ERROR" not in err
+
+
+def test_message_send_without_an_arming_verdict_does_not_claim_success(
+    monkeypatch, capsys
+):
+    """A receipt with no verdict must not imply the message was picked up."""
+    _install_arming_cli(monkeypatch, None)
+
+    rc = blueprint.main(["messages", "send", "steer me"])
+    assert rc == 0
+    assert "cannot confirm" in capsys.readouterr().err
+
+
+def test_render_messages_surfaces_failed_handling_state(capsys):
+    """``status`` hides a never-read message; ``handling_state`` is the real field."""
+    blueprint._render_messages(
+        {
+            "messages": [
+                {
+                    "id": "msg-failed",
+                    "message_type": "FEEDBACK",
+                    "from_type": "user",
+                    "content": "please refocus on the auth bug",
+                    "status": "resolved",
+                    "handling_state": "failed",
+                    "resolution": "stranded (no runner claim within the window)",
+                },
+                {
+                    "id": "msg-open",
+                    "message_type": "QUESTION",
+                    "from_type": "user",
+                    "content": "what is blocked?",
+                    "status": "open",
+                    "handling_state": "pending",
+                },
+            ]
+        }
+    )
+    out = capsys.readouterr().out
+    # A never-read message must not be indistinguishable from an answered one.
+    assert "FAILED" in out
+    assert "never handled: stranded (no runner claim within the window)" in out
+    assert "pending" in out
+
+
+def test_render_messages_marks_an_unreported_handling_state(capsys):
+    """A row with no handling_state must say so, not silently look handled."""
+    blueprint._render_messages(
+        {"messages": [{"id": "msg-1", "message_type": "NOTE", "content": "hi"}]}
+    )
+    assert "unreported" in capsys.readouterr().out
 
 
 def test_messages_answer(mock_api, monkeypatch, capsys):
