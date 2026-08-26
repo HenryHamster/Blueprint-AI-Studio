@@ -168,87 +168,14 @@ jobs:
 
       - name: Run guard-data corpus
         env:
-          # Wholesale override of the --standalone roster
-          # (scripts/test-backend.sh:665). Newline-separated selectors, base64.
-          # Narrower than --standalone on purpose: that roster is ~1800 tests
-          # and defaults Postgres ON. These are the derived-artifact and
-          # manifest guards only, and none of them needs a database.
-          BLUEPRINT_STATIC_GUARD_SELECTORS: |
-            dGVzdGluZy90ZXN0X3Rlc3RfZHVyYXRpb25zX2ZyZXNobmVzcy5weQp0ZXN0aW5nL3Rlc3Rfdml0
-            ZXN0X2R1cmF0aW9uc19mcmVzaG5lc3MucHkKdGVzdGluZy90ZXN0X3Rlc3RfZXN0YXRlX3Jhbmtl
-            ZF9xdWV1ZS5weQp0ZXN0aW5nL3Rlc3Rfc2hhcmRfYmFsYW5jZS5weQp0ZXN0aW5nL3Rlc3RfaW1w
-            YWN0ZWRfdGVzdHMucHkKdGVzdGluZy90ZXN0X3dlYnNvY2tldF9lbWl0dGVyX2ludmVudG9yeS5w
-            eQp0ZXN0aW5nL3Rlc3Rfb3BlcmF0b3Jfd29ya2JlbmNoX2NvbnRyYWN0cy5weTo6dGVzdF93ZWJz
-            b2NrZXRfZW1pdHRlcl9pbnZlbnRvcnlfY292ZXJzX2N1cnJlbnRfZW1pdHRlcnMKdGVzdGluZy90
-            ZXN0X2V2ZW50X3R5cGVfaW52YXJpYW50cy5weQp0ZXN0aW5nL3Rlc3RfbWlncmF0aW9uX2NoYWlu
-            LnB5CnRlc3RpbmcvdGVzdF9yZWxlYXNlX3Byb21vdGlvbl9tZXRyaWNfbWFuaWZlc3QucHkKdGVz
-            dGluZy90ZXN0X2NvbnZlcnNhdGlvbmFsX3dvcmtkYXlfcHJvdGVjdGlvbi5weQo=
-          # Fallback only: the step above normally leaves the image under the
-          # tier-1 local tag, so the harness never reaches tier 2. Keep the
+          # Fallback only: the prep step above normally leaves the image under
+          # the tier-1 local tag, so the harness never reaches tier 2. Keep the
           # credentials anyway so that if the prep step failed for some reason,
           # the GHCR pull (scripts/test-backend.sh:374) is still available
           # rather than dropping straight to a ~15-minute local build.
           GHCR_TOKEN: ${{ github.token }}
           GHCR_USER: ${{ github.actor }}
-        run: |
-          # The env value above is soft-wrapped across lines for readability;
-          # the harness base64-decodes it and base64 ignores whitespace, but
-          # strip it anyway so the value is exactly what a local reproduction
-          # would export.
-          BLUEPRINT_STATIC_GUARD_SELECTORS="$(printf '%s' "$BLUEPRINT_STATIC_GUARD_SELECTORS" | tr -d '[:space:]')"
-          export BLUEPRINT_STATIC_GUARD_SELECTORS
-          bash scripts/test-backend.sh --standalone --no-postgres
-
-      - name: Explain a failure
-        if: failure()
-        run: |
-          # A red guard-data check spawns a real fix task
-          # (ci_completion.py, fix_reason="ci_failure"), which costs a VM. Give
-          # that agent — and a human — the exact command, so it converges in one
-          # pass instead of rediscovering the regeneration path.
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Guard data is stale
-
-          A derived artifact no longer matches the test estate. This is almost
-          always a test that was **added, renamed, or deleted** without
-          regenerating the file that indexes it.
-
-          Each guard names the offending entries in its own assertion — read the
-          failure above first; it is more specific than anything here.
-
-          Regenerate whichever artifact the failure names:
-
-          | Artifact | Command |
-          |---|---|
-          | `backend/.test_durations` | `scripts/store-backend-durations.sh` (~15-20 min, needs Docker + Postgres) |
-          | `admin-ui/.test_durations.json`, `agent/.test_durations.json` | `scripts/batch-store-durations.sh` |
-          | either of the above, from existing data | `scripts/regenerate-durations.py` |
-          | `test-estate-ranked-queue.md` | `python scripts/generate_test_estate_ranked_queue.py` |
-          | viewport manifest | `python scripts/viewport_manifest.py` |
-          | frontend release manifest | `python scripts/frontend_release_manifest.py` |
-
-          Reproduce this exact lane locally:
-
-          ```bash
-          export BLUEPRINT_STATIC_GUARD_SELECTORS="$(printf '%s\n' \
-            testing/test_test_durations_freshness.py \
-            testing/test_vitest_durations_freshness.py \
-            testing/test_test_estate_ranked_queue.py \
-            testing/test_shard_balance.py \
-            testing/test_impacted_tests.py \
-            testing/test_websocket_emitter_inventory.py \
-            'testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters' \
-            testing/test_event_type_invariants.py \
-            testing/test_migration_chain.py \
-            testing/test_release_promotion_metric_manifest.py \
-            testing/test_conversational_workday_protection.py | base64 -w0)"
-          bash scripts/test-backend.sh --standalone --no-postgres
-          ```
-
-          **Do not "fix" this by deleting the guard or the stale entry's test.**
-          If a test really was removed, regenerating the artifact drops its row
-          for you.
-          EOF
+        run: bash scripts/guard_data_lane.sh
 
       # Pair of the pre-checkout reclaim above. Runs even when the tests fail,
       # so a red guard-data run does not additionally leave the runner unable to
