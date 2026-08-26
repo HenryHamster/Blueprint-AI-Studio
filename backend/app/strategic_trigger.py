@@ -108,7 +108,10 @@ ARMING_RESIDENT_SESSION = "resident_session"
 
 
 def classify_operator_arming(
-    message_type: MessageType, *, event_type: str | None = None
+    message_type: MessageType,
+    *,
+    event_type: str | None = None,
+    conversation_turn: bool = False,
 ) -> str:
     """Pure classifier: what will/did an operator message do to the strategist?
 
@@ -126,9 +129,25 @@ def classify_operator_arming(
     the strategist). ``question_answer`` is the one NOTE event that still
     represents active operator steering: the strategist asked for missing input,
     and the operator supplied it.
+
+    ``conversation_turn`` marks a turn typed into the Strategic conversation
+    itself (``POST .../strategic-session/messages`` and its operator-access
+    mirror) rather than filed on the message board. On that lane the message
+    TYPE is not a statement of intent -- it is whatever the client defaulted to,
+    and both ``blueprint strategic send`` and ``blueprint strategic chat``
+    default to ``NOTE``. Classifying such a turn as a passive note arms nothing,
+    so in Chat mode (the state the workbench falls back to whenever a Workday
+    session expires) the operator's message lands in a lane with NO reader: no
+    live Resident, no armed cadence, and the reaper eventually fails it as
+    unhandled. A conversation turn is therefore always steering; a passive NOTE
+    stays passive on every other lane. This is the same rule the
+    resident-bound branch of ``create_operator_project_message`` already applies
+    ("every canonical conversation row belongs to the active Resident,
+    including NOTE-shaped chat input") -- extended to the case where no Resident
+    is bound, which is exactly the case that used to strand.
     """
     if message_type is MessageType.NOTE:
-        if event_type in {"question_answer", "feedback_reply"}:
+        if conversation_turn or event_type in {"question_answer", "feedback_reply"}:
             return ARMING_STEERING
         return ARMING_PASSIVE_NOTE
     if event_type:
@@ -305,6 +324,7 @@ async def maybe_arm_operator_refresh(
     event_type: str | None = None,
     message_content: str | None = None,
     resident_session_active: bool = False,
+    conversation_turn: bool = False,
 ) -> str:
     """Shared 'should this operator message wake the strategist, and arm it' gate.
 
@@ -352,8 +372,15 @@ async def maybe_arm_operator_refresh(
     in that state returns ``ARMING_RESIDENT_SESSION`` (handled live) without
     writing any marker; passive/routine messages keep their own outcome (they
     never armed anything anyway).
+
+    ``conversation_turn`` is forwarded to ``classify_operator_arming``: a turn
+    typed into the Strategic conversation is steering regardless of its message
+    type, so it always ends up with a reader (the live Resident when one is
+    bound, the armed cadence otherwise) instead of stranding as a passive note.
     """
-    outcome = classify_operator_arming(message_type, event_type=event_type)
+    outcome = classify_operator_arming(
+        message_type, event_type=event_type, conversation_turn=conversation_turn
+    )
     if outcome != ARMING_STEERING:
         return outcome
     if resident_session_active:
