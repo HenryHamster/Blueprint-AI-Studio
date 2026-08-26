@@ -407,6 +407,29 @@ def _terminal_failure_message(
     return reason or default
 
 
+# Written into the job's artifact dir by the local wrapper's image-resolution
+# block: the full output of the `docker pull`, and — when the pull failed but a
+# local copy was found — the line saying the run continued on that local copy.
+#
+# WHY THE FALLBACK EXISTS: `docker pull` of a tag that was BUILT ON THIS HOST
+# fails by definition, because the tag exists in no registry. The fleet is all
+# local runners, so building a pinned image locally is the ordinary way to get a
+# clean environment onto your own hardware — and an unconditional fatal pull
+# turned that working image into a hard `container_image_pull_failed`.
+#
+# WHAT A SUCCESSFUL `docker image inspect` PROVES: that the reference resolves,
+# right now, to an image in THIS host's local image store, so `docker run` has
+# something to execute.
+#
+# WHAT IT DOES NOT PROVE: that the local image matches any registry digest, that
+# it is current, or that it is the image the author meant. A stale local layer
+# that shadows a moved tag is exactly the case the pull exists to prevent, which
+# is why the pull is still ATTEMPTED FIRST on every run and the fallback is only
+# reached on positive evidence after the pull has already failed. The realised
+# path is recorded here rather than inferred, so a run explained by a stale local
+# image can be recognised as one after the fact.
+_CONTAINER_IMAGE_RESOLUTION_LOG = "container_image_resolution.log"
+
 # Designated result-file path the command writes; read back after it finishes.
 _GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
 # On-VM artifact directory the GCP startup script provisions and uploads.
@@ -846,7 +869,19 @@ async def run_preflight_smoke(
                         f"docker login {server_q} -u {user_q} --password-stdin "
                         ">/dev/null 2>&1 &&"
                     )
-                docker_parts.append(f"docker pull {shlex.quote(container_image)} &&")
+                # Same resolution order the real run uses: pull first (so a
+                # registry image is never smoked from a stale cached layer),
+                # then accept a copy already in this host's image store. This
+                # gate runs BEFORE the job, so a bare `docker pull &&` here
+                # rejected a locally built image before the wrapper could ever
+                # run it — the gate, not the run, was the thing saying no.
+                # Still fail-closed: when neither route resolves, the `&&`
+                # chain short-circuits and the smoke fails.
+                _smoke_image_q = shlex.quote(container_image)
+                docker_parts.append(
+                    f"{{ docker pull {_smoke_image_q} || "
+                    f"docker image inspect {_smoke_image_q} >/dev/null; }} &&"
+                )
                 docker_parts.append(f"{prefix} bash -lc {shlex.quote(command)}")
                 effective_command = " ".join(docker_parts)
             else:
@@ -1829,6 +1864,79 @@ def _build_container_run_prefix(
     return " ".join(parts)
 
 
+def _build_container_image_resolution_block(
+    container_image: str,
+    *,
+    terminal_path: str,
+    image_resolution_log: str,
+    login_line: str = "",
+) -> str:
+    """Shell that makes *container_image* runnable, or fails closed saying why.
+
+    Resolution order, and it is the order that matters:
+
+    1. ``docker pull`` ALWAYS runs first. On a registry image this is what stops
+       a stale cached layer from being executed in place of the tag the author
+       actually named — so it is not skipped, not even when a local copy exists.
+    2. Only if the pull FAILED, ``docker image inspect`` asks whether a copy is
+       nonetheless present in this host's image store. That is positive evidence
+       that ``docker run`` has something to execute, and the run continues on it.
+    3. If BOTH fail the image is unresolvable and the job fails CLOSED, before
+       the command runs, with a typed ``container_image_pull_failed`` reason.
+
+    WHAT STEP 2 PROVES: the reference resolves right now to an image in this
+    host's local store.
+
+    WHAT STEP 2 DOES NOT PROVE: that the local image matches any registry
+    digest, that it is current, or that it is the image the author meant. It is
+    reached only after a pull has already failed, and the path actually taken is
+    written to *image_resolution_log* rather than inferred, so a result later
+    explained by a stale local image can be recognised as one.
+
+    The failure reason NAMES BOTH ATTEMPTS and the pull's exit code, because a
+    reason that says only "failed" sends a human back to re-derive which of the
+    two routes was tried and which one broke. The pull's own output is appended
+    to *image_resolution_log* instead of being discarded to /dev/null, so the
+    registry's actual complaint (auth, rate limit, unknown tag) survives.
+
+    ``terminal_path`` and ``image_resolution_log`` are expected pre-quoted;
+    *container_image* is quoted here.
+    """
+    image_q = shlex.quote(container_image)
+    # $? is read on the line immediately after the pull so nothing can clobber
+    # it. The image reference reaches the heredoc through a shell variable
+    # rather than by interpolation: the heredoc is deliberately UNQUOTED (it has
+    # to expand $FINISHED_AT), so an interpolated reference would itself be
+    # subject to expansion inside it.
+    return (
+        login_line
+        + f"BP_IMAGE_REF={image_q}\n"
+        + f"docker pull {image_q} >>{image_resolution_log} 2>&1\n"
+        + "PULL_EXIT=$?\n"
+        + 'if [ "$PULL_EXIT" -ne 0 ]; then\n'
+        + f"  if docker image inspect {image_q} >/dev/null 2>>{image_resolution_log}; then\n"
+        + "    printf '%s\\n' \"blueprint: docker pull failed (exit $PULL_EXIT);"
+        + " running the copy of $BP_IMAGE_REF already present in this host's"
+        + f" image store\" >>{image_resolution_log}\n"
+        + "  else\n"
+        + "    FINISHED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')\n"
+        + f"    cat > {terminal_path} <<PULL_EOF\n"
+        + "STATUS=FAILED\n"
+        + "EXIT_CODE=1\n"
+        + "FINISHED_AT=$FINISHED_AT\n"
+        + "REASON=container_image_pull_failed: docker pull $BP_IMAGE_REF exited"
+        + " $PULL_EXIT and docker image inspect found no copy in this host's"
+        + f" image store (see {_CONTAINER_IMAGE_RESOLUTION_LOG})\n"
+        + "METRICS=\n"
+        + "COMMAND_LOG=\n"
+        + "RELEASE_ECHO=\n"
+        + "PULL_EOF\n"
+        + "    exit 1\n"
+        + "  fi\n"
+        + "fi"
+    )
+
+
 def _build_local_wrapper_command(
     command: str,
     *,
@@ -1859,10 +1967,15 @@ def _build_local_wrapper_command(
             "live_tail.b64",
         )
     )
-    # Block emitted before the python runner that handles docker login + pull.
-    # Separated from the run command so pull failure can write a typed terminal
-    # reason (container_image_pull_failed) instead of falling through as a
-    # generic command failure.
+    # Block emitted before the python runner that handles docker login + image
+    # resolution. Separated from the run command so an UNRESOLVABLE image can
+    # write a typed terminal reason (container_image_pull_failed) instead of
+    # falling through as a generic command failure.
+    #
+    # "Unresolvable" means both routes failed: the pull AND the local image
+    # store. A failed pull alone is not fatal — see
+    # ``_CONTAINER_IMAGE_RESOLUTION_LOG`` for why, and for what the local
+    # fallback does and does not prove.
     container_setup_block = ""
     # Deterministic container name so the no-progress watchdog can ``docker kill``
     # the dockerd-parented workload (which the group SIGKILL can never reach).
@@ -1909,22 +2022,16 @@ def _build_local_wrapper_command(
                 f"printf '%s' {shlex.quote(pwd)} | "
                 f"docker login {server_q} -u {user_q} --password-stdin >/dev/null 2>&1\n"
             )
-        image_q = shlex.quote(container_image)
-        container_setup_block = (
-            login_line
-            + f"if ! docker pull {image_q} >/dev/null 2>&1; then\n"
-            + "  FINISHED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')\n"
-            + f"  cat > {terminal_path} <<PULL_EOF\n"
-            + "STATUS=FAILED\n"
-            + "EXIT_CODE=1\n"
-            + "FINISHED_AT=$FINISHED_AT\n"
-            + "REASON=container_image_pull_failed\n"
-            + "METRICS=\n"
-            + "COMMAND_LOG=\n"
-            + "RELEASE_ECHO=\n"
-            + "PULL_EOF\n"
-            + "  exit 1\n"
-            + "fi"
+        container_setup_block = _build_container_image_resolution_block(
+            container_image,
+            terminal_path=terminal_path,
+            image_resolution_log=shlex.quote(
+                os.path.join(
+                    _local_artifact_dir_for_external_id(external_id),
+                    _CONTAINER_IMAGE_RESOLUTION_LOG,
+                )
+            ),
+            login_line=login_line,
         )
     else:
         effective_command = command

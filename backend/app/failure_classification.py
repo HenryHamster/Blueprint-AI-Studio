@@ -331,6 +331,22 @@ def environment_failure_terminal_reason(
 PROVISIONING_TTL_TERMINAL_REASON = "provisioning_ttl"
 RUNTIME_TTL_TERMINAL_REASON = "runtime_ttl"
 
+# Emitted by EVERY substrate (local wrapper, GCP startup script, preflight smoke)
+# when the declared container_image cannot be resolved to something runnable.
+#
+# This token matched NO classifier rule, so it fell through to the default and
+# was billed as CODE_ERROR — the class reserved for a genuine defect in the
+# experiment's own command. The environment was never provisioned; the command
+# never ran at all. The cost of that misattribution is not just a wrong label: a
+# CODE_ERROR burns the owning task's retry budget, penalizes direction health,
+# and spawns a fix task against a command that was never the problem — so the
+# fix task fails identically, on the same unresolvable image.
+#
+# It is pinned as an exact constant, ahead of the default, for the same reason
+# the sentinels above are: a rename must break loudly rather than silently drop
+# the mapping back to CODE_ERROR.
+CONTAINER_IMAGE_UNRESOLVED_TERMINAL_REASON = "container_image_pull_failed"
+
 
 # Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
 # for longer than the scope-aware threshold (8 min small / 12 min medium /
@@ -614,6 +630,10 @@ def classify_compute_terminal_reason(
       what the command needed. Pinned on the exact constant, ahead of the generic
       substring rule, so a rename of the sentinel cannot silently drop the
       mapping back to CODE_ERROR)
+    - reason contains ``CONTAINER_IMAGE_UNRESOLVED_TERMINAL_REASON`` →
+      PROVISION_FAILURE (the declared container_image resolved to nothing
+      runnable on any substrate, so the command never ran — an environment
+      fault, not a defect in the command)
     - reason contains "provisioning" → PROVISION_FAILURE (launch/RPC failure,
       the ``provisioning_ttl`` phase-1 self-destruct expiry, and the runner's own
       "cannot establish a Python interpreter" bootstrap reasons, which all carry
@@ -635,6 +655,8 @@ def classify_compute_terminal_reason(
         if ENVIRONMENT_FAILURE_TERMINAL_REASON in lower:
             return PROVISION_FAILURE
         if PROVISIONING_TTL_TERMINAL_REASON in lower:
+            return PROVISION_FAILURE
+        if CONTAINER_IMAGE_UNRESOLVED_TERMINAL_REASON in lower:
             return PROVISION_FAILURE
         if "provisioning" in lower:
             return PROVISION_FAILURE
