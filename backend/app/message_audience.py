@@ -189,6 +189,8 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # gets the same audience.
     "runner.update_drain_stuck": OPERATOR_ACTION_NEEDED,
     "runner.cross_project_access": OPERATOR_ACTION_NEEDED,
+    # Execution placement: a local_only project with no eligible runner.
+    "placement.unsatisfiable_local_hold": OPERATOR_ACTION_NEEDED,
     # GCE task-VM proactive resource-health alerts (warm-pool monitoring parity):
     # surfaced to the operator so an OOM- or disk-bound VM is visible in the fleet
     # health summary BEFORE the VM is killed, not only via teardown forensics.

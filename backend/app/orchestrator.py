@@ -3687,6 +3687,12 @@ async def orchestrator_worker():
                             session,
                             task,
                             reason="no_eligible_local_runner",
+                            # The live pool this cycle. An EMPTY entry for this
+                            # project is not backpressure: no active runner can
+                            # ever take the task, and the policy's wait has no
+                            # timeout, so the hold raises an operator alert
+                            # instead of parking silently forever.
+                            active_runners_cache=_active_runners_cache,
                         ):
                             continue
 

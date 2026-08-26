@@ -809,3 +809,412 @@ class TestResolveLocalRunnerHoldAlert:
 
         assert first == 1
         assert second == 0, "second resolve is a no-op — alert already dismissed"
+
+
+class TestLocalOnlyUnsatisfiablePlacement:
+    """A ``local_only`` wait that can NEVER be satisfied must not read as capacity.
+
+    Live platform defect (NeurIPS project ``d0955450``): the project's only bound
+    runner was PAUSED, so zero live runners could serve it. The wait has no
+    timeout by design, so 16 consecutive strategic cycles queued behind the
+    generic "Waiting for local execution capacity" message and were force-failed
+    by the stalled-cycle reaper at 3h each. Nothing in the message or the wait
+    record said the condition was permanent.
+
+    The axis that matters for a no-timeout wait is "can any LIVE runner serve
+    this project", which is exactly what the orchestrator's active-runner cache
+    encodes. Note the pre-existing ``runner_project_binding`` counter is NOT
+    sufficient on its own: it counts a paused runner as bound (see
+    ``LOCAL_CAPACITY_WAIT_MESSAGE``), which is precisely why this case slipped
+    through.
+    """
+
+    @staticmethod
+    async def _local_only_project(session, name):
+        project = Project(
+            name=name,
+            user_id=TEST_USER_ID,
+            build_config={
+                "resource_envelope": {"execution_placement_policy": "local_only"}
+            },
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        return project
+
+    @staticmethod
+    async def _queued_task(session, project_id):
+        task = Task(
+            project_id=project_id,
+            payloads=[{"type": "create", "prompt": "do the thing"}],
+            status=TaskStatus.QUEUED,
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+
+    @pytest.mark.asyncio
+    async def test_zero_active_bound_runners_names_the_block_not_capacity(
+        self, db_session
+    ):
+        """No live runner at all -> distinct reason code + a remedy in the message."""
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+        from app.runner_project_binding import (
+            NO_ACTIVE_RUNNER_BOUND_REASON,
+            RUNNER_BINDING_GRANT_ENDPOINT,
+        )
+
+        project = await self._local_only_project(db_session, "unsatisfiable-local-only")
+        task = await self._queued_task(db_session, project.id)
+
+        # An EMPTY active-runner pool for this project is the whole signal.
+        assert await _try_runner_dispatch(db_session, task, {}, {}) is False
+        assert await _hold_task_for_local_only_placement(db_session, task) is True
+
+        await db_session.refresh(task)
+        ctx = task.context or {}
+        wait = ctx[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY]
+        assert wait["reason"] == NO_ACTIVE_RUNNER_BOUND_REASON
+        assert wait["reason"] != "no_eligible_local_runner"
+        assert wait["unsatisfiable"] is True
+        assert wait["block"]["bound_runner_count"] == 0
+        assert wait["block"]["active_runner_count"] == 0
+        # The operator message must name the problem AND the remedy, and must
+        # NOT tell the reader to wait for capacity that can never arrive.
+        message = task.latest_status_message or ""
+        assert message.startswith("Blocked (project policy: local_only):")
+        assert "no local runner is bound to this project" in message
+        assert "can never be satisfied" in message
+        assert RUNNER_BINDING_GRANT_ENDPOINT in message
+        assert "Waiting for local execution capacity" not in message
+        # The task is still HELD, never failed and never sent to cloud.
+        assert task.status == TaskStatus.QUEUED
+        # Transient dispatch marker is consumed once folded into the record.
+        assert "placement_block_snapshot" not in ctx
+
+    @pytest.mark.asyncio
+    async def test_bound_but_paused_runner_names_resume_not_grant(self, db_session):
+        """The exact live shape: a runner IS bound, but it is paused.
+
+        ``count_runners_allowed_for_project`` counts it (status != 'deleted'), so
+        the pre-existing binding-gap detector stays silent. The wait is still
+        unsatisfiable, and the remedy is to resume it -- not to grant another.
+        """
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+        from app.runner_project_binding import (
+            NO_ACTIVE_RUNNER_BOUND_REASON,
+            count_runners_allowed_for_project,
+        )
+
+        project = await self._local_only_project(db_session, "paused-only-fleet")
+        db_session.add(
+            LocalRunner(
+                project_id=project.id,
+                token_hash=uuid.uuid4().hex,
+                status="paused",
+                last_seen_at=_utcnow(),
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+        )
+        await db_session.commit()
+        task = await self._queued_task(db_session, project.id)
+
+        # Bound by the binding counter, yet absent from the ACTIVE pool.
+        assert await count_runners_allowed_for_project(db_session, project.id) == 1
+        assert await _try_runner_dispatch(db_session, task, {}, {}) is False
+        assert await _hold_task_for_local_only_placement(db_session, task) is True
+
+        await db_session.refresh(task)
+        wait = (task.context or {})[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY]
+        assert wait["reason"] == NO_ACTIVE_RUNNER_BOUND_REASON
+        assert wait["unsatisfiable"] is True
+        assert wait["block"]["bound_runner_count"] == 1
+        message = task.latest_status_message or ""
+        assert (
+            "1 local runner(s) are bound to this project but NONE are active"
+            in message
+        )
+        assert "resume or restore a bound runner" in message
+        assert "Waiting for local execution capacity" not in message
+
+    @pytest.mark.asyncio
+    async def test_bound_and_active_but_busy_keeps_generic_backpressure(
+        self, db_session
+    ):
+        """PIN: the genuinely transient case must be byte-for-byte unchanged.
+
+        A bound, live, but fully-loaded runner IS ordinary backpressure -- it
+        drains on its own. This is the behaviour the fix must not break, so both
+        the reason code and the historic message are pinned literally.
+        """
+        from app.orchestrator_runner_dispatch import (
+            RunnerDispatchSnapshot,
+            _try_runner_dispatch,
+        )
+
+        project = await self._local_only_project(db_session, "busy-bound-fleet")
+        task = await self._queued_task(db_session, project.id)
+        # Live and eligible, but already at its max_concurrent ceiling.
+        busy = RunnerDispatchSnapshot(
+            uuid.uuid4(),
+            project.id,
+            {
+                "task_types": "all",
+                "max_concurrent": 1,
+                "_active_agent_task_count": 1,
+            },
+        )
+
+        assert (
+            await _try_runner_dispatch(db_session, task, {project.id: [busy]}, {})
+            is False
+        )
+        assert await _hold_task_for_local_only_placement(db_session, task) is True
+
+        await db_session.refresh(task)
+        ctx = task.context or {}
+        wait = ctx[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY]
+        assert wait["reason"] == "no_eligible_local_runner"
+        assert "unsatisfiable" not in wait
+        assert "block" not in wait
+        assert task.latest_status_message == (
+            "Waiting for local execution capacity (project policy: local_only)."
+        )
+        assert task.status == TaskStatus.QUEUED
+        assert "placement_block_snapshot" not in ctx
+
+    @pytest.mark.asyncio
+    async def test_repeated_dispatch_cycles_keep_one_stable_wait_record(
+        self, db_session
+    ):
+        """The unsatisfiable record must not churn ``since`` across cycles.
+
+        A record that rewrites its own start time every cycle would make queue
+        age lie and would defeat any dedupe keyed on the wait, re-notifying once
+        per cycle -- the failure mode this whole change exists to remove.
+        """
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+
+        project = await self._local_only_project(db_session, "repeat-cycle-local-only")
+        task = await self._queued_task(db_session, project.id)
+
+        seen = []
+        for _ in range(3):
+            await _try_runner_dispatch(db_session, task, {}, {})
+            await _hold_task_for_local_only_placement(db_session, task)
+            await db_session.refresh(task)
+            seen.append((task.context or {})[EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY])
+
+        assert {record["since"] for record in seen} == {seen[0]["since"]}
+        assert all(record["unsatisfiable"] is True for record in seen)
+
+class TestUnsatisfiablePlacementAlert:
+    """The unsatisfiable hold must be LOUD, and loud exactly once per project.
+
+    Skipping the hold in the stalled-cycle reaper removes the only signal the
+    old behaviour produced (16 force-terminated cycles). Trading a noisy
+    livelock for a silent one is strictly worse, so the skip is only defensible
+    while this alert exists -- these tests are what keeps that true.
+    """
+
+    @staticmethod
+    async def _local_only_project(session, name):
+        project = Project(
+            name=name,
+            user_id=TEST_USER_ID,
+            build_config={
+                "resource_envelope": {"execution_placement_policy": "local_only"}
+            },
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        return project
+
+    @staticmethod
+    async def _queued_task(session, project_id):
+        task = Task(
+            project_id=project_id,
+            payloads=[{"type": "create", "prompt": "do the thing"}],
+            status=TaskStatus.QUEUED,
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+
+    @staticmethod
+    async def _open_alerts(session, project_id):
+        rows = await session.execute(
+            select(Alert).where(
+                Alert.project_id == project_id,
+                Alert.event_type == "placement.unsatisfiable_local_hold",
+                Alert.dismissed_at.is_(None),
+            )
+        )
+        return list(rows.scalars().all())
+
+    @pytest.mark.asyncio
+    async def test_unsatisfiable_hold_raises_condition_scoped_alert(self, db_session):
+        """Staging the hold pages the operator, keyed on the CONDITION."""
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+        from app.orchestrator_runner_placement import (
+            unsatisfiable_placement_dedupe_key,
+        )
+        from app.runner_project_binding import RUNNER_BINDING_GRANT_ENDPOINT
+
+        project = await self._local_only_project(db_session, "alert-unsatisfiable")
+        task = await self._queued_task(db_session, project.id)
+
+        assert await _try_runner_dispatch(db_session, task, {}, {}) is False
+        assert await _hold_task_for_local_only_placement(db_session, task) is True
+
+        alerts = await self._open_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.WARNING
+        assert alert.dedupe_key == unsatisfiable_placement_dedupe_key(project.id)
+        # Occurrence identity (task id / cycle id) must NOT be in the key: it
+        # would mint an immortal row per occurrence and reset created_at, so the
+        # age-based escalation below could never fire.
+        assert str(task.id) not in (alert.dedupe_key or "")
+        assert "can never be satisfied" in alert.message
+        assert RUNNER_BINDING_GRANT_ENDPOINT in alert.message
+        assert "local_only" in alert.message
+
+    @pytest.mark.asyncio
+    async def test_repeat_staging_bumps_occurrence_instead_of_adding_a_row(
+        self, db_session
+    ):
+        """Three dispatcher cycles, one row -- and it gets MORE informative."""
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+
+        project = await self._local_only_project(db_session, "alert-dedupe")
+        task = await self._queued_task(db_session, project.id)
+
+        for _ in range(3):
+            await _try_runner_dispatch(db_session, task, {}, {})
+            await _hold_task_for_local_only_placement(db_session, task)
+
+        alerts = await self._open_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        assert alerts[0].occurrence_count == 3
+        assert alerts[0].last_seen_at is not None
+
+    @pytest.mark.asyncio
+    async def test_alert_escalates_to_error_once_the_block_is_old(self, db_session):
+        """Dedupe on the condition; escalate on its AGE.
+
+        Only possible because the key is condition-scoped: the same row survives
+        every cycle, so ``created_at`` records when the project actually stopped
+        being able to run anything.
+        """
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+
+        project = await self._local_only_project(db_session, "alert-escalate")
+        task = await self._queued_task(db_session, project.id)
+
+        await _try_runner_dispatch(db_session, task, {}, {})
+        await _hold_task_for_local_only_placement(db_session, task)
+        alerts = await self._open_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        assert alerts[0].severity == AlertSeverity.WARNING
+
+        alerts[0].created_at = _utcnow() - timedelta(hours=4)
+        db_session.add(alerts[0])
+        await db_session.commit()
+
+        await _try_runner_dispatch(db_session, task, {}, {})
+        await _hold_task_for_local_only_placement(db_session, task)
+
+        alerts = await self._open_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        assert alerts[0].severity == AlertSeverity.ERROR
+        assert "Unresolved for 4h" in alerts[0].message
+
+    @pytest.mark.asyncio
+    async def test_active_runner_taking_work_resolves_the_alert(self, db_session):
+        """SOURCE_CONDITION retirement, proved through the production pin path."""
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+        from app.runner_eligibility import RunnerDispatchSnapshot
+
+        project = await self._local_only_project(db_session, "alert-resolve-pin")
+        task = await self._queued_task(db_session, project.id)
+
+        await _try_runner_dispatch(db_session, task, {}, {})
+        await _hold_task_for_local_only_placement(db_session, task)
+        assert len(await self._open_alerts(db_session, project.id)) == 1
+
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash=uuid.uuid4().hex,
+            status="active",
+            last_seen_at=_utcnow(),
+            capabilities={"task_types": "all", "max_concurrent": 2},
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+
+        pinned = await _try_runner_dispatch(
+            db_session,
+            task,
+            {
+                project.id: [
+                    RunnerDispatchSnapshot(
+                        runner.id,
+                        project.id,
+                        {"task_types": "all", "max_concurrent": 2},
+                    )
+                ]
+            },
+            {},
+        )
+        assert pinned is True
+        assert await self._open_alerts(db_session, project.id) == []
+
+    @pytest.mark.asyncio
+    async def test_busy_but_live_fleet_retires_a_stale_alert(self, db_session):
+        """A fleet that came back but is momentarily full is NOT an outage."""
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+        from app.runner_eligibility import RunnerDispatchSnapshot
+
+        project = await self._local_only_project(db_session, "alert-resolve-busy")
+        task = await self._queued_task(db_session, project.id)
+
+        await _try_runner_dispatch(db_session, task, {}, {})
+        await _hold_task_for_local_only_placement(db_session, task)
+        assert len(await self._open_alerts(db_session, project.id)) == 1
+
+        busy = RunnerDispatchSnapshot(
+            uuid.uuid4(),
+            project.id,
+            {
+                "task_types": "all",
+                "max_concurrent": 1,
+                "_active_agent_task_count": 1,
+            },
+        )
+        assert (
+            await _try_runner_dispatch(db_session, task, {project.id: [busy]}, {})
+            is False
+        )
+        assert await _hold_task_for_local_only_placement(db_session, task) is True
+        assert await self._open_alerts(db_session, project.id) == []
+
+    @pytest.mark.asyncio
+    async def test_managed_cloud_project_is_never_paged(self, db_session):
+        """The empty-pool dispatch branch is taken by EVERY cloud project."""
+        from app.orchestrator_runner_dispatch import _try_runner_dispatch
+
+        project = await _make_project(
+            db_session, require_local_runner=False, name="cloud-default"
+        )
+        task = await self._queued_task(db_session, project.id)
+
+        assert await _try_runner_dispatch(db_session, task, {}, {}) is False
+        # Not a local_only project: the hold declines and nothing is staged.
+        assert await _hold_task_for_local_only_placement(db_session, task) is False
+        assert await self._open_alerts(db_session, project.id) == []
