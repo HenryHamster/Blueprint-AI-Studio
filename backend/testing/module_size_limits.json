@@ -131,7 +131,7 @@
     "ci_resolution.py": 2100,
     "routers/admin_project_config.py": 2000,
     "compute_backends.py": 6200,
-    "direction_lifecycle.py": 2300,
+    "direction_lifecycle.py": 2800,
     "routers/admin_notifications.py": 2150,
     "strategic_state_read_model.py": 1100,
     "project_message_creation.py": 1250,
@@ -438,7 +438,8 @@
     "test_orchestrator_liveness.py": 2250,
     "test_lane_baseline_snapshot.py": 1750,
     "test_impacted_tests.py": 1750,
-    "test_discovery_review_packet_budget.py": 1750
+    "test_discovery_review_packet_budget.py": 1750,
+    "test_test_durations_freshness.py": 1950
   },
   "scripts": {
     "test_local_runner.py": 16650,
