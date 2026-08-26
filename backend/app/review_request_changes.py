@@ -51,12 +51,17 @@ from app.post_commit_errors import PostCommitFinalCommitFailed
 from app.retry_prompt import _detect_ci_review_disagreement
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
+    SPAWN_DEFER_MAX_ATTEMPTS,
     build_issue_ledger,
     clear_review_escalation_approval_gate,
+    clear_spawn_deferral,
     detect_fix_all_issue_class,
     fix_all_occurrences_directive,
+    record_spawn_deferral,
     review_loop_park_stale_head,
     review_loop_parked_for_operator,
+    spawn_refusal_is_already_satisfied,
+    spawn_refusal_is_transient,
     stale_respawn_delta_base_sha,
     _surface_module_finding_chain_escalation,
 )
@@ -869,6 +874,12 @@ async def run_request_changes(
         logger.info(
             f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}"
         )
+        # A deferral episode that finally cleared must not leave its counter
+        # behind: a later, unrelated deferral on this same row would inherit
+        # the exhausted budget and escalate on its first attempt.
+        clear_spawn_deferral(task)
+        flag_modified(task, "context")
+        session.add(task)
     else:
         # The chain original may own a durable human-merge intent even though
         # this REQUEST_CHANGES completion runs on its review child.  The
@@ -924,56 +935,159 @@ async def run_request_changes(
         # stuck_cycle). _spawn_pipeline_task records why it
         # returned None in SPAWN_REASON_KEY on the source task.
         _fix_refusal_label = _pipeline_spawn_refusal_label(task)
-        task.latest_status_message = (
-            f"Fix not spawned for PR #{pr_number} — "
-            f"{_fix_refusal_label}"
-        )
-        await _establish_request_changes_hold(
-            task, session, reason="review_fix_spawn_refused"
-        )
-        session.add(task)
-        cap_alert_title = (
-            f"PR #{pr_number} stalled — {_fix_refusal_label}"
-        )
-        existing_cap_alert = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == task.project_id,
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title == cap_alert_title,
-                    )
-                )
+        # Each refusal site ALSO wrote a specific human-readable sentence into
+        # ``latest_status_message`` ("waiting on active review task 6fa6bd4a",
+        # "another spawner holds the PR lock; retrying next sweep", ...).
+        # Carry that whole sentence into whatever we emit rather than
+        # flattening it to the bare reason code.
+        _spawn_detail = (task.latest_status_message or "").strip()
+
+        # Three dispositions, not two. Only the last is a genuine stall.
+        _escalate_title: str | None = None
+        _escalate_message: str | None = None
+
+        if spawn_refusal_is_already_satisfied(task):
+            # DEDUP: an equivalent fix is already active on this PR, so the
+            # chain is already doing the thing we wanted. Not a stall, and
+            # nothing to retry — no hold, no alert, keep the spawner's message.
+            logger.info(
+                "[REVIEW PIPELINE] Fix for PR #%s already covered by an active "
+                "same-type task — no escalation (%s)",
+                pr_number,
+                _spawn_detail or _fix_refusal_label,
             )
-            .scalars()
-            .first()
-        )
-        if not existing_cap_alert:
-            alert = Alert(
-                project_id=task.project_id,
-                severity=AlertSeverity.WARNING,
-                title=cap_alert_title,
-                message=f"Review requested changes on PR #{pr_number} but no fix was spawned ({_fix_refusal_label}). Manual intervention required.",
-                task_id=task.id,
-                event_type="review.escalated",
-            )
-            session.add(alert)
+            session.add(task)
             await session.commit()
-            await broadcast_to_project(
-                str(task.project_id),
-                "alert_created",
-                {
-                    "alert_id": str(alert.id),
-                    "severity": "WARNING",
-                    "title": alert.title,
-                },
+        elif spawn_refusal_is_transient(task):
+            # DEFERRED is "not right now", never "never": closed admission, a
+            # peer holding the PR spawn lock, an in-flight peer task, the
+            # mid-retry infra grace window, or a spawn-commit lock timeout.
+            # Escalating it as a stall requiring manual intervention is what
+            # stranded PR #17941 across five consecutive full review tasks
+            # (6fa6bd4a, e4c76dc5, d5473efa, 7e77113a, 085de73b), each of which
+            # re-ran a 20-30MB review and died with the identical message.
+            #
+            # Hand the completion back to the post-commit sweep instead. The
+            # parent-authority revoke above commits BEFORE _spawn_pipeline_task
+            # precisely so this retry is safe — see that commit's comment:
+            # "A spawn failure must leave the parent safely revoked and the
+            # post-commit sweep free to retry the idempotent spawn."
+            _defer = record_spawn_deferral(task, detail=_spawn_detail)
+            flag_modified(task, "context")
+            if not _defer["exhausted"]:
+                task.latest_status_message = (
+                    f"Fix spawn deferred for PR #{pr_number} "
+                    f"(attempt {_defer['attempts']}/{SPAWN_DEFER_MAX_ATTEMPTS}, "
+                    f"{_defer['elapsed_s']:.0f}s) — "
+                    f"{_spawn_detail or _fix_refusal_label}"
+                    " — post-commit sweep retries"
+                )
+                session.add(task)
+                # Commit BEFORE raising. The raise rolls this request session
+                # back and the pending marker is re-stamped from a fresh
+                # session, so an uncommitted counter would read 1 on every
+                # attempt and the bound could never fire.
+                await session.commit()
+                logger.info(
+                    "[REVIEW PIPELINE] Fix spawn deferred for PR #%s "
+                    "(attempt %s/%s, %.0fs) — retrying via post-commit sweep: %s",
+                    pr_number,
+                    _defer["attempts"],
+                    SPAWN_DEFER_MAX_ATTEMPTS,
+                    _defer["elapsed_s"],
+                    _spawn_detail or _fix_refusal_label,
+                )
+                # PostCommitFinalCommitFailed is this module's established
+                # "replay the whole completion" signal — the parent-revoke lock
+                # timeout above raises exactly the same thing. agent_status
+                # keeps the write-ahead post_commit_pending marker set and
+                # returns a clean 200 (no agent-visible 500), and
+                # _sweep_post_commit_pending re-runs this handler on its 60s
+                # cadence, which retries the idempotent spawn.
+                raise PostCommitFinalCommitFailed(
+                    f"fix spawn for PR #{pr_number} deferred "
+                    f"({_fix_refusal_label}) on attempt "
+                    f"{_defer['attempts']}/{SPAWN_DEFER_MAX_ATTEMPTS}; "
+                    "retrying via post-commit sweep"
+                )
+            # Budget exhausted. NOW it is worth an operator's time — but say
+            # what actually happened (deferred repeatedly, for how long, on
+            # what) rather than reporting a generic stall.
+            _defer_mins = _defer["elapsed_s"] / 60.0
+            task.latest_status_message = (
+                f"Fix not spawned for PR #{pr_number} — spawn deferred "
+                f"{_defer['attempts']}x over {_defer_mins:.1f} min and never "
+                f"cleared; last deferral: "
+                f"{_spawn_detail or _fix_refusal_label}"
+            )
+            _escalate_title = (
+                f"PR #{pr_number} stalled — fix spawn deferred "
+                f"{_defer['attempts']}x and never cleared"
+            )
+            _escalate_message = (
+                f"Review requested changes on PR #{pr_number}. The fix spawn "
+                f"was deferred {_defer['attempts']} times over "
+                f"{_defer_mins:.1f} minutes and never cleared. Last deferral: "
+                f"{_spawn_detail or _fix_refusal_label}. Operator attention "
+                "required."
             )
         else:
-            await session.commit()
-        logger.warning(
-            f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number} ({_fix_refusal_label})"
-        )
+            # Genuinely terminal: iteration cap, stuck cycle, supersede churn,
+            # abandon candidate, ... Unchanged escalation.
+            task.latest_status_message = (
+                f"Fix not spawned for PR #{pr_number} — "
+                f"{_fix_refusal_label}"
+            )
+            _escalate_title = (
+                f"PR #{pr_number} stalled — {_fix_refusal_label}"
+            )
+            _escalate_message = f"Review requested changes on PR #{pr_number} but no fix was spawned ({_fix_refusal_label}). Manual intervention required."
+
+        if _escalate_title is not None:
+            await _establish_request_changes_hold(
+                task, session, reason="review_fix_spawn_refused"
+            )
+            session.add(task)
+            cap_alert_title = _escalate_title
+            existing_cap_alert = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == task.project_id,
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title == cap_alert_title,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if not existing_cap_alert:
+                alert = Alert(
+                    project_id=task.project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=cap_alert_title,
+                    message=_escalate_message,
+                    task_id=task.id,
+                    event_type="review.escalated",
+                )
+                session.add(alert)
+                await session.commit()
+                await broadcast_to_project(
+                    str(task.project_id),
+                    "alert_created",
+                    {
+                        "alert_id": str(alert.id),
+                        "severity": "WARNING",
+                        "title": alert.title,
+                    },
+                )
+            else:
+                await session.commit()
+            logger.warning(
+                f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number} ({_fix_refusal_label})"
+            )
     # On every review rejection, store which issue categories caused it
     # on the original task.  Iteration 1 → _first_attempt_rejection_categories
     # (existing field); all iterations → _all_iterations_rejection_categories

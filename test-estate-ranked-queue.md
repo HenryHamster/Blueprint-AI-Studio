@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 644 | 1,006,662 | 26,764 | 11,116.778s (642 files) | 2 |
+| backend | 644 | 1,007,222 | 26,772 | 11,116.778s (642 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 113,094 | 6,178 | 317.583s (129 files) | 0 |
@@ -25,7 +25,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 1 | P2 | backend | `backend/testing/test_strategic_completion.py` | 21,426 | 616 | critical (>5000 LOC) | 603.712s measured | — |
 | 2 | P2 | backend | `backend/testing/test_release_qualifier__compute_composite.py` | 5,968 | 264 | critical (>5000 LOC) | 400.868s measured | — |
 | 3 | P2 | backend | `backend/testing/test_pipeline.py` | 6,841 | 277 | critical (>5000 LOC) | 318.896s measured | — |
-| 4 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,411 | 430 | critical (>5000 LOC) | 300.644s measured | — |
+| 4 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,894 | 437 | critical (>5000 LOC) | 300.644s measured | — |
 | 5 | P2 | backend | `backend/testing/test_task_lifecycle.py` | 13,145 | 323 | critical (>5000 LOC) | 207.992s measured | — |
 | 6 | P2 | backend | `backend/testing/test_reaper.py` | 21,152 | 492 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 492 |
 | 7 | P2 | backend | `backend/testing/test_research_completion.py` | 24,134 | 534 | critical (>5000 LOC) | 137.469s measured | — |
@@ -59,7 +59,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 35 | P2 | agent | `agent/src/handlers/strategic-resident.test.ts` | 9,165 | 135 | critical (>5000 LOC) | 13.729s measured | protected; declared floor 135 |
 | 36 | P2 | backend | `backend/testing/test_salvage_bundle_standalone.py` | 7,775 | 239 | critical (>5000 LOC) | 8.485s measured | — |
 | 37 | P2 | backend | `backend/testing/test_digest_metrics.py` | 8,216 | 251 | critical (>5000 LOC) | 8.434s measured | — |
-| 38 | P2 | backend | `backend/testing/test_agent_strategic_fetch.py` | 7,041 | 139 | critical (>5000 LOC) | 7.724s measured | protected; declared floor 139 |
+| 38 | P2 | backend | `backend/testing/test_agent_strategic_fetch.py` | 7,118 | 140 | critical (>5000 LOC) | 7.724s measured | protected; declared floor 140 |
 | 39 | P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification_2.py` | 7,021 | 112 | critical (>5000 LOC) | 5.220s measured | — |
 | 40 | P2 | backend | `backend/testing/test_strategic_state.py` | 10,654 | 174 | critical (>5000 LOC) | 4.542s measured | protected; declared floor 174 |
 | 41 | P2 | backend | `backend/testing/test_release_qualifier__sweep_stuck_qualifications.py` | 7,143 | 145 | critical (>5000 LOC) | 3.776s measured | — |

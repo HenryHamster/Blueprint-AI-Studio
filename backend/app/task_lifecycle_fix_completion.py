@@ -12,7 +12,7 @@ Free-variable set (per the design doc's live-in analysis): ``task``,
 ``task_payload``, ``review_loop``, and ``session``. Everything else the branch
 reads — ``_shared_state`` (for ``get_project_integration_branch``),
 ``flag_modified``, ``select``, the ``Alert``/``AlertSeverity``/``Project``/
-``Task`` models, ``SPAWN_REASON_KEY``/``SPAWN_REASON_DEFERRED``, and the
+``Task`` models, the shared ``spawn_refusal_*`` predicates, and the
 deferred-imported helpers below — resolves from this module's own namespace or
 a deferred import at call time.
 
@@ -41,8 +41,8 @@ from app.admin_approval_authority import (
 )
 from app.models import Alert, AlertSeverity, Project, Task
 from app.review_pipeline import (
-    SPAWN_REASON_DEFERRED,
-    SPAWN_REASON_KEY,
+    spawn_refusal_is_transient,
+    spawn_refusal_reason,
     stale_respawn_delta_base_sha,
 )
 import app.shared_state as _shared_state
@@ -301,8 +301,13 @@ async def run_fix_completion(
 
             # Read the precise spawn reason written by
             # _spawn_pipeline_task into the source task's context.
-            _sr = (task.context or {}).get(SPAWN_REASON_KEY, "unknown")
-            _is_transient = _sr == SPAWN_REASON_DEFERRED
+            _sr = spawn_refusal_reason(task)
+            # Shared predicate (app.review_pipeline) rather than an open-coded
+            # comparison: this module and app.review_request_changes each had
+            # their own copy of "is this refusal transient?", and only one of
+            # them was right — the other escalated a deferral as a stall
+            # requiring manual intervention. One definition, one behaviour.
+            _is_transient = spawn_refusal_is_transient(task)
 
             if _is_transient:
                 # Transient deferral (e.g. in-flight peer holds the
