@@ -276,6 +276,15 @@ _FILE_BUDGET_SECONDS_OVERRIDES = {
     # backend test roster. Measured 9.6s; carries @pytest.mark.timeout(120) to
     # match its sibling above. Same 120 + 60 relationship.
     "test_prune_stale_durations.py": 180,
+    # Real concurrency proofs for the duration-artifact lock: it forks actual
+    # merge_durations.py processes to show one blocks while another holds the
+    # lock, kills a holder to show the OS releases it, and drives the duration
+    # shell scripts through a real bash. Measured 7.4s warm / 13.3s cold on a
+    # developer host, i.e. already over half the 25s default on the cold pass,
+    # and the cost is inherent: a lock cannot be proven exclusive without a
+    # second real process. The file carries no timeout marker of its own, so
+    # this budget is sized purely for a loaded 2-vCPU CI runner (~8x measured).
+    "test_duration_generators.py": 60,
 }
 
 # CI's sharded pytest invocation passes ``--timeout=300`` (pytest-timeout) as a

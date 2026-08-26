@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal, resolve_dialect_name
+from app.derived_conflict_prompt import DERIVED_CONFLICT_PROMPT_BLOCK
 from app.closed_pr_reconciliation import (
     _owns_superseded_review_wait_approval_hold,
     append_superseded_pr_number,
@@ -2559,6 +2560,7 @@ async def _check_and_trigger_rollup(
                         f"that serve the original task goal on top of it.\n"
                         f"4. Run: git rebase --continue after resolving each file, "
                         f"then git push --force-with-lease"
+                        f"{DERIVED_CONFLICT_PROMPT_BLOCK}"
                     )
                 review_task, was_spawned = await _spawn_pipeline_task(
                     child,
@@ -5917,6 +5919,7 @@ async def _check_and_trigger_rollup(
                                 f"   resolution reverted a child's work — restore it before you push."
                                 f"{build_must_preserve_prompt_block(parent)}"
                                 f"{migration_guidance}"
+                                f"{DERIVED_CONFLICT_PROMPT_BLOCK}"
                             )
                         fix_task, _ = await _spawn_pipeline_task(
                             parent,

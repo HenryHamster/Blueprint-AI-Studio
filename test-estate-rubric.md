@@ -183,6 +183,25 @@ line count, threshold class, and test count from the canonical collectors in
 `backend/testing/identity_extraction.py`. Path discovery is shared with the
 duration freshness guards through `backend/testing/estate_inventory.py`.
 
+### Merge conflicts in the generated queue
+
+The queue is a total function of the tree, and Rank plus the estate-summary row
+are global, so ANY two branches that add or remove a test file conflict here --
+measured at 8 of 20 real `automain` re-sync merges (2026-08-26), more than every
+source conflict in that window combined. No merge driver can fix it: the correct
+content depends on the MERGED tree, which does not exist while git is merging
+content, so a driver could only pick a side and would trade a loud conflict for
+a silently stale report.
+
+Do not resolve it by hand and do not pick a side. Run:
+
+    bash scripts/resolve-derived-conflicts.sh
+
+which takes either side purely to clear the marker, regenerates from the merged
+tree, verifies with `--check`, and stages the result. It handles
+`backend/.test_durations` and `backend/testing/module_size_limits.json` in the
+same pass and refuses -- without touching the tree -- to guess at anything else.
+
 The Workday protection manifest is read-only input: its `test_count` values are
 reported as declared floors and are never rewritten or lowered by regeneration.
 Backend duration coverage is intentionally partial. Files without a committed

@@ -31,8 +31,18 @@ burns an LLM turn and a VM boot, then force-pushes and restarts CI.
 This module makes that class free. It resolves the conflict deterministically
 and refuses, loudly and without touching the tree, to guess at anything else.
 
-WHY THESE TWO PATHS, AND ONLY THESE TWO
----------------------------------------
+MEASURED FREQUENCY (2026-08-26)
+-------------------------------
+Twenty real ``origin/automain`` re-sync merges from automain's history were
+replayed from their two parents with STOCK drivers -- which is exactly what a
+developer clone has, and exactly how GitHub computes ``mergeable`` server-side.
+Nine conflicted. ``test-estate-ranked-queue.md`` accounted for eight of those
+nine (40% of all merges); ``module_size_limits.json`` for two and
+``cap_bump_history.json`` for one; only three carried a real source conflict.
+So the dominant cost of a merge in this repository is not merging code.
+
+WHY THESE PATHS, AND ONLY THESE
+-------------------------------
 The governing policy is ``scripts/derived_artifact_repair.py``'s module
 docstring, which sorts derived artifacts by whether they encode a DECISION.
 This module answers a strictly narrower question than that one -- not "may
@@ -40,9 +50,22 @@ this artifact be regenerated unattended?" but "is there exactly one correct
 merge of these two versions, derivable without judgement?" -- so it inherits
 that policy's taxonomy rather than restating it:
 
-* A **ratchet, floor, snapshot or cap** encodes a decision, and a merge of two
-  decisions is itself a decision. Never mechanical. Nothing of this kind is
-  registered here, and ``NEVER_MECHANICAL`` pins the reason per artifact.
+* A **ratchet, floor or snapshot** encodes a decision, and a merge of two
+  decisions is itself a decision. Never mechanical, and ``NEVER_MECHANICAL``
+  pins the reason per artifact.
+
+* A **cap** would be one of those, except that this repository has already
+  decided otherwise IN CODE: ``backend/testing/merge_size_limits.py`` is the
+  registered ``sizecap`` merge driver, it max-unions competing caps, and
+  ``rollup_size_preflight.py`` raises caps unattended as well. So
+  ``module_size_limits.json`` is registered here by REPLAYING that driver over
+  the merge stages -- not by reimplementing it, and not by ruling on it a
+  second time. Until this entry existed, the two modules contradicted each
+  other in writing: ``.gitattributes`` said the conflict auto-resolves while
+  ``NEVER_MECHANICAL`` said an agent must never resolve it unattended, and the
+  only effect of that disagreement was that a conflict the driver would have
+  prevented reached an LLM whenever it materialized somewhere the driver was
+  not registered.
 
 * A **pure report** encodes neither a decision nor an observation. It is a
   total function of the tree, so the conflicted *content* is irrelevant: the
@@ -73,14 +96,23 @@ dropped an existing entry is handed to a human rather than silently discarded.
 It never regenerates an artifact that is not conflicted. Staleness that no
 merge caused belongs to ``scripts/sentinel_freshness.py``.
 
-TWO ENTRY POINTS, ONE POLICY
-----------------------------
+THREE ENTRY POINTS, ONE POLICY
+------------------------------
 ``--merge-driver %O %A %B`` is the git custom merge driver for
 ``backend/.test_durations``, registered exactly like the existing ``sizecap``
 driver for ``module_size_limits.json`` (``.gitattributes`` plus a
-``merge.testdurations.driver`` git-config entry that the agent's workspace prep
-installs, because a clone does not carry git config). It stops the conflict
-from ever materializing during a local rebase or merge.
+``merge.testdurations.driver`` git-config entry, because a clone does not carry
+git config). It stops the conflict from ever materializing during a local
+rebase or merge.
+
+``--register-drivers`` installs BOTH drivers into whatever clone it is run in.
+``.gitattributes`` is only half the wiring and the other half used to be
+installed in exactly one place -- ``agent/src/index.ts``, at agent
+workspace-prep time -- so the fleet had the drivers and a developer clone had
+them nowhere. Every hand-resolution of these paths on a developer host was this
+repository's own machinery being absent at the point of use. The developer gate
+(``scripts/check-default.sh``) and ``scripts/resolve-derived-conflicts.sh`` now
+call it, so a clone that has ever run either one has the drivers live.
 
 ``--resolve`` is the recovery pass for a conflict that materialized anyway --
 because GitHub computes ``mergeable`` server-side with stock drivers and never
@@ -117,17 +149,21 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 __all__ = [
     "MechanicalResolution",
+    "MergeDriver",
     "NotInsertOnly",
     "ResolveOutcome",
     "MECHANICAL_RESOLVERS",
+    "MERGE_DRIVERS",
     "NEVER_MECHANICAL",
     "classify_conflicts",
+    "register_merge_drivers",
     "union_insert_only",
     "render_durations",
     "resolve_merge",
@@ -164,6 +200,14 @@ class MechanicalResolution:
     verify: tuple[str, ...] = ()
     """For ``regenerate``: a command that must exit 0 once the artifact is written."""
 
+    driver: tuple[str, ...] = ()
+    """For ``sizecap_union``: the repo-relative git merge driver to run as ``%O %A %B``.
+
+    Named separately from ``regenerate`` because it is a different operation on
+    different inputs: a generator derives the artifact from the merged TREE,
+    whereas a driver is handed the three merge STAGES and never reads the tree.
+    """
+
 
 MECHANICAL_RESOLVERS: dict[str, MechanicalResolution] = {
     "backend/.test_durations": MechanicalResolution(
@@ -198,6 +242,24 @@ MECHANICAL_RESOLVERS: dict[str, MechanicalResolution] = {
         regenerate=("scripts/generate_test_estate_ranked_queue.py", "--write"),
         verify=("scripts/generate_test_estate_ranked_queue.py", "--check"),
     ),
+    "backend/testing/module_size_limits.json": MechanicalResolution(
+        path="backend/testing/module_size_limits.json",
+        strategy="sizecap_union",
+        phase=PHASE_CONTENT_MERGE,
+        why=(
+            "Not a new judgement: this repository ALREADY resolves this exact "
+            "conflict mechanically. backend/testing/merge_size_limits.py is the "
+            "registered `sizecap` merge driver (.gitattributes) and performs a "
+            "max-cap union, and rollup_size_preflight.py appends auto-bumps of "
+            "its own. Declining it here only meant that a conflict which the "
+            "driver would have prevented -- but which materialized anyway, "
+            "because GitHub computes mergeability server-side with STOCK "
+            "drivers -- reached an LLM instead. This entry runs that same "
+            "driver over the three merge stages, so there is one implementation "
+            "and one policy rather than two that disagree."
+        ),
+        driver=("backend/testing/merge_size_limits.py",),
+    ),
 }
 
 
@@ -212,10 +274,14 @@ NEVER_MECHANICAL: dict[str, str] = {
         "ratifies every event_type both of them added, which is precisely the "
         "human ratification the snapshot exists to require."
     ),
-    "backend/testing/module_size_limits.json": (
-        "Size caps are policy, and a conflict here means two branches chose "
-        "different caps for the same module. Taking either side, or the max, "
-        "is a policy decision an agent must not make unattended."
+    "backend/testing/cap_bump_history.json": (
+        "An append-only ledger of cap bumps, keyed by commit sha, that the "
+        "deployed backend reads INSTEAD of git log. A union of two sides is "
+        "very likely correct and is worth building, but no shipped driver "
+        "already performs it, so doing it here would be this module inventing "
+        "a policy rather than reusing one. Repair it with "
+        "`python3 backend/testing/check_size_limits.py --fix`, which rebuilds "
+        "the ledger from git."
     ),
     "admin-ui/.test_durations.json": (
         "Unlike backend/.test_durations these are regenerated wholesale by a "
@@ -228,6 +294,90 @@ NEVER_MECHANICAL: dict[str, str] = {
         "Same shape and same reason as admin-ui/.test_durations.json."
     ),
 }
+
+
+@dataclass(frozen=True)
+class MergeDriver:
+    """One custom git merge driver, as ``.gitattributes`` names it."""
+
+    name: str
+    """The ``merge=<name>`` value in .gitattributes, and the git-config key."""
+
+    description: str
+    """Stored as ``merge.<name>.name``; git prints it in merge diagnostics."""
+
+    script: str
+    """Repo-relative script the driver runs, invoked as ``%O %A %B``."""
+
+    args: tuple[str, ...] = ()
+    """Arguments between the script and ``%O %A %B``."""
+
+    def command(self, python: str) -> str:
+        """The ``merge.<name>.driver`` command line, quoted for git's shell split."""
+        parts = [f'"{python}"', f'"{self.script}"', *self.args, "%O", "%A", "%B"]
+        return " ".join(parts)
+
+
+MERGE_DRIVERS: tuple[MergeDriver, ...] = (
+    MergeDriver(
+        name="sizecap",
+        description="max-cap union merge for module_size_limits.json",
+        script="backend/testing/merge_size_limits.py",
+    ),
+    MergeDriver(
+        name="testdurations",
+        description="insert-only union merge for backend/.test_durations",
+        script="scripts/derived_artifact_merge_resolve.py",
+        args=("--merge-driver",),
+    ),
+)
+
+
+def register_merge_drivers(
+    repo: Path, python: str | None = None
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Install every :data:`MERGE_DRIVERS` entry in ``repo``'s LOCAL git config.
+
+    ``.gitattributes`` maps the paths to ``merge=sizecap`` / ``merge=testdurations``,
+    but git IGNORES that mapping unless the driver command is registered in the
+    repository's own config -- and a clone does not carry git config. Until this
+    function ran somewhere, those two paths conflicted textually on every merge
+    even though the repo ships a correct mechanical merge for both.
+
+    That gap was not uniform: ``agent/src/index.ts`` installs the drivers at
+    every agent workspace-prep site, so the FLEET has had them all along, while
+    a developer clone had them nowhere. Every hand-resolution of these paths on
+    a developer host was the pipeline's own machinery being absent at the point
+    of use, which is why this is callable from the developer gate too.
+
+    ``python`` defaults to the interpreter running this process rather than the
+    literal ``python3``: Git Bash on a Windows developer host has no ``python3``
+    (the python.org installer publishes ``python.exe`` only), so a hard-coded
+    ``python3`` registers a driver that always fails -- and a failing driver is
+    indistinguishable from an unregistered one except that it is slower.
+
+    Idempotent: ``git config`` overwrites the keys. Best-effort and PER DRIVER,
+    matching ``registerDerivedArtifactMergeDrivers`` in the agent -- failing to
+    register one only means that path falls back to the normal conflict route,
+    which is strictly today's behaviour, so a partial success is worth keeping.
+
+    Returns ``(registered_names, failures_by_name)``.
+    """
+    interpreter = python or sys.executable
+    registered: list[str] = []
+    failures: dict[str, str] = {}
+    for driver in MERGE_DRIVERS:
+        try:
+            _git(repo, ["config", f"merge.{driver.name}.name", driver.description])
+            _git(
+                repo,
+                ["config", f"merge.{driver.name}.driver", driver.command(interpreter)],
+            )
+        except RuntimeError as exc:
+            failures[driver.name] = str(exc)
+            continue
+        registered.append(driver.name)
+    return tuple(registered), failures
 
 
 class NotInsertOnly(ValueError):
@@ -420,6 +570,78 @@ def _resolve_json_insert_union(repo: Path, path: str) -> str:
     )
 
 
+def _resolve_sizecap_union(repo: Path, entry: MechanicalResolution) -> str:
+    """Replay this path's registered git merge driver over the three merge stages.
+
+    Deliberately a SUBPROCESS of the very script ``.gitattributes`` names, not a
+    reimplementation of it and not an import of ``merge_limits``. The driver
+    already ships, is already registered on every agent workspace, and already
+    owns the max-cap policy and the byte-exact writer that keeps its output
+    identical to ``check_size_limits.write_limits``. Running it verbatim is what
+    makes this entry a REACH of an existing decision rather than a second one:
+    there is no second implementation that can drift, and the driver's own
+    fail-closed contract (any non-zero exit leaves the conflict) is inherited
+    rather than restated.
+    """
+    script = repo / entry.driver[0]
+    if not script.is_file():
+        raise RuntimeError(f"merge driver not found: {entry.driver[0]}")
+    raw_ours = _read_stage(repo, 2, entry.path)
+    raw_theirs = _read_stage(repo, 3, entry.path)
+    if raw_ours is None or raw_theirs is None:
+        raise RuntimeError(
+            f"{entry.path}: expected both sides of the conflict to exist "
+            f"(ours={'present' if raw_ours else 'absent'}, "
+            f"theirs={'present' if raw_theirs else 'absent'}); "
+            "an add/delete conflict is a real divergence, not a competing cap"
+        )
+    raw_base = _read_stage(repo, 1, entry.path)
+    with tempfile.TemporaryDirectory() as tmp:
+        stage_paths = []
+        for label, payload in (
+            ("O", raw_base or ""),
+            ("A", raw_ours),
+            ("B", raw_theirs),
+        ):
+            stage = Path(tmp) / label
+            # newline="" so the bytes handed to the driver are exactly the bytes
+            # git staged. A CRLF rewrite here would make the resolution differ
+            # from what the driver produces during a real merge on the same input.
+            with open(stage, "w", encoding="utf-8", newline="") as handle:
+                handle.write(payload)
+            stage_paths.append(str(stage))
+        result = subprocess.run(
+            [sys.executable, str(script), *entry.driver[1:], *stage_paths],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"{entry.driver[0]} exited {result.returncode}: "
+                f"{(result.stderr or result.stdout).strip()[:400]}"
+            )
+        # %A is both OUR version and the path the driver writes its resolution to.
+        resolved = Path(stage_paths[1]).read_text(encoding="utf-8")
+    try:
+        merged = json.loads(resolved)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{entry.driver[0]} exited 0 but emitted invalid JSON ({exc}); "
+            "refusing to stage a resolution that would land broken"
+        ) from exc
+    with open(repo / entry.path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(resolved)
+    _git(repo, ["add", "--", entry.path])
+    sections = sum(1 for value in merged.values() if isinstance(value, dict))
+    return (
+        f"max-cap union via the registered {entry.driver[0]} merge driver "
+        f"({sections} section(s))"
+    )
+
+
 def _resolve_regenerate(repo: Path, entry: MechanicalResolution) -> str:
     """Regenerate a pure report from the merged tree and stage the result."""
     script = repo / entry.regenerate[0]
@@ -489,6 +711,8 @@ def resolve_merge(repo: Path) -> ResolveOutcome:
         try:
             if entry.strategy == "json_insert_union":
                 details[path] = _resolve_json_insert_union(repo, path)
+            elif entry.strategy == "sizecap_union":
+                details[path] = _resolve_sizecap_union(repo, entry)
             elif entry.strategy == "regenerate":
                 details[path] = _resolve_regenerate(repo, entry)
             else:  # pragma: no cover - guarded by the registry itself
@@ -590,10 +814,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar=("ANCESTOR", "OURS", "THEIRS"),
         help="Run as the git merge driver for backend/.test_durations (%%O %%A %%B)",
     )
+    parser.add_argument(
+        "--register-drivers",
+        action="store_true",
+        help=(
+            "Install the repo's custom merge drivers in this clone's git config "
+            "and exit. A clone does not carry git config, so .gitattributes "
+            "alone leaves them inert."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.merge_driver:
         return merge_driver(*args.merge_driver)
     repo = _repo_root(args.repo)
+
+    if args.register_drivers:
+        registered, failures = register_merge_drivers(repo)
+        if args.json:
+            print(
+                json.dumps(
+                    {"registered": list(registered), "failures": failures},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            for name in registered:
+                print(f"registered merge driver {name}")
+            for name, reason in sorted(failures.items()):
+                print(f"could not register merge driver {name}: {reason}", file=sys.stderr)
+        # Partial registration is strictly better than none and matches the
+        # agent's per-driver best-effort loop, so only a total failure is an
+        # error the caller should act on.
+        return 1 if failures and not registered else 0
 
     outcome = resolve_merge(repo)
     if args.json:
