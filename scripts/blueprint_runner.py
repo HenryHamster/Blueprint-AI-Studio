@@ -440,10 +440,25 @@ def _image_present(tag: str, *, _run=subprocess.run) -> bool:
 def _agent_source_revision(
     *, repo_root: str = _REPO_ROOT, _run=subprocess.run
 ) -> str | None:
-    """Return the committed agent tree id used to invalidate local images."""
+    """Return the committed agent tree id used to invalidate local images.
+
+    ``-c safe.directory=<repo_root>``: this read is FAIL-OPEN by construction.
+    A ``None`` here leaves ``source_revision`` falsy in
+    :func:`ensure_agent_image`, which short-circuits ``_image_source_revision``
+    and forces ``source_mismatch`` to ``False`` -- so a STALE agent image is
+    reported "present -> docker-agent path ON" and reused. That is the
+    orchestrator-ahead-of-agent-image wedge, arrived at not by deciding the
+    image was current but by never being allowed to look.
+
+    The condition is ordinary here: ``blueprint-runner`` is installed as a
+    systemd unit whose ``User=`` is frequently not the uid that owns the
+    checkout, and git answers every command in that case with "detected
+    dubious ownership" and exit 128. Naming the checkout safe makes the read
+    WORK; it does not soften what a genuine failure means.
+    """
     try:
         result = _run(
-            ["git", "rev-parse", "HEAD:agent"],
+            ["git", "-c", f"safe.directory={repo_root}", "rev-parse", "HEAD:agent"],
             capture_output=True,
             text=True,
             timeout=15,
