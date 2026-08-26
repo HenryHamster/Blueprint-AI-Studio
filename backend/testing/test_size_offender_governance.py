@@ -2185,6 +2185,86 @@ def test_every_literal_git_argv_in_the_size_guard_is_safe_directory_hardened():
     )
 
 
+def test_governance_cap_prefilter_is_semantics_preserving():
+    """The substring prefilter must never change what a scan discovers.
+
+    ``governance_caps_from_source_text`` screens source text for the literal
+    ``_SIZE_GOVERNANCE_CAP`` before paying for ``ast.parse``. That is the
+    difference between a 21.25s and a 1.86s five-section live-tree scan, which
+    is what makes ``test_module_size_live_tree.py`` cheap enough to be
+    mandatory on every impacted run. It is safe only because every declaration
+    the parser can recognise binds a NAME ending in that literal, so the screen
+    and the matcher must stay the SAME string.
+    Both are read structurally out of the function's own AST and pinned against
+    a literal written here, so a rename cannot certify itself.
+    """
+    func = next(
+        node
+        for node in ast.walk(ast.parse(Path(slp.__file__).read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "governance_caps_from_source_text"
+    )
+    # The screen: a bare ``"..." in source_text`` membership test.
+    screens = {
+        node.left.value
+        for node in ast.walk(func)
+        if isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], (ast.In, ast.NotIn))
+        and isinstance(node.left, ast.Constant)
+        and isinstance(node.left.value, str)
+    }
+    # The matcher: the argument to the ``target.id.endswith(...)`` call.
+    matchers = {
+        node.args[0].value
+        for node in ast.walk(func)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "endswith"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+    literals = screens | matchers
+    assert screens and matchers, (
+        "expected governance_caps_from_source_text to keep both a substring "
+        f"screen and an endswith() matcher; found screens={sorted(screens)} "
+        f"matchers={sorted(matchers)}"
+    )
+    assert literals == {"_SIZE_GOVERNANCE_CAP"}, (
+        "the prefilter screen and the endswith() name matcher must use the SAME "
+        f"literal; found {sorted(literals)}. A screen stricter than the matcher "
+        "silently stops discovering caps and the size gate goes vacuous."
+    )
+
+    # Recognised forms still parse, with and without an annotation.
+    assert slp.governance_caps_from_source_text(
+        "_MODULE_SIZE_GOVERNANCE_CAP = 900\n"
+    ) == [900]
+    assert slp.governance_caps_from_source_text(
+        "_MODULE_SIZE_GOVERNANCE_CAP: int = 900\n"
+    ) == [900]
+
+    # A file with no declaration is screened out -- same answer as before.
+    assert slp.governance_caps_from_source_text("x = 1\n") == []
+
+    # The prefilter is a SUPERSET screen, never a matcher: source that carries
+    # the literal only in a comment or an unrelated name still parses and still
+    # yields nothing, so the screen cannot manufacture a cap either.
+    assert slp.governance_caps_from_source_text(
+        "# _SIZE_GOVERNANCE_CAP is documented here\nx = 1\n"
+    ) == []
+    assert slp.governance_caps_from_source_text(
+        "_SIZE_GOVERNANCE_CAPS_BY_NAME = {'a': 5}\n"
+    ) == []
+
+    # Syntactically invalid source that DOES carry the literal still degrades
+    # to [] rather than raising past the prefilter.
+    assert slp.governance_caps_from_source_text(
+        "_MODULE_SIZE_GOVERNANCE_CAP = (\n"
+    ) == []
+
+
 # ---------------------------------------------------------------------------
 # Section-collision attribution.
 #
