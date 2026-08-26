@@ -379,3 +379,86 @@ async def grant_project_to_owner_runners(
             project.id,
         )
     return {"granted_runner_ids": granted_runner_ids, "warnings": warnings}
+
+
+# ── Unsatisfiable local placement ────────────────────────────────────────────
+# ``count_runners_allowed_for_project`` answers "is ANY runner attached to this
+# project?" and deliberately counts a runner that is merely paused or unhealthy
+# (see :data:`LOCAL_CAPACITY_WAIT_MESSAGE`).  That is the right question for the
+# managed-compute hold, but it is NOT sufficient for the ``local_only``
+# execution-placement wait, which promises local execution and has no timeout.
+#
+# A project whose only bound runner is PAUSED has a non-zero bound count and yet
+# zero dispatchable capacity: no cycle can ever pin its work, and no amount of
+# waiting changes that.  The distinction that matters for a no-timeout wait is
+# therefore "can any LIVE runner serve this project?", which is exactly what the
+# orchestrator's active-runner cache already encodes (status='active' AND a
+# fresh heartbeat, expanded over the binding allow-list).  These helpers name
+# that condition and its remedy.
+
+#: Structured reason code stamped on a ``local_only`` wait that cannot be
+#: satisfied by waiting.  Distinct from ``no_eligible_local_runner`` (the
+#: genuinely transient "bound fleet is busy" backpressure) so read models,
+#: alerting, and the stalled-cycle reaper can tell a permanent block from a
+#: temporary one without parsing prose.
+NO_ACTIVE_RUNNER_BOUND_REASON = "no_active_runner_bound_to_project"
+
+
+def unsatisfiable_local_placement_clause(bound_runner_count: int | None) -> str:
+    """Operator-facing clause for "zero LIVE runners can serve this project".
+
+    ``bound_runner_count`` refines the REMEDY, not the diagnosis: the caller has
+    already established that no live runner is available.  Zero bound runners is
+    a missing grant; a non-zero count means runners are attached but none are
+    active and heartbeating, so the fix is to resume/restore one rather than to
+    grant another.
+    """
+    if bound_runner_count == 0:
+        return (
+            "no local runner is bound to this project (0 runners on its "
+            "allow-list), so this wait can never be satisfied — grant one with "
+            f"{RUNNER_BINDING_GRANT_ENDPOINT}"
+        )
+    if bound_runner_count is None:
+        return (
+            "no active local runner is bound to this project, so this wait can "
+            "never be satisfied — bind or resume a runner for it with "
+            f"{RUNNER_BINDING_GRANT_ENDPOINT}"
+        )
+    return (
+        f"{bound_runner_count} local runner(s) are bound to this project but "
+        "NONE are active and heartbeating, so this wait can never be satisfied "
+        "— resume or restore a bound runner, or grant an active one with "
+        f"{RUNNER_BINDING_GRANT_ENDPOINT}"
+    )
+
+
+def unsatisfiable_local_placement_snapshot(
+    bound_runner_count: int | None,
+) -> dict[str, Any]:
+    """Durable, machine-readable record of an unsatisfiable ``local_only`` wait."""
+
+    return {
+        "reason": NO_ACTIVE_RUNNER_BOUND_REASON,
+        "message": unsatisfiable_local_placement_clause(bound_runner_count),
+        "bound_runner_count": bound_runner_count,
+        "active_runner_count": 0,
+        "remedy": RUNNER_BINDING_GRANT_ENDPOINT,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def resolve_unsatisfiable_local_placement(
+    session: AsyncSession, project_id: uuid.UUID | None
+) -> dict[str, Any]:
+    """Build the unsatisfiable-placement snapshot for ``project_id``.
+
+    Call ONLY once the caller has established from the live dispatch cache that
+    zero active runners can serve the project.  That emptiness is the
+    authoritative signal and it comes from the caller, not from this query --
+    the bound-runner count read here only refines the remedy wording (grant a
+    runner vs. resume the one already bound).
+    """
+    return unsatisfiable_local_placement_snapshot(
+        await count_runners_allowed_for_project(session, project_id)
+    )
