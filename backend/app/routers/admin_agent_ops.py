@@ -5134,7 +5134,11 @@ async def strategic_operation(
         )
         _qr_task_id = task.id
         _qr_project_id = project.id
-        await _apply_new_version_goal(
+        # ``_received`` says the field survived extraction; ``_applied`` says it
+        # actually reached the open version. They differ when there is no open
+        # ReleaseVersion, and the gap is the point: without it the agent reads
+        # "received" and believes the objective landed.
+        _nvg_applied = await _apply_new_version_goal(
             new_version_goal, task, project, session, path="api_inline"
         )
         await _apply_new_acceptance_criteria(
@@ -5206,6 +5210,7 @@ async def strategic_operation(
                 "version_phase_decision_received": version_phase_decision is not None,
                 "qualify_request_received": qualify_request is not None,
                 "new_version_goal_received": new_version_goal is not None,
+                "new_version_goal_applied": bool(_nvg_applied),
                 "new_acceptance_criteria_received": new_acceptance_criteria is not None,
             }
         )
