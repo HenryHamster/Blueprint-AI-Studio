@@ -220,6 +220,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "release.managed_check_wait_stalled": OPERATOR_FYI,
     "release.qualification_timeout": OPERATOR_ACTION_NEEDED,
     "release.qualification_crash_loop": OPERATOR_ACTION_NEEDED,
+    "release.qualification_trigger_unowned": OPERATOR_ACTION_NEEDED,
     "release.qualification_ci_compliance_block": OPERATOR_FYI,
     "release.walkthrough_key_unmatched": OPERATOR_ACTION_NEEDED,
     # Self-review quality
