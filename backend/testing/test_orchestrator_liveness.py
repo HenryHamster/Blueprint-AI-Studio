@@ -10,10 +10,15 @@ froze the whole pipeline. The fix gates liveness on an in-cycle progress
 from the live PR head so a missing stored branch can't wedge a poison task.
 """
 
+import ast
 import asyncio
+import os
+import subprocess
+import sys
 import threading
 import uuid
 from datetime import timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2058,3 +2063,156 @@ class TestHardWatchdogThread:
             assert not fired.wait(timeout=0.5), "watchdog must not kill a follower"
         finally:
             _orch.stop_orchestrator_hard_watchdog()
+
+
+# ---------------------------------------------------------------------------
+# The hard watchdog must not outlive the lifespan that armed it.
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS PINS
+# --------------------
+# `app.lifecycle.lifespan` arms a DAEMON thread whose abort callback is the real
+# `_default_hard_abort`, which ends in `os._exit(1)`. Nothing stopped it:
+# `stop_orchestrator_hard_watchdog` had ZERO production call sites. So any
+# pytest session that entered the lifespan as leader kept a live process-killer
+# for the rest of the run — and `_shared_state.is_leader` was never reset either,
+# so the `is_guarded` gate that is supposed to protect a non-leader stayed open.
+#
+# ~240s (ORCHESTRATOR_HARD_WATCHDOG_SECONDS) after the last orchestrator progress
+# stamp, it called `os._exit(1)` on the whole pytest process. `os._exit` skips
+# `pytest_sessionfinish`, so pytest printed NO summary, NO `FAILED` line, and
+# stopped mid progress line while still exiting 1.
+#
+# Observed three times on PR #18011 (`Impacted backend tests`, runs
+# 32998752057 / 33000772113 / 33002910941). In all three the abort landed
+# 247-255s after `testing/test_orchestrator.py` finished — the last file in that
+# selection to stamp the heartbeat — i.e. inside the `(240s, 240s + 15s poll]`
+# window the bound predicts. Run 33002910941 had ZERO failing tests and still
+# exited 1, which is the cleanest proof the exit was a kill and not a verdict.
+#
+# WHY A SUBPROCESS
+# ----------------
+# The failure mode IS "this process dies", so it cannot be observed in-process:
+# a passing assertion here would be indistinguishable from the bug, because the
+# bug destroys the test runner rather than failing a test. The child arms the
+# REAL `_default_hard_abort` — not an injected fake — so what is proven is the
+# actual `os._exit(1)`, and the child's own exit code is the assertion.
+
+
+_WATCHDOG_SURVIVAL_CHILD = '''
+import sys, time
+
+import app.lifecycle as _lifecycle
+import app.orchestrator as _orch
+import app.shared_state as _ss
+from datetime import timedelta
+from app.time_utils import _utcnow
+
+# 1. Arm exactly as the lifespan does: real abort callback, real loop. Poll fast
+#    so the whole test costs a fraction of a second instead of 240s. Not guarded
+#    yet, so it cannot fire before the disarm under test.
+_ss.is_leader = False
+_orch._orchestrator_last_cycle = None
+_orch._orchestrator_last_progress = None
+_orch._orchestrator_cycle_started = None
+_orch.start_orchestrator_hard_watchdog(
+    is_guarded=lambda: _ss.is_leader,
+    poll_interval=0.01,
+)
+
+# 2. The shutdown step under test.
+_lifecycle._disarm_orchestrator_hard_watchdog()
+
+# 3. Now make every kill precondition true. A thread that survived step 2 sees a
+#    guarded leader whose heartbeat is far past the hard bound, and hard-exits.
+_orch._orchestrator_last_progress = _utcnow() - timedelta(
+    seconds=_orch.ORCHESTRATOR_HARD_WATCHDOG_SECONDS + 600
+)
+_ss.is_leader = True
+
+# 4. 50x the poll interval. An armed watchdog cannot miss this window.
+time.sleep(0.5)
+
+print("SURVIVED", flush=True)
+sys.exit(0)
+'''
+
+
+# The inner subprocess timeout is at/above testing/test_harness_timeout_budgets.py's
+# 30s inner-operation ceiling, so it has to declare the outer budget it needs.
+# 180 > 60 leaves the child's own timeout room to fire and be REPORTED
+# ("the child hung") instead of being killed by the lane and reported as a
+# nameless flake -- the budget-inversion class that guard exists to prevent.
+@pytest.mark.timeout(180)
+def test_lifespan_shutdown_disarms_the_hard_watchdog(tmp_path):
+    """A disarmed watchdog lets the process live; an armed one os._exit(1)s it.
+
+    MUTATION-PROVEN: deleting the `stop_orchestrator_hard_watchdog()` call from
+    `_disarm_orchestrator_hard_watchdog` makes the child exit 1 with no
+    "SURVIVED" on stdout and the `_default_hard_abort` faulthandler dump on
+    stderr — the exact shape of the three PR #18011 CI reds.
+    """
+    child = tmp_path / "watchdog_survival_child.py"
+    child.write_text(_WATCHDOG_SURVIVAL_CHILD, encoding="utf-8")
+
+    backend_dir = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(backend_dir), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+
+    proc = subprocess.run(
+        [sys.executable, str(child)],
+        cwd=str(backend_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        # Comfortably above the child's own 0.5s sleep plus a cold interpreter
+        # start and app import, and well below the 180s marker above, so the
+        # inner wait can never race the outer kill (the budget-inversion class).
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, (
+        "the hard watchdog survived lifespan shutdown and hard-exited the "
+        f"process (rc={proc.returncode}).\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    )
+    assert "SURVIVED" in proc.stdout
+    # The kill is silent by construction, so pin its fingerprint too: if the
+    # watchdog HAD fired, this is what would be in stderr. Asserting its absence
+    # keeps the test from passing for some unrelated reason.
+    assert "HARD-WATCHDOG" not in proc.stderr
+    assert "_default_hard_abort" not in proc.stderr
+
+
+def test_every_hard_watchdog_start_site_has_a_matching_stop():
+    """Structural pin so the pairing cannot be dropped again, or reintroduced
+    unpaired somewhere new.
+
+    The behavioural test above proves today's single call site. This one bounds
+    the whole application package: arming a process-killer without a disarm is
+    the defect class, independent of which module does it.
+    """
+    app_dir = Path(__file__).resolve().parent.parent / "app"
+    unpaired = []
+    for path in sorted(app_dir.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "start_orchestrator_hard_watchdog" not in source:
+            continue
+        tree = ast.parse(source)
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        if "start_orchestrator_hard_watchdog" not in called:
+            # A re-export or a docstring mention, not a start site.
+            continue
+        if "stop_orchestrator_hard_watchdog" not in called:
+            unpaired.append(str(path.relative_to(app_dir.parent)))
+
+    assert not unpaired, (
+        "these modules arm the hard watchdog (a daemon thread that ends in "
+        "os._exit(1)) without ever stopping it: " + ", ".join(unpaired)
+    )
