@@ -37,6 +37,7 @@ from app.discovery_authority_reconciliation import (
     reconcile_stalled_direction_authority as _reconcile_stalled_direction_authority,
 )
 from app.discovery_review_packet import (
+    DISCOVERY_BUDGET_CLASS_BLOCKER_CODES,
     DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS as _DECISION_SNAPSHOT_CHARS,
     DISCOVERY_REVIEW_MAX_PACKET_ITEMS as _MAX_PACKET_ITEMS,
     DISCOVERY_SUBSTANTIVE_EMPTINESS_REASON_CODES,
@@ -101,6 +102,13 @@ DISCOVERY_RECOMMISSION_CEILING_REACHED = "discovery_recommission_ceiling_reached
 # reviewer simply had not checked, so the engine commissioned the bounded
 # measurement it was already authorised to run.
 DISCOVERY_ESCALATION_WAS_ANSWERABLE = "discovery_escalation_was_answerable"
+# Reason code for an escalation the engine declined to forward because the only
+# thing withholding binding authority was a bounded budget the packet could not
+# fit -- never an authority question. The operator has nothing to add to such a
+# question: the evidence is in the engine's own database, and the packet's own
+# blockers say so. Routing it to a bounded measure/recommission (subject to the
+# same ceiling) is the graceful degradation; asking is the defect.
+DISCOVERY_ESCALATION_WAS_BUDGET_BOUND = "discovery_escalation_was_budget_bound"
 
 _ACTIVE_COHORT_STATUSES = frozenset(
     {
@@ -1137,6 +1145,7 @@ def _convert_escalation_to_evidence_bet(
     *,
     cycle: DiscoveryCycle,
     decision_receipt_ids: set[str],
+    reason_code: str = DISCOVERY_ESCALATION_WAS_ANSWERABLE,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Dispatch a reviewer's unanswered evidence question instead of escalating.
 
@@ -1149,6 +1158,13 @@ def _convert_escalation_to_evidence_bet(
     ``discovery_ask_operator_awaiting_resolution`` for ~16 hours on 2026-08-24
     asking permission to re-dispatch a verification task it was already
     authorised to dispatch.
+
+    Also reached, since 2026-08-25, when the packet WITHHELD binding authority
+    but every blocker was a bounded-budget overflow (``reason_code`` is
+    ``DISCOVERY_ESCALATION_WAS_BUDGET_BOUND``). That state is not an authority
+    question either: the packet could not carry evidence the engine is still
+    holding, and its own blockers name exactly what did not fit, which is
+    precisely what a bounded measurement can go and re-read.
 
     The reviewer's epistemic caution is preserved exactly -- no pass/fail grade
     is fabricated for the bet it could not verify.  Its own question becomes
@@ -1190,8 +1206,14 @@ def _convert_escalation_to_evidence_bet(
             ),
         }
     )
+    provenance = (
+        "granted binding authority"
+        if reason_code == DISCOVERY_ESCALATION_WAS_ANSWERABLE
+        else "withheld binding authority only over a bounded budget it could not "
+        "fit -- evidence the engine holds either way"
+    )
     disposition = (
-        "Engine disposition: this decision packet granted binding authority, so "
+        f"Engine disposition: this decision packet {provenance}, so "
         "the unanswered evidence question was dispatched as a bounded measure "
         "bet instead of escalated to the operator. No pass/fail grade was "
         "recorded for the prior bet."
@@ -1207,8 +1229,12 @@ def _convert_escalation_to_evidence_bet(
         "operator_question": None,
     }
     conversion_record = {
-        "reason": "binding_decision_allowed",
-        "reason_code": DISCOVERY_ESCALATION_WAS_ANSWERABLE,
+        "reason": (
+            "binding_decision_allowed"
+            if reason_code == DISCOVERY_ESCALATION_WAS_ANSWERABLE
+            else "binding_blockers_budget_class_only"
+        ),
+        "reason_code": reason_code,
         "disposition": "evidence_bet",
         "original_action": "ask_operator",
         "original_operator_question": question[:2_000],
@@ -1282,6 +1308,49 @@ def packet_substantive_emptiness_reason_code(
     )
 
 
+def packet_blockers_are_budget_class_only(payload: Mapping[str, Any]) -> bool:
+    """Is a packet's withheld authority purely a bounded-budget overflow?
+
+    ``binding_decision_allowed: false`` says the packet could not carry all of
+    its evidence whole. It has never said an operator is needed -- and in fact
+    every condition that can produce it is a budget overflow: an authority
+    snapshot too long to page, withheld records dropped by the research parent's
+    own carry bound, or an omitted-item cohort too numerous to pay the per-item
+    legibility floor. The engine is holding all of it; a human asked to resolve
+    one of these has nothing to contribute but a trip to the database.
+
+    Until this existed, that state left ``ask_operator`` as the ONLY permitted
+    verdict, which made a bounded budget the sole remaining way for the decision
+    boundary to reach a human at all -- the exact inversion the operator called
+    out: authority revoked and the question handed back because a bound
+    overflowed.
+
+    Fails closed in every direction that matters. A packet with no codes
+    (frozen before this field existed), a blocker with no code beside it -- the
+    codes are positional, so a length mismatch means a blocker of unknown class
+    -- or any code outside the budget-class vocabulary is NOT budget-class, so a
+    genuine authority blocker added later keeps its escalation. Requires the
+    builder's own boolean AND re-verifies the codes here rather than trusting
+    either alone.
+    """
+
+    manifest = payload.get("evidence_packet_manifest")
+    if not isinstance(manifest, Mapping):
+        return False
+    codes = manifest.get("binding_action_blocker_codes")
+    if not isinstance(codes, list) or not codes:
+        return False
+    blockers = manifest.get("binding_action_blockers")
+    if not isinstance(blockers, list) or len(blockers) != len(codes):
+        return False
+    if manifest.get("binding_blockers_budget_class_only") is not True:
+        return False
+    return all(
+        isinstance(code, str) and code in DISCOVERY_BUDGET_CLASS_BLOCKER_CODES
+        for code in codes
+    )
+
+
 async def _consecutive_recommissions(session, *, cycle: DiscoveryCycle) -> int:
     """Count engine-authored escalation replacements ending at this cycle.
 
@@ -1329,11 +1398,15 @@ def _convert_escalation_to_recommission(
     cycle: DiscoveryCycle,
     decision_receipt_ids: set[str],
     reason_code: str,
+    authority_granted: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Re-run an empty research bet instead of asking a human about the void.
 
-    Reached when the packet granted binding authority *and* carried nothing to
-    judge -- every ``evidence_coverage`` count zero because the research parent
+    Reached when the packet carried nothing to judge and the escalation over it
+    was one the engine can answer itself -- either because the packet granted
+    binding authority, or because ``authority_granted`` is False and the only
+    thing withholding it was a bounded-budget overflow. Nothing to judge means
+    every ``evidence_coverage`` count zero because the research parent
     auto-completed with zero actionable tasks, or was killed by a platform
     defect that carries no verdict about the work at all. On 2026-08-25 three
     directions sat ineligible at once behind
@@ -1381,8 +1454,14 @@ def _convert_escalation_to_recommission(
             ),
         }
     )
+    provenance = (
+        "granted binding authority but"
+        if authority_granted
+        else "withheld binding authority only over a bounded budget it could not "
+        "fit, and"
+    )
     disposition = (
-        "Engine disposition: this decision packet granted binding authority but "
+        f"Engine disposition: this decision packet {provenance} "
         f"carried no evidence to judge ({reason_code}), so the research bet was "
         "re-commissioned rather than escalated to the operator. An empty "
         "research result is a pipeline outcome, not an operator decision. No "
@@ -1400,7 +1479,11 @@ def _convert_escalation_to_recommission(
             "operator_question": None,
         },
         {
-            "reason": "binding_decision_allowed",
+            "reason": (
+                "binding_decision_allowed"
+                if authority_granted
+                else "binding_blockers_budget_class_only"
+            ),
             "reason_code": reason_code,
             "disposition": "recommission",
             "original_action": "ask_operator",
@@ -1417,6 +1500,7 @@ def _park_at_recommission_ceiling(
     decision_receipt_ids: set[str],
     reason_code: str,
     consecutive_recommissions: int,
+    authority_granted: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Degrade to a bounded, legible park once re-commissioning is exhausted.
 
@@ -1426,6 +1510,14 @@ def _park_at_recommission_ceiling(
     consuming research capacity, the reason code says exactly why, and an
     operator who wants it back resumes it -- but nothing blocks on a human
     answering a question the engine itself could not frame.
+
+    ``authority_granted`` names which of the two entry states this park
+    degraded from. The conversion record is the only machine-readable account
+    an operator gets of why their escalation was answered by the engine, and
+    since 2026-08-25 there are two possible answers -- the packet granted
+    binding authority, or it withheld it purely over a bounded budget.
+    Reporting the first for a case that was the second would be worse than
+    recording nothing.
     """
 
     if not decision_receipt_ids:
@@ -1460,7 +1552,11 @@ def _park_at_recommission_ceiling(
             "operator_question": None,
         },
         {
-            "reason": "binding_decision_allowed",
+            "reason": (
+                "binding_decision_allowed"
+                if authority_granted
+                else "binding_blockers_budget_class_only"
+            ),
             "reason_code": DISCOVERY_RECOMMISSION_CEILING_REACHED,
             "emptiness_reason_code": reason_code,
             "disposition": "recommission_ceiling_park",
@@ -1479,8 +1575,9 @@ async def _replace_authorised_escalation(
     cycle: DiscoveryCycle,
     payload: Mapping[str, Any],
     decision_receipt_ids: set[str],
+    budget_bound: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Route one authorised ``ask_operator`` to the disposition it deserves.
+    """Route one non-judgement ``ask_operator`` to the disposition it deserves.
 
     Three outcomes, in priority order:
 
@@ -1489,19 +1586,35 @@ async def _replace_authorised_escalation(
     * the packet carries evidence the reviewer did not check -> dispatch the
       bounded measurement (the pre-existing conversion).
 
-    Genuine judgement calls never reach here. They arrive on packets that
-    withhold binding authority, and ``ask_operator`` stays reachable for them.
+    Reached from two states, both of which the engine can answer itself:
+
+    * the packet GRANTED binding authority, so the reviewer already held the
+      power to commission what it asked permission for; or
+    * the packet withheld authority, but every blocker was a bounded-budget
+      overflow (``budget_bound``) -- the engine holds the evidence and a human
+      adds nothing. Its own blockers name what did not fit, so the successor
+      bet can go re-read exactly that.
+
+    Genuine judgement calls never reach here: they would have to arrive on a
+    packet carrying a blocker outside the budget-class vocabulary, and
+    ``ask_operator`` stays reachable for those.
     """
 
     emptiness_reason_code = packet_substantive_emptiness_reason_code(payload)
+    default_reason_code = (
+        DISCOVERY_ESCALATION_WAS_BUDGET_BOUND
+        if budget_bound
+        else DISCOVERY_ESCALATION_WAS_ANSWERABLE
+    )
     consecutive = await _consecutive_recommissions(session, cycle=cycle)
     if consecutive >= DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS:
         return _park_at_recommission_ceiling(
             result,
             cycle=cycle,
             decision_receipt_ids=decision_receipt_ids,
-            reason_code=emptiness_reason_code or DISCOVERY_ESCALATION_WAS_ANSWERABLE,
+            reason_code=emptiness_reason_code or default_reason_code,
             consecutive_recommissions=consecutive,
+            authority_granted=not budget_bound,
         )
     if emptiness_reason_code is not None:
         return _convert_escalation_to_recommission(
@@ -1509,11 +1622,13 @@ async def _replace_authorised_escalation(
             cycle=cycle,
             decision_receipt_ids=decision_receipt_ids,
             reason_code=emptiness_reason_code,
+            authority_granted=not budget_bound,
         )
     return _convert_escalation_to_evidence_bet(
         result,
         cycle=cycle,
         decision_receipt_ids=decision_receipt_ids,
+        reason_code=default_reason_code,
     )
 
 
@@ -2157,22 +2272,33 @@ async def complete_discovery_review(
                 or packet_manifest.get("required_evidence_omitted") is True
             )
         )
+        budget_bound_only = (
+            not binding_decision_allowed
+            and packet_blockers_are_budget_class_only(payload)
+        )
         if result["action"] != "ask_operator" and not binding_decision_allowed:
             raise DiscoveryReviewResultError(
                 "incomplete packet semantics permit only ask_operator"
             )
-        if result["action"] == "ask_operator" and binding_decision_allowed:
-            # The reviewer held the authority to commission exactly the work it
-            # asked permission for, so the escalation is replaced by the
-            # disposition the packet actually warrants -- a bounded measurement,
-            # a re-commissioned research bet, or a terminal park at the ceiling.
-            # See _replace_authorised_escalation for the incidents this closes.
+        if result["action"] == "ask_operator" and (
+            binding_decision_allowed or budget_bound_only
+        ):
+            # Two states, one disposition. Either the reviewer held the authority
+            # to commission exactly the work it asked permission for, or the only
+            # thing withholding that authority was a bounded budget the packet
+            # could not fit -- evidence the engine is holding either way. Both are
+            # replaced by the disposition the packet actually warrants: a bounded
+            # measurement, a re-commissioned research bet, or a terminal park at
+            # the ceiling. See _replace_authorised_escalation for the incidents
+            # this closes, and packet_blockers_are_budget_class_only for why a
+            # budget overflow is never an operator question.
             result, escalation_conversion = await _replace_authorised_escalation(
                 session,
                 result,
                 cycle=cycle,
                 payload=payload,
                 decision_receipt_ids=decision_receipt_ids,
+                budget_bound=budget_bound_only,
             )
             cited_ids = {
                 str(uuid.UUID(value)) for value in result["evidence_citations"]

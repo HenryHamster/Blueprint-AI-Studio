@@ -265,13 +265,37 @@ async def _terminate_all_non_death_cancelled(
     co-deferred child's finding re-surfaces from the ledger next cycle; a
     requeue-replacement child's work continues under the new clone; a scope-empty
     child found nothing to do.  None of these represent a genuine failure.
+
+    TERMINAL REASON
+    ---------------
+    Its sibling above persists ``SCOPE_EMPTY``; this one persisted nothing, so
+    the parent's only account of itself was the prose message — matched by the
+    "deliberately shelved or superseded" literal in
+    ``platform_kill_metrics._TERMINAL_MESSAGE_MARKERS``. Reword the sentence and
+    the row silently becomes unclassifiable, so the reason is now stamped in a
+    durable field instead.
+
+    Deliberately a ``failure_detail`` and NOT a ``failure_category``: the
+    matching ``_DETAIL_VERDICTS`` entry reproduces the marker's NOT_A_DEATH
+    verdict exactly. Stamping a class here would also flip
+    ``is_non_death_cancellation`` for this parent, which changes what the
+    dead-foundation detector does to its dependents — a dependency-semantics
+    decision that deserves its own change, not a side effect of recording a
+    reason. (That gap is real and worth closing: this function's own name says
+    "non death" while the policy function still reads it as a death.)
     """
+    from app.failure_classification import ALL_CHILDREN_SHELVED_DETAIL
+
     cancelled_count = len([c for c in children if c.status == TaskStatus.CANCELLED])
     parent.status = TaskStatus.CANCELLED
     parent.latest_status_message = (
         f"All {cancelled_count} subtask(s) deliberately shelved or superseded, or "
         f"administratively cancelled — not a failure"
     )
+    parent.context = {
+        **(parent.context or {}),
+        "failure_detail": ALL_CHILDREN_SHELVED_DETAIL,
+    }
     session.add(parent)
     await session.commit()
     await broadcast_to_project(

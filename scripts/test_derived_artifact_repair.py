@@ -33,6 +33,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -40,6 +42,8 @@ from derived_artifact_repair import (  # noqa: E402
     AUTOREPAIRABLE,
     MEASUREMENT_TAX_GUIDANCE,
     NEVER_AUTOREPAIR,
+    ROT_ONLY_AUTOREPAIR,
+    repair_entry,
     repair_sentinels,
 )
 from static_release_guard import SENTINEL_REPAIR_COMMANDS  # noqa: E402
@@ -295,3 +299,75 @@ def test_every_measurement_guard_explains_the_new_file_tax() -> None:
     ]
     assert "test erosion" in backend
     assert "hand-writing a duration" in backend
+
+
+def test_a_rot_only_repair_is_a_third_category_not_a_hole_in_the_second() -> None:
+    """``ROT_ONLY_AUTOREPAIR`` must not become a back door into auto-repair.
+
+    The two durations guards are correctly in ``NEVER_AUTOREPAIR``: their
+    registered repair is a timed run, and no checkout can invent a measurement.
+    The rot-only registry does something strictly narrower -- it deletes rows
+    for tests that no longer exist -- so a sentinel listed there has to remain
+    listed as never-auto-repairable too. If an entry ever migrated out of
+    ``NEVER_AUTOREPAIR`` into this registry, the "never regenerate a
+    measurement" rule would be silently repealed by a data edit rather than by
+    an argument.
+    """
+
+    assert set(ROT_ONLY_AUTOREPAIR) <= set(NEVER_AUTOREPAIR), (
+        "a rot-only repair was registered for a sentinel that is no longer "
+        "recorded as never-auto-repairable; pruning stale rows does not make "
+        "the artifact regenerable from a checkout"
+    )
+    assert not set(ROT_ONLY_AUTOREPAIR) & set(AUTOREPAIRABLE), (
+        "a sentinel is registered in both repair registries; the two passes "
+        "run over disjoint sets and a duplicate would repair it twice"
+    )
+    assert set(ROT_ONLY_AUTOREPAIR) <= set(MEASUREMENT_TAX_GUIDANCE), (
+        "rot-only repair exists because the ADDITION half is unpayable; a "
+        "sentinel with no measurement-tax guidance has no such asymmetry and "
+        "should be repaired normally or not at all"
+    )
+
+    for sentinel, entry in ROT_ONLY_AUTOREPAIR.items():
+        assert (REPO_ROOT / sentinel).is_file(), sentinel
+        assert (REPO_ROOT / entry.script).is_file(), entry.script
+        assert entry.args, f"{sentinel} registers no write-mode argument"
+        for artifact in entry.artifacts:
+            assert (REPO_ROOT / artifact).is_file(), artifact
+        assert len(entry.why) > 80, (
+            f"{sentinel} claims a rot-only repair on a one-line rationale; the "
+            "argument for deleting recorded evidence has to be legible"
+        )
+
+
+def test_repair_entry_resolves_both_registries_and_only_those() -> None:
+    """One lookup, so a caller cannot consult the wrong registry by accident."""
+
+    for sentinel in AUTOREPAIRABLE:
+        assert repair_entry(sentinel) is AUTOREPAIRABLE[sentinel]
+    for sentinel in ROT_ONLY_AUTOREPAIR:
+        assert repair_entry(sentinel) is ROT_ONLY_AUTOREPAIR[sentinel]
+    # Fail-closed on anything else: a sentinel with no registered repair must
+    # raise rather than resolve to a default, so a caller cannot silently run
+    # the wrong generator against it.
+    for sentinel in set(NEVER_AUTOREPAIR) - set(ROT_ONLY_AUTOREPAIR):
+        with pytest.raises(KeyError):
+            repair_entry(sentinel)
+    with pytest.raises(KeyError):
+        repair_entry("backend/testing/test_nothing_at_all.py")
+
+
+def test_a_rot_only_sentinel_is_not_repaired_by_the_default_registry() -> None:
+    """``repair_sentinels`` defaults to ``AUTOREPAIRABLE``.
+
+    A rot-only sentinel passed without its registry must be SKIPPED, not
+    repaired -- otherwise the caller's two-pass split would be decorative and a
+    single mistaken call would run a prune under the wrong classification.
+    """
+
+    for sentinel in ROT_ONLY_AUTOREPAIR:
+        outcome = repair_sentinels(REPO_ROOT, [sentinel])
+        assert outcome.skipped == (sentinel,)
+        assert outcome.ran == ()
+        assert outcome.failed == {}

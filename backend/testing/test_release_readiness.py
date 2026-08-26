@@ -15,6 +15,8 @@ from app.release_readiness import (
     _compute_requalification_decision,
     auto_mark_stale_audit_findings,
     compute_promotion_ci_green_gate,
+    promotion_ci_gate_proves_promotion,
+    PROMOTION_CI_GREEN_STATES,
     PROMOTION_READINESS_METRIC_MANIFEST,
     _READINESS_LIVE_REGIME_NOTE,
 )
@@ -411,6 +413,12 @@ class TestPromotionCiGreenGate:
 
     @pytest.mark.asyncio
     async def test_completed_success_maps_to_green(self, db_session, mocker):
+        """A ``pull_request`` success is the ONLY shape that earns ``green``.
+
+        ``event`` is pinned deliberately: this test used to omit it, which is
+        exactly how a dispatch rehearsal and a merge-gating pull_request run came
+        to be reported as the same evidence.
+        """
         project, _ = await _make_project_and_version(db_session)
         disp = _patch_gate_github(
             mocker,
@@ -419,6 +427,7 @@ class TestPromotionCiGreenGate:
                 "status": "completed",
                 "conclusion": "success",
                 "html_url": "https://gh/run/11",
+                "event": "pull_request",
             },
             head_sha="deadbeef",
         )
@@ -428,6 +437,10 @@ class TestPromotionCiGreenGate:
         assert gate["gate_state"] == "green"
         assert gate["head_sha"] == "deadbeef"
         assert gate["run_id"] == 11
+        assert gate["ci_event"] == "pull_request"
+        assert gate["full_matrix_passed"] is True
+        assert gate["promotion_equivalent"] is True
+        assert promotion_ci_gate_proves_promotion(gate) is True
         # A green (or any existing) run must NOT trigger a fresh dispatch.
         disp.assert_not_awaited()
 
@@ -706,6 +719,172 @@ class TestPromotionCiGreenGate:
         assert gate["gate_state"] == "unavailable"
         assert gate["reason"] == "error computing promotion CI green gate"
         assert gate["head_sha"] is None
+
+
+class TestPromotionCiGateRunShapeFidelity:
+    """The gate must not report a rehearsal's success as a promotion prediction.
+
+    GROUNDING INCIDENT (2026-08-25, one tree, 28 minutes apart):
+
+      * 10:13 UTC -- ``workflow_dispatch`` on the integration branch: SUCCESS.
+      * 10:41 UTC -- ``pull_request`` on the release branch: FAILURE (backend
+        shards 1 and 5; four tests in ``testing/test_size_limits_checker.py``
+        died with "git log exited 128", a git dubious-ownership refusal).
+
+    The two runs are not the same experiment.  Every ``actions/checkout@v4`` in
+    ci.yml is bare, so it checks out ``github.ref``: ``refs/pull/N/merge`` (a
+    DETACHED synthetic merge commit, no branch refs) for a pull_request run, and
+    ``refs/heads/<branch>`` (branch tip, with local and ``origin/`` refs) for a
+    dispatch.  Code that resolves a mainline ref BY NAME therefore takes a
+    different path under each shape.  Reporting both as ``green`` is what let the
+    pipeline cut a promotion PR on evidence that did not cover it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_workflow_dispatch_success_is_green_rehearsal_not_green(
+        self, db_session, mocker
+    ):
+        """THE REGRESSION TEST. A dispatch success must NOT be reported ``green``."""
+        project, _ = await _make_project_and_version(db_session)
+        _patch_gate_github(
+            mocker,
+            run={
+                "run_id": 32836106177,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": "https://gh/run/32836106177",
+                "event": "workflow_dispatch",
+            },
+            head_sha="deadbeef",
+        )
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "green_rehearsal"
+        assert gate["ci_event"] == "workflow_dispatch"
+        # It DID prove the branch is not obviously broken...
+        assert gate["full_matrix_passed"] is True
+        # ...and it did NOT prove anything about the promotion PR.
+        assert gate["promotion_equivalent"] is False
+        assert promotion_ci_gate_proves_promotion(gate) is False
+        assert "does NOT predict" in gate["reason"]
+
+    @pytest.mark.asyncio
+    async def test_absent_event_fails_closed_to_green_rehearsal(
+        self, db_session, mocker
+    ):
+        """An unidentifiable run shape can never be claimed promotion-equivalent.
+
+        Fail-closed matters here specifically: an older GitHub projection (or a
+        stubbed run) that drops ``event`` must degrade to the WEAK claim, not
+        silently inherit the strong one.
+        """
+        project, _ = await _make_project_and_version(db_session)
+        _patch_gate_github(
+            mocker,
+            run={"run_id": 21, "status": "completed", "conclusion": "success"},
+            head_sha="deadbeef",
+        )
+        gate = await compute_promotion_ci_green_gate(db_session, project.id)
+        assert gate["gate_state"] == "green_rehearsal"
+        assert gate["ci_event"] is None
+        assert gate["promotion_equivalent"] is False
+        assert promotion_ci_gate_proves_promotion(gate) is False
+
+    @pytest.mark.asyncio
+    async def test_red_stays_red_on_a_dispatch_run(self, db_session, mocker):
+        """DELIBERATE ASYMMETRY: a rehearsal FAILURE is still ``red``.
+
+        Evidence strength is not symmetric.  A rehearsal success cannot be
+        promoted to proof, but a full matrix that went red found something, and
+        failing closed on it costs a re-check while failing open costs a deleted
+        promotion PR.
+        """
+        project, _ = await _make_project_and_version(db_session)
+        _patch_gate_github(
+            mocker,
+            run={
+                "run_id": 22,
+                "status": "completed",
+                "conclusion": "failure",
+                "event": "workflow_dispatch",
+            },
+        )
+        gate = await compute_promotion_ci_green_gate(db_session, project.id)
+        assert gate["gate_state"] == "red"
+        assert gate["ci_event"] == "workflow_dispatch"
+        assert gate["full_matrix_passed"] is False
+        assert gate["promotion_equivalent"] is False
+
+    @pytest.mark.asyncio
+    async def test_every_verdict_carries_the_shape_keys(self, db_session, mocker):
+        """Shape parity: no caller should have to treat a missing key as False."""
+        project, _ = await _make_project_and_version(db_session)
+        _patch_gate_github(
+            mocker,
+            run={
+                "run_id": 23,
+                "status": "in_progress",
+                "conclusion": None,
+                "event": "workflow_dispatch",
+            },
+        )
+        gate = await compute_promotion_ci_green_gate(db_session, project.id)
+        assert gate["gate_state"] == "pending"
+        for key in ("ci_event", "full_matrix_passed", "promotion_equivalent"):
+            assert key in gate, key
+        assert gate["full_matrix_passed"] is False
+        assert gate["promotion_equivalent"] is False
+
+    @pytest.mark.asyncio
+    async def test_dispatched_verdict_carries_the_shape_keys(
+        self, db_session, mocker
+    ):
+        """The dispatch-outcome verdicts come from a different module; they must
+        still emit the same keys or a reader would see a missing-key hole."""
+        project, _ = await _make_project_and_version(db_session)
+        _patch_gate_github(mocker, run=None, head_sha="cafe1234")
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "dispatched"
+        assert gate["ci_event"] is None
+        assert gate["full_matrix_passed"] is False
+        assert gate["promotion_equivalent"] is False
+        assert promotion_ci_gate_proves_promotion(gate) is False
+
+    def test_green_states_cover_both_success_shapes(self):
+        """Branch-HEALTH readers ask a question a rehearsal answers fine."""
+        assert set(PROMOTION_CI_GREEN_STATES) == {"green", "green_rehearsal"}
+
+    def test_predicate_rejects_a_hand_rolled_green_without_the_flag(self):
+        """``promotion_ci_gate_proves_promotion`` must require BOTH signals.
+
+        A future caller that string-matches ``gate_state == "green"`` is exactly
+        the regression this predicate exists to prevent, so the predicate itself
+        must not be satisfiable by the state string alone.
+        """
+        assert (
+            promotion_ci_gate_proves_promotion(
+                {"gate_state": "green", "promotion_equivalent": True}
+            )
+            is True
+        )
+        assert promotion_ci_gate_proves_promotion({"gate_state": "green"}) is False
+        assert (
+            promotion_ci_gate_proves_promotion(
+                {"gate_state": "green", "promotion_equivalent": False}
+            )
+            is False
+        )
+        assert (
+            promotion_ci_gate_proves_promotion(
+                {"gate_state": "green_rehearsal", "promotion_equivalent": True}
+            )
+            is False
+        )
+        assert promotion_ci_gate_proves_promotion(None) is False
+        assert promotion_ci_gate_proves_promotion("green") is False
 
 
 class TestChallengeRefutedRate:

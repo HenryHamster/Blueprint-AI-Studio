@@ -541,6 +541,12 @@ def legacy_direction_message_dict(message: ProjectMessage) -> dict[str, Any]:
         "content": base["content"],
         "from": base["from_type"],
         "status": base["status"],
+        # ``status`` alone cannot separate "answered" from "nobody ever read
+        # it": the stranded-message sweep terminalizes an unclaimed conversation
+        # message to handling_state='failed' AND status='resolved'. Omitting
+        # handling_state left this route's consumers structurally unable to tell
+        # those apart, so it travels with the resolution bookkeeping.
+        "handling_state": base["handling_state"],
         "context": base["context"],
         "created_at": base["created_at"],
     }

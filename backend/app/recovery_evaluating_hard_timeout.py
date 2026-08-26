@@ -153,12 +153,34 @@ async def _handle_evaluating_hard_timeout(
     from app.vm_lifecycle import _ensure_vm_deleted
     from app.max_plan_pool import release_max_plan_account
 
+    # TERMINAL REASON. Until this stamp existed, the only record of WHY these
+    # children died was the prose in ``hard_timeout_cancel_msg``, matched by a
+    # literal substring in ``platform_kill_metrics._TERMINAL_MESSAGE_MARKERS``.
+    # That made a whole fan-out of platform kills hostage to the wording of a
+    # log line: rephrase the message and the rows silently become unclassified.
+    # ``failure_detail`` is a durable field read at the classifier's HIGHEST
+    # precedence, so the reason now survives any rewording.
+    #
+    # Deliberately a detail and NOT a ``failure_category``: the marker already
+    # assigns these rows PLATFORM_KILL, and the matching ``_DETAIL_VERDICTS``
+    # entry reproduces that verdict exactly, so this change moves the evidence
+    # without moving the number. Stamping a class here would additionally change
+    # ``is_non_death_cancellation``, which is a dependency-semantics decision
+    # this fix has no business making silently.
+    from app.failure_classification import (
+        PARENT_EVALUATION_TIMEOUT_CASCADE_DETAIL,
+    )
+
     non_terminal_children = [c for c in children if c.status not in terminal]
     vms_to_delete = []
     hard_timeout_cancel_msg = f"Cancelled: parent evaluation timeout after {hours}h"
     for child in non_terminal_children:
         child.status = TaskStatus.CANCELLED
         child.latest_status_message = hard_timeout_cancel_msg
+        child.context = {
+            **(child.context or {}),
+            "failure_detail": PARENT_EVALUATION_TIMEOUT_CASCADE_DETAIL,
+        }
         if child.vm_instance_id:
             vms_to_delete.append(child)
         child_acct = (child.context or {}).get("max_plan_account_id")

@@ -402,6 +402,20 @@ async def _handle_ci_waiting_backstop(
     from app.vm_lifecycle import _ensure_vm_deleted
     from app.max_plan_pool import release_max_plan_account
 
+    # TERMINAL REASON. See the sibling comment in
+    # ``recovery_evaluating_hard_timeout``: until this stamp existed the only
+    # record of why these children died was the prose in ``child_cancel_msg``,
+    # matched by a literal substring in
+    # ``platform_kill_metrics._TERMINAL_MESSAGE_MARKERS`` — a fan-out of platform
+    # kills held hostage to the wording of a log line. ``failure_detail`` is a
+    # durable field read at the classifier's highest precedence.
+    #
+    # Deliberately a detail and NOT a ``failure_category``: the matching
+    # ``_DETAIL_VERDICTS`` entry reproduces the marker's PLATFORM_KILL verdict
+    # exactly, so this moves the evidence without moving the number, and leaves
+    # ``is_non_death_cancellation`` untouched.
+    from app.failure_classification import PARENT_CI_BACKSTOP_CASCADE_DETAIL
+
     non_terminal_children = [c for c in children if c.status not in TERMINAL]
     vms_to_delete = []
     child_cancel_msg = (
@@ -410,6 +424,10 @@ async def _handle_ci_waiting_backstop(
     for child in non_terminal_children:
         child.status = TaskStatus.CANCELLED
         child.latest_status_message = child_cancel_msg
+        child.context = {
+            **(child.context or {}),
+            "failure_detail": PARENT_CI_BACKSTOP_CASCADE_DETAIL,
+        }
         if child.vm_instance_id:
             vms_to_delete.append(child)
         child_acct = (child.context or {}).get("max_plan_account_id")

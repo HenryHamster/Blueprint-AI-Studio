@@ -36,6 +36,14 @@ def promotion_ci_dispatch_gate_verdict(
         "dispatch_outcome": outcome,
         "dispatch_ref": ref,
         "dispatch_workflow_file": workflow_file,
+        # Shape parity with ``_promotion_ci_gate_verdict``: no run backs any of
+        # these outcomes, so nothing passed and nothing is promotion-equivalent.
+        # Emitting the keys explicitly keeps the served verdict one stable shape
+        # whichever branch produced it, instead of making every reader treat a
+        # missing key and a False value as the same thing.
+        "ci_event": None,
+        "full_matrix_passed": False,
+        "promotion_equivalent": False,
     }
     if outcome == "accepted":
         return {
