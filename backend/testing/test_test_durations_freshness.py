@@ -31,13 +31,6 @@ BACKEND_ROOT = Path(__file__).parents[1]
 DURATIONS_PATH = BACKEND_ROOT / ".test_durations"
 # Key format: "testing/<filename>.py::<test_function_or_class>"
 KEY_PATTERN = re.compile(r"^testing/test_[^/]+\.py::.+$")
-# At least 60% of test_*.py files must appear in the durations map. This is the
-# absolute fallback used only when no origin/automain baseline can be resolved;
-# when a baseline IS available the stricter ratchet below (no NEWLY uncovered
-# file relative to automain) applies instead. Both are blocking -- the absolute
-# check is fail-closed, so a baseline that sits exactly on the floor leaves zero
-# headroom and the next added test file reds the standalone lane.
-MIN_COVERAGE_FRACTION = 0.60
 _BASELINE_UNLOADED = object()
 _baseline_cache: object = _BASELINE_UNLOADED
 _baseline_clone_roots: set[Path] = set()
@@ -424,7 +417,7 @@ def test_durations_coverage_fraction_within_threshold() -> None:
 
     The committed artifact currently has inherited gaps from automain. Those
     gaps are reported loudly, but only a newly uncovered current module blocks.
-    Without an immutable baseline, retain the absolute fail-closed threshold.
+    Without an immutable baseline, EVERY uncovered module is charged.
     """
     data = _load_durations()
     files_in_durations = {k.split("::")[0] for k in data}
@@ -433,8 +426,17 @@ def test_durations_coverage_fraction_within_threshold() -> None:
     unmeasurable = _unmeasurable_modules(current_files)
     all_test_files = set(current_files) - set(unmeasurable)
 
-    if not all_test_files:
-        return  # Nothing to check (shouldn't happen in a real repo)
+    # Non-vacuity. This is asserted on the RESOLVED ROSTER, not on the
+    # measurable subset: a roster whose every member is legitimately excused is
+    # a real (if degenerate) answer, but a roster that came back empty means no
+    # test tree was reached at all, and the guard used to `return` on it and
+    # report clean having compared nothing -- the exact shape
+    # testing/test_vacuous_guard_shapes.py exists to police, inside a guard.
+    assert current_files, (
+        "the backend test roster resolved to ZERO modules, so this guard would "
+        "report clean having compared nothing. _current_test_files() reached no "
+        "test tree -- neither backend/testing nor a workspace root."
+    )
 
     covered = files_in_durations & all_test_files
     uncovered = sorted(all_test_files - files_in_durations)
@@ -458,12 +460,28 @@ def test_durations_coverage_fraction_within_threshold() -> None:
         )
         return
 
-    fraction = len(covered) / len(all_test_files)
-    assert fraction >= MIN_COVERAGE_FRACTION, (
-        f"backend/.test_durations covers only {fraction:.1%} of test files "
-        f"({len(covered)}/{len(all_test_files)}), below the {MIN_COVERAGE_FRACTION:.0%} threshold. "
-        f"No usable origin/automain or automain baseline was available; this "
-        f"absolute check is fail-closed. Regenerate via scripts/store-backend-durations.sh. "
+    # No baseline: charge EVERY uncovered module, with no tolerance band.
+    #
+    # This used to be `fraction >= 0.60`. Measured against the real tree that
+    # threshold could not fail for any regression anyone would actually ship:
+    # coverage is 637/637 = 100%, so 249 measurable modules could be deleted
+    # from the artifact and the check still passed (proved by mutation). A
+    # 40-point dead zone in front of a value pinned at 100% is a guard that
+    # reports on nothing.
+    #
+    # Exact is also what the sibling artifact guard already does -- see
+    # test_vitest_durations_freshness._assert_artifact_covers_inventory, whose
+    # BaselineUnavailable path is `new_missing, new_stale = missing, stale`,
+    # with test_coverage_guard_fails_closed_when_baseline_unresolvable pinning
+    # it. Two guards over the same defect class in the same repo should not
+    # fail closed to two different strictnesses.
+    assert not uncovered, (
+        f"backend/.test_durations does not cover {len(uncovered)} of "
+        f"{len(all_test_files)} measurable test file(s) "
+        f"({len(covered)} covered). No usable origin/automain or automain "
+        f"baseline was available, so nothing can be attributed to inherited "
+        f"drift and every uncovered module is charged here. Regenerate via "
+        f"scripts/store-backend-durations.sh. "
         f"Uncovered files ({len(uncovered)}): {uncovered[:10]}"
         + "\n"
         + format_offender_marker(uncovered)
@@ -931,6 +949,63 @@ def test_coverage_guard_falls_back_when_baseline_is_unavailable(monkeypatch) -> 
     import pytest
 
     with pytest.raises(AssertionError, match="No usable .* baseline"):
+        test_durations_coverage_fraction_within_threshold()
+
+
+def test_coverage_guard_fallback_has_no_tolerance_band(monkeypatch) -> None:
+    """Regression: the no-baseline fallback may not carry a tolerance band.
+
+    It used to be ``fraction >= MIN_COVERAGE_FRACTION`` with the constant at
+    0.60. Against the real tree -- coverage pinned at 637/637 = 100% -- that
+    left a 40-point dead zone: 249 measurable modules could be dropped from
+    the artifact and the guard still passed. Measured, not argued.
+
+    The scenario below is that dead zone in miniature: 100 modules, 61 of them
+    covered. The old check passed it (0.61 >= 0.60); an exact check charges
+    all 39. A future reintroduction of ANY ratio floor fails here.
+    """
+    import pytest
+
+    module = sys.modules[__name__]
+    total, covered_count = 100, 61
+    monkeypatch.setattr(
+        module,
+        "_current_test_files",
+        lambda: {
+            f"testing/test_{index}.py": Path(f"/tmp/test_{index}.py")
+            for index in range(total)
+        },
+    )
+    monkeypatch.setattr(module, "_unmeasurable_modules", lambda files: {})
+    monkeypatch.setattr(
+        module,
+        "_load_durations",
+        lambda: {
+            f"testing/test_{index}.py::test_one": 1.0
+            for index in range(covered_count)
+        },
+    )
+    monkeypatch.setattr(module, "_load_duration_baseline", lambda: None)
+
+    with pytest.raises(AssertionError, match="does not cover 39 of 100"):
+        test_durations_coverage_fraction_within_threshold()
+
+
+def test_coverage_guard_fails_on_an_empty_roster(monkeypatch) -> None:
+    """Non-vacuity: a roster that resolved to nothing is not a pass.
+
+    The empty-roster branch used to ``return``, so a run that had reached no
+    test tree at all reported clean having compared nothing -- the shape
+    testing/test_vacuous_guard_shapes.py exists to police, inside a guard.
+    """
+    import pytest
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "_current_test_files", dict)
+    monkeypatch.setattr(module, "_load_durations", dict)
+    monkeypatch.setattr(module, "_load_duration_baseline", lambda: None)
+
+    with pytest.raises(AssertionError, match="ZERO modules"):
         test_durations_coverage_fraction_within_threshold()
 
 

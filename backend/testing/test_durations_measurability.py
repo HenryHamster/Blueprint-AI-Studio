@@ -86,8 +86,19 @@ def test_every_exemption_carries_evidence_in_its_own_source() -> None:
 def test_exempt_modules_stay_a_narrow_exception() -> None:
     """A broad addopts change must not quietly gut the coverage ratchet."""
     roster = _roster()
-    if not roster:
-        return
+    # Non-vacuity. This used to `return` on an empty roster, so a roster that
+    # reached no test tree -- an unreadable directory, or a glob that stopped
+    # matching -- reported clean having measured nothing. Proven: narrowing the
+    # `_roster()` glob to a pattern that matches no file took the roster from
+    # 640 modules to 0 and this module still reported `9 passed`, in 0.18s
+    # instead of 28s. An input that cannot be read must exempt nothing, which
+    # is this guard's own stated third property; it has to hold for the roster
+    # too, not only for the addopts config.
+    assert roster, (
+        "the backend test roster resolved to ZERO modules, so this guard would "
+        "report clean having measured nothing. _roster() reached no test tree "
+        "under backend/testing."
+    )
     exempt = _exempt()
     fraction = len(exempt) / len(roster)
     # Adding, say, ``-m 'not asyncio'`` to addopts would exempt hundreds of
@@ -98,6 +109,25 @@ def test_exempt_modules_stay_a_narrow_exception() -> None:
         f"exempt from the durations coverage ratchet. The exemption covers a "
         f"handful of structurally unmeasurable modules, not a class of them. "
         f"Exempt: {sorted(exempt)[:10]}"
+    )
+
+
+# Pinned as a literal ON PURPOSE and set far below the real count (640 modules
+# as of 2026-08-25) so a broken path or a glob that stops recognising backend
+# test modules fails loudly instead of passing on an empty corpus. Deriving this
+# from ``len(_roster())`` would make the assertion certify itself.
+_ROSTER_FLOOR = 400
+
+
+def test_the_roster_reaches_the_backend_test_tree() -> None:
+    """The corpus every other assertion here is measured against is real."""
+    roster = _roster()
+    assert len(roster) >= _ROSTER_FLOOR, (
+        f"_roster() found only {len(roster)} backend test module(s); expected "
+        f"at least {_ROSTER_FLOOR}. Every assertion in this module is quantified "
+        f"over that roster, so a roster this small means the guard is measuring "
+        f"almost nothing -- fix the path or the glob rather than lowering this "
+        f"floor."
     )
 
 
