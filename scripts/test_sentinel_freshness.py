@@ -39,6 +39,7 @@ from derived_artifact_repair import (  # noqa: E402
     AUTOREPAIRABLE,
     MEASUREMENT_TAX_GUIDANCE,
     NEVER_AUTOREPAIR,
+    ROT_ONLY_AUTOREPAIR,
     RepairOutcome,
 )
 from static_release_guard import SENTINEL_REPAIR_COMMANDS, JUnitReport  # noqa: E402
@@ -85,7 +86,12 @@ def _install_fakes(
     harness runs reported). Selection, attribution and the block/report decision
     stay real, so a mutation to any of them shows up in these tests.
     """
-    calls: dict[str, list] = {"corpus": [], "extracted": [], "repaired": []}
+    calls: dict[str, list] = {
+        "corpus": [],
+        "extracted": [],
+        "repaired": [],
+        "registries": [],
+    }
 
     monkeypatch.setattr(lane, "_changed_files", lambda repo, base: list(changed))
     monkeypatch.setattr(lane, "_base_ref", lambda repo, base: f"origin/{base}")
@@ -100,9 +106,13 @@ def _install_fakes(
 
     monkeypatch.setattr(lane, "_extract_base", _fake_extract)
 
-    def _fake_repair(repo, sentinels):
+    def _fake_repair(repo, sentinels, registry=None):
+        # ``registry`` narrows which generators a pass may execute; recording it
+        # keeps the rot-only pass from being indistinguishable from the ordinary
+        # one in the call log.
         selected = tuple(sorted(sentinels))
         calls["repaired"].append(selected)
+        calls["registries"].append(registry)
         if repair_outcome is not None:
             return repair_outcome
         return RepairOutcome(repaired=selected)
@@ -561,25 +571,82 @@ def test_a_measurement_sentinel_is_told_what_NOT_to_do_instead(
     """
 
     durations = "backend/testing/test_test_durations_freshness.py"
+    coverage_failure = {
+        "testing/test_test_durations_freshness.py"
+        "::test_durations_coverage_fraction_within_threshold": (
+            "introduced 1 uncovered test file(s)"
+        )
+    }
     _install_fakes(
         monkeypatch,
         changed=["backend/.test_durations"],
+        current=JUnitReport(failures=dict(coverage_failure)),
+        baseline=JUnitReport(),
+        current_exit=1,
+        # The rot-only pruner runs and finds NOTHING to delete: a coverage
+        # shortfall is the opposite direction from rot. It must not be able to
+        # convert that into a heal, so the post-prune re-run still fails.
+        repair_outcome=RepairOutcome(already_fresh=(durations,)),
+        repaired=JUnitReport(failures=dict(coverage_failure)),
+        repaired_exit=1,
+    )
+
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 1
+    err = capsys.readouterr().err
+    assert "ADDITION, NOT ROT" in err, (
+        "an addition on a measurement artifact must be named as such; "
+        "'regenerate it' and 'real defect' both send the reader the wrong way"
+    )
+    assert "SELF-HEALED" not in err
+    assert MEASUREMENT_TAX_GUIDANCE[durations] in err
+    assert "test erosion" in err
+
+
+def test_rot_on_a_measurement_artifact_is_healed_by_the_narrowed_registry(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half of the asymmetry: stale rows ARE repairable offline.
+
+    A row for a test that no longer exists needs no measurement -- deleting it
+    is exactly what a full regeneration would do to that row. Charging a 15-20
+    minute timed run for it is what leaves rot sitting on the integration
+    branch until the promotion PR fail-closes on it, and a red promotion run
+    closes the PR and deletes its release branch.
+
+    Two things are pinned here. The prune must clear the block, and it must run
+    under ``ROT_ONLY_AUTOREPAIR`` -- passing the narrowed registry is what stops
+    this path from also being able to invoke the full regeneration command that
+    the same sentinel is registered as NEVER auto-repairable for.
+    """
+
+    durations = "backend/testing/test_test_durations_freshness.py"
+    calls = _install_fakes(
+        monkeypatch,
+        changed=["backend/testing/test_removed_thing.py"],
         current=JUnitReport(
             failures={
                 "testing/test_test_durations_freshness.py"
-                "::test_durations_coverage_fraction_within_threshold": (
-                    "introduced 1 uncovered test file(s)"
+                "::test_durations_no_stale_entries": (
+                    "1 stale entry(ies) in backend/.test_durations"
                 )
             }
         ),
         baseline=JUnitReport(),
         current_exit=1,
+        repair_outcome=RepairOutcome(repaired=(durations,)),
+        repaired=JUnitReport(),
+        repaired_exit=0,
     )
 
-    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 1
+    assert lane._run_lane(REPO_ROOT, "automain", fix=True) == 0
     err = capsys.readouterr().err
-    assert MEASUREMENT_TAX_GUIDANCE[durations] in err
-    assert "test erosion" in err
+    assert "SELF-HEALED (rot only)" in err
+    assert "pruned stale entries from backend/.test_durations" in err
+    assert calls["registries"] == [ROT_ONLY_AUTOREPAIR], (
+        "the rot-only pass must pass its narrowed registry; with the default "
+        "registry this sentinel would be skipped, and any widening would let "
+        "the pass run the full regeneration command instead of the pruner"
+    )
 
 
 def test_a_repairable_sentinel_carries_no_measurement_note(

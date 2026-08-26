@@ -340,8 +340,17 @@ def render_durations(durations: Mapping[str, float]) -> str:
 
 
 def _git(repo: Path, args: Sequence[str]) -> str:
+    # ``-c safe.directory=<repo>``: this module runs as a git MERGE DRIVER and
+    # as a post-merge resolver, i.e. as a CHILD of another git process. A parent
+    # that was itself made to work with ``git -c safe.directory=... merge`` does
+    # NOT pass that down -- ``-c`` is per-invocation, not environment -- so the
+    # merge succeeds and the driver's own reads die with "detected dubious
+    # ownership" (exit 128). ``_git`` raises on any non-zero, so that surfaces
+    # as "this conflict is not mechanically resolvable" and the caller escalates
+    # to an LLM fix task for a conflict this module could have resolved. The
+    # raise stays; the read is what gets repaired.
     result = subprocess.run(
-        ["git", *args],
+        ["git", "-c", f"safe.directory={repo}", *args],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -366,8 +375,12 @@ def unmerged_paths(repo: Path) -> tuple[str, ...]:
 
 def _read_stage(repo: Path, stage: int, path: str) -> str | None:
     """Read one merge stage (1=base, 2=ours, 3=theirs), or None when absent."""
+    # Same ownership hazard as ``_git`` -- and worse here, because a stage this
+    # read cannot see is indistinguishable from a stage that does not exist:
+    # ``None`` is read by the caller as an add/delete conflict ("a real
+    # divergence, not an insertion") rather than as evidence loss.
     result = subprocess.run(
-        ["git", "show", f":{stage}:{path}"],
+        ["git", "-c", f"safe.directory={repo}", "show", f":{stage}:{path}"],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -536,8 +549,15 @@ def merge_driver(ancestor_path: str, ours_path: str, theirs_path: str) -> int:
 def _repo_root(explicit: str | None) -> Path:
     if explicit:
         return Path(explicit).resolve()
+    # Discovery has no root to name yet, so it names the directory it is asking
+    # FROM. That covers the way this script is actually invoked (from the
+    # workspace root, which is the toplevel); a caller standing in a
+    # subdirectory of a foreign-owned checkout still fails, and still fails
+    # CLOSED into the SystemExit below, whose documented escape is ``--repo``.
+    cwd = Path.cwd()
     out = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
+        ["git", "-c", f"safe.directory={cwd}", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
         capture_output=True,
         text=True,
         encoding="utf-8",

@@ -76,8 +76,10 @@ __all__ = [
     "AutoRepair",
     "RepairOutcome",
     "AUTOREPAIRABLE",
+    "ROT_ONLY_AUTOREPAIR",
     "NEVER_AUTOREPAIR",
     "MEASUREMENT_TAX_GUIDANCE",
+    "repair_entry",
     "repair_sentinels",
 ]
 
@@ -112,6 +114,58 @@ AUTOREPAIRABLE: dict[str, AutoRepair] = {
             "derived from, so regenerating it discards no review signal. It is "
             "also the highest-frequency promotion blocker in the repo: adding "
             "any backend/testing/test_*.py or vitest test file stales it."
+        ),
+    ),
+}
+
+
+ROT_ONLY_AUTOREPAIR: dict[str, AutoRepair] = {
+    # A THIRD category, orthogonal to the two above, and the reason it exists is
+    # that "is this artifact auto-repairable?" turned out to be the wrong
+    # question for a measurement.
+    #
+    # AUTOREPAIRABLE asks whether the whole artifact may be REGENERATED. For
+    # backend/.test_durations the answer is a permanent no, and it stays in
+    # NEVER_AUTOREPAIR. But a measurement artifact fails in two directions and
+    # only one of them is a measurement problem:
+    #
+    #   * ADDITION (live - recorded): a test exists with no timing. Unpayable
+    #     from a checkout. Still blocks, still costs a timed run.
+    #   * ROT (recorded - live): a row names a test that no longer exists.
+    #     Deleting it is a total function of the tree. It needs no measurement
+    #     and it destroys none -- a full regeneration would drop the same row.
+    #
+    # The commands registered here can ONLY delete. prune_stale_durations.py has
+    # no code path that writes a duration, and it refuses to rewrite a file it
+    # cannot re-serialise byte-identically. So running it unattended cannot
+    # fabricate data and cannot produce a whole-file reformat diff -- the two
+    # hazards NEVER_AUTOREPAIR is protecting these artifacts from.
+    #
+    # Both entries MUST also appear in NEVER_AUTOREPAIR (pinned by
+    # test_derived_artifact_repair.py): registering a rot-only repair is not a
+    # promotion out of that list, it is a narrowing inside it.
+    "backend/testing/test_test_durations_freshness.py": AutoRepair(
+        script="scripts/prune_stale_durations.py",
+        args=("--write",),
+        artifacts=("backend/.test_durations",),
+        why=(
+            "Rot only. Removing an entry for a test file or node id that is no "
+            "longer in the tree needs no measurement and discards none -- a full "
+            "timed regeneration would drop exactly those rows. The pruner cannot "
+            "add a row, so the unpayable half (a new test with no timing) still "
+            "blocks and still costs scripts/store-backend-durations.sh."
+        ),
+    ),
+    "backend/testing/test_vitest_durations_freshness.py": AutoRepair(
+        script="scripts/prune_stale_durations.py",
+        args=("--write",),
+        artifacts=("admin-ui/.test_durations.json", "agent/.test_durations.json"),
+        why=(
+            "Rot only, same argument as the backend artifact: an entry naming a "
+            "vitest file the suite no longer collects is phantom data that a "
+            "re-timed run would drop anyway. The guard's own "
+            "_assert_all_entries_measured refuses fabricated rows, and the "
+            "pruner never writes one, so the addition half is untouched."
         ),
     ),
 }
@@ -206,10 +260,31 @@ class RepairOutcome:
                 {
                     artifact
                     for sentinel in self.repaired
-                    for artifact in AUTOREPAIRABLE[sentinel].artifacts
+                    for artifact in repair_entry(sentinel).artifacts
                 }
             )
         )
+
+    def merge(self, other: "RepairOutcome") -> "RepairOutcome":
+        """Combine two passes over disjoint registries into one report."""
+        return RepairOutcome(
+            repaired=tuple(sorted({*self.repaired, *other.repaired})),
+            already_fresh=tuple(sorted({*self.already_fresh, *other.already_fresh})),
+            skipped=tuple(sorted({*self.skipped, *other.skipped})),
+            failed={**self.failed, **other.failed},
+        )
+
+
+def repair_entry(sentinel: str) -> AutoRepair:
+    """The registered repair for ``sentinel``, from whichever registry owns it.
+
+    The two registries are disjoint by construction and that is pinned by
+    ``test_derived_artifact_repair.py``, so this lookup is unambiguous.
+    """
+    entry = AUTOREPAIRABLE.get(sentinel) or ROT_ONLY_AUTOREPAIR.get(sentinel)
+    if entry is None:  # pragma: no cover - callers only pass repaired sentinels
+        raise KeyError(sentinel)
+    return entry
 
 
 def _snapshot(repo: Path, artifacts: Iterable[str]) -> dict[str, bytes | None]:
@@ -224,23 +299,30 @@ def _snapshot(repo: Path, artifacts: Iterable[str]) -> dict[str, bytes | None]:
     return state
 
 
-def repair_sentinels(repo: Path, sentinels: Iterable[str]) -> RepairOutcome:
+def repair_sentinels(
+    repo: Path,
+    sentinels: Iterable[str],
+    registry: dict[str, AutoRepair] | None = None,
+) -> RepairOutcome:
     """Run the registered generator for each auto-repairable ``sentinel``.
 
     Fail-closed by construction: a generator that is missing, that exits
     non-zero, or that leaves its declared artifact absent is recorded in
     ``failed`` rather than being reported as a repair.  Sentinels that are not
-    in :data:`AUTOREPAIRABLE` are recorded in ``skipped`` and NEVER run -- this
-    function has no fallback path that would let an unlisted regeneration
-    command execute.
+    in ``registry`` (default :data:`AUTOREPAIRABLE`) are recorded in ``skipped``
+    and NEVER run -- this function has no fallback path that would let an
+    unlisted regeneration command execute, and passing an explicit registry
+    NARROWS what may run rather than widening it.
     """
+    if registry is None:
+        registry = AUTOREPAIRABLE
     repaired: list[str] = []
     already_fresh: list[str] = []
     skipped: list[str] = []
     failed: dict[str, str] = {}
 
     for sentinel in sorted(set(sentinels)):
-        entry = AUTOREPAIRABLE.get(sentinel)
+        entry = registry.get(sentinel)
         if entry is None:
             skipped.append(sentinel)
             continue

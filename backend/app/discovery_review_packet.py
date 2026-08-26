@@ -71,6 +71,32 @@ DISCOVERY_SUBSTANTIVE_EMPTINESS_REASON_CODES = frozenset(
         DISCOVERY_PARENT_PLATFORM_FAILED,
     }
 )
+# Machine-readable code for every condition that can withhold binding authority
+# from an otherwise well-formed packet, emitted positionally alongside
+# ``binding_action_blockers`` in the manifest.
+#
+# Every one of them is a BUDGET condition: the engine holds the evidence and
+# could not fit it in a bounded packet. None of them is an authority question,
+# which is the only thing a human is actually needed for. The decision boundary
+# reads these codes to tell the two apart -- see
+# ``app.discovery_review._replace_authorised_escalation``. A future blocker that
+# genuinely does require operator judgement must be given a code outside
+# ``DISCOVERY_BUDGET_CLASS_BLOCKER_CODES``, and an unrecognised or absent code
+# is treated as non-budget so escalation is preserved by default.
+DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE = "discovery_authority_snapshot_unpageable"
+DISCOVERY_WITHHELD_CARRY_RECORDS_OMITTED = "discovery_withheld_carry_records_omitted"
+DISCOVERY_EVIDENCE_COVERAGE_ITEM_FLOOR_UNMET = (
+    "discovery_evidence_coverage_item_floor_unmet"
+)
+DISCOVERY_EVIDENCE_COVERAGE_UNFITTABLE = "discovery_evidence_coverage_unfittable"
+DISCOVERY_BUDGET_CLASS_BLOCKER_CODES = frozenset(
+    {
+        DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE,
+        DISCOVERY_WITHHELD_CARRY_RECORDS_OMITTED,
+        DISCOVERY_EVIDENCE_COVERAGE_ITEM_FLOOR_UNMET,
+        DISCOVERY_EVIDENCE_COVERAGE_UNFITTABLE,
+    }
+)
 # Which top-level snapshot keys carry decision authority -- the content the
 # reviewer must hold whole to bind advance/park/stop instead of handing the
 # question back to a human. Everything outside these sets is framing the
@@ -513,6 +539,61 @@ def _bounded_decision_snapshot(
         DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS - (_json_cost(fallback) - 2),
     )
     return fallback, True, "the snapshot structure itself"
+
+
+def _authority_continuation(
+    source: Any, bounded: Mapping[str, Any], *, authority_keys: frozenset[str]
+) -> dict[str, Any]:
+    """Full text of the decision-bearing keys the bounded snapshot could not carry.
+
+    ``_bounded_decision_snapshot`` honestly reports that an authority key was
+    shortened; that report is correct and unchanged. What was wrong was the
+    conclusion drawn from it. The snapshot budget
+    (``DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS``, 8,000) is a bound on ONE
+    field of the decision task payload -- it is not a statement that the engine
+    has lost the text. The full authority is sitting in
+    ``DiscoveryCycle.intent_snapshot``/``bet_snapshot`` the whole time.
+
+    So instead of revoking binding authority and leaving ``ask_operator`` as the
+    only permitted verdict -- which asks a human to hand back a claim the engine
+    is holding verbatim in its own database -- the overflowing keys are PAGED:
+    carried whole in a dedicated ``authority_continuation`` evidence item, whose
+    own budget (``DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS``, 32,000) is four
+    times the snapshot budget that could not hold them.
+
+    Returns the full value of every authority key the bounded form did not
+    reproduce exactly, or an empty mapping when there is nothing to page. The
+    comparison is against the emitted value rather than the reported key names,
+    so the structure-omitted fallback -- where the bounded form keeps no source
+    keys at all -- pages every authority key it can find.
+    """
+
+    if not isinstance(source, Mapping):
+        return {}
+    return {
+        str(key): source[key]
+        for key in sorted(authority_keys)
+        if key in source and bounded.get(key) != source[key]
+    }
+
+
+def _blockers_are_budget_class(
+    blockers: Sequence[str], codes: Sequence[str]
+) -> bool:
+    """Is every blocker on this packet a bounded-budget overflow?
+
+    The codes are POSITIONAL -- one per blocker, appended in lockstep. So a
+    blocker with no code beside it is a blocker of UNKNOWN class, and unknown
+    must never read as budget-class: that is how a future authority blocker,
+    added without remembering to give it a code, would silently lose its
+    escalation. A length mismatch therefore fails closed, as does an empty code
+    list, which is also what a packet frozen before these codes existed looks
+    like.
+    """
+
+    if not codes or len(codes) != len(blockers):
+        return False
+    return all(code in DISCOVERY_BUDGET_CLASS_BLOCKER_CODES for code in codes)
 
 
 def _bounded_metadata(value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -1096,7 +1177,8 @@ def _assemble_receipt(
     missing_reasons: list[str],
     compacted: bool,
     authority_blockers: Sequence[str] = (),
-) -> tuple[dict[str, Any], list[str]]:
+    authority_blocker_codes: Sequence[str] = (),
+) -> tuple[dict[str, Any], list[str], list[str]]:
     """Assemble one candidate receipt at a given degradation level.
 
     The authority invariant is derived exactly as at full detail:
@@ -1113,7 +1195,9 @@ def _assemble_receipt(
     (a truncated intent/bet authority). They are unioned in here rather than
     recomputed per level because they do not vary with degradation level,
     and they must reach the receipt so its stored authority invariant agrees
-    with the manifest's.
+    with the manifest's. ``authority_blocker_codes`` is their positional
+    machine-readable vocabulary; this function appends the code for the one
+    blocker it can add itself, so the returned lists stay index-aligned.
     """
 
     incomplete_collections = [
@@ -1128,6 +1212,9 @@ def _assemble_receipt(
         ]
         if incomplete_collections
         else []
+    )
+    blocker_codes = list(authority_blocker_codes) + (
+        [DISCOVERY_EVIDENCE_COVERAGE_ITEM_FLOOR_UNMET] if incomplete_collections else []
     )
     receipt = {
         "source_parent": source_parent,
@@ -1164,7 +1251,7 @@ def _assemble_receipt(
         ]
         if evidence_truncated:
             receipt["evidence_truncated"] = evidence_truncated
-    return receipt, binding_action_blockers
+    return receipt, binding_action_blockers, blocker_codes
 
 
 # Coverage collections that are real, judgeable content about the COHORT but
@@ -1283,7 +1370,8 @@ def _repair_zeroed_categories(
     execution: dict[str, Any],
     missing_reasons: list[str],
     authority_blockers: Sequence[str] = (),
-) -> tuple[dict[str, Any], list[str]]:
+    authority_blocker_codes: Sequence[str] = (),
+) -> tuple[dict[str, Any], list[str], list[str]]:
     """Never let a category with real evidence render as fully absent.
 
     The progressive-level loop in ``build_discovery_review_packet`` reduces
@@ -1323,11 +1411,13 @@ def _repair_zeroed_categories(
             execution=execution,
             missing_reasons=missing_reasons,
             authority_blockers=authority_blockers,
+            authority_blocker_codes=authority_blocker_codes,
             compacted=True,
         )
 
     receipt: dict[str, Any] = {}
     binding_action_blockers: list[str] = []
+    blocker_codes: list[str] = []
     for max_chars in DISCOVERY_REVIEW_FLOOR_PROSE_CHAR_LEVELS:
         candidate_included = dict(included)
         candidate_coverage = dict(evidence_coverage)
@@ -1350,7 +1440,7 @@ def _repair_zeroed_categories(
                 omitted=floor_omitted,
                 selection=selection,
             )
-        receipt, binding_action_blockers = _assemble_receipt(
+        receipt, binding_action_blockers, blocker_codes = _assemble_receipt(
             source_parent=source_parent,
             included=candidate_included,
             stranded_deliveries=stranded_deliveries,
@@ -1358,15 +1448,16 @@ def _repair_zeroed_categories(
             execution=execution,
             missing_reasons=missing_reasons,
             authority_blockers=authority_blockers,
+            authority_blocker_codes=authority_blocker_codes,
             compacted=True,
         )
         if _receipt_fits_evidence_metadata(receipt):
-            return receipt, binding_action_blockers
+            return receipt, binding_action_blockers, blocker_codes
     # Every prose-cap level was tried; return the most aggressively truncated
     # attempt so the caller's coverage-bulk fallback (which never touches
     # item content) gets a chance to close the remaining gap without
     # re-emptying the categories this function just floor-repaired.
-    return receipt, binding_action_blockers
+    return receipt, binding_action_blockers, blocker_codes
 
 
 async def build_discovery_review_packet(
@@ -1533,7 +1624,60 @@ async def build_discovery_review_packet(
     # authority it was holding intact. The named keys are appended to the
     # blocker so an operator reading the manifest can see which part of the
     # authority was actually lost, instead of only that some part was.
+    #
+    # What changed on 2026-08-25: a decision-bearing key that cannot be carried
+    # whole no longer revokes authority on its own either. The engine holds the
+    # full text in cycle.intent_snapshot/bet_snapshot, so it is PAGED into a
+    # dedicated authority_continuation evidence item (32,000-char budget, four
+    # times the snapshot's 8,000) and the reviewer decides from the whole thing.
+    # Authority is revoked only when even that larger budget cannot carry it,
+    # which is the only case where the packet genuinely cannot deliver what the
+    # reviewer needs. Asking a human to retype a claim the database is holding
+    # verbatim was never a question only a human could answer.
     authority_blockers: list[str] = []
+    authority_blocker_codes: list[str] = []
+    intent_continuation = (
+        _authority_continuation(
+            cycle.intent_snapshot,
+            bounded_intent,
+            authority_keys=DISCOVERY_REVIEW_INTENT_AUTHORITY_KEYS,
+        )
+        if intent_authority_lost
+        else {}
+    )
+    bet_continuation = (
+        _authority_continuation(
+            cycle.bet_snapshot,
+            bounded_bet,
+            authority_keys=DISCOVERY_REVIEW_BET_AUTHORITY_KEYS,
+        )
+        if bet_authority_lost
+        else {}
+    )
+    authority_continuation: dict[str, Any] = {}
+    if intent_continuation or bet_continuation:
+        candidate = {
+            "note": (
+                "Decision-bearing authority that exceeded the bounded "
+                "intent/bet snapshot, carried here in full. Judge the bet "
+                "against these values, not against the shortened forms in "
+                "intent_snapshot/bet_snapshot."
+            ),
+            "intent_authority": intent_continuation,
+            "bet_authority": bet_continuation,
+            "intent_authority_keys": sorted(intent_continuation),
+            "bet_authority_keys": sorted(bet_continuation),
+        }
+        if _receipt_fits_evidence_metadata(candidate):
+            authority_continuation = candidate
+    # Paged-or-blocked is decided per side, never on the item merely existing.
+    # The continuation is written as one all-or-nothing candidate, so a side
+    # that contributed nothing to it -- a structure-omitted intent whose
+    # authority keys are absent from the source snapshot, say -- is NOT carried
+    # by a sibling side that did. Gating both blockers on ``authority_continuation``
+    # alone would suppress a blocker for authority nothing actually delivered.
+    intent_paged = bool(authority_continuation) and bool(intent_continuation)
+    bet_paged = bool(authority_continuation) and bool(bet_continuation)
     if withheld_carry_omitted_count:
         # Whole withheld records the research parent could not fit in its
         # bounded carry. Unlike a shortened excerpt (reported, but not
@@ -1550,16 +1694,19 @@ async def build_discovery_review_packet(
             "the bounded research carry: "
             + ", ".join(sorted(withheld_carry_omitted_checksums))[:240]
         )
-    if intent_authority_lost:
+        authority_blocker_codes.append(DISCOVERY_WITHHELD_CARRY_RECORDS_OMITTED)
+    if intent_authority_lost and not intent_paged:
         authority_blockers.append(
-            "intent authority exceeds the bounded decision contract: "
-            f"{intent_authority_lost}"
+            "intent authority exceeds the bounded decision contract and could "
+            f"not be paged into the evidence packet: {intent_authority_lost}"
         )
-    if bet_authority_lost:
+        authority_blocker_codes.append(DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE)
+    if bet_authority_lost and not bet_paged:
         authority_blockers.append(
-            "bet authority exceeds the bounded decision contract: "
-            f"{bet_authority_lost}"
+            "bet authority exceeds the bounded decision contract and could "
+            f"not be paged into the evidence packet: {bet_authority_lost}"
         )
+        authority_blocker_codes.append(DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE)
     if source is None:
         missing.append("source research parent is missing from the discovery cohort")
     # A research parent that settled FAILED/CANCELLED never rolls its staging
@@ -1714,7 +1861,7 @@ async def build_discovery_review_packet(
     included, evidence_coverage = _evidence_coverage_for_level(
         collections, _COLLECTION_BASE_DETAIL_COUNTS, level=0
     )
-    receipt, binding_action_blockers = _assemble_receipt(
+    receipt, binding_action_blockers, blocker_codes = _assemble_receipt(
         source_parent=source_parent,
         included=included,
         stranded_deliveries=stranded_deliveries,
@@ -1722,6 +1869,7 @@ async def build_discovery_review_packet(
         execution=execution,
         missing_reasons=missing_reasons,
         authority_blockers=authority_blockers,
+        authority_blocker_codes=authority_blocker_codes,
         compacted=False,
     )
     if not _receipt_fits_evidence_metadata(receipt):
@@ -1744,7 +1892,7 @@ async def build_discovery_review_packet(
             included, evidence_coverage = _evidence_coverage_for_level(
                 collections, detail_counts, level=level
             )
-            receipt, binding_action_blockers = _assemble_receipt(
+            receipt, binding_action_blockers, blocker_codes = _assemble_receipt(
                 source_parent=source_parent,
                 included=included,
                 stranded_deliveries=stranded_deliveries,
@@ -1752,6 +1900,7 @@ async def build_discovery_review_packet(
                 execution=execution,
                 missing_reasons=missing_reasons,
                 authority_blockers=authority_blockers,
+                authority_blocker_codes=authority_blocker_codes,
                 compacted=True,
             )
             if _receipt_fits_evidence_metadata(receipt):
@@ -1761,7 +1910,7 @@ async def build_discovery_review_packet(
         # category that truly has evidence as fully empty. Re-inject a
         # small, prose-truncated floor for any collection the lockstep
         # halving above zeroed out even though it had real items.
-        receipt, binding_action_blockers = _repair_zeroed_categories(
+        receipt, binding_action_blockers, blocker_codes = _repair_zeroed_categories(
             collections=collections,
             included=included,
             evidence_coverage=evidence_coverage,
@@ -1770,6 +1919,7 @@ async def build_discovery_review_packet(
             execution=execution,
             missing_reasons=missing_reasons,
             authority_blockers=authority_blockers,
+            authority_blocker_codes=authority_blocker_codes,
         )
         # _assemble_receipt always mirrors its evidence_coverage argument
         # into receipt["evidence_coverage"], so read the repaired coverage
@@ -1793,8 +1943,13 @@ async def build_discovery_review_packet(
             coverage["semantic_digest_item_coverage_complete"] = False
             coverage["semantic_digest_elided_item_count"] = coverage["omitted_count"]
             coverage["semantic_digest_min_item_chars"] = 0
-        binding_action_blockers = list(authority_blockers) + [
-            "complete authored semantic coverage cannot fit the bounded decision packet"
+        binding_action_blockers = [
+            *authority_blockers,
+            "complete authored semantic coverage cannot fit the bounded decision packet",
+        ]
+        blocker_codes = [
+            *authority_blocker_codes,
+            DISCOVERY_EVIDENCE_COVERAGE_UNFITTABLE,
         ]
         receipt.update(
             {
@@ -1825,6 +1980,26 @@ async def build_discovery_review_packet(
         head_sha=landed_sha,
         snapshot=receipt,
     )
+    continuation_item = (
+        await _get_or_add_evidence(
+            session,
+            cycle=cycle,
+            dedupe_key=(
+                f"authority-continuation:v{DISCOVERY_REVIEW_PACKET_VERSION}:"
+                f"{_checksum(authority_continuation)}"
+            ),
+            semantic_role="authority_continuation",
+            source_kind="server_ledger",
+            source_id=str(cycle.id),
+            content_type=(
+                "application/vnd.blueprint.discovery-authority-continuation+json"
+            ),
+            head_sha=landed_sha,
+            snapshot=authority_continuation,
+        )
+        if authority_continuation
+        else None
+    )
     emptiness_reason_code = substantive_emptiness_reason_code(
         evidence_coverage,
         source_status=source_parent["status"],
@@ -1848,10 +2023,28 @@ async def build_discovery_review_packet(
         "stranded_delivery_count": len(stranded_deliveries),
         "missing_required_evidence": missing_reasons,
         "binding_action_blockers": binding_action_blockers,
+        # Positional machine-readable vocabulary for the blockers above, so the
+        # decision boundary can tell a bounded-budget overflow (the engine holds
+        # the evidence, a human adds nothing) from a genuine authority question.
+        # See DISCOVERY_BUDGET_CLASS_BLOCKER_CODES.
+        "binding_action_blocker_codes": blocker_codes,
+        "binding_blockers_budget_class_only": _blockers_are_budget_class(
+            binding_action_blockers, blocker_codes
+        ),
         "binding_decision_allowed": not binding_action_blockers,
         "required_evidence_omitted": bool(missing_reasons or binding_action_blockers),
         "intent_snapshot_truncated": intent_truncated,
         "bet_snapshot_truncated": bet_truncated,
+        # Decision-bearing authority that overflowed the snapshot budget and was
+        # carried whole in the authority_continuation evidence item instead of
+        # revoking binding authority over it.
+        "authority_continued_in_evidence": bool(authority_continuation),
+        "authority_continued_keys": sorted(
+            [f"intent.{key}" for key in intent_continuation]
+            + [f"bet.{key}" for key in bet_continuation]
+        )
+        if authority_continuation
+        else [],
         # What the cycle produced but did not turn into work. A non-zero count
         # under an otherwise empty receipt is the signature of the live defect
         # this reports on: the parent DID find something, a filter routed or
@@ -1882,10 +2075,10 @@ async def build_discovery_review_packet(
         head_sha=landed_sha,
         snapshot=manifest,
     )
-    packet = [
-        _evidence_projection(item)
-        for item in [manifest_item, outcome_item]
-    ]
+    packet_items = [manifest_item, outcome_item]
+    if continuation_item is not None:
+        packet_items.append(continuation_item)
+    packet = [_evidence_projection(item) for item in packet_items]
     artifact_prerequisites = [
         {
             "artifact_id": str(artifact.id),

@@ -6982,6 +6982,12 @@ def _compute_git_repo_state(start_dir: str, *, _subprocess_run=None) -> dict:
     Asks git whether it can read a repository rather than looking for a
     ``.git`` DIRECTORY: in a linked worktree ``.git`` is a FILE, so an isdir
     probe reports "not a repo" and skips silently.
+
+    That closes the LAYOUT half of "the probe cannot look"; ``-c
+    safe.directory`` below closes the OWNERSHIP half. Both failures land in the
+    same place -- ``resolved_by: "cwd"`` with a null commit/ref/dirty -- and
+    that record is what :func:`_compute_repo_clone_warnings` exists to keep
+    honest, so a silently empty one is worse than a loud refusal.
     """
     _run = _subprocess_run if _subprocess_run is not None else subprocess.run
 
@@ -6994,8 +7000,17 @@ def _compute_git_repo_state(start_dir: str, *, _subprocess_run=None) -> dict:
 
     def _git(*a) -> "str | None":
         try:
+            # ``-c safe.directory=<start_dir>``: git refuses EVERY command with
+            # "detected dubious ownership" (exit 128) when the caller's uid does
+            # not own the checkout -- a repo mounted into a container that runs
+            # as root, or a checkout read by a service unit running as another
+            # user. Every read below then returns None and the provenance record
+            # degrades to ``resolved_by: "cwd"``, which reads exactly like "this
+            # directory is not a checkout" instead of "git was not allowed to
+            # look". Naming the path as safe makes the read WORK; it does not
+            # soften what happens when it genuinely fails.
             proc = _run(
-                ["git", "-C", start_dir, *a],
+                ["git", "-c", f"safe.directory={start_dir}", "-C", start_dir, *a],
                 capture_output=True, text=True, timeout=_GIT_READ_TIMEOUT,
             )
         except Exception:  # noqa: BLE001 -- no git is "unknown", not a crash

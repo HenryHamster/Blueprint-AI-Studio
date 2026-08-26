@@ -63,13 +63,19 @@ def _get_changed_files():
     """Get list of changed files (staged + unstaged)."""
     # Paths come back as git wrote them; a non-ascii filename must not abort
     # the verification pass with a locale decode error.
+    #
+    # ``-c safe.directory=<PROJECT_ROOT>``: an unreadable git here is FAIL-OPEN,
+    # the worst shape. Both reads below ignore their return code, so a git that
+    # exited 128 with "detected dubious ownership" yields an EMPTY changed-file
+    # set, and every ``--changed`` check then prints "No changed files" and
+    # returns True. The pass reports green having inspected nothing.
     result = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD"],
+        ["git", "-c", f"safe.directory={PROJECT_ROOT}", "diff", "--name-only", "HEAD"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         cwd=PROJECT_ROOT
     )
     staged = subprocess.run(
-        ["git", "diff", "--name-only", "--cached"],
+        ["git", "-c", f"safe.directory={PROJECT_ROOT}", "diff", "--name-only", "--cached"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         cwd=PROJECT_ROOT
     )
