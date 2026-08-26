@@ -3680,6 +3680,66 @@ async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
 
 
 @pytest.mark.asyncio
+async def test_force_promote_provenance_survives_last_qualification_overwrite(
+    db_session,
+):
+    """Each force-promote attempt keeps its own operator provenance forever."""
+    from app import release_promotion as rp
+
+    _project, version = await _make_project_and_version(db_session)
+    first_record = {
+        "candidate_sha": "first-candidate",
+        "forced_promote": True,
+        "forced_promote_by": "operator-1",
+        "forced_promote_at": "2026-08-26T10:11:12+00:00",
+        "forced_promote_reason": "first emergency release",
+    }
+    version.last_qualification = dict(first_record)
+    db_session.add(version)
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        first_record,
+        terminal_status="promoted",
+        would_promote=True,
+        promotion_enabled=True,
+    )
+    await db_session.commit()
+
+    second_record = {
+        "candidate_sha": "second-candidate",
+        "forced_promote": True,
+        "forced_promote_by": "operator-2",
+        "forced_promote_at": "2026-08-26T11:13:14+00:00",
+        "forced_promote_reason": "second emergency release",
+    }
+    version.last_qualification = dict(second_record)
+    db_session.add(version)
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        second_record,
+        terminal_status="promoted",
+        would_promote=True,
+        promotion_enabled=True,
+    )
+    await db_session.commit()
+
+    rows = await _load_only_verdict(db_session, version)
+    assert len(rows) == 2
+    first, second = rows
+    assert first.forced_promote_by == "operator-1"
+    assert first.forced_promote_at.isoformat() == "2026-08-26T10:11:12"
+    assert first.forced_promote_reason == "first emergency release"
+    assert second.forced_promote_by == "operator-2"
+    assert second.forced_promote_at.isoformat() == "2026-08-26T11:13:14"
+    assert second.forced_promote_reason == "second emergency release"
+
+    await db_session.refresh(version)
+    assert version.last_qualification["forced_promote_by"] == "operator-2"
+
+
+@pytest.mark.asyncio
 async def test_promotion_failed_attempt_persists_promotion_context(db_session):
     """A promotion_failed attempt mirrors the merge PR url / conflict / error
     context onto the immutable verdict row alongside migration-safety."""

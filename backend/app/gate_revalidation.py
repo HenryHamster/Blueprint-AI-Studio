@@ -108,8 +108,18 @@ def head_advanced_since_gate_failure(
     """
     head = _normalize_sha(head_sha)
     ctx = _task_context(task)
+    # ``_gate_revalidated_head`` first (a prior automatic revalidation already
+    # consumed that HEAD), then the STRUCTURED baseline frozen into the blocker
+    # record at block time, then the spawn-time branch point. The structured
+    # baseline is preferred over ``generated_head_sha`` because it names the base
+    # the blocker was actually OBSERVED on, which is what "advanced since the
+    # failure" means; ``generated_head_sha`` only names where the branch was cut.
+    from app.task_blocked import blocker_recheck_baseline
+
     baseline = _normalize_sha(
-        ctx.get("_gate_revalidated_head") or ctx.get("generated_head_sha")
+        ctx.get("_gate_revalidated_head")
+        or blocker_recheck_baseline(task)
+        or ctx.get("generated_head_sha")
     )
     if not head:
         return False
@@ -119,6 +129,33 @@ def head_advanced_since_gate_failure(
     blocked_at = _as_utc(task.blocked_at)
     committed_at = _as_utc(head_committed_at)
     return bool(blocked_at and committed_at and committed_at > blocked_at)
+
+
+def base_state_recheck_eligible(task: Task) -> bool:
+    """Predicate: does *task* carry the structured ``base_state`` recheck record?
+
+    This is the STRUCTURAL counterpart to :func:`is_gate_failure_blocked`. That
+    function answers the same question — "is this blocker a property of the
+    repository base rather than of the task's own diff?" — by matching the
+    agent's free prose against two hardcoded phrase lists. Prose matching only
+    ever recognizes the wordings someone thought to enumerate: a live incident
+    (task ``d58aa94c``, "Publication gate cannot pass without unrelated artifact
+    repairs … an inherited 1806-line breach") hit NEITHER list, so the
+    revalidation machinery that exists precisely for it never ran and the task
+    sat escalated to a human for 20 hours after both halves of its blocker had
+    been fixed on the integration branch.
+
+    ``task_blocked.build_blocker_recheck`` records the classification at block
+    time from the blocker's SHAPE (agent-sourced precondition, no named
+    foundation), so recognition no longer depends on wording. The prose path is
+    kept as-is for rows written before this field existed.
+    """
+    from app.task_blocked import (
+        BLOCKER_RECHECK_BASE_STATE,
+        blocker_recheck_predicate,
+    )
+
+    return blocker_recheck_predicate(task) == BLOCKER_RECHECK_BASE_STATE
 
 
 def is_gate_failure_blocked(task: Task) -> bool:

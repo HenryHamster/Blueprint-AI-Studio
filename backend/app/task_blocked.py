@@ -61,6 +61,44 @@ PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL = "structurally_unresolvable"
 
 # JSONB key under Task.context that holds the structured blocker metadata.
 BLOCKER_CONTEXT_KEY = "blocker"
+
+# ── Structured RECHECK predicate (what a sweep can re-test later) ────────────
+# A blocker's ``reason`` is free prose. Prose is not a re-testable condition, so
+# for years the ONLY blockers a sweep could re-evaluate were the ones that named
+# a machine-resolvable foundation (``needs`` — a task/PR/capability) or that a
+# server-side authority owned outright (file_conflict, pending_rollup,
+# llm_route). Everything else — an agent that ran, looked at the repository it
+# was given, and reported "this cannot proceed" — was recorded as a string and
+# re-examined by nothing. Elapsed time could CANCEL such a row (the parked
+# re-eval cap) and elapsed time could ESCALATE it, but nothing could ever CLEAR
+# it: a one-way latch that leaves valid work dead after the world fixes itself.
+#
+# ``blocker['recheck']`` closes that by recording, AT BLOCK TIME, which named
+# predicate re-tests this blocker. The predicate set is deliberately tiny and
+# general — it classifies the WORLD the condition lives in, never the specific
+# condition (no per-blocker special cases, nothing to keep in sync with agent
+# wording):
+#
+#   ``base_state`` — the agent observed the condition while executing against a
+#       repository base and named no foundation. Whatever it saw (an inherited
+#       gate failure, a stale generated artifact, a file over a cap, a missing
+#       upstream file) is a property of that base. The machine-checkable re-test
+#       is therefore "has the integration base advanced past the one the blocker
+#       was observed on, and is it healthy?" — exactly the question
+#       ``gate_revalidation`` already answers. If yes, requeue and let the task's
+#       own gate re-decide on the fresh base; that is the only authority that can
+#       actually evaluate the condition, and it is cheap to ask.
+#
+# ``baseline`` freezes the integration SHA the blocker was observed against so
+# the comparison is self-describing rather than inferred from timestamps.
+BLOCKER_RECHECK_KEY = "recheck"
+BLOCKER_RECHECK_BASE_STATE = "base_state"
+BLOCKER_RECHECK_PREDICATES: tuple[str, ...] = (BLOCKER_RECHECK_BASE_STATE,)
+# Context key holding how many base-state re-checks have already requeued this
+# task. Deliberately kept OUT of ``FRESH_ATTEMPT_CONTEXT_STRIP_KEYS`` so the
+# budget survives the requeue → re-block cycle it is meant to bound: a counter
+# that resets on every requeue is not a bound.
+BASE_STATE_RECHECK_COUNT_KEY = "_blocked_base_state_rechecks"
 PUBLICATION_GATE_RECEIPT_KEY = "publication_gate_receipt"
 PUBLICATION_GATE_RECEIPT_HISTORY_KEY = "publication_gate_receipt_history"
 _PUBLICATION_GATE_RECEIPT_HISTORY_LIMIT = 8
@@ -785,6 +823,82 @@ def get_blocker_needs(task: Task) -> list:
     return []
 
 
+def get_blocker_recheck(task: Task) -> Dict[str, Any]:
+    """Return the structured recheck predicate recorded on a blocker (``{}``).
+
+    Only a recognized ``predicate`` is returned; an unknown/missing/malformed
+    record degrades to ``{}`` so a future predicate name written by a NEWER
+    deploy can never make an older sweep act on a rule it does not implement.
+    """
+    record = get_blocker_metadata(task).get(BLOCKER_RECHECK_KEY)
+    if not isinstance(record, dict):
+        return {}
+    if record.get("predicate") not in BLOCKER_RECHECK_PREDICATES:
+        return {}
+    return dict(record)
+
+
+def blocker_recheck_predicate(task: Task) -> Optional[str]:
+    """Return the recorded recheck predicate name, or ``None``."""
+    return get_blocker_recheck(task).get("predicate")
+
+
+def blocker_recheck_baseline(task: Task) -> Optional[str]:
+    """Return the integration SHA the blocker was observed against, or ``None``."""
+    baseline = get_blocker_recheck(task).get("baseline")
+    if not isinstance(baseline, str):
+        return None
+    text = baseline.strip().lower()
+    return text or None
+
+
+def observed_base_sha(task: Task) -> Optional[str]:
+    """Best-effort integration SHA the task last executed against.
+
+    ``_gate_revalidated_head`` (stamped by a previous automatic revalidation)
+    takes precedence over the spawn-time branch point so a re-block records the
+    base it ACTUALLY ran on, not the one it was created from.
+    """
+    ctx = task.context or {}
+    for key in ("_gate_revalidated_head", "generated_head_sha"):
+        value = ctx.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return None
+
+
+def build_blocker_recheck(
+    task: Task,
+    *,
+    source: str,
+    blocker_kind: str,
+    has_needs: bool,
+    now: datetime,
+) -> Optional[Dict[str, Any]]:
+    """Classify which named predicate can re-test this blocker later.
+
+    The rule is intentionally one line of policy, not a table of conditions: an
+    ``agent``-sourced ``precondition`` blocker that names NO machine-resolvable
+    foundation is a report about the repository base the agent was handed, so
+    ``base_state`` re-tests it. Every other shape already has an owner —
+    ``upstream_dependency`` and any blocker carrying ``needs`` resolve through
+    the foundation resolver; ``file_conflict`` / ``pending_rollup`` /
+    ``llm_route`` have dedicated server-side authorities in
+    ``blocked_retry_authority`` — so they record no predicate here and their
+    behaviour is unchanged.
+    """
+    if source != "agent" or blocker_kind != "precondition" or has_needs:
+        return None
+    record: Dict[str, Any] = {
+        "predicate": BLOCKER_RECHECK_BASE_STATE,
+        "observed_at": now.isoformat(),
+    }
+    baseline = observed_base_sha(task)
+    if baseline:
+        record["baseline"] = baseline
+    return record
+
+
 def _raw_need_is_structurally_dead(raw: object) -> bool:
     """Return True for needs that are structurally unresolvable at construction time.
 
@@ -920,6 +1034,19 @@ def enter_blocked_state(
     if normalized_needs:
         meta["needs"] = normalized_needs
         meta["need"] = normalized_needs[0]
+    # Structured re-test predicate. Written for EVERY block episode (not just
+    # ones the caller thought to describe) so the recovery sweep never has to
+    # re-derive "what kind of condition is this?" by pattern-matching the free
+    # text an agent happened to write. See BLOCKER_RECHECK_KEY.
+    recheck_record = build_blocker_recheck(
+        task,
+        source=source,
+        blocker_kind=blocker_code,
+        has_needs=bool(normalized_needs),
+        now=now,
+    )
+    if recheck_record is not None:
+        meta[BLOCKER_RECHECK_KEY] = recheck_record
     ctx = dict(task.context or {})
     ctx[BLOCKER_CONTEXT_KEY] = meta
     # Preserve BLOCKED_PRECONDITION classification compatibility so historical

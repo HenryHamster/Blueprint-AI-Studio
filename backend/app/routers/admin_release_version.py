@@ -171,6 +171,14 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     from app.release_readiness import format_qualification_for_api  # noqa: PLC0415
 
     out = format_qualification_for_api(qual)
+    candidate_gate = qual.get("candidate_operator_authorship_gate")
+    if not isinstance(candidate_gate, dict):
+        sub_scores = qual.get("sub_scores")
+        candidate_gate = (
+            sub_scores.get("candidate_operator_authorship")
+            if isinstance(sub_scores, dict)
+            else None
+        )
     out.update(
         {
             "status": qual.get("status"),
@@ -187,6 +195,10 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
             # operator UI detect when the latest release_audit's findings were computed
             # against a different (older) commit than the version's evaluated candidate.
             "candidate_sha": qual.get("candidate_sha"),
+            # Candidate-range authorship is a promotion gate, not the
+            # historical serving receipt. Preserve its explicit unconfigured
+            # state and null budget so the operator can declare policy.
+            "candidate_operator_authorship_gate": candidate_gate,
             # Infra-failure context (populated only when status=infra_failure).
             "error": qual.get("error"),
             "consecutive_infra_errors": qual.get("consecutive_infra_errors"),

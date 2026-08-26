@@ -55,6 +55,7 @@ from app import release_qualifier as rq
 from app import release_scoring as rs
 from app import release_version as rv
 from app import github_refs
+from app.release_commit_authorship import default_authorship_evidence_contract
 from app.models import (
     Alert,
     Artifact,
@@ -591,6 +592,7 @@ async def _seed_qualification_children(
     version_goal: str | None = None,
     seed_merge_grade: bool = False,
     merge_grade_logs: dict | None = None,
+    declare_authorship_budget: bool = True,
 ):
     """Create the qualifier child tasks + their report artifacts, and stamp
     version.last_qualification with their ids (pending state).
@@ -709,6 +711,34 @@ async def _seed_qualification_children(
 
     if version_goal is not None:
         version.goal = version_goal
+
+    if declare_authorship_budget:
+        # Production no longer seeds an implicit authorship budget. Qualification
+        # fixtures that exercise a normal promotion path must declare the policy
+        # explicitly, just as an owner-controlled project does.
+        existing_authorship = (
+            await db_session.execute(
+                select(VersionAcceptanceCriterion).where(
+                    VersionAcceptanceCriterion.release_version_id == version.id,
+                    VersionAcceptanceCriterion.criterion_key
+                    == "c-test-operator-authorship",
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_authorship is None:
+            db_session.add(
+                VersionAcceptanceCriterion(
+                    project_id=project.id,
+                    release_version_id=version.id,
+                    criterion_key="c-test-operator-authorship",
+                    text="test fixture declares candidate authorship budget",
+                    status="active",
+                    created_by="test",
+                    evidence_contract=default_authorship_evidence_contract(),
+                    evidence_contract_updated_by="test",
+                )
+            )
+            await db_session.flush()
 
     rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
         db_session, version

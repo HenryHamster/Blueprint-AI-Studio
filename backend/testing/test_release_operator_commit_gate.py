@@ -126,14 +126,13 @@ def test_candidate_nonzero_operator_commits_blocks_distinctly():
     assert result["blocker"] != "criterion_coverage_incomplete"
 
 
-def test_candidate_no_contract_declared_is_not_applicable_and_passes():
+def test_candidate_no_contract_declared_is_unconfigured_and_blocks():
     """No active category declares an authorship evidence contract at all.
 
-    Operator hotfixes to main are policy here (v33..HEAD carries ~25
-    non-bot-authored commits) — the gate must not manufacture a zero budget
-    that hard-blocks the moment it is wired in.  Absent a declared contract
-    it reports a distinct, non-blocking ``"not_applicable"`` verdict instead,
-    even when the measured count is nonzero.
+    The gate must not manufacture a zero budget, but it also must not treat
+    the absence of policy as earned evidence. It reports a distinct
+    non-passing ``"unconfigured"`` verdict, even when the measured count is
+    nonzero.
     """
     gate = rs.evaluate_candidate_operator_authorship_gate(
         _candidate_record(_receipt(3)), _measurement(_receipt(3))
@@ -141,15 +140,16 @@ def test_candidate_no_contract_declared_is_not_applicable_and_passes():
 
     result = _score(gate)
 
-    assert gate["status"] == "not_applicable"
-    assert gate["passed"] is True
+    assert gate["status"] == "unconfigured"
+    assert gate["passed"] is False
     assert gate["count"] == 3
     assert gate["max_count"] is None
+    assert gate["blocker"] == "candidate_operator_authorship_evidence_missing"
     assert gate["reason"] == "no_operator_authorship_contract_declared"
-    assert result["promote"] is True
-    assert result["blocker"] is None
+    assert result["promote"] is False
+    assert result["blocker"] == "candidate_operator_authorship_evidence_missing"
     assert result["sub_scores"]["candidate_operator_authorship"]["status"] == (
-        "not_applicable"
+        "unconfigured"
     )
 
 
