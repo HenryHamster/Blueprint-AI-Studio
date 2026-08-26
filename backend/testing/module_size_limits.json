@@ -139,6 +139,8 @@
     "max_plan_slot_accounting.py": 50,
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 2150,
+    "release_full_suite_drift_sentinel.py": 950,
+    "release_qualifier_auto_trigger.py": 450,
     "release_qualifier_redrive.py": 3000,
     "operator_attention.py": 4700,
     "operator_failure_messages.py": 500,
