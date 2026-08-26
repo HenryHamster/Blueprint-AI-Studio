@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 644 | 1,007,222 | 26,772 | 11,116.778s (642 files) | 2 |
+| backend | 644 | 1,007,225 | 26,772 | 11,116.778s (642 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 113,094 | 6,178 | 317.583s (129 files) | 0 |
@@ -62,7 +62,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 38 | P2 | backend | `backend/testing/test_agent_strategic_fetch.py` | 7,118 | 140 | critical (>5000 LOC) | 7.724s measured | protected; declared floor 140 |
 | 39 | P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification_2.py` | 7,021 | 112 | critical (>5000 LOC) | 5.220s measured | — |
 | 40 | P2 | backend | `backend/testing/test_strategic_state.py` | 10,654 | 174 | critical (>5000 LOC) | 4.542s measured | protected; declared floor 174 |
-| 41 | P2 | backend | `backend/testing/test_release_qualifier__sweep_stuck_qualifications.py` | 7,143 | 145 | critical (>5000 LOC) | 3.776s measured | — |
+| 41 | P2 | backend | `backend/testing/test_release_qualifier__sweep_stuck_qualifications.py` | 7,146 | 145 | critical (>5000 LOC) | 3.776s measured | — |
 | 42 | P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification.py` | 7,684 | 106 | critical (>5000 LOC) | 3.708s measured | — |
 | 43 | P2 | backend | `backend/testing/test_warm_pool_maintainer.py` | 5,828 | 122 | critical (>5000 LOC) | 3.564s measured | — |
 | 44 | P2 | admin-ui | `admin-ui/src/components/VersionLifecyclePanel.test.tsx` | 5,098 | 177 | critical (>5000 LOC) | 2.891s measured | — |

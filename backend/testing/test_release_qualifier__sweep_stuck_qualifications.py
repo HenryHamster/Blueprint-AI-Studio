@@ -5445,8 +5445,11 @@ async def test_drift_sentinel_cancelled_redispatch_is_cooldown_bounded(
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     fake_now = datetime(2026, 8, 6, 12, 0, 0)
+    # The sentinel's clock lives in its own module (the leg was extracted from
+    # release_qualifier_sweep); patch it where the function resolves it, the
+    # same way the re-driver tests patch ``app.release_qualifier_redrive._utcnow``.
     utcnow_mock = mocker.patch(
-        "app.release_qualifier_sweep._utcnow", return_value=fake_now
+        "app.release_full_suite_drift_sentinel._utcnow", return_value=fake_now
     )
 
     async def _gate(session, project_id, *, dispatch=True, dispatch_on_cancelled=True):
