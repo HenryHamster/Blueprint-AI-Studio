@@ -280,6 +280,10 @@ class _MetricsIntegrityObservability:
     auto_resolved_total: int = 0
     auto_resolved_backing_path_total: int = 0
     auto_resolved_named_test_present_total: int = 0
+    # Flags dropped from the bounded ``recent_flags`` ring by the per-check
+    # fair-share cap below. Cumulative, so an operator can tell a genuinely
+    # quiet ring from a sampled one rather than silently seeing fewer flags.
+    recent_flags_elided_total: int = 0
     last_tick_at: str | None = None
     last_tick: Dict[str, Any] | None = None
     recent_ticks: Deque[Dict[str, Any]] = field(
@@ -327,10 +331,31 @@ class _MetricsIntegrityObservability:
         self.last_tick_at = str(tick["at"])
         self.last_tick = tick
         self.recent_ticks.append(tick)
-        for r in flagged:
-            entry = r.as_dict()
-            entry["at"] = tick["at"]
-            self.recent_flags.append(entry)
+        # The ring is bounded, so one high-cardinality check must not be able to
+        # monopolise it. ``near_cap_size_warning`` emits one flag per near-cap
+        # backend module (50 of them here) — on its own enough to fill every
+        # ``_RECENT_FLAGS_MAX`` slot. Flags were appended in check-registration
+        # order, so that flood silently evicted the earliest-registered checks'
+        # findings (playbook/completion-debt integrity drifts) from the only
+        # surface operators read. Give each flagging check an equal share of the
+        # ring so every one stays represented, and count what that elides so the
+        # sampling is visible rather than silent.
+        elided = 0
+        if flagged:
+            per_check_budget = max(
+                1, _RECENT_FLAGS_MAX // len({r.check for r in flagged})
+            )
+            kept_per_check: Dict[str, int] = {}
+            for r in flagged:
+                if kept_per_check.get(r.check, 0) >= per_check_budget:
+                    elided += 1
+                    continue
+                kept_per_check[r.check] = kept_per_check.get(r.check, 0) + 1
+                entry = r.as_dict()
+                entry["at"] = tick["at"]
+                self.recent_flags.append(entry)
+        self.recent_flags_elided_total += elided
+        tick["flags_elided_from_ring"] = elided
         return tick
 
     def snapshot(self) -> Dict[str, Any]:
@@ -349,6 +374,7 @@ class _MetricsIntegrityObservability:
             "last_tick": dict(self.last_tick) if self.last_tick else None,
             "recent_ticks": list(self.recent_ticks),
             "recent_flags": list(self.recent_flags),
+            "recent_flags_elided_total": self.recent_flags_elided_total,
         }
 
 
