@@ -152,6 +152,7 @@ from app.direction_terminal_guard import (
     mark_auto_direction_terminal,
 )
 from app.failure_classification import (
+    BLOCKED_PRECONDITION,
     CO_DEFERRED_SHELVED,
     EXTERNAL_API,
     EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
@@ -159,6 +160,8 @@ from app.failure_classification import (
     GRADER_TIMEOUT_CAUSES,
     GRADER_TRANSIENT_INFRA_CAUSES,
     INFRA_ANALYTICS_CLASSES,
+    PREREQUISITE_NO_PROVIDER_DETAIL,
+    PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL,
     classify_external_api_subtype,
     classify_failure,
 )
@@ -6603,7 +6606,18 @@ async def _handle_research_completion(
                     + structurally_dead_entries
                 )
                 ctx["prerequisite_escalated_to_parent"] = True
-                ctx["prerequisite_escalation_reason"] = "structurally_unresolvable"
+                ctx["prerequisite_escalation_reason"] = (
+                    PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL
+                )
+                # Terminal reason in the canonical fields, not only the bespoke
+                # key above. ``classify_failure`` already derives
+                # BLOCKED_PRECONDITION for a row carrying
+                # ``prerequisite_escalated_to_parent``, so persisting it changes
+                # no consumer's verdict — it only stops the ground-truth reader
+                # (platform_kill_metrics, which never re-derives) from filing
+                # this cancel under "unclassified".
+                ctx["failure_detail"] = PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL
+                ctx["failure_category"] = BLOCKED_PRECONDITION
                 ct.context = ctx
                 flag_modified(ct, "context")
                 ct.status = TaskStatus.CANCELLED
@@ -6644,7 +6658,12 @@ async def _handle_research_completion(
             existing_unresolved.extend(structurally_dead_entries)
             ctx["unresolved_prerequisite"] = existing_unresolved
             ctx["prerequisite_escalated_to_parent"] = True
-            ctx["prerequisite_escalation_reason"] = "no_live_or_deferred_provider"
+            ctx["prerequisite_escalation_reason"] = PREREQUISITE_NO_PROVIDER_DETAIL
+            # See the sibling branch above: the canonical fields carry the same
+            # verdict classify_failure already derives, so the ground-truth
+            # reader stops filing this cancel under "unclassified".
+            ctx["failure_detail"] = PREREQUISITE_NO_PROVIDER_DETAIL
+            ctx["failure_category"] = BLOCKED_PRECONDITION
             ct.context = ctx
             flag_modified(ct, "context")
             ct.status = TaskStatus.CANCELLED

@@ -692,6 +692,74 @@ ADMIN_CANCEL = "ADMIN_CANCEL"
 CO_DEFERRED_SHELVED = "_co_deferred_shelved"
 
 
+# ── terminal-reason detail keys ─────────────────────────────────────
+#
+# ``context['failure_detail']`` is the finer-grained companion to
+# ``failure_category``: the class says which pile a terminal row belongs in, the
+# detail says what the terminalizing path actually did. It is read at the
+# HIGHEST precedence by ``platform_kill_metrics.classify_terminal_task``.
+#
+# These constants live here, in the taxonomy module, rather than beside each
+# writer, for one reason: the writer and the verdict registry
+# (``platform_kill_metrics._DETAIL_VERDICTS``) must agree on the exact string,
+# and two independently-typed literals eventually drift. Importing one symbol on
+# both sides makes a mismatch impossible rather than merely unlikely;
+# ``test_terminal_reason_stamping`` pins that every constant here is registered.
+#
+# Each names a terminal path that previously recorded NO machine-readable reason
+# at all — a state without a why, which is the failure mode the "surface
+# reasons, not just states" rule exists to prevent.
+
+# A forward evaluation gate (audit / perf / walkthrough / compute criteria /
+# memo / knowledge document / research output) rejected the deliverable.
+# Written by ``task_evaluators.record_failed_gate``.
+EVALUATION_GATE_FAILED_DETAIL = "evaluation_gate_failed"
+
+# The PR execution fence refused this row's claim: another task canonically owns
+# the PR, or the assigned target no longer exists.
+# Written by ``review_claim_fence._cancel_pr_task``.
+PR_EXECUTION_FENCE_DENIED_DETAIL = "pr_execution_fence_denied"
+
+# Dependency cascade. The first is the dependent that declared the failed
+# prerequisite; the second is a child swept up behind it. Kept distinct so an
+# operator can tell the origin of a cascade from its blast radius.
+# Written by ``dep_lifecycle._cascade_cancel_dependent``.
+DEPENDENCY_TASK_FAILED_DETAIL = "dependency_task_failed"
+PARENT_DEPENDENCY_FAILED_DETAIL = "parent_dependency_failed"
+
+# Parent-terminal cascades: a parent was reaped by a clock and took its
+# non-terminal children with it. Written by
+# ``recovery_evaluating_hard_timeout`` and ``recovery_evaluating_ci_backstop``.
+PARENT_EVALUATION_TIMEOUT_CASCADE_DETAIL = "parent_evaluation_timeout_cascade"
+PARENT_CI_BACKSTOP_CASCADE_DETAIL = "parent_ci_wait_backstop_cascade"
+
+# Every subtask was deliberately shelved or superseded, so the parent had
+# nothing left to do. Written by
+# ``task_lifecycle_requeue._terminate_all_non_death_cancelled``.
+ALL_CHILDREN_SHELVED_DETAIL = "all_children_shelved_or_superseded"
+
+# A declared prerequisite was refused or had no live/deferred/in-flight
+# provider, so the finding was escalated to the parent instead of blocked.
+# Written by ``research_completion`` (which has long recorded the same two
+# values under ``prerequisite_escalation_reason``) and by the escalation branch
+# of ``task_blocked.enter_blocked_state``.
+PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL = "structurally_unresolvable"
+PREREQUISITE_NO_PROVIDER_DETAIL = "no_live_or_deferred_provider"
+
+# The full roster, so the verdict registry can be proven total over it.
+ALL_TERMINAL_REASON_DETAILS: tuple[str, ...] = (
+    EVALUATION_GATE_FAILED_DETAIL,
+    PR_EXECUTION_FENCE_DENIED_DETAIL,
+    DEPENDENCY_TASK_FAILED_DETAIL,
+    PARENT_DEPENDENCY_FAILED_DETAIL,
+    PARENT_EVALUATION_TIMEOUT_CASCADE_DETAIL,
+    PARENT_CI_BACKSTOP_CASCADE_DETAIL,
+    ALL_CHILDREN_SHELVED_DETAIL,
+    PREREQUISITE_STRUCTURALLY_UNRESOLVABLE_DETAIL,
+    PREREQUISITE_NO_PROVIDER_DETAIL,
+)
+
+
 # Task types that are deployment-health checks, not candidate-code-authoring.
 # When these tasks fail with a generic code-error label (claude_code_failed),
 # the cause is typically an infrastructure condition (stale engine, deployment
@@ -2519,6 +2587,58 @@ def persist_failure_category(
         record_account_failure_class(
             str(account_id), failure_class, confidence=confidence
         )
+
+
+def resolved_failure_class(task: "Task") -> str:
+    """Return the machine-readable failure class recorded for ``task``, or "".
+
+    THREE fields on a task carry a failure class and they are NOT
+    interchangeable. Reading the wrong one is itself a bug class -- it makes a
+    properly classified failure read as "we do not know", which is worse than an
+    honest unknown because it hides in the same bucket:
+
+    * ``context['failure_category']`` -- the CANONICAL value. Every
+      terminal-FAILED code path is required to stamp it via
+      :func:`persist_failure_category`, so this is the field actually populated
+      across the estate.
+    * ``context['failure_class']`` -- a SPARSE authoritative-verdict cache. Only
+      the reaper (``persist_authoritative_verdict``) writes it, so it is present
+      on a small minority of rows.
+    * :func:`classify_failure` -- derived at READ time from status text. A
+      useful last resort, but it is a derivation, not a record, so it ranks
+      below anything the terminalizing path actually persisted.
+
+    This ordering is the single backend-side definition of "which one wins". It
+    mirrors ``scripts/blueprint.py::_resolved_failure_class`` exactly on the
+    persisted fields, so the operator CLI and the agent-facing read surfaces can
+    never disagree about the same task. The CLI is a standalone HTTP client and
+    cannot import this module, so the two implementations are kept in step by
+    naming each other rather than by sharing code.
+
+    Side-effect-free. Returns "" when nothing is recorded and nothing derivable.
+    """
+    ctx = task.context or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+    persisted = str(
+        ctx.get("failure_category") or ctx.get("failure_class") or ""
+    ).strip()
+    if persisted:
+        return persisted
+    # Derivation is deliberately last AND guarded on there being text to derive
+    # from -- the same guard the admin projections use -- so an empty row does
+    # not acquire a confident-looking class out of nothing.
+    if not (task.latest_status_message or "").strip():
+        return ""
+    try:
+        return (classify_failure(task) or "").strip()
+    except Exception:  # pragma: no cover - a read surface never fails on this
+        logger.warning(
+            "[FAILURE_CLASS] classify_failure raised while resolving task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return ""
 
 
 def normalize_agent_failure_category(

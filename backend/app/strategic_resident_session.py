@@ -310,6 +310,20 @@ _WORK_STATE_TERMINAL_WINDOW_SECONDS = 3600
 # ``agent_tasks._ANCESTOR_WALK_MAX_DEPTH`` — parent_task_id is admin-mutable
 # so an explicit cap prevents cycle-induced infinite recursion.
 _WORK_STATE_ANCESTOR_WALK_MAX_DEPTH = 20
+
+# Hard row ceiling on the PROJECT-WIDE (every ``created_by``) non-terminal
+# aggregate below. Mirrors ``agent_tasks._CENSUS_SCAN_LIMIT``. The live
+# non-terminal set is small in normal operation, but "the fleet is small" is an
+# assumption, not a guarantee, and a saturated fleet is precisely the condition
+# this signal exists to reveal — so the scan is capped and a capped scan says so
+# via ``project_scan_capped`` rather than returning a suspiciously round number.
+_WORK_STATE_PROJECT_SCAN_LIMIT = 2000
+_WORK_STATE_NON_TERMINAL_STATUSES = (
+    "QUEUED",
+    "PROVISIONING",
+    "IN_PROGRESS",
+    "EVALUATING",
+)
 _RESIDENT_WAKE_BARRIER_LIMIT = 20
 _RESIDENT_WAKE_BARRIER_CONTEXT_KEYS = (
     "event_type",
@@ -2072,7 +2086,13 @@ async def _compute_resident_work_state(
       change it. Exact watch receipts are paced independently by the agent so a
       watch resolved later in the same heartbeat wakes exactly once.
     * ``work_state_summary`` — advisory ``{in_flight, terminal_since,
-      new_operator_messages}`` counts feeding the agent's tick context.
+      new_operator_messages}`` counts feeding the agent's tick context, PLUS
+      ``project_*`` counts covering the whole project across every
+      ``created_by``. The lineage keys answer "what did I spawn"; the
+      ``project_*`` keys answer "what is the pipeline doing", which the
+      strategist-anchored walk alone cannot see at all because the orchestrator
+      authors nearly everything. Both are advisory — neither wakes a turn, and
+      only the lineage keys gate exploration pacing.
 
     This is DELIBERATELY cheap (a handful of indexed ``max()``/``count()``
     aggregates) and STRICTLY read-only: it never reads or mutates the lease,
@@ -2184,6 +2204,110 @@ async def _compute_resident_work_state(
     failed: int = int(tree_row[9] or 0) if tree_row else 0
     cancelled: int = int(tree_row[10] or 0) if tree_row else 0
     terminal_since: int = int(tree_row[11] or 0) if tree_row else 0
+
+    # ── PROJECT-WIDE ambient activity (every ``created_by``) ──────────────
+    #
+    # Everything above is anchored on ``created_by = 'STRATEGIC_AGENT'``, which
+    # answers "what did I spawn" and is silent about the pipeline: the
+    # orchestrator authors the overwhelming majority of real work as
+    # ``ORCHESTRATOR``, so a Resident watching only its own lineage reports a
+    # quiet system while the fleet is busy. That is the wrong answer for the
+    # agent that is supposed to be the front for the whole pipeline.
+    #
+    # SCOPE, and what is deliberately left out:
+    #
+    # * COUNTS ONLY, never rows. This runs on EVERY heartbeat, and its output
+    #   lands in the resident's context and from there in the strategic memory
+    #   envelope — the surface whose oversize degrades into a coreless stub and
+    #   livelocks the reclaim loop (PR #17424). A fixed handful of integers is
+    #   bounded by construction no matter how large the estate gets. The
+    #   row-level view already exists and is correctly on-demand rather than
+    #   ambient: ``./fetch task-census`` (GET .../task-census) returns the
+    #   oldest non-terminal tasks with ages and blocked/parked reasons, under
+    #   its own byte clamp. Duplicating that onto the heartbeat would put an
+    #   unbounded payload on the hot path to say what a pull already says.
+    # * NO by-type or by-author breakdown. Task type is a free string out of
+    #   payload JSONB with structurally unbounded cardinality; a count map is
+    #   untrimmable by the response clamp, so the census pays for
+    #   ``bound_counts`` to carry one. The heartbeat does not need the
+    #   vocabulary, only the volume.
+    # * TERMINAL history is bounded by the existing one-hour window, not by a
+    #   full-history count, so this cannot grow with the age of the project.
+    # * The Resident's own host row is excluded, exactly as it is from the
+    #   lineage walk above: its generic task heartbeat keeps it IN_PROGRESS for
+    #   as long as the Resident is alive, so counting it would make
+    #   ``project_in_flight`` permanently non-zero and a genuinely idle project
+    #   indistinguishable from a busy one.
+    #
+    # And critically: these values are NOT folded into ``semantic_state`` /
+    # ``work_state_rev``. The rev is a WAKE fingerprint — the agent runs a full
+    # model turn whenever it changes (``shouldRunAutonomousTurn``). Anchoring it
+    # to estate-wide activity would wake the Resident on every ORCHESTRATOR
+    # transition anywhere in the project, which is the opposite failure mode
+    # from blindness and a far more expensive one. Nor do they reuse the
+    # ``in_flight`` / ``blocked`` / ``parked`` key names: the agent's
+    # ``hasPendingOwnedWork`` reads ``in_flight`` to decide whether to SUPPRESS
+    # unchanged-state exploration turns, so widening that key in place would
+    # silence the Resident entirely for as long as the fleet had anything
+    # running. Separate ``project_*`` keys are additive and advisory: they
+    # inform the turn, they do not schedule it.
+    project_rows = (
+        await session.execute(
+            text("""
+                SELECT status, count(*) AS n
+                FROM (
+                    SELECT status
+                    FROM task
+                    WHERE project_id = :project_id
+                      AND NOT archived
+                      AND (:resident_task_id IS NULL OR id != :resident_task_id)
+                      AND status IN (
+                          'QUEUED', 'PROVISIONING', 'IN_PROGRESS',
+                          'EVALUATING', 'BLOCKED', 'PARKED'
+                      )
+                    LIMIT :scan_limit
+                ) AS live
+                GROUP BY status
+            """).bindparams(
+                bindparam("project_id", type_=Task.__table__.c.project_id.type),
+                bindparam("resident_task_id", type_=Task.__table__.c.id.type),
+            ),
+            {
+                "project_id": project_id,
+                "resident_task_id": resident_task_id,
+                "scan_limit": _WORK_STATE_PROJECT_SCAN_LIMIT + 1,
+            },
+        )
+    ).fetchall()
+    project_by_status: dict[str, int] = {
+        str(getattr(row[0], "value", row[0])): int(row[1] or 0)
+        for row in project_rows
+    }
+    project_scanned = sum(project_by_status.values())
+    project_in_flight = sum(
+        project_by_status.get(status, 0)
+        for status in _WORK_STATE_NON_TERMINAL_STATUSES
+    )
+    project_terminal_since = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status.in_(
+                        (
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.CANCELLED,
+                        )
+                    ),
+                    Task.updated_at >= terminal_cutoff,
+                )
+            )
+        ).scalar()
+        or 0
+    )
 
     msg_max = (
         await session.execute(
@@ -2310,6 +2434,14 @@ async def _compute_resident_work_state(
         "parked": int(parked),
         "failed": int(failed),
         "quiescent": int(total > 0 and in_flight == 0),
+        # Project-wide ambient activity across EVERY created_by. Advisory:
+        # never folded into work_state_rev, never named like the lineage keys
+        # the agent's pacing gate reads. See the block above the query.
+        "project_in_flight": int(project_in_flight),
+        "project_blocked": int(project_by_status.get("BLOCKED", 0)),
+        "project_parked": int(project_by_status.get("PARKED", 0)),
+        "project_terminal_since": int(project_terminal_since),
+        "project_scan_capped": int(project_scanned > _WORK_STATE_PROJECT_SCAN_LIMIT),
     }
 
 

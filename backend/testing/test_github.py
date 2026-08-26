@@ -5786,6 +5786,90 @@ async def test_deferrable_consumers_respect_quota_reserve_floor(mocker):
 
 
 @pytest.mark.asyncio
+async def test_workflow_run_projection_carries_the_run_shape(mocker):
+    """get_workflow_run_for_sha must surface ``event`` and ``head_branch``.
+
+    Dropping ``event`` from this projection is what made every caller
+    structurally unable to tell a ``workflow_dispatch`` rehearsal from the
+    ``pull_request`` run that actually gates a merge.  Those two shapes do not
+    share a checkout (``refs/heads/<branch>`` vs a detached ``refs/pull/N/merge``
+    commit), so a green from one does not predict the other -- observed
+    2026-08-25 on one tree 28 minutes apart: dispatch SUCCESS, pull_request
+    FAILURE.  The helper is the only place the field is available, so it must be
+    carried, not re-derived.
+    """
+    import app.shared_state as _ss
+    from app.github import get_workflow_run_for_sha
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+    payload = {
+        "workflow_runs": [
+            {
+                "id": 32836106177,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": "https://gh/run/32836106177",
+                "event": "workflow_dispatch",
+                "head_branch": "automain",
+                "created_at": "2026-08-25T10:13:00Z",
+            }
+        ]
+    }
+
+    async def mock_request(method, url, *args, **kwargs):
+        return MockResponse(200, payload, links={})
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_workflow_run_for_sha(
+        "token", "owner", "repo", "deadbeef1234", workflow_file="ci.yml"
+    )
+    assert result is not None
+    assert result["run_id"] == 32836106177
+    assert result["conclusion"] == "success"
+    assert result["event"] == "workflow_dispatch"
+    assert result["head_branch"] == "automain"
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_projection_tolerates_a_run_without_event(mocker):
+    """A run body missing ``event`` must project ``None``, never raise.
+
+    Callers fail CLOSED on a ``None`` event (an unidentifiable run shape is never
+    treated as promotion-equivalent), so the helper's job here is only to hand
+    the absence through intact.
+    """
+    import app.shared_state as _ss
+    from app.github import get_workflow_run_for_sha
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+    payload = {
+        "workflow_runs": [
+            {
+                "id": 7,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-08-25T10:13:00Z",
+            }
+        ]
+    }
+
+    async def mock_request(method, url, *args, **kwargs):
+        return MockResponse(200, payload, links={})
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_workflow_run_for_sha(
+        "token", "owner", "repo", "deadbeef1234", workflow_file="ci.yml"
+    )
+    assert result is not None
+    assert result["event"] is None
+    assert result["head_branch"] is None
+
+
+@pytest.mark.asyncio
 async def test_commit_file_changes_stale_head_lease_creates_no_commit(mocker):
     """A concurrent tip advance aborts before blobs, trees, or commits exist."""
     from app.github import StaleBranchHeadError, commit_file_changes

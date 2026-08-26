@@ -384,6 +384,15 @@ def _operator_message_receipt(
         for key in (
             "id",
             "status",
+            # ``arming`` is the server's verdict on whether ANYTHING will read
+            # this message (see strategic_trigger.maybe_arm_operator_refresh).
+            # ``not_armed`` means the steer was durably stored but no strategic
+            # cycle will ever consume it. Dropping it here made the operator CLI
+            # structurally unable to distinguish a steer that reached the engine
+            # from one that silently went nowhere, so it must stay in the
+            # receipt: an operator message is never accepted into an unread
+            # lane without the reason travelling back with it.
+            "arming",
             "reply_message_id",
             "wakeup_state",
             "input_revision",

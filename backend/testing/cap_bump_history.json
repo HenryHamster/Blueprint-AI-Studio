@@ -2763,6 +2763,12 @@
           "commit_date": "2026-08-08T10:27:07+00:00",
           "old_cap": 2200,
           "new_cap": 2300
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T06:34:18.047084+00:00",
+          "old_cap": 2300,
+          "new_cap": 2800
         }
       ],
       "routers/admin_notifications.py": [
@@ -4855,6 +4861,14 @@
           "commit_date": "2026-08-25T17:01:30+00:00",
           "old_cap": 9900,
           "new_cap": 11950
+        }
+      ],
+      "test_blueprint_cli.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T03:26:31.812228+00:00",
+          "old_cap": 8800,
+          "new_cap": 10250
         }
       ]
     }

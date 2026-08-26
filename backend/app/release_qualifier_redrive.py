@@ -1436,7 +1436,21 @@ async def _redrive_promotion_failed_qualification(
        landed fix flips a finding to ``stale`` in the first place.  Readiness
        also carries the in-flight ``promotion_ci_remediation`` deferral, so the
        re-drive waits while the harvested fix is still being worked.
-    2. The promotion-CI gate for the integration HEAD is not ``red``.
+    2. The promotion-CI gate for the integration HEAD is not ``red``.  NOT-RED,
+       never REQUIRE-GREEN, and that asymmetry is deliberate.  An ordinary
+       integration HEAD has no ``ci.yml`` run at all (ci.yml's ``pull_request``
+       trigger is ``branches: [main]``, so integration-branch PRs get zero
+       check-runs by design), and the run the gate CAN obtain for that HEAD is a
+       ``workflow_dispatch`` rehearsal, which does not share a checkout shape
+       with the ``pull_request`` run a promotion PR gets — different ref
+       (``refs/heads/<branch>`` vs a detached ``refs/pull/N/merge``), different
+       tree whenever the base has moved, different ref inventory.  The gate now
+       says so out loud: a dispatch-derived success is reported as
+       ``green_rehearsal`` with ``promotion_equivalent=False``, never as
+       ``green``.  So gate green was already treated here as WEAK evidence and
+       still is; what bounds this loop is the circuit breaker below, not the
+       gate.  A ``red`` still holds, because a full matrix that broke found
+       something real whichever shape produced it.
     3. The integration HEAD resolves at all (fail closed when GitHub is
        unavailable -- an unresolved HEAD cannot prove the fix landed).
     4. CANDIDATE IDENTITY.  For a genuine failure (``required_check_failed``,
@@ -1456,8 +1470,9 @@ async def _redrive_promotion_failed_qualification(
        stabilize.  The only exit was a human noticing and force-promoting by
        hand.  So for ``_PROMOTION_FLAKE_RETRYABLE_FAILURES`` (today just
        ``required_check_failed``) the unchanged sha MAY be re-attempted, but
-       only on positive evidence: ``gate_state == "green"``, i.e. a COMPLETED
-       ``ci.yml`` run for exactly that HEAD sha concluded success.
+       only on positive evidence: ``gate_state`` in ``PROMOTION_CI_GREEN_STATES``
+       (``green`` or ``green_rehearsal``), i.e. a COMPLETED ``ci.yml`` run for
+       exactly that HEAD sha concluded success, whichever event shape ran it.
 
        WHAT THAT EVIDENCE IS AND IS NOT.  It is not proof the promotion PR will
        pass.  The gate's run is a ``workflow_dispatch`` on the integration
@@ -1504,6 +1519,7 @@ async def _redrive_promotion_failed_qualification(
     """
     from app import release_qualifier
     from app.release_readiness import (
+        PROMOTION_CI_GREEN_STATES,
         auto_mark_stale_audit_findings,
         compute_promotion_ci_green_gate,
         compute_requalification_readiness,
@@ -1652,11 +1668,20 @@ async def _redrive_promotion_failed_qualification(
         # positive evidence that this exact sha passes the full matrix.  Anything
         # short of a completed-green run for this HEAD -- pending, no_signal,
         # dispatched, unavailable -- is not evidence and does not unlock it.
+        #
+        # BOTH green states count, and they must.  The question here is "does the
+        # full matrix pass at this sha", not "will the promotion PR agree" -- the
+        # docstring above is explicit that this evidence is NOT the latter.  The
+        # run the gate can obtain for an integration HEAD is a
+        # ``workflow_dispatch``, which the gate now reports honestly as
+        # ``green_rehearsal``; matching only the literal ``"green"`` would make
+        # this escape hatch unreachable in exactly the situation it was added
+        # for, restoring the permanent silent latch it exists to break.
         same_candidate_flake_retry = bool(
             needs_new_candidate
             and head_sha == candidate_sha
             and error in _PROMOTION_FLAKE_RETRYABLE_FAILURES
-            and gate_state == "green"
+            and gate_state in PROMOTION_CI_GREEN_STATES
         )
         if needs_new_candidate and head_sha == candidate_sha:
             if not same_candidate_flake_retry:
@@ -1725,6 +1750,12 @@ async def _redrive_promotion_failed_qualification(
                     result_status=result_status,
                     promotion_failure_count=failure_count,
                     candidate_sha=candidate_sha[:12],
+                    # Record WHICH evidence this re-drive proceeded on.  Without
+                    # it, a re-drive that fired on a dispatch rehearsal and one
+                    # that fired on a real pull_request run are indistinguishable
+                    # afterwards — and they are not the same claim.
+                    gate_state=gate_state,
+                    gate_promotion_equivalent=bool(gate.get("promotion_equivalent")),
                     # Which of the three doors this went through.  A
                     # same-candidate retry is the one an operator most needs to
                     # recognise on sight: it is re-attempting evidence that

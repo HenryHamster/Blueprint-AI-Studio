@@ -74,7 +74,28 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
     Returns the number of tasks cancelled (the dependent itself plus its cascaded
     children) so callers can accumulate a single deduplicated operator alert per
     failed prerequisite. Returns 0 if the dependent row no longer exists.
+
+    TERMINAL REASON
+    ---------------
+    Both the dependent and every cascaded child are stamped
+    ``BLOCKED_PRECONDITION`` — "a declared precondition was never satisfied, a
+    dependency-ordering outcome", which is exactly what happened. Before this
+    stamp, a whole fan-out of CANCELLED rows carried nothing but a prose status
+    message and was unreadable to the ground-truth reader.
+
+    ``BLOCKED_PRECONDITION`` (a work outcome) rather than a platform-kill class
+    is deliberate even when the prerequisite itself died of a platform defect:
+    the prerequisite's own row already carries that kill, and re-attributing it
+    to each cascaded dependent would multiply one defect into N and corrupt the
+    "platform kills per day" denominator the metric exists to drive to zero.
+    ``failure_detail`` keeps the two positions in the cascade distinguishable.
     """
+    from app.failure_classification import (
+        BLOCKED_PRECONDITION,
+        DEPENDENCY_TASK_FAILED_DETAIL,
+        PARENT_DEPENDENCY_FAILED_DETAIL,
+        persist_failure_category,
+    )
     from app.max_plan_pool import release_max_plan_account, get_task_llm_account_id
     from app.vm_lifecycle import _ensure_vm_deleted
     from app.alert_dispatch import _maybe_create_failure_alert
@@ -102,6 +123,11 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
                 **(cancel_task.context or {}),
                 "_slot_released": True,
             }
+        cancel_task.context = {
+            **(cancel_task.context or {}),
+            "failure_detail": DEPENDENCY_TASK_FAILED_DETAIL,
+        }
+        persist_failure_category(cancel_task, BLOCKED_PRECONDITION)
         cancel_session.add(cancel_task)
         # Cascade cancel to children in non-terminal states
         children = (
@@ -134,6 +160,11 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
                     project_id=str(child.project_id) if child.project_id else None,
                 )
                 child.context = {**(child.context or {}), "_slot_released": True}
+            child.context = {
+                **(child.context or {}),
+                "failure_detail": PARENT_DEPENDENCY_FAILED_DETAIL,
+            }
+            persist_failure_category(child, BLOCKED_PRECONDITION)
             cancel_session.add(child)
             # Track child VM IDs for post-commit deletion
             if child.vm_instance_id:

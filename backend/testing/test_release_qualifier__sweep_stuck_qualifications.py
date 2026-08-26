@@ -6554,6 +6554,56 @@ async def test_promotion_failed_redrive_retries_unchanged_candidate_when_ci_gree
 
 
 @pytest.mark.asyncio
+async def test_promotion_failed_redrive_retries_unchanged_candidate_on_rehearsal(
+    db_session, mocker
+):
+    """``green_rehearsal`` must unlock the same-candidate retry too.
+
+    The retry above asks ONE question: does the full matrix pass at this exact
+    sha?  The run that can answer it for an integration HEAD is a
+    ``workflow_dispatch`` -- ci.yml's ``pull_request`` trigger is
+    ``branches: [main]``, so an integration-branch PR gets zero check-runs.  The
+    gate now reports that shape honestly as ``green_rehearsal`` rather than
+    calling it the ``green`` a promotion PR earns.
+
+    That honesty must not narrow this door.  Matching only the literal
+    ``"green"`` would make the escape hatch unreachable in precisely the
+    situation it was built for, silently restoring the permanent latch: no
+    remediation, no HEAD advance, no Alert, forever.  The retry never claimed
+    promotion-equivalence -- the docstring says so and the decision record
+    stamps ``gate_promotion_equivalent`` -- so it is spent from the same
+    promotion-failure budget either way.
+    """
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(db_session)
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, head_sha=_FAILED_CANDIDATE, gate_state="green_rehearsal"
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True, (
+        "a dispatch rehearsal that passed the full matrix is the ONLY evidence "
+        "this path can ever obtain -- refusing it re-latches the loop forever"
+    )
+    mock_run_qual.assert_called_once()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["decision"] == "fired"
+    assert decision["retry_class"] == "same_candidate_flake_retry"
+    # WHICH evidence it fired on, recorded so the two are never conflated after
+    # the fact: the branch looks healthy, the promotion PR is still unproven.
+    assert decision["gate_state"] == "green_rehearsal"
+    assert decision["gate_promotion_equivalent"] is False
+
+
+@pytest.mark.asyncio
 async def test_promotion_failed_redrive_requires_green_not_merely_not_red(
     db_session, mocker
 ):

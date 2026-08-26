@@ -871,13 +871,29 @@ async def get_workflow_run_for_sha(
 
     Returns a small status dict for the newest matching run::
 
-        {"run_id": int, "status": str, "conclusion": str | None, "html_url": str}
+        {"run_id": int, "status": str, "conclusion": str | None, "html_url": str,
+         "event": str | None, "head_branch": str | None}
 
     ``status`` is one of GitHub's run statuses (``queued`` / ``in_progress`` /
     ``completed``); ``conclusion`` is ``success`` / ``failure`` / ``cancelled`` /
     ... or ``None`` while the run is still in flight.  Returns ``None`` when no
     run exists for the SHA, or on any API error / unparseable body — graceful
     degradation, never raises (mirrors the other read-only github helpers).
+
+    ``event`` IS LOAD-BEARING, not decoration.  GitHub returns it on every run
+    and this helper used to drop it, which made every caller structurally unable
+    to tell a ``workflow_dispatch`` rehearsal from the ``pull_request`` run that
+    actually gates a merge.  Those two shapes do not share a checkout: a
+    ``pull_request`` run checks out ``refs/pull/N/merge`` (a detached synthetic
+    MERGE of head into base, with no local branch refs), while a
+    ``workflow_dispatch`` run checks out the branch tip itself (local +
+    remote-tracking branch refs present).  Environment-sensitive tests can and do
+    resolve differently across that gap — observed 2026-08-25 on one tree, 28
+    minutes apart: dispatch SUCCESS, pull_request FAILURE.  A caller that cannot
+    see ``event`` cannot know which question a green run answered, so it must be
+    carried through rather than re-derived.  ``head_branch`` rides along for the
+    same reason: on a ``pull_request`` run it names the HEAD branch, which is how
+    a caller tells an integration-branch run from a release-branch run.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -928,6 +944,11 @@ async def get_workflow_run_for_sha(
         "status": run.get("status"),
         "conclusion": run.get("conclusion"),
         "html_url": run.get("html_url", ""),
+        # See the docstring: dropping these made the run's SHAPE invisible, so a
+        # dispatch rehearsal and a merge-gating pull_request run were reported
+        # to callers as the same evidence.
+        "event": run.get("event"),
+        "head_branch": run.get("head_branch"),
     }
 
 

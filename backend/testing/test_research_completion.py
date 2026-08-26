@@ -10243,6 +10243,15 @@ async def test_unmatched_task_hash_prerequisite_escalates_to_parent(db_session, 
     assert (child.context or {}).get("prerequisite_escalation_reason") == (
         "no_live_or_deferred_provider"
     )
+    # The escalation CANCELS the row, so it must record its reason in the
+    # canonical fields too — not only under this bespoke key, which the
+    # ground-truth terminal-reason reader (platform_kill_metrics) deliberately
+    # does not consult. Without these, a fully-explained cancel was still
+    # reported as "we do not know why this task ended".
+    assert (child.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
+    assert (child.context or {}).get("failure_detail") == (
+        "no_live_or_deferred_provider"
+    )
     unresolved = (child.context or {}).get("unresolved_prerequisite", [])
     assert any(
         u.get("kind") == "task" and u.get("ref") == missing_ref
@@ -10703,6 +10712,11 @@ async def test_observation_dependency_escalates_instead_of_blocking(db_session, 
     assert (child.context or {}).get("prerequisite_escalation_reason") == (
         "structurally_unresolvable"
     )
+    # Same canonical terminal-reason stamp as the no-provider branch above: a
+    # CANCELLED row has to be readable by the ground-truth reader, not only by
+    # code that already knows to look under prerequisite_escalation_reason.
+    assert (child.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
+    assert (child.context or {}).get("failure_detail") == "structurally_unresolvable"
 
 
 @_pytest.mark.asyncio
