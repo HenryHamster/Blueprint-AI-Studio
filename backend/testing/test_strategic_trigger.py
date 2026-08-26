@@ -224,6 +224,37 @@ def test_classify_passive_note():
     )
 
 
+def test_classify_conversation_turn_note_is_steering_not_a_passive_note():
+    """A NOTE typed into the Strategic conversation must arm a reader.
+
+    ``blueprint strategic send`` and ``blueprint strategic chat`` both default
+    to ``--type NOTE``, and the workbench falls back to Chat mode whenever a
+    Workday session expires. Classified as a passive note, that turn armed
+    nothing, bound to no Resident, and was eventually failed by the reaper as
+    unhandled -- the operator's message reached a lane with no reader at all.
+    A conversation turn is steering whatever its client-defaulted type.
+
+    Asserted A/B against the message-board default so it cannot pass vacuously:
+    the same NOTE off the conversation lane must STILL be passive, or the fix
+    would have turned every filed memo into a strategic wake.
+    """
+    from app.models import MessageType
+
+    assert (
+        st.classify_operator_arming(MessageType.NOTE, conversation_turn=True)
+        == st.ARMING_STEERING
+    )
+    assert (
+        st.classify_operator_arming(MessageType.NOTE, conversation_turn=False)
+        == st.ARMING_PASSIVE_NOTE
+    )
+    # Literal pin: the steering verdict is the string the CLI and the UI both
+    # branch on. Renaming it must break here, not silently at the terminal.
+    assert st.ARMING_STEERING == "steering"
+    assert st.ARMING_PASSIVE_NOTE == "passive_note"
+
+
+
 def test_classify_question_answer_note_as_steering():
     """An operator answer to a Strategic question is active steering."""
     from app.models import MessageType
@@ -630,6 +661,34 @@ async def test_maybe_arm_returns_passive_note_without_requesting(db_session):
         )
     assert outcome == st.ARMING_PASSIVE_NOTE
     req.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_arm_persists_a_marker_for_a_conversation_note(db_session):
+    """The conversation NOTE reaches ``request_strategic_refresh``, not a no-op.
+
+    ``test_maybe_arm_returns_passive_note_without_requesting`` pins the other
+    leg: off the conversation lane the same NOTE must never attempt a wake.
+    """
+    from app.models import MessageType
+
+    project = await _make_project(db_session)
+    outcome = await st.maybe_arm_operator_refresh(
+        db_session,
+        project.id,
+        MessageType.NOTE,
+        message_content="Stop the promotion work and fix the deploy.",
+        conversation_turn=True,
+    )
+    assert outcome == st.ARMING_STEERING
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert st.strategic_refresh_pending(project.vision) is True
+    assert st.strategic_refresh_origin(project.vision) == st.ORIGIN_OPERATOR
+    assert (
+        project.vision["_strategic_refresh"]["excerpt"]
+        == "Stop the promotion work and fix the deploy."
+    )
 
 
 # ===========================================================================

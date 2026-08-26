@@ -144,7 +144,7 @@
         "TestMessages::test_strategic_session_message_allows_attachment_only_content",
         "TestMessagesWorkbenchState::test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at"
       ],
-      "test_count": 140
+      "test_count": 141
     },
     {
       "path": "backend/testing/test_admin_routers__strategic_directions.py",
@@ -403,9 +403,11 @@
         "test_operator_message_default_arms_the_active_resident",
         "test_completion_retry_still_suppressed_by_healthy_resident_worker",
         "test_completion_retry_not_suppressed_by_active_blob_with_dead_worker",
-        "test_completion_retry_suppressed_when_worker_generation_superseded"
+        "test_completion_retry_suppressed_when_worker_generation_superseded",
+        "test_the_conversation_composer_marks_its_turns_as_conversation_turns",
+        "test_server_authored_activation_turn_never_arms_a_cadence_cycle"
       ],
-      "test_count": 28
+      "test_count": 30
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
