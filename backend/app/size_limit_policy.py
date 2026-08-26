@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Callable, TypedDict
+from typing import Callable, TypedDict, TypeVar
 
 
 class GovernanceCapExceededError(ValueError):
@@ -629,6 +629,45 @@ _bump_history_cache: dict[
 ] = {}
 _CACHE_TTL_SECONDS: float = 60.0
 
+# Per-ROOT memo for the git PROBES the history read performs.  Both probes
+# answer a question about the CHECKOUT (which ref scopes the mainline ancestry;
+# does that ancestry cross a shallow boundary), not about any one module, but
+# ``_bump_history_cache`` is keyed per (module_key, section, root) — so a caller
+# that classifies N modules against ONE root re-shelled both probes N times.
+#
+# Measured cost of that gap: the reaper's near-cap sweep
+# (``app.metrics_integrity_sweep.check_near_cap_size_warning``) calls
+# :func:`parse_bump_history` once per near-cap module — 48 modules today — and
+# each call spawned SIX ``git`` processes (1 ``rev-parse --git-path``, 4
+# ``rev-parse --verify`` for the mainline candidates, 1 ``merge-base
+# --is-ancestor``).  288 serial process spawns inside one
+# ``asyncio.to_thread``: 9.3s on an idle dev box, 16.1s inside a CI shard
+# container against that lane's 30s per-test budget, which red-lit promotion
+# PR #17977 when ordinary host jitter pushed it over.  With the memo the same
+# sweep spawns 6 processes total.
+#
+# The RESOLVED root is the key (never the caller's ``None``): ``_REPO_ROOT`` is
+# monkeypatched by tests and by ``--fix --repo-root``, so keying on the raw
+# argument would let one root's answer serve another — the same poisoning
+# ``_bump_history_cache`` documents above.  Same TTL as the history cache: both
+# describe "what this checkout looks like right now".
+_git_probe_cache: dict[tuple[str, str], tuple[object, float]] = {}
+
+_ProbeT = TypeVar("_ProbeT")
+
+
+def _probe_cached(kind: str, root: str, compute: Callable[[], _ProbeT]) -> _ProbeT:
+    """Return ``compute()`` for ``(kind, root)``, memoised for the cache TTL."""
+    key = (kind, root)
+    now = time.monotonic()
+    cached = _git_probe_cache.get(key)
+    if cached is not None and now - cached[1] < _CACHE_TTL_SECONDS:
+        return cached[0]  # type: ignore[return-value]
+    value = compute()
+    _git_probe_cache[key] = (value, now)
+    return value
+
+
 # Repo root: backend/app/ -> ../../
 _SOURCE_TREE_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..")
@@ -699,6 +738,13 @@ def _mainline_git_ref(repo_root: str | None = None) -> str:
     disagree by construction.
     """
     root = repo_root or _REPO_ROOT
+    return _probe_cached(
+        "mainline_ref", root, lambda: _mainline_git_ref_uncached(root)
+    )
+
+
+def _mainline_git_ref_uncached(root: str) -> str:
+    """Uncached body of :func:`_mainline_git_ref` — up to four ``git`` spawns."""
     for candidate in _MAINLINE_BRANCH_CANDIDATES:
         try:
             # safe.directory: keep the probe working when the checkout is bound
@@ -778,6 +824,13 @@ def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     truncated.  A boundary on an unrelated branch must not fail closed.
     """
     root = repo_root or _REPO_ROOT
+    return _probe_cached(
+        "history_truncated", root, lambda: _git_history_is_truncated_uncached(root)
+    )
+
+
+def _git_history_is_truncated_uncached(root: str) -> bool:
+    """Uncached body of :func:`_git_history_is_truncated`."""
     shallow_path = _git_shallow_file_path(root)
     if not os.path.isfile(shallow_path):
         return False

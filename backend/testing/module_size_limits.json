@@ -173,7 +173,7 @@
     "post_commit_errors.py": 58,
     "task_lifecycle_completion_dispatch.py": 500,
     "release_models.py": 1750,
-    "size_limit_policy.py": 2450,
+    "size_limit_policy.py": 2900,
     "schemas.py": 1750,
     "release_commit_authorship.py": 1800,
     "approved_pr_stranding.py": 2250

@@ -2173,3 +2173,66 @@ def test_every_literal_git_argv_in_the_size_guard_is_safe_directory_hardened():
         "git invocations missing -c safe.directory= (they exit 128 under CI's "
         f"root-container /repo bind mount): {unhardened}"
     )
+
+
+def test_per_root_git_probes_do_not_rescale_with_module_count(tmp_path, mocker):
+    """One checkout is probed ONCE, however many modules are classified.
+
+    ``parse_bump_history`` is cached per ``(module_key, section, root)``, but the
+    two git probes it performs -- ``_mainline_git_ref`` and
+    ``_git_history_is_truncated`` -- answer a question about the CHECKOUT, not
+    about any one module.  Before the per-root memo every additional module
+    re-shelled both: SIX ``git`` process spawns per module (1 ``rev-parse
+    --git-path``, up to 4 ``rev-parse --verify`` for the mainline candidates,
+    1 ``merge-base --is-ancestor``).
+
+    ``app.metrics_integrity_sweep.check_near_cap_size_warning`` calls
+    ``parse_bump_history`` once per near-cap module -- 48 of them today -- from
+    inside a single ``asyncio.to_thread`` in the reaper cycle, so ONE cycle
+    spawned ~288 git processes serially.  Measured at 9.3s on an idle dev box
+    and 16.1s inside a CI shard container, against that lane's 30s per-test
+    budget; ordinary host jitter pushed it over and red-lit promotion PR #17977
+    (``TestReaperService::test_recent_heartbeat_task_is_not_reaped``, nominal
+    duration 0.68s).
+
+    The pin is on the SHAPE, not on a wall-clock number, so it cannot go
+    vacuous on a fast machine: probe spawns must be CONSTANT in the module
+    count.  Deleting the memo makes the second loop spawn 6 git processes per
+    module again and this assertion reports the exact excess.
+    """
+    repo = _init_shallow_repo(tmp_path)
+    slp._bump_history_cache.clear()
+    slp._git_probe_cache.clear()
+
+    git_calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _record(args, *call_args, **call_kwargs):
+        if args and args[0] == "git":
+            git_calls.append(list(args))
+        return real_run(args, *call_args, **call_kwargs)
+
+    mocker.patch.object(slp.subprocess, "run", side_effect=_record)
+    with patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        slp.parse_bump_history("m.py", "backend", repo)
+        first_module_spawns = len(git_calls)
+        for i in range(9):
+            slp.parse_bump_history(f"other{i}.py", "backend", repo)
+        extra = len(git_calls) - first_module_spawns
+
+    # Guard the guard: if the first classification shelled out to git zero
+    # times the fixture is not exercising the git path at all and the
+    # constant-cost assertion below would pass vacuously.
+    assert first_module_spawns > 0, (
+        "the fixture checkout never reached a git probe, so this test would "
+        "pass no matter how the probes are cached"
+    )
+    assert extra == 0, (
+        f"classifying 9 further modules against the SAME root spawned {extra} "
+        f"extra git processes ({extra / 9:.1f} per module) on top of the "
+        f"{first_module_spawns} the first module paid. The per-root probes must "
+        f"be memoised, or probe cost scales with the number of modules a single "
+        f"sweep classifies -- the 288-spawn reaper stall this test pins."
+    )

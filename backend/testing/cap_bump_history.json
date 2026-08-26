@@ -3203,6 +3203,12 @@
           "commit_date": "2026-08-19T22:06:06+00:00",
           "old_cap": 2050,
           "new_cap": 2450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T03:52:55.295648+00:00",
+          "old_cap": 2450,
+          "new_cap": 2900
         }
       ],
       "review_loop_convergence.py": [
