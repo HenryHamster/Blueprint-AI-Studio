@@ -458,6 +458,208 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
     assert "retirement_consideration_needed" not in by_id["d-cheap-2"]
 
 
+def _cpm_project(name: str, directions: list[dict]) -> Project:
+    return Project(
+        name=name,
+        user_id="u-retire",
+        autonomous_enabled=True,
+        directions=directions,
+        vision={"purpose": "test"},
+    )
+
+
+def _cpm_direction(did: str, *, cost: float, merged: int = 1, **extra) -> dict:
+    d = {
+        "id": did,
+        "text": f"Direction {did}",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {
+                "timestamp": _utcnow().isoformat(),
+                "tasks_created": 2,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": merged,
+                "estimated_cost_usd": cost,
+            }
+        ],
+    }
+    d.update(extra)
+    return d
+
+
+@pytest.mark.asyncio
+async def test_retirement_consideration_self_clears_when_cost_recovers(
+    db_session, mocker
+):
+    """A recovered direction must not keep a stale retire-me flag.
+
+    The flag used to be a one-way latch: nothing in the backend ever removed it,
+    so a direction whose cost/merge fell back under threshold carried the
+    recommendation forever and the strategist could not distinguish a live breach
+    from an old one. Recovery must clear the flag AND record why.
+    """
+    now = _utcnow()
+    # Cheap now, but carrying the flag (and its evidence) from an earlier breach.
+    recovered = _cpm_direction(
+        "d-recovered",
+        cost=1.0,
+        retirement_consideration_needed=True,
+        retirement_consideration_at="2026-01-02T00:00:00",
+        retirement_consideration_reason="Recent cost/merge $99.00 exceeded threshold $4.00.",
+        retirement_consideration_evidence={"threshold_usd": 4.0},
+    )
+    project = _cpm_project(
+        "CPM Recovery",
+        [
+            recovered,
+            _cpm_direction("d-peer-1", cost=1.0),
+            _cpm_direction("d-peer-2", cost=2.0),
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch.dict(
+        "app.direction_lifecycle._runtime_config",
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
+        clear=False,
+    )
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = {x["id"]: x for x in project.directions}["d-recovered"]
+    assert "retirement_consideration_needed" not in d, (
+        "a recovered direction must not keep the retire-me flag"
+    )
+    # The whole recommendation is cleared, not just the boolean — a stale reason
+    # or stale evidence would be read downstream as a live breach.
+    assert "retirement_consideration_reason" not in d
+    assert "retirement_consideration_evidence" not in d
+    assert "retirement_consideration_at" not in d
+    # Surface the REASON, not just the state change.
+    assert d.get("retirement_consideration_cleared_at")
+    assert "recovered to at-or-below" in (
+        d.get("retirement_consideration_cleared_reason") or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_retirement_consideration_raise_alerts_once_and_reaches_strategist(
+    db_session, mocker
+):
+    """Raising the flag must deliver the recommendation somewhere a decision happens.
+
+    Before this, the flag was written to the direction dict and read by nothing
+    but the admin-ui card, so a cost-outlier direction kept being selected for
+    research indefinitely. The raise now emits an alert exactly once per breach
+    episode (not once per lifecycle tick).
+    """
+    from app.models import Alert
+
+    now = _utcnow()
+    project = _cpm_project(
+        "CPM Alert",
+        [
+            _cpm_direction("d-expensive", cost=10.0),
+            _cpm_direction("d-peer-1", cost=1.0),
+            _cpm_direction("d-peer-2", cost=2.0),
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch.dict(
+        "app.direction_lifecycle._runtime_config",
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
+        clear=False,
+    )
+
+    async def _alerts() -> list[Alert]:
+        rows = await db_session.execute(
+            select(Alert).where(
+                Alert.event_type == "research.retirement_consideration_needed"
+            )
+        )
+        return list(rows.scalars().all())
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    first = await _alerts()
+    assert len(first) == 1, f"expected exactly one raise alert, got {len(first)}"
+    # The alert must carry WHY, not just that something happened.
+    assert "cost/merge" in first[0].message
+    assert "d-expensive" in first[0].message
+    assert "decision is owed" in first[0].message
+
+    # Second tick, still over threshold: the flag gates re-firing.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    assert len(await _alerts()) == 1, (
+        "a still-breaching direction must not re-alert on every lifecycle tick"
+    )
+
+
+def test_retirement_consideration_alert_has_a_registered_audience():
+    """A new alert event_type must be routed, or fail-closed routing drops it."""
+    from app.message_audience import (
+        STRATEGIST_INTERNAL,
+        get_registered_event_types,
+        route_event,
+    )
+
+    assert "research.retirement_consideration_needed" in get_registered_event_types()
+    # Route it the way production does. The retirement recommendation is a
+    # strategist decision input, not an operator ping -- same audience as the
+    # churn ladder's recommendation, which it deliberately mirrors.
+    assert (
+        route_event("research.retirement_consideration_needed") == STRATEGIST_INTERNAL
+    )
+    assert route_event("research.churn_retirement_recommended") == STRATEGIST_INTERNAL
+
+
+def test_strategic_payload_compaction_keeps_retirement_consideration():
+    """The signal must survive payload trimming, or the strategist never sees it."""
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    out = _compact_direction_summary_entry(
+        {
+            "id": "d-expensive",
+            "status": "active",
+            "retirement_consideration_needed": True,
+            "retirement_consideration_at": "2026-08-19T10:08:58",
+            "retirement_consideration_reason": "Recent cost/merge $0.41 exceeded threshold $0.39.",
+            "retirement_consideration_evidence": {
+                "window_cycles": 6,
+                "direction_cost_per_merge_usd": 0.4058,
+                "threshold_usd": 0.3914,
+            },
+        }
+    )
+    assert out.get("retirement_consideration_needed") is True
+    assert out.get("retirement_consideration_at")
+    assert "0.41" in (out.get("retirement_consideration_reason") or "")
+    assert (out.get("retirement_consideration_evidence") or {}).get("threshold_usd")
+
+
 @pytest.mark.asyncio
 async def test_retirement_evidence_includes_provider_model_split(db_session, mocker):
     """When a research_history entry carries cost_by_provider_model, the rolling
