@@ -3409,8 +3409,12 @@ def _run_image_resolution(tmp_path, *, pull_ok, local_present):
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["FAKE_PULL_OK"] = "1" if pull_ok else "0"
     env["FAKE_LOCAL_OK"] = "1" if local_present else "0"
+    # A fake `docker` shim is first on PATH, so this is a millisecond shell
+    # run with no network and no daemon. 20s is ~1000x headroom on a loaded
+    # 2-vCPU runner and stays under the 30s inner-operation ceiling that
+    # backend/testing/test_harness_timeout_budgets.py enforces.
     proc = subprocess.run(
-        ["bash", str(script)], env=env, capture_output=True, text=True, timeout=60
+        ["bash", str(script)], env=env, capture_output=True, text=True, timeout=20
     )
     return proc.returncode, terminal, log
 

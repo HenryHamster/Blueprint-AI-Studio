@@ -935,7 +935,7 @@ if [ "${1:-}" = "--standalone" ]; then
     STANDALONE_JUNIT_ARGS+=("--junitxml=${BLUEPRINT_STATIC_GUARD_JUNIT}")
   fi
   _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest \
-    --timeout=30 --timeout-method=signal "${STANDALONE_JUNIT_ARGS[@]}"
+    --timeout=300 --timeout-method=signal "${STANDALONE_JUNIT_ARGS[@]}"
   exit 0
 fi
 

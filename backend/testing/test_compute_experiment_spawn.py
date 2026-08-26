@@ -3790,12 +3790,15 @@ async def test_preflight_smoke_accepts_a_locally_built_image(monkeypatch, tmp_pa
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
 
+    # Both runs below drive the fake `docker` shim written above -- no daemon,
+    # no network, milliseconds each. 20s keeps them under the 30s
+    # inner-operation ceiling while leaving ~1000x headroom.
     present = subprocess.run(
         ["bash", "-c", cmd],  # -c not -lc: a login shell reloads the profile and resets PATH
         env={**env, "FAKE_LOCAL_OK": "1"},
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=20,
     )
     assert present.returncode == 0, (
         "a locally built image must pass the gate: " + present.stderr[-500:]
@@ -3806,7 +3809,7 @@ async def test_preflight_smoke_accepts_a_locally_built_image(monkeypatch, tmp_pa
         env={**env, "FAKE_LOCAL_OK": "0"},
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=20,
     )
     assert absent.returncode != 0, "an unresolvable image must still fail the gate"
 
