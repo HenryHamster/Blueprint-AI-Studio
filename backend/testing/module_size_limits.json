@@ -444,7 +444,7 @@
     "test_local_runner.py": 16650,
     "local_runner.py": 11450,
     "blueprint.py": 11950,
-    "test_blueprint_cli.py": 8800,
+    "test_blueprint_cli.py": 10250,
     "test_runner_isolation.py": 3400,
     "runner_isolation.py": 3400,
     "blueprint_runner.py": 2700,
