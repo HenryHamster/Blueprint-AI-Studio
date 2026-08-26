@@ -44,6 +44,113 @@ def _offender_detail(items) -> str:
     return " | ".join(rendered) + "\n" + format_offender_marker(identities)
 
 
+# The guard fixtures build miniature repos that run `check_size_limits.py` /
+# `static_release_guard.py` out of a tmp tree.  Those entrypoints import
+# ``app.size_limit_policy``, so the fixture has to place that module in the
+# synthetic ``backend/app`` package.  Copying the one file by hand is what the
+# fixtures used to do -- and it broke silently the moment ``size_limit_policy``
+# grew a first-party import (``app.size_limit_justification``, added with the
+# cap-ledger justification work): the copied tree still had the module the
+# fixture knew about, and every size-guard assertion started failing with
+# ``ModuleNotFoundError`` text instead of the guard output it was asserting on.
+#
+# A hand-maintained copy list cannot survive an import being added to a module
+# it copies.  Resolve the closure instead: copy the module AND every
+# first-party ``app.*`` module it transitively imports.
+_SIZE_POLICY_ROOT_MODULE = "size_limit_policy"
+
+
+def _first_party_app_imports(source: str) -> set[str]:
+    """Return the ``app.<name>`` modules a source file imports.
+
+    Deliberately a text scan, not an AST walk with an import of the real
+    module: the fixture must work against a tree that is not importable yet.
+    Both ``from app.x import y`` and ``import app.x`` forms are recognised.
+    """
+    found: set[str] = set()
+    for raw in source.splitlines():
+        line = raw.strip()
+        if line.startswith("from app."):
+            found.add(line.split()[1].split(".")[1])
+        elif line.startswith("import app."):
+            found.add(line.split()[1].split(".")[1])
+    return found
+
+
+def _copy_size_limit_policy(destination_repo: Path) -> list[str]:
+    """Copy ``app.size_limit_policy`` and its first-party import closure.
+
+    Returns the module names copied (sorted), so a caller -- or a guard test --
+    can assert the closure is more than the root module once the root module
+    has first-party dependencies.
+    """
+    app_dir = destination_repo / "backend" / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    pending = [_SIZE_POLICY_ROOT_MODULE]
+    copied: set[str] = set()
+    while pending:
+        module = pending.pop()
+        if module in copied:
+            continue
+        source_path = REPO_ROOT / "backend" / "app" / f"{module}.py"
+        if not source_path.exists():
+            # Not a single-file module in this package -- nothing to carry.
+            continue
+        shutil.copy2(source_path, app_dir / f"{module}.py")
+        copied.add(module)
+        pending.extend(_first_party_app_imports(source_path.read_text()))
+    return sorted(copied)
+
+
+def test_copied_size_limit_policy_tree_is_actually_importable(tmp_path: Path) -> None:
+    """The fixture's synthetic backend/app must import, not just exist.
+
+    This is the regression guard for the break this helper replaced.  When
+    ``size_limit_policy`` gained ``from app.size_limit_justification import
+    ...``, the hand-written two-line copy still produced a tmp tree that LOOKED
+    right, and 45 size-guard cases started failing on ``ModuleNotFoundError``
+    text rather than on anything they were written to assert.  Copying is not
+    the property that matters; importing is.  Asserting on the import means a
+    future first-party dependency cannot break the fixtures silently again.
+    """
+    copied = _copy_size_limit_policy(tmp_path)
+    assert _SIZE_POLICY_ROOT_MODULE in copied
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import app.size_limit_policy"],
+        cwd=tmp_path / "backend",
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_size_limit_policy_copy_carries_its_declared_first_party_imports(
+    tmp_path: Path,
+) -> None:
+    """Every ``app.*`` module the root module declares must land in the copy.
+
+    The importability test above is the real proof, but it can only fail once
+    an import is REACHED at module scope.  This one reads the declarations
+    directly, so an ``app.*`` import added under a conditional or inside a
+    function is still carried.
+    """
+    copied = set(_copy_size_limit_policy(tmp_path))
+    declared = _first_party_app_imports(
+        (REPO_ROOT / "backend" / "app" / f"{_SIZE_POLICY_ROOT_MODULE}.py").read_text()
+    )
+    # Guard against the assertion going vacuous if the root module ever loses
+    # every first-party import: at that point this test proves nothing and the
+    # closure helper is dead weight, which is worth surfacing rather than
+    # passing quietly.
+    assert declared, (
+        f"app/{_SIZE_POLICY_ROOT_MODULE}.py declares no first-party app.* "
+        "imports; the closure helper and this guard are now vacuous"
+    )
+    missing = {name for name in declared if name not in copied}
+    assert not missing, f"declared but not copied into the fixture tree: {sorted(missing)}"
+
+
 def test_static_guard_base_unpack_uses_data_filter() -> None:
     """The shared git-archive unpack still uses an explicit safe filter."""
     source = (REPO_ROOT / "backend" / "testing" / "fixgate_attribution.py").read_text()
@@ -772,10 +879,7 @@ def test_non_backend_task_diff_breaching_size_guard_fails_check(tmp_path: Path) 
         REPO_ROOT / "backend" / "testing" / "impacted_tests.py",
         tmp_path / "backend" / "testing" / "impacted_tests.py",
     )
-    shutil.copy2(
-        REPO_ROOT / "backend" / "app" / "size_limit_policy.py",
-        tmp_path / "backend" / "app" / "size_limit_policy.py",
-    )
+    _copy_size_limit_policy(tmp_path)
     os.chmod(tmp_path / "check", 0o755)
     os.chmod(tmp_path / "scripts" / "check-default.sh", 0o755)
     os.chmod(tmp_path / "scripts" / "static_release_guard.py", 0o755)
@@ -848,10 +952,7 @@ def test_inherited_size_breach_untouched_by_diff_does_not_fail_check(tmp_path: P
     ):
         source = REPO_ROOT / "backend" / "testing" / relative
         shutil.copy2(source, repo / "backend" / "testing" / relative)
-    shutil.copy2(
-        REPO_ROOT / "backend" / "app" / "size_limit_policy.py",
-        repo / "backend" / "app" / "size_limit_policy.py",
-    )
+    _copy_size_limit_policy(repo)
     (repo / "scripts" / "size_probe.py").write_text("one = 1\ntwo = 2\n")
     (repo / "scripts" / "changed.py").write_text("value = 1\n")
     limits_path = repo / "backend" / "testing" / "module_size_limits.json"
@@ -962,10 +1063,7 @@ def _prepare_docker_attribution_repo(
     (tmp_path / "backend" / "testing" / "test_collect_boom.py").write_text(
         "raise ImportError('fixture only')\n"
     )
-    shutil.copy2(
-        REPO_ROOT / "backend" / "app" / "size_limit_policy.py",
-        tmp_path / "backend" / "app" / "size_limit_policy.py",
-    )
+    _copy_size_limit_policy(tmp_path)
     (tmp_path / "backend" / "testing" / "module_size_limits.json").write_text(
         '{"backend": {}, "agent": {}, "frontend": {}}\n'
     )
