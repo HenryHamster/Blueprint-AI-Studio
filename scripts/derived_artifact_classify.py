@@ -661,7 +661,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--explain-unclassified",
         action="store_true",
-        help="Also print why the remaining guard-data sentinels are not classified.",
+        help=(
+            "Also print why the remaining DERIVED-ARTIFACT sentinels (the "
+            "static_release_guard.SENTINEL_REPAIR_COMMANDS population) are not "
+            "classified. The rest of the guard-data roster -- shard balance, "
+            "the impacted-test resolver, the migration chain, the promotion "
+            "metric manifest -- are not index files and have no rot/addition "
+            "axis to report."
+        ),
     )
     parser.add_argument(
         "--check",

@@ -289,3 +289,37 @@ def test_every_classified_derived_artifact_guard_is_on_the_roster() -> None:
         f"classified but never run by the guard-data lane: {missing}; add the "
         "selector to scripts/guard_data_selectors.txt or stop classifying it"
     )
+
+
+def test_every_roster_selector_is_accounted_for_in_one_direction_or_the_other() -> None:
+    """The converse ratchet: the roster cannot grow an unexplained derived guard.
+
+    ``static_release_guard.SENTINEL_REPAIR_COMMANDS`` is this repository's own
+    definition of "a guard over a generated artifact". Every roster selector
+    must therefore be either classified/explained by
+    ``derived_artifact_classify``, or outside that population -- shard balance,
+    the impacted-test resolver, the migration chain and the promotion metric
+    manifest are behaviour guards over live code, not index files, so they have
+    no rot/addition axis and none is invented for them.
+
+    Without this, adding a new derived-artifact guard to the roster would give
+    the lane a red it cannot explain, and the omission would be invisible.
+    """
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from static_release_guard import SENTINEL_REPAIR_COMMANDS
+
+    classified = set(DIRECTIONAL) | set(DECISION_BEARING) | set(NOT_DIRECTIONAL)
+    on_roster = {
+        f"backend/{selector.split('::', 1)[0]}"
+        for selector in _selectors(ROSTER.read_text(encoding="utf-8"))
+    }
+
+    unexplained = sorted(
+        (on_roster & set(SENTINEL_REPAIR_COMMANDS)) - classified
+    )
+    assert not unexplained, (
+        f"{unexplained} guard a generated artifact and run in this lane, but "
+        "derived_artifact_classify neither classifies them nor records why "
+        "not; a reader of their red gets no rot-vs-addition answer"
+    )
