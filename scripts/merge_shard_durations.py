@@ -229,6 +229,35 @@ def merge_shards(
         raise MergeError("no shard duration files given")
     output_path = output_path or baseline_path
 
+    # Third read-modify-write of the same artifact family (the other two are
+    # merge_durations.merge and regenerate-durations.write_merged), so it takes
+    # the same lock. Imported lazily for the reason the prune branch below is:
+    # merge_durations pulls the backend package onto sys.path at import time,
+    # and this module must stay importable without paying for that.
+    from merge_durations import duration_artifact_lock
+
+    with duration_artifact_lock(output_path):
+        return _merge_shards_locked(
+            shard_paths,
+            baseline_path,
+            output_path,
+            check,
+            prune_deleted,
+            allow_quality_failure,
+            log,
+        )
+
+
+def _merge_shards_locked(
+    shard_paths: list[str],
+    baseline_path: str,
+    output_path: str,
+    check: bool,
+    prune_deleted: bool,
+    allow_quality_failure: bool,
+    log,
+) -> int:
+    """merge_shards()'s body. The caller must already hold the artifact lock."""
     baseline = load_duration_file(baseline_path)
     log(f"Baseline {baseline_path}: {len(baseline)} entries")
 

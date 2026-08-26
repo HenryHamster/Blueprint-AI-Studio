@@ -20,6 +20,7 @@ from durations_quality import (
     quality_ok,
 )
 from merge_durations import (
+    duration_artifact_lock,
     filter_current_entries,
     load_duration_baseline,
     sanitize_fresh_entries,
@@ -102,8 +103,21 @@ def get_coverage():
 
 
 def write_merged():
-    """Merge all partial files into .test_durations, dropping outliers > OUTLIER_CAP."""
+    """Merge all partial files into .test_durations, dropping outliers > OUTLIER_CAP.
+
+    This is a second read-modify-write of the same committed artifact that
+    merge_durations.merge() owns, so it takes the SAME lock: a targeted
+    `store-backend-durations.sh` refresh running beside a regeneration would
+    otherwise read the baseline this call is about to replace, and one of the
+    two measurements would be silently dropped.
+    """
     td = ".test_durations"
+    with duration_artifact_lock(td):
+        return _write_merged_locked(td)
+
+
+def _write_merged_locked(td):
+    """write_merged()'s body. The caller must already hold the artifact lock."""
     merged = load_duration_baseline(td)
     root = os.getcwd()
     outlier_count = 0
