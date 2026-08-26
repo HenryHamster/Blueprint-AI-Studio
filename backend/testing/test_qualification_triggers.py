@@ -934,9 +934,16 @@ class TestExplainNewStates:
         )
         assert out["next_expected_trigger"] == "operator_or_strategist_only"
 
-    def test_deferred_unsynced_next_expected_is_sweep_retry(self):
+    def test_deferred_unsynced_next_expected_names_its_own_redriver(self):
+        # This test previously pinned "sweep_retry" -- the hardcoded default
+        # explain_qualification_trigger stamped for EVERY armed decision.  That
+        # was the read-surface defect, not the contract: the sweep does not own
+        # deferred_unsynced_redrive and will never retry it; its dedicated
+        # re-driver does.  Reporting "sweep_retry" named an actor that would
+        # never act.  The armed trigger names itself, and its owner.
         out = self._explain(status="deferred_unsynced")
-        assert out["next_expected_trigger"] == "sweep_retry"
+        assert out["next_expected_trigger"] == "deferred_unsynced_redrive"
+        assert out["trigger_owner"] == "_redrive_deferred_unsynced_qualification"
 
 
 # ---------------------------------------------------------------------------
