@@ -42,6 +42,44 @@ _MAX_AUTO_PAUSE_CYCLES = 3
 # strategist/operator retire action.
 _MAX_CHURN_PAUSE_CYCLES = 2
 
+# Churn-retirement DECISION WINDOW (dud-culling fence).
+#
+# The recommendation above holds the direction paused and non-terminal pending an
+# explicit keep/retire decision. Nothing bounded that hold: a recommended
+# direction is explicitly skipped by BOTH short clocks in this module — the 72h
+# needs_manual_intervention TTL fallback and the 48h auto-recovery cooldown — and
+# the ladder counter is frozen while it is held. With no decider, the direction
+# stayed paused forever, kept its gap staffing, and re-surfaced in every
+# strategist payload: nursed, never culled. That is the exact failure the
+# lifetime-burn ladder already fixed for itself ("eventually auto-retires with
+# zero operator action instead of thrashing in pause/extend forever"); the churn
+# ladder was the only one left without a terminal clock.
+#
+# Window derivation (NOT an arbitrary number) — two independent in-repo anchors
+# that agree on 7 days:
+#   1. Guaranteed strategist opportunities. The recommendation + its bounded
+#      evidence are surfaced into the strategist payload on every strategic cycle
+#      (strategic_spawning, direction stat_entry), and a strategic cycle is
+#      guaranteed to run at least once per `strategic_max_interval_minutes`
+#      (default 1440 = 24h) by the wall-clock backstop in autonomous_research.
+#      Seven days is therefore SEVEN guaranteed looks at a one-question decision.
+#   2. This module's existing "a signal this old is presumed dead" horizon,
+#      _REMEDIATION_MONITOR_EXPIRY_DAYS (7 days), below.
+#
+# After that many guaranteed opportunities, the absence of a decision IS the
+# decision, and the ladder's OWN recommendation (retire) is applied. The window is
+# deliberately far longer than either short clock so this fence can never be
+# confused with them: it does not clear flags or reactivate by time alone (the
+# behaviour those guards correctly reject) — it records a decision, with
+# machine-readable evidence, through the same two-tick designated-retire gate the
+# lifetime-burn ladder uses. Any sanctioned reactivation (operator PATCH /
+# strategist KEEP) clears auto_retire_pending via
+# _clear_direction_reactivation_state, so a decision made during the final tick
+# still wins.
+_CHURN_RECOMMENDATION_DECISION_DAYS = 7
+# auto_retire_pending_reason written when the window above expires undecided.
+CHURN_UNDECIDED_RETIRE_REASON = "churn_recommendation_undecided"
+
 # Lifetime-burn auto-retire ladder (5th ladder). A direction that repeatedly
 # trips the lifetime burn backstop (Rule 6) accumulates lifetime_burn_pause_count.
 # Once it reaches this threshold it is auto-retired instead of left open for
@@ -258,6 +296,10 @@ _TERMINAL_RESIDUE_KEYS = (
     "churn_retirement_recommended",
     "churn_retirement_recommended_reason",
     "churn_retirement_recommended_at",
+    # The decision record of a PREVIOUS churn-undecided retirement. A resurrected
+    # direction is starting a new life with the ladder counters zeroed, so a stale
+    # "this was culled for going undecided" record must not travel with it.
+    "churn_retirement_decision",
 )
 # Cap on the audit-note rationale so a resurrected direction can't bloat the
 # directions JSONB with an unbounded operator string.
@@ -391,6 +433,66 @@ def apply_churn_retirement_keep(direction: dict, *, allow_user_paused: bool) -> 
     direction["churn_family_pause_count"] = 0
     direction.pop("churn_pause_evidence", None)
     return True
+
+
+def _churn_recommendation_decision_overdue(direction: dict) -> dict | None:
+    """Machine-readable decision record when the churn hold has gone unanswered.
+
+    Returns ``None`` while the direction is still inside its decision window (or
+    when the recommendation carries no usable ``churn_retirement_recommended_at``
+    stamp — an unstamped recommendation is never culled on a guess; it keeps the
+    old indefinite-hold behaviour until a decision or a re-recommendation stamps
+    it).
+
+    When the window HAS elapsed, returns the full ``churn_retirement_decision``
+    blob that is persisted onto the direction, so an operator reading the retired
+    direction never has to re-derive why it was culled: it carries the decision,
+    who/what made it, when the recommendation was raised, how long it went
+    unanswered, the window and its unit of derivation (guaranteed strategist
+    opportunities), and the ladder evidence summary that produced the
+    recommendation in the first place.
+    """
+    if not direction.get("churn_retirement_recommended"):
+        return None
+    recommended_at = direction.get("churn_retirement_recommended_at")
+    if not recommended_at:
+        return None
+    try:
+        recommended_dt = datetime.fromisoformat(str(recommended_at))
+    except (TypeError, ValueError):
+        logger.warning(
+            "[LIFECYCLE] Direction %s has malformed churn_retirement_recommended_at "
+            "%r; leaving the recommendation held rather than culling on a guess",
+            direction.get("id"),
+            recommended_at,
+        )
+        return None
+    window_days = _CHURN_RECOMMENDATION_DECISION_DAYS
+    undecided_hours = (_utcnow() - recommended_dt).total_seconds() / 3600
+    if undecided_hours < window_days * 24:
+        return None
+    evidence = direction.get("churn_retirement_evidence")
+    return {
+        "decision": "retired",
+        "decided_by": "decision_window_expiry",
+        "reason_code": CHURN_UNDECIDED_RETIRE_REASON,
+        "recommended_at": str(recommended_at),
+        "decided_at": _utcnow().isoformat(),
+        "window_days": window_days,
+        "undecided_hours": round(undecided_hours, 1),
+        # The window's unit of derivation: a strategic cycle is guaranteed at
+        # least once per strategic_max_interval_minutes (default 24h), and the
+        # recommendation is in every strategic payload, so this is the number of
+        # guaranteed opportunities the strategist had to answer.
+        "strategist_opportunities": int(undecided_hours // 24),
+        "churn_family_pause_count": int(
+            direction.get("churn_family_pause_count", 0) or 0
+        ),
+        "recommendation_summary": (
+            evidence.get("summary") if isinstance(evidence, dict) else None
+        )
+        or direction.get("churn_retirement_recommended_reason"),
+    }
 
 
 def apply_churn_retirement_retire(
@@ -952,6 +1054,79 @@ async def _process_direction_lifecycle_locked(
             pending_retired_memory, d, "auto_retired_lifetime_burn"
         )
 
+    async def _retire_churn_undecided(d: dict, did) -> None:
+        """Apply the churn ladder's own recommendation after an undecided window.
+
+        Runs only from the designated retire pass, one tick after the fence
+        flagged the direction, and only for a direction still in a live status
+        (the coherence guard above already dropped anything that went terminal or
+        was reactivated in between). Delegates the terminal mutation to
+        :func:`apply_churn_retirement_retire` — the same sanctioned helper the
+        explicit operator/strategist RETIRE decision uses — so an expiry-applied
+        retirement and an explicitly-decided one are byte-identical in outcome
+        (``stopped``) and residue-clearing. The distinguishing record is the
+        durable ``churn_retirement_decision`` blob, which survives the clear.
+        """
+        decision = d.get("churn_retirement_decision") or {}
+        _undecided_h = decision.get("undecided_hours")
+        _window_days = decision.get("window_days", _CHURN_RECOMMENDATION_DECISION_DAYS)
+        _summary = decision.get("recommendation_summary") or "churn/unproductive loop"
+        _reason = (
+            f"Auto-retired: churn-retirement recommendation went undecided for "
+            f"{_undecided_h}h (decision window {_window_days}d, "
+            f"~{decision.get('strategist_opportunities', '?')} guaranteed strategist "
+            f"opportunities). Applying the recommended retirement — {_summary}. "
+            f"Slot freed for new directions."
+        )
+        apply_churn_retirement_retire(d, reason=_reason, now_iso=_utcnow().isoformat())
+        logger.info(
+            "[AUTONOMOUS] Auto-retired churn-recommended direction %s after an "
+            "undecided %sd decision window: %s",
+            did,
+            _window_days,
+            (d.get("text", "") or "")[:60],
+        )
+        from app.models import Alert, AlertSeverity
+
+        session.add(
+            Alert(
+                project_id=project.id,
+                event_type="research.direction_auto_retired",
+                severity=AlertSeverity.INFO,
+                title="Direction auto-retired (churn recommendation undecided)",
+                message=(
+                    f"Direction '{(d.get('text', '') or '')[:80]}' was recommended for "
+                    f"churn retirement and went undecided for {_undecided_h}h "
+                    f"(window {_window_days}d). The recommended retirement was applied "
+                    f"automatically. Slot freed for the strategic agent to create a "
+                    f"replacement; the direction remains resurrectable."
+                ),
+            )
+        )
+        try:
+            from app.notification_dispatch import (
+                post_direction_milestone_message,
+            )
+
+            await post_direction_milestone_message(
+                session,
+                project.id,
+                direction_text=d.get("text", ""),
+                milestone="auto-retired-churn-undecided",
+                reason=d.get("auto_completed_reason", _reason),
+                direction_id=did,
+                evidence=decision or None,
+            )
+        except Exception as _notify_exc:  # noqa: BLE001
+            logger.warning(
+                f"[NOTIFY] Failed to post churn-undecided retire milestone for {did}: "
+                f"{_notify_exc}"
+            )
+        _reconcile_retired_gap(did)
+        _record_auto_retired_memory(
+            pending_retired_memory, d, "auto_retired_churn_undecided"
+        )
+
     # Designated retire pass: consume auto_retire_pending flags set in the prior
     # lifecycle tick. Separates the DECISION to retire (flagged by an outlier
     # auto-retire site) from EXECUTION (here), so every retirement passes through
@@ -1013,6 +1188,8 @@ async def _process_direction_lifecycle_locked(
         if _retire_reason == "lifetime_burn":
             _lb_count = _d.get("lifetime_burn_pause_count", _MAX_LIFETIME_BURN_PAUSE_CYCLES)
             await _retire_lifetime_burn(_d, _retire_did, _lb_count)
+        elif _retire_reason == CHURN_UNDECIDED_RETIRE_REASON:
+            await _retire_churn_undecided(_d, _retire_did)
         else:
             logger.warning(
                 f"[LIFECYCLE] Unknown auto_retire_pending_reason {_retire_reason!r} "
@@ -1172,7 +1349,32 @@ async def _process_direction_lifecycle_locked(
         # intervention flag (which the branch below already respects): even if
         # that flag were cleared elsewhere, the recommendation itself keeps the
         # direction paused until a sanctioned undo path clears the flag.
+        #
+        # The hold is NOT unbounded, though: once the decision window has elapsed
+        # with no keep/retire answer, apply the ladder's own recommendation rather
+        # than nursing the dud forever. This never reactivates and never clears a
+        # flag by time alone — it flags the two-tick designated retire, exactly as
+        # the lifetime-burn ladder does below, so the direction stays visible in
+        # the strategist payload for one more tick and any sanctioned reactivation
+        # in the meantime cancels it.
         if d.get("churn_retirement_recommended"):
+            _decided = _churn_recommendation_decision_overdue(d)
+            if _decided is not None and not d.get("auto_retire_pending"):
+                d["churn_retirement_decision"] = _decided
+                d["auto_retire_pending"] = True
+                d["auto_retire_pending_reason"] = CHURN_UNDECIDED_RETIRE_REASON
+                d["auto_retire_pending_at"] = now.isoformat()
+                directions_modified = True
+                logger.warning(
+                    "[AUTONOMOUS] Churn-retirement recommendation for direction %s "
+                    "went undecided for %.1fh (window %dd, ~%d guaranteed strategist "
+                    "opportunities); applying the recommended retirement on the next "
+                    "lifecycle tick",
+                    d.get("id"),
+                    _decided["undecided_hours"],
+                    _decided["window_days"],
+                    _decided["strategist_opportunities"],
+                )
             continue
         recovery_hours = default_recovery_hours
         try:
