@@ -627,7 +627,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | resolve_discovery | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | report_autonomous_finding | consume_knowledge | dismiss_knowledge | request_qualification",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | resolve_discovery | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | report_autonomous_finding | consume_knowledge | dismiss_knowledge | request_qualification | force_promote | requeue_task | reset_iteration_cap | set_task_priority | unhold_direction",
   "data": { }
 }
 ```
@@ -686,6 +686,51 @@ truncated). Notable behaviors:
   persists across session restarts. Required `data` fields: `key` (string, ≤ 200
   chars) and `content` (string, ≤ 2000 chars). Entries are capped at 50; oldest
   are evicted first.
+
+Pipeline **action** verbs. Each re-enters the same server-side implementation
+its operator HTTP lever calls, so behavior cannot drift between the two. All
+require a non-empty `reason`, and all report the REASON an action did not happen
+rather than asserting success.
+
+- `force_promote` promotes the open release version while **skipping the release
+  audit/qualification gate — and only that gate**. It does **NOT** skip CI: the
+  release branch is still cut, the `release-vN` → promotion-target PR is still
+  opened, and the promotion target's required branch-protection checks must still
+  go green before anything merges. Optional `candidate_sha` (7–40 hex, resolved
+  server-side) defaults to the current integration-branch HEAD. Two-phase by
+  design — the first call cuts the PR and returns a waiting status (commonly
+  `promotion_check_wait`); call again once CI is green to land it. Pre-promote
+  no-op guards (`no_open_version`, `no_credentials`, `ci_not_green`,
+  `promotion_check_wait`, …) come back as `promoted: false` with the raw
+  `promotion_status`, not as an HTTP error.
+- `requeue_task` re-drives one same-project task back to `QUEUED`. This is also
+  the **retry** verb. Requires `target_task_id`; optional `guidance` is the
+  one-shot retry instruction appended to the requeued prompt (defaults to
+  `reason`). Retryable source statuses are `FAILED`, `CANCELLED`, `BLOCKED`,
+  `EVALUATING`, `PARKED`; anything else returns `409` naming the current status.
+  Does **NOT** re-run a failed release qualification (use `request_qualification`)
+  and does **NOT** unpark a review-fix loop (use `reset_iteration_cap`).
+- `reset_iteration_cap` is the **unpark** verb for a review-fix chain: a chain
+  parked for operator disposition is released by exactly this operation. It
+  archives the FAILED review/fix tasks on the PR, zeroes the per-chain iteration
+  counter, stamps the reset marker that also releases the merge gate's
+  exact-target respawn budget, and clears the abandon-candidate marker. It does
+  **NOT** re-spawn anything (`respawned: false`) and never touches the PR.
+  Returns `400` when the task carries no `review_loop.pr_number` /
+  `rollup_pr_number`, `409` while a failed review/fix task still has a pending
+  post-commit continuation.
+- `set_task_priority` reprioritises one same-project task by rewriting
+  `Task.priority`, the integer the dispatch loop orders by. `priority` accepts
+  `high` | `medium` | `low` (100 | 50 | 0) or an explicit integer 0–100. It does
+  **NOT** dispatch the task, raise a concurrency cap, or clear a dependency or
+  landing gate (`dispatched: false`) — priority only decides order among rows
+  that are already eligible. To reprioritise a *direction*, use
+  `update_direction` with `priority`.
+- `unhold_direction` clears a direction's consecutive-failure hold so it
+  dispatches work again; idempotent, returning `was_held: false` when the
+  direction was already healthy. It does **NOT** change the direction's status,
+  reset saturation, re-activate a retired or staged direction (use
+  `activate_direction`), or spawn anything (`spawned: false`).
 
 ---
 
