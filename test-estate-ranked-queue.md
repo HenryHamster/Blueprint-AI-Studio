@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 645 | 1,008,471 | 26,807 | 11,123.372s (643 files) | 2 |
+| backend | 645 | 1,008,987 | 26,818 | 11,123.372s (643 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 113,094 | 6,178 | 317.583s (129 files) | 0 |
@@ -574,7 +574,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 550 | G | backend | `backend/testing/test_security.py` | 716 | 68 | under 1500 LOC | 0.981s measured | — |
 | 551 | G | backend | `backend/testing/test_optimistic_version.py` | 199 | 3 | under 1500 LOC | 0.904s measured | — |
 | 552 | G | backend | `backend/testing/test_c5_approval_gate_invariant.py` | 309 | 3 | under 1500 LOC | 0.894s measured | — |
-| 553 | G | backend | `backend/testing/test_blocked_recheck_autonomy.py` | 79 | 1 | under 1500 LOC | 0.878s measured | — |
+| 553 | G | backend | `backend/testing/test_blocked_recheck_autonomy.py` | 595 | 12 | under 1500 LOC | 0.878s measured | — |
 | 554 | G | backend | `backend/testing/test_strategic_memory_claim_redaction_repair_retry.py` | 252 | 2 | under 1500 LOC | 0.866s measured | — |
 | 555 | G | admin-ui | `admin-ui/src/components/DashboardMetricCards.test.tsx` | 208 | 24 | under 1500 LOC | 0.862s measured | — |
 | 556 | G | backend | `backend/testing/test_task_direction_refs.py` | 50 | 3 | under 1500 LOC | 0.860s measured | — |
