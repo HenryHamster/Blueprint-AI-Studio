@@ -200,6 +200,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/orchestrator_compute_experiment_dispatch.py",
         "backend/app/orchestrator_provision.py",
         "backend/app/orchestrator_runner_dispatch.py",
+        "backend/app/orchestrator_runner_placement.py",
         "backend/app/plan_completion.py",
         "backend/app/reaper.py",
         "backend/app/reaper_bug_message_sweeps.py",

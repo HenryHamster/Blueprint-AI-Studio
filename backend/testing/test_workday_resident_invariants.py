@@ -730,6 +730,159 @@ async def test_resident_mutations_reject_overlapping_one_shot_but_messages_pass(
     )
 
 
+async def _arm_fresh_continuation(db_session, project):
+    """Put the project's local-continuation marker into the fresh/owned state."""
+    vision = dict(project.vision or {})
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = _continuation_marker(fresh=True)
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+
+def _sibling_strategic_task(project, *, task_type, status, started_at, context):
+    return Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "prompt": "sibling strategic row"}],
+        status=status,
+        started_at=started_at,
+        created_by="ORCHESTRATOR",
+        context=context,
+        depends_on=[],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker_key", ["_resident_session", "_resident_infrastructure"]
+)
+async def test_resident_mutation_fence_ignores_sibling_resident_process_row(
+    db_session, marker_key
+):
+    """A second Resident PROCESS row is not a competing one-shot Strategic writer.
+
+    The Resident runs AS a ``strategic_review`` Task, so the old payload-type-only
+    lane check counted its own predecessor generation / adopted duplicate as a
+    rival writer and 409'd every mutation for as long as that row stayed
+    non-terminal — i.e. it muted the Resident precisely during a handoff, while
+    the operator was talking to it. Single-writer among Resident workers is
+    already enforced by the session-id / generation / incarnation checks that run
+    immediately before this fence.
+    """
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _arm_fresh_continuation(db_session, project)
+    sibling = _sibling_strategic_task(
+        project,
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        context={
+            marker_key: True,
+            "strategic_session_id": str(uuid.uuid4()),
+            "_resident_worker_generation": 1,
+        },
+    )
+    db_session.add(sibling)
+    await db_session.commit()
+
+    # Must NOT raise: the sibling is Resident process infrastructure.
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "update_running_update"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resident_mutation_fence_ignores_never_started_one_shot(db_session):
+    """A one-shot that has never executed has written nothing to race with.
+
+    It has issued no strategic op and holds no pre-mutation snapshot. Fencing on
+    it mutes the Resident for the whole queue wait — indefinitely when the
+    one-shot cannot dispatch. Once it actually starts, the fence must return.
+    """
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _arm_fresh_continuation(db_session, project)
+    one_shot = _sibling_strategic_task(
+        project,
+        task_type="strategic_review",
+        status=TaskStatus.QUEUED,
+        started_at=None,
+        context={},
+    )
+    db_session.add(one_shot)
+    await db_session.commit()
+
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "update_running_update"
+    )
+
+    # The invariant is intact: the same row fences as soon as it begins executing.
+    one_shot.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    one_shot.status = TaskStatus.PROVISIONING
+    db_session.add(one_shot)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as started:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    assert started.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_resident_lane_refusal_names_the_blocking_task(db_session):
+    """A refusal must carry WHY: which task owns the lane, its type and state."""
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _arm_fresh_continuation(db_session, project)
+    one_shot = _sibling_strategic_task(
+        project,
+        task_type="design_doc_update",
+        status=TaskStatus.IN_PROGRESS,
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        context={},
+    )
+    db_session.add(one_shot)
+    await db_session.commit()
+    await db_session.refresh(one_shot)
+
+    with pytest.raises(HTTPException) as blocked:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    detail = str(blocked.value.detail)
+    assert blocked.value.status_code == 409
+    assert "lane" in detail.lower()
+    assert str(one_shot.id) in detail
+    assert "design_doc_update" in detail
+    assert "IN_PROGRESS" in detail
+
+
+@pytest.mark.asyncio
+async def test_resident_continuation_refusal_carries_its_reason(db_session):
+    """The continuation refusal must say which lease condition failed."""
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    vision = dict(project.vision or {})
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = _continuation_marker(fresh=False)
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as expired:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    detail = str(expired.value.detail)
+    assert expired.value.status_code == 409
+    assert "expired" in detail.lower()
+    assert "reason=stale" in detail
+    assert "fresh=False" in detail
+    assert "enabled=True" in detail
 
 
 @pytest.mark.asyncio

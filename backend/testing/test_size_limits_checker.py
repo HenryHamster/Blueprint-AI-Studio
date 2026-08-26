@@ -864,9 +864,16 @@ def test_fix_chronic_git_read_failure_refuses_bump(tmp_path, capsys, mocker):
     )
 
 
+# The chronic bypass now persists WHY it was taken, so the approval value has
+# to be a recordable "<operator>: <reason>" -- the block below the refusal test
+# pins the validation and the ledger write.
+_REASON = "the module gates the promotion path; decomposition is queued"
+_APPROVAL = f"henry: {_REASON}"
+
+
 def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker, monkeypatch):
     """--force-chronic grants operator-approved bump even for chronic offenders."""
-    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, "henry")
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, _APPROVAL)
     from datetime import datetime, timedelta, timezone
 
     from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
@@ -938,6 +945,197 @@ def test_force_chronic_without_operator_approval_env_is_refused(tmp_path, capsys
     assert json.loads(_read(jp))["backend"]["chronic.py"] == 1600, (
         "the cap must be left exactly as it was"
     )
+
+
+# ---------------------------------------------------------------------------
+# The operator approval must be RECORDABLE, and it must be RECORDED.
+#
+# ``--force-chronic`` used to gate on the mere PRESENCE of
+# ``SIZE_CAP_OPERATOR_APPROVAL``: the value was never read and never persisted,
+# so ``SIZE_CAP_OPERATOR_APPROVAL=1`` opened the bypass and the ledger record it
+# produced -- {commit_sha, commit_date, old_cap, new_cap} -- said nothing about
+# who authorised the raise or why.  The value is now validated as
+# "<operator>: <reason>" and stored as the record's ``justification``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (_APPROVAL, _APPROVAL),
+        # Whitespace (a shell-pasted newline included) collapses to one line, so
+        # the recorded value is always a single tidy JSON string.
+        (f"  henry:\n\t{_REASON}  ", _APPROVAL),
+        # A colon inside the reason belongs to the reason: only the first splits.
+        (
+            "henry: see PR #17587: that unapproved bump was reverted",
+            "henry: see PR #17587: that unapproved bump was reverted",
+        ),
+    ],
+)
+def test_normalize_operator_approval_accepts_a_real_reason(raw, expected):
+    justification, error = csl.normalize_operator_approval(raw)
+
+    assert error == ""
+    assert justification == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "",
+        "   ",
+        "\n\t ",
+        # Values that satisfy a presence check and carry nothing.
+        "1",
+        "0",
+        "true",
+        "yes",
+        "TBD",
+        # A reason with nobody attached to it.
+        "raising the cap because the module keeps on growing",
+        # An operator with no reason attached.
+        "henry:",
+        "henry: ok",
+        "henry: yes",
+        # Too short / too few words to be a justification.
+        "henry: needed",
+        "henry: cap too low now",
+        # The operator half is itself a placeholder, or missing.
+        "yes: the promotion gate needs this headroom today",
+        ": the promotion gate needs this headroom today",
+    ],
+)
+def test_normalize_operator_approval_rejects_a_valueless_value(raw):
+    justification, error = csl.normalize_operator_approval(raw)
+
+    assert justification == ""
+    assert error, f"{raw!r} must not satisfy the gate"
+
+
+def test_normalize_operator_approval_rejects_an_oversize_value():
+    """A whole diff pasted into the env var is not a ledger field."""
+    justification, error = csl.normalize_operator_approval("henry: " + "reason " * 200)
+
+    assert justification == ""
+    assert "characters" in error
+
+
+def _chronic_history():
+    """Three bumps: enough to classify the module as a chronic offender."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.size_limit_policy import CHRONIC_WINDOW_DAYS, BumpRecord
+
+    def _rec(old, new, days_ago):
+        date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        return BumpRecord(
+            commit_sha=f"sha{days_ago}", commit_date=date, old_cap=old, new_cap=new
+        )
+
+    return [
+        _rec(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
+        _rec(1200, 1400, CHRONIC_WINDOW_DAYS - 60),
+        _rec(1400, 1600, 30),
+    ]
+
+
+def _ledger_history(json_path):
+    ledger = json.loads(
+        _read(os.path.join(os.path.dirname(json_path), "cap_bump_history.json"))
+    )
+    return ledger["history"]["backend"]
+
+
+@pytest.mark.parametrize(
+    "raw", ["", "   ", "1", "true", "yes", "henry", "henry: ok", "henry: needed"]
+)
+def test_force_chronic_refuses_a_value_that_cannot_be_recorded(
+    tmp_path, capsys, mocker, monkeypatch, raw
+):
+    """A value that only clears a presence check no longer opens the bypass.
+
+    Every one of these was accepted before the value was persisted, which is
+    what made the approval unauditable: the ledger recorded the raise but not
+    the authorisation, so a reviewer could not tell an operator's headroom
+    decision from a bump someone forced to go green.
+    """
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, raw)
+    repo, jp = _build_repo(tmp_path, backend={"chronic.py": (1720, 1600)})
+    mocker.patch(
+        "app.size_limit_policy.parse_bump_history", return_value=_chronic_history()
+    )
+
+    rc = _run(jp, repo, "--fix", "--force-chronic", "--sections", "backend")
+
+    err = capsys.readouterr().err
+    assert rc == 1, "an unrecordable approval must fail closed"
+    assert csl._OPERATOR_APPROVAL_ENV in err, err
+    assert json.loads(_read(jp))["backend"]["chronic.py"] == 1600, (
+        "the cap must be left exactly as it was"
+    )
+    assert not os.path.exists(
+        os.path.join(os.path.dirname(jp), "cap_bump_history.json")
+    ), "a refused bump must not write a ledger record"
+
+
+def test_force_chronic_records_the_operator_approval_as_a_justification(
+    tmp_path, capsys, mocker, monkeypatch
+):
+    """The point of the whole change: the approval lands in the ledger record."""
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, f"  henry:\n\t{_REASON}  ")
+    repo, jp = _build_repo(tmp_path, backend={"chronic.py": (1720, 1600)})
+    mocker.patch(
+        "app.size_limit_policy.parse_bump_history", return_value=_chronic_history()
+    )
+
+    rc = _run(jp, repo, "--fix", "--force-chronic", "--sections", "backend")
+
+    assert rc == 0, rc
+    new_cap = bump_size_limit(1720)
+    assert json.loads(_read(jp))["backend"]["chronic.py"] == new_cap
+    records = _ledger_history(jp)["chronic.py"]
+    assert len(records) == 1, records
+    assert set(records[0]) == {
+        "commit_sha",
+        "commit_date",
+        "old_cap",
+        "new_cap",
+        "justification",
+    }
+    assert (records[0]["old_cap"], records[0]["new_cap"]) == (1600, new_cap)
+    assert records[0]["justification"] == _APPROVAL
+    assert "justification" in capsys.readouterr().out
+
+
+def test_operator_approval_is_not_stamped_on_a_routine_bump(
+    tmp_path, capsys, mocker, monkeypatch
+):
+    """Only the bump that NEEDED the approval carries it.
+
+    Stamping an ordinary policy bump applied in the same run would make the
+    field useless as an audit signal -- every record would carry an approval
+    nobody was ever asked for.
+    """
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, _APPROVAL)
+    repo, jp = _build_repo(
+        tmp_path, backend={"chronic.py": (1720, 1600), "routine.py": (1720, 1600)}
+    )
+    chronic = _chronic_history()
+    mocker.patch(
+        "app.size_limit_policy.parse_bump_history",
+        side_effect=lambda key, section, repo_root=None: (
+            chronic if key == "chronic.py" else []
+        ),
+    )
+
+    rc = _run(jp, repo, "--fix", "--force-chronic", "--sections", "backend")
+
+    assert rc == 0, rc
+    history = _ledger_history(jp)
+    assert history["chronic.py"][0]["justification"] == _APPROVAL
+    assert "justification" not in history["routine.py"][0]
 
 
 def test_coverage_threshold_in_sync_with_test_invariants():
@@ -2113,7 +2311,7 @@ def _build_zero_headroom_governed_module(tmp_path, name: str):
 @pytest.mark.parametrize("extra_args", [(), ("--force-chronic",)])
 def test_fix_refuses_zero_headroom_governed_module_without_crash(tmp_path, capsys, mocker, extra_args, monkeypatch):
     """--force-chronic waives the chronic gate, not the governance ceiling."""
-    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, "henry")
+    monkeypatch.setenv(csl._OPERATOR_APPROVAL_ENV, _APPROVAL)
     repo, jp = _build_zero_headroom_governed_module(tmp_path, "governed_over.py")
     with mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[]):
         rc = _run(jp, repo, "--fix", *extra_args, "--sections", "backend")  # AssertionError here IS the defect

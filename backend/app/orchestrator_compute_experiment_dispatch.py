@@ -807,6 +807,12 @@ async def _dispatch_compute_experiment_directly(
         session,
         task,
         reason="no_eligible_local_runner",
+        # ``runner is None`` alone cannot tell an unsatisfiable placement from a
+        # capability/VRAM/pin gate, both of which are ordinary backpressure.  The
+        # pool decides: an EMPTY entry for this project means no live runner can
+        # ever take the job, which pages instead of parking silently forever.  A
+        # non-empty entry keeps this branch byte-for-byte as it was.
+        active_runners_cache=active_runners_cache,
     ):
         logger.info(
             "[RUNNERS] Holding compute_experiment %s: project placement policy "

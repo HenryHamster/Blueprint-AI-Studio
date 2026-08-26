@@ -161,6 +161,15 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "runner.fleet_no_healthy": AlertEventPolicy("runner.fleet_no_healthy"),
     "runner.post_update_silent": AlertEventPolicy("runner.post_update_silent"),
     "runner.cross_project_access": AlertEventPolicy("runner.cross_project_access"),
+    # A ``local_only`` project whose active-runner pool is empty: the placement
+    # wait has no timeout by design, so without this the work parks silently and
+    # forever.  Condition-scoped dedupe (one row per project, not per task or
+    # per cycle) so the row AGES and can escalate; the producer dismisses it the
+    # moment an eligible runner takes work for the project.
+    "placement.unsatisfiable_local_hold": AlertEventPolicy(
+        "placement.unsatisfiable_local_hold",
+        retirement=AlertRetirementMode.SOURCE_CONDITION,
+    ),
     "deployment.halted": AlertEventPolicy("deployment.halted"),
     "deployment.rollback_recommended": AlertEventPolicy(
         "deployment.rollback_recommended"
@@ -255,6 +264,15 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "research.strategic_issue": AlertEventPolicy(
         "research.strategic_issue", domain=DOMAIN_RESEARCH_DIRECTIONS
     ),
+    # Force-terminated strategic cycle / timed-out direction diagnosis.  Was
+    # emitted as a raw ``Alert(...)`` insert titled with the cycle id, so it
+    # bypassed this registry entirely: the import-time retirement assertion
+    # below iterates these keys only, and an occurrence-keyed title can never
+    # dedupe -- one immortal row per stalled cycle.  MANUAL is the honest mode:
+    # the row describes work that has already died, so there is no live
+    # condition a resolver could watch clear.  Retirement is the operator
+    # acknowledging it.
+    "research.diagnosis_stalled": AlertEventPolicy("research.diagnosis_stalled"),
     # Strategic-cycle liveness applies to every autonomous project, while its
     # producer owns retirement when a completion or healthy-idle receipt arrives.
     "research.strategic_cycle_liveness": AlertEventPolicy(
@@ -339,6 +357,7 @@ _MANUAL_RETIREMENT_EVENTS = frozenset(
         "rollup.backmerge_blocked",
         "rollup.pr_blocked",
         "notification.dead_letter_lost",
+        "research.diagnosis_stalled",
     }
 )
 
