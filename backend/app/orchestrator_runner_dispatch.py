@@ -145,6 +145,7 @@ from app.orchestrator_runner_placement import (  # noqa: F401
     _clear_execution_placement_wait,
     _hold_task_for_local_only_placement,
     _stage_local_only_placement_wait,
+    clear_unsatisfiable_local_placement_alert,
 )
 
 # ── Compute-experiment dispatch ──────────────────────────────────────────────
@@ -768,6 +769,12 @@ async def _try_runner_dispatch(
 
         await _resolve_local_runner_hold_alert(session, task.id)
         await _resolve_container_runner_hold_alert(session, task.id)
+        # A live, bound runner just accepted work for this project, which is
+        # direct evidence against "no active runner is bound to this project".
+        # Only queried when the task actually WAS parked under the placement
+        # policy, so an ordinary pin pays nothing for it.
+        if EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY in ctx:
+            await clear_unsatisfiable_local_placement_alert(session, task.project_id)
     except Exception:
         logger.exception(
             "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id

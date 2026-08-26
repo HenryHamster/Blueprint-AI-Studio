@@ -35,6 +35,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.orchestrator_runner_placement import task_is_local_only_placement_hold
 from app.problem_model import sanitize_problem_model_raw
 from app.strategic_constants import CYCLE_SUMMARY_MAX
 from app.strategic_runtime_work import task_is_strategic_local_runner_hold
@@ -1147,7 +1148,9 @@ async def find_stalled(
             ):
                 if c.phase1_task_id is not None:
                     linked_task = linked_tasks_by_id.get(c.phase1_task_id)
-                    if task_is_strategic_local_runner_hold(linked_task):
+                    if task_is_strategic_local_runner_hold(
+                        linked_task
+                    ) or task_is_local_only_placement_hold(linked_task):
                         continue
                 stalled.append(c)
         elif c.outcome == OUTCOME_PHASE2_RUNNING:
@@ -1167,7 +1170,9 @@ async def find_stalled(
             ):
                 if c.phase2_task_id is not None:
                     linked_task = linked_tasks_by_id.get(c.phase2_task_id)
-                    if task_is_strategic_local_runner_hold(linked_task):
+                    if task_is_strategic_local_runner_hold(
+                        linked_task
+                    ) or task_is_local_only_placement_hold(linked_task):
                         continue
                 stalled.append(c)
         if len(stalled) >= limit:
