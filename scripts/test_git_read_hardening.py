@@ -51,8 +51,13 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
+# scripts/*.py tests run with --noconftest, so the shared offender-identity
+# producer is reached by the same explicit path insertion the other scripts
+# guards use rather than by a conftest-installed sys.path entry.
+sys.path.insert(0, str(REPOSITORY_ROOT / "backend"))
 
 import verify  # noqa: E402
+from testing.fixgate_attribution import format_offender_marker  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # The structural sweep
@@ -216,13 +221,18 @@ def test_every_git_read_names_the_checkout_it_reads_as_safe() -> None:
         "the sweep did not inspect modules that are known to shell out to git, "
         "so a clean result here would be blindness rather than health: "
         f"{missing_floor}"
+        + "\n"
+        + format_offender_marker(missing_floor)
     )
     assert not offenders, (
         "git refuses EVERY subcommand with 'detected dubious ownership' (exit "
         "128) when the calling uid does not own the checkout -- the shape a "
         "container running as root or a systemd unit with a foreign User= hits "
         "routinely. Pass -c safe.directory=<root> on the invocation so the read "
-        "WORKS; do not soften what a genuine failure means: " + repr(offenders)
+        "WORKS; do not soften what a genuine failure means: "
+        + repr(offenders)
+        + "\n"
+        + format_offender_marker(offenders)
     )
 
 
