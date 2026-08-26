@@ -6484,6 +6484,186 @@ async def test_step7_wedged_queued_phase_task_without_activity_still_reaped(
 
 
 @pytest.mark.asyncio
+async def test_step7_missing_phase2_start_is_repaired_not_borrowed_from_phase1(
+    reaper_db, mocker
+):
+    """A NULL ``phase2_started_at`` must not be measured with phase 1's clock.
+
+    Row shape produced by ``0047_add_strategic_cycle_table``: ``phase2_running``
+    backfilled straight from the legacy JSONB, ``phase2_started_at`` left NULL
+    because the entry had no parseable ``phase1_completed_at``, and
+    ``phase1_started_at`` COALESCEd to a long-past timestamp. The old
+    ``phase2_started_at or phase1_started_at`` fallback then reported phase 1's
+    age as ">3h in phase2" and force-terminated a phase-2 task that had been
+    running for minutes.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2-just-started",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        # Phase 1 started long ago; phase 2 started when the task was created.
+        phase1_started_at=_utcnow() - timedelta(hours=9),
+        phase2_started_at=None,
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 0, (
+        "phase 2 started minutes ago; only phase 1's clock is >3h old and it is "
+        "not evidence about phase 2"
+    )
+    assert task.status == TaskStatus.IN_PROGRESS, (
+        "the phase-2 task must not be force-terminated on a duration nothing "
+        "measured"
+    )
+    assert cycle.outcome == "phase2_running"
+    # The missing fact is REPAIRED from evidence, not left for a human: the
+    # phase-2 task is created at phase-2 start, so its created_at IS the start.
+    assert cycle.phase2_started_at is not None
+    assert cycle.phase2_started_at == task.created_at
+    repair = cycle.cycle_metadata["phase_start_repair"]
+    assert repair["phase"] == "phase2"
+    assert repair["source"] == "linked_task_created_at"
+
+
+@pytest.mark.asyncio
+async def test_step7_repaired_phase2_start_still_stalls_a_wedged_cycle(
+    reaper_db, mocker
+):
+    """Mutation guard: the repair must not become a shield.
+
+    Same NULL ``phase2_started_at`` shape, but the phase-2 task really has been
+    QUEUED for 9h with no heartbeat and no lifecycle write. Repairing the start
+    from the task's ``created_at`` must produce an HONEST >3h measurement and
+    the ordinary stall, with the reason naming both the cause and the repair.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2-wedged-null-start",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    from sqlalchemy import update as _sa_update
+
+    await reaper_db.execute(
+        _sa_update(Task)
+        .where(Task.id == task.id)
+        .values(
+            created_at=_utcnow() - timedelta(hours=9),
+            updated_at=_utcnow() - timedelta(hours=9),
+        )
+    )
+    await reaper_db.commit()
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=10),
+        phase2_started_at=None,
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 1
+    assert task.status == TaskStatus.FAILED
+    assert cycle.outcome == "stalled_phase2"
+    assert cycle.failure_reason.startswith(
+        "reaper_stall (attempt 1, cause phase2:queued_never_dispatched):"
+    ), cycle.failure_reason
+    # Surface the REASON, including where the clock came from — a cycle that
+    # stalls on the first sweep that ever measured it otherwise reads as the
+    # reaper inventing a deadline.
+    assert "phase2 start timestamp was missing and was repaired" in (
+        cycle.failure_reason
+    ), cycle.failure_reason
+    assert "linked_task_created_at" in cycle.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_step7_phase2_start_repair_is_idempotent_and_bounded(reaper_db, mocker):
+    """A repaired row is not repaired again, and repair alone is not a stall."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    from app import strategic_cycle as _sc
+
+    project = await _make_project(reaper_db)
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        # No phase-2 task and no phase-1 completion: the row carries no evidence
+        # of phase 2 ever starting, so the clock starts at the observation.
+        phase2_task_id=None,
+        phase1_started_at=_utcnow() - timedelta(hours=9),
+        phase1_completed_at=None,
+        phase2_started_at=None,
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    first = await _sc.repair_missing_phase_starts(reaper_db)
+    await reaper_db.commit()
+    assert len(first) == 1
+    assert first[0]["source"] == "observed_at_repair"
+
+    await reaper_db.refresh(cycle)
+    assert cycle.phase2_started_at is not None
+    # Deciding costs at most one extra window; it never asserts an unmeasured age.
+    assert cycle.phase2_started_at > _utcnow() - timedelta(minutes=5)
+
+    second = await _sc.repair_missing_phase_starts(reaper_db)
+    await reaper_db.commit()
+    assert second == [], "a repaired row must not match the predicate again"
+
+
+@pytest.mark.asyncio
 async def test_step7_reconciles_already_terminal_task_while_pipeline_paused(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):

@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 645 | 1,012,835 | 26,910 | 11,122.935s (643 files) | 2 |
+| backend | 645 | 1,013,128 | 26,917 | 11,122.935s (643 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 113,094 | 6,178 | 317.583s (129 files) | 0 |
@@ -27,7 +27,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 3 | P2 | backend | `backend/testing/test_pipeline.py` | 6,841 | 277 | critical (>5000 LOC) | 318.896s measured | — |
 | 4 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,894 | 437 | critical (>5000 LOC) | 300.644s measured | — |
 | 5 | P2 | backend | `backend/testing/test_task_lifecycle.py` | 13,145 | 323 | critical (>5000 LOC) | 207.992s measured | — |
-| 6 | P2 | backend | `backend/testing/test_reaper.py` | 21,674 | 499 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 499 |
+| 6 | P2 | backend | `backend/testing/test_reaper.py` | 21,854 | 502 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 499 |
 | 7 | P2 | backend | `backend/testing/test_research_completion.py` | 24,134 | 534 | critical (>5000 LOC) | 137.469s measured | — |
 | 8 | P2 | backend | `backend/testing/test_autonomous_research.py` | 20,258 | 393 | critical (>5000 LOC) | 125.162s measured | — |
 | 9 | P2 | backend | `backend/testing/test_invariants.py` | 15,823 | 279 | critical (>5000 LOC) | 120.389s measured | — |
@@ -127,124 +127,124 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 103 | P5 | backend | `backend/testing/test_admin_approval_authority.py` | 1,510 | 16 | moderate (1500–2999 LOC) | 36.201s measured | — |
 | 104 | P5 | backend | `backend/testing/test_admin_runners.py` | 1,826 | 62 | moderate (1500–2999 LOC) | 34.994s measured | — |
 | 105 | P5 | backend | `backend/testing/test_alerts.py` | 2,287 | 60 | moderate (1500–2999 LOC) | 33.602s measured | — |
-| 106 | P5 | agent | `agent/src/prompts/check-helper.test.ts` | 2,350 | 69 | moderate (1500–2999 LOC) | 30.009s measured | — |
-| 107 | P5 | backend | `backend/testing/test_staged_directions.py` | 1,694 | 40 | moderate (1500–2999 LOC) | 29.493s measured | — |
-| 108 | P5 | agent | `agent/src/prompt.guidance.test.ts` | 2,153 | 176 | moderate (1500–2999 LOC) | 28.990s measured | — |
-| 109 | P5 | backend | `backend/testing/test_api.py` | 1,587 | 39 | moderate (1500–2999 LOC) | 26.354s measured | — |
-| 110 | P5 | backend | `backend/testing/test_warm_pool_dispatch.py` | 1,961 | 40 | moderate (1500–2999 LOC) | 24.592s measured | — |
-| 111 | P5 | backend | `backend/testing/test_generated_shell.py` | 2,722 | 111 | moderate (1500–2999 LOC) | 23.466s measured | — |
-| 112 | P5 | backend | `backend/testing/test_admin_routers__notifications.py` | 1,595 | 54 | moderate (1500–2999 LOC) | 23.459s measured | — |
-| 113 | P5 | backend | `backend/testing/test_review_merge_authority.py` | 1,540 | 18 | moderate (1500–2999 LOC) | 23.223s measured | — |
-| 114 | P5 | backend | `backend/testing/test_discovery_review.py` | 2,938 | 61 | moderate (1500–2999 LOC) | 21.216s measured | — |
-| 115 | P5 | backend | `backend/testing/test_admin_routers__strategic_directions.py` | 2,071 | 29 | moderate (1500–2999 LOC) | 20.878s measured | protected; declared floor 29 |
-| 116 | P5 | backend | `backend/testing/test_audit_finding_class_guards.py` | 2,068 | 35 | moderate (1500–2999 LOC) | 20.635s measured | — |
-| 117 | P5 | backend | `backend/testing/test_approved_pr_stranding.py` | 1,687 | 34 | moderate (1500–2999 LOC) | 20.351s measured | — |
-| 118 | P5 | backend | `backend/testing/test_release_commit_authorship.py` | 2,412 | 53 | moderate (1500–2999 LOC) | 18.205s measured | — |
-| 119 | P5 | backend | `backend/testing/test_deploy_health.py` | 2,237 | 81 | moderate (1500–2999 LOC) | 17.586s measured | — |
-| 120 | P5 | backend | `backend/testing/test_migration_apply_gate.py` | 2,900 | 86 | moderate (1500–2999 LOC) | 17.539s measured | — |
-| 121 | P5 | backend | `backend/testing/test_compute_park_wake.py` | 1,721 | 12 | moderate (1500–2999 LOC) | 17.022s measured | — |
-| 122 | P5 | backend | `backend/testing/test_strategic_spawning_scope_budget.py` | 2,578 | 41 | moderate (1500–2999 LOC) | 14.284s measured | — |
-| 123 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.test.tsx` | 2,818 | 78 | moderate (1500–2999 LOC) | 14.213s measured | protected; declared floor 78 |
-| 124 | P5 | agent | `agent/src/prompts/code-change-helpers.test.ts` | 1,900 | 90 | moderate (1500–2999 LOC) | 13.227s measured | — |
-| 125 | P5 | backend | `backend/testing/test_warm_pool.py` | 1,591 | 45 | moderate (1500–2999 LOC) | 13.002s measured | — |
-| 126 | P5 | backend | `backend/testing/test_workday_resident_invariants.py` | 1,646 | 38 | moderate (1500–2999 LOC) | 12.536s measured | protected; declared floor 38 |
-| 127 | P5 | backend | `backend/testing/test_lock_window.py` | 2,373 | 36 | moderate (1500–2999 LOC) | 11.653s measured | — |
-| 128 | P5 | backend | `backend/testing/test_task_locking.py` | 2,456 | 62 | moderate (1500–2999 LOC) | 11.250s measured | — |
-| 129 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.send.test.tsx` | 1,908 | 38 | moderate (1500–2999 LOC) | 11.185s measured | — |
-| 130 | P5 | backend | `backend/testing/test_service_credentials.py` | 1,500 | 30 | moderate (1500–2999 LOC) | 10.779s measured | — |
-| 131 | P5 | backend | `backend/testing/test_auto_remediation.py` | 2,857 | 62 | moderate (1500–2999 LOC) | 9.882s measured | — |
-| 132 | P5 | backend | `backend/testing/test_diagnostics.py` | 1,505 | 59 | moderate (1500–2999 LOC) | 9.673s measured | — |
-| 133 | P5 | backend | `backend/testing/test_strategic_spawning_type_selection.py` | 2,620 | 64 | moderate (1500–2999 LOC) | 9.580s measured | — |
-| 134 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.filters.test.tsx` | 1,701 | 55 | moderate (1500–2999 LOC) | 8.977s measured | — |
-| 135 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.interactions.test.tsx` | 1,846 | 52 | moderate (1500–2999 LOC) | 8.913s measured | — |
-| 136 | P5 | backend | `backend/testing/test_completion_debt.py` | 2,246 | 56 | moderate (1500–2999 LOC) | 8.440s measured | — |
-| 137 | P5 | backend | `backend/testing/test_cost_telemetry_reconciliation.py` | 1,694 | 42 | moderate (1500–2999 LOC) | 7.868s measured | — |
-| 138 | P5 | backend | `backend/testing/test_strategic_spawning_outcome_evaluation.py` | 2,605 | 48 | moderate (1500–2999 LOC) | 6.466s measured | — |
-| 139 | P5 | backend | `backend/testing/test_evergreen_backlog.py` | 1,539 | 50 | moderate (1500–2999 LOC) | 6.364s measured | — |
-| 140 | P5 | backend | `backend/testing/test_compute_gcp_startup.py` | 1,991 | 62 | moderate (1500–2999 LOC) | 5.984s measured | — |
-| 141 | P5 | backend | `backend/testing/test_warm_backlog_reuse.py` | 2,019 | 53 | moderate (1500–2999 LOC) | 5.982s measured | — |
-| 142 | P5 | backend | `backend/testing/test_payload_schemas.py` | 2,161 | 148 | moderate (1500–2999 LOC) | 5.802s measured | — |
-| 143 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.notifications.test.tsx` | 1,524 | 65 | moderate (1500–2999 LOC) | 5.501s measured | — |
-| 144 | P5 | agent | `agent/src/handlers/audits.test.ts` | 2,190 | 92 | moderate (1500–2999 LOC) | 5.229s measured | — |
-| 145 | P5 | admin-ui | `admin-ui/src/components/DashboardHome.test.tsx` | 2,682 | 80 | moderate (1500–2999 LOC) | 5.207s measured | — |
-| 146 | P5 | backend | `backend/testing/test_build_config_commands.py` | 1,718 | 56 | moderate (1500–2999 LOC) | 5.114s measured | — |
-| 147 | P5 | backend | `backend/testing/test_failure_residual.py` | 1,518 | 59 | moderate (1500–2999 LOC) | 4.634s measured | — |
-| 148 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.advanced.test.tsx` | 1,932 | 32 | moderate (1500–2999 LOC) | 4.328s measured | protected; declared floor 32 |
-| 149 | P5 | backend | `backend/testing/test_operator_inbox_liveness.py` | 2,505 | 50 | moderate (1500–2999 LOC) | 3.890s measured | — |
-| 150 | P5 | admin-ui | `admin-ui/src/components/KnowledgeBrowser.test.tsx` | 1,689 | 46 | moderate (1500–2999 LOC) | 3.815s measured | — |
-| 151 | P5 | admin-ui | `admin-ui/src/components/SrTrendBreakdown.test.tsx` | 2,335 | 149 | moderate (1500–2999 LOC) | 3.713s measured | — |
-| 152 | P5 | backend | `backend/testing/test_lane_baseline_snapshot.py` | 1,520 | 45 | moderate (1500–2999 LOC) | 3.637s measured | — |
-| 153 | P5 | backend | `backend/testing/test_discovery_review_packet_budget.py` | 1,624 | 25 | moderate (1500–2999 LOC) | 3.599s measured | — |
-| 154 | P5 | admin-ui | `admin-ui/src/components/StrategicContextRail.test.tsx` | 2,550 | 60 | moderate (1500–2999 LOC) | 3.312s measured | protected; declared floor 60 |
-| 155 | P5 | backend | `backend/testing/test_strategic_spawning_version_phase.py` | 2,800 | 42 | moderate (1500–2999 LOC) | 3.265s measured | — |
-| 156 | P5 | admin-ui | `admin-ui/src/components/WarmVmPanel.test.tsx` | 1,769 | 67 | moderate (1500–2999 LOC) | 3.029s measured | — |
-| 157 | P5 | agent | `agent/src/handlers/strategic.test.ts` | 2,923 | 89 | moderate (1500–2999 LOC) | 3.023s measured | — |
-| 158 | P5 | admin-ui | `admin-ui/src/components/FleetRunnersPanel.test.tsx` | 2,942 | 94 | moderate (1500–2999 LOC) | 2.946s measured | — |
-| 159 | P5 | admin-ui | `admin-ui/src/components/TaskDetailDrawerMeta.test.tsx` | 2,200 | 109 | moderate (1500–2999 LOC) | 2.512s measured | — |
-| 160 | P5 | agent | `agent/src/index.llm-runner.test.ts` | 1,969 | 95 | moderate (1500–2999 LOC) | 2.156s measured | — |
-| 161 | P5 | backend | `backend/testing/test_test_durations_freshness.py` | 1,669 | 45 | moderate (1500–2999 LOC) | 2.129s measured | — |
-| 162 | P5 | backend | `backend/testing/test_orchestrator_liveness.py` | 2,379 | 69 | moderate (1500–2999 LOC) | 1.893s measured | — |
-| 163 | P5 | agent | `agent/src/index.provider-runner.test.ts` | 1,880 | 134 | moderate (1500–2999 LOC) | 1.864s measured | protected; declared floor 134 |
-| 164 | P5 | backend | `backend/testing/test_fleet_utilization.py` | 1,527 | 42 | moderate (1500–2999 LOC) | 1.586s measured | — |
-| 165 | P5 | backend | `backend/testing/test_empty_repo_onboarding.py` | 1,837 | 51 | moderate (1500–2999 LOC) | 1.565s measured | — |
-| 166 | P5 | agent | `agent/src/index.pool-mode.test.ts` | 2,602 | 73 | moderate (1500–2999 LOC) | 1.499s measured | — |
-| 167 | P5 | admin-ui | `admin-ui/src/hooks/useWorkbenchCommands.test.tsx` | 2,238 | 58 | moderate (1500–2999 LOC) | 1.277s measured | — |
-| 168 | P5 | backend | `backend/testing/test_review_loop_convergence.py` | 2,684 | 52 | moderate (1500–2999 LOC) | 1.084s measured | — |
-| 169 | P5 | backend | `backend/testing/test_warm_vm_integration.py` | 2,999 | 28 | moderate (1500–2999 LOC) | 0.992s measured | — |
-| 170 | P5 | admin-ui | `admin-ui/src/hooks/useTaskModal.test.ts` | 1,698 | 79 | moderate (1500–2999 LOC) | 0.848s measured | — |
-| 171 | P5 | backend | `backend/testing/test_migration_chain.py` | 1,697 | 80 | moderate (1500–2999 LOC) | 0.714s measured | — |
-| 172 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,953 | 87 | moderate (1500–2999 LOC) | 0.565s measured | — |
-| 173 | P5 | backend | `backend/testing/test_dependency_contracts.py` | 1,804 | 44 | moderate (1500–2999 LOC) | 0.551s measured | — |
-| 174 | P5 | backend | `backend/testing/test_ci_resolution.py` | 2,942 | 165 | moderate (1500–2999 LOC) | 0.331s measured | — |
-| 175 | P5 | backend | `backend/testing/test_finding_deduplication.py` | 2,485 | 131 | moderate (1500–2999 LOC) | 0.286s measured | — |
-| 176 | P5 | backend | `backend/testing/test_migration_divergence.py` | 2,302 | 76 | moderate (1500–2999 LOC) | 0.275s measured | — |
-| 177 | P5 | backend | `backend/testing/test_ci_compliance.py` | 1,617 | 37 | moderate (1500–2999 LOC) | 0.253s measured | — |
-| 178 | P5 | backend | `backend/testing/test_health_zone_pool.py` | 2,149 | 118 | moderate (1500–2999 LOC) | 0.236s measured | — |
-| 179 | P5 | admin-ui | `admin-ui/src/hooks/useLogViewer.test.ts` | 1,593 | 48 | moderate (1500–2999 LOC) | 0.217s measured | — |
-| 180 | P5 | backend | `backend/testing/test_size_limits_checker.py` | 2,537 | 102 | moderate (1500–2999 LOC) | 0.162s measured | — |
-| 181 | P5 | agent | `agent/src/handlers/specialized.test.ts` | 2,570 | 146 | moderate (1500–2999 LOC) | 0.143s measured | — |
-| 182 | P5 | agent | `agent/src/index.test.ts` | 1,885 | 201 | moderate (1500–2999 LOC) | 0.117s measured | — |
-| 183 | P5 | backend | `backend/testing/test_llm_runtime.py` | 1,885 | 47 | moderate (1500–2999 LOC) | 0.100s measured | — |
-| 184 | P5 | agent | `agent/src/index.utilities.test.ts` | 1,556 | 131 | moderate (1500–2999 LOC) | 0.091s measured | — |
-| 185 | P5 | backend | `backend/testing/test_max_plan_pool_usage.py` | 2,499 | 96 | moderate (1500–2999 LOC) | 0.087s measured | — |
-| 186 | P5 | agent | `agent/src/handlers/strategic-sections.test.ts` | 2,963 | 198 | moderate (1500–2999 LOC) | 0.085s measured | — |
-| 187 | P5 | backend | `backend/testing/test_impacted_tests.py` | 1,576 | 62 | moderate (1500–2999 LOC) | 0.082s measured | — |
-| 188 | P5 | agent | `agent/src/workspacePrep.test.ts` | 1,887 | 74 | moderate (1500–2999 LOC) | 0.063s measured | protected; declared floor 74 |
-| 189 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.utils.test.ts` | 1,622 | 168 | moderate (1500–2999 LOC) | 0.063s measured | — |
-| 190 | P5 | agent | `agent/src/prompt.project-context.test.ts` | 2,116 | 158 | moderate (1500–2999 LOC) | 0.062s measured | — |
-| 191 | P5 | agent | `agent/src/prompt.test.ts` | 2,513 | 178 | moderate (1500–2999 LOC) | 0.048s measured | — |
-| 192 | P5 | backend | `backend/testing/test_artifact_refs.py` | 1,546 | 29 | moderate (1500–2999 LOC) | 0.036s measured | — |
-| 193 | P5 | agent | `agent/src/prompts/thinker.test.ts` | 1,904 | 101 | moderate (1500–2999 LOC) | 0.032s measured | — |
-| 194 | P5 | agent | `agent/src/prompt.format.test.ts` | 1,512 | 102 | moderate (1500–2999 LOC) | 0.029s measured | — |
-| 195 | P5 | agent | `agent/src/prompts/pr-helper.test.ts` | 2,353 | 41 | moderate (1500–2999 LOC) | 0.025s measured | — |
-| 196 | G | backend | `backend/testing/test_scripts_test_lane.py` | 389 | 3 | under 1500 LOC | 208.064s measured | — |
-| 197 | G | backend | `backend/testing/test_task_outcomes.py` | 1,375 | 108 | under 1500 LOC | 187.368s measured | — |
-| 198 | G | backend | `backend/testing/test_task_evaluators.py` | 1,172 | 79 | under 1500 LOC | 153.388s measured | — |
-| 199 | G | backend | `backend/testing/test_qualification_triggers.py` | 1,059 | 80 | under 1500 LOC | 143.296s measured | — |
-| 200 | G | backend | `backend/testing/test_rate_limit_detection.py` | 995 | 68 | under 1500 LOC | 130.206s measured | — |
-| 201 | G | backend | `backend/testing/test_task_constructor_authority_manifest.py` | 370 | 6 | under 1500 LOC | 118.662s measured | — |
-| 202 | G | backend | `backend/testing/test_provider_settings_bag.py` | 945 | 53 | under 1500 LOC | 114.172s measured | — |
-| 203 | G | backend | `backend/testing/test_research_context_eviction.py` | 1,013 | 64 | under 1500 LOC | 108.568s measured | — |
-| 204 | G | backend | `backend/testing/test_failure_layer_classifier.py` | 542 | 72 | under 1500 LOC | 100.534s measured | — |
-| 205 | G | backend | `backend/testing/test_providers.py` | 1,256 | 80 | under 1500 LOC | 98.906s measured | — |
-| 206 | G | backend | `backend/testing/test_migration_0724_name_reuse_after_revocation.py` | 287 | 6 | under 1500 LOC | 90.314s measured | — |
-| 207 | G | backend | `backend/testing/test_migration_0681_0694_preservation.py` | 1,093 | 3 | under 1500 LOC | 86.621s measured | — |
-| 208 | G | backend | `backend/testing/test_rollup_orphan_prs.py` | 350 | 32 | under 1500 LOC | 79.804s measured | — |
-| 209 | G | backend | `backend/testing/test_project_resource_envelope.py` | 883 | 65 | under 1500 LOC | 77.566s measured | — |
-| 210 | G | backend | `backend/testing/test_rollup_state.py` | 209 | 24 | under 1500 LOC | 62.286s measured | — |
-| 211 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 1,051 | 19 | under 1500 LOC | 57.849s measured | — |
-| 212 | G | agent | `agent/src/prompts/terminal-checkpoint-helpers.test.ts` | 435 | 12 | under 1500 LOC | 52.983s measured | — |
-| 213 | G | backend | `backend/testing/test_scope_complexity.py` | 380 | 32 | under 1500 LOC | 52.778s measured | — |
-| 214 | G | backend | `backend/testing/test_migration_0640_0682_workday_chain.py` | 334 | 1 | under 1500 LOC | 50.136s measured | — |
-| 215 | G | backend | `backend/testing/test_local_runner_viewable_selection.py` | 1,039 | 43 | under 1500 LOC | 47.838s measured | — |
-| 216 | G | backend | `backend/testing/test_review_policy_parity.py` | 372 | 22 | under 1500 LOC | 47.704s measured | — |
-| 217 | G | backend | `backend/testing/test_playbook_storage.py` | 723 | 24 | under 1500 LOC | 46.644s measured | — |
-| 218 | G | backend | `backend/testing/test_release_audit_contract.py` | 785 | 22 | under 1500 LOC | 45.066s measured | — |
-| 219 | G | backend | `backend/testing/test_qualification_dimensions.py` | 180 | 12 | under 1500 LOC | 36.808s measured | — |
-| 220 | G | backend | `backend/testing/test_runner_progress_protocol.py` | 467 | 19 | under 1500 LOC | 35.190s measured | — |
-| 221 | G | backend | `backend/testing/test_strategic_trigger.py` | 809 | 52 | under 1500 LOC | 33.716s measured | — |
-| 222 | G | backend | `backend/testing/test_migration_0722_discovery_controller.py` | 147 | 1 | under 1500 LOC | 32.526s measured | — |
-| 223 | G | backend | `backend/testing/test_strategic_cycle.py` | 1,472 | 60 | under 1500 LOC | 31.970s measured | — |
+| 106 | P5 | backend | `backend/testing/test_strategic_cycle.py` | 1,585 | 64 | moderate (1500–2999 LOC) | 31.970s measured | — |
+| 107 | P5 | agent | `agent/src/prompts/check-helper.test.ts` | 2,350 | 69 | moderate (1500–2999 LOC) | 30.009s measured | — |
+| 108 | P5 | backend | `backend/testing/test_staged_directions.py` | 1,694 | 40 | moderate (1500–2999 LOC) | 29.493s measured | — |
+| 109 | P5 | agent | `agent/src/prompt.guidance.test.ts` | 2,153 | 176 | moderate (1500–2999 LOC) | 28.990s measured | — |
+| 110 | P5 | backend | `backend/testing/test_api.py` | 1,587 | 39 | moderate (1500–2999 LOC) | 26.354s measured | — |
+| 111 | P5 | backend | `backend/testing/test_warm_pool_dispatch.py` | 1,961 | 40 | moderate (1500–2999 LOC) | 24.592s measured | — |
+| 112 | P5 | backend | `backend/testing/test_generated_shell.py` | 2,722 | 111 | moderate (1500–2999 LOC) | 23.466s measured | — |
+| 113 | P5 | backend | `backend/testing/test_admin_routers__notifications.py` | 1,595 | 54 | moderate (1500–2999 LOC) | 23.459s measured | — |
+| 114 | P5 | backend | `backend/testing/test_review_merge_authority.py` | 1,540 | 18 | moderate (1500–2999 LOC) | 23.223s measured | — |
+| 115 | P5 | backend | `backend/testing/test_discovery_review.py` | 2,938 | 61 | moderate (1500–2999 LOC) | 21.216s measured | — |
+| 116 | P5 | backend | `backend/testing/test_admin_routers__strategic_directions.py` | 2,071 | 29 | moderate (1500–2999 LOC) | 20.878s measured | protected; declared floor 29 |
+| 117 | P5 | backend | `backend/testing/test_audit_finding_class_guards.py` | 2,068 | 35 | moderate (1500–2999 LOC) | 20.635s measured | — |
+| 118 | P5 | backend | `backend/testing/test_approved_pr_stranding.py` | 1,687 | 34 | moderate (1500–2999 LOC) | 20.351s measured | — |
+| 119 | P5 | backend | `backend/testing/test_release_commit_authorship.py` | 2,412 | 53 | moderate (1500–2999 LOC) | 18.205s measured | — |
+| 120 | P5 | backend | `backend/testing/test_deploy_health.py` | 2,237 | 81 | moderate (1500–2999 LOC) | 17.586s measured | — |
+| 121 | P5 | backend | `backend/testing/test_migration_apply_gate.py` | 2,900 | 86 | moderate (1500–2999 LOC) | 17.539s measured | — |
+| 122 | P5 | backend | `backend/testing/test_compute_park_wake.py` | 1,721 | 12 | moderate (1500–2999 LOC) | 17.022s measured | — |
+| 123 | P5 | backend | `backend/testing/test_strategic_spawning_scope_budget.py` | 2,578 | 41 | moderate (1500–2999 LOC) | 14.284s measured | — |
+| 124 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.test.tsx` | 2,818 | 78 | moderate (1500–2999 LOC) | 14.213s measured | protected; declared floor 78 |
+| 125 | P5 | agent | `agent/src/prompts/code-change-helpers.test.ts` | 1,900 | 90 | moderate (1500–2999 LOC) | 13.227s measured | — |
+| 126 | P5 | backend | `backend/testing/test_warm_pool.py` | 1,591 | 45 | moderate (1500–2999 LOC) | 13.002s measured | — |
+| 127 | P5 | backend | `backend/testing/test_workday_resident_invariants.py` | 1,646 | 38 | moderate (1500–2999 LOC) | 12.536s measured | protected; declared floor 38 |
+| 128 | P5 | backend | `backend/testing/test_lock_window.py` | 2,373 | 36 | moderate (1500–2999 LOC) | 11.653s measured | — |
+| 129 | P5 | backend | `backend/testing/test_task_locking.py` | 2,456 | 62 | moderate (1500–2999 LOC) | 11.250s measured | — |
+| 130 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.send.test.tsx` | 1,908 | 38 | moderate (1500–2999 LOC) | 11.185s measured | — |
+| 131 | P5 | backend | `backend/testing/test_service_credentials.py` | 1,500 | 30 | moderate (1500–2999 LOC) | 10.779s measured | — |
+| 132 | P5 | backend | `backend/testing/test_auto_remediation.py` | 2,857 | 62 | moderate (1500–2999 LOC) | 9.882s measured | — |
+| 133 | P5 | backend | `backend/testing/test_diagnostics.py` | 1,505 | 59 | moderate (1500–2999 LOC) | 9.673s measured | — |
+| 134 | P5 | backend | `backend/testing/test_strategic_spawning_type_selection.py` | 2,620 | 64 | moderate (1500–2999 LOC) | 9.580s measured | — |
+| 135 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.filters.test.tsx` | 1,701 | 55 | moderate (1500–2999 LOC) | 8.977s measured | — |
+| 136 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.interactions.test.tsx` | 1,846 | 52 | moderate (1500–2999 LOC) | 8.913s measured | — |
+| 137 | P5 | backend | `backend/testing/test_completion_debt.py` | 2,246 | 56 | moderate (1500–2999 LOC) | 8.440s measured | — |
+| 138 | P5 | backend | `backend/testing/test_cost_telemetry_reconciliation.py` | 1,694 | 42 | moderate (1500–2999 LOC) | 7.868s measured | — |
+| 139 | P5 | backend | `backend/testing/test_strategic_spawning_outcome_evaluation.py` | 2,605 | 48 | moderate (1500–2999 LOC) | 6.466s measured | — |
+| 140 | P5 | backend | `backend/testing/test_evergreen_backlog.py` | 1,539 | 50 | moderate (1500–2999 LOC) | 6.364s measured | — |
+| 141 | P5 | backend | `backend/testing/test_compute_gcp_startup.py` | 1,991 | 62 | moderate (1500–2999 LOC) | 5.984s measured | — |
+| 142 | P5 | backend | `backend/testing/test_warm_backlog_reuse.py` | 2,019 | 53 | moderate (1500–2999 LOC) | 5.982s measured | — |
+| 143 | P5 | backend | `backend/testing/test_payload_schemas.py` | 2,161 | 148 | moderate (1500–2999 LOC) | 5.802s measured | — |
+| 144 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.notifications.test.tsx` | 1,524 | 65 | moderate (1500–2999 LOC) | 5.501s measured | — |
+| 145 | P5 | agent | `agent/src/handlers/audits.test.ts` | 2,190 | 92 | moderate (1500–2999 LOC) | 5.229s measured | — |
+| 146 | P5 | admin-ui | `admin-ui/src/components/DashboardHome.test.tsx` | 2,682 | 80 | moderate (1500–2999 LOC) | 5.207s measured | — |
+| 147 | P5 | backend | `backend/testing/test_build_config_commands.py` | 1,718 | 56 | moderate (1500–2999 LOC) | 5.114s measured | — |
+| 148 | P5 | backend | `backend/testing/test_failure_residual.py` | 1,518 | 59 | moderate (1500–2999 LOC) | 4.634s measured | — |
+| 149 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.advanced.test.tsx` | 1,932 | 32 | moderate (1500–2999 LOC) | 4.328s measured | protected; declared floor 32 |
+| 150 | P5 | backend | `backend/testing/test_operator_inbox_liveness.py` | 2,505 | 50 | moderate (1500–2999 LOC) | 3.890s measured | — |
+| 151 | P5 | admin-ui | `admin-ui/src/components/KnowledgeBrowser.test.tsx` | 1,689 | 46 | moderate (1500–2999 LOC) | 3.815s measured | — |
+| 152 | P5 | admin-ui | `admin-ui/src/components/SrTrendBreakdown.test.tsx` | 2,335 | 149 | moderate (1500–2999 LOC) | 3.713s measured | — |
+| 153 | P5 | backend | `backend/testing/test_lane_baseline_snapshot.py` | 1,520 | 45 | moderate (1500–2999 LOC) | 3.637s measured | — |
+| 154 | P5 | backend | `backend/testing/test_discovery_review_packet_budget.py` | 1,624 | 25 | moderate (1500–2999 LOC) | 3.599s measured | — |
+| 155 | P5 | admin-ui | `admin-ui/src/components/StrategicContextRail.test.tsx` | 2,550 | 60 | moderate (1500–2999 LOC) | 3.312s measured | protected; declared floor 60 |
+| 156 | P5 | backend | `backend/testing/test_strategic_spawning_version_phase.py` | 2,800 | 42 | moderate (1500–2999 LOC) | 3.265s measured | — |
+| 157 | P5 | admin-ui | `admin-ui/src/components/WarmVmPanel.test.tsx` | 1,769 | 67 | moderate (1500–2999 LOC) | 3.029s measured | — |
+| 158 | P5 | agent | `agent/src/handlers/strategic.test.ts` | 2,923 | 89 | moderate (1500–2999 LOC) | 3.023s measured | — |
+| 159 | P5 | admin-ui | `admin-ui/src/components/FleetRunnersPanel.test.tsx` | 2,942 | 94 | moderate (1500–2999 LOC) | 2.946s measured | — |
+| 160 | P5 | admin-ui | `admin-ui/src/components/TaskDetailDrawerMeta.test.tsx` | 2,200 | 109 | moderate (1500–2999 LOC) | 2.512s measured | — |
+| 161 | P5 | agent | `agent/src/index.llm-runner.test.ts` | 1,969 | 95 | moderate (1500–2999 LOC) | 2.156s measured | — |
+| 162 | P5 | backend | `backend/testing/test_test_durations_freshness.py` | 1,669 | 45 | moderate (1500–2999 LOC) | 2.129s measured | — |
+| 163 | P5 | backend | `backend/testing/test_orchestrator_liveness.py` | 2,379 | 69 | moderate (1500–2999 LOC) | 1.893s measured | — |
+| 164 | P5 | agent | `agent/src/index.provider-runner.test.ts` | 1,880 | 134 | moderate (1500–2999 LOC) | 1.864s measured | protected; declared floor 134 |
+| 165 | P5 | backend | `backend/testing/test_fleet_utilization.py` | 1,527 | 42 | moderate (1500–2999 LOC) | 1.586s measured | — |
+| 166 | P5 | backend | `backend/testing/test_empty_repo_onboarding.py` | 1,837 | 51 | moderate (1500–2999 LOC) | 1.565s measured | — |
+| 167 | P5 | agent | `agent/src/index.pool-mode.test.ts` | 2,602 | 73 | moderate (1500–2999 LOC) | 1.499s measured | — |
+| 168 | P5 | admin-ui | `admin-ui/src/hooks/useWorkbenchCommands.test.tsx` | 2,238 | 58 | moderate (1500–2999 LOC) | 1.277s measured | — |
+| 169 | P5 | backend | `backend/testing/test_review_loop_convergence.py` | 2,684 | 52 | moderate (1500–2999 LOC) | 1.084s measured | — |
+| 170 | P5 | backend | `backend/testing/test_warm_vm_integration.py` | 2,999 | 28 | moderate (1500–2999 LOC) | 0.992s measured | — |
+| 171 | P5 | admin-ui | `admin-ui/src/hooks/useTaskModal.test.ts` | 1,698 | 79 | moderate (1500–2999 LOC) | 0.848s measured | — |
+| 172 | P5 | backend | `backend/testing/test_migration_chain.py` | 1,697 | 80 | moderate (1500–2999 LOC) | 0.714s measured | — |
+| 173 | P5 | backend | `backend/testing/test_size_offender_governance.py` | 2,953 | 87 | moderate (1500–2999 LOC) | 0.565s measured | — |
+| 174 | P5 | backend | `backend/testing/test_dependency_contracts.py` | 1,804 | 44 | moderate (1500–2999 LOC) | 0.551s measured | — |
+| 175 | P5 | backend | `backend/testing/test_ci_resolution.py` | 2,942 | 165 | moderate (1500–2999 LOC) | 0.331s measured | — |
+| 176 | P5 | backend | `backend/testing/test_finding_deduplication.py` | 2,485 | 131 | moderate (1500–2999 LOC) | 0.286s measured | — |
+| 177 | P5 | backend | `backend/testing/test_migration_divergence.py` | 2,302 | 76 | moderate (1500–2999 LOC) | 0.275s measured | — |
+| 178 | P5 | backend | `backend/testing/test_ci_compliance.py` | 1,617 | 37 | moderate (1500–2999 LOC) | 0.253s measured | — |
+| 179 | P5 | backend | `backend/testing/test_health_zone_pool.py` | 2,149 | 118 | moderate (1500–2999 LOC) | 0.236s measured | — |
+| 180 | P5 | admin-ui | `admin-ui/src/hooks/useLogViewer.test.ts` | 1,593 | 48 | moderate (1500–2999 LOC) | 0.217s measured | — |
+| 181 | P5 | backend | `backend/testing/test_size_limits_checker.py` | 2,537 | 102 | moderate (1500–2999 LOC) | 0.162s measured | — |
+| 182 | P5 | agent | `agent/src/handlers/specialized.test.ts` | 2,570 | 146 | moderate (1500–2999 LOC) | 0.143s measured | — |
+| 183 | P5 | agent | `agent/src/index.test.ts` | 1,885 | 201 | moderate (1500–2999 LOC) | 0.117s measured | — |
+| 184 | P5 | backend | `backend/testing/test_llm_runtime.py` | 1,885 | 47 | moderate (1500–2999 LOC) | 0.100s measured | — |
+| 185 | P5 | agent | `agent/src/index.utilities.test.ts` | 1,556 | 131 | moderate (1500–2999 LOC) | 0.091s measured | — |
+| 186 | P5 | backend | `backend/testing/test_max_plan_pool_usage.py` | 2,499 | 96 | moderate (1500–2999 LOC) | 0.087s measured | — |
+| 187 | P5 | agent | `agent/src/handlers/strategic-sections.test.ts` | 2,963 | 198 | moderate (1500–2999 LOC) | 0.085s measured | — |
+| 188 | P5 | backend | `backend/testing/test_impacted_tests.py` | 1,576 | 62 | moderate (1500–2999 LOC) | 0.082s measured | — |
+| 189 | P5 | agent | `agent/src/workspacePrep.test.ts` | 1,887 | 74 | moderate (1500–2999 LOC) | 0.063s measured | protected; declared floor 74 |
+| 190 | P5 | admin-ui | `admin-ui/src/components/MessagesPanel.utils.test.ts` | 1,622 | 168 | moderate (1500–2999 LOC) | 0.063s measured | — |
+| 191 | P5 | agent | `agent/src/prompt.project-context.test.ts` | 2,116 | 158 | moderate (1500–2999 LOC) | 0.062s measured | — |
+| 192 | P5 | agent | `agent/src/prompt.test.ts` | 2,513 | 178 | moderate (1500–2999 LOC) | 0.048s measured | — |
+| 193 | P5 | backend | `backend/testing/test_artifact_refs.py` | 1,546 | 29 | moderate (1500–2999 LOC) | 0.036s measured | — |
+| 194 | P5 | agent | `agent/src/prompts/thinker.test.ts` | 1,904 | 101 | moderate (1500–2999 LOC) | 0.032s measured | — |
+| 195 | P5 | agent | `agent/src/prompt.format.test.ts` | 1,512 | 102 | moderate (1500–2999 LOC) | 0.029s measured | — |
+| 196 | P5 | agent | `agent/src/prompts/pr-helper.test.ts` | 2,353 | 41 | moderate (1500–2999 LOC) | 0.025s measured | — |
+| 197 | G | backend | `backend/testing/test_scripts_test_lane.py` | 389 | 3 | under 1500 LOC | 208.064s measured | — |
+| 198 | G | backend | `backend/testing/test_task_outcomes.py` | 1,375 | 108 | under 1500 LOC | 187.368s measured | — |
+| 199 | G | backend | `backend/testing/test_task_evaluators.py` | 1,172 | 79 | under 1500 LOC | 153.388s measured | — |
+| 200 | G | backend | `backend/testing/test_qualification_triggers.py` | 1,059 | 80 | under 1500 LOC | 143.296s measured | — |
+| 201 | G | backend | `backend/testing/test_rate_limit_detection.py` | 995 | 68 | under 1500 LOC | 130.206s measured | — |
+| 202 | G | backend | `backend/testing/test_task_constructor_authority_manifest.py` | 370 | 6 | under 1500 LOC | 118.662s measured | — |
+| 203 | G | backend | `backend/testing/test_provider_settings_bag.py` | 945 | 53 | under 1500 LOC | 114.172s measured | — |
+| 204 | G | backend | `backend/testing/test_research_context_eviction.py` | 1,013 | 64 | under 1500 LOC | 108.568s measured | — |
+| 205 | G | backend | `backend/testing/test_failure_layer_classifier.py` | 542 | 72 | under 1500 LOC | 100.534s measured | — |
+| 206 | G | backend | `backend/testing/test_providers.py` | 1,256 | 80 | under 1500 LOC | 98.906s measured | — |
+| 207 | G | backend | `backend/testing/test_migration_0724_name_reuse_after_revocation.py` | 287 | 6 | under 1500 LOC | 90.314s measured | — |
+| 208 | G | backend | `backend/testing/test_migration_0681_0694_preservation.py` | 1,093 | 3 | under 1500 LOC | 86.621s measured | — |
+| 209 | G | backend | `backend/testing/test_rollup_orphan_prs.py` | 350 | 32 | under 1500 LOC | 79.804s measured | — |
+| 210 | G | backend | `backend/testing/test_project_resource_envelope.py` | 883 | 65 | under 1500 LOC | 77.566s measured | — |
+| 211 | G | backend | `backend/testing/test_rollup_state.py` | 209 | 24 | under 1500 LOC | 62.286s measured | — |
+| 212 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 1,051 | 19 | under 1500 LOC | 57.849s measured | — |
+| 213 | G | agent | `agent/src/prompts/terminal-checkpoint-helpers.test.ts` | 435 | 12 | under 1500 LOC | 52.983s measured | — |
+| 214 | G | backend | `backend/testing/test_scope_complexity.py` | 380 | 32 | under 1500 LOC | 52.778s measured | — |
+| 215 | G | backend | `backend/testing/test_migration_0640_0682_workday_chain.py` | 334 | 1 | under 1500 LOC | 50.136s measured | — |
+| 216 | G | backend | `backend/testing/test_local_runner_viewable_selection.py` | 1,039 | 43 | under 1500 LOC | 47.838s measured | — |
+| 217 | G | backend | `backend/testing/test_review_policy_parity.py` | 372 | 22 | under 1500 LOC | 47.704s measured | — |
+| 218 | G | backend | `backend/testing/test_playbook_storage.py` | 723 | 24 | under 1500 LOC | 46.644s measured | — |
+| 219 | G | backend | `backend/testing/test_release_audit_contract.py` | 785 | 22 | under 1500 LOC | 45.066s measured | — |
+| 220 | G | backend | `backend/testing/test_qualification_dimensions.py` | 180 | 12 | under 1500 LOC | 36.808s measured | — |
+| 221 | G | backend | `backend/testing/test_runner_progress_protocol.py` | 467 | 19 | under 1500 LOC | 35.190s measured | — |
+| 222 | G | backend | `backend/testing/test_strategic_trigger.py` | 809 | 52 | under 1500 LOC | 33.716s measured | — |
+| 223 | G | backend | `backend/testing/test_migration_0722_discovery_controller.py` | 147 | 1 | under 1500 LOC | 32.526s measured | — |
 | 224 | G | backend | `backend/testing/test_release_readiness.py` | 1,345 | 48 | under 1500 LOC | 31.104s measured | — |
 | 225 | G | backend | `backend/testing/test_admin_routers__problem_model.py` | 1,230 | 39 | under 1500 LOC | 31.084s measured | — |
 | 226 | G | backend | `backend/testing/test_durations_measurability.py` | 280 | 10 | under 1500 LOC | 30.756s measured | — |
