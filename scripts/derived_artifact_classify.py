@@ -475,20 +475,27 @@ DECISION_BEARING: dict[str, str] = {
         "the repair is a hand edit by design. Nothing here is the index has not "
         "caught up; both directions are a contract change."
     ),
-}
-
-
-NOT_DIRECTIONAL: dict[str, str] = {
     "backend/testing/test_conversational_workday_protection.py": (
-        "The rot/addition axis does not apply. The per-file test_count entries in "
-        "conversational_workday_manifest.json are FLOORS, not an index: "
-        "recorded > live is EROSION (tests were deleted from a protected "
-        "surface, always a defect), and recorded < live never fails at all "
-        "because a floor that is exceeded is satisfied. There is no addition "
-        "failure to tell apart from rot, so reporting a direction here would be "
-        "an invented heuristic rather than a measurement."
+        "The per-file test_count entries in conversational_workday_manifest.json "
+        "are EXACT pins, not floors -- `_find_test_count_mismatches` reports "
+        "`declared_exact=` and `test_new_floor_slack_relative_to_integration_"
+        "branch_fails` exists precisely to prove that declaring LESS than the "
+        "tree has still fails. Direction is computable, but it does not change "
+        "the disposition: recorded > live is EROSION (coverage was deleted from "
+        "a protected surface, always a defect), and recorded < live is coverage "
+        "that was ADDED and not yet ratified. Both block, and both are repaired "
+        "by a human editing the manifest deliberately -- upward to ratify the "
+        "new tests, never downward to match a deletion."
     ),
 }
+
+
+# Sentinels whose artifact has no rot/addition axis at all -- where "the tree
+# grew a thing the artifact does not record" is not a state the artifact can
+# be in. Empty is a legitimate state for this registry, not a sign it is dead:
+# a sentinel belongs here only when the direction is genuinely UNCOMPUTABLE,
+# not merely when both directions happen to block (that is DECISION_BEARING).
+NOT_DIRECTIONAL: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -635,15 +642,21 @@ def format_report(results: list[Classification]) -> str:
 
 def format_unclassified() -> str:
     """The honest half of the report: what this tool refuses to classify."""
-    lines = [
-        f"{_PREFIX} not classified (direction is computable but does not change "
-        "the disposition -- an addition here IS the reviewable event):"
-    ]
-    for sentinel, why in sorted(DECISION_BEARING.items()):
-        lines.append(f"{_PREFIX}   {sentinel}: {why}")
-    lines.append(f"{_PREFIX} not classified (the rot/addition axis does not apply):")
-    for sentinel, why in sorted(NOT_DIRECTIONAL.items()):
-        lines.append(f"{_PREFIX}   {sentinel}: {why}")
+    lines: list[str] = []
+    if DECISION_BEARING:
+        lines.append(
+            f"{_PREFIX} not classified (direction is computable but does not "
+            "change the disposition -- an addition here IS the reviewable "
+            "event):"
+        )
+        for sentinel, why in sorted(DECISION_BEARING.items()):
+            lines.append(f"{_PREFIX}   {sentinel}: {why}")
+    if NOT_DIRECTIONAL:
+        lines.append(
+            f"{_PREFIX} not classified (the rot/addition axis does not apply):"
+        )
+        for sentinel, why in sorted(NOT_DIRECTIONAL.items()):
+            lines.append(f"{_PREFIX}   {sentinel}: {why}")
     return "\n".join(lines)
 
 

@@ -403,3 +403,46 @@ def test_the_unclassified_explanation_names_every_unclassified_sentinel() -> Non
 
     for sentinel in (*DECISION_BEARING, *NOT_DIRECTIONAL):
         assert sentinel in text
+
+
+def test_workday_protection_rationale_matches_the_guard_it_describes() -> None:
+    """The 'both directions block' claim stays tied to the guard's own proof.
+
+    This entry used to sit in ``NOT_DIRECTIONAL`` describing the manifest's
+    ``test_count`` values as FLOORS, with the explicit claim that "recorded <
+    live never fails at all because a floor that is exceeded is satisfied".
+    That was false. The guard reports ``declared_exact=`` and owns a dedicated
+    test proving a declaration BELOW the tree fails -- which is exactly the red
+    a PR that ADDS tests to a protected file gets. An agent reading the old
+    text when guard-data goes red concludes its own addition cannot be the
+    cause and spends a review cycle hunting elsewhere.
+
+    So the rationale is pinned against the guard source, not against itself: if
+    someone ever makes the count a real floor by deleting the exactness test,
+    this fails and the text has to be rewritten with it.
+    """
+    sentinel = "backend/testing/test_conversational_workday_protection.py"
+
+    assert sentinel in DECISION_BEARING, (
+        "the direction IS computable here and both directions block; recording "
+        "it as non-directional told readers the opposite of what the guard does"
+    )
+    assert sentinel not in NOT_DIRECTIONAL
+
+    guard = (REPO_ROOT / sentinel).read_text(encoding="utf-8")
+    assert "declared_exact=" in guard, (
+        "the guard no longer reports an EXACT declaration; the rationale in "
+        "DECISION_BEARING claims it does and is now stale"
+    )
+    assert "def test_new_floor_slack_relative_to_integration_branch_fails" in guard, (
+        "the test proving that declaring FEWER tests than the tree has still "
+        "fails is gone; without it the count really would be a floor and this "
+        "rationale would be describing a guard that no longer exists"
+    )
+
+    why = DECISION_BEARING[sentinel]
+    assert "EXACT" in why
+    assert "never fails" not in why, (
+        "the rationale is back to claiming slack is satisfied, which the "
+        "guard's own test refutes"
+    )
