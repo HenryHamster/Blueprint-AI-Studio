@@ -148,7 +148,10 @@ def test_size_limit_policy_copy_carries_its_declared_first_party_imports(
         "imports; the closure helper and this guard are now vacuous"
     )
     missing = {name for name in declared if name not in copied}
-    assert not missing, f"declared but not copied into the fixture tree: {sorted(missing)}"
+    assert not missing, (
+        f"declared but not copied into the fixture tree: {sorted(missing)}\n"
+        + format_offender_marker(sorted(missing))
+    )
 
 
 def test_static_guard_base_unpack_uses_data_filter() -> None:

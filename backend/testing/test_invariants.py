@@ -15304,6 +15304,40 @@ def _standalone_failure_message(node: ast.AST) -> ast.AST | None:
     return None
 
 
+_NUMERIC_PRESENTATION_TYPES = frozenset("bcdeEfFgGnosxX%")
+
+
+def _numeric_format_spec(node: ast.FormattedValue) -> bool:
+    """Report whether an f-string slot formats its value as a NUMBER.
+
+    ``_collection_names_in_function`` treats ``a - b`` as a set difference,
+    which is right for ``declared - copied`` and wrong for
+    ``time.monotonic() - started``.  The interpolation site settles it without
+    a name heuristic: ``f"{waited:.1f}s"`` would raise ``TypeError`` on any
+    collection, so a slot carrying a numeric presentation type is proof the
+    value is a scalar and its diagnostic names no offenders to mark.
+
+    Deliberately narrow. Only a literal, fully-constant spec ending in a
+    numeric presentation type counts; a bare ``{name}``, a ``!r`` conversion,
+    an alignment-only spec, or a spec built at runtime all stay collections,
+    because none of them rules a collection out.
+    """
+
+    spec = node.format_spec
+    if spec is None:
+        return False
+    if not isinstance(spec, ast.JoinedStr):
+        return False
+    text = ""
+    for piece in spec.values:
+        if not isinstance(piece, ast.Constant) or not isinstance(piece.value, str):
+            # A nested slot means the spec itself is computed at runtime; it
+            # cannot be read as proof of anything here.
+            return False
+        text += piece.value
+    return bool(text) and text[-1] in _NUMERIC_PRESENTATION_TYPES
+
+
 def _rendered_collection_names(
     message: ast.AST,
     collection_names: set[str],
@@ -15345,7 +15379,10 @@ def _rendered_collection_names(
         parent = parents.get(id(child))
         while parent is not None:
             if isinstance(parent, ast.FormattedValue):
-                rendered.add(node.id)
+                # A numerically formatted slot proves the value is a scalar,
+                # so this rendering identifies no offender collection.
+                if not _numeric_format_spec(parent):
+                    rendered.add(node.id)
                 break
             if isinstance(parent, ast.Call):
                 if isinstance(parent.func, ast.Name):
@@ -15367,6 +15404,41 @@ def _rendered_collection_names(
         else:
             rendered.add(node.id)
     return rendered
+
+
+def test_numeric_format_spec_only_excuses_scalar_interpolations():
+    """The scalar discriminator must stay proof, never a blanket excuse.
+
+    ``_collection_names_in_function`` reads ``a - b`` as a set difference.
+    That is right for ``declared - copied`` and wrong for
+    ``time.monotonic() - started``, so a scalar timing assertion used to be
+    charged with failing to name offenders it does not have.
+
+    The interpolation site settles it, but only in one direction: a numeric
+    presentation type cannot format a collection, so it PROVES scalar. No
+    other spec proves anything, and every one of them has to keep counting as
+    a collection -- otherwise this discriminator becomes a way to silence the
+    guard by reformatting a diagnostic.
+    """
+
+    def slot(source: str) -> ast.FormattedValue:
+        return next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FormattedValue)
+        )
+
+    # Proof of a scalar: these raise TypeError on any collection.
+    assert _numeric_format_spec(slot('f"{waited:.1f}s"'))
+    assert _numeric_format_spec(slot('f"{count:d}"'))
+    assert _numeric_format_spec(slot('f"{ratio:.2%}"'))
+
+    # Proof of nothing: a collection renders fine through every one of these,
+    # so the offender-identity requirement still applies.
+    assert not _numeric_format_spec(slot('f"{offenders}"'))
+    assert not _numeric_format_spec(slot('f"{offenders!r}"'))
+    assert not _numeric_format_spec(slot('f"{offenders:>20}"'))
+    assert not _numeric_format_spec(slot('f"{offenders:{width}}"'))
 
 
 def test_standalone_corpus_set_guards_emit_offender_identity():

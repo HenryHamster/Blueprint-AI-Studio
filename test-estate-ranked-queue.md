@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 645 | 1,011,276 | 26,873 | 11,123.372s (643 files) | 2 |
+| backend | 645 | 1,011,348 | 26,874 | 11,123.372s (643 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 113,094 | 6,178 | 317.583s (129 files) | 0 |
@@ -30,7 +30,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 6 | P2 | backend | `backend/testing/test_reaper.py` | 21,369 | 495 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 495 |
 | 7 | P2 | backend | `backend/testing/test_research_completion.py` | 24,134 | 534 | critical (>5000 LOC) | 137.469s measured | — |
 | 8 | P2 | backend | `backend/testing/test_autonomous_research.py` | 20,226 | 393 | critical (>5000 LOC) | 125.162s measured | — |
-| 9 | P2 | backend | `backend/testing/test_invariants.py` | 15,751 | 278 | critical (>5000 LOC) | 120.389s measured | — |
+| 9 | P2 | backend | `backend/testing/test_invariants.py` | 15,823 | 279 | critical (>5000 LOC) | 120.389s measured | — |
 | 10 | P2 | backend | `backend/testing/test_local_runner.py` | 14,056 | 348 | critical (>5000 LOC) | 111.153s measured | — |
 | 11 | P2 | backend | `backend/testing/test_digest.py` | 11,003 | 231 | critical (>5000 LOC) | 86.555s measured | — |
 | 12 | P2 | backend | `backend/testing/test_directions.py` | 11,762 | 339 | critical (>5000 LOC) | 79.334s measured | — |

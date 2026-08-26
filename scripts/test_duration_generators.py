@@ -770,7 +770,10 @@ def test_store_backend_durations_keeps_the_measurement_when_the_merge_fails(
 
     assert result.returncode != 0, result.stdout
     retained = list(tmp_path.glob(".duration_refresh.*"))
-    assert len(retained) == 1, f"{retained}\n{result.stdout}\n{result.stderr}"
+    assert len(retained) == 1, (
+        f"{retained}\n{result.stdout}\n{result.stderr}\n"
+        + format_offender_marker(sorted(str(path) for path in retained))
+    )
     assert (retained[0] / "target" / "durations.json").is_file()
     assert retained[0].name in result.stderr, result.stderr
     assert "merge_durations.py" in result.stderr, result.stderr
