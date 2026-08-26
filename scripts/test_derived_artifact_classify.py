@@ -317,11 +317,17 @@ def test_the_ranked_queue_reports_both_directions_as_mechanical(
 
 
 # Two full walks of the real test estate (the generator's and the classifier's).
-# The standalone lane runs with --timeout=30, and an inner budget below the real
-# cost of a HEALTHY operation is a flake, not a guard: it fails with a timeout
-# instead of an assertion, which reads as an infrastructure fault and gets
-# retried rather than fixed. State the real budget where the cost is.
-@pytest.mark.timeout(240)
+# An inner budget below the real cost of a HEALTHY operation is a flake, not a
+# guard: it fails with a timeout instead of an assertion, which reads as an
+# infrastructure fault and gets retried rather than fixed. State the real budget
+# where the cost is.
+#
+# Whole file measured 20.1s. 120s is ~6x that, which covers a loaded 2-vCPU CI
+# runner reading this tree over a bind mount. It was 240s, a number picked to
+# clear the old 30s lane default rather than sized on anything; 240 forced the
+# scripts lane to grant this file 300s of budget it cannot use, and a budget
+# that advertises a cost the work never incurs hides a real regression.
+@pytest.mark.timeout(120)
 def test_ranked_queue_live_matches_the_generator() -> None:
     """The classifier's row set is the generator's, against the real tree.
 
