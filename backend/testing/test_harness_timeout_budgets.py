@@ -42,6 +42,8 @@ Runs under --noconftest (no DB, no conftest fixtures).
 import ast
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -669,3 +671,381 @@ def test_the_scripts_lane_marker_extractor_is_not_vacuous() -> None:
     assert _max_timeout_marker(module_shape) == ("pytestmark", 45.0)
 
     assert _max_timeout_marker(ast.parse("def test_x():\n    pass\n")) is None
+
+
+# ---------------------------------------------------------------------------
+# SILENT DEATH: pytest exiting non-zero without finishing its session
+# ---------------------------------------------------------------------------
+#
+# A sibling class to the budget inversion above, and the one this module was
+# extended for. A budget inversion at least NAMES its victim
+# ("Failed: Timeout (>30.0s)"). A pytest process ended by os._exit(), abort(),
+# a segfault or the OOM killer names nothing at all: it never reaches
+# pytest_sessionfinish, so there is no "short test summary info", no FAILED
+# line, and no closing "=== N passed in Xs ===" banner -- just a progress row
+# that stops mid-character and a non-zero status.
+#
+# `Impacted backend tests` went red exactly this way three times on PR #18011
+# (runs 32998752057 / 33000772113 / 33002910941). One of those runs had ZERO
+# failing tests and still exited 1. The root cause -- the orchestrator hard
+# watchdog daemon thread the app lifespan armed and never disarmed, calling
+# os._exit(1) ~240s after the last heartbeat -- is fixed in
+# app/lifecycle.py::_disarm_orchestrator_hard_watchdog. But the DIAGNOSABILITY
+# hole is separate and outlives that one bug: any future in-process abort,
+# fatal signal or OOM-kill produces the same unreadable red.
+#
+# scripts/test-backend.sh::_run_pytest closes it by naming the class when the
+# shape appears. These tests hold that helper to its two contracts:
+#
+#   1. EXIT-CODE FIDELITY. It pipes pytest through `tee`, and `cmd | tee f`
+#      yields *tee's* status. This repo has already been burned by that exact
+#      masking (`test-backend.sh ... | tail` reporting success while tests
+#      failed), so the ${PIPESTATUS[0]} read is load-bearing, not decoration.
+#   2. The banner fires on a truncated stream and STAYS QUIET otherwise. A
+#      diagnostic that cries wolf on every ordinary red is worse than none.
+
+
+def _harness_script() -> Path | None:
+    """Locate scripts/test-backend.sh, or None when it is not mounted.
+
+    Same trap as _scripts_dir(): in the containerised lanes _repo_root() falls
+    back to /app (the bind-mounted backend/), which holds no scripts/test-backend.sh.
+    Both Docker lanes also mount the real checkout read-only at /repo, so look
+    there before giving up.
+    """
+    for candidate in (
+        REPO_ROOT / "scripts" / "test-backend.sh",
+        Path("/repo") / "scripts" / "test-backend.sh",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+HARNESS_SCRIPT = _harness_script()
+
+_NO_HARNESS = pytest.mark.skipif(
+    HARNESS_SCRIPT is None,
+    reason="scripts/test-backend.sh is not mounted in this lane",
+)
+
+
+def _harness_text() -> str:
+    assert HARNESS_SCRIPT is not None
+    return HARNESS_SCRIPT.read_text(encoding="utf-8")
+
+
+def _extract_shell_function(text: str, name: str) -> str:
+    """Return the source of a top-level shell function, brace line included.
+
+    Top-level only, and deliberately so: the terminator is a "}" in column 0,
+    which is unambiguous in this file (every nested block and the heredoc body
+    is indented). A brace-counting parser would have to understand heredocs,
+    quoting and case-statement ";;" -- more machinery, more ways to be wrong.
+    """
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.startswith(name + "() {"):
+            start = index
+            break
+    assert start is not None, name + "() not found in scripts/test-backend.sh"
+    for index in range(start + 1, len(lines)):
+        if lines[index] == "}":
+            return "\n".join(lines[start : index + 1]) + "\n"
+    raise AssertionError(name + "() has no closing brace in column 0")
+
+
+def _bash_executable() -> str | None:
+    for candidate in (
+        Path("C:/Program Files/Git/bin/bash.exe"),
+        Path("C:/Program Files/Git/usr/bin/bash.exe"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("bash")
+
+
+BASH = _bash_executable()
+
+_NO_BASH = pytest.mark.skipif(
+    BASH is None, reason="no bash interpreter available to drive the harness helper"
+)
+
+
+def _drive_run_pytest(
+    tmp_path: Path,
+    *,
+    stub_body: str,
+    tail: str = "",
+    prelude: str = "set -euo pipefail",
+) -> "subprocess.CompletedProcess[str]":
+    """Run the REAL _run_pytest from test-backend.sh against a stubbed _run.
+
+    The helper is lifted verbatim out of the shipped harness rather than
+    re-typed here -- a copy would drift and the guard would then be testing
+    itself. ``_run`` is the only seam: stubbing it lets us hand _run_pytest any
+    (output, exit status) pair, including the pairs a real pytest can only
+    produce by being killed.
+
+    The default ``prelude`` matches the harness's own top-of-file settings
+    (test-backend.sh line 20), so the errexit save/restore inside _run_pytest is
+    exercised rather than bypassed. Callers override it to prove _run_pytest does
+    not silently depend on those settings being what they happen to be today.
+    """
+    script = tmp_path / "drive.sh"
+    script.write_text(
+        prelude
+        + "\n"
+        + _extract_shell_function(_harness_text(), "_run_pytest")
+        + "\n_run() {\n"
+        + stub_body
+        + "\n}\n"
+        # `if` is required: under errexit a bare non-zero call aborts the script
+        # before we could capture $?. It also proves the caller's errexit is
+        # intact on the way out.
+        + "if _run_pytest testing/test_example.py; then rc=0; else rc=$?; fi\n"
+        + 'echo "RC=$rc"\n'
+        + tail,
+        encoding="utf-8",
+    )
+    assert BASH is not None
+    return subprocess.run(
+        [BASH, str(script)],
+        capture_output=True,
+        text=True,
+        # Below MAX_INNER_OPERATION_SECONDS (30), as this module's own guard
+        # requires of a helper: a helper cannot know its callers' budget, so a
+        # pytest-timeout marker on it would do nothing. Every stub returns
+        # immediately, so 20s can only ever fire on a genuine hang.
+        timeout=20,
+        cwd=str(tmp_path),
+    )
+
+
+_BANNER = "HARNESS: pytest exited"
+
+# A run ended abruptly part-way through a file -- the exact shape job
+# 98289065075 produced on PR #18011: a progress row, no newline, no summary.
+_TRUNCATED = (
+    "printf '%s' 'testing/test_local_runner.py ....................'\n" "return 1"
+)
+
+
+@_NO_HARNESS
+@_NO_BASH
+class TestRunPytestSilentDeathDetector:
+    """scripts/test-backend.sh::_run_pytest -- exit fidelity and the banner."""
+
+    def test_exit_code_survives_the_tee_pipeline(self, tmp_path: Path) -> None:
+        """137 must not be laundered into 0 by tee under the harness's own settings.
+
+        ``tee`` succeeds whenever it can write its file. 137 is chosen because
+        it is what Docker surfaces for a SIGKILL/OOM-kill -- the very class this
+        helper exists to make legible -- and because it is unmistakably neither
+        0 nor 1.
+        """
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body="printf '%s' 'testing/test_x.py ......'\nreturn 137",
+        )
+        assert "RC=137" in proc.stdout, (
+            "_run_pytest laundered the child's exit status. "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+    def test_exit_code_survives_without_the_caller_s_pipefail(
+        self, tmp_path: Path
+    ) -> None:
+        """THE fidelity check. The test above passes for the WRONG REASON.
+
+        Found by mutation-proving this guard: replacing ${PIPESTATUS[0]} with
+        ``$?`` did NOT turn the test above red. With ``set -o pipefail`` in
+        effect -- which test-backend.sh happens to set on line 20, and which
+        ``set +e`` does NOT clear -- ``$?`` after a pipeline already reports the
+        rightmost non-zero status, so the two spellings agree by coincidence.
+
+        That coincidence is the hazard. It makes _run_pytest's correctness
+        depend on a shell option set hundreds of lines away, and it makes the
+        obvious "simplification" to ``$?`` look safe under test. Drop pipefail --
+        as a refactor, a sourcing context or a ``bash -c`` wrapper might --
+        and ``$?`` becomes tee's status, which is 0 whenever tee could write its
+        file. A killed pytest would then report SUCCESS: the silent-GREEN twin
+        of the silent red this helper exists to fix, and the same masking that
+        has already burned this repo once (``test-backend.sh ... | tail``).
+
+        So pin the property that actually matters: _run_pytest reports pytest's
+        own status regardless of the caller's shell options.
+        """
+        proc = _drive_run_pytest(
+            tmp_path,
+            # No pipefail. Everything else as the harness has it.
+            prelude="set -eu",
+            stub_body="printf '%s' 'testing/test_x.py ......'\nreturn 137",
+        )
+        assert "RC=137" in proc.stdout, (
+            "_run_pytest reported tee's exit status instead of pytest's once the "
+            "caller's pipefail was gone -- a killed pytest would read as a pass. "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+    def test_ordinary_nonzero_exit_is_also_reported_faithfully(
+        self, tmp_path: Path
+    ) -> None:
+        """A normal test failure still returns pytest's own 1."""
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=(
+                "echo 'testing/test_x.py ..F..'\n"
+                "echo '=== short test summary info ==='\n"
+                "echo '=== 1 failed, 4 passed in 3.21s ==='\n"
+                "return 1"
+            ),
+        )
+        assert "RC=1" in proc.stdout
+
+    def test_success_is_reported_faithfully(self, tmp_path: Path) -> None:
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=(
+                "echo 'testing/test_x.py .....'\n"
+                "echo '=== 5 passed in 3.21s ==='\n"
+                "return 0"
+            ),
+        )
+        assert "RC=0" in proc.stdout
+
+    def test_truncated_stream_gets_the_banner(self, tmp_path: Path) -> None:
+        """The whole point: name the class instead of leaving a bare red."""
+        proc = _drive_run_pytest(tmp_path, stub_body=_TRUNCATED)
+        assert "RC=1" in proc.stdout
+        assert _BANNER in proc.stderr, (
+            "a pytest that exited non-zero WITHOUT a session summary produced "
+            "no diagnostic -- this is the undiagnosable red of PR #18011. "
+            f"stderr={proc.stderr!r}"
+        )
+
+    def test_banner_names_the_known_in_process_abort(self, tmp_path: Path) -> None:
+        """A banner that only says 'something went wrong' is not a diagnosis.
+
+        The first thing worth checking is a leaked watchdog/supervisor thread,
+        so the banner has to name that call site and the grep that confirms it.
+        """
+        proc = _drive_run_pytest(tmp_path, stub_body=_TRUNCATED)
+        assert "_default_hard_abort" in proc.stderr
+        assert "HARD-WATCHDOG" in proc.stderr
+        assert "--capture=no" in proc.stderr, (
+            "the banner must say how to recover the diagnostics pytest's fd "
+            "capture swallowed, or the next engineer re-runs just as blind"
+        )
+
+    def test_banner_stays_quiet_on_a_finished_failing_session(
+        self, tmp_path: Path
+    ) -> None:
+        """No crying wolf. Ordinary reds must stay unadorned."""
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=(
+                "echo 'testing/test_x.py ..F..'\n"
+                "echo '=== short test summary info ==='\n"
+                "echo 'FAILED testing/test_x.py::test_thing - assert 1 == 2'\n"
+                "echo '=== 1 failed, 4 passed in 3.21s ==='\n"
+                "return 1"
+            ),
+        )
+        assert "RC=1" in proc.stdout
+        assert (
+            _BANNER not in proc.stderr
+        ), f"banner fired on an ordinary reported failure: {proc.stderr!r}"
+
+    def test_banner_stays_quiet_when_no_tests_ran(self, tmp_path: Path) -> None:
+        """Exit 5 with an empty selection is a finished session, not a kill.
+
+        This is the case a naive "did anything FAIL?" detector gets wrong: there
+        is no FAILED line and no F, yet pytest concluded normally and said so.
+        """
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=("echo '=== no tests ran in 0.04s ==='\n" "return 5"),
+        )
+        assert "RC=5" in proc.stdout
+        assert (
+            _BANNER not in proc.stderr
+        ), f"banner fired on an empty-but-complete session: {proc.stderr!r}"
+
+    def test_banner_stays_quiet_on_success(self, tmp_path: Path) -> None:
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=("echo '=== 5 passed in 3.21s ==='\n" "return 0"),
+        )
+        assert _BANNER not in proc.stderr
+
+    def test_caller_errexit_is_restored_after_a_failure(self, tmp_path: Path) -> None:
+        """_run_pytest disables errexit around its pipeline. It must put it back.
+
+        If it did not, every command after the first pytest invocation in
+        test-backend.sh would stop aborting on failure and the harness would run
+        on past a broken step to a green-looking end -- a silent GREEN, which is
+        strictly worse than the silent red this helper was added to fix.
+        """
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=_TRUNCATED,
+            tail="false\necho 'ERREXIT_LOST'\n",
+        )
+        assert (
+            "ERREXIT_LOST" not in proc.stdout
+        ), "errexit was not restored: the script ran on past a failing command"
+        assert proc.returncode != 0
+
+
+@_NO_HARNESS
+class TestRunPytestWiring:
+    """Static wiring checks -- these run even in a lane without bash.
+
+    A perfect _run_pytest that nothing calls detects nothing, so the helper's
+    behaviour and its adoption are separate assertions.
+    """
+
+    def test_no_pytest_invocation_bypasses_the_helper(self) -> None:
+        text = _harness_text()
+        raw = [
+            line
+            for line in text.splitlines()
+            if re.search(r"\b_run\s+python3\s+-m\s+pytest\b", line)
+        ]
+        body = _extract_shell_function(text, "_run_pytest").splitlines()
+        bypassing = [line for line in raw if line not in body]
+        assert len(raw) == 1 and not bypassing, (
+            "every pytest invocation in test-backend.sh must go through "
+            "_run_pytest, or that lane keeps producing undiagnosable reds. "
+            f"Bypassing lines: {bypassing}"
+        )
+
+    def test_helper_is_actually_adopted(self) -> None:
+        calls = [
+            line
+            for line in _harness_text().splitlines()
+            if re.match(r"\s*_run_pytest\s", line)
+        ]
+        assert len(calls) >= 5, (
+            "expected _run_pytest at every pytest call site in test-backend.sh "
+            f"(standalone, verification, targeted, corpus, full); found {calls}"
+        )
+
+    def test_pipestatus_is_read_on_the_line_after_the_pipeline(self) -> None:
+        """PIPESTATUS is reset by ANY intervening command, `|| true` included.
+
+        Reading it one line later is the only correct placement, and it is
+        exactly the line a well-meaning refactor "tidies" into ``$?``. Pin the
+        adjacency, not merely the presence of the word.
+        """
+        lines = _extract_shell_function(_harness_text(), "_run_pytest").splitlines()
+        piped = [i for i, line in enumerate(lines) if "| tee " in line]
+        assert len(piped) == 1, f"expected exactly one tee pipeline, found {piped}"
+        following = lines[piped[0] + 1].strip()
+        assert following == "status=${PIPESTATUS[0]}", (
+            "the pipeline's exit status must be captured from PIPESTATUS on the "
+            f"immediately following line; found {following!r}. `$?` there would "
+            "report tee, which succeeds even when pytest is killed."
+        )

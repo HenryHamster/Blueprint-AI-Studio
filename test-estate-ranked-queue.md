@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 645 | 1,010,738 | 26,858 | 11,123.372s (643 files) | 2 |
+| backend | 645 | 1,011,801 | 26,884 | 11,123.372s (643 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 113,094 | 6,178 | 317.583s (129 files) | 0 |
@@ -27,7 +27,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 3 | P2 | backend | `backend/testing/test_pipeline.py` | 6,841 | 277 | critical (>5000 LOC) | 318.896s measured | — |
 | 4 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,894 | 437 | critical (>5000 LOC) | 300.644s measured | — |
 | 5 | P2 | backend | `backend/testing/test_task_lifecycle.py` | 13,145 | 323 | critical (>5000 LOC) | 207.992s measured | — |
-| 6 | P2 | backend | `backend/testing/test_reaper.py` | 21,369 | 495 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 495 |
+| 6 | P2 | backend | `backend/testing/test_reaper.py` | 21,674 | 499 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 499 |
 | 7 | P2 | backend | `backend/testing/test_research_completion.py` | 24,134 | 534 | critical (>5000 LOC) | 137.469s measured | — |
 | 8 | P2 | backend | `backend/testing/test_autonomous_research.py` | 20,226 | 393 | critical (>5000 LOC) | 125.162s measured | — |
 | 9 | P2 | backend | `backend/testing/test_invariants.py` | 15,751 | 278 | critical (>5000 LOC) | 120.389s measured | — |
@@ -182,7 +182,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 158 | P5 | admin-ui | `admin-ui/src/components/TaskDetailDrawerMeta.test.tsx` | 2,200 | 109 | moderate (1500–2999 LOC) | 2.512s measured | — |
 | 159 | P5 | agent | `agent/src/index.llm-runner.test.ts` | 1,969 | 95 | moderate (1500–2999 LOC) | 2.156s measured | — |
 | 160 | P5 | backend | `backend/testing/test_test_durations_freshness.py` | 1,669 | 45 | moderate (1500–2999 LOC) | 2.129s measured | — |
-| 161 | P5 | backend | `backend/testing/test_orchestrator_liveness.py` | 2,060 | 64 | moderate (1500–2999 LOC) | 1.893s measured | — |
+| 161 | P5 | backend | `backend/testing/test_orchestrator_liveness.py` | 2,218 | 66 | moderate (1500–2999 LOC) | 1.893s measured | — |
 | 162 | P5 | agent | `agent/src/index.provider-runner.test.ts` | 1,880 | 134 | moderate (1500–2999 LOC) | 1.864s measured | protected; declared floor 134 |
 | 163 | P5 | backend | `backend/testing/test_fleet_utilization.py` | 1,527 | 42 | moderate (1500–2999 LOC) | 1.586s measured | — |
 | 164 | P5 | backend | `backend/testing/test_empty_repo_onboarding.py` | 1,837 | 51 | moderate (1500–2999 LOC) | 1.565s measured | — |
@@ -231,7 +231,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 207 | G | backend | `backend/testing/test_rollup_orphan_prs.py` | 350 | 32 | under 1500 LOC | 79.804s measured | — |
 | 208 | G | backend | `backend/testing/test_project_resource_envelope.py` | 883 | 65 | under 1500 LOC | 77.566s measured | — |
 | 209 | G | backend | `backend/testing/test_rollup_state.py` | 209 | 24 | under 1500 LOC | 62.286s measured | — |
-| 210 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 671 | 6 | under 1500 LOC | 57.849s measured | — |
+| 210 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 1,051 | 19 | under 1500 LOC | 57.849s measured | — |
 | 211 | G | agent | `agent/src/prompts/terminal-checkpoint-helpers.test.ts` | 435 | 12 | under 1500 LOC | 52.983s measured | — |
 | 212 | G | backend | `backend/testing/test_scope_complexity.py` | 380 | 32 | under 1500 LOC | 52.778s measured | — |
 | 213 | G | backend | `backend/testing/test_migration_0640_0682_workday_chain.py` | 334 | 1 | under 1500 LOC | 50.136s measured | — |
@@ -332,7 +332,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 308 | G | backend | `backend/testing/test_strategic_workday_handoff_recovery.py` | 307 | 4 | under 1500 LOC | 7.967s measured | protected; declared floor 4 |
 | 309 | G | backend | `backend/testing/test_strategic_consultation_detail.py` | 654 | 15 | under 1500 LOC | 7.942s measured | — |
 | 310 | G | backend | `backend/testing/test_migration_0608_projectmessage_foundation.py` | 717 | 10 | under 1500 LOC | 7.721s measured | — |
-| 311 | G | backend | `backend/testing/test_strategic_cycle_gating.py` | 578 | 12 | under 1500 LOC | 7.701s measured | — |
+| 311 | G | backend | `backend/testing/test_strategic_cycle_gating.py` | 798 | 19 | under 1500 LOC | 7.701s measured | — |
 | 312 | G | backend | `backend/testing/test_playbook_lifecycle.py` | 388 | 11 | under 1500 LOC | 7.700s measured | — |
 | 313 | G | backend | `backend/testing/test_check_gate_fail_closed.py` | 1,497 | 35 | under 1500 LOC | 7.637s measured | — |
 | 314 | G | backend | `backend/testing/test_github_onboarding_access.py` | 596 | 15 | under 1500 LOC | 7.441s measured | — |
