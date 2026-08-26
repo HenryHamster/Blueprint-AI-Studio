@@ -698,8 +698,9 @@ def test_durations_no_stale_entries() -> None:
 
     Parametrized variants (e.g. "test_foo[param1]") are checked by stripping
     the "[...]" suffix and verifying the base function/method exists.
-    Files that no longer exist on disk are ignored here (the coverage-fraction
-    test flags those separately).
+    Entries whose FILE is gone entirely are out of scope here by construction
+    (``_stale_entries`` skips them) and are guarded by
+    ``test_durations_no_orphaned_file_entries`` below.
     """
     data = _load_durations()
 
@@ -741,6 +742,108 @@ def test_durations_no_stale_entries() -> None:
         f"Fix: remove these entries from backend/.test_durations, or regenerate "
         f"via scripts/store-backend-durations.sh." + "\n" + format_offender_marker(str(offender) for offender in stale)
     )
+
+
+def _orphaned_file_entries(durations: dict, test_files: set[str]) -> set[str]:
+    """Entries whose test FILE is absent from the roster entirely.
+
+    The complement of ``_stale_entries``, which by construction can only see a
+    key whose file still exists: its ``file_key not in test_files: continue``
+    skips exactly this population.
+    """
+    return {
+        key
+        for key in durations
+        if "::" in key and key.split("::", 1)[0] not in test_files
+    }
+
+
+def test_durations_no_orphaned_file_entries() -> None:
+    """A duration entry for a test FILE that no longer exists is stale too.
+
+    This closes a hole, not a hypothetical. ``_stale_entries`` skips any key
+    whose file is missing from the roster, and ``test_durations_no_stale_entries``
+    used to hand that case off to "the coverage-fraction test" — but
+    ``test_durations_coverage_fraction_within_threshold`` computes only
+    ``live - recorded`` (which modules have no entry). Nothing computed
+    ``recorded - live`` at file granularity, so DELETING a backend test module
+    left every one of its rows behind and no guard in this repository failed.
+
+    Those rows are not harmless. ci.yml COPYs this artifact to
+    ``/app/.test_durations`` and pytest-split's ``least_duration`` algorithm
+    sums it per shard, so phantom seconds for a file that no longer exists
+    permanently under-fill whichever shard inherits them.
+
+    Attribution matches the sibling guards: drift already present on the
+    baseline warns rather than blocks, because rot someone else introduced must
+    not stop the fleet, and only what this candidate introduced hard-fails.
+    """
+    data = _load_durations()
+    current_files = _current_test_files()
+    if not current_files:
+        return  # No roster to compare against (a backend-only image with no /repo).
+
+    orphaned = _orphaned_file_entries(data, set(current_files))
+
+    baseline = _load_duration_baseline()
+    if baseline is not None:
+        baseline_orphaned = _orphaned_file_entries(
+            baseline.durations, set(baseline.test_files)
+        )
+        inherited = orphaned & baseline_orphaned
+        new_orphaned = orphaned - baseline_orphaned
+        _warn_inherited("orphaned file", inherited, baseline.ref)
+        assert not new_orphaned, (
+            f"backend/.test_durations introduced {len(new_orphaned)} entry(ies) "
+            f"for test file(s) that no longer exist, relative to {baseline.ref}. "
+            "These phantom seconds are summed by pytest-split and permanently "
+            "under-fill the shard that inherits them.\n"
+            f"New orphaned entries: {sorted(new_orphaned)[:10]}\n"
+            "Fix: `python scripts/prune_stale_durations.py --write`. This is ROT, "
+            "not a missing measurement — no timed run is needed."
+            + "\n"
+            + format_offender_marker(sorted(new_orphaned))
+        )
+        return
+
+    assert not orphaned, (
+        f"backend/.test_durations contains {len(orphaned)} entry(ies) for test "
+        "file(s) that no longer exist. These phantom seconds are summed by "
+        "pytest-split and permanently under-fill the shard that inherits them.\n"
+        f"Orphaned entries ({min(len(orphaned), 10)} of {len(orphaned)} shown): "
+        f"{sorted(orphaned)[:10]}\n"
+        "Fix: `python scripts/prune_stale_durations.py --write`. This is ROT, not "
+        "a missing measurement — no timed run is needed."
+        + "\n"
+        + format_offender_marker(sorted(orphaned))
+    )
+
+
+def test_orphaned_file_entries_are_the_complement_of_stale_entries() -> None:
+    """Planted rot of each shape lands in exactly one guard, never neither.
+
+    The hole this pins was invisible precisely because each guard's docstring
+    deferred the case to the other one. Assert the partition directly: a key
+    whose file is gone is seen ONLY by the orphan guard, a key whose file
+    exists but whose node id is gone ONLY by the node guard.
+    """
+    durations = {
+        "testing/test_present.py::test_alive": 1.0,
+        "testing/test_present.py::test_deleted_node": 1.0,
+        "testing/test_deleted_file.py::test_anything": 1.0,
+    }
+    on_disk = {"testing/test_present.py"}
+    ids_by_file = {"testing/test_present.py": {"test_alive"}}
+
+    node_rot = _stale_entries(durations, on_disk, ids_by_file)
+    file_rot = _orphaned_file_entries(durations, on_disk)
+
+    assert node_rot == {"testing/test_present.py::test_deleted_node"}
+    assert file_rot == {"testing/test_deleted_file.py::test_anything"}
+    assert not node_rot & file_rot
+    assert (node_rot | file_rot) == set(durations) - {
+        "testing/test_present.py::test_alive"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +1029,106 @@ def test_stale_guard_rejects_new_stale_entry(tmp_path: Path, monkeypatch) -> Non
 
     with pytest.raises(AssertionError, match="introduced 1 stale"):
         test_durations_no_stale_entries()
+
+
+def _orphan_fixture(tmp_path: Path, monkeypatch, *, baseline) -> None:
+    """Point the orphan guard at a tree with one row whose FILE is gone."""
+    module = sys.modules[__name__]
+    path = tmp_path / "test_current.py"
+    path.write_text("def test_current(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "_current_test_files",
+        lambda: {"testing/test_current.py": path},
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_durations",
+        lambda: {
+            "testing/test_current.py::test_current": 1.0,
+            "testing/test_deleted_module.py::test_gone": 4.0,
+        },
+    )
+    monkeypatch.setattr(module, "_load_duration_baseline", lambda: baseline)
+
+
+def test_orphan_guard_rejects_new_orphaned_entry(tmp_path: Path, monkeypatch) -> None:
+    """Genuine ROT still blocks: deleting a test module cannot go unnoticed.
+
+    This is the case that had NO guard at all before. ``_stale_entries`` skips
+    a key whose file is missing from the roster, and the coverage guard only
+    computes ``live - recorded``, so every row of a deleted module survived and
+    kept inflating whichever pytest-split shard inherited it.
+    """
+    _orphan_fixture(
+        tmp_path,
+        monkeypatch,
+        baseline=_DurationBaseline(
+            ref="origin/automain",
+            test_files=frozenset({"testing/test_current.py"}),
+            durations={"testing/test_current.py::test_current": 1.0},
+            stale_entries=frozenset(),
+        ),
+    )
+
+    import pytest
+
+    with pytest.raises(AssertionError, match=r"introduced 1 entry\(ies\)") as excinfo:
+        test_durations_no_orphaned_file_entries()
+
+    message = str(excinfo.value)
+    assert "testing/test_deleted_module.py::test_gone" in message
+    assert "prune_stale_durations.py --write" in message, (
+        "a rot failure must name the offline repair; sending the reader to a "
+        "15-20 minute timed run for a row that only needs deleting is what "
+        "trains people to treat this gate as noise"
+    )
+    assert "ROT, not a missing measurement" in message
+
+
+def test_orphan_guard_suppresses_inherited_orphaned_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Rot already on the baseline warns; only what this candidate added blocks.
+
+    Attribution has to match the sibling guards exactly. A new absolute check
+    would red every open PR the moment one deleted module landed, which is how
+    a guard gets disabled instead of obeyed.
+    """
+    _orphan_fixture(
+        tmp_path,
+        monkeypatch,
+        baseline=_DurationBaseline(
+            ref="origin/automain",
+            test_files=frozenset({"testing/test_current.py"}),
+            durations={
+                "testing/test_current.py::test_current": 1.0,
+                "testing/test_deleted_module.py::test_gone": 4.0,
+            },
+            stale_entries=frozenset(),
+        ),
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        test_durations_no_orphaned_file_entries()
+
+    assert any("orphaned file" in str(item.message) for item in caught), (
+        "inherited rot must still be REPORTED; silently tolerating it is how "
+        "it survives to the promotion PR, where the red closes the PR"
+    )
+
+
+def test_orphan_guard_falls_back_when_baseline_is_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No baseline means no attribution, so the guard stays fail-closed."""
+    _orphan_fixture(tmp_path, monkeypatch, baseline=None)
+
+    import pytest
+
+    with pytest.raises(AssertionError, match=r"entry\(ies\) for test file"):
+        test_durations_no_orphaned_file_entries()
 
 
 def test_coverage_guard_falls_back_when_baseline_is_unavailable(monkeypatch) -> None:

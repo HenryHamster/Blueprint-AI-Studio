@@ -1,0 +1,24 @@
+# Roster for the guard-data "Derived artifacts" check
+# (.github/workflows/guard-data.yml -> scripts/guard_data_lane.sh).
+#
+# One pytest selector per line, harness-relative (scripts/test-backend.sh runs
+# pytest with cwd=backend, so backend tests are named testing/test_x.py). Blank
+# lines and lines starting with # are ignored.
+#
+# This list used to live base64-encoded inside the workflow, where it was
+# unreadable, unreviewable in a diff, and unreachable from a local reproduction
+# without hand-decoding. It is deliberately NARROWER than --standalone: that
+# roster is ~1800 tests and defaults Postgres ON. These are the derived-artifact
+# and manifest guards only, and none of them needs a database.
+
+testing/test_test_durations_freshness.py
+testing/test_vitest_durations_freshness.py
+testing/test_test_estate_ranked_queue.py
+testing/test_shard_balance.py
+testing/test_impacted_tests.py
+testing/test_websocket_emitter_inventory.py
+testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
+testing/test_event_type_invariants.py
+testing/test_migration_chain.py
+testing/test_release_promotion_metric_manifest.py
+testing/test_conversational_workday_protection.py
