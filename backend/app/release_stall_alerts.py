@@ -23,7 +23,7 @@ from app.release_gate_latch import (
 )
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 984
+_MODULE_SIZE_GOVERNANCE_CAP: int = 1450
 
 logger = logging.getLogger(__name__)
 

@@ -26,12 +26,17 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+# scripts/*.py tests run with --noconftest, so the shared offender-identity
+# producer is reached by the same explicit path insertion the other scripts
+# guards use rather than by a conftest-installed sys.path entry.
+sys.path.insert(0, str(REPO_ROOT / "backend"))
 
 from derived_artifact_classify import (  # noqa: E402
     DECISION_BEARING,
     DIRECTIONAL,
     NOT_DIRECTIONAL,
 )
+from testing.fixgate_attribution import format_offender_marker  # noqa: E402
 
 LANE = REPO_ROOT / "scripts" / "guard_data_lane.sh"
 ROSTER = REPO_ROOT / "scripts" / "guard_data_selectors.txt"
@@ -293,6 +298,8 @@ def test_every_classified_derived_artifact_guard_is_on_the_roster() -> None:
     assert not missing, (
         f"classified but never run by the guard-data lane: {missing}; add the "
         "selector to scripts/guard_data_selectors.txt or stop classifying it"
+        + "\n"
+        + format_offender_marker(missing)
     )
 
 
@@ -327,4 +334,44 @@ def test_every_roster_selector_is_accounted_for_in_one_direction_or_the_other() 
         f"{unexplained} guard a generated artifact and run in this lane, but "
         "derived_artifact_classify neither classifies them nor records why "
         "not; a reader of their red gets no rot-vs-addition answer"
+        + "\n"
+        + format_offender_marker(unexplained)
+    )
+
+
+def test_the_workflow_actually_calls_this_lane():
+    """guard-data.yml must INVOKE the script, not re-inline the roster.
+
+    The point of this file is that the lane's behaviour lives somewhere a diff
+    can review it. That only holds while the operator-only workflow still calls
+    it. Two drifts are possible and neither is visible from the script side:
+
+    * the workflow reverts to exporting ``BLUEPRINT_STATIC_GUARD_SELECTORS``
+      itself, at which point this script and its roster are dead code and every
+      test in this file passes while measuring nothing that CI runs -- the
+      vacuous-guard shape;
+    * a SECOND roster appears alongside the call, and the two disagree about
+      which guards run at the merge gate.
+
+    So: exactly one roster, and it is the file. Read as text, not parsed YAML,
+    because the assertion is about the executed command line.
+    """
+
+    workflow = REPO_ROOT / ".github" / "workflows" / "guard-data.yml"
+    assert workflow.is_file(), f"{workflow} is missing; this pin cannot look"
+    text = workflow.read_text(encoding="utf-8")
+
+    executable = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    assert "bash scripts/guard_data_lane.sh" in executable, (
+        "guard-data.yml no longer invokes scripts/guard_data_lane.sh, so this "
+        "file's roster and failure classification are dead code while its "
+        "tests still pass"
+    )
+    assert "BLUEPRINT_STATIC_GUARD_SELECTORS" not in executable, (
+        "guard-data.yml sets the selector roster itself again. The roster "
+        f"belongs in {ROSTER.name}, where a diff can review which guards run "
+        "at the merge gate; two rosters can silently disagree"
     )

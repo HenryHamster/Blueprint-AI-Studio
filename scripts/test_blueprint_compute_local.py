@@ -25,6 +25,13 @@ import blueprint
 import blueprint_api
 import pytest
 
+# scripts/*.py tests run with --noconftest, so the shared offender-identity
+# producer is reached by the same explicit path insertion the other scripts
+# guards use rather than by a conftest-installed sys.path entry.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+
+from testing.fixgate_attribution import format_offender_marker  # noqa: E402
+
 _PLAN = blueprint._compute_resolve_shell()
 _SHELL_USABLE = _PLAN.exe == "bash" or os.path.isfile(_PLAN.exe)
 _needs_shell = pytest.mark.skipif(
@@ -1042,7 +1049,14 @@ def test_repo_state_names_the_checkout_safe_on_every_git_read(tmp_path):
 
     blueprint._compute_git_repo_state(str(tmp_path), _subprocess_run=fake_run)
 
-    assert len(calls) == 4, calls  # toplevel, HEAD, abbrev-ref, status
+    # toplevel, HEAD, abbrev-ref, status
+    assert len(calls) == 4, (
+        f"expected 4 git reads from _compute_git_repo_state, saw {len(calls)}"
+        + "\n"
+        + format_offender_marker(
+            f"{index}:{' '.join(argv)}" for index, argv in enumerate(calls)
+        )
+    )
     for argv in calls:
         assert argv[:3] == ["git", "-c", f"safe.directory={tmp_path}"], argv
 

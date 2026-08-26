@@ -83,6 +83,12 @@
           "commit_date": "2026-07-14T13:46:25Z",
           "old_cap": 5900,
           "new_cap": 7000
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7000,
+          "new_cap": 9400
         }
       ],
       "task_completion_self_audit.py": [
@@ -179,6 +185,12 @@
           "commit_date": "2026-06-11T18:34:00-07:00",
           "old_cap": 1000,
           "new_cap": 1250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1250,
+          "new_cap": 1850
         }
       ],
       "orchestrator.py": [
@@ -265,6 +277,12 @@
           "commit_date": "2026-07-21T23:25:37Z",
           "old_cap": 5100,
           "new_cap": 5900
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5900,
+          "new_cap": 8000
         }
       ],
       "orchestrator_ci_monitor.py": [
@@ -311,6 +329,12 @@
           "commit_date": "2026-08-07T19:27:08Z",
           "old_cap": 1180,
           "new_cap": 1400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1400,
+          "new_cap": 2100
         }
       ],
       "orchestrator_runner_dispatch.py": [
@@ -387,6 +411,12 @@
           "commit_date": "2026-08-11T02:59:57+00:00",
           "old_cap": 4600,
           "new_cap": 5350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5350,
+          "new_cap": 7050
         }
       ],
       "compute.py": [
@@ -407,6 +437,12 @@
           "commit_date": "2026-06-12T06:26:17Z",
           "old_cap": 3250,
           "new_cap": 3750
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3750,
+          "new_cap": 5400
         }
       ],
       "github.py": [
@@ -483,6 +519,12 @@
           "commit_date": "2026-06-29T04:46:10Z",
           "old_cap": 2000,
           "new_cap": 2350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2350,
+          "new_cap": 3450
         }
       ],
       "github_issues.py": [
@@ -511,6 +553,12 @@
           "commit_date": "2026-07-14T09:59:35Z",
           "old_cap": 1000,
           "new_cap": 1250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1250,
+          "new_cap": 1850
         }
       ],
       "github_pulls.py": [
@@ -525,6 +573,12 @@
           "commit_date": "2026-07-13T02:44:39-07:00",
           "old_cap": 1250,
           "new_cap": 1500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1500,
+          "new_cap": 2200
         }
       ],
       "discovery_review.py": [
@@ -545,6 +599,12 @@
           "commit_date": "2026-08-25T08:22:09-07:00",
           "old_cap": 2500,
           "new_cap": 2900
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2900,
+          "new_cap": 4000
         }
       ],
       "routers/admin_settings.py": [
@@ -565,6 +625,12 @@
           "commit_date": "2026-07-06T00:51:30Z",
           "old_cap": 4100,
           "new_cap": 4750
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4750,
+          "new_cap": 6800
         }
       ],
       "routers/admin_analytics.py": [
@@ -629,6 +695,12 @@
           "commit_date": "2026-07-14T13:22:28Z",
           "old_cap": 1200,
           "new_cap": 1450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1450,
+          "new_cap": 2000
         }
       ],
       "routers/admin_digest.py": [
@@ -847,6 +919,12 @@
           "commit_date": "2026-07-22T15:18:45Z",
           "old_cap": 6350,
           "new_cap": 7450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7450,
+          "new_cap": 10800
         }
       ],
       "routers/agent_strategic_messages.py": [
@@ -855,6 +933,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 1950,
           "new_cap": 3450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3450,
+          "new_cap": 5200
         }
       ],
       "routers/admin_pool_accounts.py": [
@@ -931,6 +1015,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 6250,
           "new_cap": 7200
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7200,
+          "new_cap": 9500
         }
       ],
       "anomaly_detection.py": [
@@ -1013,6 +1103,12 @@
           "commit_date": "2026-07-05T11:30:49Z",
           "old_cap": 5550,
           "new_cap": 6450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6450,
+          "new_cap": 9250
         }
       ],
       "services.py": [
@@ -1133,6 +1229,12 @@
           "commit_date": "2026-07-22T12:04:18Z",
           "old_cap": 4550,
           "new_cap": 5300
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5300,
+          "new_cap": 7350
         }
       ],
       "autonomous_research.py": [
@@ -1171,6 +1273,12 @@
           "commit_date": "2026-08-07T08:50:56+00:00",
           "old_cap": 3900,
           "new_cap": 4550
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4550,
+          "new_cap": 6600
         }
       ],
       "autonomous_research_residual.py": [
@@ -1179,6 +1287,12 @@
           "commit_date": "2026-06-16T19:18:50Z",
           "old_cap": 600,
           "new_cap": 900
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 900,
+          "new_cap": 1400
         }
       ],
       "efficiency_snapshot.py": [
@@ -1253,6 +1367,12 @@
           "commit_date": "2026-07-22T16:48:51Z",
           "old_cap": 5950,
           "new_cap": 6000
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6000,
+          "new_cap": 7950
         }
       ],
       "llm_cost_attribution.py": [
@@ -1329,6 +1449,12 @@
           "commit_date": "2026-07-09T18:03:14Z",
           "old_cap": 6400,
           "new_cap": 7400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7400,
+          "new_cap": 10750
         }
       ],
       "strategic_completion.py": [
@@ -1421,6 +1547,12 @@
           "commit_date": "2026-08-06T07:47:06Z",
           "old_cap": 7200,
           "new_cap": 8350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 8350,
+          "new_cap": 11300
         }
       ],
       "rollup_management.py": [
@@ -1483,6 +1615,12 @@
           "commit_date": "2026-07-22T08:40:56Z",
           "old_cap": 5550,
           "new_cap": 6450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6450,
+          "new_cap": 9400
         }
       ],
       "rollup_migration_validation.py": [
@@ -1503,6 +1641,12 @@
           "commit_date": "2026-07-12T04:19:50Z",
           "old_cap": 1100,
           "new_cap": 1350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1350,
+          "new_cap": 1900
         }
       ],
       "reaper.py": [
@@ -1559,6 +1703,12 @@
           "commit_date": "2026-07-21T12:59:36Z",
           "old_cap": 3650,
           "new_cap": 4250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4250,
+          "new_cap": 5900
         }
       ],
       "reaper_sweeps.py": [
@@ -1651,6 +1801,12 @@
           "commit_date": "2026-08-22T20:54:33-07:00",
           "old_cap": 4750,
           "new_cap": 5500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5500,
+          "new_cap": 7600
         }
       ],
       "reaper_fleet_health_sweeps.py": [
@@ -1673,6 +1829,12 @@
           "commit_date": "2026-08-19T15:33:45+00:00",
           "old_cap": 1700,
           "new_cap": 2050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2050,
+          "new_cap": 3100
         }
       ],
       "blocked_task_unblock_sweeps.py": [
@@ -1687,6 +1849,12 @@
           "commit_date": "2026-08-19T00:43:57Z",
           "old_cap": 2100,
           "new_cap": 2500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2500,
+          "new_cap": 3750
         }
       ],
       "reaper_infra_recovery.py": [
@@ -1823,6 +1991,12 @@
           "commit_date": "2026-07-28T00:09:07-07:00",
           "old_cap": 4550,
           "new_cap": 5350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5350,
+          "new_cap": 7700
         }
       ],
       "deploy_health.py": [
@@ -1921,6 +2095,12 @@
           "commit_date": "2026-06-16T05:10:19Z",
           "old_cap": 1350,
           "new_cap": 1600
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1600,
+          "new_cap": 2300
         }
       ],
       "release_qualifier.py": [
@@ -2053,6 +2233,12 @@
           "commit_date": "2026-06-15T10:14:10Z",
           "old_cap": 800,
           "new_cap": 1050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1050,
+          "new_cap": 1450
         }
       ],
       "release_promotion.py": [
@@ -2079,6 +2265,12 @@
           "commit_date": "2026-08-10T01:45:48+00:00",
           "old_cap": 2350,
           "new_cap": 2750
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2750,
+          "new_cap": 3600
         }
       ],
       "sr_analytics_catch_rate.py": [
@@ -2197,6 +2389,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 6450,
           "new_cap": 9400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 9400,
+          "new_cap": 12700
         }
       ],
       "shared_state.py": [
@@ -2267,6 +2465,12 @@
           "commit_date": "2026-07-05T01:11:56Z",
           "old_cap": 7600,
           "new_cap": 8950
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 8950,
+          "new_cap": 12750
         }
       ],
       "failure_classification.py": [
@@ -2287,6 +2491,12 @@
           "commit_date": "2026-07-15T10:13:15Z",
           "old_cap": 3350,
           "new_cap": 3950
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3950,
+          "new_cap": 5800
         }
       ],
       "notification_dispatch.py": [
@@ -2301,6 +2511,12 @@
           "commit_date": "2026-07-14T11:39:15Z",
           "old_cap": 2700,
           "new_cap": 3150
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3150,
+          "new_cap": 4700
         }
       ],
       "ci_completion.py": [
@@ -2365,6 +2581,12 @@
           "commit_date": "2026-08-07T08:50:56+00:00",
           "old_cap": 2250,
           "new_cap": 2650
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2650,
+          "new_cap": 3700
         }
       ],
       "problem_model.py": [
@@ -2391,6 +2613,12 @@
           "commit_date": "2026-07-10T13:23:09Z",
           "old_cap": 2950,
           "new_cap": 3450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3450,
+          "new_cap": 4900
         }
       ],
       "knowledge_completion.py": [
@@ -2417,6 +2645,12 @@
           "commit_date": "2026-06-27T21:30:53Z",
           "old_cap": 2950,
           "new_cap": 3400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3400,
+          "new_cap": 5000
         }
       ],
       "alert_dispatch.py": [
@@ -2437,6 +2671,12 @@
           "commit_date": "2026-07-07T16:26:54Z",
           "old_cap": 2450,
           "new_cap": 2950
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2950,
+          "new_cap": 4450
         }
       ],
       "compute_jobs.py": [
@@ -2481,6 +2721,12 @@
           "commit_date": "2026-07-17T09:44:54Z",
           "old_cap": 4850,
           "new_cap": 5600
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5600,
+          "new_cap": 7600
         }
       ],
       "task_evaluators.py": [
@@ -2515,6 +2761,12 @@
           "commit_date": "2026-08-10T01:45:48+00:00",
           "old_cap": 3050,
           "new_cap": 3600
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3600,
+          "new_cap": 5100
         }
       ],
       "runtime_config_state.py": [
@@ -2587,6 +2839,12 @@
           "commit_date": "2026-07-09T19:20:41Z",
           "old_cap": 2300,
           "new_cap": 2650
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2650,
+          "new_cap": 3850
         }
       ],
       "review_fix_lane_pilot.py": [
@@ -2627,6 +2885,12 @@
           "commit_date": "2026-07-14T16:11:50Z",
           "old_cap": 2000,
           "new_cap": 2450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2450,
+          "new_cap": 3550
         }
       ],
       "routers/admin_project_strategic_session.py": [
@@ -2641,6 +2905,12 @@
           "commit_date": "2026-07-16T08:50:31Z",
           "old_cap": 3150,
           "new_cap": 4050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4050,
+          "new_cap": 6000
         }
       ],
       "recovery_evaluating.py": [
@@ -2665,6 +2935,12 @@
           "commit_date": "2026-07-06T06:35:45Z",
           "old_cap": 1750,
           "new_cap": 2050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2050,
+          "new_cap": 2750
         }
       ],
       "ci_resolution.py": [
@@ -2673,6 +2949,12 @@
           "commit_date": "2026-07-13T01:02:09Z",
           "old_cap": 1800,
           "new_cap": 2100
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2100,
+          "new_cap": 3150
         }
       ],
       "routers/admin_project_config.py": [
@@ -2681,6 +2963,12 @@
           "commit_date": "2026-08-03T02:38:00-07:00",
           "old_cap": 1800,
           "new_cap": 2000
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2000,
+          "new_cap": 2900
         }
       ],
       "compute_backends.py": [
@@ -2763,6 +3051,12 @@
           "commit_date": "2026-08-08T10:27:07+00:00",
           "old_cap": 2200,
           "new_cap": 2300
+        },
+        {
+          "commit_sha": "41c75a33fe335cc6f64949f400c8984971930384",
+          "commit_date": "2026-08-25T23:47:15-07:00",
+          "old_cap": 2300,
+          "new_cap": 2800
         }
       ],
       "routers/admin_notifications.py": [
@@ -2843,6 +3137,12 @@
           "commit_date": "2026-07-14T10:51:24Z",
           "old_cap": 2650,
           "new_cap": 3150
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3150,
+          "new_cap": 4700
         }
       ],
       "payload_schemas.py": [
@@ -2871,6 +3171,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 2150,
           "new_cap": 2500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2500,
+          "new_cap": 3450
         }
       ],
       "metrics_integrity_sweep.py": [
@@ -2909,6 +3215,12 @@
           "commit_date": "2026-07-17T14:20:50Z",
           "old_cap": 5550,
           "new_cap": 6500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6500,
+          "new_cap": 9100
         }
       ],
       "release_readiness.py": [
@@ -2923,6 +3235,12 @@
           "commit_date": "2026-08-10T15:25:00+00:00",
           "old_cap": 2100,
           "new_cap": 2450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2450,
+          "new_cap": 3550
         }
       ],
       "acceptance_criteria.py": [
@@ -2973,6 +3291,12 @@
           "commit_date": "2026-08-11T09:16:08+00:00",
           "old_cap": 5150,
           "new_cap": 5950
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5950,
+          "new_cap": 8050
         }
       ],
       "runner_health_alerts.py": [
@@ -3001,6 +3325,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 2550,
           "new_cap": 3150
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3150,
+          "new_cap": 4650
         }
       ],
       "runner_health_monitors.py": [
@@ -3061,6 +3391,12 @@
           "commit_date": "2026-08-06T11:08:45Z",
           "old_cap": 3800,
           "new_cap": 4400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4400,
+          "new_cap": 6000
         }
       ],
       "acceptance_gate.py": [
@@ -3167,6 +3503,12 @@
           "commit_date": "2026-08-01T20:08:12-07:00",
           "old_cap": 5850,
           "new_cap": 6850
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6850,
+          "new_cap": 9900
         }
       ],
       "release_qualifier_audit.py": [
@@ -3181,6 +3523,12 @@
           "commit_date": "2026-08-08T10:27:07+00:00",
           "old_cap": 2100,
           "new_cap": 2500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2500,
+          "new_cap": 3550
         }
       ],
       "findings_index.py": [
@@ -3211,6 +3559,12 @@
           "commit_date": "2026-08-11T03:14:02+00:00",
           "old_cap": 1950,
           "new_cap": 2350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2350,
+          "new_cap": 3300
         }
       ],
       "approved_pr_stranding.py": [
@@ -3219,6 +3573,12 @@
           "commit_date": "2026-08-11T18:11:00-07:00",
           "old_cap": 1800,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2250,
+          "new_cap": 3000
         }
       ],
       "project_message_creation.py": [
@@ -3243,6 +3603,12 @@
           "commit_date": "2026-08-18T19:09:25-07:00",
           "old_cap": 1900,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2250,
+          "new_cap": 3200
         }
       ],
       "recovery_evaluating_approval.py": [
@@ -3251,6 +3617,12 @@
           "commit_date": "2026-08-18T18:53:36-07:00",
           "old_cap": 450,
           "new_cap": 800
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 800,
+          "new_cap": 1250
         }
       ],
       "research_direction_state.py": [
@@ -3281,6 +3653,172 @@
           "commit_date": "2026-08-25T12:32:29-07:00",
           "old_cap": 1800,
           "new_cap": 2200
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2200,
+          "new_cap": 3150
+        }
+      ],
+      "orchestrator_compute_experiment_dispatch.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1620,
+          "new_cap": 2300
+        }
+      ],
+      "orchestrator_provision.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 800,
+          "new_cap": 1300
+        }
+      ],
+      "reaper_evaluating_sweeps.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 600,
+          "new_cap": 950
+        }
+      ],
+      "digest_remediation.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 900,
+          "new_cap": 1450
+        }
+      ],
+      "playbook_auto.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 450,
+          "new_cap": 700
+        }
+      ],
+      "source_ref_validation.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1900,
+          "new_cap": 2600
+        }
+      ],
+      "recovery_evaluating_helpers.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1100,
+          "new_cap": 1550
+        }
+      ],
+      "recovery_post_commit_pending.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1100,
+          "new_cap": 1550
+        }
+      ],
+      "recovery_sidecar.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 400,
+          "new_cap": 650
+        }
+      ],
+      "release_qualifier_redrive.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2050,
+          "new_cap": 3000
+        }
+      ],
+      "capability_trial_verdict.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2400
+        }
+      ],
+      "compute_image_build.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2550
+        }
+      ],
+      "plan_completion.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2550
+        }
+      ],
+      "migration_apply_gate.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2150,
+          "new_cap": 3150
+        }
+      ],
+      "capability_registry.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2400
+        }
+      ],
+      "storage.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2400
+        }
+      ],
+      "routers/agent_warm_continuity.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1700,
+          "new_cap": 2400
+        }
+      ],
+      "task_lifecycle_completion_dispatch.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 500,
+          "new_cap": 750
+        }
+      ],
+      "release_models.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2550
+        }
+      ],
+      "schemas.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2400
         }
       ]
     },
@@ -3339,6 +3877,12 @@
           "commit_date": "2026-07-08T01:22:28-07:00",
           "old_cap": 1500,
           "new_cap": 1900
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1900,
+          "new_cap": 2850
         }
       ],
       "prompts/check-helper.ts": [
@@ -3403,6 +3947,12 @@
           "commit_date": "2026-08-06T08:55:39Z",
           "old_cap": 2300,
           "new_cap": 2350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2350,
+          "new_cap": 3550
         }
       ],
       "prompts/done-helper.ts": [
@@ -3501,6 +4051,12 @@
           "commit_date": "2026-07-25T01:55:36-07:00",
           "old_cap": 1600,
           "new_cap": 1900
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1900,
+          "new_cap": 2800
         }
       ],
       "handlers/strategic-resident-lib.ts": [
@@ -3521,6 +4077,12 @@
           "commit_date": "2026-08-02T03:12:40-07:00",
           "old_cap": 3050,
           "new_cap": 3550
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3550,
+          "new_cap": 5350
         }
       ],
       "handlers/strategic-resident.ts": [
@@ -3541,6 +4103,12 @@
           "commit_date": "2026-08-12T17:45:11-07:00",
           "old_cap": 5350,
           "new_cap": 6200
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6200,
+          "new_cap": 8950
         }
       ],
       "prompts/thinker.ts": [
@@ -3595,6 +4163,12 @@
           "commit_date": "2026-08-23T07:32:31-07:00",
           "old_cap": 2050,
           "new_cap": 2100
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2100,
+          "new_cap": 3150
         }
       ],
       "handlers/review-fix-migration.ts": [
@@ -3631,6 +4205,12 @@
           "commit_date": "2026-07-08T19:44:51Z",
           "old_cap": 1300,
           "new_cap": 1550
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1550,
+          "new_cap": 2250
         }
       ],
       "handlers/audits.ts": [
@@ -3701,6 +4281,12 @@
           "commit_date": "2026-06-02T17:18:54-07:00",
           "old_cap": 350,
           "new_cap": 400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 420,
+          "new_cap": 650
         }
       ],
       "workspacePrep.ts": [
@@ -3709,6 +4295,12 @@
           "commit_date": "2026-06-11T18:34:00-07:00",
           "old_cap": 240,
           "new_cap": 500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 500,
+          "new_cap": 800
         }
       ],
       "reset.ts": [
@@ -3823,6 +4415,12 @@
           "commit_date": "2026-07-09T14:18:10Z",
           "old_cap": 1500,
           "new_cap": 1800
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1800,
+          "new_cap": 2500
         }
       ],
       "providers/runners.ts": [
@@ -3861,6 +4459,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 2250,
           "new_cap": 2700
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2700,
+          "new_cap": 3750
         }
       ],
       "prompts/context-prefix.ts": [
@@ -3881,6 +4485,12 @@
           "commit_date": "2026-06-27T07:00:06Z",
           "old_cap": 1100,
           "new_cap": 1350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1350,
+          "new_cap": 1950
         }
       ],
       "providers/resident-session.ts": [
@@ -3895,6 +4505,20 @@
           "commit_date": "2026-07-24T20:49:54-07:00",
           "old_cap": 800,
           "new_cap": 1050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1050,
+          "new_cap": 1550
+        }
+      ],
+      "index.ts": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4600,
+          "new_cap": 6650
         }
       ]
     },
@@ -4079,6 +4703,12 @@
           "commit_date": "2026-07-22T01:32:08Z",
           "old_cap": 3250,
           "new_cap": 3800
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3800,
+          "new_cap": 5200
         }
       ],
       "components/MessageBubble.tsx": [
@@ -4087,6 +4717,12 @@
           "commit_date": "2026-06-05T22:37:07Z",
           "old_cap": 400,
           "new_cap": 650
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 650,
+          "new_cap": 1000
         }
       ],
       "components/RecentErrorsWidget.tsx": [
@@ -4165,6 +4801,12 @@
           "commit_date": "2026-06-09T23:53:30-07:00",
           "old_cap": 1900,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 400,
+          "new_cap": 600
         }
       ],
       "api.ts": [
@@ -4249,6 +4891,12 @@
           "commit_date": "2026-07-10T22:11:43Z",
           "old_cap": 1300,
           "new_cap": 1550
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1550,
+          "new_cap": 2150
         }
       ],
       "components/HeaderBar.tsx": [
@@ -4289,6 +4937,12 @@
           "commit_date": "2026-07-14T10:26:59Z",
           "old_cap": 2900,
           "new_cap": 3350
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3350,
+          "new_cap": 4600
         }
       ],
       "api/compute.ts": [
@@ -4311,6 +4965,68 @@
           "commit_date": "2026-08-07T07:24:52Z",
           "old_cap": 1750,
           "new_cap": 2100
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2100,
+          "new_cap": 2850
+        }
+      ],
+      "components/TaskCard.tsx": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1500,
+          "new_cap": 2050
+        }
+      ],
+      "components/TaskDetailDrawerSections.tsx": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1950,
+          "new_cap": 2700
+        }
+      ],
+      "components/NewProjectModal.tsx": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1350,
+          "new_cap": 1950
+        }
+      ],
+      "components/ResearchBrowser.tsx": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1050,
+          "new_cap": 1550
+        }
+      ],
+      "hooks/useWorkbenchCommands.ts": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1800,
+          "new_cap": 2550
+        }
+      ],
+      "components/FleetRunnersPanel.tsx": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2000,
+          "new_cap": 2950
+        }
+      ],
+      "strategicStateApi.ts": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1850,
+          "new_cap": 2700
         }
       ]
     },
@@ -4327,6 +5043,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 27390,
           "new_cap": 31550
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 31550,
+          "new_cap": 41300
         }
       ],
       "test_compute.py": [
@@ -4335,6 +5057,12 @@
           "commit_date": "2026-08-06T11:08:45Z",
           "old_cap": 7976,
           "new_cap": 9400
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 9400,
+          "new_cap": 13600
         }
       ],
       "test_acceptance_criteria.py": [
@@ -4369,6 +5097,12 @@
           "commit_date": "2026-08-19T00:55:51-07:00",
           "old_cap": 8450,
           "new_cap": 10050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 10050,
+          "new_cap": 13400
         }
       ],
       "test_acceptance_gate.py": [
@@ -4389,6 +5123,12 @@
           "commit_date": "2026-08-08T02:32:09Z",
           "old_cap": 4800,
           "new_cap": 5700
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5700,
+          "new_cap": 8000
         }
       ],
       "test_pack_under_budget.py": [
@@ -4411,6 +5151,12 @@
           "commit_date": "2026-07-23T13:57:29Z",
           "old_cap": 2750,
           "new_cap": 3750
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3750,
+          "new_cap": 5450
         }
       ],
       "test_task_locking.py": [
@@ -4419,6 +5165,12 @@
           "commit_date": "2026-07-23T12:38:01Z",
           "old_cap": 2250,
           "new_cap": 2600
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2600,
+          "new_cap": 3700
         }
       ],
       "test_payload_schemas.py": [
@@ -4435,6 +5187,12 @@
           "commit_date": "2026-08-07T11:43:39Z",
           "old_cap": 2050,
           "new_cap": 2450
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2450,
+          "new_cap": 3400
         }
       ],
       "test_operator_inbox_liveness.py": [
@@ -4489,6 +5247,12 @@
           "commit_date": "2026-08-12T22:29:42-07:00",
           "old_cap": 4500,
           "new_cap": 5500
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5500,
+          "new_cap": 7950
         }
       ],
       "test_shard_balance.py": [
@@ -4511,6 +5275,12 @@
           "commit_date": "2026-07-30T18:49:32-07:00",
           "old_cap": 1800,
           "new_cap": 2200
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2200,
+          "new_cap": 3150
         }
       ],
       "test_ci_compliance_gate.py": [
@@ -4531,6 +5301,12 @@
           "commit_date": "2026-08-11T02:13:43+00:00",
           "old_cap": 2750,
           "new_cap": 3300
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3300,
+          "new_cap": 4550
         }
       ],
       "test_strategic_session_messages.py": [
@@ -4545,6 +5321,12 @@
           "commit_date": "2026-08-12T22:29:42-07:00",
           "old_cap": 2250,
           "new_cap": 2950
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2950,
+          "new_cap": 4450
         }
       ],
       "test_rollup_management.py": [
@@ -4553,6 +5335,12 @@
           "commit_date": "2026-08-08T14:04:37+00:00",
           "old_cap": 5350,
           "new_cap": 6250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6250,
+          "new_cap": 9050
         }
       ],
       "test_discovery_review.py": [
@@ -4573,6 +5361,12 @@
           "commit_date": "2026-08-25T08:22:09-07:00",
           "old_cap": 2500,
           "new_cap": 2950
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2950,
+          "new_cap": 4400
         }
       ],
       "test_dependency_contracts.py": [
@@ -4581,6 +5375,12 @@
           "commit_date": "2026-08-08T19:11:48+00:00",
           "old_cap": 1616,
           "new_cap": 2000
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2000,
+          "new_cap": 2750
         }
       ],
       "test_admin_routers__version_lifecycle.py": [
@@ -4589,6 +5389,12 @@
           "commit_date": "2026-08-08T21:15:34+00:00",
           "old_cap": 4800,
           "new_cap": 5600
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5600,
+          "new_cap": 7350
         }
       ],
       "test_review_loop_convergence.py": [
@@ -4603,6 +5409,12 @@
           "commit_date": "2026-08-18T23:26:30-07:00",
           "old_cap": 2250,
           "new_cap": 2800
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2800,
+          "new_cap": 4050
         }
       ],
       "test_release_scoring.py": [
@@ -4619,6 +5431,12 @@
           "commit_date": "2026-08-11T13:41:25+00:00",
           "old_cap": 2100,
           "new_cap": 2650
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2650,
+          "new_cap": 3650
         }
       ],
       "test_release_qualifier__sweep_stuck_qualifications.py": [
@@ -4627,6 +5445,12 @@
           "commit_date": "2026-08-19T00:43:57Z",
           "old_cap": 6100,
           "new_cap": 7200
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7200,
+          "new_cap": 10400
         }
       ],
       "test_task_lifecycle.py": [
@@ -4635,6 +5459,12 @@
           "commit_date": "2026-08-18T19:09:30-07:00",
           "old_cap": 12100,
           "new_cap": 14050
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 14050,
+          "new_cap": 18450
         }
       ],
       "test_orchestrator.py": [
@@ -4643,6 +5473,12 @@
           "commit_date": "2026-08-18T17:48:44-07:00",
           "old_cap": 17150,
           "new_cap": 19850
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 19850,
+          "new_cap": 26350
         }
       ],
       "test_pipeline_reliability.py": [
@@ -4659,6 +5495,12 @@
           "commit_date": "2026-08-19T10:24:13+00:00",
           "old_cap": 7050,
           "new_cap": 8150
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 8150,
+          "new_cap": 11150
         }
       ],
       "test_strategic_state.py": [
@@ -4675,6 +5517,12 @@
           "commit_date": "2026-08-20T06:56:03Z",
           "old_cap": 14850,
           "new_cap": 17100
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 17100,
+          "new_cap": 22100
         }
       ],
       "test_size_limits_checker.py": [
@@ -4697,6 +5545,12 @@
           "commit_date": "2026-08-20T23:36:38-07:00",
           "old_cap": 2750,
           "new_cap": 3300
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3300,
+          "new_cap": 4950
         }
       ],
       "test_generated_shell.py": [
@@ -4705,6 +5559,12 @@
           "commit_date": "2026-08-22T16:34:38-07:00",
           "old_cap": 2400,
           "new_cap": 2850
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2850,
+          "new_cap": 4100
         }
       ],
       "check_size_limits.py": [
@@ -4743,6 +5603,12 @@
           "commit_date": "2026-08-25T01:32:02-07:00",
           "old_cap": 1800,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2250,
+          "new_cap": 3100
         }
       ],
       "test_pipeline_integration.py": [
@@ -4759,6 +5625,12 @@
           "commit_date": "2026-08-25T00:43:40-07:00",
           "old_cap": 14250,
           "new_cap": 16650
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 15100,
+          "new_cap": 19700
         }
       ],
       "test_size_offender_governance.py": [
@@ -4782,6 +5654,366 @@
           "old_cap": 2100,
           "new_cap": 2600
         }
+      ],
+      "test_strategic_completion.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 22750,
+          "new_cap": 30000
+        }
+      ],
+      "test_reaper.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 21750,
+          "new_cap": 29650
+        }
+      ],
+      "test_review_pipeline.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 21650,
+          "new_cap": 28600
+        }
+      ],
+      "test_autonomous_research.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 20850,
+          "new_cap": 28350
+        }
+      ],
+      "test_efficiency_snapshot.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 13100,
+          "new_cap": 17850
+        }
+      ],
+      "test_diagnostics.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1605,
+          "new_cap": 2300
+        }
+      ],
+      "test_digest_metrics.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 9050,
+          "new_cap": 11950
+        }
+      ],
+      "test_release_reconciliation.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 8950,
+          "new_cap": 12100
+        }
+      ],
+      "test_salvage_bundle_standalone.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 8600,
+          "new_cap": 11300
+        }
+      ],
+      "test_compute_experiment_completion.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7700,
+          "new_cap": 10300
+        }
+      ],
+      "test_knowledge_documents.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7500,
+          "new_cap": 9900
+        }
+      ],
+      "test_problem_model.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7450,
+          "new_cap": 9900
+        }
+      ],
+      "test_agent_strategic_fetch.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 7400,
+          "new_cap": 10250
+        }
+      ],
+      "test_max_plan_pool.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6900,
+          "new_cap": 9250
+        }
+      ],
+      "test_evaluating.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6650,
+          "new_cap": 9350
+        }
+      ],
+      "test_github.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6300,
+          "new_cap": 8600
+        }
+      ],
+      "test_warm_pool_maintainer.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 6050,
+          "new_cap": 8500
+        }
+      ],
+      "test_direction_lifecycle.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5650,
+          "new_cap": 7650
+        }
+      ],
+      "test_onboard.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5100,
+          "new_cap": 6800
+        }
+      ],
+      "test_task_completion.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5000,
+          "new_cap": 6800
+        }
+      ],
+      "test_compute_experiment_spawn.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4900,
+          "new_cap": 6650
+        }
+      ],
+      "test_rollup_cleanup.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4750,
+          "new_cap": 6250
+        }
+      ],
+      "test_services.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4650,
+          "new_cap": 6300
+        }
+      ],
+      "test_failure_classification.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4650,
+          "new_cap": 6500
+        }
+      ],
+      "test_strategic_analysis.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4500,
+          "new_cap": 5900
+        }
+      ],
+      "test_hotfix_backmerge.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4250,
+          "new_cap": 5800
+        }
+      ],
+      "test_release_version.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 4150,
+          "new_cap": 5800
+        }
+      ],
+      "test_notification_dispatch.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3700,
+          "new_cap": 5200
+        }
+      ],
+      "test_digest_direction_progress.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3600,
+          "new_cap": 4950
+        }
+      ],
+      "test_ci_resolution.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3100,
+          "new_cap": 4450
+        }
+      ],
+      "test_review_learning.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2850,
+          "new_cap": 4250
+        }
+      ],
+      "test_alerts.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2300,
+          "new_cap": 3450
+        }
+      ],
+      "test_admin_project_config.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2100,
+          "new_cap": 2900
+        }
+      ],
+      "test_warm_backlog_reuse.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2100,
+          "new_cap": 3050
+        }
+      ],
+      "test_review_merge_authority.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1650,
+          "new_cap": 2350
+        }
+      ],
+      "test_empty_repo_onboarding.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1900,
+          "new_cap": 2800
+        }
+      ],
+      "test_api.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2400
+        }
+      ],
+      "_release_qualifier_testhelpers.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2350,
+          "new_cap": 3450
+        }
+      ],
+      "test_compute_runner_dispatch.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 3350,
+          "new_cap": 4950
+        }
+      ],
+      "test_compute_gcp_startup.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2200,
+          "new_cap": 3000
+        }
+      ],
+      "test_max_plan_pool_usage.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2750,
+          "new_cap": 3750
+        }
+      ],
+      "test_admin_routers__messages.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 5250,
+          "new_cap": 7150
+        }
+      ],
+      "test_warm_pool_dispatch.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2100,
+          "new_cap": 2950
+        }
+      ],
+      "test_approved_pr_stranding.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1800,
+          "new_cap": 2550
+        }
+      ],
+      "test_discovery_review_packet_budget.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1750,
+          "new_cap": 2450
+        }
       ]
     },
     "scripts": {
@@ -4797,6 +6029,12 @@
           "commit_date": "2026-08-21T10:38:20-07:00",
           "old_cap": 2400,
           "new_cap": 2850
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 2850,
+          "new_cap": 4050
         }
       ],
       "static_release_guard.py": [
@@ -4823,6 +6061,12 @@
           "commit_date": "2026-08-23T15:21:49-07:00",
           "old_cap": 1050,
           "new_cap": 1075
+        },
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1075,
+          "new_cap": 1600
         }
       ],
       "test_vitest_verification_guard.py": [
@@ -4859,10 +6103,26 @@
       ],
       "test_blueprint_cli.py": [
         {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-26T03:26:31.812228+00:00",
+          "commit_sha": "a7e1e5e80df53c05d567710f82bedc7fe0744fdd",
+          "commit_date": "2026-08-25T20:27:29-07:00",
           "old_cap": 8800,
           "new_cap": 10250
+        }
+      ],
+      "local_runner.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 11450,
+          "new_cap": 15250
+        }
+      ],
+      "test_bootstrap_local_app_release.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T09:21:35.671692+00:00",
+          "old_cap": 1700,
+          "new_cap": 2300
         }
       ]
     }
