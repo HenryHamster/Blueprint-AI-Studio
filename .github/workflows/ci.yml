@@ -763,7 +763,29 @@ jobs:
             # (backend/testing/test_local_runner_terminal_log.py etc.) resolve
             # scripts/ via /repo and HARD-FAIL (not skip) when CI is set, so
             # they enforce in the promotion gate instead of silently skipping.
+            # --user/HOME/USER: run as the runner user, not root. This is the
+            # idiom scripts/test-backend.sh already applies to every local and
+            # agent-VM run of this same image, so the image is known to work
+            # non-root; these two lanes are the ones that call `docker run`
+            # directly and therefore missed it. Root-owned droppings in a
+            # bind-mounted tree are not cosmetic: on a SHARED self-hosted runner
+            # one poisoned run makes the same SHA pass or fail depending on which
+            # runner picks it up, and a git read inside the container sees a
+            # workspace it does not own (`detected dubious ownership`, exit 128 --
+            # the shape that killed the v45 promotion attempt). HOME is
+            # redirected because it defaults to "/", which a non-root uid cannot
+            # write; USER is exported because --user injects a uid the image's
+            # /etc/passwd does not know and getpass.getuser() raises KeyError.
+            #
+            # The "Reclaim workspace from root-owned container droppings" steps
+            # are deliberately LEFT IN PLACE. If this works they become no-ops;
+            # if it does not, they still protect the next job. Delete them in a
+            # follow-up once a promotion run proves the droppings are gone --
+            # never in the same commit that might create them.
             docker run --rm --network "$CI_NETWORK" -v "$PWD/backend:/app:ro" \
+              --user "$(id -u):$(id -g)" \
+              -e HOME=/tmp \
+              -e USER="$(id -un)" \
               -v "$PWD:/repo:ro" \
               -e PYTHONDONTWRITEBYTECODE=1 \
               -e GCE_METADATA_IP=127.0.0.1 \
@@ -821,7 +843,14 @@ jobs:
       - name: Runner-script suite (scripts/)
         if: matrix.shard == 1
         run: |
+          # Same runner-user mapping as the shard lane above, and for the
+          # same reason -- see the comment there. This lane reads /repo, which
+          # is the mount a container-side `git log` trips over when the uid
+          # inside does not match the checkout's owner.
           docker run --rm -v "$PWD:/repo:ro" -w /repo/scripts \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e USER="$(id -un)" \
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e CI=true \
             ${{ steps.deps.outputs.image }} \
