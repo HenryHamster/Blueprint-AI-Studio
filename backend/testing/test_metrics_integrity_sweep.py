@@ -8108,3 +8108,54 @@ async def test_observe_mode_tick_is_logged_with_correct_tripped_signal(db):
     # tripped must match whether the in-memory tick actually flagged anything.
     expected_tripped = tick["flagged"] > 0
     assert rows[0].tripped is expected_tripped
+
+
+# --- Bounded observability ring: fair share across checks --------------------
+
+
+def test_recent_flags_ring_is_not_monopolised_by_one_high_cardinality_check():
+    """A bounded ring must stay *representative*: a single check emitting more
+    flags than the whole ring must not evict every other check's findings.
+
+    Regression. ``near_cap_size_warning`` emits one flag per near-cap backend
+    module. Once that count reached ``_RECENT_FLAGS_MAX`` it filled every slot
+    on its own, and because flags were appended in check-registration order the
+    flood silently evicted the drifts recorded before it - so the only
+    operator-facing surface showed nothing but size warnings while real
+    integrity drifts went invisible.
+    """
+    obs = mis._MetricsIntegrityObservability()
+    quiet = CheckResult(
+        check="playbook_confirmation_integrity",
+        status=CheckStatus.FLAGGED,
+        subject="project-1",
+        delta=1,
+    )
+    flood = [
+        CheckResult(
+            check="near_cap_size_warning",
+            status=CheckStatus.FLAGGED,
+            subject=f"module_{i}.py",
+            delta=1,
+        )
+        for i in range(mis._RECENT_FLAGS_MAX + 10)
+    ]
+    # The quiet flag is recorded FIRST - the exact position the flood evicted.
+    tick = obs.record_tick(
+        now=_utcnow(), mode="observe", results=[quiet, *flood], enrolled=0
+    )
+    snap = obs.snapshot()
+
+    # The tick summary still carries every flag, uncapped.
+    assert tick["flagged"] == mis._RECENT_FLAGS_MAX + 11
+    assert len(tick["flags"]) == mis._RECENT_FLAGS_MAX + 11
+
+    # The bounded ring stays bounded ...
+    assert len(snap["recent_flags"]) <= mis._RECENT_FLAGS_MAX
+    # ... and still represents BOTH checks, not just the noisy one.
+    ring_checks = {f["check"] for f in snap["recent_flags"]}
+    assert ring_checks == {"playbook_confirmation_integrity", "near_cap_size_warning"}
+
+    # The flood is sampled down, and that sampling is reported, not silent.
+    assert snap["recent_flags_elided_total"] > 0
+    assert tick["flags_elided_from_ring"] == snap["recent_flags_elided_total"]

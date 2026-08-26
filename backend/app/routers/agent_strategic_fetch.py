@@ -1792,6 +1792,7 @@ async def agent_fetch_qualification(
         "promotion_confidence_threshold": None,
         "projected_promotion_ready": None,
         "promotion_ci_green_gate": None,
+        "promotion_ci_gate_proves_promotion": None,
     }
     try:
         from app.release_readiness import (  # noqa: PLC0415
@@ -1822,6 +1823,7 @@ async def agent_fetch_qualification(
             # Populated by the CI-green-gate block below; keep the key present so
             # the response shape is stable whether or not that compute succeeds.
             "promotion_ci_green_gate": None,
+            "promotion_ci_gate_proves_promotion": None,
         }
     except Exception:
         logger.exception(
@@ -1836,13 +1838,29 @@ async def agent_fetch_qualification(
     # dispatch=False so this read NEVER triggers a workflow run. Best-effort: a
     # GitHub failure degrades to ``promotion_ci_green_gate: None`` without breaking
     # the read or changing any existing key.
+    #
+    # ``promotion_ci_gate_proves_promotion`` is served BESIDE the raw gate on
+    # purpose.  The strategist is the actor that decides to force-promote, and
+    # the gate's ``green`` used to conflate two different claims: "a full matrix
+    # passed somewhere" and "a run of the SAME SHAPE the promotion PR gets
+    # passed".  A ``workflow_dispatch`` rehearsal on the integration branch and
+    # the promotion PR's ``pull_request`` run do not share a checkout, so the
+    # first does not predict the second — proven on 2026-08-25 when one tree
+    # produced dispatch=SUCCESS at 10:13 UTC and pull_request=FAILURE at 10:41.
+    # Reading the raw gate still requires knowing that; this boolean answers the
+    # only question a promotion decision actually asks.
     try:
         from app.release_readiness import (  # noqa: PLC0415
             compute_promotion_ci_green_gate,
+            promotion_ci_gate_proves_promotion,
         )
 
-        requalification_extra["promotion_ci_green_gate"] = (
-            await compute_promotion_ci_green_gate(session, project_id, dispatch=False)
+        _ci_gate = await compute_promotion_ci_green_gate(
+            session, project_id, dispatch=False
+        )
+        requalification_extra["promotion_ci_green_gate"] = _ci_gate
+        requalification_extra["promotion_ci_gate_proves_promotion"] = (
+            promotion_ci_gate_proves_promotion(_ci_gate)
         )
     except Exception:
         logger.exception(
