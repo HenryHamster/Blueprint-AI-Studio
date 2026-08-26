@@ -61,6 +61,7 @@ async def _cycle_with_source(
     state: str = "open",
     generation: int = 1,
     deadline_at=None,
+    direction_overrides: dict | None = None,
 ):
     direction_key = f"d-{uuid.uuid4().hex[:8]}"
     direction = {
@@ -75,6 +76,14 @@ async def _cycle_with_source(
             "implementation_constraints": "Reuse the current runtime.",
         },
     }
+    # Overrides land before the project row and the frozen bet snapshot are
+    # built from the same dict, so the authority fence still sees one identity.
+    if direction_overrides:
+        direction = {
+            key: value
+            for key, value in {**direction, **direction_overrides}.items()
+            if value is not None
+        }
     project = Project(
         name=f"discovery-review-{uuid.uuid4().hex[:8]}",
         user_id="discovery-review-test",
@@ -123,7 +132,13 @@ def _evidence_ids(review: Task) -> list[str]:
     ]
 
 
-def _result(cycle: DiscoveryCycle, review: Task, *, action: str = "advance"):
+def _result(
+    cycle: DiscoveryCycle,
+    review: Task,
+    *,
+    action: str = "advance",
+    claim: str | None = None,
+):
     result = {
         "cycle_id": str(cycle.id),
         "reviewed_revision": review.first_payload["expected_revision"],
@@ -136,7 +151,7 @@ def _result(cycle: DiscoveryCycle, review: Task, *, action: str = "advance"):
         "operator_question": None,
     }
     if action == "advance":
-        result["next_bet"] = _next_bet()
+        result["next_bet"] = _next_bet(**({"claim": claim} if claim else {}))
     elif action == "park":
         result["park_reason"] = "The external benchmark is not yet available."
         result["resume_condition"] = "Resume when the benchmark is published."

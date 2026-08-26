@@ -1897,6 +1897,28 @@ async def _validate_direction_for_advance(
     return current_authority
 
 
+def _successor_assignment_prompt(next_bet: Mapping[str, Any]) -> str:
+    """Render the bounded bet as the successor's single-issue assignment.
+
+    The bet -- not the direction -- is the thing this one research generation
+    is asked to settle, so it is stated as the child's research focus. Framing
+    it explicitly as bounded work *inside* a standing direction is the point:
+    the child must be able to tell the assignment it has to finish from the
+    open-ended container it is finishing it inside, which is exactly the
+    distinction the old claim-as-direction-text payload erased.
+    """
+
+    return (
+        f"Bounded discovery bet for this generation (mode: {next_bet['mode']}). "
+        "This is one single-issue assignment inside the standing direction "
+        "above, not the direction itself; settle it and stop.\n"
+        f"Claim under test: {next_bet['claim']}\n"
+        f"Decision question: {next_bet['decision_question']}\n"
+        f"Success evidence: {next_bet['success_evidence']}\n"
+        f"Retirement condition: {next_bet['retirement_condition']}"
+    )
+
+
 def _successor_specification(
     *,
     cycle: DiscoveryCycle,
@@ -1931,6 +1953,55 @@ def _successor_specification(
     )
     direction_context = current_direction or frozen_direction
     raw_paths = direction_context.get("paths") if direction_context else None
+    # A direction is the open-ended container; the bet is one bounded
+    # assignment inside it. ``strategic_ops_manifest.json`` already states that
+    # invariant for the strategist's own creator -- "a direction is a durable
+    # strategic outcome or bet, not a task, file/PR shard, implementation
+    # checklist, or live status update" -- and this path was the one direction
+    # writer that bypassed it, because it wrote the reviewer's bet ``claim``
+    # straight into the direction's own identity slot.
+    #
+    # From generation 2 onward the successor was therefore told its DIRECTION
+    # was that single bounded claim: the container was replaced by the
+    # assignment. A claim phrased as settled fact ("Both named liveness tests
+    # exist at backend/testing/test_orchestrator_liveness.py:318") then has no
+    # terminating condition -- it is trivially re-confirmable forever, so each
+    # generation re-verified it and filed a rollup saying so (#17884, #17908,
+    # #17926, #17928: 4 of 10 research rollups in one day). Nothing in the
+    # discovery ladder counts "this bet re-confirmed what we already knew"
+    # against a direction, so the churn only ended when an unrelated
+    # saturation/churn ladder retired the direction some seven generations and
+    # ~9 days later.
+    #
+    # The authoritative open-ended text is already carried here on purpose:
+    # ``_validate_direction_for_advance`` re-reads live direction authority
+    # under the directions lock, and ``_authoritative_successor_bet`` freezes
+    # it into ``successor.bet_snapshot["direction"]``. Read it instead of
+    # overwriting it. ``claim`` is not dropped -- it moves to the assignment
+    # slots below, which is where the research child actually needs it.
+    raw_direction_text = (
+        direction_context.get("text") if direction_context else None
+    )
+    direction_text = (
+        raw_direction_text.strip() if isinstance(raw_direction_text, str) else ""
+    )
+    # Fall back to the claim only when neither live nor frozen authority
+    # carries any text. An anonymous direction is worse than a bet-shaped one:
+    # the research child would be handed no subject at all.
+    direction_text = direction_text or claim
+    # ``completion_criteria`` is the same conflation one field over: it is a
+    # direction field (see ``direction_authority_snapshot``), so it must carry
+    # the direction's own bar, not this one bet's ``success_evidence``. The
+    # bet's bar travels with the bet. Omitted rather than blanked when the
+    # direction has none, matching how the authority snapshot drops empties.
+    raw_completion_criteria = (
+        direction_context.get("completion_criteria") if direction_context else None
+    )
+    direction_completion_criteria = (
+        raw_completion_criteria.strip()
+        if isinstance(raw_completion_criteria, str) and raw_completion_criteria.strip()
+        else None
+    )
     capacity_consuming_carry = sum(
         1
         for finding in prior_deferred_findings
@@ -1943,7 +2014,7 @@ def _successor_specification(
         "directions": [
             {
                 "id": cycle.direction_key,
-                "text": claim,
+                "text": direction_text,
                 "status": "active",
                 "priority": (
                     direction_context.get("priority", "medium")
@@ -1959,7 +2030,11 @@ def _successor_specification(
                     if isinstance(raw_paths, list)
                     else []
                 ),
-                "completion_criteria": next_bet["success_evidence"],
+                **(
+                    {"completion_criteria": direction_completion_criteria}
+                    if direction_completion_criteria
+                    else {}
+                ),
                 "research_context": {
                     "mode": next_bet["mode"],
                     "decision_question": next_bet["decision_question"],
@@ -1967,6 +2042,17 @@ def _successor_specification(
                 },
             }
         ],
+        # The bounded bet is the ASSIGNMENT, and this is the only uncapped
+        # prose channel that reaches the research child: the agent resolves its
+        # "Research focus" as payload.prompt -> payload.description ->
+        # task.description, and ``strategic_spawn_requests`` hard-caps the task
+        # description at 500 chars. Before this fix the claim reached the child
+        # only by occupying the direction's identity slot, so moving it out
+        # without giving it a real home would have traded churn for lost work.
+        # ``research_handoff.research_question_for_grader`` reads this slot one
+        # rung above ``discovery_bet_snapshot.decision_question``; the bet block
+        # is a strictly fuller statement of the same commissioned decision.
+        "prompt": _successor_assignment_prompt(next_bet),
         "base_branch": get_project_integration_branch(project),
         "work_headroom": effective_research_finding_headroom(
             capacity_consuming_carry
@@ -1995,7 +2081,17 @@ def _successor_specification(
     # would outrank and downgrade that canonical route.
     return {
         "task": {
-            "title": f"Research: {claim}"[:200],
+            # ``discovery_review_packet`` bounds the ``direction`` mapping out
+            # of the decision packet on the documented grounds that the
+            # reviewer still sees the direction's identifying text because
+            # "the receipt's ``source_parent.title`` is literally
+            # ``'Research: {direction_text}'``". Titling the successor after
+            # the claim broke that invariant at every generation >= 2, so the
+            # next reviewer read the previous bet as the direction's identity
+            # and authored its successor as a refinement of it -- the loop that
+            # made the direction eat its own output. Restore the invariant the
+            # packet builder already depends on.
+            "title": f"Research: {direction_text}"[:200],
             "description": (
                 f"Discovery successor ({next_bet['mode']}): "
                 f"{next_bet['decision_question']}"
