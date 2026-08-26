@@ -5181,23 +5181,25 @@ class TestOperatorMessageArmingGateCoverage:
             )
 
     # Budget, not a default. This guard reads and parses all 572
-    # backend/app/*.py. The standalone lane runs it under --timeout=30, a
-    # budget sized on a native Linux filesystem; over the Docker-on-Windows
-    # bind mount it died as `Failed: Timeout (>30.0s) from pytest-timeout` at
-    # 29.96s while its three synthetic sibling tests passed -- which reads as
-    # an unguarded operator-message site, when the scan underneath had found
-    # zero offenders. A timeout, not an assertion, is the tell.
+    # backend/app/*.py. Under the THEN-30s lane budget -- a number sized on a
+    # native Linux filesystem -- it died over the Docker-on-Windows bind mount
+    # as `Failed: Timeout (>30.0s) from pytest-timeout` at 29.96s while its
+    # three synthetic sibling tests passed, which reads as an unguarded
+    # operator-message site when the scan underneath had found zero offenders.
+    # A timeout, not an assertion, is the tell. The lane catch-all is
+    # LANE_HANG_DETECTOR_SECONDS (test_harness_timeout_budgets.py) and is much
+    # larger today; this explicit budget stays so the scan reds as itself.
     #
     # Profiled in the lane's own container: read 20.67s, prefilter 2.11s,
     # parse of the 46 surviving files 2.83s; parsing all 572 instead is
     # 10.77s. So the prefilter below removes the reducible half (10.77s ->
     # 2.83s), taking the guard from ~31.6s to 19.21s warm. What is left is one
     # read of every app file, and the guard cannot skip it -- the prefilter
-    # needs the text. At 20.67s that read alone is two thirds of a 30s budget,
-    # before any contention from the 1842-test session it runs inside, and on
-    # a cold page cache the whole guard measured 46.87s. The prefilter is
-    # worth keeping, but it cannot move this guard off a 30s boundary; only a
-    # budget can.
+    # needs the text. At 20.67s that read alone was two thirds of the then-30s
+    # budget, before any contention from the 1842-test session it runs inside,
+    # and on a cold page cache the whole guard measured 46.87s. The prefilter
+    # is worth keeping, but it could not move this guard off that boundary;
+    # only an explicit budget could.
     #
     # 120s is the house budget for corpus-scanning guards
     # (test_string_patch_targets_resolve, test_mock_patch_targets_resolve;
@@ -11934,11 +11936,13 @@ def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] |
 # vacuous-mock guard below reuses it for free), and already memoises the app
 # module parses. What is left is one tokenize pass over the corpus.
 #
-# The standalone lane runs with --timeout=30 sized on a native Linux
-# filesystem. Over the Docker-on-Windows bind mount the same work is ~2.3x
-# slower (~28s), so the guard was landing on the wrong side of its budget and
-# failing as a TIMEOUT -- reporting a slow filesystem as a stale-patch-target
-# defect. 120s matches the house budget for corpus-scanning guards
+# Over the Docker-on-Windows bind mount the same work is ~2.3x slower (~28s),
+# so against the then-30s lane budget the guard was landing on the wrong side
+# and failing as a TIMEOUT -- reporting a slow filesystem as a
+# stale-patch-target defect. The lane catch-all
+# (LANE_HANG_DETECTOR_SECONDS, backend/testing/test_harness_timeout_budgets.py)
+# is far larger now; this marker stays because it bounds the scan as ITSELF.
+# 120s matches the house budget for corpus-scanning guards
 # (test_websocket_emitter_inventory, test_patched_app_symbols_have_production_
 # call_sites at 90s) and leaves ~4x headroom over the bind-mount figure.
 @pytest.mark.timeout(120)
@@ -13172,8 +13176,9 @@ def test_no_deprecated_datetime_utcnow_calls():
         #
         # Why a guard that measures 9.85s needed this at all: that is the
         # isolated cost over the Docker-on-Windows bind mount, but the lane
-        # runs it inside a 1842-test session against --timeout=30, and there
-        # it died on `Failed: Timeout (>30.0s) from pytest-timeout` -- reading
+        # runs it inside a 1842-test session, and against the then-30s lane
+        # budget it died on `Failed: Timeout (>30.0s) from pytest-timeout` --
+        # reading
         # 569 files off a contended bind mount is several times its solo cost,
         # and the failure is intermittent precisely because it sat close to
         # the line. A timeout, not an assertion, reports a slow filesystem as
@@ -15486,12 +15491,13 @@ def test_standalone_corpus_set_guards_emit_offender_identity():
 
 
 # This shells out to scripts/test-backend.sh for a roster read. Measured
-# at 17.8s on an idle Windows host, and the CI lanes run pytest with
-# --timeout=30 -- so under an eight-shard load this lands on the wrong
-# side of its budget and fails as a TIMEOUT, reporting a slow harness
-# boot as a roster defect. 180s leaves ~10x headroom over the measured
-# figure and stays above the 120s inner subprocess timeout below, which
-# is what must be allowed to fire first.
+# at 17.8s on an idle Windows host; under an eight-shard load that landed on
+# the wrong side of the then-30s lane budget and failed as a TIMEOUT,
+# reporting a slow harness boot as a roster defect. 180s leaves ~10x headroom
+# over the measured figure and stays above the 120s inner subprocess timeout
+# below, which is what must be allowed to fire first -- the marker is what
+# keeps this attributable instead of an anonymous LANE_HANG_DETECTOR_SECONDS
+# kill (backend/testing/test_harness_timeout_budgets.py).
 @pytest.mark.timeout(180)
 def test_standalone_offender_roster_covers_the_harness_inventory():
     """The scanned roster is never narrower than the lane the harness runs.

@@ -78,8 +78,11 @@ def iter_vitest_test_files(workspace_root: Path, suite: str) -> tuple[Path, ...]
     be a test. ``admin-ui`` contains ``node_modules``, so that stat-ed on the
     order of 200k files to find ~500, and every one of them was then rejected
     by the predicate for not starting with ``src/``. Cheap locally; over the
-    Docker-on-Windows bind mount the standalone lane runs on it blew the 30s
-    pytest timeout, taking down both this inventory and the ranked-queue guard
+    Docker-on-Windows bind mount the standalone lane runs on it blew the
+    then-30s pytest timeout (the lane catch-all is now
+    ``LANE_HANG_DETECTOR_SECONDS``, and much larger -- but the 200k stats were
+    never worth paying against any budget), taking down both this inventory
+    and the ranked-queue guard
     that consumes it -- reported as an inventory failure, which is not what it
     was.
 

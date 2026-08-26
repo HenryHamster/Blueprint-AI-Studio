@@ -1930,8 +1930,12 @@ class TestProjectVerificationProbe(unittest.TestCase):
             self.assertNotIn("/var/run/docker.sock", argv)
             self.assertNotIn("/run/docker.sock", argv)
 
-    # Boots a live sandbox PostgreSQL, which the lanes' --timeout=30 cannot
-    # cover; the inner 90s budget could never fire without this marker.
+    # Boots a live sandbox PostgreSQL. Its inner 90s budget is far above
+    # MAX_INNER_OPERATION_SECONDS (backend/testing/
+    # test_harness_timeout_budgets.py) -- and above pytest-timeout's ini default
+    # in backend/pyproject.toml -- so without an explicit marker the harness
+    # would kill this test before its own 90s could ever report. The marker
+    # states the budget here rather than inheriting whatever the lane passes.
     @pytest.mark.timeout(180)
     def test_real_probe_runs_live_sandbox_postgres_when_installed(self):
         pg_config = shutil.which("pg_config")

@@ -87,7 +87,7 @@ _SUBPROCESS_CALLS = frozenset(
 
 # The class is not specific to subprocess. PR #17882 introduced a fresh
 # instance within hours of this sweep in a different shape -- an
-# ``Event.wait(timeout=30.0)`` under the same 30s lane -- which is the same
+# ``Event.wait(timeout=30.0)`` under the then-30s lane -- which is the same
 # bug exactly: the wait can only ever be killed by the harness, never report
 # itself. These three take their timeout in SECONDS unambiguously, which is
 # why the family stops here: Playwright-style APIs spell it ``wait_for_*`` and
@@ -317,9 +317,10 @@ def _collect() -> tuple[list[_Finding], dict[str, dict[str, int]]]:
 
 
 # This guard AST-parses the whole backend/testing and scripts corpus (~600
-# files); measured at 41s on a Windows checkout against the lanes' own
-# --timeout=30. 120s matches the house budget for corpus-scanning guards
-# (#17870, test_websocket_emitter_inventory) with ~3x headroom.
+# files); measured at 41s on a Windows checkout. 120s matches the house budget
+# for corpus-scanning guards (#17870, test_websocket_emitter_inventory) with ~3x
+# headroom, and keeps this scan attributable rather than letting it red as an
+# anonymous LANE_HANG_DETECTOR_SECONDS kill.
 @pytest.mark.timeout(120)
 def test_no_subprocess_timeout_exceeds_its_lane_budget() -> None:
     """Every wrapped subprocess must be able to hit its own timeout first."""
@@ -414,6 +415,113 @@ def test_declared_lane_budget_matches_the_pin() -> None:
             "no lane declared a --timeout= at all; the pin above is now "
             "unanchored to anything CI runs."
         )
+
+
+# Deliberate HISTORICAL citations: prose that names a superseded lane budget on
+# purpose, as a record of an incident that happened under it. Keyed by file
+# name with the reason, so adding one is a reviewed act rather than a silent
+# exemption. Everything else must either cite the CURRENT budget or -- better --
+# name ``LANE_HANG_DETECTOR_SECONDS`` and carry no number at all.
+_HISTORICAL_LANE_CITATIONS: dict[str, str] = {
+    "test_scripts_test_lane.py": (
+        "documents the 30 -> 300 raise itself -- naming the superseded value "
+        "is the whole point of that comment"
+    ),
+}
+
+# Prove the scanner reached a real corpus. test-backend.sh carries the lane's
+# own EXECUTABLE --timeout=<LANE_HANG_DETECTOR_SECONDS>, so it is always
+# present: if this anchor goes missing the scan is looking at the wrong tree and
+# a clean result proves nothing.
+_CITATION_ANCHOR = "test-backend.sh"
+
+
+def test_no_comment_cites_a_superseded_lane_timeout() -> None:
+    """Prose must not state a lane budget that disagrees with the live one.
+
+    THE DEFECT CLASS: when the lane budget moved 30 -> 300, it left ~40 comments
+    across ~25 files still asserting the superseded 30-second value. A comment
+    that states a wrong constant is worse than no comment -- an agent debugging
+    a timeout red reads it, computes headroom against 30, and concludes the
+    wrong thing about a lane that actually allows ten times that. This codebase
+    is largely maintained by agents reading these comments, so that is a live
+    misdiagnosis source, not a tidiness concern.
+
+    Deliberately NARROW. It polices exactly one mechanically-checkable form --
+    a literal ``--timeout=<digits>`` -- and makes no attempt to parse prose like
+    "the 30s lane", which a regex cannot tell apart from a legitimate mention of
+    MAX_INNER_OPERATION_SECONDS (also 30, and deliberately unchanged). A guard
+    that fired on every unrelated edit near a number would cost more than the
+    rot it prevents.
+
+    Scope excludes .github/workflows (agents cannot edit it, so a failure there
+    would be an unfixable wedge) and docs/ (dated point-in-time records, whose
+    numbers are correct AS OF their date).
+    """
+    citation = re.compile(r"--timeout=(\d+)\b")
+    offenders: list[str] = []
+    seen_anchor = False
+    scanned = 0
+
+    targets: list[Path] = []
+    for root, pattern in (
+        (BACKEND_TESTING, "*.py"),
+        (REPO_ROOT / "backend" / "app", "**/*.py"),
+        (SCRIPTS_DIR, "*.py"),
+    ):
+        if root.is_dir():
+            targets.extend(sorted(root.glob(pattern)))
+    lane_script = SCRIPTS_DIR / "test-backend.sh"
+    if lane_script.is_file():
+        targets.append(lane_script)
+
+    for path in targets:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        scanned += 1
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            for value in citation.findall(line):
+                if path.name == _CITATION_ANCHOR:
+                    seen_anchor = seen_anchor or int(value) == (
+                        LANE_HANG_DETECTOR_SECONDS
+                    )
+                if int(value) == LANE_HANG_DETECTOR_SECONDS:
+                    continue
+                if path.name in _HISTORICAL_LANE_CITATIONS:
+                    continue
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT) if REPO_ROOT in path.parents else path}"
+                    f":{lineno} cites --timeout={value}"
+                )
+
+    assert scanned >= 400, (
+        f"only {scanned} files scanned; the corpus is not being reached, so a "
+        f"clean result proves nothing. Looked under {BACKEND_TESTING}, "
+        f"{REPO_ROOT / 'backend' / 'app'} and {SCRIPTS_DIR}."
+    )
+    if lane_script.is_file():
+        assert seen_anchor, (
+            f"{_CITATION_ANCHOR} no longer carries an executable lane timeout "
+            f"equal to LANE_HANG_DETECTOR_SECONDS ({LANE_HANG_DETECTOR_SECONDS})."
+            f" Either the lane stopped passing one -- which "
+            f"test_declared_lane_budget_matches_the_pin should have caught -- or "
+            f"this scanner has stopped recognising the form it polices."
+        )
+
+    assert not offenders, (
+        f"{len(offenders)} comment(s) cite a lane timeout that disagrees with "
+        f"LANE_HANG_DETECTOR_SECONDS ({LANE_HANG_DETECTOR_SECONDS}):\n  "
+        + "\n  ".join(offenders)
+        + "\n\nPreferred fix: state the CONSTANT NAME "
+        "(LANE_HANG_DETECTOR_SECONDS) instead of restating its value, so the "
+        "comment cannot rot the next time the budget moves. If the number is "
+        "deliberately historical, say so in the prose AND add the file to "
+        "_HISTORICAL_LANE_CITATIONS with a reason. Do NOT reach for the inner "
+        "ceiling here: MAX_INNER_OPERATION_SECONDS is a different number doing "
+        "a different job."
+    )
 
 
 def test_the_two_budgets_stay_ordered_and_distinct() -> None:

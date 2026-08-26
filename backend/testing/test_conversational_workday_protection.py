@@ -281,8 +281,8 @@ def test_all_protect_test_ids_exist_in_their_files():
     # per-reference TypeScript revalidation stat cannot tell us
     # anything -- see frozen_typescript_tree() (PR #17853) for the
     # measurement. Without it this guard took 30.00s over the
-    # Docker-on-Windows bind mount and died on the lane's 30s timeout,
-    # reporting a slow filesystem as a deleted protected test.
+    # Docker-on-Windows bind mount and died on the lane's then-30s
+    # pytest-timeout, reporting a slow filesystem as a deleted protected test.
     with frozen_typescript_tree():
         missing = _find_existence_violations(manifest, REPO_ROOT)
 
@@ -366,9 +366,13 @@ def test_new_floor_slack_relative_to_integration_branch_fails():
         item for item in manifest["protect"]
         if item["path"] == "backend/testing/test_reaper.py"
     )
-    # Both this count and the mismatch sweep below read the same
-    # unchanging tree; one freeze covers the pair. Measured 27.66s
-    # unfrozen over the bind mount against a 30s budget.
+    # Both this count and the mismatch sweep below read the same unchanging
+    # tree; one freeze covers the pair. Measured 27.66s unfrozen over the bind
+    # mount -- sized when the lane budget was 30s, which that measurement did
+    # not clear. The lane catch-all is now LANE_HANG_DETECTOR_SECONDS
+    # (backend/testing/test_harness_timeout_budgets.py) and far larger, but
+    # 27.66s of redundant stat calls is still 27.66s of nothing, so the freeze
+    # stays on its own merits rather than on a budget that has since moved.
     with frozen_typescript_tree():
         actual = _protected_test_count(
             entry["path"],
@@ -471,9 +475,9 @@ def test_removed_backend_resident_seams_are_absent():
     # One pass over the tree, not one per class name. The read used to sit
     # inside the class-name loop, so this scanned 8 x 568 = 4,544 files to
     # inspect 568. Over the Docker-on-Windows bind mount that is the difference
-    # between a fast guard and one that trips the standalone lane's 30s
-    # pytest-timeout -- reporting a slow filesystem as a resident-class
-    # regression.
+    # between a fast guard and one that trips the standalone lane's
+    # pytest-timeout catch-all (LANE_HANG_DETECTOR_SECONDS, 30s at the time)
+    # -- reporting a slow filesystem as a resident-class regression.
     #
     # Match "class StrategicResident(" or "class StrategicResident:" but not
     # substrings of longer names (e.g. StrategicResident must not swallow a
