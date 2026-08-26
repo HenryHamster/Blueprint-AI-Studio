@@ -64,6 +64,15 @@ _ENTITY_OPS = frozenset(
         "cancel_watch",
         "cancel_task",
         "dispose_completion_debt",
+        # Pipeline ACTION verbs that mutate a named entity, so a Workday
+        # consultation binds a receipt to them the same way it does for
+        # cancel_task. force_promote is deliberately absent: like
+        # request_qualification it is a project-level TRIGGER, not an edit to a
+        # direction/task entity, so it has no entity id to bind a receipt to.
+        "requeue_task",
+        "reset_iteration_cap",
+        "set_task_priority",
+        "unhold_direction",
     }
 )
 _ENTITY_KINDS = frozenset(
