@@ -1643,6 +1643,11 @@ async def _process_direction_lifecycle_locked(
             (project_cpm_median * cpm_multiplier) if project_cpm_median else None
         )
         if direction_cpm and threshold and direction_cpm > threshold:
+            # Raise once per breach episode. The pre-existing flag value gates
+            # re-firing so the alert below is not re-emitted on every lifecycle
+            # tick while the direction stays over threshold (mirrors the churn
+            # ladder's ``churn_retirement_recommended`` gate).
+            _already_flagged = bool(d.get("retirement_consideration_needed"))
             d["retirement_consideration_needed"] = True
             d["retirement_consideration_at"] = _utcnow().isoformat()
             d["retirement_consideration_reason"] = (
@@ -1669,6 +1674,61 @@ async def _process_direction_lifecycle_locked(
             logger.warning(
                 f"[AUTONOMOUS] Direction {did} flagged for retirement consideration: "
                 f"cost/merge ${direction_cpm:.2f} > ${threshold:.2f}"
+            )
+            if not _already_flagged:
+                # Deliver the recommendation to a decider. Before this, the flag
+                # was written to the direction dict and read by nothing but the
+                # admin-ui card, so a cost-outlier direction kept being selected
+                # for research indefinitely and no keep-or-retire decision was
+                # ever owed by anyone.
+                from app.models import Alert, AlertSeverity
+
+                session.add(
+                    Alert(
+                        project_id=project.id,
+                        event_type="research.retirement_consideration_needed",
+                        severity=AlertSeverity.INFO,
+                        title="Direction flagged for retirement consideration",
+                        message=(
+                            f"Direction '{(d.get('text') or '')[:80]}' ({did}) has a "
+                            f"{cpm_window}-cycle cost/merge of ${direction_cpm:.2f}, over the "
+                            f"${threshold:.2f} threshold ({cpm_multiplier:g}x the project "
+                            f"median). A keep-or-retire decision is owed. The direction stays "
+                            f"ACTIVE and eligible for research until a strategist/operator "
+                            f"decides — a cost breach alone is not evidence of low value."
+                        ),
+                    )
+                )
+        elif d.get("retirement_consideration_needed"):
+            # Self-clear. The recommendation used to be a one-way latch: nothing
+            # in the backend ever removed these keys, so a direction whose
+            # cost/merge recovered kept carrying a stale retire-me badge forever
+            # and the strategist could not tell a live breach from an old one.
+            # Clear it and record WHY, so the signal read downstream is current.
+            if direction_cpm is None or threshold is None:
+                _clear_reason = (
+                    "cost/merge is no longer measurable for this direction "
+                    f"(cost_per_merge={direction_cpm!r}, threshold={threshold!r})"
+                )
+            else:
+                _clear_reason = (
+                    f"cost/merge ${direction_cpm:.2f} recovered to at-or-below the "
+                    f"${threshold:.2f} threshold"
+                )
+            for _key in (
+                "retirement_consideration_needed",
+                "retirement_consideration_at",
+                "retirement_consideration_reason",
+                "retirement_consideration_evidence",
+            ):
+                d.pop(_key, None)
+            d["retirement_consideration_cleared_at"] = _utcnow().isoformat()
+            d["retirement_consideration_cleared_reason"] = _clear_reason
+            directions_modified = True
+            logger.info(
+                "[AUTONOMOUS] Direction %s retirement consideration cleared: %s",
+                did,
+                _clear_reason,
             )
         # Auto-pause check — must come after cooldown to only evaluate directions eligible for research
         pause_reason = _check_direction_health(d)

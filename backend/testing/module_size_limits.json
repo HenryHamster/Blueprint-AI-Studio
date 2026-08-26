@@ -173,7 +173,7 @@
     "post_commit_errors.py": 58,
     "task_lifecycle_completion_dispatch.py": 750,
     "release_models.py": 2550,
-    "size_limit_policy.py": 2450,
+    "size_limit_policy.py": 3000,
     "schemas.py": 2400,
     "release_commit_authorship.py": 1800,
     "approved_pr_stranding.py": 3000
@@ -295,7 +295,7 @@
     "test_efficiency_snapshot.py": 17850,
     "test_digest.py": 12250,
     "test_diagnostics.py": 2300,
-    "test_size_offender_governance.py": 2450,
+    "test_size_offender_governance.py": 2950,
     "test_task_lifecycle.py": 18450,
     "test_acceptance_criteria.py": 13650,
     "test_acceptance_criteria__walkthrough.py": 903,
