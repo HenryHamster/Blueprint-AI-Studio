@@ -20409,3 +20409,486 @@ async def test_text_fallback_stuck_also_requires_head_advance(db_session, mocker
         "Text-fallback stuck detection must require a fix attempt in between"
     )
     assert "stuck" not in (original_task.latest_status_message or "").lower()
+
+
+# ── Transient fix-spawn deferral is a WAIT, not a stall ──────────────────────
+#
+# Live defect (Blueprint project 37d445e1, PR #17941): five consecutive review
+# tasks — 6fa6bd4a, e4c76dc5, d5473efa, 7e77113a, 085de73b — each ran a full
+# 20-30MB review and then died with the identical
+# "Fix not spawned for PR #17941 — deferred_cross_type", each one establishing a
+# hold and raising a "Manual intervention required" WARNING alert. Every
+# SPAWN_REASON_DEFERRED site is transient by construction and says so in its own
+# status message ("retrying next sweep", "waiting on active {type} task {id}").
+# On the SAME PR the sibling path (task_lifecycle_fix_completion) recorded
+# "Fix applied for PR #17941 but review spawn deferred (concurrent spawn)" —
+# the two callers had drifted on what a deferral means.
+
+_DEFER_SITE_DETAIL = (
+    "Fix deferred for PR #909 — waiting on active review task 6fa6bd4a"
+)
+_DEDUP_SITE_DETAIL = "Fix skipped for PR #909 — idempotent spawn already active"
+
+
+def _stub_request_changes_github(mocker, *, head="live-head", base="base-sha"):
+    """Minimal GitHub/broadcast stubs for a full run_request_changes pass."""
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/app/review_pipeline.py"}],
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": head, "ref": "feat/deferral"},
+            "base": {"sha": base, "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success"},
+    )
+
+
+def _patch_refusing_spawn(mocker, reason, detail, *, calls=None):
+    """Patch _spawn_pipeline_task to refuse with ``reason`` like the real sites do.
+
+    The real ``_spawn_pipeline_task`` records the reason code in
+    ``source_task.context[SPAWN_REASON_KEY]`` AND writes a specific
+    ``latest_status_message`` before returning ``(None, False)``.
+    """
+
+    async def _spawn(source_task, task_type, session, *args, **kwargs):
+        if calls is not None:
+            calls.append(task_type)
+        ctx = dict(source_task.context or {})
+        ctx[SPAWN_REASON_KEY] = reason
+        source_task.context = ctx
+        source_task.latest_status_message = detail
+        session.add(source_task)
+        return None, False
+
+    return mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task", side_effect=_spawn
+    )
+
+
+async def _build_request_changes_world(db_session, pr_number, *, head, base):
+    project = await _make_db_project(db_session)
+    original = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"review_loop": {}},
+    )
+    await _persist(db_session, original)
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review", "pr_number": pr_number}],
+        context={
+            "review_loop": {
+                "pr_number": pr_number,
+                "branch": "feat/deferral",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+                "iteration": 1,
+                "review_target": _review_target(project.id, pr_number, base, head),
+            }
+        },
+    )
+    await _persist(db_session, review_task)
+    return project, original, review_task
+
+
+async def _drive_request_changes(
+    db_session, review_task, original, pr_number, *, head, base
+):
+    _issues = [
+        {"description": "Null deref in the fallback writer", "severity": "major"}
+    ]
+    return await run_request_changes(
+        review_task,
+        pr_number=pr_number,
+        branch="feat/deferral",
+        base_branch="main",
+        original_task_id=str(original.id),
+        original_prompt="Do the thing",
+        feedback="Found a real defect",
+        issues=_issues,
+        resolutions=[],
+        investigated_files=["backend/app/review_pipeline.py"],
+        verdict_unparseable=False,
+        reviewed_head_sha=head,
+        reviewed_base_sha=base,
+        _review_iteration=1,
+        _current_review_entry={
+            "iteration": 1,
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Found a real defect",
+            "issues": _issues,
+            "resolutions": [],
+            "reviewed_head_sha": head,
+            "reviewed_base_sha": base,
+        },
+        review_loop=(review_task.context or {})["review_loop"],
+        _record_structured_review_result=lambda _t: None,
+        session=db_session,
+    )
+
+
+async def _project_escalation_alerts(db_session, project_id):
+    """Every WARNING alert on the project.
+
+    Distinct from the task-scoped ``_escalation_alerts`` above: these
+    request-changes escalations are keyed to the review row, and asserting
+    on the whole project proves no alert was raised anywhere.
+    """
+    rows = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.severity == AlertSeverity.WARNING,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows)
+
+
+def _has_spawn_refusal_hold(task) -> bool:
+    """True when _establish_request_changes_hold ran for a spawn refusal.
+
+    On a COMPLETED review row that helper establishes the hold and then
+    immediately settles it as unactionable, which swaps the live provenance for
+    a release receipt. Either shape proves the escalation branch ran; the
+    absence of both proves it did not.
+    """
+    from app.admin_approval_authority import (
+        APPROVAL_HOLD_PROVENANCE_KEY,
+        APPROVAL_HOLD_RELEASED_KEY,
+    )
+
+    ctx = task.context or {}
+    for key in (APPROVAL_HOLD_PROVENANCE_KEY, APPROVAL_HOLD_RELEASED_KEY):
+        episode = ctx.get(key)
+        if (
+            isinstance(episode, dict)
+            and episode.get("owner") == "review_request_changes"
+            and episode.get("reason") == "review_fix_spawn_refused"
+        ):
+            return True
+    return False
+
+
+@pytest.mark.asyncio
+async def test_deferred_fix_spawn_neither_holds_nor_demands_manual_intervention(
+    db_session, mocker
+):
+    """DEFECT: a transient deferral was escalated as a stall needing a human.
+
+    A SPAWN_REASON_DEFERRED refusal means "not right now" — a peer holds the PR
+    spawn lock, an in-flight task must finish, admission is momentarily closed.
+    It must not establish a review_fix_spawn_refused hold and must not raise the
+    "Manual intervention required" alert.
+    """
+    from app.post_commit_errors import PostCommitFinalCommitFailed
+
+    head, base, pr = "live-head", "base-sha", 909
+    _stub_request_changes_github(mocker, head=head, base=base)
+    _patch_refusing_spawn(mocker, SPAWN_REASON_DEFERRED, _DEFER_SITE_DETAIL)
+    project, original, review_task = await _build_request_changes_world(
+        db_session, pr, head=head, base=base
+    )
+
+    # The deferral hands the completion back to the post-commit sweep, which is
+    # signalled by PostCommitFinalCommitFailed (agent_status keeps the
+    # write-ahead post_commit_pending marker set and returns a clean 200).
+    with pytest.raises(PostCommitFinalCommitFailed) as excinfo:
+        await _drive_request_changes(
+            db_session, review_task, original, pr, head=head, base=base
+        )
+    assert "deferred" in str(excinfo.value).lower()
+
+    fresh = await db_session.get(Task, review_task.id)
+    assert not _has_spawn_refusal_hold(fresh), (
+        "a transient deferral must not establish a review_fix_spawn_refused hold"
+    )
+    alerts = await _project_escalation_alerts(db_session, project.id)
+    assert alerts == [], (
+        "a transient deferral must raise no operator alert at all, got: "
+        f"{[a.title for a in alerts]}"
+    )
+    # Surface REASONS, not states: the site's own sentence is carried through.
+    assert "waiting on active review task 6fa6bd4a" in (
+        fresh.latest_status_message or ""
+    )
+    assert "attempt 1/5" in (fresh.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_deferred_fix_spawn_is_retried_and_the_fix_eventually_spawns(
+    db_session, mocker
+):
+    """The deferral must actually converge on a spawned fix, not go quiet.
+
+    Turning a noisy livelock into a silent one is worse, not better: drive the
+    deferral, then the post-commit-sweep replay, and prove a fix task is
+    created and the deferral bookkeeping is cleared.
+    """
+    from app.post_commit_errors import PostCommitFinalCommitFailed
+    from app.review_pipeline import SPAWN_DEFERRAL_KEY
+
+    head, base, pr = "live-head", "base-sha", 910
+    _stub_request_changes_github(mocker, head=head, base=base)
+    _patch_refusing_spawn(mocker, SPAWN_REASON_DEFERRED, _DEFER_SITE_DETAIL)
+    project, original, review_task = await _build_request_changes_world(
+        db_session, pr, head=head, base=base
+    )
+
+    with pytest.raises(PostCommitFinalCommitFailed):
+        await _drive_request_changes(
+            db_session, review_task, original, pr, head=head, base=base
+        )
+    fresh = await db_session.get(Task, review_task.id)
+    assert (fresh.context or {}).get(SPAWN_DEFERRAL_KEY, {}).get("attempts") == 1
+
+    # The sweep re-runs the completion; by now the peer released the lock.
+    spawned_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "fix", "pr_number": pr}],
+    )
+    await _persist(db_session, spawned_fix)
+
+    async def _spawn_ok(source_task, task_type, session, *args, **kwargs):
+        return spawned_fix, True
+
+    mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task", side_effect=_spawn_ok
+    )
+    action_taken, response = await _drive_request_changes(
+        db_session, fresh, original, pr, head=head, base=base
+    )
+
+    assert action_taken is True and response is None
+    settled = await db_session.get(Task, review_task.id)
+    assert SPAWN_DEFERRAL_KEY not in (settled.context or {}), (
+        "a cleared deferral must not leave its counter behind for a later episode"
+    )
+    assert not _has_spawn_refusal_hold(settled)
+    assert await _project_escalation_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_deferred_fix_spawn_retry_is_bounded_and_escalation_names_it(
+    db_session, mocker
+):
+    """An unbounded retry is the same livelock without the alert.
+
+    After SPAWN_DEFER_MAX_ATTEMPTS deferrals the chain escalates — with a
+    message that says it was deferred repeatedly and for how long, and that
+    still carries the deferral site's own reason.
+    """
+    from app.post_commit_errors import PostCommitFinalCommitFailed
+    from app.review_pipeline import SPAWN_DEFER_MAX_ATTEMPTS
+
+    head, base, pr = "live-head", "base-sha", 911
+    _stub_request_changes_github(mocker, head=head, base=base)
+    _patch_refusing_spawn(mocker, SPAWN_REASON_DEFERRED, _DEFER_SITE_DETAIL)
+    project, original, review_task = await _build_request_changes_world(
+        db_session, pr, head=head, base=base
+    )
+
+    current = review_task
+    for attempt in range(1, SPAWN_DEFER_MAX_ATTEMPTS):
+        with pytest.raises(PostCommitFinalCommitFailed):
+            await _drive_request_changes(
+                db_session, current, original, pr, head=head, base=base
+            )
+        current = await db_session.get(Task, review_task.id)
+        assert await _project_escalation_alerts(db_session, project.id) == [], (
+            f"attempt {attempt} must stay inside the retry budget"
+        )
+
+    # The budget is now spent: this pass escalates instead of raising.
+    action_taken, response = await _drive_request_changes(
+        db_session, current, original, pr, head=head, base=base
+    )
+    assert action_taken is True and response is None
+
+    settled = await db_session.get(Task, review_task.id)
+    alerts = await _project_escalation_alerts(db_session, project.id)
+    assert len(alerts) == 1, [a.title for a in alerts]
+    alert = alerts[0]
+    assert f"deferred {SPAWN_DEFER_MAX_ATTEMPTS}x and never cleared" in alert.title
+    assert f"deferred {SPAWN_DEFER_MAX_ATTEMPTS} times over" in alert.message
+    assert "waiting on active review task 6fa6bd4a" in alert.message
+    # It must NOT masquerade as the generic terminal stall.
+    assert "no fix was spawned" not in alert.message
+    status = settled.latest_status_message or ""
+    assert f"deferred {SPAWN_DEFER_MAX_ATTEMPTS}x over" in status
+    assert "never cleared" in status
+    assert _has_spawn_refusal_hold(settled), (
+        "bounded exhaustion is a real stall and must establish the hold"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cap_exhausted_fix_spawn_still_escalates_unchanged(
+    db_session, mocker
+):
+    """Pin the terminal path: widening the transient branch must break this.
+
+    cap_exhausted is a genuine stall. It keeps the original status message,
+    the original alert title, the "Manual intervention required" wording, and
+    the hold — and it must NOT be handed to the post-commit sweep.
+    """
+    from app.review_pipeline import SPAWN_REASON_CAP
+
+    head, base, pr = "live-head", "base-sha", 912
+    _stub_request_changes_github(mocker, head=head, base=base)
+    _patch_refusing_spawn(
+        mocker, SPAWN_REASON_CAP, "Fix capped for PR #912 - iteration cap"
+    )
+    project, original, review_task = await _build_request_changes_world(
+        db_session, pr, head=head, base=base
+    )
+
+    action_taken, response = await _drive_request_changes(
+        db_session, review_task, original, pr, head=head, base=base
+    )
+    assert action_taken is True and response is None
+
+    settled = await db_session.get(Task, review_task.id)
+    # Exact, unchanged sentence. The suffix after it is the unactionable-hold
+    # release receipt _establish_request_changes_hold appends on a COMPLETED
+    # row; the prefix is what admin_approval_authority infers the hold reason
+    # from, so it is pinned literally.
+    _status = settled.latest_status_message or ""
+    assert _status.startswith(
+        f"Fix not spawned for PR #{pr} — cap_exhausted (iteration cap reached)"
+    ), _status
+    assert "(review_fix_spawn_refused)" in _status
+    alerts = await _project_escalation_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].title == (
+        f"PR #{pr} stalled — cap_exhausted (iteration cap reached)"
+    )
+    assert alerts[0].message == (
+        f"Review requested changes on PR #{pr} but no fix was spawned "
+        "(cap_exhausted (iteration cap reached)). Manual intervention required."
+    )
+    assert _has_spawn_refusal_hold(settled)
+
+
+@pytest.mark.asyncio
+async def test_dedup_fix_spawn_is_neither_a_stall_nor_a_retry(db_session, mocker):
+    """DEDUP means an equivalent fix is already active — nothing to escalate.
+
+    All three DEDUP sites in _spawn_pipeline_task currently return that existing
+    task rather than None, so this branch is defence in depth. If it ever does
+    become reachable it must not demand an operator, and must not enter the
+    bounded-retry budget either (retrying cannot change anything, and would end
+    in a false "deferred repeatedly" escalation).
+    """
+    from app.review_pipeline import SPAWN_DEFERRAL_KEY, SPAWN_REASON_DEDUP
+
+    head, base, pr = "live-head", "base-sha", 913
+    _stub_request_changes_github(mocker, head=head, base=base)
+    _patch_refusing_spawn(mocker, SPAWN_REASON_DEDUP, _DEDUP_SITE_DETAIL)
+    project, original, review_task = await _build_request_changes_world(
+        db_session, pr, head=head, base=base
+    )
+
+    action_taken, response = await _drive_request_changes(
+        db_session, review_task, original, pr, head=head, base=base
+    )
+    assert action_taken is True and response is None
+
+    settled = await db_session.get(Task, review_task.id)
+    assert await _project_escalation_alerts(db_session, project.id) == []
+    assert not _has_spawn_refusal_hold(settled)
+    assert SPAWN_DEFERRAL_KEY not in (settled.context or {}), (
+        "DEDUP must not consume the transient-deferral retry budget"
+    )
+
+
+def test_spawn_deferral_budget_also_bounded_by_elapsed_window():
+    """The count is not the only bound — a slow sweep cadence trips the window.
+
+    Pins both limbs of the budget with literals so a future edit cannot widen
+    them silently.
+    """
+    from datetime import datetime as _dt
+
+    from app.review_pipeline import (
+        SPAWN_DEFER_GRACE_S,
+        SPAWN_DEFER_MAX_ATTEMPTS,
+        record_spawn_deferral,
+    )
+
+    assert SPAWN_DEFER_MAX_ATTEMPTS == 5
+    assert SPAWN_DEFER_GRACE_S == 300
+
+    # Naive UTC, matching the model/_utcnow convention used by the helper.
+    t0 = _dt(2026, 8, 26, 12, 0, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    task = make_task(context={})
+
+    first = record_spawn_deferral(task, detail="peer holds the lock", now=t0)
+    assert first["attempts"] == 1 and first["exhausted"] is False
+
+    # Second attempt, but a long way after the first: the window binds even
+    # though only two attempts were made.
+    late = record_spawn_deferral(
+        task, now=t0 + timedelta(seconds=SPAWN_DEFER_GRACE_S)
+    )
+    assert late["attempts"] == 2
+    assert late["elapsed_s"] == SPAWN_DEFER_GRACE_S
+    assert late["exhausted"] is True
+    assert late["detail"] == "peer holds the lock"
+
+
+def test_transient_spawn_refusal_predicate_is_shared_by_both_callers():
+    """The two fix/review spawn callers must not re-derive "transient" locally.
+
+    They drifted once already: task_lifecycle_fix_completion retried a deferral
+    while review_request_changes escalated the identical condition as a stall
+    requiring manual intervention (both fired on PR #17941). One definition.
+    """
+    import app.review_pipeline as rp
+    import app.review_request_changes as rrc
+    import app.task_lifecycle_fix_completion as tlfc
+
+    assert tlfc.spawn_refusal_is_transient is rp.spawn_refusal_is_transient
+    assert rrc.spawn_refusal_is_transient is rp.spawn_refusal_is_transient
+
+    deferred = make_task(context={SPAWN_REASON_KEY: SPAWN_REASON_DEFERRED})
+    assert rp.spawn_refusal_is_transient(deferred) is True
+    assert rp.spawn_refusal_is_already_satisfied(deferred) is False
+
+    # Every non-DEFERRED reason stays terminal for the transient predicate.
+    for terminal_reason in (
+        "cap_exhausted",
+        "stuck_cycle",
+        "supersession_churn_halt",
+        "blocked_repeat_fingerprint",
+        "abandon_candidate",
+        "unknown",
+    ):
+        other = make_task(context={SPAWN_REASON_KEY: terminal_reason})
+        assert rp.spawn_refusal_is_transient(other) is False, terminal_reason
+        assert rp.spawn_refusal_is_already_satisfied(other) is False, terminal_reason
