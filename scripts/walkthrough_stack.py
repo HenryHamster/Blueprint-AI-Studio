@@ -603,8 +603,25 @@ def _cli_check(args: argparse.Namespace) -> int:
     if not os.path.isdir(build_context):
         problems.append(f"no backend/ build context at {build_context}")
     try:
+        # ``-c safe.directory=<workspace>`` is load-bearing. ``--workspace`` is
+        # an arbitrary operator-supplied path, so the checkout is routinely
+        # owned by a uid other than the one running this pre-flight (a
+        # runner-created workspace inspected by an operator, a checkout bound
+        # into a container that runs as root). Without it git answers every
+        # command with "detected dubious ownership" (exit 128) and this branch
+        # reports "is not a git checkout" about a perfectly good checkout --
+        # a fail-closed refusal built on a read that never happened. The
+        # refusal below stays exactly as-is; only the read is repaired.
         result = subprocess.run(
-            ["git", "-C", workspace, "rev-parse", "--is-inside-work-tree"],
+            [
+                "git",
+                "-c",
+                f"safe.directory={workspace}",
+                "-C",
+                workspace,
+                "rev-parse",
+                "--is-inside-work-tree",
+            ],
             capture_output=True,
             encoding="utf-8",
             timeout=_DOCKER_SMALL_TIMEOUT_S,
