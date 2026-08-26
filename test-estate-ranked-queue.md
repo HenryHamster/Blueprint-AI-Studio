@@ -11,7 +11,7 @@
 
 | Area | Files | Test LOC | Canonical tests | Measured cost | Unknown-cost files |
 |------|------:|---------:|----------------:|--------------:|-------------------:|
-| backend | 642 | 1,004,035 | 26,706 | 11,110.296s (640 files) | 2 |
+| backend | 642 | 1,004,122 | 26,707 | 11,110.296s (640 files) | 2 |
 | admin-ui | 254 | 101,607 | 4,537 | 209.625s (254 files) | 0 |
 | admin-ui-viewport | 165 | 31,747 | 822 | 0.000s (0 files) | 165 |
 | agent | 129 | 112,976 | 6,174 | 314.283s (129 files) | 0 |
@@ -40,7 +40,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 16 | P2 | backend | `backend/testing/test_agent.py` | 29,469 | 515 | critical (>5000 LOC) | 65.904s measured | — |
 | 17 | P2 | backend | `backend/testing/test_metrics_integrity_sweep.py` | 8,161 | 216 | critical (>5000 LOC) | 65.620s measured | — |
 | 18 | P2 | backend | `backend/testing/test_admin_routers__version_lifecycle.py` | 5,056 | 103 | critical (>5000 LOC) | 58.078s measured | — |
-| 19 | P2 | backend | `backend/testing/test_compute.py` | 9,361 | 192 | critical (>5000 LOC) | 57.415s measured | — |
+| 19 | P2 | backend | `backend/testing/test_compute.py` | 9,365 | 192 | critical (>5000 LOC) | 57.415s measured | — |
 | 20 | P2 | backend | `backend/testing/test_orchestrator.py` | 18,818 | 362 | critical (>5000 LOC) | 57.238s measured | — |
 | 21 | P2 | backend | `backend/testing/test_compute_experiment_completion.py` | 7,103 | 132 | critical (>5000 LOC) | 55.582s measured | — |
 | 22 | P2 | backend | `backend/testing/test_knowledge_documents.py` | 6,801 | 164 | critical (>5000 LOC) | 48.488s measured | — |
@@ -89,7 +89,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 65 | P3 | backend | `backend/testing/test_project_tools.py` | 3,447 | 108 | high (3000–5000 LOC) | 27.728s measured | — |
 | 66 | P3 | backend | `backend/testing/test_digest_sr.py` | 3,895 | 74 | high (3000–5000 LOC) | 27.494s measured | — |
 | 67 | P3 | backend | `backend/testing/test_improvement_lane.py` | 3,811 | 100 | high (3000–5000 LOC) | 26.526s measured | — |
-| 68 | P3 | backend | `backend/testing/test_compute_experiment_spawn.py` | 4,552 | 151 | high (3000–5000 LOC) | 26.515s measured | — |
+| 68 | P3 | backend | `backend/testing/test_compute_experiment_spawn.py` | 4,555 | 151 | high (3000–5000 LOC) | 26.515s measured | — |
 | 69 | P3 | backend | `backend/testing/test_digest_direction_progress.py` | 3,284 | 61 | high (3000–5000 LOC) | 25.744s measured | — |
 | 70 | P3 | backend | `backend/testing/test_reaper_sweeps_compute_image.py` | 3,046 | 77 | high (3000–5000 LOC) | 25.598s measured | — |
 | 71 | P3 | backend | `backend/testing/test_pipeline_reliability.py` | 4,259 | 54 | high (3000–5000 LOC) | 23.104s measured | — |
@@ -216,7 +216,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 192 | P5 | agent | `agent/src/prompts/thinker.test.ts` | 1,904 | 101 | moderate (1500–2999 LOC) | 0.032s measured | — |
 | 193 | P5 | agent | `agent/src/prompt.format.test.ts` | 1,512 | 102 | moderate (1500–2999 LOC) | 0.029s measured | — |
 | 194 | P5 | agent | `agent/src/prompts/pr-helper.test.ts` | 2,353 | 41 | moderate (1500–2999 LOC) | 0.025s measured | — |
-| 195 | G | backend | `backend/testing/test_scripts_test_lane.py` | 363 | 3 | under 1500 LOC | 208.064s measured | — |
+| 195 | G | backend | `backend/testing/test_scripts_test_lane.py` | 380 | 3 | under 1500 LOC | 208.064s measured | — |
 | 196 | G | backend | `backend/testing/test_task_outcomes.py` | 1,375 | 108 | under 1500 LOC | 187.368s measured | — |
 | 197 | G | backend | `backend/testing/test_task_evaluators.py` | 1,172 | 79 | under 1500 LOC | 153.388s measured | — |
 | 198 | G | backend | `backend/testing/test_qualification_triggers.py` | 1,052 | 80 | under 1500 LOC | 143.296s measured | — |
@@ -231,7 +231,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | 207 | G | backend | `backend/testing/test_rollup_orphan_prs.py` | 350 | 32 | under 1500 LOC | 79.804s measured | — |
 | 208 | G | backend | `backend/testing/test_project_resource_envelope.py` | 883 | 65 | under 1500 LOC | 77.566s measured | — |
 | 209 | G | backend | `backend/testing/test_rollup_state.py` | 209 | 24 | under 1500 LOC | 62.286s measured | — |
-| 210 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 608 | 5 | under 1500 LOC | 57.849s measured | — |
+| 210 | G | backend | `backend/testing/test_harness_timeout_budgets.py` | 671 | 6 | under 1500 LOC | 57.849s measured | — |
 | 211 | G | agent | `agent/src/prompts/terminal-checkpoint-helpers.test.ts` | 435 | 12 | under 1500 LOC | 52.983s measured | — |
 | 212 | G | backend | `backend/testing/test_scope_complexity.py` | 380 | 32 | under 1500 LOC | 52.778s measured | — |
 | 213 | G | backend | `backend/testing/test_migration_0640_0682_workday_chain.py` | 334 | 1 | under 1500 LOC | 50.136s measured | — |
