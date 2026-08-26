@@ -1513,7 +1513,7 @@ async def test_strategic_cadence_uses_monotonic_accepted_cycle_receipt(
 
 @pytest.mark.asyncio
 async def test_disabled_automatic_strategic_lane_still_spawns_one_tactical_root(
-    db_session, mocker
+    db_session, mocker, caplog
 ):
     """A due cadence and pending retry cannot leak into a tactical canary.
 
@@ -1521,7 +1521,19 @@ async def test_disabled_automatic_strategic_lane_still_spawns_one_tactical_root(
     conditions armed.  The project-owned flag suppresses both calls without
     consuming their durable markers, while the eligible direction still gets
     exactly one autonomous research root.
+
+    The suppression must also be AUDIBLE.  Previously this scheduler pass took
+    the disabled branch with no log line, no counter and no marker: the tactical
+    root below still spawned, so every liveness surface stayed green while the
+    entire automatic Strategic authoring lane was off.  Assert the reason line
+    here, at the real call site, not just on the helper in isolation.
     """
+    import logging
+
+    from app import strategic_cycle_admission as _admission_mod
+
+    _admission_mod.reset_strategic_lane_suppression_notices()
+    caplog.set_level(logging.WARNING, logger="app.strategic_cycle_admission")
     strategic_review = mocker.patch(
         "app.strategic_spawning._spawn_strategic_review",
         new=AsyncMock(return_value=True),
@@ -1587,6 +1599,26 @@ async def test_disabled_automatic_strategic_lane_still_spawns_one_tactical_root(
     await db_session.refresh(project)
     assert project.vision["_pending_strategic_review"] == pending_retry
     assert "_strategic_last_accepted_research_count" not in project.vision
+
+    suppression_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "Automatic Strategic cycles SUPPRESSED" in record.getMessage()
+    ]
+    assert suppression_lines, (
+        "the disabled Strategic lane took the suppressed branch silently"
+    )
+    assert all(
+        "build_config.automatic_strategic_cycles_enabled" in line
+        for line in suppression_lines
+    )
+    assert all(str(project.id) in line for line in suppression_lines)
+    # Both entry conditions were armed, so both suppressed triggers must be named.
+    triggers = {
+        line.split("trigger=", 1)[1].split(";", 1)[0] for line in suppression_lines
+    }
+    assert triggers == {"autonomous_loop_pass", "strategic_cadence_due"}, triggers
+    _admission_mod.reset_strategic_lane_suppression_notices()
 
 
 def test_strategic_cadence_receipt_does_not_consume_concurrent_completion():

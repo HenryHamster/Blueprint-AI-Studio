@@ -347,7 +347,10 @@ async def get_all_projects(
                 "build_config": _redact_build_config(
                     row.build_config or {}, row.my_role
                 ),
-                "build_config_warnings": build_config_lint_warnings(row.build_config),
+                "build_config_warnings": build_config_lint_warnings(
+                    row.build_config,
+                    autonomous_enabled=row.autonomous_enabled,
+                ),
                 "merge_verification_verdict": compute_merge_verification_verdict(row),
                 "merge_gate_runtime": merge_gate_runtime_block(row),
                 "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
@@ -420,7 +423,10 @@ async def get_project(
         "running_update_acknowledged_at": utc_iso(project.running_update_acknowledged_at),
         "self_reflection_log": project.self_reflection_log or [],
         "build_config": _redact_build_config(project.build_config or {}, role),
-        "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "build_config_warnings": build_config_lint_warnings(
+            project.build_config,
+            autonomous_enabled=project.autonomous_enabled,
+        ),
         "merge_verification_verdict": compute_merge_verification_verdict(project),
         "merge_gate_runtime": merge_gate_runtime_block(project),
         "autonomous_enabled": project.autonomous_enabled,
@@ -496,7 +502,10 @@ async def get_project_summary(
         "running_update": project.running_update,
         "running_update_acknowledged_at": utc_iso(project.running_update_acknowledged_at),
         "build_config": _redact_build_config(project.build_config or {}, role),
-        "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "build_config_warnings": build_config_lint_warnings(
+            project.build_config,
+            autonomous_enabled=project.autonomous_enabled,
+        ),
         "merge_verification_verdict": compute_merge_verification_verdict(project),
         "merge_gate_runtime": merge_gate_runtime_block(project),
         "autonomous_enabled": project.autonomous_enabled,
@@ -875,7 +884,9 @@ async def update_project(
     # they already have. Warnings are computed from the validated, committed
     # build_config so the value reflects what was actually persisted.
     response = project.model_dump()
-    response["build_config_warnings"] = build_config_lint_warnings(project.build_config)
+    response["build_config_warnings"] = build_config_lint_warnings(
+        project.build_config, autonomous_enabled=project.autonomous_enabled
+    )
     response["merge_verification_verdict"] = compute_merge_verification_verdict(project)
     response["merge_gate_runtime"] = merge_gate_runtime_block(project)
     return response
@@ -948,7 +959,10 @@ async def detect_project_build_config(
 
     return {
         "build_config": project.build_config or {},
-        "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "build_config_warnings": build_config_lint_warnings(
+            project.build_config,
+            autonomous_enabled=project.autonomous_enabled,
+        ),
         "merge_verification_verdict": compute_merge_verification_verdict(project),
         "merge_gate_runtime": merge_gate_runtime_block(project),
     }
