@@ -41,6 +41,7 @@ class). The ratchet still pins that the real generator exists and is the one
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -65,6 +66,7 @@ from derived_artifact_merge_resolve import (  # noqa: E402
     union_insert_only,
     unmerged_paths,
 )
+import derived_artifact_merge_resolve as dar  # noqa: E402
 from derived_artifact_repair import AUTOREPAIRABLE  # noqa: E402
 
 DURATIONS = "backend/.test_durations"
@@ -310,6 +312,89 @@ def test_resolves_both_derived_conflicts_and_leaves_the_tree_committable(conflic
 
     _git(conflicted_repo, "commit", "-q", "--no-edit")
     assert _git(conflicted_repo, "status", "--porcelain").strip() == ""
+
+
+# --------------------------------------------------------------------------
+# The checkout this runs over is routinely owned by someone else
+# --------------------------------------------------------------------------
+#
+# This module runs as a git MERGE DRIVER, i.e. as a CHILD of another git
+# process, and as a resolver invoked from the agent. ``-c safe.directory=`` is
+# PER-INVOCATION: a parent `git -c safe.directory=... merge` does not pass it
+# down, so the merge itself succeeds and the driver's own reads die with
+# "detected dubious ownership" (exit 128). The failure is expensive rather than
+# loud -- it reads as "this conflict is not mechanically resolvable" and
+# escalates to a VM plus an LLM turn for a conflict with one correct answer.
+
+_DUBIOUS_OWNERSHIP_RC = 128
+
+
+def _foreign_owned_git_or_skip(root: Path) -> None:
+    """Stage "another user owns this checkout" without needing a second uid.
+
+    ``GIT_TEST_ASSUME_DIFFERENT_OWNER=1`` is git's own switch for exactly this
+    condition, so a single-uid container reproduces the real CI failure. Skip
+    rather than assert when this git cannot stage it.
+    """
+    env = {**os.environ, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+    kw = {"cwd": root, "capture_output": True, "text": True, "env": env,
+          "timeout": 15}
+    bare = subprocess.run(["git", "rev-parse", "--show-toplevel"], **kw)
+    safe = subprocess.run(
+        ["git", "-c", f"safe.directory={root}", "rev-parse", "--show-toplevel"], **kw
+    )
+    if bare.returncode != _DUBIOUS_OWNERSHIP_RC or safe.returncode != 0:
+        pytest.skip("this git cannot stage the dubious-ownership condition here")
+    assert "dubious ownership" in bare.stderr, bare.stderr
+
+
+def test_resolves_a_merge_in_a_checkout_git_calls_foreign_owned(
+    conflicted_repo, monkeypatch
+):
+    """Real conflicted tree, real exit-128 git, no mock of the git layer.
+
+    Kills a dropped ``safe.directory`` on either read independently: without it
+    on ``_git`` the pass raises out of ``unmerged_paths``; without it on
+    ``_read_stage`` both sides read as absent and the union refuses as an
+    add/delete divergence.
+    """
+    _foreign_owned_git_or_skip(conflicted_repo)
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+
+    outcome = resolve_merge(conflicted_repo)
+
+    assert outcome.complete, outcome
+    assert set(outcome.resolved) == {DURATIONS, RANKED_QUEUE}
+    assert unmerged_paths(conflicted_repo) == ()
+    merged = json.loads((conflicted_repo / DURATIONS).read_text(encoding="utf-8"))
+    assert merged == {
+        "testing/test_base.py::test_base": 1.5,
+        "testing/test_ours.py::test_x": 2.5,
+        "testing/test_theirs.py::test_x": 3.5,
+    }
+
+
+def test_repo_discovery_works_in_a_checkout_git_calls_foreign_owned(
+    tmp_path, monkeypatch
+):
+    """``--repo`` is optional, so discovery must survive the same condition."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main", ".")
+    _foreign_owned_git_or_skip(repo)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+
+    assert dar._repo_root(None).resolve() == repo.resolve()
+
+
+def test_repo_discovery_still_refuses_outside_a_repository(tmp_path, monkeypatch):
+    """Hardening the READ must not soften the fail-closed CONSEQUENCE."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.chdir(plain)
+    with pytest.raises(SystemExit):
+        dar._repo_root(None)
 
 
 def test_refuses_and_mutates_nothing_when_any_conflict_is_not_mechanical(conflicted_repo):

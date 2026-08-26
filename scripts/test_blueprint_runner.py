@@ -3,7 +3,9 @@
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2095,6 +2097,87 @@ class StatusResourceLimitsTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         output = fake_stdout.getvalue()
         self.assertIn("env file not found", output)
+
+
+class AgentSourceRevisionOwnershipTests(unittest.TestCase):
+    """``_agent_source_revision`` is a FAIL-OPEN read, so it has to work.
+
+    ``None`` from this read leaves ``source_revision`` falsy in
+    ``ensure_agent_image``, which short-circuits ``_image_source_revision`` and
+    pins ``source_mismatch`` to ``False``. A STALE agent image is then reported
+    "present -> docker-agent path ON" and reused -- the orchestrator-ahead-of-
+    agent-image wedge, reached not by deciding the image was current but by
+    never being allowed to look.
+    """
+
+    _DUBIOUS_OWNERSHIP_RC = 128
+
+    def _repo_with_agent_tree(self):
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "agent"))
+        with open(os.path.join(root, "agent", "index.ts"), "w", encoding="utf-8") as fh:
+            fh.write("export {};" + chr(10))
+        for argv in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@example.com"],
+            ["git", "config", "user.name", "t"],
+            ["git", "add", "-A"],
+            ["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"],
+        ):
+            subprocess.run(argv, cwd=root, capture_output=True, timeout=15, check=False)
+        return root
+
+    def _require_foreign_owned_git(self, root):
+        """Stage "another user owns this checkout" without a second uid.
+
+        ``GIT_TEST_ASSUME_DIFFERENT_OWNER=1`` is git's own switch for the exact
+        condition CI hits when a repo owned by the runner user is read by a
+        process running as someone else -- a container running as root, or the
+        ``blueprint-runner`` systemd unit whose ``User=`` is not the checkout
+        owner. Skip rather than fail if this git cannot stage it.
+        """
+        env = {**os.environ, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+        kw = {"cwd": root, "capture_output": True, "text": True, "env": env,
+              "timeout": 15}
+        bare = subprocess.run(["git", "rev-parse", "HEAD:agent"], **kw)
+        safe = subprocess.run(
+            ["git", "-c", f"safe.directory={root}", "rev-parse", "HEAD:agent"], **kw
+        )
+        if bare.returncode != self._DUBIOUS_OWNERSHIP_RC or safe.returncode != 0:
+            self.skipTest("this git cannot stage the dubious-ownership condition here")
+        self.assertIn("dubious ownership", bare.stderr)
+
+    def test_revision_is_read_from_a_checkout_git_calls_foreign_owned(self):
+        """Real repo, real exit-128 git, no mock: the tree id must come back."""
+        root = self._repo_with_agent_tree()
+        self._require_foreign_owned_git(root)
+
+        with patch.dict(os.environ, {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
+            revision = br._agent_source_revision(repo_root=root)
+
+        self.assertIsNotNone(
+            revision,
+            "unhardened, git exits 128 here and the staleness check silently "
+            "disappears",
+        )
+        self.assertRegex(revision, r"^[0-9a-f]{40,64}$")
+
+    def test_a_null_revision_reports_a_stale_image_as_current(self):
+        """The consequence the read above exists to prevent, made explicit."""
+        agent_dir = tempfile.mkdtemp()
+        run = _fake_docker(present=True, image_revision="a" * 40)
+
+        result = br.ensure_agent_image(
+            tag="blueprint-agent:local",
+            docker_usable=True,
+            agent_dir=agent_dir,
+            source_revision=None,
+            _run=run,
+        )
+
+        # No mismatch can be computed, so a demonstrably stale image is ON.
+        self.assertEqual(result.image, "blueprint-agent:local")
+        self.assertTrue(result.active)
 
 
 if __name__ == "__main__":

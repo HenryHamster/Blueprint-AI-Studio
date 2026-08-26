@@ -1,4 +1,10 @@
-"""Standalone guard: no test may be written in a shape that cannot fail.
+"""Standalone guard: no guard may be written in a shape that cannot fail.
+
+SCOPE: every ``*.py`` module under ``backend/testing`` and ``scripts`` -- test
+modules AND the helper/checker modules they delegate to. The rules below are
+about guard machinery, and in this repository the machinery lives mostly in
+modules the ``test_`` prefix does not match. See ``_iter_corpus_files``.
+
 
 THE DEFECT CLASS THIS EXISTS TO PREVENT
 ---------------------------------------
@@ -98,11 +104,20 @@ _REPO_TOPLEVEL = (
 )
 
 # Non-vacuity floors. Pinned as literals ON PURPOSE and set far below the real
-# counts (630 files / 367 predicates / 274 corpus calls / 1052 try blocks under
-# backend/testing, 39 / 164 / 22 / 117 under scripts as of 2026-08-25) so a
-# broken path -- or a matcher that has stopped recognising the shape it polices
-# -- fails loudly instead of passing on an empty corpus. Deriving them from the
-# scan itself is exactly the self-certification this module exists to prevent.
+# counts (662 files / 22 of them non-test / 407 predicates / 296 corpus calls /
+# 1113 try blocks under backend/testing, 105 / 62 / 290 / 56 / 835 under scripts
+# as of 2026-08-25) so a broken path -- or a matcher that has stopped
+# recognising the shape it polices -- fails loudly instead of passing on an
+# empty corpus. Deriving them from the scan itself is exactly the
+# self-certification this module exists to prevent.
+#
+# ``non_test_files`` is the floor that keeps the corpus from silently shrinking
+# back to ``test_*.py``. That narrowing is not hypothetical: it is what this
+# module shipped with, and it left every guard IMPLEMENTATION -- the modules
+# that actually root corpus scans and probe ``.git`` -- outside the scan. A
+# planted violation of each rule sat in two of them while this module reported
+# ``6 passed``. A ``files`` floor alone cannot catch that: backend/testing has
+# 640 test modules, so dropping all 22 non-test ones barely moves it.
 #
 # They are declared PER ROOT because the lanes see different trees: the sharded
 # backend lane runs inside the Docker image, which carries backend/ as /app and
@@ -112,12 +127,14 @@ _REPO_TOPLEVEL = (
 _ROOT_FLOORS = {
     "backend/testing": {
         "files": 400,
+        "non_test_files": 15,
         "fs_predicates": 200,
         "corpus_calls": 150,
         "try_blocks": 600,
     },
     "scripts": {
         "files": 25,
+        "non_test_files": 40,
         "fs_predicates": 80,
         "corpus_calls": 12,
         "try_blocks": 60,
@@ -175,14 +192,41 @@ _ROOT_MISS_REASONS = {
 }
 
 
-def _iter_test_files() -> list[tuple[str, Path]]:
-    """Yield (root_label, path) so coverage can be asserted per root."""
+def _iter_corpus_files() -> list[tuple[str, Path]]:
+    """Yield (root_label, path) for EVERY ``*.py`` module in each guard root.
+
+    Not ``test_*.py``. The three rules police guard MACHINERY -- where a corpus
+    scan is rooted, how a ``.git``-backed guard decides it can run, whether a
+    handler eats its own failure signal -- and in this repository most of that
+    machinery lives in helper modules whose names the ``test_`` prefix does not
+    match: ``check_size_limits.py``, ``check_test_imports.py``,
+    ``impacted_tests.py``, ``estate_inventory.py``, ``git_checkout_probe.py``
+    and ``repo_scripts_path.py`` under backend/testing, and
+    ``static_release_guard.py``, ``sentinel_freshness.py``,
+    ``backend_verification_guard.py`` and ``durations_quality.py`` under
+    scripts/. A ``test_*.py``-only corpus left 84 of those modules -- 22 under
+    backend/testing and 62 under scripts -- permanently unscanned, which is
+    this module's own defect class inside this module: the meta-guard reported
+    clean over the test files while every guard IMPLEMENTATION sat outside its
+    reach.
+
+    MEASURED, not argued: one violation of each of the three rules was planted
+    in ``estate_inventory.py`` and ``sentinel_freshness.py`` and this module
+    still reported ``6 passed``. ``test_the_corpus_reaches_non_test_modules``
+    below, and the ``non_test_files`` floors in ``_ROOT_FLOORS``, exist so a
+    future narrowing of this glob fails loudly instead of silently shrinking
+    the corpus back.
+    """
     found: list[tuple[str, Path]] = [
-        ("backend/testing", p) for p in sorted(BACKEND_TESTING.glob("test_*.py"))
+        ("backend/testing", p) for p in sorted(BACKEND_TESTING.glob("*.py"))
     ]
     if SCRIPTS_DIR is not None:
-        found.extend(("scripts", p) for p in sorted(SCRIPTS_DIR.glob("test_*.py")))
+        found.extend(("scripts", p) for p in sorted(SCRIPTS_DIR.glob("*.py")))
     return found
+
+
+def _is_test_module(path: Path) -> bool:
+    return path.name.startswith("test_")
 
 
 def _rel(path: Path) -> str:
@@ -467,7 +511,7 @@ def _collect() -> tuple[dict[str, list[str]], dict[str, dict[str, int]]]:
         "self_defeating_try": [],
     }
     coverage: dict[str, dict[str, int]] = {}
-    for label, path in _iter_test_files():
+    for label, path in _iter_corpus_files():
         try:
             source = path.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source)
@@ -475,9 +519,17 @@ def _collect() -> tuple[dict[str, list[str]], dict[str, dict[str, int]]]:
             continue
         counts = coverage.setdefault(
             label,
-            {"files": 0, "fs_predicates": 0, "corpus_calls": 0, "try_blocks": 0},
+            {
+                "files": 0,
+                "non_test_files": 0,
+                "fs_predicates": 0,
+                "corpus_calls": 0,
+                "try_blocks": 0,
+            },
         )
         counts["files"] += 1
+        if not _is_test_module(path):
+            counts["non_test_files"] += 1
         rel = _rel(path)
         # ONE walk per file. Rules 1 and 3 and every coverage counter are
         # decided from the node in hand; the tree is then dropped rather than
@@ -548,7 +600,53 @@ def _assert_corpus_is_real(coverage: dict[str, dict[str, int]]) -> None:
             )
 
 
-# The whole backend/testing + scripts corpus (669 files) is read and AST-walked
+def test_the_corpus_reaches_the_guard_implementations() -> None:
+    """Regression: the scan must not narrow back to ``test_*.py``.
+
+    This module shipped globbing ``test_*.py`` only. The three rules police
+    guard machinery, and the machinery lives in helper modules -- so the scan
+    reached the tests that CALL the guards and never the guards themselves.
+    Proven by planting a rule-1, a rule-2 and a rule-3 violation in
+    ``estate_inventory.py`` and ``sentinel_freshness.py``: the module still
+    reported ``6 passed``.
+
+    Asserted on the ROSTER rather than on the memoised counters so this fails
+    on a narrowed glob even if ``_collect`` is never reached, and stated per
+    root so losing one root cannot be covered by the other.
+    """
+    by_root: dict[str, list[Path]] = {}
+    for label, path in _iter_corpus_files():
+        by_root.setdefault(label, []).append(path)
+
+    assert by_root, (
+        f"no corpus root resolved at all. backend/testing: "
+        f"{_ROOT_MISS_REASONS['backend/testing']}; scripts: "
+        f"{_ROOT_MISS_REASONS['scripts']}."
+    )
+    for label, floor in ((k, v["non_test_files"]) for k, v in _ROOT_FLOORS.items()):
+        paths = by_root.get(label)
+        if paths is None:
+            # Same fail-closed-under-CI / skip-on-a-partial-dev-layout split
+            # that _assert_corpus_is_real uses; see its comment.
+            message = (
+                f"the {label} corpus root never resolved: "
+                f"{_ROOT_MISS_REASONS.get(label, label)}."
+            )
+            if os.environ.get("CI"):
+                pytest.fail(message)
+            pytest.skip(message)
+            continue
+        non_test = sorted(p.name for p in paths if not _is_test_module(p))
+        assert len(non_test) >= floor, (
+            f"only {len(non_test)} non-test module(s) in the {label} corpus; "
+            f"expected at least {floor}. The scan has narrowed back to "
+            f"test_*.py, which leaves every guard IMPLEMENTATION under {label} "
+            f"unscanned while this module goes on reporting clean. Scanned: "
+            f"{non_test}"
+        )
+
+
+# The whole backend/testing + scripts corpus (767 files) is read and AST-walked
 # once here; the two rule tests below reuse the memoised result and cost nothing.
 # Measured at 32.2s on a Windows checkout (Python 3.13), against the lanes' own
 # --timeout=30 -- so this guard CANNOT run without an explicit marker, and a

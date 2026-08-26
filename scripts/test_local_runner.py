@@ -7053,8 +7053,17 @@ class TestFunctionalProbes(unittest.TestCase):
         fake = MagicMock()
         fake.returncode = 0
         fake.stdout = "v22-15-gabc1234-dirty\n"
-        with patch("subprocess.run", return_value=fake):
+        with patch("subprocess.run", return_value=fake) as run:
             self.assertEqual(local_runner._runner_version(), "v22-15-gabc1234-dirty")
+        # Same ownership hazard as the source-identity read below: unhardened,
+        # git exits 128 under a systemd User= that does not own the checkout and
+        # every heartbeat reports no version at all, which the fleet view cannot
+        # distinguish from an old runner that never sent one.
+        scripts_dir = os.path.dirname(os.path.abspath(local_runner.__file__))
+        self.assertEqual(
+            run.call_args.args[0][:3],
+            ["git", "-c", f"safe.directory={scripts_dir}"],
+        )
 
     def test_runner_version_none_on_nonzero_exit(self):
         fake = MagicMock()
@@ -7087,7 +7096,19 @@ class TestFunctionalProbes(unittest.TestCase):
             self.assertEqual(
                 local_runner._clean_source_sha("v22-15-gabc1234"), sha
             )
-        self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "HEAD"])
+        # ``-c safe.directory=<scripts dir>`` is part of the contract, not
+        # decoration: the runner is routinely installed as a systemd unit whose
+        # User= is not the uid that owns the checkout, and git answers every
+        # command in that case with "detected dubious ownership" (exit 128).
+        # This function returns None on any failure, so an unhardened read is a
+        # MISSING source identity on every heartbeat -- and the agent_image
+        # serving gate compares exact commit identities, so a missing one can
+        # never match.
+        scripts_dir = os.path.dirname(os.path.abspath(local_runner.__file__))
+        self.assertEqual(
+            run.call_args.args[0],
+            ["git", "-c", f"safe.directory={scripts_dir}", "rev-parse", "HEAD"],
+        )
 
     def test_checkout_source_sha_rejects_dirty_checkout(self):
         with patch("subprocess.run") as run:
@@ -7123,6 +7144,18 @@ class TestFunctionalProbes(unittest.TestCase):
                 local_runner._agent_binary_checkout_sha(["node", entry]), sha
             )
         self.assertEqual(run.call_args.kwargs["cwd"], "/alternate-checkout/agent/dist")
+        # BLUEPRINT_AGENT_BINARY deliberately points at a DIFFERENT checkout, so
+        # "owned by another user" is the expected case here, not the exotic one.
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "git",
+                "-c",
+                "safe.directory=/alternate-checkout/agent/dist",
+                "rev-parse",
+                "HEAD",
+            ],
+        )
 
     def test_agent_binary_checkout_sha_none_on_short_sha(self):
         fake = MagicMock()
@@ -7738,7 +7771,14 @@ class TestCleanSourceSha(_LocalRunnerTestCase):
                 full_sha,
             )
 
-        self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "HEAD"])
+        # See TestCheckoutSourceSha: a git that cannot read the checkout is a
+        # missing identity, not a wrong one, and nothing downstream can tell the
+        # difference.
+        scripts_dir = os.path.dirname(os.path.abspath(local_runner.__file__))
+        self.assertEqual(
+            run.call_args.args[0],
+            ["git", "-c", f"safe.directory={scripts_dir}", "rev-parse", "HEAD"],
+        )
         self.assertEqual(
             run.call_args.kwargs["cwd"],
             str(Path(local_runner.__file__).resolve().parent),

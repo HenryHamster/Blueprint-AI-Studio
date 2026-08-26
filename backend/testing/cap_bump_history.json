@@ -4862,6 +4862,14 @@
           "old_cap": 9900,
           "new_cap": 11950
         }
+      ],
+      "test_blueprint_cli.py": [
+        {
+          "commit_sha": "unattributed",
+          "commit_date": "2026-08-26T03:26:31.812228+00:00",
+          "old_cap": 8800,
+          "new_cap": 10250
+        }
       ]
     }
   }

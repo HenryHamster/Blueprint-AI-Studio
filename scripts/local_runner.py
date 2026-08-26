@@ -2202,7 +2202,15 @@ def _runner_version() -> str | None:
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     try:
         result = subprocess.run(
-            ["git", "describe", "--tags", "--always", "--dirty"],
+            [
+                "git",
+                "-c",
+                f"safe.directory={scripts_dir}",
+                "describe",
+                "--tags",
+                "--always",
+                "--dirty",
+            ],
             cwd=scripts_dir,
             capture_output=True,
             text=True,
@@ -2244,8 +2252,14 @@ def _checkout_source_sha() -> str | None:
     """
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     try:
+        # ``-c safe.directory``: the runner is routinely installed as a systemd
+        # unit whose User= is not the uid that owns the checkout, and git then
+        # refuses with "detected dubious ownership" (exit 128). This function
+        # returns None on any failure, so that lands as a MISSING source
+        # identity on every heartbeat -- and the agent_image serving gate
+        # compares exact commit identities, so a missing one can never match.
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-c", f"safe.directory={scripts_dir}", "rev-parse", "HEAD"],
             cwd=scripts_dir,
             capture_output=True,
             text=True,
@@ -2279,8 +2293,12 @@ def _agent_binary_checkout_sha(agent_binary: list[str] | None) -> str | None:
         return None
     entry_dir = os.path.dirname(os.path.realpath(entry_path))
     try:
+        # BLUEPRINT_AGENT_BINARY can point at a checkout owned by a different
+        # user than the one running the runner, which is precisely the
+        # "dubious ownership" shape; without this the provenance silently
+        # degrades to None. See ``_checkout_source_sha``.
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-c", f"safe.directory={entry_dir}", "rev-parse", "HEAD"],
             cwd=entry_dir,
             capture_output=True,
             text=True,
