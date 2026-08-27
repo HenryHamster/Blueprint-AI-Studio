@@ -399,6 +399,42 @@ class TestCli(unittest.TestCase):
         # docker info + git rev-parse both exercised; no containers created.
         self.assertEqual(mock_run.call_count, 2)
 
+    def test_check_names_the_workspace_safe_before_reading_it(self):
+        """The preflight must actually LOOK before it refuses.
+
+        ``--workspace`` is an arbitrary operator-supplied path, so the checkout
+        is routinely owned by a different uid than the process inspecting it. A
+        git without ``-c safe.directory=`` answers "detected dubious ownership"
+        and exits 128 for EVERY command, and the branch below then reports
+        "<ws> is not a git checkout" about a perfectly good checkout. The
+        refusal is correct; a refusal reached without reading is not.
+        """
+        ws = self._tmp_checkout()
+        args = wts.build_parser().parse_args(["--check", "--workspace", ws])
+        with mock.patch.object(wts.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                [], 0, stdout="true", stderr=""
+            )
+            self.assertEqual(wts._cli_check(args), 0)
+        git_argv = [
+            call.args[0]
+            for call in mock_run.call_args_list
+            if call.args and call.args[0] and call.args[0][0] == "git"
+        ]
+        self.assertEqual(len(git_argv), 1, mock_run.call_args_list)
+        self.assertEqual(git_argv[0][:3], ["git", "-c", f"safe.directory={ws}"])
+
+    def test_check_still_refuses_a_directory_that_is_not_a_checkout(self):
+        """Hardening the READ must not soften the fail-closed CONSEQUENCE."""
+        ws = self._tmp_checkout()
+        args = wts.build_parser().parse_args(["--check", "--workspace", ws])
+        with mock.patch.object(wts.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                subprocess.CompletedProcess([], 128, stdout="", stderr="nope"),
+            ]
+            self.assertEqual(wts._cli_check(args), 1)
+
     def test_check_fails_when_backend_context_missing(self):
         ws = tempfile.mkdtemp()
         args = wts.build_parser().parse_args(["--check", "--workspace", ws])

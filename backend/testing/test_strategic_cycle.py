@@ -7,8 +7,9 @@ real table.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -561,6 +562,135 @@ async def test_find_stalled_phase2_excludes_open_pause_window(db_session):
     )
     paused = await strategic_cycle.find_stalled(db_session, deploy_state=paused_state)
     assert all(c.id != cycle.id for c in paused)
+
+
+@pytest.mark.asyncio
+async def test_find_stalled_phase2_never_borrows_the_phase1_clock(db_session):
+    """A NULL ``phase2_started_at`` is missing evidence, not a 9h-old phase 2.
+
+    ``find_stalled`` used to fall back to ``phase1_started_at``, which reports
+    phase 1's age as phase 2's and hands the reaper a >3h verdict it never
+    measured. Mutation control: restoring
+    ``ref = c.phase2_started_at or c.phase1_started_at`` makes this cycle
+    stalled.
+    """
+    project = await _make_project(db_session)
+    cycle = StrategicCycle(
+        id="sc-p2-null-start",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow() - timedelta(hours=9),
+        phase2_started_at=None,
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    stalled = await strategic_cycle.find_stalled(db_session)
+    assert all(c.id != cycle.id for c in stalled)
+
+
+@pytest.mark.asyncio
+async def test_repair_missing_phase_starts_prefers_the_linked_task_start(db_session):
+    """The phase task is CREATED at phase start, so its created_at is the start."""
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Strategic review",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    cycle = StrategicCycle(
+        id="sc-p2-repair",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow() - timedelta(hours=9),
+        phase1_completed_at=_utcnow() - timedelta(hours=8),
+        phase2_task_id=task.id,
+        phase2_started_at=None,
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    repairs = await strategic_cycle.repair_missing_phase_starts(db_session)
+    await db_session.commit()
+    await db_session.refresh(cycle)
+
+    assert [r["cycle_id"] for r in repairs] == [cycle.id]
+    assert repairs[0]["source"] == strategic_cycle.PHASE_START_FROM_LINKED_TASK
+    assert cycle.phase2_started_at == task.created_at
+    # A pause baseline is stamped with the repair so the pause-aware deadline
+    # has one, and historical closed windows are not retroactively credited.
+    assert "phase2_pause_baseline" in cycle.cycle_metadata
+
+
+def test_phase_start_evidence_never_uses_phase1_start_for_phase2():
+    """Pure-function pin: phase 1's start is never evidence about phase 2.
+
+    This is the whole defect in one assertion — the fallback that produced the
+    ">3h in phase2" claim is a phase-1 timestamp.
+    """
+    phase1_start = _utcnow() - timedelta(hours=9)
+    cycle = StrategicCycle(
+        id="sc-evidence",
+        project_id=uuid.uuid4(),
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=phase1_start,
+        phase1_completed_at=None,
+        phase2_started_at=None,
+    )
+    now = _utcnow()
+    value, source = strategic_cycle.phase_start_evidence(
+        cycle, phase="phase2", linked_task=None, now=now
+    )
+    assert source == strategic_cycle.PHASE_START_FROM_OBSERVATION
+    assert value == now
+    assert value != phase1_start
+
+    # With a phase-1 completion the phase-2 clock starts there, not at phase-1 start.
+    cycle.phase1_completed_at = _utcnow() - timedelta(hours=8)
+    value, source = strategic_cycle.phase_start_evidence(
+        cycle, phase="phase2", linked_task=None, now=now
+    )
+    assert source == strategic_cycle.PHASE_START_FROM_PHASE1_COMPLETED
+    assert value == cycle.phase1_completed_at
+
+
+def test_phase_start_evidence_rejects_non_utc_aware_observation():
+    cycle = StrategicCycle(
+        id="sc-evidence-offset",
+        project_id=uuid.uuid4(),
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow() - timedelta(hours=9),
+        phase1_completed_at=None,
+        phase2_started_at=None,
+    )
+    non_utc = _utcnow().replace(tzinfo=timezone(timedelta(hours=1)))
+
+    with pytest.raises(ValueError, match="Expected UTC or naive datetime"):
+        strategic_cycle.phase_start_evidence(
+            cycle, phase="phase2", linked_task=None, now=non_utc
+        )
+
+
+def test_phase_start_evidence_phase1_falls_back_to_the_cycle_row():
+    """The phase-1 arm (unreachable via the NOT NULL column) still decides."""
+    created = _utcnow() - timedelta(hours=6)
+    cycle = StrategicCycle(
+        id="sc-evidence-p1",
+        project_id=uuid.uuid4(),
+        outcome=strategic_cycle.OUTCOME_PHASE1_RUNNING,
+        phase1_started_at=None,
+        created_at=created,
+    )
+    value, source = strategic_cycle.phase_start_evidence(
+        cycle, phase="phase1", linked_task=None, now=_utcnow()
+    )
+    assert source == strategic_cycle.PHASE_START_FROM_CYCLE_CREATED
+    assert value == created
 
 
 @pytest.mark.asyncio

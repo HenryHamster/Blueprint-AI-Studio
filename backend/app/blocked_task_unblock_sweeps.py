@@ -177,6 +177,73 @@ MISSING_FOUNDATION_MARKER_KEY = "missing_foundation"
 # by the old +10y sentinel path; any legitimate bounded recheck will be shorter.
 _TRANSIENT_BLOCKER_PARK_SENTINEL = timedelta(days=365)
 
+# Bounded number of times a blocker carrying the structured ``base_state``
+# recheck predicate may be requeued onto a FRESH integration base before
+# automatic recovery gives up and leaves the row escalated for the operator.
+#
+# Why a count and not just "one per distinct HEAD": the per-HEAD guard
+# (``_gate_revalidated_head``) already prevents a busy loop, but on a
+# high-churn integration branch HEAD advances many times a day, so per-HEAD
+# alone is an unbounded number of VM runs for a condition that is genuinely
+# not base-inherited. Bounding the COUNT keeps the good case cheap (the base
+# usually only has to move once for inherited rot to clear) and stops a
+# mis-classified blocker from quietly burning the fleet — the failure mode
+# that makes "auto-retry instead of escalate" worse than the bug it replaces.
+# Exhaustion is NOT a cancellation: the row stays BLOCKED and escalated, and
+# its status message names how many bases were tried and what was seen on the
+# last one.
+_BLOCKED_BASE_STATE_RECHECK_CAP = 3
+
+
+def _base_state_recheck_has_budget(task) -> bool:
+    """True iff *task* carries the ``base_state`` predicate with retries left."""
+    from app.gate_revalidation import base_state_recheck_eligible
+    from app.task_blocked import BASE_STATE_RECHECK_COUNT_KEY
+
+    if not base_state_recheck_eligible(task):
+        return False
+    used = int((task.context or {}).get(BASE_STATE_RECHECK_COUNT_KEY, 0))
+    return used < _BLOCKED_BASE_STATE_RECHECK_CAP
+
+
+def _base_state_recheck_clause(observation: dict) -> str:
+    """Human-readable "what the base-state re-check looked at" clause.
+
+    Surfaced-reasons requirement: an escalated base_state row must never read as
+    an unexplained stall OR as a silent retry loop. The clause names the budget
+    consumed, the base that was examined, and the concrete reason the re-check
+    did not fire.
+    """
+    used = int(observation.get("used", 0))
+    cap = int(observation.get("cap", _BLOCKED_BASE_STATE_RECHECK_CAP))
+    head = observation.get("head")
+    head_text = str(head)[:12] if isinstance(head, str) and head else "unknown"
+    if observation.get("exhausted"):
+        return (
+            f"automatic base-state recovery exhausted after {used}/{cap} requeues "
+            f"onto fresh integration bases (last seen {head_text}); the "
+            "precondition did not clear on any of them"
+        )
+    if observation.get("respawn"):
+        return (
+            f"re-checked {used}/{cap}: integration base advanced to {head_text}, "
+            "but a live same-scope respawn already covers this work"
+        )
+    if not observation.get("state_resolved", True):
+        return (
+            f"re-checked {used}/{cap}: integration base state could not be "
+            "resolved (no GitHub credentials or branch HEAD), holding"
+        )
+    if not observation.get("advanced"):
+        return (
+            f"re-checked {used}/{cap}: integration base unchanged at {head_text} "
+            "— nothing new to retry against"
+        )
+    return (
+        f"re-checked {used}/{cap}: integration base {head_text} is not a healthy "
+        "retry target (CI not green / still pending), holding"
+    )
+
 
 def _next_recheck_delay(
     attempts: int, *, cap: timedelta = _BLOCKED_RECHECK_MAX
@@ -193,6 +260,10 @@ def _next_recheck_delay(
     return timedelta(seconds=min(secs, cap.total_seconds()))
 
 
+# Hard ceiling for the operator-facing escalated BLOCKED status message.
+_ESCALATED_STATUS_MESSAGE_MAX = 500
+
+
 def _escalated_status_message(
     blocker_kind: str, detail: str, recheck_at: datetime
 ) -> str:
@@ -204,13 +275,26 @@ def _escalated_status_message(
     automatically re-examine it, so an operator reading the task list (or the
     admin blocked-tasks view) sees WHY it is stuck and WHEN it will be looked
     at again without having to open the alert or the raw context JSON.
+
+    The length budget is spent on the FREE-TEXT ``detail``, never on the fixed
+    head or the recheck-time tail. Truncating the assembled string instead —
+    which is what this did — silently amputated the WHEN half of that contract
+    whenever ``detail`` ran long: a base-state recheck clause prepended to a
+    full agent blocker reason assembles to 520 characters, so the operator was
+    shown "… — next automatic recheck at" with no timestamp after it, which
+    reads exactly like the unexplained stall this message exists to prevent.
     """
     detail_text = (detail or "").strip()
-    base = f"Blocked (escalated — operator alert raised): {blocker_kind or 'unknown'}"
+    head = f"Blocked (escalated — operator alert raised): {blocker_kind or 'unknown'}"
+    tail = f" — next automatic recheck at {recheck_at.strftime('%Y-%m-%d %H:%M UTC')}"
     if detail_text:
-        base += f" — {detail_text}"
-    base += f" — next automatic recheck at {recheck_at.strftime('%Y-%m-%d %H:%M UTC')}"
-    return base[:500]
+        separator = " — "
+        budget = _ESCALATED_STATUS_MESSAGE_MAX - len(head) - len(tail) - len(separator)
+        if budget > 1:
+            if len(detail_text) > budget:
+                detail_text = detail_text[: budget - 1].rstrip() + "…"
+            head += f"{separator}{detail_text}"
+    return (head + tail)[:_ESCALATED_STATUS_MESSAGE_MAX]
 
 
 def _is_escalated_needless_agent_blocker(task) -> bool:
@@ -1655,7 +1739,13 @@ async def sweep_unblock_blocked_tasks(
         # tasks).
         has_need = isinstance(get_blocker_metadata(task).get("need"), dict)
         is_transient = task.blocker_kind in {"file_conflict", "pending_rollup"}
-        if has_need or is_transient:
+        # A blocker carrying the structured ``base_state`` recheck predicate has a
+        # machine-checkable re-test with budget left, so it belongs on the low
+        # cadence for the same reason a resolvable need does: the sweep can
+        # actually clear it. Once the budget is spent it drops back to the
+        # known-hard backoff.
+        has_live_base_state_recheck = _base_state_recheck_has_budget(task)
+        if has_need or is_transient or has_live_base_state_recheck:
             next_recheck = now + _BLOCKED_PARKED_REEVAL_INTERVAL
         else:
             escalated_recheck_count = int(
@@ -1726,24 +1816,38 @@ async def sweep_unblock_blocked_tasks(
         # cheaply re-check the gate condition against current HEAD instead
         # of spawning a suite run.  One GitHub check-runs call per project
         # per sweep cycle (cached), not per blocked task.
-        from app.gate_revalidation import is_gate_failure_blocked as _gfb
+        from app.gate_revalidation import (
+            base_state_recheck_eligible as _base_eligible,
+            is_gate_failure_blocked as _gfb,
+        )
+
+        async def _cached_gate_state(project_id) -> dict:
+            """Integration-HEAD gate state, one GitHub call per project per sweep."""
+            key = str(project_id)
+            cached = _gate_cache.get(key)
+            if cached is None:
+                from app.gate_revalidation import resolve_gate_state
+
+                cached = await resolve_gate_state(
+                    session,
+                    project_id,
+                    github_info_cache=_github_cache,
+                )
+                _gate_cache[key] = cached or {}
+            return _gate_cache[key]
+
+        # What this tick's structured base-state re-check actually observed.
+        # Consumed by the escalated branch below so an escalated row's status
+        # message reports the re-check instead of restating the original block.
+        _base_observation: dict | None = None
 
         if _gfb(task):
             from app.gate_revalidation import (
                 has_live_respawn,
                 head_advanced_since_gate_failure,
-                resolve_gate_state,
             )
 
-            _pid_key = str(task.project_id)
-            _gs = _gate_cache.get(_pid_key)
-            if _gs is None:
-                _gs = await resolve_gate_state(
-                    session,
-                    task.project_id,
-                    github_info_cache=_github_cache,
-                )
-                _gate_cache[_pid_key] = _gs or {}
+            _gs = await _cached_gate_state(task.project_id)
             if (
                 _gs
                 and _gs.get(
@@ -1759,6 +1863,7 @@ async def sweep_unblock_blocked_tasks(
             ):
                 from sqlalchemy.orm.attributes import flag_modified
 
+                _was_escalated = bool((task.context or {}).get("_blocked_escalated"))
                 task = await _relock_blocked_retry_mutation_authority(session, task)
                 if task is None:
                     await _commit_task_row(_bc_start)
@@ -1795,11 +1900,144 @@ async def sweep_unblock_blocked_tasks(
                         },
                     )
                 )
+                # Condition lifecycle ended, so the alert lifecycle must too —
+                # a resumed task must not leave an open 'permanently blocked'
+                # ERROR alert behind. Best-effort; never aborts the resume.
+                if _was_escalated:
+                    from app.alert_dispatch import _resolve_blocked_escalation_alert
+
+                    with contextlib.suppress(Exception):
+                        await _resolve_blocked_escalation_alert(task, session)
                 await _commit_task_row(_bc_start)
                 continue
             # A live same-scope respawn means DON'T unblock; fall through to the
             # existing blocker machinery so the respawn completes instead of
             # racing the recovered original.
+        elif _base_eligible(task):
+            # ── STRUCTURED base-state re-check ─────────────────────────────
+            # Same recovery as the prose branch above, reached through the
+            # ``blocker['recheck']`` predicate recorded at block time instead of
+            # through a phrase match on whatever English the agent wrote. This
+            # is the half that was missing: a blocked precondition that named no
+            # foundation and matched no enumerated phrase was re-evaluated by
+            # NOTHING — elapsed time could cancel it and elapsed time could
+            # escalate it to a human, but nothing could ever clear it, so valid
+            # work stayed dead after the world fixed itself.
+            #
+            # Bounded, and loud when the bound runs out: each requeue needs a
+            # genuinely NEW integration base (``_gate_revalidated_head``) AND a
+            # slot from ``_BLOCKED_BASE_STATE_RECHECK_CAP``. Exhaustion leaves the
+            # row BLOCKED and escalated with a message naming what was tried.
+            from app.gate_revalidation import (
+                has_live_respawn,
+                head_advanced_since_gate_failure,
+            )
+            from app.task_blocked import BASE_STATE_RECHECK_COUNT_KEY
+
+            _base_used = int((task.context or {}).get(BASE_STATE_RECHECK_COUNT_KEY, 0))
+            # Seed ``head`` with the base this row was LAST requeued onto, so an
+            # exhausted row can name what it actually tried without spending a
+            # GitHub call it is no longer entitled to. Without this the budget
+            # message rendered "(last seen unknown)" on every exhausted row —
+            # the one operator-facing string whose whole job is to say which
+            # bases were tried.
+            _base_last_head = (task.context or {}).get(
+                "_gate_revalidated_head"
+            ) or (task.context or {}).get("generated_head_sha")
+            _base_observation = {
+                "used": _base_used,
+                "cap": _BLOCKED_BASE_STATE_RECHECK_CAP,
+                "exhausted": _base_used >= _BLOCKED_BASE_STATE_RECHECK_CAP,
+                "state_resolved": True,
+                "advanced": False,
+                "respawn": False,
+                "head": _base_last_head if isinstance(_base_last_head, str) else None,
+            }
+            if not _base_observation["exhausted"]:
+                _gs = await _cached_gate_state(task.project_id)
+                _base_observation["state_resolved"] = bool(_gs)
+                _base_observation["head"] = (_gs or {}).get(
+                    "head_sha"
+                ) or _base_observation["head"]
+                _base_observation["advanced"] = bool(
+                    _gs
+                    and head_advanced_since_gate_failure(
+                        task,
+                        _gs.get("head_sha"),
+                        head_committed_at=_gs.get("head_committed_at"),
+                    )
+                )
+                _base_ready = bool(
+                    _gs
+                    and _gs.get(
+                        "revalidation_ready", _gs.get("green_at_head", False)
+                    )
+                )
+                if _base_observation["advanced"] and _base_ready:
+                    if await has_live_respawn(task, session):
+                        _base_observation["respawn"] = True
+                    else:
+                        from sqlalchemy.orm.attributes import flag_modified
+
+                        _was_escalated = bool(
+                            (task.context or {}).get("_blocked_escalated")
+                        )
+                        _prior_base = (
+                            (task.context or {}).get("_gate_revalidated_head")
+                            or (task.context or {}).get("generated_head_sha")
+                        )
+                        task = await _relock_blocked_retry_mutation_authority(
+                            session, task
+                        )
+                        if task is None:
+                            await _commit_task_row(_bc_start)
+                            continue
+                        _reset_blocked_task_for_requeue(
+                            task, preserve_first_blocked=False
+                        )
+                        task.status = TaskStatus.QUEUED
+                        _from_text = (
+                            str(_prior_base)[:12]
+                            if isinstance(_prior_base, str) and _prior_base
+                            else "its original base"
+                        )
+                        task.latest_status_message = (
+                            "Unblocked — blocked precondition re-checked against a "
+                            f"fresh integration base ({_from_text} → "
+                            f"{_gs['head_sha'][:12]}); requeued to re-evaluate it "
+                            f"there ({_base_used + 1}/"
+                            f"{_BLOCKED_BASE_STATE_RECHECK_CAP})"
+                        )
+                        ctx = dict(task.context or {})
+                        ctx["_gate_revalidated_at"] = _gs["checked_at_utc"]
+                        ctx["_gate_revalidated_head"] = _gs["head_sha"]
+                        ctx[BASE_STATE_RECHECK_COUNT_KEY] = _base_used + 1
+                        task.context = ctx
+                        flag_modified(task, "context")
+                        session.add(task)
+                        requeued += 1
+                        pending_broadcasts.append(
+                            (
+                                str(task.project_id),
+                                {
+                                    "task_id": str(task.id),
+                                    "status": "QUEUED",
+                                    "message": task.latest_status_message,
+                                },
+                            )
+                        )
+                        # The 'permanently blocked' operator alert is now stale:
+                        # the condition lifecycle ended, so the alert lifecycle
+                        # must too. Best-effort — never abort the resume.
+                        if _was_escalated:
+                            from app.alert_dispatch import (
+                                _resolve_blocked_escalation_alert,
+                            )
+
+                            with contextlib.suppress(Exception):
+                                await _resolve_blocked_escalation_alert(task, session)
+                        await _commit_task_row(_bc_start)
+                        continue
 
         ctx = task.context or {}
         # Multi-need classification (shared by the parked and live paths): a
@@ -1953,9 +2191,22 @@ async def sweep_unblock_blocked_tasks(
                 ctx["_blocked_escalated_recheck_count"] = escalated_recheck_count
                 task.context = ctx
                 flag_modified(task, "context")
-                next_recheck = now + _next_recheck_delay(
-                    escalated_recheck_count, cap=_BLOCKED_ESCALATED_RECHECK_MAX
+                # A row carrying the structured base_state predicate is no longer
+                # "nothing here can verify its precondition cleared" — the branch
+                # at the top of this loop DID re-check it this tick. Until its
+                # bounded budget is spent it therefore belongs on the SAME low
+                # re-evaluation cadence as a parked blocker with a resolvable
+                # need, not on the 24h known-hard backoff; and its status message
+                # must report the re-check rather than restate the block.
+                _base_live = bool(
+                    _base_observation and not _base_observation.get("exhausted")
                 )
+                if _base_live:
+                    next_recheck = now + _BLOCKED_PARKED_REEVAL_INTERVAL
+                else:
+                    next_recheck = now + _next_recheck_delay(
+                        escalated_recheck_count, cap=_BLOCKED_ESCALATED_RECHECK_MAX
+                    )
                 task.recheck_after = next_recheck
                 _blocker_meta = ctx.get("blocker")
                 _escalation_detail = (
@@ -1963,9 +2214,15 @@ async def sweep_unblock_blocked_tasks(
                     if isinstance(_blocker_meta, dict)
                     else None
                 )
+                _detail_text = _escalation_detail or task.blocked_reason or ""
+                if _base_observation is not None:
+                    _clause = _base_state_recheck_clause(_base_observation)
+                    _detail_text = (
+                        f"{_clause} — {_detail_text}" if _detail_text else _clause
+                    )
                 task.latest_status_message = _escalated_status_message(
                     task.blocker_kind or "unknown",
-                    _escalation_detail or task.blocked_reason or "",
+                    _detail_text,
                     next_recheck,
                 )
                 session.add(task)

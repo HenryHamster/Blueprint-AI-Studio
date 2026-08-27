@@ -161,6 +161,15 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "runner.fleet_no_healthy": AlertEventPolicy("runner.fleet_no_healthy"),
     "runner.post_update_silent": AlertEventPolicy("runner.post_update_silent"),
     "runner.cross_project_access": AlertEventPolicy("runner.cross_project_access"),
+    # A ``local_only`` project whose active-runner pool is empty: the placement
+    # wait has no timeout by design, so without this the work parks silently and
+    # forever.  Condition-scoped dedupe (one row per project, not per task or
+    # per cycle) so the row AGES and can escalate; the producer dismisses it the
+    # moment an eligible runner takes work for the project.
+    "placement.unsatisfiable_local_hold": AlertEventPolicy(
+        "placement.unsatisfiable_local_hold",
+        retirement=AlertRetirementMode.SOURCE_CONDITION,
+    ),
     "deployment.halted": AlertEventPolicy("deployment.halted"),
     "deployment.rollback_recommended": AlertEventPolicy(
         "deployment.rollback_recommended"
@@ -199,6 +208,13 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "release.stabilize_stalled": AlertEventPolicy(
         "release.stabilize_stalled", domain=DOMAIN_RELEASE_LIFECYCLE
     ),
+    # The strategic agent was asked for the version goal and did not emit it.
+    # Condition-scoped (project + version) and non-blocking: a null goal still
+    # degrades gracefully in release_scoring; this only makes the omission
+    # audible instead of silent.
+    "release.version_goal_not_authored": AlertEventPolicy(
+        "release.version_goal_not_authored", domain=DOMAIN_RELEASE_LIFECYCLE
+    ),
     "release.promotion_deploy_failed": AlertEventPolicy(
         "release.promotion_deploy_failed", domain=DOMAIN_RELEASE_LIFECYCLE
     ),
@@ -210,6 +226,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     ),
     "release.qualification_crash_loop": AlertEventPolicy(
         "release.qualification_crash_loop", domain=DOMAIN_RELEASE_LIFECYCLE
+    ),
+    "release.qualification_trigger_unowned": AlertEventPolicy(
+        "release.qualification_trigger_unowned", domain=DOMAIN_RELEASE_LIFECYCLE
     ),
     "release.walkthrough_key_unmatched": AlertEventPolicy(
         "release.walkthrough_key_unmatched", domain=CORE_ALERT_DOMAIN
@@ -245,10 +264,34 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "research.strategic_issue": AlertEventPolicy(
         "research.strategic_issue", domain=DOMAIN_RESEARCH_DIRECTIONS
     ),
+    # Force-terminated strategic cycle / timed-out direction diagnosis.  Was
+    # emitted as a raw ``Alert(...)`` insert titled with the cycle id, so it
+    # bypassed this registry entirely: the import-time retirement assertion
+    # below iterates these keys only, and an occurrence-keyed title can never
+    # dedupe -- one immortal row per stalled cycle.  MANUAL is the honest mode:
+    # the row describes work that has already died, so there is no live
+    # condition a resolver could watch clear.  Retirement is the operator
+    # acknowledging it.
+    "research.diagnosis_stalled": AlertEventPolicy("research.diagnosis_stalled"),
     # Strategic-cycle liveness applies to every autonomous project, while its
     # producer owns retirement when a completion or healthy-idle receipt arrives.
     "research.strategic_cycle_liveness": AlertEventPolicy(
         "research.strategic_cycle_liveness",
+        retirement=AlertRetirementMode.SOURCE_CONDITION,
+    ),
+    # The DOWNGRADE of the halt WARNING above.  A project whose automatic
+    # Strategic lane is deliberately off is excluded from the halt detector --
+    # correctly, since no cycle receipt can ever be expected -- and the sweep
+    # also RETIRES any open halt alert on it.  Before this event existed, that
+    # left a wedged project and a deliberately quiet one producing byte-identical
+    # alert feeds.  INFO + ``action_required=False`` keeps the lane visible in
+    # the feed without paging; the producer owns retirement and dismisses the row
+    # the moment the lane is re-enabled or its ``until`` bound lapses.
+    "research.strategic_lane_disabled": AlertEventPolicy(
+        "research.strategic_lane_disabled",
+        allow_info=True,
+        action_required=False,
+        audience=OPERATOR_FYI,
         retirement=AlertRetirementMode.SOURCE_CONDITION,
     ),
     "rollup.backmerge_blocked": AlertEventPolicy(
@@ -264,7 +307,17 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
         "migration.chain_blocked", domain=DOMAIN_MIGRATIONS
     ),
     "self_improvement.payload_too_large": AlertEventPolicy(
-        "self_improvement.payload_too_large", domain=DOMAIN_SELF_IMPROVEMENT
+        "self_improvement.payload_too_large",
+        domain=DOMAIN_SELF_IMPROVEMENT,
+        # ROUTE_TIMELINE is what makes the TIMELINE_ONLY retirement mode hold.
+        # Left at the default ROUTE_ALERT the gateway would mint a durable row
+        # and ``sweep_resolve_policy_retirement_alerts`` would retire it on the
+        # next pass, forever -- the retirement mode would be a claim the route
+        # contradicts.  (The strategist-internal audience happens to suppress it
+        # first today, but that is an accident of a second gate, not the
+        # contract.)
+        route=ROUTE_TIMELINE,
+        action_required=False,
     ),
     "cost.unpriced_models": AlertEventPolicy(
         "cost.unpriced_models", route=ROUTE_HEALTH, action_required=False
@@ -288,6 +341,96 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "notification.dead_letter_lost": AlertEventPolicy(
         "notification.dead_letter_lost"
     ),
+    # === Events that only ever existed as raw ``Alert(...)`` inserts =========
+    #
+    # Registered 2026-08-26.  Each was constructed directly against the model,
+    # so it never reached ``should_emit_project_alert``: no audience gate, no
+    # route gate, no INFO gate, and -- because the retirement contract below
+    # iterates THIS dict -- no declared way to leave the feed.  Registering them
+    # is what lets the contract see them at all; their mint sites are routed
+    # through ``create_project_alert_if_allowed`` in the same change.
+    #
+    # POINT-IN-TIME NOTICES.  Each states something that ALREADY HAPPENED, so no
+    # future state makes the statement false and no resolver could ever clear
+    # it -- AND ``message_audience`` already classifies each as
+    # ``strategist-internal``, i.e. the codebase had already decided none of
+    # them is operator-facing.  Routing was the only thing missing: every one
+    # was built as a raw ``Alert(...)`` that never asked.
+    # ``ROUTE_TIMELINE`` stops the mint at the gate, and the existing
+    # ``sweep_resolve_policy_retirement_alerts`` backstop retires the durable
+    # rows the earlier raw inserts already left behind.
+    #
+    # Point-in-time notices that ``message_audience`` marks OPERATOR-facing are
+    # deliberately NOT in this group -- suppressing those would delete an
+    # operator signal rather than move it.  They are registered as ordinary
+    # ``ROUTE_ALERT`` events with ``MANUAL`` retirement, which is what their
+    # title-dedupe-until-dismissed producers already implement.
+    "branch.cleanup_summary": AlertEventPolicy(
+        "branch.cleanup_summary", route=ROUTE_TIMELINE, action_required=False
+    ),
+    "research.anomaly_auto_adjusted": AlertEventPolicy(
+        "research.anomaly_auto_adjusted", route=ROUTE_TIMELINE, action_required=False
+    ),
+    "runner.self_update": AlertEventPolicy(
+        "runner.self_update", route=ROUTE_TIMELINE, action_required=False
+    ),
+    # OPERATOR-facing point-in-time notices: they stay on the alert route and
+    # end by operator dismissal.  ``problem_model.wipe_risk`` is
+    # operator-action-needed; ``research.escalation_delivery_failed`` reports
+    # that an escalation never reached the operator, which is precisely the
+    # thing an operator must see.
+    "problem_model.wipe_risk": AlertEventPolicy("problem_model.wipe_risk"),
+    "research.escalation_delivery_failed": AlertEventPolicy(
+        "research.escalation_delivery_failed", domain=DOMAIN_RESEARCH_DIRECTIONS
+    ),
+    # ONGOING CONDITIONS whose producer already owns a real resolver.
+    "capacity.usage_meter_dark": AlertEventPolicy("capacity.usage_meter_dark"),
+    "release_blocked": AlertEventPolicy(
+        "release_blocked", domain=DOMAIN_RELEASE_LIFECYCLE
+    ),
+    "runner.update_drain_stuck": AlertEventPolicy("runner.update_drain_stuck"),
+    "vm.low_memory": AlertEventPolicy("vm.low_memory"),
+    # ONGOING CONDITIONS with NO resolver today.  ``MANUAL`` is the honest mode:
+    # it records that nothing in the pipeline dismisses these, so an operator
+    # must.  Do NOT "upgrade" one to SOURCE_CONDITION without writing the
+    # resolver -- that mode ASSERTS a resolver exists, and asserting it without
+    # writing it is exactly what produced the immortal rows this change fixes.
+    "DAILY_BUDGET_ALERT": AlertEventPolicy("DAILY_BUDGET_ALERT"),
+    "MONTHLY_BUDGET_ALERT": AlertEventPolicy("MONTHLY_BUDGET_ALERT"),
+    "approval.merge_checked_base_mismatch": AlertEventPolicy(
+        "approval.merge_checked_base_mismatch"
+    ),
+    "compute.image_build_failure": AlertEventPolicy("compute.image_build_failure"),
+    "compute.image_protect_fail": AlertEventPolicy("compute.image_protect_fail"),
+    "compute.image_refresh_failure": AlertEventPolicy("compute.image_refresh_failure"),
+    "cost.telemetry_reconciliation_drift": AlertEventPolicy(
+        "cost.telemetry_reconciliation_drift"
+    ),
+    "hotfix_backmerge.size_violation": AlertEventPolicy(
+        "hotfix_backmerge.size_violation", domain=DOMAIN_ROLLUP_LTS
+    ),
+    "problem_model.live_core_over_budget": AlertEventPolicy(
+        "problem_model.live_core_over_budget"
+    ),
+    "research.already_fixed_deadlock": AlertEventPolicy(
+        "research.already_fixed_deadlock", domain=DOMAIN_RESEARCH_DIRECTIONS
+    ),
+    "research.churn_retirement_recommended": AlertEventPolicy(
+        "research.churn_retirement_recommended",
+        domain=DOMAIN_RESEARCH_DIRECTIONS,
+        allow_info=True,
+    ),
+    "research.dedup_deadlock": AlertEventPolicy(
+        "research.dedup_deadlock", domain=DOMAIN_RESEARCH_DIRECTIONS
+    ),
+    "research.direction_drift": AlertEventPolicy(
+        "research.direction_drift", domain=DOMAIN_RESEARCH_DIRECTIONS
+    ),
+    "research.retirement_consideration_needed": AlertEventPolicy(
+        "research.retirement_consideration_needed",
+        domain=DOMAIN_RESEARCH_DIRECTIONS,
+        allow_info=True,
+    ),
 }
 
 
@@ -309,6 +452,19 @@ _TIMELINE_ONLY_RETIREMENT_EVENTS = frozenset(
         "deployment.halted_recovered",
         "research.direction_auto_completed",
         "research.direction_auto_retired",
+        # Point-in-time notices (2026-08-26).  These describe a completed past
+        # event, so there is no future state in which the row becomes false and
+        # nothing could ever resolve it.  TIMELINE_ONLY both blocks the mint at
+        # the policy gate and lets the retirement backstop clear the durable
+        # rows their raw-insert era already wrote.
+        "branch.cleanup_summary",
+        "research.anomaly_auto_adjusted",
+        "runner.self_update",
+        # ``self_improvement.payload_too_large`` records that ONE payload build
+        # exceeded the cap; the next build is a separate fact.  It had been
+        # sitting in the SOURCE_CONDITION default, which claims a producer
+        # resolves it; that producer never had a resolver.
+        "self_improvement.payload_too_large",
     }
 )
 _MANUAL_RETIREMENT_EVENTS = frozenset(
@@ -324,29 +480,178 @@ _MANUAL_RETIREMENT_EVENTS = frozenset(
         "review.fail_open",
         "release.qualification_timeout",
         "release.qualification_crash_loop",
+        "release.qualification_trigger_unowned",
         "release.walkthrough_key_unmatched",
         "rollup.backmerge_blocked",
         "rollup.pr_blocked",
         "notification.dead_letter_lost",
+        "research.diagnosis_stalled",
+        # Ongoing conditions with NO resolver (2026-08-26).  MANUAL is a
+        # statement of fact, not a preference: nothing in the pipeline dismisses
+        # these, so an operator must.  Each was previously carrying the
+        # SOURCE_CONDITION default, which asserts the producer owns a resolver
+        # -- an assertion nothing checked and, for these, nothing honoured.
+        # Moving one back to SOURCE_CONDITION requires writing the resolver
+        # first; ``_SOURCE_CONDITION_RETIREMENT_EVENTS`` is checked against the
+        # resolver registry below.
+        "deployment.rollback_recommended",
+        "migration.chain_blocked",
+        "warm_pool.cost_guard",
+        # ``sr.signal_stale`` is registered ``route=ROUTE_HEALTH`` yet its only
+        # producer (pipeline_alert_scan._run_signal_staleness_watchdog) mints
+        # durable rows directly.  MANUAL is the mode that matches what actually
+        # happens today; TIMELINE_ONLY would make the policy backstop churn
+        # against a live producer every sweep.  The route/producer contradiction
+        # is tracked as an allowlisted bypass in test_alert_mint_sites.py.
+        "sr.signal_stale",
+        "DAILY_BUDGET_ALERT",
+        "MONTHLY_BUDGET_ALERT",
+        "approval.merge_checked_base_mismatch",
+        "compute.image_build_failure",
+        "compute.image_protect_fail",
+        "compute.image_refresh_failure",
+        "cost.telemetry_reconciliation_drift",
+        "hotfix_backmerge.size_violation",
+        "problem_model.live_core_over_budget",
+        # Operator-facing point-in-time notices: nothing can make the statement
+        # false, so dismissal is the only honest end.  Their producers already
+        # dedupe on a stable title until dismissed, which is MANUAL in practice.
+        "problem_model.wipe_risk",
+        "research.escalation_delivery_failed",
+        "research.already_fixed_deadlock",
+        "research.churn_retirement_recommended",
+        "research.dedup_deadlock",
+        "research.direction_drift",
+        "research.retirement_consideration_needed",
     }
 )
 
-_RETIREMENT_MODE_BY_EVENT: dict[str, AlertRetirementMode] = dict.fromkeys(
-    ALERT_EVENT_POLICIES, AlertRetirementMode.SOURCE_CONDITION
-)
-_RETIREMENT_MODE_BY_EVENT.update(
+#: Events whose PRODUCER owns a resolver that dismisses the row when the
+#: condition clears.  Membership here is a claim about code that exists: before
+#: adding an event, point at the function that calls
+#: :func:`resolve_project_alert_by_dedupe_key` (or an equivalent
+#: ``dismissed_at`` write) on recovery.  If there is no such function, the
+#: honest mode is ``MANUAL`` -- see the note in
+#: ``_MANUAL_RETIREMENT_EVENTS``.
+_SOURCE_CONDITION_RETIREMENT_EVENTS = frozenset(
     {
-        **dict.fromkeys(
-            _TASK_TERMINAL_RETIREMENT_EVENTS, AlertRetirementMode.TASK_TERMINAL
-        ),
-        **dict.fromkeys(
-            _TIMELINE_ONLY_RETIREMENT_EVENTS, AlertRetirementMode.TIMELINE_ONLY
-        ),
-        **dict.fromkeys(_MANUAL_RETIREMENT_EVENTS, AlertRetirementMode.MANUAL),
+        "capacity.usage_meter_dark",
+        "cost.spend_hold",
+        "cost.unpriced_models",
+        "deployment.auto_pause",
+        "deployment.flapping_resume",
+        "deployment.forced_resume",
+        "deployment.halted",
+        "deployment.rollback_detected",
+        "deployment.wake_delivery_stalled",
+        "efficiency.provider_routing_verdict",
+        "efficiency.self_repair_burn_share",
+        "efficiency.snapshot_cadence_overdue",
+        "migration.slot_contention",
+        "placement.unsatisfiable_local_hold",
+        "release.build_stalled",
+        "release.calcifying",
+        "release.ci_unresolved",
+        "release.managed_check_wait_stalled",
+        "release.promotion_deploy_failed",
+        "release.stabilize_stalled",
+        "release.version_goal_not_authored",
+        "release_blocked",
+        "research.stale_staged_direction",
+        "research.strategic_cycle_liveness",
+        "research.strategic_issue",
+        "research.strategic_lane_disabled",
+        "runner.cross_project_access",
+        "runner.deactivated",
+        "runner.degraded",
+        "runner.fleet_no_healthy",
+        "runner.idle_gpu",
+        "runner.low_disk",
+        "runner.low_memory",
+        "runner.post_update_silent",
+        "runner.token_stale",
+        # runner_health_alerts._resolve_update_drain_stuck_alert, wired from
+        # routers/runner.py's heartbeat handler when the drain clears.
+        "runner.update_drain_stuck",
+        "sr.catch_rate_below_target",
+        "sr.lone_checker",
+        # runner_health_alerts._resolve_vm_low_memory_alert, wired from
+        # runner_health_monitors when the VM's cgroup headroom recovers.
+        # NOTE: pipeline_alert_scan._emit_agent_vm_resource_alert reuses this
+        # event_type for an AGGREGATE agent-VM failure-rate condition and sets
+        # no dedupe_key, so the per-VM resolver cannot reach that row.  That is
+        # a separate mint-site defect (a distinct event type is owed), not a
+        # reason to demote the event that does have a working resolver.
+        "vm.low_memory",
+        "warm_pool.payoff",
     }
 )
-if set(_RETIREMENT_MODE_BY_EVENT) != set(ALERT_EVENT_POLICIES):
-    raise RuntimeError("every alert policy must declare a retirement mode")
+
+#: The declaration table the retirement contract is resolved from.  Order is
+#: irrelevant -- overlap is an error, not a precedence rule.
+RETIREMENT_MODE_DECLARATIONS: tuple[tuple[frozenset[str], AlertRetirementMode], ...] = (
+    (_TASK_TERMINAL_RETIREMENT_EVENTS, AlertRetirementMode.TASK_TERMINAL),
+    (_TIMELINE_ONLY_RETIREMENT_EVENTS, AlertRetirementMode.TIMELINE_ONLY),
+    (_MANUAL_RETIREMENT_EVENTS, AlertRetirementMode.MANUAL),
+    (_SOURCE_CONDITION_RETIREMENT_EVENTS, AlertRetirementMode.SOURCE_CONDITION),
+)
+
+
+def build_retirement_map(
+    registered_event_types: Any,
+    declarations: Any = RETIREMENT_MODE_DECLARATIONS,
+) -> dict[str, AlertRetirementMode]:
+    """Resolve every registered event's retirement mode from EXPLICIT declarations.
+
+    Raises ``RuntimeError`` when an event declares two modes, declares none, or
+    is declared without being registered.  Nothing is defaulted: an alert that
+    does not say how it leaves the feed fails at import.
+
+    This is a FUNCTION, not an inline ``if``, on purpose.  2026-08-26: the block
+    it replaces seeded itself with
+    ``dict.fromkeys(ALERT_EVENT_POLICIES, SOURCE_CONDITION)`` and then checked
+    that every registry key had a mode -- two sets that were equal BY
+    CONSTRUCTION, so the check could never raise.  Its companion contract test
+    (``test_every_operator_action_needed_event_type_declares_a_retirement_rule``)
+    asserted ``retirement is None``, which the ``replace(...)`` comprehension
+    below made impossible too.  Two guards, both structurally incapable of
+    failing, both claiming to prevent exactly the immortal rows that accumulated
+    anyway: a new event silently inherited SOURCE_CONDITION -- the one mode that
+    ASSERTS a producer-owned resolver exists -- with nothing verifying one did.
+    An import-time ``if`` over the live registry cannot be falsified by a test;
+    a function can be handed adversarial input and proven to raise.
+    """
+    resolved: dict[str, AlertRetirementMode] = {}
+    for mode_events, mode in declarations:
+        for event_type in mode_events:
+            if event_type in resolved:
+                raise RuntimeError(
+                    "alert event declares more than one retirement mode: "
+                    f"{event_type} ({resolved[event_type].value} + {mode.value})"
+                )
+            resolved[event_type] = mode
+
+    registered = set(registered_event_types)
+    undeclared = sorted(registered - set(resolved))
+    if undeclared:
+        raise RuntimeError(
+            "every alert policy must declare a retirement mode; add each of "
+            "these to exactly one of _TASK_TERMINAL_RETIREMENT_EVENTS, "
+            "_TIMELINE_ONLY_RETIREMENT_EVENTS, _MANUAL_RETIREMENT_EVENTS, or "
+            "_SOURCE_CONDITION_RETIREMENT_EVENTS: " + ", ".join(undeclared)
+        )
+    unregistered = sorted(set(resolved) - registered)
+    if unregistered:
+        raise RuntimeError(
+            "retirement mode declared for events missing from "
+            "ALERT_EVENT_POLICIES: " + ", ".join(unregistered)
+        )
+    return resolved
+
+
+_RETIREMENT_MODE_BY_EVENT: dict[str, AlertRetirementMode] = build_retirement_map(
+    ALERT_EVENT_POLICIES
+)
 ALERT_EVENT_POLICIES = {
     event_type: replace(policy, retirement=_RETIREMENT_MODE_BY_EVENT[event_type])
     for event_type, policy in ALERT_EVENT_POLICIES.items()
@@ -602,6 +907,42 @@ async def create_project_alert_if_allowed(
             },
         )
     return alert, True, decision
+
+
+async def resolve_project_alert_by_dedupe_key(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    dedupe_key: str,
+    *,
+    broadcast: bool = False,
+) -> int:
+    """Dismiss the open alert a producer opened under ``dedupe_key``.
+
+    This is the ``SOURCE_CONDITION`` counterpart to
+    :func:`create_project_alert_if_allowed`.  A producer that mints under a
+    stable, condition-scoped dedupe key calls this the moment it observes the
+    condition clear, and the row leaves the feed on its own.
+
+    Retirement mode ``SOURCE_CONDITION`` is a claim that such a call exists.
+    Before this helper the claim had no shared implementation, so each producer
+    either hand-rolled a ``dismissed_at`` write or -- for six registered events
+    -- simply never wrote one, and the alert outlived the condition forever.
+
+    Callers own transaction commit.  Returns the number of rows dismissed.
+    """
+
+    alert = await _find_active_deduped_alert(session, project_id, dedupe_key)
+    if alert is None:
+        return 0
+    alert.dismissed_at = _utcnow()
+    session.add(alert)
+    if broadcast:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return 1
 
 
 def serialize_project_alert_domains(project: Project) -> dict[str, Any]:

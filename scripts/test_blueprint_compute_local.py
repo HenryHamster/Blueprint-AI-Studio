@@ -25,6 +25,13 @@ import blueprint
 import blueprint_api
 import pytest
 
+# scripts/*.py tests run with --noconftest, so the shared offender-identity
+# producer is reached by the same explicit path insertion the other scripts
+# guards use rather than by a conftest-installed sys.path entry.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+
+from testing.fixgate_attribution import format_offender_marker  # noqa: E402
+
 _PLAN = blueprint._compute_resolve_shell()
 _SHELL_USABLE = _PLAN.exe == "bash" or os.path.isfile(_PLAN.exe)
 _needs_shell = pytest.mark.skipif(
@@ -972,6 +979,86 @@ def test_repo_state_uses_git_not_a_dot_git_isdir_probe(tmp_path):
     assert state["commit"] is None, state
     assert any("not a readable git repository" in w
                for w in blueprint._compute_repo_clone_warnings({}, state))
+
+
+# --- the OWNERSHIP half of "the probe cannot look" ---------------------------
+#
+# The isdir test above pins the LAYOUT half. This is the other one: git refuses
+# EVERY command with "detected dubious ownership" (exit 128) when the caller's
+# uid does not own the checkout. That is not exotic -- it is what a repo owned
+# by the runner user looks like from inside a container running as root, and
+# what a checkout looks like to a systemd unit running as another User=. Both
+# failures land in the SAME record (`resolved_by: "cwd"`, null commit), so an
+# unhardened read reports "this directory is not a checkout" about a perfectly
+# good checkout, and the provenance for the run is a confident blank.
+
+_DUBIOUS_OWNERSHIP_RC = 128
+
+
+def _foreign_owned_git_or_skip(root: str) -> None:
+    """Stage "another user owns this checkout" without needing a second uid.
+
+    ``GIT_TEST_ASSUME_DIFFERENT_OWNER=1`` is git's own switch for exactly this
+    condition, so the test reproduces the real CI failure on any host and in a
+    single-uid container. Skipping (rather than asserting) when this git cannot
+    stage it keeps the pin from becoming a platform-specific red.
+    """
+    env = {**os.environ, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+    kw = {"cwd": root, "capture_output": True, "text": True, "env": env, "timeout": 10}
+    bare = subprocess.run(["git", "rev-parse", "--show-toplevel"], **kw)
+    safe = subprocess.run(
+        ["git", "-c", f"safe.directory={root}", "rev-parse", "--show-toplevel"], **kw
+    )
+    if bare.returncode != _DUBIOUS_OWNERSHIP_RC or safe.returncode != 0:
+        pytest.skip("this git cannot stage the dubious-ownership condition here")
+    assert "dubious ownership" in bare.stderr, bare.stderr
+
+
+def test_repo_state_reads_a_checkout_git_considers_foreign_owned(monkeypatch, tmp_path):
+    """A real repo, a real exit-128 git, no mocks: the read must still work."""
+    repo = tmp_path / "repo"
+    (repo / "seed.txt").parent.mkdir(parents=True, exist_ok=True)
+    (repo / "seed.txt").write_text("x", encoding="utf-8")
+    _init_repo(repo)
+    _foreign_owned_git_or_skip(str(repo))
+
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+    state = blueprint._compute_git_repo_state(str(repo))
+
+    # Unhardened this is resolved_by "cwd" with a null commit -- indistinguishable
+    # from the not-a-repo case pinned directly above.
+    assert state["resolved_by"] == "git", state
+    assert re.fullmatch(r"[0-9a-f]{40}", state["commit"] or ""), state
+    assert state["dirty"] is False, state
+    assert not blueprint._compute_repo_clone_warnings({}, state), state
+
+
+def test_repo_state_names_the_checkout_safe_on_every_git_read(tmp_path):
+    """Pinned so the hardening cannot be dropped from one read but not another.
+
+    This is the asymmetry that produced the live incident: a probe hardened
+    with ``-c safe.directory=`` while the actual read beside it was not, so the
+    guard proved it *could* look and then looked with a command that could not.
+    """
+    calls: list = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        stdout = str(tmp_path) if "--show-toplevel" in argv else "x"
+        return subprocess.CompletedProcess(list(argv), 0, stdout=stdout, stderr="")
+
+    blueprint._compute_git_repo_state(str(tmp_path), _subprocess_run=fake_run)
+
+    # toplevel, HEAD, abbrev-ref, status
+    assert len(calls) == 4, (
+        f"expected 4 git reads from _compute_git_repo_state, saw {len(calls)}"
+        + "\n"
+        + format_offender_marker(
+            f"{index}:{' '.join(argv)}" for index, argv in enumerate(calls)
+        )
+    )
+    for argv in calls:
+        assert argv[:3] == ["git", "-c", f"safe.directory={tmp_path}"], argv
 
 
 # ---------------------------------------------------------------------------

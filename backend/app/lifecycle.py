@@ -18,6 +18,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 import app.shared_state as _shared_state
+from app.alert_policy import create_project_alert_if_allowed
 from app.database import AsyncSessionLocal, engine, init_db
 from app.models import (
     AllowedUser,
@@ -1003,6 +1004,58 @@ async def _run_leader_bootstrap_maintenance(*, is_leader: bool) -> None:
     await _seed_completion_debt_design_doc()
     await _heal_poisoned_problem_models()
     await _seed_deploy_project_futility_verdicts()
+
+
+def _disarm_orchestrator_hard_watchdog() -> None:
+    """Shutdown counterpart to ``start_orchestrator_hard_watchdog``.
+
+    The hard watchdog is a DAEMON THREAD holding ``_default_hard_abort``, which
+    ends in ``os._exit(1)``. It outlives the lifespan unless something stops it,
+    and until this helper existed nothing did: ``stop_orchestrator_hard_watchdog``
+    had ZERO production call sites, despite its own docstring claiming it is
+    "used by graceful shutdown / tests". An armed watchdog past ``yield`` is
+    wrong in both environments this app runs in.
+
+    * **In prod** it stays armed for the whole SIGTERM drain, watching a
+      heartbeat that by definition is no longer being pumped. A drain that
+      outlasts ``ORCHESTRATOR_HARD_WATCHDOG_SECONDS`` is then hard-killed
+      mid-flight — the watchdog converts a graceful drain into an abrupt one,
+      the opposite of its purpose.
+
+    * **Under pytest** it is a process-wide time bomb. Any test that enters this
+      lifespan as leader leaves the thread running; ``_shared_state.is_leader``
+      stays True; the progress stamp goes stale as unrelated tests run; and
+      ~240s later ``os._exit(1)`` kills the entire pytest session. Because
+      ``os._exit`` skips ``pytest_sessionfinish``, that renders as a red CI job
+      whose log stops mid progress line with no summary, no ``FAILED`` line and
+      nothing to act on. Observed three times on PR #18011 (`Impacted backend
+      tests`, runs 32998752057 / 33000772113 / 33002910941, the last a rerun
+      of the same SHA): the abort landed 239s / 252s / 249s after the
+      ``testing/test_orchestrator.py`` block — the last thing in that
+      selection to pump the heartbeat — ended. The true anchor is the final
+      progress stamp, which is at or slightly before that file boundary, so
+      all three sit inside the ``(bound, bound + poll]`` window this pairing
+      closes. One of the three ran with ZERO failing tests and still exited 1;
+      run 32998752057 caught the ``_default_hard_abort`` faulthandler dump in
+      the log because fd capture happened to be off at that instant, which is
+      the only reason the class was identifiable at all.
+
+      The control is PR #18010, same base, same runner pool, 15 impacted
+      files that also included ``test_orchestrator.py``: it passed because
+      only ~103s of tests followed that file, never reaching the bound. The
+      discriminator is not which tests are selected but how much wall clock
+      runs after the last orchestrator progress stamp — which is why the
+      victim file looked arbitrary and the dot count moved between reruns.
+
+    Leadership is cleared alongside it. The advisory lock is released when
+    ``leader_conn`` closes further down the shutdown path, so a lingering
+    ``is_leader = True`` is a stale claim — and it is exactly what the
+    ``is_guarded`` callable passed to the watchdog reads.
+    """
+    from app.orchestrator import stop_orchestrator_hard_watchdog
+
+    stop_orchestrator_hard_watchdog()
+    _shared_state.is_leader = False
 
 
 @asynccontextmanager
@@ -2198,15 +2251,25 @@ async def lifespan(app):
                                         .scalars()
                                         .all()
                                     )
+                                    # ``deployment.auto_resume`` is registered
+                                    # ROUTE_TIMELINE/TIMELINE_ONLY: a restart
+                                    # that already happened is a notice, not a
+                                    # standing condition, so nothing could ever
+                                    # resolve the row.  This emitter fanned one
+                                    # such INFO row out to EVERY project (up to
+                                    # 5000) per restart and never asked the
+                                    # policy.  The restart itself is already on
+                                    # the log line above, so routing through the
+                                    # gate loses no signal.
                                     for project_id in project_ids:
-                                        alert = Alert(
+                                        await create_project_alert_if_allowed(
+                                            alert_session,
                                             project_id=project_id,
+                                            event_type="deployment.auto_resume",
                                             severity=AlertSeverity.INFO,
                                             title=f"Background service restarted: {name}",
                                             message=f"Service '{name}' was automatically restarted (attempt #{state['attempts']}).",
-                                            event_type="deployment.auto_resume",
                                         )
-                                        alert_session.add(alert)
                                     await alert_session.commit()
                             except Exception as alert_exc:
                                 logger.warning(
@@ -2235,6 +2298,10 @@ async def lifespan(app):
     start_orchestrator_hard_watchdog(is_guarded=lambda: _shared_state.is_leader)
 
     yield
+    # FIRST shutdown step, before any await: disarm the process-killer started
+    # above. See _disarm_orchestrator_hard_watchdog for why an armed watchdog
+    # past `yield` is wrong in both environments this app runs in.
+    _disarm_orchestrator_hard_watchdog()
     # Stop the monitor before snapshotting the registry so it cannot install a
     # replacement between snapshot and cancellation. After automatic restarts,
     # the shared registry is authoritative; startup-local handles may be stale.

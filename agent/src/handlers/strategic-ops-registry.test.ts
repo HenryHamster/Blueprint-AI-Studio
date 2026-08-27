@@ -69,8 +69,8 @@ describe('strategic ops registry — internal consistency', () => {
 describe('shared manifest lockstep', () => {
   it('backend/app/strategic_ops_manifest.json equals the registry projection', () => {
     const onDisk: unknown = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8'));
-    // If this fails after a registry edit, regenerate the manifest from
-    // strategicOpsManifest() (see strategic-ops-registry.ts header).
+    // If this fails after a registry edit, regenerate the manifest:
+    //   cd agent && npx tsx scripts/regen-strategic-ops-manifest.mjs
     expect(onDisk).toEqual(strategicOpsManifest());
   });
 });
@@ -102,8 +102,12 @@ describe('generated ./strategic CLI derives from the registry', () => {
     ]);
     expect(create?.fields).toContain('staged');
     expect(create?.fields).toContain('gap_id');
+    expect(create?.fields).toContain('cost_budget_usd');
     expect(create?.notes?.join('\n')).toContain('recurring autonomous research lane');
     expect(create?.notes?.join('\n')).toContain('multiple spawn-task calls under one direction');
+    const update = cliOpInput('update-direction');
+    expect(update?.fields).toContain('cost_budget_usd');
+    expect(update?.notes?.join('\n')).toContain('set it to null to clear');
     const spawn = cliOpInput('spawn-task');
     expect(spawn?.example).toMatchObject({ direction_id: 'd-pipeline-reliability' });
     expect(spawn?.fields).toContain('depends_on');

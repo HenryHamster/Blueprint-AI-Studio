@@ -3741,6 +3741,80 @@ async def test_preflight_smoke_runs_containerized_when_image_set(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_preflight_smoke_accepts_a_locally_built_image(monkeypatch, tmp_path):
+    """The GATE must not reject an image the run could execute.
+
+    The smoke runs BEFORE the job, so a bare ``docker pull &&`` here refused a
+    locally built tag (which exists in no registry and can never be pulled)
+    before the wrapper ever got the chance to run it. The fleet is all local
+    runners, so that is a normal image, not an exotic one.
+
+    Drives the smoke's REAL generated command against a fake docker rather than
+    asserting on its text, then re-drives it with no local copy to show the gate
+    still fails closed.
+    """
+    import os
+    import subprocess
+
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(
+        cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured)
+    )
+
+    await cb.run_preflight_smoke(
+        "python3 train.py",
+        container_image="local/trainer:dev",
+        timeout_seconds=5,
+    )
+    cmd = captured[0]["args"][2]
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "docker"
+    # pull always fails (no registry has this tag); `image inspect` answers per
+    # FAKE_LOCAL_OK; `run` succeeds so a resolved image reaches the command.
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        '  pull) echo "manifest for $2 not found" >&2; exit 1 ;;\n'
+        '  image) [ "$2" = "inspect" ] && { [ "$FAKE_LOCAL_OK" = "1" ] && exit 0; exit 1; } ;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+
+    # Both runs below drive the fake `docker` shim written above -- no daemon,
+    # no network, milliseconds each. 20s keeps them under the 30s
+    # inner-operation ceiling while leaving ~1000x headroom.
+    present = subprocess.run(
+        ["bash", "-c", cmd],  # -c not -lc: a login shell reloads the profile and resets PATH
+        env={**env, "FAKE_LOCAL_OK": "1"},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert present.returncode == 0, (
+        "a locally built image must pass the gate: " + present.stderr[-500:]
+    )
+
+    absent = subprocess.run(
+        ["bash", "-c", cmd],  # -c not -lc: a login shell reloads the profile and resets PATH
+        env={**env, "FAKE_LOCAL_OK": "0"},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert absent.returncode != 0, "an unresolvable image must still fail the gate"
+
+
+@pytest.mark.asyncio
 async def test_preflight_smoke_degrades_to_bare_host_when_docker_absent(monkeypatch):
     """When container_image is set but Docker is NOT on the orchestrator, the smoke
     falls back to the bare-host bash -lc path and flags degraded_no_docker — it must

@@ -634,7 +634,8 @@ fi
 if [ -n "$(git status --porcelain)" ]; then
   git add -A
   git -c user.email=blueprint-agent@automated.dev -c user.name='Blueprint Agent' \\
-    commit -m "$TITLE" >/dev/null || {
+    commit -m "$TITLE" \\
+      -m 'Co-authored-by: Blueprint Agent <blueprint-agent@automated.dev>' >/dev/null || {
     echo "[pr] git commit failed" >&2
     git status --short
     exit 1

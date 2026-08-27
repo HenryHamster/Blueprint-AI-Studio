@@ -7,6 +7,7 @@ canonical direction scope carried by direct research tasks.
 
 import pytest
 from httpx import AsyncClient
+from unittest.mock import AsyncMock
 
 from app.auth import create_agent_token
 from app.models import Project, ProjectMember, Task, TaskStatus
@@ -24,6 +25,81 @@ async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project"):
     session.add(member)
     await session.commit()
     return project
+
+
+@pytest.mark.asyncio
+async def test_create_direction_accepts_cost_budget_usd(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """The authenticated strategist path persists, updates, and clears budgets."""
+    project = await _make_project(db_session, name="Strategic direction budget")
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-direction-budget",
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(
+        str(task.id), "agent-vm-direction-budget", task_type="strategic_review"
+    )
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops.emit_strategic_updated", AsyncMock()
+    )
+    headers = {"x-agent-token": token}
+
+    created = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Ship a bounded campaign",
+                "success_evidence": "The campaign completes within its cost envelope",
+                "retirement_condition": "The campaign lands or the hypothesis is invalidated",
+                "cost_budget_usd": 0,
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    direction_id = created.json()["direction_id"]
+    await db_session.refresh(project)
+    direction = next(d for d in project.directions if d["id"] == direction_id)
+    assert direction["cost_budget_usd"] == 0.0
+
+    updated = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {"direction_id": direction_id, "cost_budget_usd": 12.5},
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    await db_session.refresh(project)
+    direction = next(d for d in project.directions if d["id"] == direction_id)
+    assert direction["cost_budget_usd"] == 12.5
+
+    cleared = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": direction_id,
+                "changes": {"cost_budget_usd": None},
+            },
+        },
+    )
+    assert cleared.status_code == 200, cleared.text
+    await db_session.refresh(project)
+    direction = next(d for d in project.directions if d["id"] == direction_id)
+    assert "cost_budget_usd" not in direction
 
 
 @pytest.mark.asyncio

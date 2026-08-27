@@ -52,6 +52,7 @@ from app.digest_metrics import (
     compute_lane_waste_diagnostics,
 )
 from app.platform_kill_metrics import compute_platform_kill_metrics
+from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.routers.admin_pipeline_observability import (
     _load_escalation_alerts,
     _load_outer_loop_original_tasks,
@@ -2371,9 +2372,11 @@ async def get_platform_kill_metrics(
 
     The operator's reliability metric is "platform-killed tasks per day, driven
     to zero". This endpoint is the measurement: it classifies every terminal
-    (FAILED / CANCELLED) task in the window as a platform kill, a work outcome,
-    a not-a-death, or — when the terminalizing path recorded no reason —
-    ``unclassified``.
+    (FAILED / CANCELLED) project-work task in the window as a platform kill, a
+    work outcome, a not-a-death, or — when the terminalizing path recorded no
+    reason — ``unclassified``. Continuous Resident generations are control-plane
+    audit records rather than project work, so they are excluded from this
+    denominator.
 
     Read ``platform_kills_per_day`` together with ``classified_fraction``. A zero
     rate next to a low classified fraction means "not measured", not "no
@@ -2392,6 +2395,7 @@ async def get_platform_kill_metrics(
 
     filters = [
         Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+        non_resident_infrastructure_task_filter(),
         or_(
             Task.completed_at >= cutoff,
             and_(Task.completed_at.is_(None), Task.updated_at >= cutoff),

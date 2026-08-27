@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.orchestrator_filters import (
+    apply_completion_priority,
     cap_pipeline_slots,
     reserve_slots_for_types,
     apply_project_fairness,
@@ -122,6 +123,29 @@ async def test_reorder_sorts_by_predicted_success_under_degradation():
         predict_fn=lambda scope, direction, proj: scores[scope],
     )
     assert out == ["high", "low"]
+
+
+@pytest.mark.asyncio
+async def test_reorder_preserves_task_priority_under_degradation():
+    release_audit = _task("release-audit", scope="medium")
+    release_audit.priority = 100
+    ordinary_small = _task("ordinary-small", scope="small", risk="low")
+    ordinary_small.priority = 50
+    tasks = [release_audit, ordinary_small]
+    scores = {"medium": 0.2, "small": 0.9}
+
+    out = await reorder_eligible_by_health(
+        ["release-audit", "ordinary-small"],
+        tasks,
+        recent_results=[],
+        slots_available=1,
+        runtime_config={"max_concurrent_vms": 8, "dispatch_confidence_floor": 0.0},
+        zone_summary=_HEALTHY_ZONES,
+        session=_FakeSession(0),
+        predict_fn=lambda scope, direction, proj: scores[scope],
+    )
+
+    assert out == ["release-audit", "ordinary-small"]
 
 
 @pytest.mark.asyncio
@@ -269,6 +293,41 @@ def test_reserve_no_promotion_when_reserved_type_already_present():
         slots_available=2,
     )
     assert out == ["c1", "r1", "r2"]
+
+
+@pytest.mark.asyncio
+async def test_urgent_release_audit_survives_all_dispatch_reorders():
+    audit = _task("audit", ttype="release_audit", scope="medium")
+    audit.priority = 100
+    ordinary = _task("ordinary", ttype="create", scope="small", risk="low")
+    ordinary.priority = 50
+    tasks = [audit, ordinary]
+
+    health_ordered = await reorder_eligible_by_health(
+        [audit.id, ordinary.id],
+        tasks,
+        recent_results=[],
+        slots_available=1,
+        runtime_config={"max_concurrent_vms": 8, "dispatch_confidence_floor": 0.0},
+        zone_summary=_HEALTHY_ZONES,
+        session=_FakeSession(0),
+        predict_fn=lambda scope, direction, proj: 0.2 if scope == "medium" else 0.9,
+    )
+    completion_ordered = apply_completion_priority(
+        health_ordered,
+        {audit.id: "release_audit", ordinary.id: "create"},
+        {audit.id: None, ordinary.id: None},
+        set(),
+        set(),
+    )
+    reserved = reserve_slots_for_types(
+        completion_ordered,
+        tasks,
+        {"reserved_slots_for_types": {"create": 1}},
+        slots_available=1,
+    )
+
+    assert reserved == [audit.id, ordinary.id]
 
 
 # ---------------------------------------------------------------------------

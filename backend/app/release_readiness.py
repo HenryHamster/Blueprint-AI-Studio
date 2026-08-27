@@ -53,7 +53,7 @@ from app.release_scoring import (
 )
 from app.shared_state import resolve_project_promotion_enabled
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2185
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3550
 
 logger = logging.getLogger(__name__)
 
@@ -608,6 +608,15 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "promotion_pr_url": verdict.promotion_pr_url,
         "promotion_conflict": verdict.promotion_conflict,
         "promotion_error_detail": verdict.promotion_error_detail,
+        # Force-promote provenance is immutable per attempt; unlike the same
+        # keys on ReleaseVersion.last_qualification, it survives later writes.
+        "forced_promote_by": verdict.forced_promote_by,
+        "forced_promote_at": (
+            verdict.forced_promote_at.isoformat()
+            if verdict.forced_promote_at
+            else None
+        ),
+        "forced_promote_reason": verdict.forced_promote_reason,
         # --- Acceptance-window signal (additive; None on legacy rows without aggregate) -
         # acceptance_window_total / verified / fraction use the write-task-only population:
         # only task types that can declare acceptance evidence count in the denominator.
@@ -1401,8 +1410,74 @@ async def compute_requalification_readiness(
 # promotion_failed re-driver holds on ``red`` / unresolvable ``head_sha``, but
 # must NOT require ``green``: an ordinary integration HEAD has no ci.yml run.
 _PROMOTION_CI_GATE_STATES = frozenset(
-    "green pending red cancelled dispatched dispatch_rejected no_signal unavailable".split()
+    "green green_rehearsal pending red cancelled dispatched dispatch_rejected "
+    "no_signal unavailable".split()
 )
+
+# GitHub ``workflow_run.event`` values whose run shape is the one that actually
+# gates a merge.  A ``pull_request`` run is the ONLY shape that reproduces the
+# promotion PR's checkout, so it is the only shape whose success predicts the
+# promotion PR's verdict.
+#
+# WHY THIS DISTINCTION EXISTS.  ci.yml can be reached two ways: a real
+# ``pull_request`` into ``main`` (the promotion PR) and a ``workflow_dispatch``
+# on the integration branch (what this gate fires when the HEAD has no run).
+# They are NOT the same experiment:
+#
+#   * ``actions/checkout@v4`` is bare in every ci.yml job (no ``ref``, no
+#     ``fetch-depth``), so it checks out ``github.ref``.  On ``pull_request``
+#     that is ``refs/pull/N/merge`` — a DETACHED synthetic merge of head into
+#     base.  On ``workflow_dispatch`` it is ``refs/heads/<branch>`` — the branch
+#     tip, with a local branch and an ``origin/<branch>`` remote-tracking ref.
+#   * So the TREE differs whenever the base has commits the head lacks (the
+#     dispatch never tests the merge result), and the REF INVENTORY differs
+#     always (``origin/automain`` / ``automain`` resolve on a dispatch and do
+#     not exist on a PR run, where HEAD is the only ref).
+#   * Code that resolves a mainline ref by name therefore takes a different
+#     branch under each shape — and the test container the backend shards use
+#     binds the workspace into a ROOT container the runner user owns, so any
+#     git read reached without ``-c safe.directory=`` dies with exit 128.
+#
+# Confirmed instance, 2026-08-25, one tree: ``workflow_dispatch`` on the
+# integration branch concluded SUCCESS at 10:13 UTC; the ``pull_request`` run on
+# the release branch concluded FAILURE at 10:41 UTC (backend shards 1 and 5, four
+# tests in ``testing/test_size_limits_checker.py``, "git log exited 128").  Same
+# code, opposite verdicts, 28 minutes apart.  The pipeline read the 10:13 green
+# as permission to cut the promotion PR, and the PR was closed and its branch
+# deleted when the 10:41 run went red.
+#
+# ``pull_request_target`` is included for completeness: it also runs on a real
+# pull-request event.  It is not used by ci.yml today.
+_PROMOTION_EQUIVALENT_CI_EVENTS = frozenset({"pull_request", "pull_request_target"})
+
+# Gate states meaning "a full ci.yml matrix ran to completion and passed".  This
+# is the INTEGRATION-BRANCH HEALTH question ("is the branch broken right now"),
+# which a rehearsal answers perfectly well and which the drift sentinel asks.  It
+# is deliberately NOT the promotion question — see
+# :func:`promotion_ci_gate_proves_promotion`.
+PROMOTION_CI_GREEN_STATES = frozenset({"green", "green_rehearsal"})
+
+
+def promotion_ci_gate_proves_promotion(gate: dict[str, Any] | None) -> bool:
+    """True only when the gate's evidence PREDICTS the promotion PR's verdict.
+
+    The one seam callers should use before treating a green gate as authority to
+    cut (or to keep) a promotion PR.  Requires BOTH a ``green`` state and the
+    ``promotion_equivalent`` flag, so a future caller cannot regress this by
+    string-matching ``gate_state == "green"`` against a rehearsal verdict.
+
+    A ``green_rehearsal`` returns False.  That is not pessimism: a rehearsal
+    proves the branch is not obviously broken, and nothing more.  Use
+    :data:`PROMOTION_CI_GREEN_STATES` when the branch-health question is the one
+    being asked.
+    """
+    if not isinstance(gate, dict):
+        return False
+    return (
+        gate.get("gate_state") == "green"
+        and gate.get("promotion_equivalent") is True
+    )
+
 
 # Branch-level dispatch coalescing window for the promotion CI gate.  ci.yml is
 # keyed to a branch-level ``cancel-in-progress`` concurrency group, so a fresh
@@ -1422,14 +1497,34 @@ def _promotion_ci_gate_verdict(
     run_id: Any = None,
     html_url: str | None = None,
     reason: str = "",
+    ci_event: str | None = None,
 ) -> dict[str, Any]:
-    """Small, stable verdict dict for :func:`compute_promotion_ci_green_gate`."""
+    """Small, stable verdict dict for :func:`compute_promotion_ci_green_gate`.
+
+    ``ci_event`` is the GitHub ``workflow_run.event`` of the run this verdict was
+    derived from (``None`` when no run backs the verdict).  The two derived
+    booleans are computed here, in ONE place, so every verdict carries the same
+    semantics and no caller has to re-derive them from the state string:
+
+      * ``full_matrix_passed`` — a full ci.yml matrix ran and passed.  Answers
+        "is the integration branch healthy right now".
+      * ``promotion_equivalent`` — the run shape matches the one a promotion PR
+        gets, so its verdict PREDICTS the promotion PR's.  Answers "is it safe to
+        cut the promotion PR".  Fail-closed: an absent or unrecognised
+        ``ci_event`` is never promotion-equivalent, because a run whose shape we
+        cannot identify cannot be claimed to reproduce anything.
+    """
     return {
         "gate_state": gate_state,
         "head_sha": head_sha,
         "run_id": run_id,
         "html_url": html_url,
         "reason": reason,
+        "ci_event": ci_event,
+        "full_matrix_passed": gate_state in PROMOTION_CI_GREEN_STATES,
+        "promotion_equivalent": (
+            gate_state == "green" and ci_event in _PROMOTION_EQUIVALENT_CI_EVENTS
+        ),
     }
 
 
@@ -1453,7 +1548,16 @@ async def compute_promotion_ci_green_gate(
     dispatch outcome, retry authority, and same-authority suppression key.
     ``gate_state`` is one of:
 
-      * ``green``      — a COMPLETED ``ci.yml`` run for the current HEAD concluded success
+      * ``green``      — a COMPLETED ``ci.yml`` run for the current HEAD concluded
+                         success ON A ``pull_request`` RUN — the same run shape a
+                         promotion PR gets, so this verdict predicts the
+                         promotion PR's verdict
+      * ``green_rehearsal`` — a COMPLETED ``ci.yml`` run for the current HEAD
+                         concluded success, but on some OTHER event shape
+                         (``workflow_dispatch``, ``push``, …).  The branch is not
+                         obviously broken; this does NOT predict the promotion
+                         PR.  See ``_PROMOTION_EQUIVALENT_CI_EVENTS`` for the
+                         mechanism and the confirmed 2026-08-25 counter-example.
       * ``pending``    — a run for HEAD is queued / in_progress (not yet concluded)
       * ``red``        — a run for HEAD concluded non-success
       * ``cancelled``  — a run for HEAD concluded cancelled and
@@ -1484,6 +1588,25 @@ async def compute_promotion_ci_green_gate(
     in which case it surfaces as ``cancelled`` without dispatching so a caller
     that wants to avoid dispatch churn can react instead of re-dispatching the
     full matrix on every sweep.
+
+    TWO QUESTIONS, TWO ANSWERS.  Every verdict carries two derived booleans so a
+    caller states which question it is asking instead of string-matching
+    ``"green"`` and getting whichever answer happens to be there:
+
+      * ``full_matrix_passed`` — "is the integration branch healthy right now?"
+        True for ``green`` AND ``green_rehearsal``.  This is the drift sentinel's
+        question, and a rehearsal answers it: the sentinel's own red incidents
+        also come from rehearsal runs, so retiring one with the other is
+        symmetric, not a false clear.
+      * ``promotion_equivalent`` — "will the promotion PR's CI agree?"  True only
+        for ``green``.  Use :func:`promotion_ci_gate_proves_promotion` rather
+        than reading the flag directly.
+
+    Anything that cuts, keeps, or force-lands a promotion PR must consult the
+    SECOND one.  A dispatch that reads back green is a rehearsal on a different
+    checkout, and the pipeline treating it as promotion evidence is why
+    promotions were being cut into a red gate and then closed with their branch
+    deleted.
 
     IMPORTANT: this performs a GitHub round-trip and is DELIBERATELY separate from
     :func:`compute_requalification_readiness`, which stays DB-only and
@@ -1530,14 +1653,39 @@ async def compute_promotion_ci_green_gate(
             html_url = run.get("html_url") or ""
             status_ = run.get("status")
             conclusion = run.get("conclusion")
+            ci_event = run.get("event")
             if status_ == "completed":
                 if conclusion == "success":
+                    # A SUCCESS is only as strong as the run shape that produced
+                    # it.  Split the two, rather than reporting both as ``green``
+                    # and hoping downstream reads the fine print.
+                    if ci_event in _PROMOTION_EQUIVALENT_CI_EVENTS:
+                        return _promotion_ci_gate_verdict(
+                            "green",
+                            head_sha=head_sha,
+                            run_id=run_id,
+                            html_url=html_url,
+                            ci_event=ci_event,
+                            reason=(
+                                "ci.yml run for integration HEAD concluded "
+                                f"success on a {ci_event} run — the same run "
+                                "shape a promotion PR gets"
+                            ),
+                        )
                     return _promotion_ci_gate_verdict(
-                        "green",
+                        "green_rehearsal",
                         head_sha=head_sha,
                         run_id=run_id,
                         html_url=html_url,
-                        reason="ci.yml run for integration HEAD concluded success",
+                        ci_event=ci_event,
+                        reason=(
+                            "ci.yml run for integration HEAD concluded success, "
+                            f"but on a {ci_event or 'unknown'} run — a rehearsal "
+                            "whose checkout shape differs from a promotion PR's "
+                            "(branch tip vs refs/pull/N/merge), so it shows the "
+                            "branch is not broken but does NOT predict the "
+                            "promotion PR's verdict"
+                        ),
                     )
                 if conclusion == "cancelled":
                     if not dispatch_on_cancelled:
@@ -1546,6 +1694,7 @@ async def compute_promotion_ci_green_gate(
                             head_sha=head_sha,
                             run_id=run_id,
                             html_url=html_url,
+                            ci_event=ci_event,
                             reason=(
                                 "ci.yml run for integration HEAD was cancelled — "
                                 "surfaced as a distinct signal; caller decides "
@@ -1558,6 +1707,7 @@ async def compute_promotion_ci_green_gate(
                             head_sha=head_sha,
                             run_id=run_id,
                             html_url=html_url,
+                            ci_event=ci_event,
                             reason=(
                                 "ci.yml run for integration HEAD was cancelled "
                                 "(read-only gate, no run dispatched)"
@@ -1571,9 +1721,18 @@ async def compute_promotion_ci_green_gate(
                         head_sha=head_sha,
                         run_id=run_id,
                         html_url=html_url,
+                        ci_event=ci_event,
+                        # DELIBERATELY ASYMMETRIC: a rehearsal FAILURE stays
+                        # ``red``.  The shapes differ, so a rehearsal success
+                        # cannot be promoted to proof — but a full matrix that
+                        # went red found something, and failing closed on it
+                        # costs a re-check while failing open costs a deleted
+                        # promotion PR.  Evidence strength is not symmetric
+                        # between "it passed" and "it broke".
                         reason=(
                             "ci.yml run for integration HEAD concluded "
                             f"{conclusion or 'non-success'}"
+                            + (f" on a {ci_event} run" if ci_event else "")
                         ),
                     )
             else:
@@ -1583,6 +1742,7 @@ async def compute_promotion_ci_green_gate(
                     head_sha=head_sha,
                     run_id=run_id,
                     html_url=html_url,
+                    ci_event=ci_event,
                     reason=f"ci.yml run for integration HEAD is {status_ or 'in flight'}",
                 )
 

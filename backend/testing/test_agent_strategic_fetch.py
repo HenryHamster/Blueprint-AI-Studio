@@ -1558,10 +1558,10 @@ async def _make_project_with_version(db_session, *, vm="agent-vm-qual"):
 
 
 @pytest.mark.asyncio
-async def test_operator_authorship_receipt_uses_promoted_serving_range(
+async def test_operator_authorship_read_prefers_candidate_gate_and_preserves_serving_receipt(
     client: AsyncClient, db_session, monkeypatch
 ):
-    """A read validates the immutable promoted-to-served receipt range only."""
+    """The candidate gate is primary while serving evidence remains additive."""
     from unittest.mock import AsyncMock
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1570,9 +1570,23 @@ async def test_operator_authorship_receipt_uses_promoted_serving_range(
         AUTHORSHIP_RECEIPT_SOURCE,
     )
 
-    project, task, _ = await _make_project_with_version(
+    project, task, open_version = await _make_project_with_version(
         db_session, vm="agent-vm-authorship-range"
     )
+    open_version.base_sha = "e" * 40
+    open_version.candidate_sha = "f" * 40
+    open_version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_operator_authorship_gate": {
+            "status": "blocked",
+            "passed": False,
+            "count": 7,
+            "max_count": 0,
+            "range": {"base_sha": "e" * 40, "head_sha": "f" * 40},
+            "blocker": "candidate_operator_authorship_nonzero",
+            "reason": "candidate_operator_authored_count_exceeds_contract",
+        },
+    }
     promoted = ReleaseVersion(
         project_id=project.id,
         version_number=9,
@@ -1596,7 +1610,7 @@ async def test_operator_authorship_receipt_uses_promoted_serving_range(
             },
         },
     )
-    db_session.add(promoted)
+    db_session.add_all([open_version, promoted])
     await db_session.commit()
 
     monkeypatch.setattr("app.deployed_sha.get_serving_sha", lambda: "d" * 40)
@@ -1609,10 +1623,18 @@ async def test_operator_authorship_receipt_uses_promoted_serving_range(
     )
 
     assert response.status_code == 200, response.text
-    report = response.json()["operator_authored_commits"]
-    assert report["state"] == "resolved"
-    assert report["count"] == 0
-    assert report["range"] == {"base_sha": "b" * 40, "head_sha": "c" * 40}
+    body = response.json()
+    report = body["operator_authored_commits"]
+    assert report["state"] == "blocked"
+    assert report["status"] == "blocked"
+    assert report["count"] == 7
+    assert report["max_count"] == 0
+    assert report["range"] == {"base_sha": "e" * 40, "head_sha": "f" * 40}
+    assert body["candidate_operator_authorship_gate"] == report
+    serving_report = body["serving_operator_authored_commits"]
+    assert serving_report["state"] == "resolved"
+    assert serving_report["count"] == 0
+    assert serving_report["range"] == {"base_sha": "b" * 40, "head_sha": "c" * 40}
     count.assert_not_awaited()
 
     tampered_qualification = dict(promoted.last_qualification)
@@ -1628,9 +1650,65 @@ async def test_operator_authorship_receipt_uses_promoted_serving_range(
         f"/api/agent/projects/{project.id}/qualification",
         headers={"x-agent-token": create_agent_token(str(task.id), task.vm_instance_id)},
     )
-    tampered_report = tampered.json()["operator_authored_commits"]
-    assert tampered_report["state"] == "unresolved"
-    assert tampered_report["reason"] == "stored_authorship_receipt_invalid"
+    tampered_body = tampered.json()
+    assert tampered_body["operator_authored_commits"]["count"] == 7
+    assert tampered_body["serving_operator_authored_commits"]["state"] == "unresolved"
+    assert tampered_body["serving_operator_authored_commits"]["reason"] == (
+        "stored_authorship_receipt_invalid"
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_authorship_read_falls_back_to_serving_receipt_for_legacy_open_version(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """Legacy open rows without a candidate gate retain the old read value."""
+    from app.release_commit_authorship import (
+        AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+        AUTHORSHIP_RECEIPT_SOURCE,
+    )
+
+    project, task, _ = await _make_project_with_version(
+        db_session, vm="agent-vm-authorship-legacy"
+    )
+    promoted = ReleaseVersion(
+        project_id=project.id,
+        version_number=9,
+        status="promoted",
+        promoted_sha="b" * 40,
+        served_sha="c" * 40,
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        serving_status="serving_confirmed",
+        last_qualification={
+            "operator_authored_commits": {
+                "source": AUTHORSHIP_RECEIPT_SOURCE,
+                "schema_version": AUTHORSHIP_RECEIPT_SCHEMA_VERSION,
+                "state": "resolved",
+                "count": 0,
+                "offenders": [],
+                "range": {"base_sha": "b" * 40, "head_sha": "c" * 40},
+                "measured_at": "2026-01-01T00:00:00+00:00",
+                "retry": {"attempt": 1, "retryable": False, "next_retry_at": None},
+            }
+        },
+    )
+    db_session.add(promoted)
+    await db_session.commit()
+
+    monkeypatch.setattr("app.deployed_sha.get_serving_sha", lambda: "d" * 40)
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": create_agent_token(str(task.id), task.vm_instance_id)},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["operator_authored_commits"]["count"] == 0
+    assert body["operator_authored_commits"]["range"] == {
+        "base_sha": "b" * 40,
+        "head_sha": "c" * 40,
+    }
+    assert body["operator_authored_commits"] == body["serving_operator_authored_commits"]
 
 
 @pytest.mark.asyncio
@@ -2683,6 +2761,14 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
         "sub_scores": {"audit": 0.4, "ci": 1.0},
         "blocker": "audit_findings",
         "finalized_at": "2026-06-02T09:45:00",
+        "candidate_operator_authorship_gate": {
+            "status": "unconfigured",
+            "passed": False,
+            "count": 0,
+            "max_count": None,
+            "blocker": "candidate_operator_authorship_evidence_missing",
+            "reason": "no_operator_authorship_contract_declared",
+        },
         "audit_findings": [
             {"severity": "HIGH", "summary": "Missing auth"},
             {"severity": "MEDIUM", "summary": "Weak test"},
@@ -2758,6 +2844,11 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     assert "challenger_refuted_audit_findings" not in qual
     assert qual["debt_enforce_confidence_preview"] == pytest.approx(0.52)
     assert qual["debt_enforce_weight_preview"] == pytest.approx(0.15)
+    assert qual["candidate_operator_authorship_gate"]["status"] == "unconfigured"
+    assert qual["candidate_operator_authorship_gate"]["max_count"] is None
+    assert qual["candidate_operator_authorship_gate"]["reason"] == (
+        "no_operator_authorship_contract_declared"
+    )
 
     recent = data["recent_versions"]
     assert len(recent) == 1

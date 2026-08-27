@@ -67,6 +67,15 @@ excluded by name in ``derived_artifact_repair.NEVER_AUTOREPAIR`` and keeps the
 report-only behaviour; so does every sentinel when ``--fix`` is not passed.  A
 repair that does not clear the drift still blocks, and a generator that fails
 to run fails the lane rather than being reported as a repair.
+
+``--fix`` also runs the ROT-ONLY repairs in
+``derived_artifact_repair.ROT_ONLY_AUTOREPAIR``.  Those sentinels stay in
+``NEVER_AUTOREPAIR`` -- their artifacts are measurements and may never be
+regenerated -- but a measurement fails in two directions and only one of them
+needs a measurement to fix.  A row naming a test that no longer exists is
+deleted for free from the tree; a test with no row still blocks and still costs
+a timed run.  The registered command can only DELETE, so the unpayable half is
+structurally out of its reach.
 """
 
 from __future__ import annotations
@@ -89,7 +98,9 @@ except ImportError:  # pragma: no cover - fixture trees run on UTF-8 hosts
 from derived_artifact_repair import (  # noqa: E402
     AUTOREPAIRABLE,
     MEASUREMENT_TAX_GUIDANCE,
+    ROT_ONLY_AUTOREPAIR,
     RepairOutcome,
+    repair_entry,
     repair_sentinels,
 )
 from static_release_guard import (  # noqa: E402
@@ -177,14 +188,33 @@ def _routes_naming(failures: dict[str, str], sentinels: list[str]) -> list[str]:
 
 def _report_repair(outcome: RepairOutcome, stream) -> None:
     for sentinel in outcome.repaired:
-        print(f"{PREFIX} SELF-HEALED: {sentinel}", file=stream)
-        for artifact in AUTOREPAIRABLE[sentinel].artifacts:
+        rot_only = sentinel in ROT_ONLY_AUTOREPAIR
+        label = "SELF-HEALED (rot only)" if rot_only else "SELF-HEALED"
+        print(f"{PREFIX} {label}: {sentinel}", file=stream)
+        for artifact in repair_entry(sentinel).artifacts:
+            verb = "pruned stale entries from" if rot_only else "regenerated"
             print(
-                f"{PREFIX}   regenerated {artifact} — `./pr open` stages it with "
+                f"{PREFIX}   {verb} {artifact} — `./pr open` stages it with "
                 "`git add -A`; on a developer host commit it yourself",
                 file=stream,
             )
     for sentinel in outcome.already_fresh:
+        if sentinel in ROT_ONLY_AUTOREPAIR:
+            # The pruner found nothing to delete, so whatever is failing is NOT
+            # rot. For a measurement artifact that almost always means the
+            # opposite direction — a test with no timing — and saying "real
+            # defect" there would send the reader looking for a bug that is not
+            # any bug at all.
+            print(
+                f"{PREFIX} ADDITION, NOT ROT: {sentinel} has no stale entries to "
+                "prune, so its failure is a MISSING measurement, not phantom "
+                "data. Run `python scripts/derived_artifact_classify.py "
+                "--explain-unclassified` for the exact entries and the cost of "
+                "the repair; there is no offline shortcut and fabricating a row "
+                "is worse than the red",
+                file=stream,
+            )
+            continue
         # The generator produced identical bytes, so this sentinel's failure is
         # NOT staleness of its artifact. Say so instead of implying a repair.
         print(
@@ -208,10 +238,22 @@ def _self_repair(
     """
     drifted = _failing_sentinels(current_report.failures, sentinels)
     candidates = [sentinel for sentinel in drifted if sentinel in AUTOREPAIRABLE]
-    if not candidates:
+    rot_only = [sentinel for sentinel in drifted if sentinel in ROT_ONLY_AUTOREPAIR]
+    if not candidates and not rot_only:
         return None
 
-    outcome = repair_sentinels(repo, candidates)
+    # Two passes over DISJOINT registries, never one pass over their union: the
+    # registry argument narrows what a pass may execute, so a sentinel can only
+    # ever be run by the registry that classified it. An empty pass is skipped
+    # rather than run with an empty selection, so the call log records only
+    # repairs that were actually attempted.
+    outcome = RepairOutcome()
+    if candidates:
+        outcome = outcome.merge(repair_sentinels(repo, candidates))
+    if rot_only:
+        outcome = outcome.merge(
+            repair_sentinels(repo, rot_only, registry=ROT_ONLY_AUTOREPAIR)
+        )
     if outcome.failed:
         print(
             f"{PREFIX} ERROR: a registered generator could not be run; refusing "

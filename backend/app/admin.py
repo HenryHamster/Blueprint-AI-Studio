@@ -4311,6 +4311,12 @@ async def request_changes(
                     f"{REVIEW_FIX_GOAL_PREAMBLE}A human reviewer flagged this PR. "
                     f"Feedback:\n\n{payload.feedback}"
                 ),
+                # Explicit, not implicit: an omitted fix_reason silently
+                # DEFAULTS to "code_review" at every consumer. Same routing,
+                # but stating it is what lets the spawn-site manifest guard
+                # tell "a human reviewer's feedback" apart from "nobody
+                # thought about the lane".
+                fix_reason="code_review",
                 original_task_id=str(request_task_id),
                 source_spawn_authority=source_authority,
                 source_spawn_publication=source_publication,
@@ -4453,214 +4459,23 @@ async def reset_iteration_cap(
         task_id, current_user["user_id"], session, "member"
     )
 
-    # The authorization lookup is intentionally read-only. Re-read and lock the
-    # exact row before interpreting cap ownership or mutating its context so a
-    # newer manual/security/spend episode cannot be cleared by a stale route
-    # identity.
-    authorized_project_id = task.project_id
-    task = (
-        (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.id == task_id,
-                    Task.project_id == authorized_project_id,
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    ctx = task.context or {}
-    review_loop = ctx.get("review_loop", {}) or {}
-    pr_number = review_loop.get("pr_number") or ctx.get("rollup_pr_number")
-    if not pr_number:
-        raise HTTPException(
-            status_code=400,
-            detail="Task has no PR number in context.review_loop.pr_number or context.rollup_pr_number",
-        )
-
-    # Archive FAILED review/fix tasks on this PR so they drop from the global count.
-    # _pr_number_match is dialect-conditional: on SQLite, .as_string() JSON_QUOTE-
-    # double-quotes the int and never matches, so reuse the shared helper which
-    # falls back to func.json_extract for SQLite.
-    from app.ci_completion import _pr_number_match
-
-    failed_result = await session.execute(
-        select(Task)
-        .where(
-            Task.project_id == task.project_id,
-            Task.status == TaskStatus.FAILED,
-            Task.archived.is_(False),
-            _pr_number_match(session, pr_number),
-        )
-        .options(
-            load_only(
-                Task.id,
-                Task.archived,
-                Task.payloads,
-                Task.post_commit_pending,
-                raiseload=True,
-            )
-        )
-    )
-    failed_review_fix_tasks = [
-        candidate
-        for candidate in failed_result.scalars().all()
-        if _task_payload_dict(candidate).get("type") in ("review", "fix")
-    ]
-    pending_failed = next(
-        (
-            candidate
-            for candidate in failed_review_fix_tasks
-            if candidate.post_commit_pending
-        ),
-        None,
-    )
-    if pending_failed is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Cannot reset the iteration cap while failed review/fix task "
-                f"{pending_failed.id} has a pending post-commit continuation"
-            ),
-        )
-    failed_review_fix_ids = [candidate.id for candidate in failed_review_fix_tasks]
-    archived_count = 0
-    if failed_review_fix_ids:
-        if resolve_dialect_name(session) == "sqlite":
-            failed_task_type = func.json_extract(Task.payloads, "$[0].type")
-        else:
-            failed_task_type = Task.payloads[0]["type"].as_string()
-        archive_result = await session.execute(
-            update(Task)
-            .where(
-                Task.id.in_(failed_review_fix_ids),
-                Task.project_id == task.project_id,
-                Task.status == TaskStatus.FAILED,
-                Task.archived.is_(False),
-                Task.post_commit_pending.is_(False),
-                failed_task_type.in_(("review", "fix")),
-                _pr_number_match(session, pr_number),
-            )
-            .values(archived=True, version=Task.version + 1)
-            .execution_options(synchronize_session=False)
-        )
-        archived_count = max(0, int(archive_result.rowcount or 0))
-
-    from app.admin_approval_authority import (
-        APPROVAL_HOLD_EPISODE_KEY,
-        APPROVAL_HOLD_PROVENANCE_KEY,
-        approval_hold_provenance,
-        consume_approval_hold_metadata,
-        revoke_operator_approval_followup,
+    # The reset body is shared with the strategist/Resident op of the same name
+    # (POST /api/agent/strategic, op=reset_iteration_cap) so both callers unpark a
+    # chain through ONE implementation. See app/iteration_cap_reset.py.
+    from app.iteration_cap_reset import (
+        IterationCapResetError,
+        apply_iteration_cap_reset,
     )
 
-    hold_provenance = ctx.get(APPROVAL_HOLD_PROVENANCE_KEY)
-    hold_reason = ctx.get("approval_hold_reason")
-    cap_hold_owned = bool(
-        task.requires_approval is True
-        and isinstance(hold_provenance, dict)
-        and hold_provenance.get("episode")
-        == ctx.get(APPROVAL_HOLD_EPISODE_KEY)
-        and hold_provenance.get("set_at") == ctx.get("_approval_set_at")
-        and hold_provenance.get("reason") == hold_reason
-        and (
-            (
-                hold_provenance.get("owner") == "review_loop_convergence"
-                and hold_reason
-                in {
-                    "approved_cap_pr_preserved_for_handmerge",
-                    "review_cap_preserved_for_handmerge",
-                    "review_cap_exhausted",
-                }
-            )
-            or (
-                hold_provenance.get("owner") == "review_pipeline"
-                and hold_reason == "cross_episode_abandon_candidate"
-                and isinstance(ctx.get("review_loop_abandon_candidate"), dict)
-            )
+    try:
+        return await apply_iteration_cap_reset(
+            session,
+            task_id=task_id,
+            project_id=task.project_id,
+            actor=current_user.get("email", current_user["user_id"]),
         )
-    )
-    cap_hold_episode = approval_hold_provenance(task) if cap_hold_owned else None
-
-    # Reset per-chain iteration counter on the parking task
-    new_ctx = dict(ctx)
-    new_review_loop = dict(review_loop)
-    previous_iteration = new_review_loop.get("iteration", 0)
-    new_review_loop["iteration"] = 0
-    new_review_loop["iteration_reset_at"] = _utcnow().isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
-    new_review_loop["iteration_reset_by"] = current_user.get(
-        "email", current_user["user_id"]
-    )
-    # The merge gate's exact-target respawn budget is a SECOND per-chain
-    # counter, and it is keyed on the immutable (base_sha, head_sha) target
-    # rather than on the iteration. Clearing only the iteration would leave it
-    # exhausted, so the very next CI tick would re-park the PR the operator
-    # just released -- with the same head, the same key, and the same count.
-    # An explicit operator reset is precisely the disposition that budget was
-    # escalating for, so it releases the budget too.
-    #
-    # What actually releases it is the ``iteration_reset_at`` stamp written
-    # above: the gate derives that budget from review ROWS (a context counter
-    # could not survive the ci-waiting driver row migrating), and its census
-    # excludes every row created at or before the stamp -- the same closed-
-    # episode window the per-PR cap query in review_pipeline already applies.
-    # The three keys below are the gate's read-model of that census. They are
-    # no longer authority for anything, but a stale copy of an exhausted count
-    # is exactly what an operator would read next, so drop them with it.
-    from app.review_merge_gate import (
-        _SPAWN_BUDGET_CENSUS_KEY,
-        _SPAWN_BUDGET_COUNT_KEY,
-        _SPAWN_BUDGET_TARGET_KEY,
-    )
-
-    new_review_loop.pop(_SPAWN_BUDGET_COUNT_KEY, None)
-    new_review_loop.pop(_SPAWN_BUDGET_TARGET_KEY, None)
-    new_review_loop.pop(_SPAWN_BUDGET_CENSUS_KEY, None)
-    new_ctx["review_loop"] = new_review_loop
-    # An abandon-candidate hold is a recoverable episode stop. Resetting the
-    # existing iteration budget explicitly starts a fresh census window; keep
-    # the immutable pre-reset rows for audit, but remove the active stop marker
-    # so the next orchestrator cycle can resume the PR.
-    new_ctx.pop("review_loop_abandon_candidate", None)
-    task.context = new_ctx
-    flag_modified(task, "context")
-
-    # Clear only an exact cap-owned episode. A newer independent hold may share
-    # the boolean latch but is not authority for this operation to consume.
-    was_requires_approval = cap_hold_episode is not None
-    if cap_hold_episode is not None:
-        task.requires_approval = False
-        from app.closed_pr_reconciliation import revoke_review_wait_approval_hold
-
-        revoke_review_wait_approval_hold(task)
-        revoke_operator_approval_followup(task)
-        consume_approval_hold_metadata(
-            task,
-            expected_episode=cap_hold_episode,
-        )
-
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
-    logger.info(
-        f"[ADMIN] Iteration cap reset on task {task.id} (PR #{pr_number}): "
-        f"archived {archived_count} failed review/fix tasks, "
-        f"per-chain iteration {previous_iteration}→0"
-    )
-    return {
-        "task_id": str(task.id),
-        "pr_number": pr_number,
-        "archived_count": archived_count,
-        "previous_per_chain_iteration": previous_iteration,
-        "requires_approval_cleared": was_requires_approval,
-    }
+    except IterationCapResetError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 @router.post("/tasks/{task_id}/unarchive")

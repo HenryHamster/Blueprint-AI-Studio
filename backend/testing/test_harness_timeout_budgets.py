@@ -1,6 +1,6 @@
 """
-Standalone guard: no test may wrap a subprocess in a timeout that is >= the
-pytest-timeout budget the CI lane runs it under.
+Standalone guard: no test may wrap a subprocess in a timeout at or above the
+inner-operation ceiling without declaring an explicit pytest-timeout marker.
 
 THE DEFECT CLASS THIS EXISTS TO PREVENT
 ---------------------------------------
@@ -40,20 +40,48 @@ Runs under --noconftest (no DB, no conftest fixtures).
 """
 
 import ast
+import io
 import os
 import re
+import shutil
+import subprocess
+import tokenize
 from pathlib import Path
 
 import pytest
 
-# The pytest-timeout budget every backend CI lane passes on the command line.
+# TWO NUMBERS, TWO JOBS. These used to be a single constant at 30, which made
+# one literal do two incompatible things.
 #
-# Pinned as a literal ON PURPOSE. Reading it out of the config files would make
-# this guard self-certifying: bumping ci.yml would silently relax every
-# assertion below. Instead the literal is the authority and
+# 1. LANE_HANG_DETECTOR_SECONDS -- the pytest-timeout budget every backend CI
+#    lane passes on the command line. Its ONLY job is to catch a genuine hang
+#    (deadlock, lost socket, unbounded retry) before GitHub Actions' 360-min
+#    default stalls the runner for six hours. It is deliberately generous.
+#    At 30s it was ALSO acting as a per-test performance budget, and in that
+#    role it kept killing healthy work under host I/O contention: three
+#    distinct victims across two local standalone runs (never the same test
+#    twice, all whole-tree read+parse scans over 500-1000 files), plus the
+#    shard-4 red that blocked release v45 on a candidate that had gone green
+#    at the identical sha 40 minutes earlier. A hang detector that fires on
+#    contention is a flake generator, and on a promotion PR a flake deletes
+#    the release branch.
+#
+# 2. MAX_INNER_OPERATION_SECONDS -- the ceiling at or above which a single
+#    inner blocking call (subprocess / Event.wait / join / acquire) must
+#    declare itself with an explicit ``@pytest.mark.timeout(M)`` where M
+#    exceeds the inner timeout. This is the budget-inversion guard from the
+#    docstring above and it KEEPS ITS TEETH AT 30. Raising it alongside the
+#    hang detector is precisely the mistake this split exists to prevent: it
+#    has caught a promotion-killing class at least three times, and a 30s
+#    inner call is a code smell whether or not the harness now survives it.
+#
+# Both are pinned as literals ON PURPOSE. Reading them out of the config files
+# would make this guard self-certifying: bumping ci.yml would silently relax
+# every assertion below. Instead the literals are the authority and
 # ``test_declared_lane_budget_matches_the_pin`` proves the config still agrees
-# with it, so a deliberate bump has to touch this line and be reviewed.
-LANE_TIMEOUT_SECONDS = 30
+# with them, so a deliberate bump has to touch these lines and be reviewed.
+LANE_HANG_DETECTOR_SECONDS = 300
+MAX_INNER_OPERATION_SECONDS = 30
 
 _SUBPROCESS_CALLS = frozenset(
     {"run", "check_output", "check_call", "call", "Popen"}
@@ -61,7 +89,7 @@ _SUBPROCESS_CALLS = frozenset(
 
 # The class is not specific to subprocess. PR #17882 introduced a fresh
 # instance within hours of this sweep in a different shape -- an
-# ``Event.wait(timeout=30.0)`` under the same 30s lane -- which is the same
+# ``Event.wait(timeout=30.0)`` under the then-30s lane -- which is the same
 # bug exactly: the wait can only ever be killed by the harness, never report
 # itself. These three take their timeout in SECONDS unambiguously, which is
 # why the family stops here: Playwright-style APIs spell it ``wait_for_*`` and
@@ -197,16 +225,17 @@ class _Finding:
         if not self.owner_is_test:
             return (
                 f"{rel}:{self.lineno}: helper {self.owner}() wraps a subprocess "
-                f"in timeout={self.seconds:g}s, at or above the {LANE_TIMEOUT_SECONDS}s "
-                f"lane budget. A helper cannot carry a pytest-timeout marker that "
+                f"in timeout={self.seconds:g}s, at or above the "
+                f"{MAX_INNER_OPERATION_SECONDS}s inner-operation ceiling. A helper "
+                f"cannot carry a pytest-timeout marker that "
                 f"applies to its callers -- lower the inner timeout instead."
             )
         if self.budget is None:
             return (
                 f"{rel}:{self.lineno}: {self.owner}() wraps a subprocess in "
-                f"timeout={self.seconds:g}s under a {LANE_TIMEOUT_SECONDS}s lane budget "
-                f"with no @pytest.mark.timeout. The harness kills the call before "
-                f"its own timeout can fire."
+                f"timeout={self.seconds:g}s, at or above the "
+                f"{MAX_INNER_OPERATION_SECONDS}s inner-operation ceiling, with no "
+                f"@pytest.mark.timeout declaring the budget it needs."
             )
         return (
             f"{rel}:{self.lineno}: {self.owner}() wraps a subprocess in "
@@ -250,7 +279,7 @@ def _collect() -> tuple[list[_Finding], dict[str, dict[str, int]]]:
                 except (ValueError, TypeError, SyntaxError):
                     continue
                 counts["calls"] += 1
-                if seconds < LANE_TIMEOUT_SECONDS:
+                if seconds < MAX_INNER_OPERATION_SECONDS:
                     continue
                 enclosing = [
                     f for f in functions
@@ -290,9 +319,10 @@ def _collect() -> tuple[list[_Finding], dict[str, dict[str, int]]]:
 
 
 # This guard AST-parses the whole backend/testing and scripts corpus (~600
-# files); measured at 41s on a Windows checkout against the lanes' own
-# --timeout=30. 120s matches the house budget for corpus-scanning guards
-# (#17870, test_websocket_emitter_inventory) with ~3x headroom.
+# files); measured at 41s on a Windows checkout. 120s matches the house budget
+# for corpus-scanning guards (#17870, test_websocket_emitter_inventory) with ~3x
+# headroom, and keeps this scan attributable rather than letting it red as an
+# anonymous LANE_HANG_DETECTOR_SECONDS kill.
 @pytest.mark.timeout(120)
 def test_no_subprocess_timeout_exceeds_its_lane_budget() -> None:
     """Every wrapped subprocess must be able to hit its own timeout first."""
@@ -335,9 +365,9 @@ def test_no_subprocess_timeout_exceeds_its_lane_budget() -> None:
         )
 
     assert not findings, (
-        f"{len(findings)} subprocess timeout(s) at or above the "
-        f"{LANE_TIMEOUT_SECONDS}s CI lane budget. The harness kills the call "
-        f"before its own timeout fires, so it reds as an unreproducible flake "
+        f"{len(findings)} blocking call(s) at or above the "
+        f"{MAX_INNER_OPERATION_SECONDS}s inner-operation ceiling with no explicit "
+        f"@pytest.mark.timeout. An undeclared long call reds as a flake "
         f"rather than a real failure:\n\n"
         + "\n\n".join(str(f) for f in findings)
     )
@@ -346,8 +376,8 @@ def test_no_subprocess_timeout_exceeds_its_lane_budget() -> None:
 def test_declared_lane_budget_matches_the_pin() -> None:
     """The pinned literal must still match what CI actually passes.
 
-    Without this, ``LANE_TIMEOUT_SECONDS`` could drift away from the real lane
-    budget and the guard above would police a number nothing uses.
+    Without this, ``LANE_HANG_DETECTOR_SECONDS`` could drift away from the real
+    lane budget and the guard above would police a number nothing uses.
     """
     declarations = {
         REPO_ROOT / ".github" / "workflows" / "ci.yml": None,
@@ -358,23 +388,190 @@ def test_declared_lane_budget_matches_the_pin() -> None:
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
+        # Comment lines are stripped before the scan. Both files are commented
+        # in the same syntax they execute, so a `# ... --timeout=300 ...` note
+        # explaining the budget would otherwise SATISFY this pin on its own --
+        # the vacuous-guard shape where prose, not the executed command, is what
+        # the guard reads. Proven by mutation: with comments counted, reverting
+        # the real ci.yml invocation to 30 reported `[30, 300]` (the 300 came
+        # from a comment); with them stripped the same mutation reports `[30]`.
+        executable = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
         values = {
-            int(m) for m in re.findall(r"--timeout=(\d+)\b", text)
+            int(m) for m in re.findall(r"--timeout=(\d+)\b", executable)
         }
         if not values:
             continue
         checked += 1
-        assert values == {LANE_TIMEOUT_SECONDS}, (
+        assert values == {LANE_HANG_DETECTOR_SECONDS}, (
             f"{path.name} passes --timeout={sorted(values)} but this guard is "
-            f"pinned to {LANE_TIMEOUT_SECONDS}. Update LANE_TIMEOUT_SECONDS "
-            f"deliberately (and re-check every marker it governs) rather than "
-            f"letting the pin drift."
+            f"pinned to {LANE_HANG_DETECTOR_SECONDS}. Update "
+            f"LANE_HANG_DETECTOR_SECONDS deliberately (and re-check every marker "
+            f"it governs) rather than letting the pin drift. This is the HANG "
+            f"DETECTOR, not MAX_INNER_OPERATION_SECONDS -- never move them "
+            f"together."
         )
     if REPO_ROOT.joinpath(".github").is_dir():
         assert checked >= 1, (
             "no lane declared a --timeout= at all; the pin above is now "
             "unanchored to anything CI runs."
         )
+
+
+# Deliberate HISTORICAL citations: prose that names a superseded lane budget on
+# purpose, as a record of an incident that happened under it. Keyed by file
+# name with the reason, so adding one is a reviewed act rather than a silent
+# exemption. Everything else must either cite the CURRENT budget or -- better --
+# name ``LANE_HANG_DETECTOR_SECONDS`` and carry no number at all.
+_HISTORICAL_LANE_CITATIONS: dict[str, str] = {
+    "test_scripts_test_lane.py": (
+        "documents the 30 -> 300 raise itself -- naming the superseded value "
+        "is the whole point of that comment"
+    ),
+}
+
+# Match only the mechanically unambiguous literal form. Corpus reachability is
+# proved independently by the file-count floor below, while the focused unit
+# test mutation-proves that comments are admitted and code/strings are not.
+_LANE_TIMEOUT_CITATION_RE = re.compile(r"--timeout=(\d+)\b")
+
+
+def _comment_timeout_citations(path: Path, text: str) -> list[tuple[int, str]]:
+    """Return timeout literals from comments, never executable code or strings."""
+    if path.suffix == ".py":
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+            return [
+                (token.start[0], value)
+                for token in tokens
+                if token.type == tokenize.COMMENT
+                for value in _LANE_TIMEOUT_CITATION_RE.findall(token.string)
+            ]
+        except (IndentationError, SyntaxError, tokenize.TokenError) as exc:
+            raise AssertionError(f"could not tokenize {path}: {exc}") from exc
+
+    # The only non-Python target is scripts/test-backend.sh. Restrict this to
+    # full-line shell comments: parsing inline shell comments correctly needs a
+    # shell parser, and treating executable arguments as prose is the defect
+    # this helper exists to prevent.
+    return [
+        (lineno, value)
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if line.lstrip().startswith("#")
+        for value in _LANE_TIMEOUT_CITATION_RE.findall(line)
+    ]
+
+
+def test_timeout_citation_scanner_only_reads_comments() -> None:
+    source = (
+        'literal = "--timeout=30"\n'
+        'subprocess.run(["pytest", "--timeout=30"])\n'
+        '"""A docstring containing --timeout=30."""\n'
+        "# The old lane passed --timeout=30.\n"
+    )
+    assert _comment_timeout_citations(Path("synthetic.py"), source) == [(4, "30")]
+
+    shell = "pytest --timeout=30\n# The old lane passed --timeout=30.\n"
+    assert _comment_timeout_citations(Path("synthetic.sh"), shell) == [(2, "30")]
+
+
+def test_no_comment_cites_a_superseded_lane_timeout() -> None:
+    """Comments must not state a lane budget that disagrees with the live one.
+
+    THE DEFECT CLASS: when the lane budget moved 30 -> 300, it left ~40 comments
+    across ~25 files still asserting the superseded 30-second value. A comment
+    that states a wrong constant is worse than no comment -- an agent debugging
+    a timeout red reads it, computes headroom against 30, and concludes the
+    wrong thing about a lane that actually allows ten times that. This codebase
+    is largely maintained by agents reading these comments, so that is a live
+    misdiagnosis source, not a tidiness concern.
+
+    Deliberately NARROW. It polices exactly one mechanically-checkable form --
+    a literal ``--timeout=<digits>`` -- and makes no attempt to parse prose like
+    "the 30s lane", which a regex cannot tell apart from a legitimate mention of
+    MAX_INNER_OPERATION_SECONDS (also 30, and deliberately unchanged). A guard
+    that fired on every unrelated edit near a number would cost more than the
+    rot it prevents.
+
+    Scope excludes .github/workflows (agents cannot edit it, so a failure there
+    would be an unfixable wedge) and docs/ (dated point-in-time records, whose
+    numbers are correct AS OF their date).
+    """
+    offenders: list[str] = []
+    scanned = 0
+
+    targets: list[Path] = []
+    for root, pattern in (
+        (BACKEND_TESTING, "*.py"),
+        (REPO_ROOT / "backend" / "app", "**/*.py"),
+        (SCRIPTS_DIR, "*.py"),
+    ):
+        if root.is_dir():
+            targets.extend(sorted(root.glob(pattern)))
+    lane_script = SCRIPTS_DIR / "test-backend.sh"
+    if lane_script.is_file():
+        targets.append(lane_script)
+
+    for path in targets:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        scanned += 1
+        for lineno, value in _comment_timeout_citations(path, text):
+            if int(value) == LANE_HANG_DETECTOR_SECONDS:
+                continue
+            if path.name in _HISTORICAL_LANE_CITATIONS:
+                continue
+            offenders.append(
+                f"{path.relative_to(REPO_ROOT) if REPO_ROOT in path.parents else path}"
+                f":{lineno} cites --timeout={value}"
+            )
+
+    assert scanned >= 400, (
+        f"only {scanned} files scanned; the corpus is not being reached, so a "
+        f"clean result proves nothing. Looked under {BACKEND_TESTING}, "
+        f"{REPO_ROOT / 'backend' / 'app'} and {SCRIPTS_DIR}."
+    )
+    assert not offenders, (
+        f"{len(offenders)} comment(s) cite a lane timeout that disagrees with "
+        f"LANE_HANG_DETECTOR_SECONDS ({LANE_HANG_DETECTOR_SECONDS}):\n  "
+        + "\n  ".join(offenders)
+        + "\n\nPreferred fix: state the CONSTANT NAME "
+        "(LANE_HANG_DETECTOR_SECONDS) instead of restating its value, so the "
+        "comment cannot rot the next time the budget moves. If the number is "
+        "deliberately historical, say so in the prose AND add the file to "
+        "_HISTORICAL_LANE_CITATIONS with a reason. Do NOT reach for the inner "
+        "ceiling here: MAX_INNER_OPERATION_SECONDS is a different number doing "
+        "a different job."
+    )
+
+
+def test_the_two_budgets_stay_ordered_and_distinct() -> None:
+    """The inner ceiling must stay strictly below the hang detector.
+
+    These are deliberately two numbers doing two jobs. If a later edit collapses
+    them -- by lowering the hang detector back onto the ceiling, or by dragging
+    the ceiling up with it -- the inversion guard silently becomes the hang
+    detector again, which is the exact conflation this split undid. Equality is
+    the failure mode, so it is asserted strictly.
+    """
+    assert MAX_INNER_OPERATION_SECONDS < LANE_HANG_DETECTOR_SECONDS, (
+        f"MAX_INNER_OPERATION_SECONDS ({MAX_INNER_OPERATION_SECONDS}) must stay "
+        f"strictly below LANE_HANG_DETECTOR_SECONDS "
+        f"({LANE_HANG_DETECTOR_SECONDS}). An inner blocking call may never be "
+        f"allowed to reach the harness ceiling: at that point the harness kills "
+        f"it before its own timeout can report, which is the promotion-killing "
+        f"flake this module exists to prevent."
+    )
+    # The ceiling is the number with teeth; pin it so a bump has to be
+    # deliberate and reviewed rather than drifting up with the detector.
+    assert MAX_INNER_OPERATION_SECONDS == 30, (
+        "MAX_INNER_OPERATION_SECONDS is the budget-inversion ceiling that has "
+        "caught a promotion-killing class at least three times. Changing it "
+        "needs its own justification, separate from any hang-detector change."
+    )
 
 
 def test_the_guard_rejects_a_known_bad_shape() -> None:
@@ -386,7 +583,7 @@ def test_the_guard_rejects_a_known_bad_shape() -> None:
     bad = ast.parse(
         "import subprocess\n"
         "def test_thing():\n"
-        f"    subprocess.run(['x'], timeout={LANE_TIMEOUT_SECONDS})\n"
+        f"    subprocess.run(['x'], timeout={MAX_INNER_OPERATION_SECONDS})\n"
     )
     calls = [
         n for n in ast.walk(bad)
@@ -396,7 +593,7 @@ def test_the_guard_rejects_a_known_bad_shape() -> None:
     ]
     assert len(calls) == 1
     seconds = float(ast.literal_eval(calls[0].keywords[0].value))
-    assert seconds >= LANE_TIMEOUT_SECONDS, (
+    assert seconds >= MAX_INNER_OPERATION_SECONDS, (
         "the equal-numbers case must be treated as an inversion, not a fit"
     )
 
@@ -606,3 +803,381 @@ def test_the_scripts_lane_marker_extractor_is_not_vacuous() -> None:
     assert _max_timeout_marker(module_shape) == ("pytestmark", 45.0)
 
     assert _max_timeout_marker(ast.parse("def test_x():\n    pass\n")) is None
+
+
+# ---------------------------------------------------------------------------
+# SILENT DEATH: pytest exiting non-zero without finishing its session
+# ---------------------------------------------------------------------------
+#
+# A sibling class to the budget inversion above, and the one this module was
+# extended for. A budget inversion at least NAMES its victim
+# ("Failed: Timeout (>30.0s)"). A pytest process ended by os._exit(), abort(),
+# a segfault or the OOM killer names nothing at all: it never reaches
+# pytest_sessionfinish, so there is no "short test summary info", no FAILED
+# line, and no closing "=== N passed in Xs ===" banner -- just a progress row
+# that stops mid-character and a non-zero status.
+#
+# `Impacted backend tests` went red exactly this way three times on PR #18011
+# (runs 32998752057 / 33000772113 / 33002910941). One of those runs had ZERO
+# failing tests and still exited 1. The root cause -- the orchestrator hard
+# watchdog daemon thread the app lifespan armed and never disarmed, calling
+# os._exit(1) ~240s after the last heartbeat -- is fixed in
+# app/lifecycle.py::_disarm_orchestrator_hard_watchdog. But the DIAGNOSABILITY
+# hole is separate and outlives that one bug: any future in-process abort,
+# fatal signal or OOM-kill produces the same unreadable red.
+#
+# scripts/test-backend.sh::_run_pytest closes it by naming the class when the
+# shape appears. These tests hold that helper to its two contracts:
+#
+#   1. EXIT-CODE FIDELITY. It pipes pytest through `tee`, and `cmd | tee f`
+#      yields *tee's* status. This repo has already been burned by that exact
+#      masking (`test-backend.sh ... | tail` reporting success while tests
+#      failed), so the ${PIPESTATUS[0]} read is load-bearing, not decoration.
+#   2. The banner fires on a truncated stream and STAYS QUIET otherwise. A
+#      diagnostic that cries wolf on every ordinary red is worse than none.
+
+
+def _harness_script() -> Path | None:
+    """Locate scripts/test-backend.sh, or None when it is not mounted.
+
+    Same trap as _scripts_dir(): in the containerised lanes _repo_root() falls
+    back to /app (the bind-mounted backend/), which holds no scripts/test-backend.sh.
+    Both Docker lanes also mount the real checkout read-only at /repo, so look
+    there before giving up.
+    """
+    for candidate in (
+        REPO_ROOT / "scripts" / "test-backend.sh",
+        Path("/repo") / "scripts" / "test-backend.sh",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+HARNESS_SCRIPT = _harness_script()
+
+_NO_HARNESS = pytest.mark.skipif(
+    HARNESS_SCRIPT is None,
+    reason="scripts/test-backend.sh is not mounted in this lane",
+)
+
+
+def _harness_text() -> str:
+    assert HARNESS_SCRIPT is not None
+    return HARNESS_SCRIPT.read_text(encoding="utf-8")
+
+
+def _extract_shell_function(text: str, name: str) -> str:
+    """Return the source of a top-level shell function, brace line included.
+
+    Top-level only, and deliberately so: the terminator is a "}" in column 0,
+    which is unambiguous in this file (every nested block and the heredoc body
+    is indented). A brace-counting parser would have to understand heredocs,
+    quoting and case-statement ";;" -- more machinery, more ways to be wrong.
+    """
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.startswith(name + "() {"):
+            start = index
+            break
+    assert start is not None, name + "() not found in scripts/test-backend.sh"
+    for index in range(start + 1, len(lines)):
+        if lines[index] == "}":
+            return "\n".join(lines[start : index + 1]) + "\n"
+    raise AssertionError(name + "() has no closing brace in column 0")
+
+
+def _bash_executable() -> str | None:
+    for candidate in (
+        Path("C:/Program Files/Git/bin/bash.exe"),
+        Path("C:/Program Files/Git/usr/bin/bash.exe"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("bash")
+
+
+BASH = _bash_executable()
+
+_NO_BASH = pytest.mark.skipif(
+    BASH is None, reason="no bash interpreter available to drive the harness helper"
+)
+
+
+def _drive_run_pytest(
+    tmp_path: Path,
+    *,
+    stub_body: str,
+    tail: str = "",
+    prelude: str = "set -euo pipefail",
+) -> "subprocess.CompletedProcess[str]":
+    """Run the REAL _run_pytest from test-backend.sh against a stubbed _run.
+
+    The helper is lifted verbatim out of the shipped harness rather than
+    re-typed here -- a copy would drift and the guard would then be testing
+    itself. ``_run`` is the only seam: stubbing it lets us hand _run_pytest any
+    (output, exit status) pair, including the pairs a real pytest can only
+    produce by being killed.
+
+    The default ``prelude`` matches the harness's own top-of-file settings
+    (test-backend.sh line 20), so the errexit save/restore inside _run_pytest is
+    exercised rather than bypassed. Callers override it to prove _run_pytest does
+    not silently depend on those settings being what they happen to be today.
+    """
+    script = tmp_path / "drive.sh"
+    script.write_text(
+        prelude
+        + "\n"
+        + _extract_shell_function(_harness_text(), "_run_pytest")
+        + "\n_run() {\n"
+        + stub_body
+        + "\n}\n"
+        # `if` is required: under errexit a bare non-zero call aborts the script
+        # before we could capture $?. It also proves the caller's errexit is
+        # intact on the way out.
+        + "if _run_pytest testing/test_example.py; then rc=0; else rc=$?; fi\n"
+        + 'echo "RC=$rc"\n'
+        + tail,
+        encoding="utf-8",
+    )
+    assert BASH is not None
+    return subprocess.run(
+        [BASH, str(script)],
+        capture_output=True,
+        text=True,
+        # Below MAX_INNER_OPERATION_SECONDS (30), as this module's own guard
+        # requires of a helper: a helper cannot know its callers' budget, so a
+        # pytest-timeout marker on it would do nothing. Every stub returns
+        # immediately, so 20s can only ever fire on a genuine hang.
+        timeout=20,
+        cwd=str(tmp_path),
+    )
+
+
+_BANNER = "HARNESS: pytest exited"
+
+# A run ended abruptly part-way through a file -- the exact shape job
+# 98289065075 produced on PR #18011: a progress row, no newline, no summary.
+_TRUNCATED = (
+    "printf '%s' 'testing/test_local_runner.py ....................'\n" "return 1"
+)
+
+
+@_NO_HARNESS
+@_NO_BASH
+class TestRunPytestSilentDeathDetector:
+    """scripts/test-backend.sh::_run_pytest -- exit fidelity and the banner."""
+
+    def test_exit_code_survives_the_tee_pipeline(self, tmp_path: Path) -> None:
+        """137 must not be laundered into 0 by tee under the harness's own settings.
+
+        ``tee`` succeeds whenever it can write its file. 137 is chosen because
+        it is what Docker surfaces for a SIGKILL/OOM-kill -- the very class this
+        helper exists to make legible -- and because it is unmistakably neither
+        0 nor 1.
+        """
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body="printf '%s' 'testing/test_x.py ......'\nreturn 137",
+        )
+        assert "RC=137" in proc.stdout, (
+            "_run_pytest laundered the child's exit status. "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+    def test_exit_code_survives_without_the_caller_s_pipefail(
+        self, tmp_path: Path
+    ) -> None:
+        """THE fidelity check. The test above passes for the WRONG REASON.
+
+        Found by mutation-proving this guard: replacing ${PIPESTATUS[0]} with
+        ``$?`` did NOT turn the test above red. With ``set -o pipefail`` in
+        effect -- which test-backend.sh happens to set on line 20, and which
+        ``set +e`` does NOT clear -- ``$?`` after a pipeline already reports the
+        rightmost non-zero status, so the two spellings agree by coincidence.
+
+        That coincidence is the hazard. It makes _run_pytest's correctness
+        depend on a shell option set hundreds of lines away, and it makes the
+        obvious "simplification" to ``$?`` look safe under test. Drop pipefail --
+        as a refactor, a sourcing context or a ``bash -c`` wrapper might --
+        and ``$?`` becomes tee's status, which is 0 whenever tee could write its
+        file. A killed pytest would then report SUCCESS: the silent-GREEN twin
+        of the silent red this helper exists to fix, and the same masking that
+        has already burned this repo once (``test-backend.sh ... | tail``).
+
+        So pin the property that actually matters: _run_pytest reports pytest's
+        own status regardless of the caller's shell options.
+        """
+        proc = _drive_run_pytest(
+            tmp_path,
+            # No pipefail. Everything else as the harness has it.
+            prelude="set -eu",
+            stub_body="printf '%s' 'testing/test_x.py ......'\nreturn 137",
+        )
+        assert "RC=137" in proc.stdout, (
+            "_run_pytest reported tee's exit status instead of pytest's once the "
+            "caller's pipefail was gone -- a killed pytest would read as a pass. "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+    def test_ordinary_nonzero_exit_is_also_reported_faithfully(
+        self, tmp_path: Path
+    ) -> None:
+        """A normal test failure still returns pytest's own 1."""
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=(
+                "echo 'testing/test_x.py ..F..'\n"
+                "echo '=== short test summary info ==='\n"
+                "echo '=== 1 failed, 4 passed in 3.21s ==='\n"
+                "return 1"
+            ),
+        )
+        assert "RC=1" in proc.stdout
+
+    def test_success_is_reported_faithfully(self, tmp_path: Path) -> None:
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=(
+                "echo 'testing/test_x.py .....'\n"
+                "echo '=== 5 passed in 3.21s ==='\n"
+                "return 0"
+            ),
+        )
+        assert "RC=0" in proc.stdout
+
+    def test_truncated_stream_gets_the_banner(self, tmp_path: Path) -> None:
+        """The whole point: name the class instead of leaving a bare red."""
+        proc = _drive_run_pytest(tmp_path, stub_body=_TRUNCATED)
+        assert "RC=1" in proc.stdout
+        assert _BANNER in proc.stderr, (
+            "a pytest that exited non-zero WITHOUT a session summary produced "
+            "no diagnostic -- this is the undiagnosable red of PR #18011. "
+            f"stderr={proc.stderr!r}"
+        )
+
+    def test_banner_names_the_known_in_process_abort(self, tmp_path: Path) -> None:
+        """A banner that only says 'something went wrong' is not a diagnosis.
+
+        The first thing worth checking is a leaked watchdog/supervisor thread,
+        so the banner has to name that call site and the grep that confirms it.
+        """
+        proc = _drive_run_pytest(tmp_path, stub_body=_TRUNCATED)
+        assert "_default_hard_abort" in proc.stderr
+        assert "HARD-WATCHDOG" in proc.stderr
+        assert "--capture=no" in proc.stderr, (
+            "the banner must say how to recover the diagnostics pytest's fd "
+            "capture swallowed, or the next engineer re-runs just as blind"
+        )
+
+    def test_banner_stays_quiet_on_a_finished_failing_session(
+        self, tmp_path: Path
+    ) -> None:
+        """No crying wolf. Ordinary reds must stay unadorned."""
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=(
+                "echo 'testing/test_x.py ..F..'\n"
+                "echo '=== short test summary info ==='\n"
+                "echo 'FAILED testing/test_x.py::test_thing - assert 1 == 2'\n"
+                "echo '=== 1 failed, 4 passed in 3.21s ==='\n"
+                "return 1"
+            ),
+        )
+        assert "RC=1" in proc.stdout
+        assert (
+            _BANNER not in proc.stderr
+        ), f"banner fired on an ordinary reported failure: {proc.stderr!r}"
+
+    def test_banner_stays_quiet_when_no_tests_ran(self, tmp_path: Path) -> None:
+        """Exit 5 with an empty selection is a finished session, not a kill.
+
+        This is the case a naive "did anything FAIL?" detector gets wrong: there
+        is no FAILED line and no F, yet pytest concluded normally and said so.
+        """
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=("echo '=== no tests ran in 0.04s ==='\n" "return 5"),
+        )
+        assert "RC=5" in proc.stdout
+        assert (
+            _BANNER not in proc.stderr
+        ), f"banner fired on an empty-but-complete session: {proc.stderr!r}"
+
+    def test_banner_stays_quiet_on_success(self, tmp_path: Path) -> None:
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=("echo '=== 5 passed in 3.21s ==='\n" "return 0"),
+        )
+        assert _BANNER not in proc.stderr
+
+    def test_caller_errexit_is_restored_after_a_failure(self, tmp_path: Path) -> None:
+        """_run_pytest disables errexit around its pipeline. It must put it back.
+
+        If it did not, every command after the first pytest invocation in
+        test-backend.sh would stop aborting on failure and the harness would run
+        on past a broken step to a green-looking end -- a silent GREEN, which is
+        strictly worse than the silent red this helper was added to fix.
+        """
+        proc = _drive_run_pytest(
+            tmp_path,
+            stub_body=_TRUNCATED,
+            tail="false\necho 'ERREXIT_LOST'\n",
+        )
+        assert (
+            "ERREXIT_LOST" not in proc.stdout
+        ), "errexit was not restored: the script ran on past a failing command"
+        assert proc.returncode != 0
+
+
+@_NO_HARNESS
+class TestRunPytestWiring:
+    """Static wiring checks -- these run even in a lane without bash.
+
+    A perfect _run_pytest that nothing calls detects nothing, so the helper's
+    behaviour and its adoption are separate assertions.
+    """
+
+    def test_no_pytest_invocation_bypasses_the_helper(self) -> None:
+        text = _harness_text()
+        raw = [
+            line
+            for line in text.splitlines()
+            if re.search(r"\b_run\s+python3\s+-m\s+pytest\b", line)
+        ]
+        body = _extract_shell_function(text, "_run_pytest").splitlines()
+        bypassing = [line for line in raw if line not in body]
+        assert len(raw) == 1 and not bypassing, (
+            "every pytest invocation in test-backend.sh must go through "
+            "_run_pytest, or that lane keeps producing undiagnosable reds. "
+            f"Bypassing lines: {bypassing}"
+        )
+
+    def test_helper_is_actually_adopted(self) -> None:
+        calls = [
+            line
+            for line in _harness_text().splitlines()
+            if re.match(r"\s*_run_pytest\s", line)
+        ]
+        assert len(calls) >= 5, (
+            "expected _run_pytest at every pytest call site in test-backend.sh "
+            f"(standalone, verification, targeted, corpus, full); found {calls}"
+        )
+
+    def test_pipestatus_is_read_on_the_line_after_the_pipeline(self) -> None:
+        """PIPESTATUS is reset by ANY intervening command, `|| true` included.
+
+        Reading it one line later is the only correct placement, and it is
+        exactly the line a well-meaning refactor "tidies" into ``$?``. Pin the
+        adjacency, not merely the presence of the word.
+        """
+        lines = _extract_shell_function(_harness_text(), "_run_pytest").splitlines()
+        piped = [i for i, line in enumerate(lines) if "| tee " in line]
+        assert len(piped) == 1, f"expected exactly one tee pipeline, found {piped}"
+        following = lines[piped[0] + 1].strip()
+        assert following == "status=${PIPESTATUS[0]}", (
+            "the pipeline's exit status must be captured from PIPESTATUS on the "
+            f"immediately following line; found {following!r}. `$?` there would "
+            "report tee, which succeeds even when pytest is killed."
+        )

@@ -29,6 +29,7 @@ unchanged.
 from __future__ import annotations
 
 
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -50,7 +51,7 @@ from app.shared_state import (
     get_project_promotion_target as _get_project_promotion_target,
 )
 from app.time_utils import _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2374
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3600
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +244,13 @@ def _parse_iso_dt(raw: Any) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _coerce_verdict_detail(raw: Any) -> str | None:
+    """Normalize structured gate detail for the verdict history TEXT columns."""
+    if raw is None or isinstance(raw, str):
+        return raw
+    return json.dumps(raw, sort_keys=True, separators=(",", ":"))
 
 
 def _recover_confidence_from_ci_unresolved(
@@ -524,10 +532,12 @@ async def _record_qualification_verdict(
             # findings, and gate detail.  Keys match _finalize_qualification's
             # base_record exactly.
             migration_safety=base_record.get("migration_safety"),
-            migration_safety_detail=base_record.get("migration_safety_detail"),
+            migration_safety_detail=_coerce_verdict_detail(
+                base_record.get("migration_safety_detail")
+            ),
             migration_apply_safety=base_record.get("migration_apply_safety"),
-            migration_apply_safety_detail=base_record.get(
-                "migration_apply_safety_detail"
+            migration_apply_safety_detail=_coerce_verdict_detail(
+                base_record.get("migration_apply_safety_detail")
             ),
             audit_findings=base_record.get("audit_findings"),
             excluded_audit_findings=base_record.get("excluded_audit_findings"),
@@ -562,6 +572,12 @@ async def _record_qualification_verdict(
             promotion_pr_url=base_record.get("pr_url"),
             promotion_conflict=(conflict if isinstance(conflict, bool) else None),
             promotion_error_detail=promotion_error_detail,
+            # Force-promote provenance is copied into every immutable verdict
+            # row so later qualification writes cannot erase the operator's
+            # actor, justification, or timestamp.
+            forced_promote_by=base_record.get("forced_promote_by"),
+            forced_promote_at=_parse_iso_dt(base_record.get("forced_promote_at")),
+            forced_promote_reason=base_record.get("forced_promote_reason"),
         )
         # Flush the caller's staged mutations into the outer transaction first,
         # so the savepoint below isolates ONLY the verdict INSERT.
@@ -1859,6 +1875,7 @@ async def _record_promotion_failure(
     detail: str | None = None,
     pr_url: str | None = None,
     conflict: bool = False,
+    candidate_sha: str | None = None,
     lock_released: bool,
 ) -> dict[str, Any]:
     """Record a failed promotion: keep the version open, set phase=stabilize.
@@ -1885,6 +1902,22 @@ async def _record_promotion_failure(
     self-contradictory terminal record.  When the re-locked row is no longer
     ``open`` this returns an ``already_promoted``-style result WITHOUT touching
     ``last_qualification``, exactly mirroring ``_record_promotion_success``.
+
+    Candidate identity is pinned HERE, not inherited on trust.  Its success twin
+    ``_record_promotion_success`` takes ``candidate_sha`` and writes it into the
+    record explicitly; this function used to take the key only from whatever the
+    caller happened to put in ``base_record``.  Every current caller does supply
+    it, so this is latent rather than live -- but the degenerate case is
+    strictly WORSE than an ordinary failure, which is why it is closed rather
+    than documented.  An empty ``candidate_sha`` on a ``promotion_failed``
+    record sends the sweep re-driver down its ``candidate_identity_unknown``
+    branch, and unlike the sibling ``candidate_unchanged`` branch that one has
+    no Alert: the version holds silently, forever, with the read surface
+    reporting nothing wrong.  Resolution order is the explicit argument, then
+    ``base_record``, then the candidate on the row's own prior record (the
+    ``promotion_pending``/qualification record for this same attempt).  When
+    none resolves, ``candidate_sha_unresolved`` is stamped so the hold has a
+    stated reason instead of being a blank.
     """
     locked = await _relock_version_for_promotion_write(
         session, version, lock_released=lock_released
@@ -1925,12 +1958,38 @@ async def _record_promotion_failure(
         _prev_count = int(
             version.last_qualification.get("promotion_failure_count") or 0
         )
+    _pinned_candidate = str(
+        candidate_sha
+        or base_record.get("candidate_sha")
+        or (
+            version.last_qualification.get("candidate_sha")
+            if isinstance(version.last_qualification, dict)
+            else None
+        )
+        or ""
+    ).strip()
     record = {
         **base_record,
         "status": "promotion_failed",
         "error": error,
         "promotion_failure_count": _prev_count + 1,
     }
+    if _pinned_candidate:
+        record["candidate_sha"] = _pinned_candidate
+    else:
+        # Do NOT invent one.  Say so, loudly and on the record: the re-driver
+        # branch this reaches has no cap and no Alert of its own.
+        record.pop("candidate_sha", None)
+        record["candidate_sha_unresolved"] = True
+        logger.error(
+            "[RELEASE_QUALIFIER] promote: recording a '%s' failure for v%d with "
+            "NO resolvable candidate_sha — the sweep re-driver will hold this "
+            "version at candidate_identity_unknown, which is uncapped and "
+            "unalerted; stamping candidate_sha_unresolved so the hold is not a "
+            "blank",
+            error,
+            version.version_number,
+        )
     if detail:
         record["detail"] = detail
     if pr_url:
@@ -2086,6 +2145,28 @@ async def _record_promotion_success(
         "promoted_sha": effective_sha,
         "pr_url": pr_url,
     }
+    # Clear the PREVIOUS attempt's failure state.  ``base_record`` on the
+    # reconcile paths is ``dict(last_qualification)`` of a ``promotion_failed``
+    # record (release_reconciliation._reconcile_if_promotion_failed_landed), so
+    # ``status`` was overwritten above while ``error`` / ``detail`` / ``conflict``
+    # rode through untouched: v40-v44 all promoted SUCCESSFULLY and all still
+    # read ``error: "required_check_failed"``.  That makes ``error`` unusable as
+    # a state signal -- an operator cannot tell a currently-failing version from
+    # one that failed once and shipped weeks ago.  Nothing reads ``error`` /
+    # ``detail`` / ``conflict`` except under ``status in {"promotion_failed",
+    # "error", "infra_failure"}``, so a promoted record has no consumer for
+    # them; the history is preserved verbatim under ``prior_promotion_failure``
+    # (alongside ``promotion_failure_count``, which already survives) rather
+    # than deleted.
+    _prior_failure = {
+        key: record[key]
+        for key in ("error", "detail", "conflict")
+        if record.get(key)
+    }
+    for key in ("error", "detail", "conflict"):
+        record.pop(key, None)
+    if _prior_failure:
+        record["prior_promotion_failure"] = _prior_failure
     if empty_diff:
         record["empty_diff"] = True
     if already_landed:

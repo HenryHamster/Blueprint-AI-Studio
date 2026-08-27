@@ -639,6 +639,7 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         # lifecycle view also names WHY each category is unmet (additive).
         "category_verdicts",
         "residual_uncaptured_gap",
+        "candidate_operator_authorship_gate",
     )
     out = {key: qual.get(key) for key in keys if qual.get(key) is not None}
 
@@ -677,6 +678,23 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
             out[count_key] = qual.get(count_key)
 
     return out
+
+
+def _project_candidate_authorship_gate(gate: Any) -> dict[str, Any] | None:
+    """Expose the persisted candidate authorship decision on the read surface.
+
+    The qualification gate is a decision summary rather than a GitHub receipt;
+    preserve its status, budget, measured range, and reason while adding the
+    legacy ``state`` spelling used by agent readers of the old receipt shape.
+    A present-but-malformed gate stays visible as unresolved instead of falling
+    back to an unrelated promoted serving window.
+    """
+    if not isinstance(gate, dict):
+        return None
+    projected = dict(gate)
+    status = gate.get("status")
+    projected["state"] = status if isinstance(status, str) else "unresolved"
+    return projected
 
 
 def _compose_serving_block(
@@ -1674,8 +1692,10 @@ async def agent_fetch_qualification(
 
     Payload includes: candidate_sha, finalized_at, status, confidence,
     sub_scores, findings, excluded_findings, challenger_refuted_findings, and
-    serving_sha (the git SHA of the deployed code producing this response), and
-    the persisted operator_authored_commits release evidence.
+    serving_sha (the git SHA of the deployed code producing this response).
+    ``operator_authored_commits`` is the persisted candidate gate; the
+    validated promoted serving receipt is retained under
+    ``serving_operator_authored_commits`` for operational context.
     """
     from app.deployed_sha import get_serving_sha  # noqa: PLC0415
     from app.release_qualifier import (  # noqa: PLC0415
@@ -1759,7 +1779,7 @@ async def agent_fetch_qualification(
         and latest_promoted_version.serving_status == "serving_confirmed"
         else None
     )
-    operator_authored_commits = validated_authorship or unresolved_authorship_receipt(
+    serving_operator_authored_commits = validated_authorship or unresolved_authorship_receipt(
         authorship_base_sha,
         authorship_head_sha,
         "stored_authorship_receipt_invalid"
@@ -1792,6 +1812,7 @@ async def agent_fetch_qualification(
         "promotion_confidence_threshold": None,
         "projected_promotion_ready": None,
         "promotion_ci_green_gate": None,
+        "promotion_ci_gate_proves_promotion": None,
     }
     try:
         from app.release_readiness import (  # noqa: PLC0415
@@ -1822,6 +1843,7 @@ async def agent_fetch_qualification(
             # Populated by the CI-green-gate block below; keep the key present so
             # the response shape is stable whether or not that compute succeeds.
             "promotion_ci_green_gate": None,
+            "promotion_ci_gate_proves_promotion": None,
         }
     except Exception:
         logger.exception(
@@ -1836,13 +1858,29 @@ async def agent_fetch_qualification(
     # dispatch=False so this read NEVER triggers a workflow run. Best-effort: a
     # GitHub failure degrades to ``promotion_ci_green_gate: None`` without breaking
     # the read or changing any existing key.
+    #
+    # ``promotion_ci_gate_proves_promotion`` is served BESIDE the raw gate on
+    # purpose.  The strategist is the actor that decides to force-promote, and
+    # the gate's ``green`` used to conflate two different claims: "a full matrix
+    # passed somewhere" and "a run of the SAME SHAPE the promotion PR gets
+    # passed".  A ``workflow_dispatch`` rehearsal on the integration branch and
+    # the promotion PR's ``pull_request`` run do not share a checkout, so the
+    # first does not predict the second — proven on 2026-08-25 when one tree
+    # produced dispatch=SUCCESS at 10:13 UTC and pull_request=FAILURE at 10:41.
+    # Reading the raw gate still requires knowing that; this boolean answers the
+    # only question a promotion decision actually asks.
     try:
         from app.release_readiness import (  # noqa: PLC0415
             compute_promotion_ci_green_gate,
+            promotion_ci_gate_proves_promotion,
         )
 
-        requalification_extra["promotion_ci_green_gate"] = (
-            await compute_promotion_ci_green_gate(session, project_id, dispatch=False)
+        _ci_gate = await compute_promotion_ci_green_gate(
+            session, project_id, dispatch=False
+        )
+        requalification_extra["promotion_ci_green_gate"] = _ci_gate
+        requalification_extra["promotion_ci_gate_proves_promotion"] = (
+            promotion_ci_gate_proves_promotion(_ci_gate)
         )
     except Exception:
         logger.exception(
@@ -1945,6 +1983,22 @@ async def agent_fetch_qualification(
         )
     )
     verdict = selected_verdict or evidence_verdict
+    candidate_gate: Any = None
+    open_qualification = open_row.last_qualification
+    if isinstance(open_qualification, dict):
+        candidate_gate = open_qualification.get("candidate_operator_authorship_gate")
+    if not isinstance(candidate_gate, dict):
+        verdict_scores = verdict.sub_scores if verdict is not None else None
+        if isinstance(verdict_scores, dict):
+            candidate_gate = verdict_scores.get("candidate_operator_authorship")
+    candidate_operator_authored_commits = _project_candidate_authorship_gate(
+        candidate_gate
+    )
+    operator_authored_commits = (
+        candidate_operator_authored_commits
+        if candidate_operator_authored_commits is not None
+        else serving_operator_authored_commits
+    )
     qualification_provenance = qualification_read_provenance(
         open_row, selected_verdict
     )
@@ -2053,7 +2107,9 @@ async def agent_fetch_qualification(
             "qualification_provenance": qualification_provenance,
             "dimension_states": qualification_dimension_states,
             "serving_sha": serving_sha,
+            "candidate_operator_authorship_gate": candidate_operator_authored_commits,
             "operator_authored_commits": operator_authored_commits,
+            "serving_operator_authored_commits": serving_operator_authored_commits,
             "current_effective_policy": current_effective_policy,
             "active_or_last_attempt_policy": active_or_last_attempt_policy,
             **requalification_extra,
@@ -2113,7 +2169,9 @@ async def agent_fetch_qualification(
         "qualification_provenance": qualification_provenance,
         "dimension_states": qualification_dimension_states,
         "serving_sha": serving_sha,
+        "candidate_operator_authorship_gate": candidate_operator_authored_commits,
         "operator_authored_commits": operator_authored_commits,
+        "serving_operator_authored_commits": serving_operator_authored_commits,
         "current_effective_policy": current_effective_policy,
         "active_or_last_attempt_policy": active_or_last_attempt_policy,
         **requalification_extra,

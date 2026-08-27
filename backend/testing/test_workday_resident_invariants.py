@@ -52,8 +52,11 @@ from app.strategic_resident_session import (
 )
 from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY, persist_strategic_workbench_update
 from app.strategic_trigger import (
+    ARMING_PASSIVE_NOTE,
     ARMING_RESIDENT_SESSION,
+    ARMING_STEERING,
     maybe_arm_operator_refresh,
+    strategic_refresh_pending,
 )
 from app.work_session_command_execution import _request_arming_after_receipt
 
@@ -652,7 +655,7 @@ async def test_operator_send_serializes_with_resident_transition(
         )
         assert actual == expected
 
-def _continuation_marker(*, fresh: bool) -> dict:
+def _continuation_marker(*, fresh: bool, operator: str = "operator") -> dict:
     seen = datetime.now(timezone.utc)
     if not fresh:
         seen = seen - timedelta(hours=2)
@@ -660,38 +663,244 @@ def _continuation_marker(*, fresh: bool) -> dict:
     return {
         "version": 1,
         "active": True,
-        "operator_user_id": "operator",
+        "operator_user_id": operator,
         "updated_at": stamp,
         "last_seen_at": stamp,
     }
 
 
-@pytest.mark.asyncio
-async def test_resident_mutations_reject_expired_continuation_but_messages_pass(
-    db_session,
-):
-    project, task, _ = await _make_resident_record(
-        db_session, task_status=TaskStatus.IN_PROGRESS
-    )
+async def _set_continuation(db_session, project, marker: dict | None) -> None:
     vision = dict(project.vision or {})
-    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = _continuation_marker(fresh=False)
+    if marker is None:
+        vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
+    else:
+        vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
     project.vision = vision
     db_session.add(project)
     await db_session.commit()
 
-    with pytest.raises(HTTPException) as expired:
+
+@pytest.mark.asyncio
+async def test_resident_mutations_reject_unowned_continuation_but_messages_pass(
+    db_session,
+):
+    """Ownership stays a hard refusal — and the refusal says WHICH condition failed.
+
+    Replaces the freshness half of the old
+    ``test_resident_mutations_reject_expired_continuation_but_messages_pass``:
+    an expired-but-OWNED lease is now renewed by the mutation itself (see
+    ``test_resident_mutation_renews_a_stale_but_owned_continuation``). What must
+    still fail closed is an identity mismatch — a POPPED marker (Stop / the
+    Workday->Chat switch) and a marker belonging to another operator session.
+    Neither is satisfiable by working, so both keep refusing.
+    """
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+
+    # Popped marker: Stop and the mode switch remain terminal.
+    await _set_continuation(db_session, project, None)
+    with pytest.raises(HTTPException) as unarmed:
         await _enforce_resident_mutation_fence(
             db_session, project, task, "update_running_update"
         )
-    assert expired.value.status_code == 409
-    assert "expired" in str(expired.value.detail).lower()
+    assert unarmed.value.status_code == 409
+    unarmed_detail = str(unarmed.value.detail)
+    assert "not armed" in unarmed_detail.lower()
+    assert "enabled=False" in unarmed_detail
+    assert "reason=not_enabled" in unarmed_detail
 
+    # Foreign owner, still fresh: never taken over.
+    await _set_continuation(
+        db_session, project, _continuation_marker(fresh=True, operator="other-op")
+    )
+    with pytest.raises(HTTPException) as foreign:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    assert foreign.value.status_code == 409
+    foreign_detail = str(foreign.value.detail)
+    assert "owned_by_current_operator=False" in foreign_detail
+    assert "ownership=other_operator" in foreign_detail
+    assert (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY][
+        "operator_user_id"
+    ] == "other-op"
+
+    # The conversational Workday path is never fenced by any of this.
     await _enforce_resident_mutation_fence(
         db_session, project, task, "create_message"
     )
     await _enforce_resident_mutation_fence(
         db_session, project, task, "resolve_message"
     )
+
+
+@pytest.mark.asyncio
+async def test_resident_mutation_renews_a_stale_but_owned_continuation(db_session):
+    """An idle-lapsed lease must not lock the Resident out until a human returns.
+
+    Continuation freshness governs the LOCAL-RUNNER PIN, not write authority:
+    while fresh, ``strategic_local_runner`` stamps
+    ``strategic_local_runner_required`` so the cloud cadence cannot reclaim the
+    lane. Whether this worker may write was already decided upstream by the
+    session/task/generation/incarnation checks. Gating mutations on the pin's
+    freshness made the lockout self-reinforcing — the Resident could not renew
+    by working, only by being talked to — so the mutation itself now re-anchors
+    the lease.
+    """
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_CONTINUATION_WORK_RENEWAL_REASON,
+        strategic_local_continuation_status_from_vision,
+    )
+
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    stale = _continuation_marker(fresh=False)
+    await _set_continuation(db_session, project, stale)
+    assert (
+        strategic_local_continuation_status_from_vision(
+            project.vision, operator_user_id="operator"
+        )["fresh"]
+        is False
+    )
+
+    # Must NOT raise: a stale pin is not an authority failure.
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "update_running_update"
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["last_seen_at"] != stale["last_seen_at"]
+    assert (
+        marker["last_renewal_reason"]
+        == STRATEGIC_LOCAL_CONTINUATION_WORK_RENEWAL_REASON
+    )
+    assert marker["operator_user_id"] == "operator"
+    post = strategic_local_continuation_status_from_vision(
+        project.vision, operator_user_id="operator"
+    )
+    assert post["fresh"] is True
+    assert post["owned_by_current_operator"] is True
+
+
+@pytest.mark.asyncio
+async def test_resident_mutation_fence_never_resurrects_a_popped_continuation(
+    db_session,
+):
+    """The dead-man's switch is intact: a refused mutation arms nothing.
+
+    If the fence could mint a marker, Stop and the Workday->Chat switch would
+    stop being terminal and an ended session could re-pin the project locally
+    forever — the exact 12h-pin failure the short TTL was introduced to end.
+    """
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _set_continuation(db_session, project, None)
+
+    with pytest.raises(HTTPException):
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    await db_session.rollback()
+    await db_session.refresh(project)
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (project.vision or {})
+
+
+@pytest.mark.asyncio
+async def test_unworked_continuation_still_lapses_and_releases_the_local_pin(
+    db_session,
+):
+    """The property the lease really protects: cloud reclaim of an idle lane.
+
+    Renewal now keys on WORK rather than on operator presence, so this proves
+    the switch still throws: with no op and no heartbeat the marker stays stale
+    and ``strategic_local_runner`` stops demanding a local runner, handing the
+    Strategic lane back to the cloud cadence. Work — and only work — re-arms it.
+    """
+    from app.strategic_local_runner import (
+        _resolve_local_continuation_runner_intent,
+    )
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+    )
+
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _set_continuation(db_session, project, _continuation_marker(fresh=False))
+
+    lapsed = await _resolve_local_continuation_runner_intent(
+        db_session, project.id, "strategic_review"
+    )
+    assert lapsed == {}
+
+    # A Strategic mutation from the live Resident re-arms the pin.
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "update_running_update"
+    )
+    await db_session.commit()
+
+    rearmed = await _resolve_local_continuation_runner_intent(
+        db_session, project.id, "strategic_review"
+    )
+    assert rearmed.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_fence_renewal_is_paced_at_the_call_site_not_only_in_the_helper(
+    db_session,
+):
+    """An op burst must not rewrite project.vision once per op.
+
+    ``with_vision_locked`` calls ``flag_modified`` on ``project.vision`` BEFORE
+    it can observe what the mutate_fn decided, so a renewal helper that
+    correctly no-ops still produces a full JSONB UPDATE of the whole column
+    every single time it is routed through the locked writer. Pacing that lives
+    only inside the helper is therefore invisible at the call site: the fence
+    runs on every non-message Strategic op, so a chatty Resident turn would
+    rewrite the column on each one.
+
+    Asserted on the real dirty-set at flush time rather than on a spy, so the
+    test fails if the call-site gate is removed.
+    """
+    from sqlalchemy import event
+
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+
+    dirtied: list[bool] = []
+
+    def _watch(sync_session, flush_context, instances):
+        dirtied.append(any(obj is project for obj in sync_session.dirty))
+
+    event.listen(db_session.sync_session, "before_flush", _watch)
+    try:
+        # Stale anchor: the renewal is due, so the column IS rewritten.
+        await _set_continuation(db_session, project, _continuation_marker(fresh=False))
+        dirtied.clear()
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+        assert any(dirtied), "a due renewal must write project.vision"
+
+        # Anchor now inside the pacing window: the next op must write nothing.
+        await db_session.commit()
+        dirtied.clear()
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+        assert not any(dirtied), (
+            "a paced (not-yet-due) renewal must not mark project.vision dirty; "
+            "with_vision_locked flags the column unconditionally, so the gate "
+            "has to sit at the call site"
+        )
+    finally:
+        event.remove(db_session.sync_session, "before_flush", _watch)
 
 
 @pytest.mark.asyncio
@@ -720,13 +929,190 @@ async def test_resident_mutations_reject_overlapping_one_shot_but_messages_pass(
             db_session, project, task, "update_running_update"
         )
     assert overlap.value.status_code == 409
-    assert "lane" in str(overlap.value.detail).lower()
+    overlap_detail = str(overlap.value.detail)
+    assert "lane" in overlap_detail.lower()
+    # A bare state name leaves the Resident unable to say WHAT blocked it, so
+    # it escalates a transient overlap to the operator as if it were terminal.
+    # The refusal must name the conflicting task and its transience.
+    assert str(one_shot.id) in overlap_detail
+    assert "strategic_review" in overlap_detail
+    assert "transient" in overlap_detail.lower()
+    assert "no operator action" in overlap_detail.lower()
 
     await _enforce_resident_mutation_fence(
         db_session, project, task, "create_message"
     )
 
 
+async def _arm_fresh_continuation(db_session, project):
+    """Put the project's local-continuation marker into the fresh/owned state."""
+    vision = dict(project.vision or {})
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = _continuation_marker(fresh=True)
+    project.vision = vision
+    db_session.add(project)
+    await db_session.commit()
+
+
+def _sibling_strategic_task(project, *, task_type, status, started_at, context):
+    return Task(
+        project_id=project.id,
+        payloads=[{"type": task_type, "prompt": "sibling strategic row"}],
+        status=status,
+        started_at=started_at,
+        created_by="ORCHESTRATOR",
+        context=context,
+        depends_on=[],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker_key", ["_resident_session", "_resident_infrastructure"]
+)
+async def test_resident_mutation_fence_ignores_sibling_resident_process_row(
+    db_session, marker_key
+):
+    """A second Resident PROCESS row is not a competing one-shot Strategic writer.
+
+    The Resident runs AS a ``strategic_review`` Task, so the old payload-type-only
+    lane check counted its own predecessor generation / adopted duplicate as a
+    rival writer and 409'd every mutation for as long as that row stayed
+    non-terminal — i.e. it muted the Resident precisely during a handoff, while
+    the operator was talking to it. Single-writer among Resident workers is
+    already enforced by the session-id / generation / incarnation checks that run
+    immediately before this fence.
+    """
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _arm_fresh_continuation(db_session, project)
+    sibling = _sibling_strategic_task(
+        project,
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        context={
+            marker_key: True,
+            "strategic_session_id": str(uuid.uuid4()),
+            "_resident_worker_generation": 1,
+        },
+    )
+    db_session.add(sibling)
+    await db_session.commit()
+
+    # Must NOT raise: the sibling is Resident process infrastructure.
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "update_running_update"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resident_mutation_fence_ignores_never_started_one_shot(db_session):
+    """A one-shot that has never executed has written nothing to race with.
+
+    It has issued no strategic op and holds no pre-mutation snapshot. Fencing on
+    it mutes the Resident for the whole queue wait — indefinitely when the
+    one-shot cannot dispatch. Once it actually starts, the fence must return.
+    """
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _arm_fresh_continuation(db_session, project)
+    one_shot = _sibling_strategic_task(
+        project,
+        task_type="strategic_review",
+        status=TaskStatus.QUEUED,
+        started_at=None,
+        context={},
+    )
+    db_session.add(one_shot)
+    await db_session.commit()
+
+    await _enforce_resident_mutation_fence(
+        db_session, project, task, "update_running_update"
+    )
+
+    # The invariant is intact: the same row fences as soon as it begins executing.
+    one_shot.started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    one_shot.status = TaskStatus.PROVISIONING
+    db_session.add(one_shot)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as started:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    assert started.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_resident_lane_refusal_names_the_blocking_task(db_session):
+    """A refusal must carry WHY: which task owns the lane, its type and state."""
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _arm_fresh_continuation(db_session, project)
+    one_shot = _sibling_strategic_task(
+        project,
+        task_type="design_doc_update",
+        status=TaskStatus.IN_PROGRESS,
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        context={},
+    )
+    db_session.add(one_shot)
+    await db_session.commit()
+    await db_session.refresh(one_shot)
+
+    with pytest.raises(HTTPException) as blocked:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    detail = str(blocked.value.detail)
+    assert blocked.value.status_code == 409
+    assert "lane" in detail.lower()
+    assert str(one_shot.id) in detail
+    assert "design_doc_update" in detail
+    assert "IN_PROGRESS" in detail
+
+
+@pytest.mark.asyncio
+async def test_resident_continuation_refusal_carries_its_reason(db_session):
+    """The continuation refusal must say which lease condition failed.
+
+    Retargeted from the freshness case. A stale-but-owned lease is no longer a
+    refusal at all — the mutation renews it (see
+    ``test_resident_mutation_renews_a_stale_but_owned_continuation``), so the
+    old expired-marker setup no longer reaches a refusal to inspect. The
+    surviving refusals are the identity ones, and the property this test exists
+    to protect is unchanged: a refusal must name the failing condition instead
+    of a bare state name.
+
+    It additionally pins that the refusal does not MISLEAD. If it implied the
+    TTL blocked the write, the Resident would sit out a lease that is in fact
+    valid, or escalate for a re-arm it does not need.
+    """
+    project, task, _ = await _make_resident_record(
+        db_session, task_status=TaskStatus.IN_PROGRESS
+    )
+    await _set_continuation(
+        db_session,
+        project,
+        _continuation_marker(fresh=True, operator="another-operator"),
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await _enforce_resident_mutation_fence(
+            db_session, project, task, "update_running_update"
+        )
+    detail = str(refused.value.detail)
+    assert refused.value.status_code == 409
+    assert "not armed for this operator" in detail
+    assert "ownership=other_operator" in detail
+    assert "owned_by_current_operator=False" in detail
+    assert "enabled=True" in detail
+    assert "fresh=True" in detail
+    assert "expires_at=" in detail
+    assert "freshness is NOT the blocker" in detail
 
 
 @pytest.mark.asyncio
@@ -1100,6 +1486,86 @@ async def test_workbench_and_work_session_arming_suppressed_during_resident_sess
 # with ``sequence IS NULL``, and this function pre-allocates the sequence before
 # INSERT, so the wrong value is durable.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+
+def test_the_conversation_composer_marks_its_turns_as_conversation_turns():
+    """The operator conversation entrypoint must flag the turn as such.
+
+    ``conversation_turn`` is what guarantees a turn typed at the Resident gets a
+    reader (bound Resident, else armed cadence) instead of stranding as a
+    passive note. It cannot be derived from ``surface``: the message-BOARD
+    routes also default to ``MessageSurface.CONVERSATION``, so the two lanes are
+    indistinguishable at the seam. That makes this router call site the single
+    load-bearing binding, and a silent drop of the kwarg would re-open the
+    strand with every behavioural test still green (the board leg would pass and
+    the conversation leg would simply go quiet). Pin it structurally.
+
+    ``agent_strategic_messages.create_finalized_call_transcript`` is the only
+    other CONVERSATION-surface operator input, and it is deliberately NOT
+    flagged: its ``_revalidate_call_lease`` precommit requires an IN_PROGRESS
+    resident task owning the exact live session, so every turn it accepts is
+    already bound and reports ``resident_session``. Flagging it would change no
+    outcome.
+    """
+    source = inspect.getsource(
+        strategic_session_router.create_project_strategic_session_message
+    )
+    assert "create_operator_project_message(" in source
+    assert "conversation_turn=True" in source
+
+
+@pytest.mark.asyncio
+async def test_server_authored_activation_turn_never_arms_a_cadence_cycle(db_session):
+    """The Resident activation prompt is not operator steering.
+
+    It is written through the same helper with ``MessageType.NOTE`` on the
+    CONVERSATION surface, so if it ever reached the conversation lane it would
+    look exactly like an operator chat turn and wake a cadence cycle nobody
+    asked for. The activation marker excludes it at the arming site.
+
+    Asserted A/B: the identical call WITHOUT the activation marker must arm, or
+    the exclusion leg proves nothing.
+    """
+    project = Project(name="Activation fence", user_id="operator", vision={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activation = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="Resident activation prompt.",
+        context={},
+        server_context={RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY: True},
+        workbench_context=None,
+        idempotency_key=str(uuid.uuid4()),
+        conversation_turn=True,
+        include_strategic_session_snapshot=False,
+    )
+    assert activation.arming == ARMING_PASSIVE_NOTE
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is False
+
+    operator_turn = await create_operator_project_message(
+        db_session,
+        project=project,
+        user_id="operator",
+        message_type=MessageType.NOTE,
+        content="Actually, stop the promotion and fix the deploy.",
+        context={},
+        workbench_context=None,
+        idempotency_key=str(uuid.uuid4()),
+        conversation_turn=True,
+        include_strategic_session_snapshot=False,
+    )
+    assert operator_turn.arming == ARMING_STEERING
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert strategic_refresh_pending(project.vision) is True
 
 
 @pytest.mark.asyncio

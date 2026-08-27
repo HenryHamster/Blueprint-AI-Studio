@@ -6,7 +6,14 @@
       "sentinels": [
         "backend/testing/test_scripts_dir_resolution_guard.py"
       ],
-      "why": "test_scripts_dir_resolution_guard.py AST-scans the WHOLE backend tree (every backend/**/*.py outside alembic/versions/) for hand-rolled repo-scripts resolution: a parent-directory walk that joins 'scripts', or a sys.path mutation that adds a scripts directory, without going through backend/testing/repo_scripts_path.resolve_scripts_dir. It imports nothing that a new offender would import, so the dotted-import reverse-dep scan can never select it: the offender is a brand-new literal path expression in an arbitrary module. Without this registration the guard runs only in the full promotion suite, which is exactly the #17738 shape -- the drift merges green on the task PR and surfaces at the automain->main promotion matrix, where a red CLOSES the PR and deletes its release branch. The surface is the whole backend tree because that is literally the corpus the guard scans; the cost is bounded (the guard prefilters on source text and parses ~47 of ~1231 files, ~3s). Deliberately NOT added to scripts/test-backend.sh STANDALONE_ARGS: that lane runs pytest --timeout=30 and this guard reads the whole backend tree over a Docker bind mount, which is the harness-budget-inversion flake shape; the ordinary sharded backend lanes collect it under --timeout=60 at the promotion gate, and this registration covers the task PR."
+      "why": "test_scripts_dir_resolution_guard.py AST-scans the WHOLE backend tree (every backend/**/*.py outside alembic/versions/) for hand-rolled repo-scripts resolution: a parent-directory walk that joins 'scripts', or a sys.path mutation that adds a scripts directory, without going through backend/testing/repo_scripts_path.resolve_scripts_dir. It imports nothing that a new offender would import, so the dotted-import reverse-dep scan can never select it: the offender is a brand-new literal path expression in an arbitrary module. Without this registration the guard runs only in the full promotion suite, which is exactly the #17738 shape -- the drift merges green on the task PR and surfaces at the automain->main promotion matrix, where a red CLOSES the PR and deletes its release branch. The surface is the whole backend tree because that is literally the corpus the guard scans; the cost is bounded (the guard prefilters on source text and parses ~47 of ~1231 files, ~3s). Deliberately NOT added to scripts/test-backend.sh STANDALONE_ARGS: that lane and the ordinary sharded backend lanes both pass LANE_HANG_DETECTOR_SECONDS (backend/testing/test_harness_timeout_budgets.py) as pytest's --timeout, and this guard reads the whole backend tree over a Docker bind mount, which is the harness-budget-inversion flake shape. The sharded backend lanes collect it at the promotion gate, and this registration covers the task PR."
+    },
+    {
+      "glob": "backend/**/*.py",
+      "sentinels": [
+        "backend/testing/test_harness_timeout_budgets.py"
+      ],
+      "why": "test_no_comment_cites_a_superseded_lane_timeout reads backend/testing/*.py, backend/app/**/*.py, scripts/*.py and scripts/test-backend.sh as TEXT, looking for a literal '--timeout=<digits>' that disagrees with LANE_HANG_DETECTOR_SECONDS. The thing it polices is a COMMENT, so there is no import edge to it by construction and the dotted-import reverse-dep scan can never select this file. Unregistered, the guard would run only in the full promotion suite: prose rot merges green on the task PR and reds the automain->main promotion PR, which then CLOSES and deletes its release branch -- strictly worse than the rot it polices. Registration is what makes this guard net-positive rather than a delayed promotion-killer. The surface is the whole backend tree because that is most of the corpus it reads; the scan is one read_text per file with no ast.parse, measured 0.69s for the three pinning tests together. KNOWN GAP, deliberate: scripts/*.py is scanned but is NOT registered as a surface here. A non-backend glob would make impacted_tests.corpus_lane_required_sentinels demand a STANDALONE_ARGS seat for this whole MODULE, and the module's other tests drive scripts/test-backend.sh's _run_pytest through real bash subprocesses -- 72.91s for its 20 tests on a native Windows checkout, and the corpus lane runs over a Docker-on-Windows bind mount where that gets worse. A scripts-only diff that introduces a stale citation is therefore caught at the promotion gate rather than on the task PR. Widen this only together with that roster seat, and measure the module on the bind mount first."
     },
     {
       "glob": "backend/app/**/*.py",
@@ -143,6 +150,36 @@
       "glob": "scripts/test_local_runner.py",
       "sentinels": ["backend/testing/test_conversational_workday_protection.py"],
       "why": "conversational_workday_manifest.json's PROTECT list names this exact file. Same scoping rationale as scripts/test_runner_isolation.py above."
+    },
+    {
+      "glob": "backend/app/**/*.py",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "SIZE-GUARDRAIL LEFT SHIFT. The module-size guardrail (module_size_limits.json caps + the 1500-line uncapped coverage threshold) was enforced against the LIVE TREE only by test_invariants.py, which runs in the ci.yml backend matrix -- and ci.yml's pull_request trigger is `branches: [main]`, so an automain PR never runs it. The only workflow an automain PR does get is guard-data.yml, whose Derived-artifacts job replaces the standalone roster wholesale via BLUEPRINT_STATIC_GUARD_SELECTORS (no size scan in that list) and whose Impacted-backend-tests job runs only what this manifest selects. Before this entry NO glob mapped a governed source surface to any live-tree size scan, so a size breach first turned red on the automain->main promotion PR -- the worst place for it, since a red promotion PR usually CLOSES and deletes its release branch. Proven live, not theoretical: PR #17966 took backend/testing/test_impacted_tests.py from 1431 to 1522 lines past the uncapped threshold and merged into automain green. backend/app is the 'backend' section's source root, so any change here can breach a cap. The sentinel imports check_size_limits, not the modules it scans, so the dotted-import reverse-dep scan can never select it for an arbitrary app file."
+    },
+    {
+      "glob": "backend/testing/**/*.py",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "backend/testing is the 'testing' section's source root and the surface the proven breach (test_impacted_tests.py at 1522 uncapped lines, merged green into automain) actually landed on. Registered as **/*.py rather than test_*.py because the section scans every .py under the root, helpers included."
+    },
+    {
+      "glob": "backend/testing/module_size_limits.json",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "The cap ledger itself. Lowering a cap, or deleting an entry, turns a previously-clean file into a violation without touching a single source file, so the gate has to re-run on an edit to this artifact. It is not a .py file, so neither the reverse-dep scan nor the test_<module>.py convention can reach it."
+    },
+    {
+      "glob": "agent/src/**",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "agent/src is the 'agent' section's source root. A PR confined to agent/ contains no backend Python at all, so the reverse-dep scan selects nothing and only this registration (plus the standalone roster seat it forces) puts a size scan on that diff."
+    },
+    {
+      "glob": "admin-ui/src/**",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "admin-ui/src is the 'frontend' section's source root (.ts/.tsx, excluding *.test.ts(x) and *.d.ts). Same selection gap as agent/src/** above."
+    },
+    {
+      "glob": "scripts/**/*.py",
+      "sentinels": ["backend/testing/test_module_size_live_tree.py"],
+      "why": "scripts/ is the 'scripts' section's source root, with 17 capped modules and release-critical logic. A scripts/**-shaped glob is safe here where the older conversational-workday entries deliberately used exact filenames: scripts/ is ALREADY a static_release_guard STATIC_PATH_PREFIXES member derived from conversational_workday_manifest.json (test_static_scope_matches_path_boundaries asserts scripts/test-backend.sh.bak is in scope), so this widens nothing there. Registering these three non-backend surfaces is what makes impacted_tests.corpus_lane_required_sentinels demand a STANDALONE_ARGS seat for this sentinel -- deliberate, and paid for honestly: the scan is a corpus walk whose cost is file I/O, measured 3x on each filesystem it runs on -- ~2.6s with the repo on a Linux filesystem (what CI does) but 78-103s across a Docker-on-Windows bind mount (what ./check test does on a Windows dev box). It therefore carries an explicit @pytest.mark.timeout(120) so its budget is stated at the test rather than inherited from whatever the lane happens to pass -- LANE_HANG_DETECTOR_SECONDS (backend/testing/test_harness_timeout_budgets.py) is a hang detector for the lane as a whole, not a performance budget for this scan, and the marker keeps a slow filesystem from being reported as a size defect either way. See the module docstring for both measurements."
     }
   ]
 }

@@ -125,6 +125,15 @@ def healthy_orchestrator():
 
 
 @pytest.fixture()
+def leader_instance():
+    """Pin leader-only /health assertions independent of shard test order."""
+    original = _shared_state.is_leader
+    _shared_state.is_leader = True
+    yield
+    _shared_state.is_leader = original
+
+
+@pytest.fixture()
 def all_deps_healthy():
     """Ensure all external deps are True for the duration of the test."""
     original = dict(_shared_state.external_health)
@@ -163,6 +172,7 @@ async def health_client():
 
 
 @pytest.mark.smoketest
+@pytest.mark.usefixtures("leader_instance")
 class TestHealthEndpoint:
     """Integration tests for GET /health.
 

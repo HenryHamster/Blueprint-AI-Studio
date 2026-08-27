@@ -1422,6 +1422,9 @@ async def cap_pipeline_slots(
     return kept
 
 
+_RESERVATION_PRIORITY_FENCE = 100
+
+
 def reserve_slots_for_types(
     eligible_ids: list,
     candidate_tasks: list[Task],
@@ -1430,11 +1433,14 @@ def reserve_slots_for_types(
 ) -> list:
     """Promote reserved task types into the dispatch window under queue pressure.
 
-    Ensures high-priority task types (e.g. create, research) get a minimum share
-    of slots when they're queued behind self-perpetuating review/fix chains. Only
+    Ensures reserved task types (e.g. create, research) get a minimum share of
+    slots when they're queued behind self-perpetuating review/fix chains. Only
     activates when queue pressure exists (more eligible tasks than open slots) and
-    there are reserved-type tasks waiting beyond the dispatch cutoff. The reserved
-    minimums come from ``runtime_config['reserved_slots_for_types']`` (defaults to
+    there are reserved-type tasks waiting beyond the dispatch cutoff. Reservation
+    remains an anti-starvation policy among ordinary tasks, but it cannot displace
+    work at the urgent priority fence unless the promoted task is at least as
+    urgent. The reserved minimums come from
+    ``runtime_config['reserved_slots_for_types']`` (defaults to
     ``{"create": 1, "research": 1}``).
 
     Returns the reordered ``eligible_ids`` (promoted reserved tasks moved into the
@@ -1450,6 +1456,12 @@ def reserve_slots_for_types(
     types_by_id = {
         t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
     }
+    priority_by_id = {}
+    for task in candidate_tasks:
+        try:
+            priority_by_id[task.id] = int(task.priority)
+        except (AttributeError, TypeError, ValueError):
+            priority_by_id[task.id] = 50
     reserved_types = set(reserved_config.keys())
     # ``reorder_by_completion_priority`` returns a list subclass carrying the
     # small set of EVALUATING delivery-owner dependencies that must not be
@@ -1476,18 +1488,31 @@ def reserve_slots_for_types(
         if not promote:
             continue
         displacement_indexes: list[int] = []
-        for i in range(len(initial) - 1, -1, -1):
-            if len(displacement_indexes) >= len(promote):
-                break
-            tid = initial[i]
-            if (
-                types_by_id.get(tid) not in reserved_types
-                and tid not in completion_protected_ids
-            ):
-                displacement_indexes.append(i)
-        if not displacement_indexes:
+        admitted_promotions: list = []
+        for promoted_id in promote:
+            promoted_priority = priority_by_id.get(promoted_id, 50)
+            displacement_index = next(
+                (
+                    i
+                    for i in range(len(initial) - 1, -1, -1)
+                    if i not in displacement_indexes
+                    and types_by_id.get(initial[i]) not in reserved_types
+                    and initial[i] not in completion_protected_ids
+                    and (
+                        priority_by_id.get(initial[i], 50)
+                        < _RESERVATION_PRIORITY_FENCE
+                        or priority_by_id.get(initial[i], 50) <= promoted_priority
+                    )
+                ),
+                None,
+            )
+            if displacement_index is None:
+                continue
+            displacement_indexes.append(displacement_index)
+            admitted_promotions.append(promoted_id)
+        if not admitted_promotions:
             continue
-        promote = promote[: len(displacement_indexes)]
+        promote = admitted_promotions
         displacement_index_set = set(displacement_indexes)
         # Preserve every displaced ID and its relative order just beyond the
         # dispatch window.  The old pop-only implementation silently dropped

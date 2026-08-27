@@ -23,6 +23,7 @@ from app.models import (
     Alert,
     AlertSeverity,
 )
+from app.alert_policy import create_project_alert_if_allowed
 from app.strategic_authority_locks import (
     LegacyEngineAuthorityExpired,
     commit_legacy_authorized,
@@ -67,7 +68,12 @@ from app.research_cycle_cadence import (
     record_strategic_cadence_fire,
     strategic_cadence_due,
 )
-from app.strategic_cycle_admission import automatic_strategic_cycles_enabled
+from app.strategic_cycle_admission import (
+    SUPPRESSION_TRIGGER_CADENCE_DUE,
+    SUPPRESSION_TRIGGER_LOOP_PASS,
+    describe_automatic_strategic_cycles,
+    note_automatic_strategic_cycles_suppressed,
+)
 from app.research_finding_policy import NON_SPAWNING_FINDING_TYPES
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
@@ -804,45 +810,53 @@ async def _advance_circuit_breaker_and_check(
     return False
 
 
-def _stage_anomaly_action_alert(
+async def _stage_anomaly_action_alert(
     session: AsyncSession,
     project_id: uuid.UUID,
     anomaly_action: dict,
 ) -> None:
-    """Stage durable anomaly state while legacy authority is still locked."""
+    """Stage the anomaly-action notice while legacy authority is still locked.
+
+    ``research.anomaly_auto_adjusted`` is TIMELINE_ONLY, so this routes through
+    the policy gate rather than inserting ``Alert(...)`` directly.  Both arms
+    below state a COMPLETED action -- "max_concurrent_vms was reduced from A to
+    B", "thresholds were restored" -- and neither has a future state that makes
+    it false.  The ``restored`` arm is the clearest case: it is a recovery
+    announcement, and as a raw insert it minted a SECOND permanent row rather
+    than dismissing the first, so a recovered pipeline read as two open alerts.
+    ``_publish_anomaly_action`` already publishes both transitions post-commit.
+    """
     action = anomaly_action.get("action")
     if action == "adjusted" and anomaly_action.get("is_new"):
         pre_vms = anomaly_action.get("pre_adjustment_max_vms") or "?"
         new_vms = anomaly_action["max_concurrent_vms"]
         gate = anomaly_action["failure_gate_threshold"]
         triggers = ", ".join(anomaly_action.get("trigger_anomalies") or [])
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                event_type="research.anomaly_auto_adjusted",
-                title="Pipeline auto-adjusted: anomaly threshold exceeded",
-                message=(
-                    f"max_concurrent_vms reduced from {pre_vms} to {new_vms}, "
-                    f"failure_gate_threshold tightened to {gate}. "
-                    f"Triggered by: {triggers}."
-                ),
-            )
+        await create_project_alert_if_allowed(
+            session,
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            event_type="research.anomaly_auto_adjusted",
+            title="Pipeline auto-adjusted: anomaly threshold exceeded",
+            message=(
+                f"max_concurrent_vms reduced from {pre_vms} to {new_vms}, "
+                f"failure_gate_threshold tightened to {gate}. "
+                f"Triggered by: {triggers}."
+            ),
         )
     elif action == "restored":
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.INFO,
-                event_type="research.anomaly_auto_adjusted",
-                title="Pipeline restored: anomaly conditions cleared",
-                message=(
-                    "max_concurrent_vms restored to "
-                    f"{anomaly_action['max_concurrent_vms']}, "
-                    "failure_gate_threshold restored to "
-                    f"{anomaly_action['failure_gate_threshold']}."
-                ),
-            )
+        await create_project_alert_if_allowed(
+            session,
+            project_id=project_id,
+            severity=AlertSeverity.INFO,
+            event_type="research.anomaly_auto_adjusted",
+            title="Pipeline restored: anomaly conditions cleared",
+            message=(
+                "max_concurrent_vms restored to "
+                f"{anomaly_action['max_concurrent_vms']}, "
+                "failure_gate_threshold restored to "
+                f"{anomaly_action['failure_gate_threshold']}."
+            ),
         )
 
 
@@ -1027,7 +1041,21 @@ async def _spawn_research_task_inner(
     # cadence/force work is a separate operator-owned lane so a bounded tactical
     # canary can run without also releasing the strategist. Manual/operator
     # Strategic surfaces never enter this function and remain unaffected.
-    automatic_strategic_cycles_allowed = automatic_strategic_cycles_enabled(project)
+    _strategic_lane = describe_automatic_strategic_cycles(project)
+    automatic_strategic_cycles_allowed = _strategic_lane.enabled
+    if not automatic_strategic_cycles_allowed:
+        # Surface the REASON, not the state.  Every ``force_strategic`` setter,
+        # the wall-clock backstop, the starvation refresh and the pending-SR
+        # retry are all gated on this one flag, and the gate used to be a bare
+        # ``and`` with no log, no counter and no marker.  Emit here -- before
+        # any of the early returns below can starve the deeper call sites --
+        # so a suppressed lane can never again be indistinguishable from a
+        # healthy one.  The notice is throttled per project, not per pass.
+        note_automatic_strategic_cycles_suppressed(
+            project,
+            trigger=SUPPRESSION_TRIGGER_LOOP_PASS,
+            admission=_strategic_lane,
+        )
 
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
     # Blueprint pipeline repo and polluted new projects with wrong build/test
@@ -1977,7 +2005,7 @@ async def _spawn_research_task_inner(
     strategic_frequency = (project.vision or {}).get(
         "_strategic_frequency_override"
     ) or _runtime_config.get("strategic_research_frequency", 6)
-    is_strategic = automatic_strategic_cycles_allowed and (
+    _strategic_cadence_or_force = (
         strategic_cadence_due(
             research_spawn_count,
             (project.vision or {}).get(STRATEGIC_LAST_ACCEPTED_RESEARCH_COUNT_KEY),
@@ -1985,6 +2013,16 @@ async def _spawn_research_task_inner(
         )
         or force_strategic
     )
+    is_strategic = automatic_strategic_cycles_allowed and _strategic_cadence_or_force
+    if _strategic_cadence_or_force and not automatic_strategic_cycles_allowed:
+        # The strongest form of the signal: a Strategic cycle was actually DUE
+        # this pass and the lane flag ate it.  Its own throttle slot so the
+        # coarser per-pass notice above cannot swallow it.
+        note_automatic_strategic_cycles_suppressed(
+            project,
+            trigger=SUPPRESSION_TRIGGER_CADENCE_DUE,
+            admission=_strategic_lane,
+        )
     # 2026-05-03: gate strategic spawn on (a) no-active-strategic AND
     # (b) no recent strategic spawn (regardless of terminal state).
     #
@@ -2130,13 +2168,16 @@ async def _spawn_research_task_inner(
             session, project, force_strategic=force_strategic
         )
         if gate_decision.skip:
+            # Log the gate's OWN reason. This branch also carries the
+            # consecutive-stall cutoff, where "nothing meaningful changed" is
+            # actively false and hid the one line an operator needed.
             logger.info(
-                "[STRATEGIC] no-delta gate: skipping strategic cycle for project %s "
-                "(watermark=%s, signals=%s) — nothing meaningful changed since the "
-                "last cycle",
+                "[STRATEGIC] gate: skipping strategic cycle for project %s "
+                "(watermark=%s, signals=%s) — %s",
                 project.id,
                 gate_decision.watermark,
                 gate_decision.signals.as_dict(),
+                gate_decision.reason,
             )
             await record_no_delta_skip(
                 session,
@@ -2242,20 +2283,24 @@ async def _spawn_research_task_inner(
             )
             if not existing_alert:
                 max_kb = _MAX_PAYLOAD_BYTES // 1024
-                session.add(
-                    Alert(
-                        project_id=project.id,
-                        event_type="self_improvement.payload_too_large",
-                        severity=AlertSeverity.WARNING,
-                        title="Strategic review skipped: payload too large",
-                        message=(
-                            f"Strategic spawn payload exceeds the {max_kb} KB limit "
-                            f"({e.size} bytes, top contributors: "
-                            f"{', '.join(f'{k}={n}B' for k, n in e.top_keys[:3])}). "
-                            "Tactical research continues, but strategic refresh is paused "
-                            "until the design_doc/problem_model/conversation_thread shrink."
-                        ),
-                    )
+                # TIMELINE_ONLY through the policy gate. This records that ONE
+                # payload build exceeded the cap; the next build is a separate
+                # fact, and nothing ever re-observed this one to clear it. The
+                # machine-readable stall marker written just below is what the
+                # strategic-stall signal actually reads.
+                await create_project_alert_if_allowed(
+                    session,
+                    project_id=project.id,
+                    event_type="self_improvement.payload_too_large",
+                    severity=AlertSeverity.WARNING,
+                    title="Strategic review skipped: payload too large",
+                    message=(
+                        f"Strategic spawn payload exceeds the {max_kb} KB limit "
+                        f"({e.size} bytes, top contributors: "
+                        f"{', '.join(f'{k}={n}B' for k, n in e.top_keys[:3])}). "
+                        "Tactical research continues, but strategic refresh is paused "
+                        "until the design_doc/problem_model/conversation_thread shrink."
+                    ),
                 )
             # Write a machine-readable marker so the strategic-stall signal
             # can distinguish a payload-bloat stall from a scheduling stall
@@ -2627,7 +2672,13 @@ async def _spawn_research_task_inner(
             new_vms = anomaly_action["max_concurrent_vms"]
             gate = anomaly_action["failure_gate_threshold"]
             triggers = ", ".join(anomaly_action.get("trigger_anomalies") or [])
-            alert = Alert(
+            # NOTE: this whole ``if anomaly_action["action"] != "none"`` block is
+            # unreachable -- ``anomaly_action`` is hard-set to ``{"action":
+            # "none"}`` immediately above. The live emitter is
+            # ``_stage_anomaly_action_alert``. Routed through the policy gate
+            # anyway so a future revival cannot resurrect a raw insert.
+            await create_project_alert_if_allowed(
+                session,
                 project_id=project.id,
                 event_type="research.anomaly_auto_adjusted",
                 severity=AlertSeverity.WARNING,
@@ -2638,7 +2689,6 @@ async def _spawn_research_task_inner(
                     f"Triggered by: {triggers}."
                 ),
             )
-            session.add(alert)
             asyncio.ensure_future(  # noqa: RUF006
                 dispatch_external_notification(
                     str(project.id),
@@ -2655,7 +2705,9 @@ async def _spawn_research_task_inner(
         elif anomaly_action["action"] == "restored":
             new_vms = anomaly_action["max_concurrent_vms"]
             gate = anomaly_action["failure_gate_threshold"]
-            alert = Alert(
+            # Unreachable; see the note on the sibling branch above.
+            await create_project_alert_if_allowed(
+                session,
                 project_id=project.id,
                 event_type="research.anomaly_auto_adjusted",
                 severity=AlertSeverity.INFO,
@@ -2665,7 +2717,6 @@ async def _spawn_research_task_inner(
                     f"failure_gate_threshold restored to {gate}."
                 ),
             )
-            session.add(alert)
             asyncio.ensure_future(  # noqa: RUF006
                 dispatch_external_notification(
                     str(project.id),
@@ -3720,7 +3771,7 @@ async def _spawn_research_task_inner(
     if breaker["state"] == "HALF_OPEN" and spawned_tasks:
         breaker["half_open_task_id"] = str(spawned_tasks[0].id)
     anomaly_action = await check_anomaly_actions()
-    _stage_anomaly_action_alert(session, project.id, anomaly_action)
+    await _stage_anomaly_action_alert(session, project.id, anomaly_action)
     await commit_legacy_authorized(session, project.id, legacy_generation)
     await _publish_anomaly_action(project.id, anomaly_action)
 

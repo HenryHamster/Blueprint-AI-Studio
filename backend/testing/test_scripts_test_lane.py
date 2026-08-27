@@ -261,15 +261,41 @@ _FILE_BUDGET_SECONDS_OVERRIDES = {
     # wrapper would refuse to honour. 360 also leaves ~5x headroom over the
     # slower measurement for a loaded 2-vCPU CI runner.
     "test_blueprint_compute_local.py": 360,
+    # Two whole-tree walks of the real test estate: the ranked-queue generator's
+    # and the classifier's. Measured 20.1s locally; the file carries
+    # @pytest.mark.timeout(120) (~6x measured, sized for a loaded 2-vCPU runner
+    # reading this tree over a bind mount), so the per-file budget must clear
+    # 120 + the same 60s grace the layers below use.
+    #
+    # This was a latent inversion, not a red: both this file and the one below
+    # arrived carrying 240s markers inside a lane that grants 25s. They are only
+    # reachable from the standalone lane, so the mismatch would have surfaced
+    # first at an automain->main promotion PR, where a red closes the PR.
+    "test_derived_artifact_classify.py": 180,
+    # One pass over the real 21k-row .test_durations artifact and the whole
+    # backend test roster. Measured 9.6s; carries @pytest.mark.timeout(120) to
+    # match its sibling above. Same 120 + 60 relationship.
+    "test_prune_stale_durations.py": 180,
+    # Real concurrency proofs for the duration-artifact lock: it forks actual
+    # merge_durations.py processes to show one blocks while another holds the
+    # lock, kills a holder to show the OS releases it, and drives the duration
+    # shell scripts through a real bash. Measured 7.4s warm / 13.3s cold on a
+    # developer host, i.e. already over half the 25s default on the cold pass,
+    # and the cost is inherent: a lock cannot be proven exclusive without a
+    # second real process. The file carries no timeout marker of its own, so
+    # this budget is sized purely for a loaded 2-vCPU CI runner (~8x measured).
+    "test_duration_generators.py": 60,
 }
 
-# CI's sharded pytest invocation passes ``--timeout=30`` (pytest-timeout), which
-# kills the OUTER lane test before an override budget above 30s can matter. A
-# ``pytest.mark.timeout`` marker takes precedence over the CLI option, so every
-# override param carries one at budget + this grace. The grace keeps the layers
-# ordered: the inner subprocess timeout fires first (diagnosable per-file
-# failure with captured output), and the outer marker only fires if the lane
-# harness itself wedges.
+# CI's sharded pytest invocation passes ``--timeout=300`` (pytest-timeout) as a
+# HANG DETECTOR, not as a performance budget -- see LANE_HANG_DETECTOR_SECONDS
+# in backend/testing/test_harness_timeout_budgets.py. It was ``--timeout=30``,
+# which killed the OUTER lane test before any override budget above 30s could
+# matter. A ``pytest.mark.timeout`` marker takes precedence over the CLI option,
+# so every override param still carries one at budget + this grace, which keeps
+# the layers ordered even for the budgets above 300: the inner subprocess
+# timeout fires first (diagnosable per-file failure with captured output), and
+# the outer marker only fires if the lane harness itself wedges.
 _OUTER_TIMEOUT_GRACE_SECONDS = 60
 
 

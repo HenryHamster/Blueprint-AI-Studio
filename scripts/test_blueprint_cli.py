@@ -3262,6 +3262,102 @@ def test_tasks_failures_empty(monkeypatch, capsys):
     assert "No failed tasks." in out
 
 
+def _failures_api(tasks):
+    """Build a fake api() that serves ``tasks`` for the FAILED listing."""
+    def fake_api(method, path, body=None, timeout=30):
+        return {"tasks": tasks, "total": len(tasks)}
+
+    return fake_api
+
+
+def _run_failures_json(monkeypatch, capsys, tasks):
+    fake_api = _failures_api(tasks)
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    assert blueprint.main(["--json", "tasks", "failures"]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_tasks_failures_buckets_on_persisted_failure_category(monkeypatch, capsys):
+    """context['failure_category'] is the canonical persisted class and must bucket.
+
+    Regression pin: this grouping used to read ONLY context['failure_class'] --
+    the sparse authoritative-verdict cache that only the reaper writes -- so a
+    task the backend had properly classified via persist_failure_category()
+    landed in UNKNOWN. A classified failure reported as UNKNOWN is state without
+    reason, which is the whole point of this view.
+    """
+    parsed = _run_failures_json(monkeypatch, capsys, [
+        {"id": "fc-aaa0-0000-0000-000000000000", "task_type": "create",
+         "title": "timed out task", "status": "FAILED", "attempt_count": 1,
+         "latest_status_message": "agent stopped reporting",
+         "error_logs": "",
+         "context": {"failure_category": "AGENT_TIMEOUT"}},
+    ])
+    assert "AGENT_TIMEOUT" in parsed["buckets"], parsed["buckets"]
+    assert "UNKNOWN" not in parsed["buckets"]
+
+
+def test_tasks_failures_falls_back_to_top_level_failure_class(monkeypatch, capsys):
+    """The server-derived top-level failure_class is the last-resort reason."""
+    parsed = _run_failures_json(monkeypatch, capsys, [
+        {"id": "fc-bbb0-0000-0000-000000000000", "task_type": "fix",
+         "title": "provision died", "status": "FAILED", "attempt_count": 1,
+         "latest_status_message": "instance never came up",
+         "error_logs": "", "context": {},
+         "failure_class": "PROVISION_FAILURE"},
+    ])
+    assert "PROVISION_FAILURE" in parsed["buckets"], parsed["buckets"]
+
+
+def test_tasks_failures_emits_the_persisted_reason_fields(monkeypatch, capsys):
+    """Each emitted row carries the reason the terminalizing path recorded."""
+    parsed = _run_failures_json(monkeypatch, capsys, [
+        {"id": "fc-ccc0-0000-0000-000000000000", "task_type": "review",
+         "title": "superseded review", "status": "FAILED", "attempt_count": 1,
+         "latest_status_message": "agent stopped reporting",
+         "error_logs": "",
+         "context": {"failure_category": "AGENT_TIMEOUT",
+                     "failure_detail": "superseded_by_review_pipeline"}},
+    ])
+    entry = parsed["buckets"]["AGENT_TIMEOUT"][0]
+    assert entry["failure_class"] == "AGENT_TIMEOUT"
+    assert entry["failure_detail"] == "superseded_by_review_pipeline"
+
+
+def test_tasks_failures_human_render_shows_why(monkeypatch, capsys):
+    """The human render prints the persisted reason, not only the bucket header."""
+    tasks = [
+        {"id": "fc-ddd0-0000-0000-000000000000", "task_type": "review",
+         "title": "superseded review", "status": "FAILED", "attempt_count": 1,
+         "latest_status_message": "agent stopped reporting",
+         "error_logs": "",
+         "context": {"failure_category": "AGENT_TIMEOUT",
+                     "failure_detail": "superseded_by_review_pipeline"}},
+    ]
+    fake_api = _failures_api(tasks)
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    assert blueprint.main(["tasks", "failures"]) == 0
+    out = capsys.readouterr().out
+    assert "WHY: AGENT_TIMEOUT / superseded_by_review_pipeline" in out
+
+
+def test_tasks_failures_classless_row_reports_its_detail_not_unknown(
+    monkeypatch, capsys
+):
+    """A row with no class but a failure_detail is bucketed by that detail."""
+    parsed = _run_failures_json(monkeypatch, capsys, [
+        {"id": "fc-eee0-0000-0000-000000000000", "task_type": "create",
+         "title": "shelved", "status": "FAILED", "attempt_count": 0,
+         "latest_status_message": "stopped", "error_logs": "",
+         "context": {"failure_detail": "review_cap_exhausted"}},
+    ])
+    assert "DETAIL:review_cap_exhausted" in parsed["buckets"], parsed["buckets"]
+
+
 # ── help text and output formatting polish ────────────────────────────────────
 
 def test_tasks_help_has_description():
@@ -4590,18 +4686,25 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     assert any("status=all" in path for _, path, _ in mock_api)
 
     # --- send posts correct body and type ---
+    # The shared mock replies ``arming: not_armed`` -- a message that was stored
+    # but that nothing will ever read. The send must therefore FAIL loudly; it
+    # used to exit 0, which is precisely how a dead steer looked like a live one.
     mock_api.clear()
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
     monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
-    rc = blueprint.main(["messages", "send", "hello world", "--type", "NOTE"])
-    assert rc == 0
+    with pytest.raises(SystemExit) as unserviced:
+        blueprint.main(["messages", "send", "hello world", "--type", "NOTE"])
+    assert unserviced.value.code == 1
     post_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/messages" in p]
     assert len(post_calls) == 1
     _, _, body = post_calls[0]
     assert body["content"] == "hello world"
     assert body["message_type"] == "NOTE"
-    out = capsys.readouterr().out
-    assert "msg-abc" in out
+    captured = capsys.readouterr()
+    # The message id still reaches the operator: the row exists, so a blind
+    # re-send would duplicate it.
+    assert "msg-abc" in captured.out
+    assert "NOT armed" in captured.err
 
     # --- read-only config refuses send ---
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
@@ -4670,6 +4773,213 @@ def test_messages_list_scoped_credential_uses_operator_projection(
     rendered = capsys.readouterr().out
     assert "[BLOCK]" in rendered
     assert "system" in rendered
+
+
+def _install_arming_cli(monkeypatch, arming):
+    """Point the CLI at a fake API whose message POST returns ``arming``.
+
+    Matches both send routes: the plain lane ends ``/messages`` and the
+    strategic lane ends ``strategic-session/messages`` (or ``strategic/messages``
+    under a scoped credential).
+    """
+    calls = []
+
+    def api_fake(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "POST" and path.endswith("/messages"):
+            receipt = {"id": "msg-arm", "status": "created"}
+            if arming is not None:
+                receipt["arming"] = arming
+            return receipt
+        return {}
+
+    monkeypatch.setattr(
+        blueprint, "load_config", lambda: {"api_url": "x", "api_key": "operator-key"}
+    )
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "operator-key"}
+    )
+    monkeypatch.setattr(blueprint, "get_project_id", lambda _value=None: "project-1")
+    monkeypatch.setattr(blueprint, "api", api_fake)
+    return calls
+
+
+def test_messages_send_fails_loudly_when_nothing_will_read_the_message(
+    monkeypatch, capsys
+):
+    """``not_armed`` = stored but unconsumed. It must exit non-zero, not 0.
+
+    This is the operator-input defect in one assertion: an accepted message that
+    no strategic cycle will consume and no resident is listening for must never
+    be reported as a successful steer.
+    """
+    _install_arming_cli(monkeypatch, "not_armed")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["messages", "send", "please refocus on the auth bug"])
+    assert exc.value.code == 1
+
+    err = capsys.readouterr().err
+    assert "NOT armed" in err
+    # The reason must name what to use instead, not merely report a state.
+    assert "blueprint strategic send" in err
+
+
+def test_messages_send_json_mode_keeps_stdout_parseable_and_still_fails(
+    monkeypatch, capsys
+):
+    """The verdict travels on stderr so ``--json`` stdout stays machine-readable."""
+    _install_arming_cli(monkeypatch, "not_armed")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["--json", "messages", "send", "steer me"])
+    assert exc.value.code == 1
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["arming"] == "not_armed"
+    assert "NOT armed" in captured.err
+
+
+def test_messages_send_reports_a_serviced_steer(monkeypatch, capsys):
+    """A steer that armed the strategist reports WHY it is serviced."""
+    _install_arming_cli(monkeypatch, "steering")
+
+    rc = blueprint.main(["messages", "send", "please refocus on the auth bug"])
+    assert rc == 0
+    assert "steering" in capsys.readouterr().err
+
+
+def test_messages_send_warns_when_a_passive_note_wakes_nobody(monkeypatch, capsys):
+    """A passive NOTE is recorded but wakes nothing -- the operator must be told."""
+    _install_arming_cli(monkeypatch, "passive_note")
+
+    rc = blueprint.main(["messages", "send", "fyi", "--type", "NOTE"])
+    # Deliberate and legitimate, so it stays exit 0 -- but never silent.
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "nothing will act on this message" in err
+
+
+def test_strategic_send_fails_on_a_passive_note_because_a_bound_turn_is_not_passive(
+    monkeypatch, capsys
+):
+    """``passive_note`` on the strategic lane is proof of a strand, not of binding.
+
+    The old contract here exited 0 on the theory that ``precreate_ensure`` could
+    bind the turn to a live Workday session that reads it whatever the arming
+    outcome. That theory is false against the server:
+    ``create_operator_project_message`` overwrites the outcome to
+    ``resident_session`` for every CONVERSATION row it binds, and the server now
+    classifies every conversation turn as steering regardless of message type.
+    So ``passive_note`` here can only mean nothing bound it AND nothing armed --
+    the exact silent-drop this whole verdict exists to expose.
+    """
+    _install_arming_cli(monkeypatch, "passive_note")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["strategic", "send", "continue the current strategy"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "ERROR" in err
+    assert "passive_note" in err
+    assert "nothing will ever read or answer it" in err
+
+
+def test_strategic_send_fails_loudly_on_an_unarmed_send(monkeypatch, capsys):
+    """``not_armed`` on the strategic lane is a strand and must exit 1.
+
+    A bound turn reports ``resident_session``; an armed one reports
+    ``steering``. ``not_armed`` is therefore the server saying, unambiguously,
+    that the row was stored with no reader on either path.
+    """
+    _install_arming_cli(monkeypatch, "not_armed")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["strategic", "send", "change the plan"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "not_armed" in err
+    assert "ERROR" in err
+    assert "blueprint strategic start" in err
+
+
+def test_strategic_send_reports_a_bound_resident_turn_as_serviced(monkeypatch, capsys):
+    """The serviced verdicts stay exit 0 -- the fix must not break the happy path."""
+    _install_arming_cli(monkeypatch, "resident_session")
+
+    rc = blueprint.main(["strategic", "send", "change the plan"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "resident_session" in err
+    assert "ERROR" not in err
+
+
+def test_strategic_send_does_not_fail_on_an_unknown_future_verdict(monkeypatch, capsys):
+    """Only the KNOWN unserviced verdicts exit 1.
+
+    A newer server introducing an additional serviced outcome must not be turned
+    into a false strand by an older CLI, so an unrecognised verdict is reported
+    neutrally rather than failed.
+    """
+    _install_arming_cli(monkeypatch, "some_future_outcome")
+
+    rc = blueprint.main(["strategic", "send", "change the plan"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "some_future_outcome" in err
+    assert "ERROR" not in err
+
+
+def test_message_send_without_an_arming_verdict_does_not_claim_success(
+    monkeypatch, capsys
+):
+    """A receipt with no verdict must not imply the message was picked up."""
+    _install_arming_cli(monkeypatch, None)
+
+    rc = blueprint.main(["messages", "send", "steer me"])
+    assert rc == 0
+    assert "cannot confirm" in capsys.readouterr().err
+
+
+def test_render_messages_surfaces_failed_handling_state(capsys):
+    """``status`` hides a never-read message; ``handling_state`` is the real field."""
+    blueprint._render_messages(
+        {
+            "messages": [
+                {
+                    "id": "msg-failed",
+                    "message_type": "FEEDBACK",
+                    "from_type": "user",
+                    "content": "please refocus on the auth bug",
+                    "status": "resolved",
+                    "handling_state": "failed",
+                    "resolution": "stranded (no runner claim within the window)",
+                },
+                {
+                    "id": "msg-open",
+                    "message_type": "QUESTION",
+                    "from_type": "user",
+                    "content": "what is blocked?",
+                    "status": "open",
+                    "handling_state": "pending",
+                },
+            ]
+        }
+    )
+    out = capsys.readouterr().out
+    # A never-read message must not be indistinguishable from an answered one.
+    assert "FAILED" in out
+    assert "never handled: stranded (no runner claim within the window)" in out
+    assert "pending" in out
+
+
+def test_render_messages_marks_an_unreported_handling_state(capsys):
+    """A row with no handling_state must say so, not silently look handled."""
+    blueprint._render_messages(
+        {"messages": [{"id": "msg-1", "message_type": "NOTE", "content": "hi"}]}
+    )
+    assert "unreported" in capsys.readouterr().out
 
 
 def test_messages_answer(mock_api, monkeypatch, capsys):
@@ -8781,3 +9091,74 @@ def test_fleet_runners_lists_hostname_status_and_bindings(fleet_binding_api, cap
     assert row["enrollment_project_id"] == ENROLLMENT_PID
     bound_ids = {p["project_id"] for p in row["projects"]}
     assert bound_ids == {ENROLLMENT_PID, TARGET_PID}
+
+
+# ---------------------------------------------------------------------------
+# `tasks autonomy-debug` -> strategic lane read path
+#
+# `build_config.automatic_strategic_cycles_enabled` has NO operator CLI write
+# verb (deliberately: changing it stays an explicit admin PATCH) and until this
+# render existed it had no CLI READ path either.  A disabled lane keeps tactical
+# research spawning, so every other line of this view looks healthy while no
+# automatic Strategic cycle is ever authored.
+# ---------------------------------------------------------------------------
+
+
+def test_autonomy_debug_renders_a_disabled_strategic_lane(capsys):
+    """The render must name the flag state, the reason, the actor and the bound."""
+    blueprint._render_autonomy_debug(
+        {
+            "spawn_blocked": False,
+            "automatic_strategic_cycles_enabled": False,
+            "automatic_strategic_cycles_disable": {
+                "enabled": False,
+                "reason": "bounded tactical canary",
+                "disabled_by": "operator-patch",
+                "until": "2099-01-01T00:00:00",
+                "legacy_bare_boolean": False,
+                "malformed_until": False,
+            },
+        }
+    )
+    out = capsys.readouterr().out
+    assert "strategic_lane: DISABLED" in out
+    assert "bounded tactical canary" in out
+    assert "operator-patch" in out
+    assert "expires:     2099-01-01T00:00:00" in out
+
+
+def test_autonomy_debug_names_an_unbounded_legacy_disable(capsys):
+    """A bare stored ``false`` must read as permanent, not merely 'off'."""
+    blueprint._render_autonomy_debug(
+        {
+            "spawn_blocked": False,
+            "automatic_strategic_cycles_enabled": False,
+            "automatic_strategic_cycles_disable": {
+                "enabled": False,
+                "reason": None,
+                "disabled_by": None,
+                "until": None,
+                "legacy_bare_boolean": True,
+                "malformed_until": False,
+            },
+        }
+    )
+    out = capsys.readouterr().out
+    assert "strategic_lane: DISABLED" in out
+    assert "<none recorded>" in out
+    assert "<unknown>" in out
+    assert "expires:     never" in out
+    assert "legacy bare boolean" in out
+
+
+def test_autonomy_debug_lane_render_is_quiet_when_enabled_or_absent(capsys):
+    """An enabled lane gets one line; a payload without the key gets none."""
+    blueprint._render_autonomy_debug(
+        {"spawn_blocked": False, "automatic_strategic_cycles_enabled": True}
+    )
+    out = capsys.readouterr().out
+    assert "strategic_lane: ENABLED" in out
+    assert "DISABLED" not in out
+
+    blueprint._render_autonomy_debug({"spawn_blocked": False})
+    assert "strategic_lane" not in capsys.readouterr().out

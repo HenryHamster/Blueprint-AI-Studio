@@ -351,17 +351,18 @@ def _simulate_ldf_allocation(durations: dict, num_shards: int) -> list[float]:
     return shard_totals
 
 
-# The standalone lane passes --timeout=30 on the command line, a number sized on
-# a native Linux filesystem. This guard's cost is dominated by
-# _enumerate_collected_test_ids(), which must read and parse all 627 backend
-# test files and resolve collector-faithful identities for each. Measured over the
-# Docker-on-Windows bind mount the lane runs on: 17.82s cold, 14.64s with the
-# page cache already hot -- so a warm cache does not rescue it either. Against
-# a 30s budget that is a coin flip, and on the lane it lost: the guard died on
-# `Failed: Timeout (>30.0s) from pytest-timeout`, the signal landing mid-walk
-# inside the per-file read (identity_extraction -> Path.read_text) rather than
-# on any assertion -- i.e. it reported a slow filesystem as a shard-imbalance
-# defect.
+# The standalone lane passes LANE_HANG_DETECTOR_SECONDS on the command line
+# (backend/testing/test_harness_timeout_budgets.py). This guard's cost is
+# dominated by _enumerate_collected_test_ids(), which must read and parse all
+# 627 backend test files and resolve collector-faithful identities for each.
+# Measured over the Docker-on-Windows bind mount the lane runs on: 17.82s cold,
+# 14.64s with the page cache already hot -- so a warm cache does not rescue it
+# either. Against the THEN-30s lane budget that was a coin flip, and on the lane
+# it lost: the guard died on `Failed: Timeout (>30.0s) from pytest-timeout`, the
+# signal landing mid-walk inside the per-file read (identity_extraction ->
+# Path.read_text) rather than on any assertion -- i.e. it reported a slow
+# filesystem as a shard-imbalance defect. The lane catch-all is far larger now,
+# but the marker below stays: it bounds this scan as ITSELF.
 #
 # The walk is irreducible -- every test file must be enumerated, and there is
 # no sound textual prefilter for "contains a test". So the budget is the thing
@@ -484,8 +485,9 @@ def test_impute_missing_mean_matches_durations_quality() -> None:
 
 # Same whole-corpus enumeration, same budget rationale as
 # test_projected_shard_balance_within_threshold above. It survived the lane run
-# that killed its sibling at 14.64s of a 30s budget -- a pass by 15 seconds, not
-# by design. The memoization above now makes it nearly free when it runs second,
+# that killed its sibling at 14.64s of the then-30s budget -- a pass by 15
+# seconds, not by design; see the note above that test for what the lane budget
+# is now. The memoization above now makes it nearly free when it runs second,
 # but ordering is not a contract, so it carries the marker on its own account.
 @pytest.mark.timeout(180)
 def test_projected_shard_balance_threshold_is_reachable() -> None:

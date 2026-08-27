@@ -4,11 +4,12 @@
   "protect": [
     {
       "path": "backend/testing/test_project_message_projection.py",
-      "reason": "Protects the bounded realtime/canonical preview fields that power the truthful non-interruptive Workday-consulted cue in Chat.",
+      "reason": "Protects the bounded realtime/canonical preview fields that power the truthful non-interruptive Workday-consulted cue in Chat, and the legacy direction-message projection that must keep handling_state alongside status \u2014 the only field separating a message a runner answered from one the stranded-message sweep terminalized because nothing ever read it.",
       "test_ids": [
-        "test_message_preview_preserves_bounded_workday_chat_provenance"
+        "test_message_preview_preserves_bounded_workday_chat_provenance",
+        "test_legacy_direction_projection_separates_answered_from_never_read"
       ],
-      "test_count": 29
+      "test_count": 30
     },
     {
       "path": "backend/testing/test_strategic_session_messages.py",
@@ -143,7 +144,7 @@
         "TestMessages::test_strategic_session_message_allows_attachment_only_content",
         "TestMessagesWorkbenchState::test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at"
       ],
-      "test_count": 140
+      "test_count": 141
     },
     {
       "path": "backend/testing/test_admin_routers__strategic_directions.py",
@@ -173,7 +174,7 @@
         "test_strategic_create_message_note_type_not_grounded",
         "test_strategic_create_message_broadcasts_workbench_envelope"
       ],
-      "test_count": 139
+      "test_count": 140
     },
     {
       "path": "backend/testing/test_operator_workbench_contracts.py",
@@ -181,7 +182,7 @@
       "test_ids": [
         "test_operator_workbench_current_state_contract_surfaces"
       ],
-      "test_count": 8
+      "test_count": 11
     },
     {
       "path": "admin-ui/src/components/MessageBubble.test.tsx",
@@ -389,8 +390,11 @@
         "test_all_three_fresh_attempt_paths_reapply_resident_binding",
         "test_resident_retry_reloads_live_project_before_repinning",
         "test_operator_send_serializes_with_resident_transition",
-        "test_resident_mutations_reject_expired_continuation_but_messages_pass",
         "test_resident_mutations_reject_overlapping_one_shot_but_messages_pass",
+        "test_resident_mutation_fence_ignores_sibling_resident_process_row",
+        "test_resident_mutation_fence_ignores_never_started_one_shot",
+        "test_resident_lane_refusal_names_the_blocking_task",
+        "test_resident_continuation_refusal_carries_its_reason",
         "test_terminal_reconciler_ignores_requeued_worker",
         "test_terminal_reconciler_replaces_exact_continuous_generation",
         "test_terminal_reconciler_exposes_start_after_replacement_failure",
@@ -402,9 +406,16 @@
         "test_operator_message_default_arms_the_active_resident",
         "test_completion_retry_still_suppressed_by_healthy_resident_worker",
         "test_completion_retry_not_suppressed_by_active_blob_with_dead_worker",
-        "test_completion_retry_suppressed_when_worker_generation_superseded"
+        "test_completion_retry_suppressed_when_worker_generation_superseded",
+        "test_the_conversation_composer_marks_its_turns_as_conversation_turns",
+        "test_server_authored_activation_turn_never_arms_a_cadence_cycle",
+        "test_resident_mutation_fence_never_resurrects_a_popped_continuation",
+        "test_resident_mutation_renews_a_stale_but_owned_continuation",
+        "test_resident_mutations_reject_unowned_continuation_but_messages_pass",
+        "test_unworked_continuation_still_lapses_and_releases_the_local_pin",
+        "test_fence_renewal_is_paced_at_the_call_site_not_only_in_the_helper"
       ],
-      "test_count": 28
+      "test_count": 38
     },
     {
       "path": "backend/testing/test_strategic_resident_session.py",
@@ -424,6 +435,10 @@
         "test_continuous_hydration_ensure_succeeds",
         "test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_start_works",
         "test_start_adopts_task_and_liveness_heartbeat_renews_lease",
+        "test_repeated_start_uplifts_only_unstarted_canonical_resident",
+        "test_repeated_start_does_not_rewrite_started_resident_priority",
+        "test_priority_uplift_rejects_exact_identity_from_another_project",
+        "test_repeated_start_does_not_uplift_cross_project_vision_pointer",
         "test_member_started_resident_spawn_persists_launcher",
         "test_failed_start_compensation_reconciles_cycle_and_emits_receipt",
         "test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears",
@@ -497,7 +512,7 @@
         "test_autonomous_turn_flag_cannot_rescue_committed_chat_mode",
         "test_autonomous_working_turn_renews_freshness_without_mutation"
       ],
-      "test_count": 85
+      "test_count": 89
     },
     {
       "path": "agent/src/workspacePrep.test.ts",
@@ -546,9 +561,11 @@
       "path": "agent/src/handlers/strategic-helpers.test.ts",
       "reason": "Protects generated Strategic helper provenance, stable mutation identity across retries, and the deliberate private-consultation qualification boundary.",
       "test_ids": [
-        "writeStrategicHelpers > injects stable typed-consultation provenance across transport retries"
+        "writeStrategicHelpers > injects stable typed-consultation provenance across transport retries",
+        "writeStrategicHelpers > live token resolution > _call surfaces a 409 as an explicit refusal, never as a zero-effect success",
+        "writeStrategicHelpers > live token resolution > _call keeps a 409 non-fatal so the refused turn survives to report it"
       ],
-      "test_count": 116
+      "test_count": 118
     },
     {
       "path": "agent/src/handlers/strategic-resident.test.ts",
@@ -647,6 +664,7 @@
         "handleStrategicResident \u2014 typed Fast lease lifecycle > keeps the shared private Workday boundary replyless, silent, and serialized",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > paces a transient Fast claim conflict and retries the same client identity",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > paces every released cold Fast claim before retrying the still-open message",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > paces legacy Workday claim conflicts while renewing the Resident incarnation",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > preempts a Workday continuation at message-poll cadence for new operator input",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > preserves a newer Workday status when concurrent Fast completes",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > preserves autonomous Ready when Workday settles after Fast pending but before dispatch",
@@ -691,7 +709,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 135
+      "test_count": 136
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
@@ -985,6 +1003,12 @@
         "pending operator-decision review state machine > keeps an overflow sentinel until an explicit overflow outcome covers it",
         "pending operator-decision review state machine > queues multiple markerless exchanges and advances them one at a time",
         "pending operator-decision review state machine > round-trips the current exchange and ordered queue across a restart",
+        "project-wide ambient work state > hasPendingOwnedWork ignores project-wide activity",
+        "project-wide ambient work state > hasPendingOwnedWork still suppresses on genuinely owned work",
+        "project-wide ambient work state > the idle watching line is actually built from the project-aware note",
+        "project-wide ambient work state > watching note degrades cleanly on an older backend",
+        "project-wide ambient work state > watching note reports the fleet even when the lineage owns nothing",
+        "project-wide ambient work state > watching note stays one clause when the project matches the lineage",
         "re-exam change-gate (skip settled-clear, unchanged surfaces) > 1. skips a recently-cleared direction with NO change signal since that clear",
         "re-exam change-gate (skip settled-clear, unchanged surfaces) > 2. re-examines a direction with a NEW outcome/cycle/PR delta since its last clear",
         "re-exam change-gate (skip settled-clear, unchanged surfaces) > 2b. prioritizes a CHANGED direction ahead of a settled-clear, unchanged one (even if less recent)",
@@ -1072,7 +1096,7 @@
         "shouldRunAutonomousTurn (state-gated pacing) > runs the first-ever turn immediately, independent of exploration cadence",
         "shouldRunAutonomousTurn (state-gated pacing) > shouldRunAutonomousTurn does not fire on the loop's own applied ops"
       ],
-      "test_count": 304
+      "test_count": 310
     },
     {
       "path": "admin-ui/src/hooks/useStrategicLiveness.test.tsx",
@@ -1107,7 +1131,7 @@
         "test_classify_orphan_resident_session_exempt_from_progress_staleness",
         "test_classify_resident_session_warm_idle_not_reaped"
       ],
-      "test_count": 492
+      "test_count": 503
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",

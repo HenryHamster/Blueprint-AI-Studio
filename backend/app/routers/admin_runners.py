@@ -30,8 +30,12 @@ from app.models import (
     TASK_OUTCOME_TERMINAL_STATUSES,
     _utcnow,
 )
+from app.orchestrator_runner_placement import (
+    clear_unsatisfiable_local_placement_alert,
+)
 from app.runner_project_binding import (
     add_binding,
+    allowed_project_ids,
     allowed_project_ids_by_runner,
     bound_project_ids,
     remove_binding,
@@ -853,6 +857,21 @@ async def update_runner_status(
         project_id,
         released_pins,
     )
+    if target == "active":
+        # Resuming a runner can be the single event that makes an unsatisfiable
+        # local_only placement satisfiable again. The dispatcher would retire
+        # the page on its next pin, but only if the project still has queued
+        # work -- retire it here so a project whose queue drained first is not
+        # left with a stale page. Best-effort: never fail an operator action.
+        try:
+            for allowed_id in await allowed_project_ids(session, runner):
+                await clear_unsatisfiable_local_placement_alert(session, allowed_id)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to retire placement alerts after resuming "
+                "runner %s (non-fatal)",
+                runner_id,
+            )
     await emit_workbench_refetch(
         project_id,
         resource="local_runner",
@@ -1419,6 +1438,20 @@ async def add_runner_project(
         runner_id,
         project_id,
     )
+    if runner.status == "active":
+        # Same reasoning as the resume path: binding an ACTIVE runner is what
+        # clears a "no active runner bound to this project" block.
+        try:
+            await clear_unsatisfiable_local_placement_alert(
+                session, payload.project_id
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to retire placement alert for project %s "
+                "after binding runner %s (non-fatal)",
+                payload.project_id,
+                runner_id,
+            )
     await emit_workbench_refetch(
         project_id,
         resource="local_runner",

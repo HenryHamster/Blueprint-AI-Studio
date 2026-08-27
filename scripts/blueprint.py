@@ -1228,6 +1228,37 @@ def _render_task_tree(data: dict) -> None:
         print(f"    [{icon}] {cid}  merged={str(merged):<5}  pr={pr:<4}  {title}")
 
 
+def _resolved_failure_class(t: dict) -> str:
+    """Return the persisted failure class for a task dict, most canonical first.
+
+    Three fields carry a failure class on the admin task projection and they are
+    NOT interchangeable:
+
+    * ``context['failure_category']`` -- the canonical one. Every terminal-FAILED
+      code path is required to stamp it via
+      ``failure_classification.persist_failure_category``, so this is the field
+      that is actually populated on the estate.
+    * ``context['failure_class']`` -- the authoritative-verdict cache written by
+      ``persist_authoritative_verdict``. Only the reaper writes it, so it is
+      present on a small minority of rows.
+    * top-level ``failure_class`` -- the server-side ``classify_failure(task)``
+      projection, derived from log text at read time. A useful last resort, but
+      the endpoint only computes it for FAILED/CANCELLED rows that have a status
+      message.
+
+    Reading only ``context['failure_class']`` therefore reports nothing for most
+    genuinely classified failures -- state without reason, which is the exact
+    thing the operator surfaces are supposed to stop doing.
+    """
+    ctx = t.get("context") or {}
+    return (
+        ctx.get("failure_category")
+        or ctx.get("failure_class")
+        or t.get("failure_class")
+        or ""
+    )
+
+
 def _tasks_failures(args: argparse.Namespace) -> None:
     """Fetch FAILED tasks, group by root cause, and emit triage-ready output."""
     pid = get_project_id(getattr(args, "project_id", None))
@@ -1252,7 +1283,8 @@ def _tasks_failures(args: argparse.Namespace) -> None:
         msg = t.get("latest_status_message") or ""
         error = t.get("error_logs") or ""
         ctx = t.get("context") or {}
-        fc = ctx.get("failure_class", "")
+        fc = _resolved_failure_class(t)
+        detail = ctx.get("failure_detail") or ""
 
         cause = "UNKNOWN"
         if "API usage exhausted" in error or "API usage exhausted" in msg:
@@ -1293,6 +1325,11 @@ def _tasks_failures(args: argparse.Namespace) -> None:
             cause = "AGENT_TIMEOUT"
         elif fc:
             cause = fc
+        elif detail:
+            # No class at all, but the terminalizing path left a finer-grained
+            # marker. Surfacing it beats reporting UNKNOWN: the operator gets a
+            # name to grep for instead of a shrug.
+            cause = f"DETAIL:{detail}"
 
         buckets.setdefault(cause, []).append(t)
 
@@ -1308,6 +1345,13 @@ def _tasks_failures(args: argparse.Namespace) -> None:
                     "parent_task_id": t.get("parent_task_id"),
                     "latest_status_message": t.get("latest_status_message"),
                     "error_logs": t.get("error_logs"),
+                    # The persisted reason itself, not just the derived bucket:
+                    # a bucket says which pile the row landed in, these say what
+                    # the terminalizing path actually recorded on the row.
+                    "failure_class": _resolved_failure_class(t) or None,
+                    "failure_detail": (t.get("context") or {}).get(
+                        "failure_detail"
+                    ),
                 }
                 for t in group
             ]
@@ -1339,6 +1383,12 @@ def _render_failures(data: dict) -> None:
             msg = _safe_trunc(t.get("latest_status_message") or "", 100)
             error = _safe_trunc((t.get("error_logs") or "").split("\n")[0], 120)
             print(f"  {tid}  [{ttype:8}]  att={attempts}  parent={parent or '-':>8}  {title}")
+            reason_bits = [
+                part for part in (t.get("failure_class"), t.get("failure_detail"))
+                if part
+            ]
+            if reason_bits:
+                print(f"    WHY: {' / '.join(reason_bits)}")
             if error:
                 print(f"    ERR: {error}")
             elif msg:
@@ -1385,6 +1435,36 @@ def _tasks_autonomy_debug(args: argparse.Namespace) -> None:
     _emit(args, data, _render_autonomy_debug)
 
 
+def _render_strategic_lane(data: dict) -> None:
+    """Print the automatic-Strategic-lane admission state and its reason.
+
+    This flag has NO operator write verb anywhere in the CLI (deliberately --
+    changing it stays an explicit admin PATCH), and until this render existed it
+    had no read path either: the only way to learn that a project's entire
+    automatic Strategic authoring lane was off was a raw API call. A disabled
+    lane keeps tactical research spawning, so every other line in this view
+    looks healthy while no Strategic cycle is ever authored.
+    """
+    enabled = data.get("automatic_strategic_cycles_enabled")
+    if enabled is None:
+        return
+    if enabled:
+        print("  strategic_lane: ENABLED (automatic Strategic cycles may spawn)")
+        return
+    detail = data.get("automatic_strategic_cycles_disable") or {}
+    print("  strategic_lane: DISABLED — no automatic Strategic cycle will spawn")
+    print(f"    reason:      {detail.get('reason') or '<none recorded>'}")
+    print(f"    disabled_by: {detail.get('disabled_by') or '<unknown>'}")
+    if detail.get("until"):
+        print(f"    expires:     {detail['until']}")
+    elif detail.get("malformed_until"):
+        print("    expires:     <unparseable `until`> — treated as UNBOUNDED")
+    else:
+        print("    expires:     never (no `until` bound)")
+    if detail.get("legacy_bare_boolean"):
+        print("    form:        legacy bare boolean (no bound, no expiry, no actor)")
+
+
 def _render_autonomy_debug(data: dict) -> None:
     print("=== AUTONOMY DEBUG ===")
     blocked = data.get("spawn_blocked")
@@ -1394,6 +1474,7 @@ def _render_autonomy_debug(data: dict) -> None:
         print("  can_spawn: YES — no guards; next tick will spawn")
     else:
         print("  can_spawn: ?")
+    _render_strategic_lane(data)
     guards = data.get("blocking_guards") or []
     if guards:
         print(f"\n--- Blocking Guards ({len(guards)}) ---")
@@ -1431,10 +1512,12 @@ def _render_task_detail(t: dict) -> None:
     if msg:
         print(f"  Message:  {msg[:200]}")
     ctx = t.get("context") or {}
-    fc = (ctx.get("failure_category") or ctx.get("failure_class")
-          or t.get("failure_class"))
+    fc = _resolved_failure_class(t)
     if fc and t.get("status") in ("FAILED", "CANCELLED"):
         print(f"  FailClass: {fc}")
+    fdetail = ctx.get("failure_detail")
+    if fdetail and t.get("status") in ("FAILED", "CANCELLED"):
+        print(f"  FailDetail: {fdetail}")
     # Why a task is not moving is the first thing an operator asks, and it was
     # the one thing this view never answered -- the fields were in the JSON and
     # absent from the human render, so `tasks show` reported the state and
@@ -3221,6 +3304,22 @@ def _messages_list(args: argparse.Namespace) -> None:
 _MSG_ICONS = {"BUG_REPORT": "BUG", "FEEDBACK": "FB", "NOTE": "NOTE",
               "QUESTION": "Q", "BLOCKER": "BLOCK"}
 
+# ``status`` ("open"/"linked"/"resolved") is message RESOLUTION bookkeeping.
+# ``handling_state`` is whether the engine actually took the message, and it is
+# the field an operator needs: reaper step 25
+# (reaper_bug_message_sweeps.sweep_fail_stranded_pending_conversation_messages)
+# terminalizes an unclaimed conversation message to
+# handling_state='failed' + status='resolved', so a message NOBODY read and a
+# message that was answered both read as status='resolved'. Rendering only
+# ``status`` is what made "sent, then silence" indistinguishable from "handled".
+_HANDLING_LABELS = {
+    "pending": "pending",
+    "claimed": "claimed",
+    "responded": "responded",
+    "superseded": "superseded",
+    "failed": "FAILED",
+}
+
 
 def _render_messages(data: dict) -> None:
     msgs = data.get("messages") or []
@@ -3232,7 +3331,114 @@ def _render_messages(data: dict) -> None:
         icon = _MSG_ICONS.get(m.get("type") or m.get("message_type", ""), "?")
         src = m.get("from") or m.get("from_type", "?")
         age = (m.get("created_at") or "?")[:16]
-        print(f"  {msg_id} [{icon}] ({src}, {age}) {(m.get('content') or '')[:120]}")
+        raw_handling = m.get("handling_state")
+        handling = _HANDLING_LABELS.get(raw_handling, raw_handling or "unreported")
+        line = f"  {msg_id} [{icon}] ({src}, {age}, {handling})"
+        print(f"{line} {(m.get('content') or '')[:120]}")
+        if raw_handling == "failed":
+            reason = m.get("resolution") or "no runner claimed this message"
+            print(f"    ^ never handled: {reason}")
+
+
+# ``arming`` is the server's verdict on whether ANYTHING will read the message
+# just accepted (backend/app/strategic_trigger.py:94-141, 300-372). It is the
+# ONLY field that separates a steer that reached the engine from a row that was
+# merely stored, so a send receipt must never discard it: an operator message
+# silently accepted into a lane nothing consumes is indistinguishable, at the
+# terminal, from one that was acted on.
+_ARMING_SERVICED = {
+    "steering": "armed the strategist; the next strategic cycle consumes it",
+    "resident_session": "delivered live to the running Workday session",
+    "duplicate": "idempotent replay of an already-accepted message",
+}
+# Genuine steering whose marker could NOT be persisted. The row exists, but no
+# strategic cycle will ever consume it.
+_ARMING_UNSERVICED = "not_armed"
+# Recorded for the message board, but by design these never arm a strategic
+# cycle. Legitimate when intended, a silent drop when not.
+_ARMING_PASSIVE = {
+    "passive_note": "a passive NOTE never arms a strategic cycle",
+    "routine_event": "a routine digest event never arms a strategic cycle",
+}
+_ARMING_REMEDY = (
+    "use 'blueprint strategic send' or 'blueprint strategic chat', which open a "
+    "Workday session that reads the conversation thread directly."
+)
+
+
+def _report_arming(result, *, lane: str) -> None:
+    """Print the server's serviceability verdict; exit 1 when nothing will read it.
+
+    ``lane`` is ``"messages"`` for the plain operator send and ``"strategic"``
+    for the Workday send. The distinction is load-bearing, not cosmetic:
+
+    * On the ``messages`` lane ``maybe_arm_operator_refresh`` is the SOLE gate
+      (routers/admin_routers__messages.py). Nothing else on that path arranges a
+      reader, so ``not_armed`` there is proof the message will never be read --
+      a hard failure, not a warning.
+    * The ``strategic`` lane additionally passes ``precreate_ensure``, which can
+      bind the message to a live Workday session -- but binding is NOT invisible
+      to the verdict. ``create_operator_project_message`` overwrites the arming
+      outcome to ``resident_session`` for every CONVERSATION row it binds
+      (backend/app/project_message_creation.py, "every canonical conversation
+      row belongs to the active Resident"), and the server now classifies every
+      conversation turn as steering whatever its message type. So on this lane
+      ``not_armed`` / ``passive_note`` is proof of the opposite of binding: no
+      Resident took it AND no cadence was armed. That is a strand, and it fails
+      exit 1 exactly like the plain lane. (This used to exit 0 on the theory
+      that a bound message could still report ``passive_note``; it cannot.)
+
+    Everything here goes to stderr: ``--json`` callers parse stdout, and they
+    read the verdict from the ``arming`` key of the emitted receipt instead.
+    """
+    arming = (result or {}).get("arming") if isinstance(result, dict) else None
+    if not arming:
+        # Older server, or a route that does not report the verdict. Say so
+        # rather than implying the message was picked up.
+        print(
+            "  (server did not report an arming outcome -- cannot confirm "
+            "anything will read this message)",
+            file=sys.stderr,
+        )
+        return
+    if arming in _ARMING_SERVICED:
+        print(f"  Handling: {arming} -- {_ARMING_SERVICED[arming]}", file=sys.stderr)
+        return
+    if lane == "strategic":
+        if arming == _ARMING_UNSERVICED or arming in _ARMING_PASSIVE:
+            # A bound turn is reported as ``resident_session``, so reaching here
+            # means nothing bound it and nothing was armed. Only an unknown
+            # (newer-server) verdict falls through to the neutral report below,
+            # so a future serviced outcome is never mistaken for a strand.
+            print(
+                f"ERROR: this Strategic turn was STORED but arming={arming}: no "
+                "Workday session bound it and no strategic cycle was armed, so "
+                "nothing will ever read or answer it. Re-send to retry, or "
+                "start a Workday session ('blueprint strategic start') first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"  Handling: {arming}", file=sys.stderr)
+        return
+    if arming == _ARMING_UNSERVICED:
+        print(
+            "ERROR: this message was STORED but NOT armed: no strategic cycle "
+            "will consume it and nothing else on this lane reads it, so nothing "
+            "will ever answer it. Re-send to retry the steer, or "
+            + _ARMING_REMEDY,
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if arming in _ARMING_PASSIVE:
+        print(
+            f"WARNING: {_ARMING_PASSIVE[arming]}, so nothing will act on this "
+            "message -- it is recorded for the message board only. Send a "
+            "steering type (--type FEEDBACK / QUESTION / BLOCKER) to arm the "
+            "strategist, or " + _ARMING_REMEDY,
+            file=sys.stderr,
+        )
+        return
+    print(f"  Handling: {arming}", file=sys.stderr)
 
 
 def _messages_send(args: argparse.Namespace) -> None:
@@ -3259,6 +3465,9 @@ def _messages_send(args: argparse.Namespace) -> None:
     )
     result = api("POST", route, body)
     _emit(args, result, lambda d: print(f"  Message sent: {d.get('id', '?')}"))
+    # Runs in --json mode too: the verdict decides the EXIT CODE, and a caller
+    # that only checks the status line must not be told a dead send succeeded.
+    _report_arming(result, lane="messages")
 
 
 def _messages_answer(args: argparse.Namespace) -> None:
@@ -4926,9 +5135,17 @@ def _render_analytics_platform_kills(data: dict) -> None:
     if daily:
         print("  --- per day (kills / terminal) ---")
         for row in daily:
+            causes = ", ".join(
+                f"{kill_class}={count}"
+                for kill_class, count in sorted(
+                    (row.get("platform_kills_by_class") or {}).items()
+                )
+            )
+            cause_suffix = f"  [{causes}]" if causes else ""
             print(
                 f"  {row.get('date','?')}  {row.get('platform_kills',0):4d}"
                 f" / {row.get('terminal_tasks',0):4d}"
+                f"{cause_suffix}"
             )
 
     reasons = data.get("unclassified_reasons") or []
@@ -5267,6 +5484,7 @@ def _strategic_send(args: argparse.Namespace) -> None:
         result,
         lambda row: print(f"  Strategic message sent: {row.get('id', '?')}"),
     )
+    _report_arming(result, lane="strategic")
 
 
 # ── trim-playbook-archive ─────────────────────────────────────────────────────
@@ -6982,6 +7200,12 @@ def _compute_git_repo_state(start_dir: str, *, _subprocess_run=None) -> dict:
     Asks git whether it can read a repository rather than looking for a
     ``.git`` DIRECTORY: in a linked worktree ``.git`` is a FILE, so an isdir
     probe reports "not a repo" and skips silently.
+
+    That closes the LAYOUT half of "the probe cannot look"; ``-c
+    safe.directory`` below closes the OWNERSHIP half. Both failures land in the
+    same place -- ``resolved_by: "cwd"`` with a null commit/ref/dirty -- and
+    that record is what :func:`_compute_repo_clone_warnings` exists to keep
+    honest, so a silently empty one is worse than a loud refusal.
     """
     _run = _subprocess_run if _subprocess_run is not None else subprocess.run
 
@@ -6994,8 +7218,17 @@ def _compute_git_repo_state(start_dir: str, *, _subprocess_run=None) -> dict:
 
     def _git(*a) -> "str | None":
         try:
+            # ``-c safe.directory=<start_dir>``: git refuses EVERY command with
+            # "detected dubious ownership" (exit 128) when the caller's uid does
+            # not own the checkout -- a repo mounted into a container that runs
+            # as root, or a checkout read by a service unit running as another
+            # user. Every read below then returns None and the provenance record
+            # degrades to ``resolved_by: "cwd"``, which reads exactly like "this
+            # directory is not a checkout" instead of "git was not allowed to
+            # look". Naming the path as safe makes the read WORK; it does not
+            # soften what happens when it genuinely fails.
             proc = _run(
-                ["git", "-C", start_dir, *a],
+                ["git", "-c", f"safe.directory={start_dir}", "-C", start_dir, *a],
                 capture_output=True, text=True, timeout=_GIT_READ_TIMEOUT,
             )
         except Exception:  # noqa: BLE001 -- no git is "unknown", not a crash

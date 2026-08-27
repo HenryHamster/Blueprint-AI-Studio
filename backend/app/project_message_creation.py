@@ -633,6 +633,14 @@ async def create_operator_project_message(
     # durable, and strands the operator's message on the display-only surface,
     # which has no delivery path and no claim lifecycle.
     surface: MessageSurface = MessageSurface.CONVERSATION,
+    # True only for a turn typed into the Strategic conversation itself (the
+    # ``/strategic-session/messages`` composer and its operator-access mirror),
+    # as opposed to a row filed on the message board. ``surface`` cannot carry
+    # this: both message-board routes also default to CONVERSATION, so the two
+    # lanes are indistinguishable by surface alone. A conversation turn must
+    # always end up with a reader, so it classifies as steering regardless of
+    # its (client-defaulted) message type -- see ``classify_operator_arming``.
+    conversation_turn: bool = False,
     reply_to_message_id: uuid.UUID | None = None,
     include_strategic_session_snapshot: bool = True,
     precommit_validate: Callable[
@@ -822,6 +830,15 @@ async def create_operator_project_message(
         message_type,
         message_content=trimmed_content,
         resident_session_active=resident_active,
+        # The server-authored resident activation prompt is written through
+        # this same helper with ``MessageType.NOTE`` on the CONVERSATION
+        # surface. It is not operator steering, so it must never arm a cadence
+        # cycle even if a future caller routes it through the conversation lane.
+        conversation_turn=bool(
+            conversation_turn
+            and message_context.get(RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY)
+            is not True
+        ),
     )
     if resident_active and surface == MessageSurface.CONVERSATION:
         # Every canonical conversation row belongs to the active Resident,

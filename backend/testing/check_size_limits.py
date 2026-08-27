@@ -79,7 +79,7 @@ if _BACKEND_DIR not in sys.path:
 # resolved to a nonexistent ``/scripts`` there, so every receipt import failed
 # with nothing naming why. Probe both layouts, and keep the miss REASON so the
 # fail-open receipt warnings below can report it instead of a bare ImportError.
-from testing.repo_scripts_path import resolve_scripts_dir_from_env
+from testing.repo_scripts_path import resolve_scripts_dir_from_env  # noqa: E402
 
 _SCRIPTS_DIR, _SCRIPTS_DIR_UNAVAILABLE = resolve_scripts_dir_from_env(_BACKEND_DIR)
 _SCRIPTS_DIR_HINT = f" — {_SCRIPTS_DIR_UNAVAILABLE}" if _SCRIPTS_DIR_UNAVAILABLE else ""
@@ -253,7 +253,107 @@ SECTIONS = ("backend", "agent", "frontend", "testing", "scripts")
 # ci_completion.py 3100 -> 3600 on its seventh bump (PR #17587, reverted). The
 # flag now demands this variable so the approval has to come from outside the
 # task: an agent that hits a chronic offender must decompose it or block.
+# ``SIZE_CAP_OPERATOR_APPROVAL``'s VALUE is recorded, not merely counted as
+# present. Until 2026-08-26 this was a presence gate: the value was never read
+# and never persisted, so ``SIZE_CAP_OPERATOR_APPROVAL=1`` cleared it and
+# cap_bump_history.json kept no trace of who authorised the bump or why. The
+# only surviving audit surface was a commit message nothing validates, nothing
+# links to the record, and a squash can lose -- so a reviewer could not tell an
+# operator's headroom decision from a bump forced to go green. The value now
+# has to name the approving operator AND give a real reason, and it is written
+# into the bumped module's ledger record as ``justification``.
 _OPERATOR_APPROVAL_ENV = "SIZE_CAP_OPERATOR_APPROVAL"
+_OPERATOR_APPROVAL_FORMAT = "<operator>: <why this cap raise is the right call>"
+_APPROVAL_MAX_CHARS = 500
+_APPROVAL_MAX_OPERATOR_CHARS = 64
+_APPROVAL_MIN_REASON_CHARS = 24
+_APPROVAL_MIN_REASON_WORDS = 3
+# Tokens that satisfy a presence check while carrying no information. Rejected
+# on their own AND as either half of the "<operator>: <reason>" pair, so
+# "ci: yes" is refused exactly like a bare "yes".
+_APPROVAL_PLACEHOLDERS = frozenset(
+    {
+        "-",
+        "--",
+        "0",
+        "1",
+        "approve",
+        "approved",
+        "false",
+        "n",
+        "n/a",
+        "na",
+        "no",
+        "none",
+        "ok",
+        "okay",
+        "tbd",
+        "temp",
+        "test",
+        "todo",
+        "true",
+        "x",
+        "y",
+        "yes",
+    }
+)
+
+
+def normalize_operator_approval(raw: "str | None") -> "tuple[str, str]":
+    """Validate an operator-approval value; return ``(justification, error)``.
+
+    Exactly one of the two is non-empty. ``justification`` is the normalized
+    ``"<operator>: <reason>"`` text persisted on the cap-bump-history record;
+    ``error`` says why the value was refused, so the CLI can surface the REASON
+    rather than a bare "approval missing".
+
+    Whitespace (including newlines pasted in from a shell) is collapsed so the
+    stored value is a single tidy line. Presence alone is never enough: an
+    empty/blank value, a placeholder like ``1``/``true``/``yes``, a value with
+    no ``:`` separator, and a reason too short or too few words to carry
+    information are all refused.
+    """
+    text = " ".join((raw or "").split())
+    if not text:
+        return "", f"{_OPERATOR_APPROVAL_ENV} is unset, empty, or only whitespace"
+    if len(text) > _APPROVAL_MAX_CHARS:
+        return "", (
+            f"the value is {len(text)} characters; keep the recorded "
+            f"justification under {_APPROVAL_MAX_CHARS}"
+        )
+    if ":" not in text:
+        return "", (
+            f"the value {text!r} has no ':' separating the approving operator "
+            "from the reason"
+        )
+    operator, reason = (part.strip() for part in text.split(":", 1))
+    if not operator or operator.lower() in _APPROVAL_PLACEHOLDERS:
+        return "", (
+            f"the operator identifier before ':' is empty or the placeholder "
+            f"{operator!r}"
+        )
+    if len(operator) > _APPROVAL_MAX_OPERATOR_CHARS:
+        return "", (
+            f"the operator identifier before ':' is {len(operator)} characters; "
+            f"keep it under {_APPROVAL_MAX_OPERATOR_CHARS}"
+        )
+    if reason.lower() in _APPROVAL_PLACEHOLDERS:
+        return "", (
+            f"the reason after ':' is the placeholder {reason!r}, not a "
+            "justification"
+        )
+    if (
+        len(reason) < _APPROVAL_MIN_REASON_CHARS
+        or len(reason.split()) < _APPROVAL_MIN_REASON_WORDS
+    ):
+        return "", (
+            f"the reason after ':' must be at least "
+            f"{_APPROVAL_MIN_REASON_CHARS} characters and "
+            f"{_APPROVAL_MIN_REASON_WORDS} words; got {len(reason)} characters "
+            f"in {len(reason.split())} word(s)"
+        )
+    return f"{operator}: {reason}", ""
+
 
 _RELEASE_SURFACE_PREFIXES = ("release_", "acceptance_")
 _RELEASE_SURFACE_EXTRA_MODULES = ("approved_pr_stranding.py",)
@@ -1092,9 +1192,11 @@ def main(argv: list[str] | None = None) -> int:
         dest="force_chronic",
         help=(
             "operator-approval override: allow --fix to bump a chronic offender's cap. "
-            f"Requires {_OPERATOR_APPROVAL_ENV} in the environment -- it is an operator "
-            "lever, not a task-agent one. Attribution is recorded in the output. Without "
-            "this flag, chronic offenders are skipped and exit 1 is returned."
+            f"Requires {_OPERATOR_APPROVAL_ENV}='{_OPERATOR_APPROVAL_FORMAT}' in the "
+            "environment -- it is an operator lever, not a task-agent one. That value is "
+            "persisted as the bumped record's justification in cap_bump_history.json, so "
+            "the authorisation outlives the commit message. Without this flag, chronic "
+            "offenders are skipped and exit 1 is returned."
         ),
     )
     parser.add_argument(
@@ -1127,12 +1229,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--repair-target requires --fix")
     if len(args.repair_target) != len(set(args.repair_target)):
         parser.error("--repair-target values must be unique")
-    if args.force_chronic and not os.environ.get(_OPERATOR_APPROVAL_ENV, "").strip():
+    operator_approval, approval_error = normalize_operator_approval(
+        os.environ.get(_OPERATOR_APPROVAL_ENV)
+    )
+    if args.force_chronic and approval_error:
         print(
-            f"[refused] --force-chronic requires operator approval: set "
-            f"{_OPERATOR_APPROVAL_ENV} to the approving operator's identifier. A task "
-            "agent must not pass this flag -- decompose the module, or raise a blocker "
-            "so an operator can decide. See PR #16787 for a reverted unapproved bump.",
+            f"[refused] --force-chronic requires a RECORDABLE operator approval: set "
+            f"{_OPERATOR_APPROVAL_ENV}='{_OPERATOR_APPROVAL_FORMAT}' -- {approval_error}. "
+            "The value is persisted as the bump's justification in "
+            "cap_bump_history.json, so a placeholder that only clears a presence check "
+            "is refused. A task agent must not pass this flag -- decompose the module, "
+            "or raise a blocker so an operator can decide. See PR #16787 for a reverted "
+            "unapproved bump.",
             file=sys.stderr,
         )
         return 1
@@ -1280,6 +1388,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         chronic_skipped: list[tuple[str, dict, str]] = []
         bumped: list[tuple[str, dict, int]] = []
+        # Operator approval is recorded ONLY on the bumps that actually needed
+        # it -- the chronic ones. An ordinary policy bump applied in the same
+        # run is not operator-authorised, and stamping it would make the field
+        # meaningless as an audit signal.
+        chronic_justifications: dict[tuple[str, str, int, int], str] = {}
         added: list[tuple[str, dict, int]] = []
         pruned: list[tuple[str, dict]] = []
         for section, rec in breaches:
@@ -1302,6 +1415,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 new_cap = verdict["suggested_new_limit"]
                 data[section][rec["rel"]] = new_cap
+                if verdict["is_chronic"] and operator_approval:
+                    chronic_justifications[
+                        (section, rec["rel"], rec["cap"], new_cap)
+                    ] = operator_approval
                 label = "[fix-chronic]" if verdict["is_chronic"] else "[fix]"
                 print(
                     f"{label}  {section}/{rec['rel']}: {rec['count']} lines — "
@@ -1397,6 +1514,7 @@ def main(argv: list[str] | None = None) -> int:
                     # the observed provenance. The trailing status field is
                     # advisory for reporting only, so drop it here.
                     + [rec[:6] for rec in missing_ledger_records],
+                    justifications=chronic_justifications or None,
                     repair_targets=(
                         {(section, rec["rel"]) for section, rec, _new_cap in bumped}
                         if scoped_repair
@@ -1417,6 +1535,12 @@ def main(argv: list[str] | None = None) -> int:
                     print(
                         f"Attributed {len(unattributed_ledger_records)} pending "
                         f"cap-bump record(s) in "
+                        f"{os.path.basename(ledger_path)}."
+                    )
+                if chronic_justifications:
+                    print(
+                        f"Recorded the operator approval as the justification on "
+                        f"{len(chronic_justifications)} chronic cap bump(s) in "
                         f"{os.path.basename(ledger_path)}."
                     )
                 if bumped:

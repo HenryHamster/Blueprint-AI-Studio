@@ -3891,7 +3891,10 @@ def test_research_completion_direction_terminal_alert_stamps_honest_event_type()
         for call in ast.walk(tree)
         if isinstance(call, ast.Call)
         and (
-            (isinstance(call.func, ast.Name) and call.func.id == "Alert")
+            (
+                isinstance(call.func, ast.Name)
+                and call.func.id in {"Alert", "create_project_alert_if_allowed"}
+            )
             or (isinstance(call.func, ast.Attribute) and call.func.attr == "Alert")
         )
         for keyword in call.keywords

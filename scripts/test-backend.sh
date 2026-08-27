@@ -651,6 +651,89 @@ _run() {
   fi
 }
 
+# _run_pytest <pytest args...> — _run for pytest, plus a name for the one
+# failure shape pytest cannot report about itself.
+#
+# THE CLASS
+# ---------
+# A pytest process that dies by os._exit()/abort()/a fatal signal never reaches
+# pytest_sessionfinish. So it prints NO "short test summary info", NO
+# "=== N failed ... ===" line, and stops MID progress line — while still exiting
+# non-zero. On CI that is a red job with a truncated log and nothing to act on:
+# the failure has no name, no file, no traceback. Engineers then hunt for a
+# broken test that does not exist.
+#
+# Not hypothetical. `Impacted backend tests` went red exactly this way three
+# times on PR #18011 (runs 32998752057 / 33000772113 / 33002910941): the
+# orchestrator hard watchdog — a daemon thread the app lifespan armed and never
+# disarmed — called os._exit(1) ~240s after the last heartbeat and killed the
+# runner mid-file. One of those runs had ZERO failing tests and still exited 1.
+# That root cause is fixed (app/lifecycle.py::_disarm_orchestrator_hard_watchdog),
+# but ANY future in-process os._exit, C-level abort, segfault or OOM-kill
+# produces the same unreadable red. This names the class when it recurs.
+#
+# EXIT-CODE FIDELITY is the whole reason PIPESTATUS appears here. `cmd | tee f`
+# yields *tee's* status, and this repo has already been burned by that exact
+# masking (`test-backend.sh ... | tail` reporting success while tests failed).
+# Two rules, both load-bearing:
+#
+#   * ${PIPESTATUS[0]} must be read on the line IMMEDIATELY after the
+#     pipeline. Any command in between, `|| true` very much included,
+#     resets it.
+#   * It must be PIPESTATUS and not `$?`, even though `$?` looks equivalent
+#     today. It only looks equivalent because line 20 sets `pipefail`
+#     (which the `set +e` below does NOT clear), so `$?` reports the
+#     rightmost non-zero status. Lose pipefail — to a refactor, a
+#     sourcing context, a `bash -c` wrapper — and `$?` becomes tee's
+#     status, which is 0 whenever tee could write its file. A KILLED pytest
+#     would then report SUCCESS: the silent-GREEN twin of the silent red
+#     this function exists to fix.
+#
+# backend/testing/test_harness_timeout_budgets.py pins both rules, and pins
+# the second by driving this very function with pipefail switched off.
+_run_pytest() {
+  local stream status had_errexit=0
+  stream="$(mktemp "${TMPDIR:-/tmp}/blueprint-pytest-stream.XXXXXX")"
+  case $- in *e*) had_errexit=1 ;; esac
+  set +e
+  _run python3 -m pytest "$@" 2>&1 | tee "$stream"
+  status=${PIPESTATUS[0]}
+  if [ "$had_errexit" = "1" ]; then set -e; fi
+  # A finished session always prints a closing "=== ... in <N>s ===" banner —
+  # true for passes, failures, errors and "no tests ran" alike. Its absence next
+  # to a non-zero status means the process was ended rather than concluded.
+  if [ "$status" -ne 0 ] \
+     && ! grep -qE '(^=+ .* in [0-9]|short test summary info)' "$stream"; then
+    cat >&2 <<SILENT_DEATH
+
+===============================================================================
+HARNESS: pytest exited $status WITHOUT finishing its session.
+
+There is no summary above and no FAILED line because pytest never reached
+pytest_sessionfinish. The process was ENDED; it did not decide to exit. A
+progress line that stops mid-row is the tell.
+
+This is NOT a failing assertion — do not go hunting for a broken test.
+Causes, in the order worth checking:
+
+  * An in-process os._exit()/abort() from APPLICATION code running inside the
+    test process. A leaked watchdog/supervisor thread is the known instance:
+    app/orchestrator_liveness.py::_default_hard_abort. Grep the log for
+    'HARD-WATCHDOG' and for a 'Current thread 0x' faulthandler dump.
+  * A fatal signal — a segfault in a C extension, or the kernel/cgroup OOM
+    killer. Docker surfaces those as 137/139, not as 1.
+  * A usage or collection error: look for an 'ERROR:' line above.
+
+The dying process's own diagnostics are probably MISSING even though it wrote
+them: pytest captures fd 1 and 2, and os._exit discards that buffer unreplayed.
+Re-run the same selectors with -s (--capture=no) to make them survive.
+===============================================================================
+SILENT_DEATH
+  fi
+  rm -f "$stream"
+  return "$status"
+}
+
 # These are all roots containing test_*.py modules that the backend test gates
 # must inspect for silent zero-test stubs. Keep this derived from the repository
 # layout rather than maintaining a second per-file coverage roster.
@@ -800,6 +883,8 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_audit_finding_class_guards.py
     testing/test_admin_auth_invariant.py
     testing/test_release_promotion_metric_manifest.py
+    testing/test_release_activation_approval.py
+    testing/test_discovery_evidence_bound.py
     testing/test_dependency_deprecations.py
     testing/test_websocket_emitter_inventory.py
     testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
@@ -817,6 +902,22 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_vitest_durations_freshness.py
     testing/test_test_imports_checker.py
     testing/test_scripts_lane_hermetic_credentials.py
+    # Live-tree module-size guardrail. Required here, not optional: it is
+    # registered in drift_sentinel_surfaces.json against agent/src/**,
+    # admin-ui/src/** and scripts/**/*.py, and corpus_lane_required_sentinels()
+    # demands a roster seat for any sentinel with a non-backend surface -- the
+    # corpus lane is the only lane a diff carrying no backend Python reaches.
+    # It is a corpus scan, and its cost is file I/O: ~2.6s with the repo on a
+    # Linux filesystem (CI), but 78-103s across a Docker-on-Windows bind mount
+    # -- both measured 3x. The module carries an explicit
+    # @pytest.mark.timeout(120) -- the same house budget
+    # test_string_patch_targets_resolve uses -- so the bind-mount case reds as
+    # ITSELF rather than as an anonymous lane kill. (When this lane's
+    # LANE_HANG_DETECTOR_SECONDS was 30 the marker was also what kept the
+    # Windows figure from failing outright.) Never remove that marker without
+    # re-measuring on BOTH: a corpus scan killed by a bare lane timeout
+    # reports a slow filesystem as a size defect.
+    testing/test_module_size_live_tree.py
     )
     # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
     # The scripts roster is explicitly maintained above and checked by
@@ -920,8 +1021,8 @@ if [ "${1:-}" = "--standalone" ]; then
   if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then
     STANDALONE_JUNIT_ARGS+=("--junitxml=${BLUEPRINT_STATIC_GUARD_JUNIT}")
   fi
-  _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest \
-    --timeout=30 --timeout-method=signal "${STANDALONE_JUNIT_ARGS[@]}"
+  _run_pytest "${STANDALONE_ARGS[@]}" -v --noconftest \
+    --timeout=300 --timeout-method=signal "${STANDALONE_JUNIT_ARGS[@]}"
   exit 0
 fi
 
@@ -1016,7 +1117,7 @@ if [ $# -gt 0 ]; then
     else
       verification_junit="$VERIFICATION_HOST_JUNIT"
     fi
-  _run python3 -m pytest "$@" --junitxml="$verification_junit"
+  _run_pytest "$@" --junitxml="$verification_junit"
     verification_tmp="${BLUEPRINT_VERIFICATION_RESULT_FILE}.$$"
     python3 -c 'import datetime,json,sys,xml.etree.ElementTree as ET; junit,out,*selectors=sys.argv[1:]; root=ET.parse(junit).getroot(); suites=[root] if root.tag.endswith("testsuite") else list(root); tests=sum(int(s.attrib.get("tests",0)) for s in suites); skipped=sum(int(s.attrib.get("skipped",0)) for s in suites); failures=sum(int(s.attrib.get("failures",0))+int(s.attrib.get("errors",0)) for s in suites); assert tests>0 and skipped<tests and failures==0, f"unacceptable pytest result tests={tests} skipped={skipped} failures={failures}"; payload={"version":1,"harness":"scripts/test-backend.sh","selectors":selectors,"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":tests,"skipped":skipped,"failures":failures,"exit_code":0,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$VERIFICATION_HOST_JUNIT" "$verification_tmp" "$@"
     mv -f "$verification_tmp" "$BLUEPRINT_VERIFICATION_RESULT_FILE"
@@ -1037,21 +1138,21 @@ if [ $# -gt 0 ]; then
       else
         verification_junit="$BLUEPRINT_VERIFICATION_JUNIT"
       fi
-      _run python3 -m pytest "$@" --junitxml="$verification_junit"
+      _run_pytest "$@" --junitxml="$verification_junit"
     else
-      _run python3 -m pytest "$@"
+      _run_pytest "$@"
     fi
   fi
   exit 0
 fi
 
 echo "=== Standalone tests ==="
-_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py /repo/scripts/test_blueprint_compute_local.py /repo/scripts/test_blueprint_mcp.py /repo/scripts/test_hermes_operator_cli.py "${STANDALONE_RELEASE_TEST_ARGS[@]}" testing/test_test_durations_freshness.py testing/test_durations_measurability.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
+_run_pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_admin_auth_invariant.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py /repo/scripts/test_blueprint_compute_local.py /repo/scripts/test_blueprint_mcp.py /repo/scripts/test_hermes_operator_cli.py "${STANDALONE_RELEASE_TEST_ARGS[@]}" testing/test_test_durations_freshness.py testing/test_durations_measurability.py testing/test_shard_balance.py testing/test_vitest_durations_freshness.py -v --noconftest
 
 echo "=== Full test suite ==="
 if [ "${#TESTMON_ARGS[@]}" -gt 0 ]; then
   echo "(warm testmon cache present — selecting only tests with changed dependencies)"
 fi
-_run python3 -m pytest testing/ -q --tb=short "${TESTMON_ARGS[@]}"
+_run_pytest testing/ -q --tb=short "${TESTMON_ARGS[@]}"
 
 echo "=== All backend tests passed ==="

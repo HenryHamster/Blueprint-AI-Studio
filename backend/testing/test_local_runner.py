@@ -57,6 +57,7 @@ from app.routers.runner import (
     _parse_multipart_form_stream,
 )
 from app.runner_config import config_generation, live_safe_config
+from app.strategic_resident_session import RESIDENT_TASK_PRIORITY
 from app.task_capabilities import STRATEGIC_LOCAL_AGENT_TASK_TYPES, STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -3689,6 +3690,51 @@ class TestRunnerEndpoints:
         # The NEWER, higher-priority task wins over the older low-priority one.
         assert resp.json()["task_id"] == str(new_high.id)
 
+    @pytest.mark.asyncio
+    async def test_next_task_resident_priority_outranks_older_high_priority_work(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        base = _utcnow() - timedelta(minutes=10)
+        old_high = self._pinned(
+            project.id,
+            runner.id,
+            created_at=base,
+            priority=100,
+        )
+        resident = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={
+                "runner_target_id": str(runner.id),
+                "_resident_session": True,
+                "strategic_session_id": "ss-runner-priority",
+                "_resident_worker_generation": 1,
+            },
+            created_at=base + timedelta(minutes=5),
+            priority=RESIDENT_TASK_PRIORITY,
+        )
+        db_session.add_all([old_high, resident])
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=self._selection()),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["task_id"] == str(resident.id)
+
     # ── Skip escalation: a bounded scan is only safe if skips have a consumer ──
 
     @staticmethod
@@ -6167,10 +6213,10 @@ class TestRunnerEndpoints:
         )
 
     @pytest.mark.asyncio
-    async def test_update_report_creates_alert_on_success(
+    async def test_update_report_does_not_create_durable_alert_on_success(
         self, client: AsyncClient, db_session
     ):
-        """POST /api/runner/update-report with status=success creates an INFO Alert."""
+        """A successful point-in-time update report never becomes a durable alert."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(
             db_session, project.id, hostname="runner-update-test"
@@ -6189,7 +6235,6 @@ class TestRunnerEndpoints:
         body = resp.json()
         assert body["ok"] is True
 
-        # Verify an alert was created.
         rows = (
             await db_session.execute(
                 select(Alert).where(
@@ -6198,18 +6243,13 @@ class TestRunnerEndpoints:
                 )
             )
         ).scalars().all()
-        assert len(rows) == 1
-        alert = rows[0]
-        assert alert.severity == AlertSeverity.INFO
-        assert "succeeded" in alert.title
-        assert runner.hostname in alert.title or str(runner.id)[:8] in alert.title
-        assert "aaaaaaaaaa → bbbbbbbbbb" in alert.message
+        assert rows == []
 
     @pytest.mark.asyncio
-    async def test_update_report_creates_alert_on_failure(
+    async def test_update_report_does_not_create_durable_alert_on_failure(
         self, client: AsyncClient, db_session
     ):
-        """POST /api/runner/update-report with status=failure creates a WARNING Alert."""
+        """A failed point-in-time update report never becomes a durable alert."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
 
@@ -6230,10 +6270,7 @@ class TestRunnerEndpoints:
                 )
             )
         ).scalars().all()
-        assert len(rows) == 1
-        alert = rows[0]
-        assert alert.severity == AlertSeverity.WARNING
-        assert "failed" in alert.title
+        assert rows == []
 
     @pytest.mark.asyncio
     async def test_update_report_rejects_invalid_status(

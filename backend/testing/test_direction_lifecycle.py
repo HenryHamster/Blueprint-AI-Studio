@@ -458,6 +458,208 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
     assert "retirement_consideration_needed" not in by_id["d-cheap-2"]
 
 
+def _cpm_project(name: str, directions: list[dict]) -> Project:
+    return Project(
+        name=name,
+        user_id="u-retire",
+        autonomous_enabled=True,
+        directions=directions,
+        vision={"purpose": "test"},
+    )
+
+
+def _cpm_direction(did: str, *, cost: float, merged: int = 1, **extra) -> dict:
+    d = {
+        "id": did,
+        "text": f"Direction {did}",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {
+                "timestamp": _utcnow().isoformat(),
+                "tasks_created": 2,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": merged,
+                "estimated_cost_usd": cost,
+            }
+        ],
+    }
+    d.update(extra)
+    return d
+
+
+@pytest.mark.asyncio
+async def test_retirement_consideration_self_clears_when_cost_recovers(
+    db_session, mocker
+):
+    """A recovered direction must not keep a stale retire-me flag.
+
+    The flag used to be a one-way latch: nothing in the backend ever removed it,
+    so a direction whose cost/merge fell back under threshold carried the
+    recommendation forever and the strategist could not distinguish a live breach
+    from an old one. Recovery must clear the flag AND record why.
+    """
+    now = _utcnow()
+    # Cheap now, but carrying the flag (and its evidence) from an earlier breach.
+    recovered = _cpm_direction(
+        "d-recovered",
+        cost=1.0,
+        retirement_consideration_needed=True,
+        retirement_consideration_at="2026-01-02T00:00:00",
+        retirement_consideration_reason="Recent cost/merge $99.00 exceeded threshold $4.00.",
+        retirement_consideration_evidence={"threshold_usd": 4.0},
+    )
+    project = _cpm_project(
+        "CPM Recovery",
+        [
+            recovered,
+            _cpm_direction("d-peer-1", cost=1.0),
+            _cpm_direction("d-peer-2", cost=2.0),
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch.dict(
+        "app.direction_lifecycle._runtime_config",
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
+        clear=False,
+    )
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = {x["id"]: x for x in project.directions}["d-recovered"]
+    assert "retirement_consideration_needed" not in d, (
+        "a recovered direction must not keep the retire-me flag"
+    )
+    # The whole recommendation is cleared, not just the boolean — a stale reason
+    # or stale evidence would be read downstream as a live breach.
+    assert "retirement_consideration_reason" not in d
+    assert "retirement_consideration_evidence" not in d
+    assert "retirement_consideration_at" not in d
+    # Surface the REASON, not just the state change.
+    assert d.get("retirement_consideration_cleared_at")
+    assert "recovered to at-or-below" in (
+        d.get("retirement_consideration_cleared_reason") or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_retirement_consideration_raise_alerts_once_and_reaches_strategist(
+    db_session, mocker
+):
+    """Raising the flag must deliver the recommendation somewhere a decision happens.
+
+    Before this, the flag was written to the direction dict and read by nothing
+    but the admin-ui card, so a cost-outlier direction kept being selected for
+    research indefinitely. The raise now emits an alert exactly once per breach
+    episode (not once per lifecycle tick).
+    """
+    from app.models import Alert
+
+    now = _utcnow()
+    project = _cpm_project(
+        "CPM Alert",
+        [
+            _cpm_direction("d-expensive", cost=10.0),
+            _cpm_direction("d-peer-1", cost=1.0),
+            _cpm_direction("d-peer-2", cost=2.0),
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch.dict(
+        "app.direction_lifecycle._runtime_config",
+        {
+            "direction_cost_per_merge_window": 6,
+            "direction_cost_per_merge_multiplier": 2.0,
+        },
+        clear=False,
+    )
+
+    async def _alerts() -> list[Alert]:
+        rows = await db_session.execute(
+            select(Alert).where(
+                Alert.event_type == "research.retirement_consideration_needed"
+            )
+        )
+        return list(rows.scalars().all())
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    first = await _alerts()
+    assert len(first) == 1, f"expected exactly one raise alert, got {len(first)}"
+    # The alert must carry WHY, not just that something happened.
+    assert "cost/merge" in first[0].message
+    assert "d-expensive" in first[0].message
+    assert "decision is owed" in first[0].message
+
+    # Second tick, still over threshold: the flag gates re-firing.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    assert len(await _alerts()) == 1, (
+        "a still-breaching direction must not re-alert on every lifecycle tick"
+    )
+
+
+def test_retirement_consideration_alert_has_a_registered_audience():
+    """A new alert event_type must be routed, or fail-closed routing drops it."""
+    from app.message_audience import (
+        STRATEGIST_INTERNAL,
+        get_registered_event_types,
+        route_event,
+    )
+
+    assert "research.retirement_consideration_needed" in get_registered_event_types()
+    # Route it the way production does. The retirement recommendation is a
+    # strategist decision input, not an operator ping -- same audience as the
+    # churn ladder's recommendation, which it deliberately mirrors.
+    assert (
+        route_event("research.retirement_consideration_needed") == STRATEGIST_INTERNAL
+    )
+    assert route_event("research.churn_retirement_recommended") == STRATEGIST_INTERNAL
+
+
+def test_strategic_payload_compaction_keeps_retirement_consideration():
+    """The signal must survive payload trimming, or the strategist never sees it."""
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    out = _compact_direction_summary_entry(
+        {
+            "id": "d-expensive",
+            "status": "active",
+            "retirement_consideration_needed": True,
+            "retirement_consideration_at": "2026-08-19T10:08:58",
+            "retirement_consideration_reason": "Recent cost/merge $0.41 exceeded threshold $0.39.",
+            "retirement_consideration_evidence": {
+                "window_cycles": 6,
+                "direction_cost_per_merge_usd": 0.4058,
+                "threshold_usd": 0.3914,
+            },
+        }
+    )
+    assert out.get("retirement_consideration_needed") is True
+    assert out.get("retirement_consideration_at")
+    assert "0.41" in (out.get("retirement_consideration_reason") or "")
+    assert (out.get("retirement_consideration_evidence") or {}).get("threshold_usd")
+
+
 @pytest.mark.asyncio
 async def test_retirement_evidence_includes_provider_model_split(db_session, mocker):
     """When a research_history entry carries cost_by_provider_model, the rolling
@@ -2405,10 +2607,23 @@ async def test_already_fixed_deadlock_auto_retires_via_apply_post_spawn(db_sessi
     HEAD) make the direction genuinely exhausted. When a fresh no-findings cycle is
     applied and the direction is neither code-failing nor externally frozen, it is
     routed to non-success terminal status='retired' with an exhaustion reason and
-    an INFO 'Direction auto-retired' alert. Exhaustion must not masquerade as
+    a 'Direction auto-retired' milestone notice. Exhaustion must not masquerade as
     evidence that the direction achieved its declared outcome.
+
+    2026-08-26: this test used to demand a durable ``Alert`` row. It was asserting
+    a row the registry already forbade: ``research.direction_auto_retired`` was
+    already in ``_TIMELINE_ONLY_RETIREMENT_EVENTS`` on ``origin/automain``, so the
+    retirement backstop sweep retired that row on every pass -- the assertion only
+    held because it ran inside one transaction, before any sweep. "Direction X was
+    retired at T" is a completed fact; no condition can clear it, so a durable
+    operator row for it is unresolvable by construction. The mint site now asks the
+    policy gate, which suppresses the row, and the delivery is the
+    ``direction_milestone`` ProjectMessage that the same code path already posted
+    before this change. The assertion is re-pointed at that live observable and
+    additionally pins the absence of the durable row, so a regression that
+    re-introduces the raw insert fails here.
     """
-    from app.models import Alert
+    from app.models import Alert, ProjectMessage
     from app.research_direction_state import apply_post_spawn_state
     from test_autonomous_research import _active_direction, _make_research_task
 
@@ -2478,15 +2693,44 @@ async def test_already_fixed_deadlock_auto_retires_via_apply_post_spawn(db_sessi
         f"auto_completed_reason must reflect exhaustion, got {d.get('auto_completed_reason')!r}"
     )
 
+    # The retirement is delivered as a direction_milestone notice ...
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    milestones = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "direction_milestone"
+        and (m.context or {}).get("milestone") == "auto-retired"
+    ]
+    assert len(milestones) == 1, (
+        "expected exactly 1 'auto-retired' direction_milestone message, got "
+        f"{len(milestones)} (all event_types: "
+        f"{[(m.context or {}).get('event_type') for m in msgs]})"
+    )
+    assert "exhausted" in (milestones[0].context.get("reason") or ""), (
+        "the milestone notice must carry the exhaustion reason, got "
+        f"{milestones[0].context.get('reason')!r}"
+    )
+
+    # ... and NOT as a durable, unresolvable operator alert row.
     result = await db_session.execute(
         select(Alert).where(
             Alert.project_id == project.id,
             Alert.title == "Direction auto-retired",
-            Alert.dismissed_at.is_(None),
         )
     )
-    assert result.scalars().first() is not None, (
-        "expected a 'Direction auto-retired' alert"
+    assert result.scalars().first() is None, (
+        "'Direction auto-retired' is a completed fact, not a standing condition: "
+        "it must not mint a durable alert row that no resolver can ever clear"
     )
 
 
@@ -4996,3 +5240,647 @@ def test_retired_diagnoses_archive_dedups_by_direction_id():
     assert doc["retired_diagnoses_archive"][0]["direction_id"] == "d-dedup-test-2"
     assert doc["retired_diagnoses_archive"][1]["direction_id"] == "d-dedup-test"
     assert "Third update" in doc["retired_diagnoses_archive"][1]["diagnosis"]
+
+
+# ---------------------------------------------------------------------------
+# Churn-retirement DECISION WINDOW (dud-culling fence).
+#
+# The recommendation-and-hold above is correct, but it had no terminal clock: a
+# recommended direction is skipped by BOTH the 72h needs_manual_intervention TTL
+# and the 48h auto-recovery cooldown, so with no decider it stayed paused,
+# non-terminal and gap-staffing forever — nursed, never culled. These tests pin
+# the fence that bounds the hold, and equally pin that the fence does NOT fire
+# early (a slow-but-good direction inside its window is untouched).
+# ---------------------------------------------------------------------------
+
+
+def _churn_recommended_direction(
+    *,
+    direction_id: str = "d-undecided",
+    recommended_hours_ago: float,
+    gap_id: str | None = "g-undecided",
+    stamp: object = "__default__",
+) -> dict:
+    """A direction already held at the churn-retirement recommendation fence."""
+    now = _utcnow()
+    recommended_at = (
+        (now - timedelta(hours=recommended_hours_ago)).isoformat()
+        if stamp == "__default__"
+        else stamp
+    )
+    d = {
+        "id": direction_id,
+        "text": "Zombie direction recommended for churn retirement",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Unproductive: 0 PRs merged across recent cycles",
+        "paused_at": (now - timedelta(hours=1)).isoformat(),
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": (now - timedelta(hours=1)).isoformat(),
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended: zombie loop",
+        "churn_retirement_evidence": {"summary": "2x churn-family auto-pause, 0 merges"},
+        "churn_family_pause_count": 2,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+        "gap_id": gap_id,
+    }
+    if recommended_at is not None:
+        d["churn_retirement_recommended_at"] = recommended_at
+    return d
+
+
+async def _churn_project(db_session, directions: list[dict], name: str) -> Project:
+    project = Project(
+        name=name,
+        user_id="u-undecided",
+        autonomous_enabled=True,
+        directions=directions,
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-undecided",
+                    "name": "Undecided gap",
+                    "status": "active",
+                    "active_moves": [
+                        d["id"] for d in directions if d.get("gap_id") == "g-undecided"
+                    ],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_churn_recommendation_undecided_window_auto_retires(db_session, mocker):
+    """NAMED acceptance test. A churn-retirement recommendation that goes
+    unanswered past its decision window is CULLED, not nursed: tick 1 flags the
+    two-tick designated retire and records a machine-readable decision blob (so an
+    operator never re-derives WHY), tick 2 applies the ladder's own recommended
+    retirement with the ``stopped`` outcome, reconciles the gap it was staffing,
+    and writes retired-memory under a distinct reason code."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = _utcnow()
+    # 8 days > the 7-day decision window.
+    direction = _churn_recommended_direction(recommended_hours_ago=8 * 24)
+    project = await _churn_project(db_session, [direction], "Churn Undecided Test")
+
+    # --- Tick 1: the fence flags, but does NOT terminate. ---
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-undecided")
+    assert d["status"] == "paused", (
+        "the fence must not terminate in the flag tick — the direction stays "
+        "visible in the strategist payload for one more tick"
+    )
+    assert d.get("auto_retire_pending") is True
+    assert d.get("auto_retire_pending_reason") == "churn_recommendation_undecided"
+
+    decision = d.get("churn_retirement_decision")
+    assert isinstance(decision, dict), "the WHY must be recorded machine-readably"
+    assert decision["decision"] == "retired"
+    assert decision["decided_by"] == "decision_window_expiry"
+    assert decision["reason_code"] == "churn_recommendation_undecided"
+    assert decision["window_days"] == 7
+    assert decision["undecided_hours"] >= 7 * 24
+    # The window's unit of derivation: guaranteed daily strategist opportunities.
+    assert decision["strategist_opportunities"] >= 7
+    assert decision["churn_family_pause_count"] == 2
+    assert decision["recommendation_summary"] == "2x churn-family auto-pause, 0 merges"
+    assert decision["recommended_at"] == direction["churn_retirement_recommended_at"]
+
+    # --- Tick 2: the designated retire pass applies the recommendation. ---
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(minutes=30)
+    )
+    await db_session.refresh(project)
+
+    remaining_ids = {x["id"] for x in (project.directions or [])}
+    assert "d-undecided" not in remaining_ids, (
+        "an undecided churn recommendation must be culled, not nursed forever"
+    )
+
+    retired_mem = (project.vision or {}).get("_recently_retired_directions") or []
+    mem_entry = next((m for m in retired_mem if m.get("id") == "d-undecided"), None)
+    assert mem_entry is not None, "the cull must record retired-direction memory"
+    assert mem_entry.get("reason") == "auto_retired_churn_undecided", (
+        f"reason should be 'auto_retired_churn_undecided', got {mem_entry.get('reason')!r}"
+    )
+
+    # Gap staffing reconciled — the recommendation-hold deliberately preserved it,
+    # so the cull is the thing that must release it.
+    gap = project.problem_model["gaps"][0]
+    assert "d-undecided" not in gap["active_moves"], (
+        "culled direction must be released from the gap it was staffing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_churn_recommendation_inside_window_is_still_held(db_session, mocker):
+    """The fence bounds the hold; it does not shorten it. A recommendation that is
+    still INSIDE its decision window is untouched — no retire flag, no decision
+    blob, still paused and still recommended. This is the ambition side of the
+    bar: a slow direction keeps its full window to be answered."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = _utcnow()
+    # 6 days < the 7-day window — and deliberately PAST both short clocks
+    # (48h auto-recovery cooldown, 72h intervention TTL) to prove the fence is a
+    # third, independent clock rather than either of those.
+    direction = _churn_recommended_direction(recommended_hours_ago=6 * 24)
+    project = await _churn_project(db_session, [direction], "Churn Inside Window Test")
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-undecided")
+
+    assert d["status"] == "paused"
+    assert d.get("churn_retirement_recommended") is True
+    assert "auto_retire_pending" not in d, (
+        "inside the decision window the fence must not fire"
+    )
+    assert "churn_retirement_decision" not in d
+    assert (project.vision or {}).get("_recently_retired_directions") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_churn_recommendation_without_stamp_is_never_culled(db_session, mocker):
+    """Never cull on a guess. A recommendation carrying no usable
+    ``churn_retirement_recommended_at`` (missing or malformed) has no decision
+    clock, so it keeps the old indefinite hold rather than being retired on an
+    assumed age."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = _utcnow()
+    missing = _churn_recommended_direction(
+        direction_id="d-nostamp", recommended_hours_ago=0, gap_id=None, stamp=None
+    )
+    malformed = _churn_recommended_direction(
+        direction_id="d-badstamp",
+        recommended_hours_ago=0,
+        gap_id=None,
+        stamp="not-a-timestamp",
+    )
+    project = await _churn_project(
+        db_session, [missing, malformed], "Churn Unstamped Test"
+    )
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    for did in ("d-nostamp", "d-badstamp"):
+        d = next(x for x in project.directions if x["id"] == did)
+        assert d["status"] == "paused", f"{did} must remain held, not culled"
+        assert d.get("churn_retirement_recommended") is True
+        assert "auto_retire_pending" not in d, (
+            f"{did} has no usable decision clock and must never be culled on a guess"
+        )
+        assert "churn_retirement_decision" not in d
+
+
+@pytest.mark.asyncio
+async def test_keep_decision_during_pending_tick_cancels_the_cull(db_session, mocker):
+    """A decision that lands during the final tick still wins. The fence flags the
+    two-tick retire; a sanctioned KEEP (operator PATCH / strategist reactivate)
+    before the designated pass consumes it clears auto_retire_pending through
+    _clear_direction_reactivation_state, so the direction survives ACTIVE and is
+    never retired."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.direction_lifecycle import apply_churn_retirement_keep
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = _utcnow()
+    direction = _churn_recommended_direction(recommended_hours_ago=8 * 24)
+    project = await _churn_project(db_session, [direction], "Churn Keep Race Test")
+
+    # Tick 1: fence flags the pending retire.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-undecided")
+    assert d.get("auto_retire_pending") is True
+
+    # Operator/strategist KEEP lands before the designated pass consumes the flag.
+    assert apply_churn_retirement_keep(d, allow_user_paused=False) is True
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Tick 2: the designated retire pass must find nothing to do.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(minutes=30)
+    )
+    await db_session.refresh(project)
+
+    survivor = next(
+        (x for x in (project.directions or []) if x["id"] == "d-undecided"), None
+    )
+    assert survivor is not None, "a KEEP decision must save the direction from the cull"
+    assert survivor["status"] == "active"
+    assert survivor.get("auto_completed") is not True
+    assert "churn_retirement_recommended" not in survivor
+    assert survivor.get("churn_family_pause_count") == 0
+
+    retired_mem = (project.vision or {}).get("_recently_retired_directions") or []
+    assert not any(m.get("id") == "d-undecided" for m in retired_mem), (
+        "a kept direction must never record retired memory"
+    )
+
+
+# ---------------------------------------------------------------------------
+# pause_direction_autonomously: the shared active->paused seam
+#
+# Regression cover for the strategist pause ONE-WAY LATCH. Before the seam
+# existed, the two strategist update_direction sites wrote
+# `d["status"] = changes["status"]` bare, producing a paused direction with no
+# auto_paused / paused_at / paused_reason markers. Such a direction is
+# indistinguishable from a genuine operator hold, so:
+#   * cooldown auto-recovery skips it forever (its guard requires
+#     status == "paused" AND auto_paused AND paused_at), and
+#   * reactivate_paused_direction refuses the strategist
+#     (allow_user_paused=False).
+# The engine could therefore park its own portfolio and never restart it.
+# ---------------------------------------------------------------------------
+from app.direction_lifecycle import (
+    STRATEGIST_PAUSE_REASON_FALLBACK,
+    pause_direction_autonomously,
+    strategist_pause_reason,
+)
+
+
+def _strategist_pause_target() -> dict:
+    return {
+        "id": "d-autopause",
+        "text": "active direction the strategist wants parked",
+        "status": "active",
+        "priority": "medium",
+        "research_history": [],
+    }
+
+
+def test_pause_direction_autonomously_stamps_every_recovery_marker():
+    """All three markers the auto-recovery guard reads must be present.
+
+    This is the exact tuple `_process_direction_lifecycle` requires
+    (`status == "paused" and auto_paused and paused_at`); losing any one of
+    them strands the direction paused forever.
+    """
+    d = _strategist_pause_target()
+    pause_direction_autonomously(d, reason="Strategic review: out of budget")
+
+    assert d["status"] == "paused"
+    assert d["auto_paused"] is True
+    assert d["paused_at"], "paused_at is required by the cooldown recovery guard"
+    # paused_at must parse — the recovery guard skips a malformed value.
+    datetime.fromisoformat(d["paused_at"])
+    assert d["paused_reason"] == "Strategic review: out of budget"
+    assert d["auto_pause_count"] == 1
+
+
+def test_pause_direction_autonomously_increments_existing_pause_count():
+    d = _strategist_pause_target()
+    d["auto_pause_count"] = 3
+    pause_direction_autonomously(d, reason="again")
+    assert d["auto_pause_count"] == 4
+
+
+def test_pause_direction_autonomously_consumes_grace_marker():
+    """A re-pause consumes auto_recovered_at.
+
+    Leaving the grace marker set on a paused direction would make
+    _check_direction_health skip its history-based rules after the direction
+    came back, hiding the very history that justified the pause.
+    """
+    d = _strategist_pause_target()
+    d["auto_recovered_at"] = "2026-01-01T00:00:00"
+    pause_direction_autonomously(d, reason="re-pause")
+    assert "auto_recovered_at" not in d
+
+
+def test_pause_direction_autonomously_leaves_retirement_ladders_alone():
+    """The strategist's free-text rationale must not advance a retirement ladder.
+
+    churn_family_pause_count / lifetime_burn_pause_count are driven by the
+    lifecycle's own classified health reasons, not by an engine pause.
+    """
+    d = _strategist_pause_target()
+    d["churn_family_pause_count"] = 2
+    d["lifetime_burn_pause_count"] = 1
+    pause_direction_autonomously(d, reason="Strategic review: churn is scary")
+    assert d["churn_family_pause_count"] == 2
+    assert d["lifetime_burn_pause_count"] == 1
+
+
+def test_strategist_pause_reason_prefixes_rationale():
+    assert (
+        strategist_pause_reason("waiting on the v45 deploy")
+        == "Strategic review: waiting on the v45 deploy"
+    )
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_strategist_pause_reason_falls_back_when_blank(blank):
+    """A pause always carries a reason — never an empty paused_reason."""
+    assert strategist_pause_reason(blank) == STRATEGIST_PAUSE_REASON_FALLBACK
+    assert STRATEGIST_PAUSE_REASON_FALLBACK.strip(), "fallback must be non-empty"
+
+
+def test_strategist_pause_reason_caps_unbounded_rationale():
+    """paused_reason is persisted JSONB rendered in operator surfaces; an
+    unbounded model-authored string must not land there."""
+    reason = strategist_pause_reason("x" * 5000)
+    assert len(reason) == 500, "literal cap pin (STRATEGIST_PAUSE_REASON_MAX)"
+    assert reason.startswith("Strategic review: ")
+
+
+def test_strategist_pause_then_strategist_reactivate_round_trip():
+    """THE LATCH REGRESSION: what the strategist paused, the strategist can resume.
+
+    With the bare `d["status"] = "paused"` write this fails —
+    reactivate_paused_direction sees paused-without-auto_paused, classifies it
+    as a user pause, and returns False with allow_user_paused=False.
+    """
+    d = _strategist_pause_target()
+    pause_direction_autonomously(d, reason=strategist_pause_reason("park it"))
+    assert d["status"] == "paused"
+
+    assert reactivate_paused_direction(d, allow_user_paused=False) is True, (
+        "the strategist must be able to resume a direction it paused itself"
+    )
+    assert d["status"] == "active"
+    assert d.get("auto_recovered_at") is not None
+    for key in ("auto_paused", "paused_reason", "paused_at"):
+        assert key not in d
+
+
+def test_operator_pause_still_blocks_strategist_reactivation():
+    """The user-paused block is NOT weakened by the new seam.
+
+    Only a human PATCH produces a paused direction with no auto_paused marker,
+    and the strategist still may not resume it.
+    """
+    d = _strategist_pause_target()
+    # Exactly what routers/directions.py does for an operator PATCH pause: a
+    # bare status write, deliberately leaving no auto_paused marker.
+    d["status"] = "paused"
+
+    assert reactivate_paused_direction(d, allow_user_paused=False) is False
+    assert d["status"] == "paused"
+    # ...but the operator themselves may still resume it.
+    assert reactivate_paused_direction(d, allow_user_paused=True) is True
+    assert d["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_strategist_paused_direction_auto_recovers_after_cooldown(db_session):
+    """A strategist-paused direction is picked up by cooldown auto-recovery.
+
+    The 48h default is pinned as a LITERAL here rather than read back from
+    runtime_config: asserting the constant against itself would make a change
+    to the default self-certifying.
+    """
+    assert _ss.runtime_config.get("direction_auto_recovery_hours") == 48, (
+        "direction_auto_recovery_hours default changed; update this literal pin"
+    )
+
+    d = _strategist_pause_target()
+    d["id"] = "d-strat-cooldown"
+    pause_direction_autonomously(d, reason=strategist_pause_reason("park it"))
+    # Back-date the pause past the 48h default cooldown.
+    d["paused_at"] = (_utcnow() - timedelta(hours=49)).isoformat()
+
+    project = Project(
+        name="Strategist Pause Cooldown",
+        user_id="u-strat-cooldown",
+        autonomous_enabled=True,
+        directions=[d],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=_utcnow(),
+    )
+    await db_session.refresh(project)
+
+    recovered = next(x for x in project.directions if x["id"] == "d-strat-cooldown")
+    assert recovered["status"] == "active", (
+        "a strategist-paused direction must time-recover like any auto-pause; "
+        "a marker-less bare write would be skipped by the recovery guard forever"
+    )
+    for key in ("auto_paused", "paused_reason", "paused_at"):
+        assert key not in recovered
+
+
+@pytest.mark.asyncio
+async def test_marker_less_paused_direction_never_auto_recovers(db_session):
+    """Counterpart pin: the latch is real.
+
+    A paused direction WITHOUT the auto-pause markers (a genuine operator hold,
+    or the pre-fix bare strategist write) is never time-recovered. This is the
+    behaviour that made the bare write fatal, and it must stay intact so
+    operator holds are honoured.
+    """
+    d = _strategist_pause_target()
+    d["id"] = "d-markerless"
+    d["status"] = "paused"  # bare write: no auto_paused, no paused_at
+
+    project = Project(
+        name="Marker-less Pause",
+        user_id="u-markerless",
+        autonomous_enabled=True,
+        directions=[d],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=_utcnow(),
+    )
+    await db_session.refresh(project)
+
+    stuck = next(x for x in project.directions if x["id"] == "d-markerless")
+    assert stuck["status"] == "paused"
+# ─────────────────────────────────────────────────────────────────────────────
+# Dud evidence reaches the strategist — the only actor that can retire a
+# direction — as REASONS, not a bare counter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _unproductive_direction(direction_id: str, cycles: int) -> dict:
+    """An active direction that has been unproductive for ``cycles`` cycles, with
+    the reason ring the production writers record."""
+    from app.direction_metrics import record_direction_productivity
+
+    d: dict = {
+        "id": direction_id,
+        "text": "A direction that stopped producing",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    for i in range(cycles):
+        record_direction_productivity(
+            d,
+            productive=False,
+            reason_code=(
+                "no_actionable_findings" if i % 2 else "no_children_no_findings"
+            ),
+            detail=f"research cycle {i} attributed neither a child task nor a finding",
+            task_id=f"task-{i}",
+            at_iso=f"2026-08-2{i}T00:00:00+00:00",
+        )
+    return d
+
+
+def test_strategist_direction_stats_surface_the_unproductive_streak_and_why():
+    """``retire_direction`` is a strategist op, and the strategist decides from
+    this payload. The cost/merge ``retirement_consideration_*`` flag already
+    reached it; the per-cycle productivity judgment did not, so a direction could
+    be visibly EXPENSIVE but never visibly UNPRODUCTIVE. Both halves must be
+    present, and the productivity half must carry its reasons — a bare
+    ``consecutive_unproductive_cycles: 5`` cannot distinguish a direction that
+    spawned nothing from one that spawned plenty and merged nothing.
+    """
+    from types import SimpleNamespace
+
+    from app.strategic_spawning import _build_direction_stats
+
+    dud = _unproductive_direction("d-dud", 5)
+    productive = {
+        "id": "d-healthy",
+        "text": "A direction still producing",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "last_cycle_productive": True,
+        "consecutive_unproductive_cycles": 0,
+    }
+    _included, stats = _build_direction_stats(
+        SimpleNamespace(directions=[dud, productive])
+    )
+    by_id = {s["id"]: s for s in stats}
+
+    dud_stat = by_id["d-dud"]
+    assert dud_stat["consecutive_unproductive_cycles"] == 5
+    streak = dud_stat["unproductive_streak"]
+    assert "5 consecutive unproductive cycle(s)" in streak
+    # Surface REASONS, not states: the distinct causes are named.
+    assert "no_actionable_findings" in streak
+    assert "no_children_no_findings" in streak
+    last = dud_stat["last_productivity_reason"]
+    assert last["productive"] is False
+    assert last["reason_code"] in ("no_actionable_findings", "no_children_no_findings")
+    assert last["detail"]
+
+    # A productive direction carries no dud noise at all: a zero streak is
+    # omitted rather than emitted as a 0, so the strategist's attention is not
+    # split across every healthy direction.
+    healthy_stat = by_id["d-healthy"]
+    assert "consecutive_unproductive_cycles" not in healthy_stat
+    assert "unproductive_streak" not in healthy_stat
+
+
+def test_strategist_direction_stats_tolerate_a_legacy_direction_without_reasons():
+    """A direction carrying the legacy counter but no reason ring (written before
+    this landed) still surfaces its streak — fail-safe, reasons simply omitted."""
+    from types import SimpleNamespace
+
+    from app.strategic_spawning import _build_direction_stats
+
+    legacy = {
+        "id": "d-legacy",
+        "text": "Legacy direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "last_cycle_productive": False,
+        "consecutive_unproductive_cycles": 3,
+    }
+    _included, stats = _build_direction_stats(SimpleNamespace(directions=[legacy]))
+    stat = stats[0]
+    assert stat["consecutive_unproductive_cycles"] == 3
+    assert stat["unproductive_streak"] == "3 consecutive unproductive cycle(s)"
+    assert "last_productivity_reason" not in stat
+
+
+def test_strategic_payload_compaction_keeps_the_unproductive_streak():
+    """The dud signal must survive payload trimming, or the strategist never sees
+    it. ``_compact_direction_summary_entry`` is an ALLOWLIST: a key that is not
+    named there is dropped silently, which is exactly how a signal can be
+    computed, alerted on, rendered in the UI, and still never reach the decision.
+    """
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    out = _compact_direction_summary_entry(
+        {
+            "id": "d-dud",
+            "status": "active",
+            "consecutive_unproductive_cycles": 4,
+            "unproductive_streak": (
+                "4 consecutive unproductive cycle(s); reasons: "
+                "no_actionable_findings, no_children_no_findings"
+            ),
+            "last_productivity_reason": {
+                "productive": False,
+                "reason_code": "no_actionable_findings",
+                "detail": "research cycle completed with zero actionable findings",
+                "consecutive_unproductive_cycles": 4,
+            },
+        }
+    )
+    assert out.get("consecutive_unproductive_cycles") == 4
+    assert "4 consecutive unproductive cycle(s)" in (out.get("unproductive_streak") or "")
+    assert "no_actionable_findings" in (out.get("unproductive_streak") or "")
+    compacted_reason = out.get("last_productivity_reason") or {}
+    assert compacted_reason.get("reason_code") == "no_actionable_findings"
+    assert compacted_reason.get("productive") is False
+    assert compacted_reason.get("detail")

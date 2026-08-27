@@ -70,6 +70,7 @@ from app.runner_pull_skip import (
     skip_seen_at,
     stamp_skip_reason,
 )
+from app.alert_policy import create_project_alert_if_allowed
 from app.database import get_session
 from app.execution_principal import resolve_project_execution_principal
 from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobFile, ComputeJobStatus, LocalRunner, Project, RunnerHeartbeatSnapshot, Task, TaskStatus, _utcnow
@@ -2377,13 +2378,12 @@ async def update_report(
     runner: LocalRunner = Depends(get_current_runner),
     session: AsyncSession = Depends(get_session),
 ):
-    """Create an operator alert for a runner's self-update outcome.
+    """Accept a runner's self-update outcome report.
 
     Called best-effort by ``blueprint-runner update`` after the update
-    completes (or fails).  Creates an INFO alert on success, WARNING on
-    failure, and broadcasts it so the operator console surfaces the outcome
-    immediately — no need to SSH or grep logs to see if the version bump
-    landed.
+    completes (or fails).  The ``runner.self_update`` event is a point-in-time
+    notice routed through the shared alert policy.  Its ``TIMELINE_ONLY``
+    retirement contract deliberately prevents a durable alert row.
 
     Authenticated via the runner's bearer token (same as heartbeat).
     Best-effort contract: the runner never blocks its own update CLI on
@@ -2412,28 +2412,33 @@ async def update_report(
             f"self-update failed — check the runner's logs for details."
         )
 
-    alert = Alert(
+    # TIMELINE_ONLY through the policy gate.  "Runner self-update succeeded" is
+    # a completed past fact -- no future state makes it false, so nothing could
+    # ever resolve it -- and the raw insert carried no dedupe_key of any kind,
+    # so every update on every runner left another permanent row in the feed.
+    alert, _created, _decision = await create_project_alert_if_allowed(
+        session,
         project_id=runner.project_id,
+        event_type="runner.self_update",
         severity=severity,
         title=title,
         message=message[:1000],
         source="runner",
-        event_type="runner.self_update",
     )
-    session.add(alert)
     await session.commit()
 
-    await broadcast_to_project(
-        str(runner.project_id),
-        "alert_created",
-        {
-            "alert_id": str(alert.id),
-            "severity": severity.value,
-            "title": alert.title,
-            "domain": alert.domain or "core",
-            "event_type": alert.event_type,
-        },
-    )
+    if alert is not None:
+        await broadcast_to_project(
+            str(runner.project_id),
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": severity.value,
+                "title": alert.title,
+                "domain": alert.domain or "core",
+                "event_type": alert.event_type,
+            },
+        )
 
     return {"ok": True}
 

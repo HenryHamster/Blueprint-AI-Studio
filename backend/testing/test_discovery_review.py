@@ -61,6 +61,7 @@ async def _cycle_with_source(
     state: str = "open",
     generation: int = 1,
     deadline_at=None,
+    direction_overrides: dict | None = None,
 ):
     direction_key = f"d-{uuid.uuid4().hex[:8]}"
     direction = {
@@ -75,6 +76,14 @@ async def _cycle_with_source(
             "implementation_constraints": "Reuse the current runtime.",
         },
     }
+    # Overrides land before the project row and the frozen bet snapshot are
+    # built from the same dict, so the authority fence still sees one identity.
+    if direction_overrides:
+        direction = {
+            key: value
+            for key, value in {**direction, **direction_overrides}.items()
+            if value is not None
+        }
     project = Project(
         name=f"discovery-review-{uuid.uuid4().hex[:8]}",
         user_id="discovery-review-test",
@@ -123,7 +132,13 @@ def _evidence_ids(review: Task) -> list[str]:
     ]
 
 
-def _result(cycle: DiscoveryCycle, review: Task, *, action: str = "advance"):
+def _result(
+    cycle: DiscoveryCycle,
+    review: Task,
+    *,
+    action: str = "advance",
+    claim: str | None = None,
+):
     result = {
         "cycle_id": str(cycle.id),
         "reviewed_revision": review.first_payload["expected_revision"],
@@ -136,7 +151,7 @@ def _result(cycle: DiscoveryCycle, review: Task, *, action: str = "advance"):
         "operator_question": None,
     }
     if action == "advance":
-        result["next_bet"] = _next_bet()
+        result["next_bet"] = _next_bet(**({"claim": claim} if claim else {}))
     elif action == "park":
         result["park_reason"] = "The external benchmark is not yet available."
         result["resume_condition"] = "Resume when the benchmark is published."
@@ -211,6 +226,52 @@ def _withhold_binding_authority(db_session, review: Task) -> None:
     payload = dict(review.first_payload)
     payload["evidence_packet_manifest"] = {
         **dict(payload.get("evidence_packet_manifest") or {}),
+        "binding_decision_allowed": False,
+        "required_evidence_omitted": True,
+    }
+    review.payloads = [payload, *list(review.payloads or [])[1:]]
+    db_session.add(review)
+
+
+def _withhold_binding_authority_for_budget(
+    db_session,
+    review: Task,
+    *,
+    codes: list[str],
+    claim_budget_class: bool | None = None,
+    extra_uncoded_blockers: list[str] | None = None,
+) -> None:
+    """Withhold authority the way a bounded-budget overflow does.
+
+    Same manifest shape as ``_withhold_binding_authority`` plus the positional
+    reason codes the packet builder emits, which are what let the decision
+    boundary tell "the packet could not carry evidence the engine holds" from
+    "a human has to make this call".
+
+    ``claim_budget_class`` overrides the derived boolean so the boundary's own
+    re-verification of the codes can be pinned separately from the builder's
+    claim about them. The two are deliberately not the same check.
+
+    ``extra_uncoded_blockers`` appends blockers with no code beside them, which
+    is what a future authority blocker added without a code would look like on
+    the wire.
+    """
+
+    payload = dict(review.first_payload)
+    manifest = dict(payload.get("evidence_packet_manifest") or {})
+    payload["evidence_packet_manifest"] = {
+        **manifest,
+        "binding_action_blockers": [f"blocker for {code}" for code in codes]
+        + list(extra_uncoded_blockers or []),
+        "binding_action_blocker_codes": codes,
+        "binding_blockers_budget_class_only": (
+            claim_budget_class
+            if claim_budget_class is not None
+            else all(
+                code in discovery_review_packet.DISCOVERY_BUDGET_CLASS_BLOCKER_CODES
+                for code in codes
+            )
+        ),
         "binding_decision_allowed": False,
         "required_evidence_omitted": True,
     }
@@ -1870,6 +1931,10 @@ async def test_recommission_ceiling_parks_instead_of_re_firing(db_session):
     conversion = cycle.review_result["converted_from_ask_operator"]
     assert conversion["reason_code"] == "discovery_recommission_ceiling_reached"
     assert conversion["disposition"] == "recommission_ceiling_park"
+    # This packet DID grant binding authority; the record has to say so, and
+    # test_budget_bound_ceiling_park_names_the_state_it_degraded_from pins the
+    # other entry state so the two cannot collapse into one stamp.
+    assert conversion["reason"] == "binding_decision_allowed"
     assert (
         conversion["consecutive_recommissions"]
         == DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS
@@ -1969,6 +2034,255 @@ async def test_empty_evidence_without_authority_still_escalates(db_session):
         if message.context["event_type"] == "discovery.operator_question"
     ]
     assert len(operator_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_budget_bound_blockers_are_degraded_not_escalated(db_session):
+    """A bounded budget overflowing is never a question for a human.
+
+    Every condition that withholds binding authority from a well-formed packet
+    is a budget condition: the packet could not carry, in bounded form,
+    evidence the engine is still holding in its own database. Before
+    2026-08-25 that state made ``ask_operator`` the *only* verdict
+    ``complete_discovery_review`` would accept -- so an overflowing bound was
+    the one remaining way the discovery boundary could reach the operator, and
+    what it reached them with was a request to hand back the engine's own data.
+
+    Now the boundary reads the packet's machine-readable blocker codes. When
+    all of them are budget-class it takes the same bounded degradation an
+    authorised escalation takes -- a ``measure`` successor, subject to the same
+    recommission ceiling -- and records *why* rather than waking anyone.
+    """
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    await _give_the_cohort_real_evidence(db_session, cycle, source)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority_for_budget(
+        db_session,
+        review,
+        codes=[discovery_review_packet.DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE],
+    )
+    await db_session.flush()
+
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = (
+        "The bet claim was truncated in my packet. Can you paste the full claim?"
+    )
+    await complete_discovery_review(db_session, task=review, raw_result=escalation)
+    await db_session.flush()
+
+    assert cycle.verdict != "ask_operator"
+    assert cycle.review_result["operator_question"] is None
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["disposition"] == "evidence_bet"
+    # Surface the REASON, not just the state: a budget bound, not an
+    # authority call, and distinct from the already-authorised conversion.
+    assert conversion["reason_code"] == "discovery_escalation_was_budget_bound"
+    assert conversion["reason"] == "binding_blockers_budget_class_only"
+
+    operator_messages = [
+        message
+        for message in (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
+            )
+        )
+        .scalars()
+        .all()
+        if message.context["event_type"] == "discovery.operator_question"
+    ]
+    assert operator_messages == []
+
+
+@pytest.mark.asyncio
+async def test_unrecognised_blocker_code_still_escalates(db_session):
+    """Fail closed: only a *known* budget code earns the degradation.
+
+    The whole point of the codes is that a future blocker which genuinely does
+    need operator judgement can be added without it being silently swallowed.
+    An unrecognised code -- and, by the same rule, an absent one, which
+    ``test_empty_evidence_without_authority_still_escalates`` pins -- keeps the
+    escalation.
+    """
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    await _give_the_cohort_real_evidence(db_session, cycle, source)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority_for_budget(
+        db_session,
+        review,
+        codes=[
+            discovery_review_packet.DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE,
+            "discovery_operator_scope_call_required",
+        ],
+    )
+    await db_session.flush()
+
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="ask_operator"),
+    )
+    await db_session.flush()
+
+    assert cycle.verdict == "ask_operator"
+    assert "converted_from_ask_operator" not in cycle.review_result
+
+
+@pytest.mark.asyncio
+async def test_budget_bound_recommission_names_the_state_it_degraded_from(db_session):
+    """The recommission record must not claim authority the packet withheld.
+
+    A packet can be BOTH substantively empty and short of a bound -- the parent
+    produced nothing and the little it did produce did not fit. That lands on
+    the re-commission branch from the budget-bound entry state, and stamping
+    ``binding_decision_allowed`` there would tell an operator auditing the
+    ledger the packet granted authority when it did the opposite.
+    """
+
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["evidence_substantively_empty"] is True
+    _withhold_binding_authority_for_budget(
+        db_session,
+        review,
+        codes=[discovery_review_packet.DISCOVERY_WITHHELD_CARRY_RECORDS_OMITTED],
+    )
+    await db_session.flush()
+
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="ask_operator"),
+    )
+    await db_session.flush()
+
+    assert cycle.verdict != "ask_operator"
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["disposition"] == "recommission"
+    assert conversion["reason"] == "binding_blockers_budget_class_only"
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_claiming_budget_class_over_an_unknown_code_still_escalates(
+    db_session,
+):
+    """The boundary re-verifies the codes; it never takes the claim on trust.
+
+    ``binding_blockers_budget_class_only`` is a boolean the packet builder
+    derives, and revoking an operator's escalation must not rest on a single
+    derived field: a packet frozen by an older builder, a hand-patched
+    manifest, or a future builder that adds a genuine authority blocker
+    without updating that boolean would each silently swallow a real question.
+    So the boundary re-checks the code list itself and both have to agree.
+
+    This is the leg ``test_unrecognised_blocker_code_still_escalates`` cannot
+    reach: there the derived boolean is already False, so the code check is
+    never consulted. Here the manifest asserts budget-class outright and the
+    unknown code alone has to stop the degradation.
+    """
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    await _give_the_cohort_real_evidence(db_session, cycle, source)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority_for_budget(
+        db_session,
+        review,
+        codes=[
+            discovery_review_packet.DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE,
+            "discovery_operator_scope_call_required",
+        ],
+        claim_budget_class=True,
+    )
+    await db_session.flush()
+
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="ask_operator"),
+    )
+    await db_session.flush()
+
+    assert cycle.verdict == "ask_operator"
+    assert "converted_from_ask_operator" not in cycle.review_result
+
+
+@pytest.mark.asyncio
+async def test_a_blocker_with_no_code_beside_it_keeps_its_escalation(db_session):
+    """The boundary reads alignment, not just the codes it can see.
+
+    A manifest whose blocker list is longer than its code list is carrying at
+    least one blocker of unknown class. Degrading on the strength of the coded
+    ones would revoke an escalation the packet never said was safe to revoke --
+    the same trust-the-derived-field mistake as taking
+    ``binding_blockers_budget_class_only`` on faith, one level down.
+    """
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    await _give_the_cohort_real_evidence(db_session, cycle, source)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority_for_budget(
+        db_session,
+        review,
+        codes=[discovery_review_packet.DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE],
+        extra_uncoded_blockers=["an authority question nobody gave a code"],
+        claim_budget_class=True,
+    )
+    await db_session.flush()
+
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="ask_operator"),
+    )
+    await db_session.flush()
+
+    assert cycle.verdict == "ask_operator"
+    assert "converted_from_ask_operator" not in cycle.review_result
+
+
+@pytest.mark.asyncio
+async def test_budget_bound_ceiling_park_names_the_state_it_degraded_from(db_session):
+    """A degradation record must not misstate WHY it degraded.
+
+    The re-commission ceiling park is now reachable from both entry states.
+    Stamping ``binding_decision_allowed`` on a park whose packet in fact
+    WITHHELD authority over a bounded budget would make the one
+    machine-readable field an operator audits say the opposite of what
+    happened -- surfacing a state instead of the reason, which is the habit
+    this whole change is meant to break.
+    """
+    assert DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS == 2
+    project, cycle, _ = await _cycle_with_source(
+        db_session, generation=DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS + 1
+    )
+    for generation in range(1, DISCOVERY_MAX_CONSECUTIVE_RECOMMISSIONS + 1):
+        await _settled_recommission(db_session, cycle, generation=generation)
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    _withhold_binding_authority_for_budget(
+        db_session,
+        review,
+        codes=[discovery_review_packet.DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE],
+    )
+    await db_session.flush()
+
+    escalation = _result(cycle, review, action="ask_operator")
+    escalation["operator_question"] = "Still nothing, and my packet was cut. Help?"
+    await complete_discovery_review(db_session, task=review, raw_result=escalation)
+    await db_session.flush()
+
+    assert cycle.verdict == "park"
+    conversion = cycle.review_result["converted_from_ask_operator"]
+    assert conversion["disposition"] == "recommission_ceiling_park"
+    assert conversion["reason"] == "binding_blockers_budget_class_only"
 
 
 @pytest.mark.asyncio

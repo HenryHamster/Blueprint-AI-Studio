@@ -83,9 +83,9 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
     shared_state.runtime_config["promotion_enabled"] = False
 
     project, version = await _make_project_and_version(db_session)
-    # open_version seeds a default operator-authorship criterion; this test is
-    # specifically about the no-criteria shape, so drop it.
-    await _delete_default_authorship_criterion(db_session, version)
+    # The fixture declares an authorship budget, but that policy row is excluded
+    # from ordinary criterion coverage, so this remains a no-product-criteria
+    # test while still satisfying the explicit promotion-gate contract.
     await _seed_qualification_children(
         db_session,
         project,
@@ -112,35 +112,14 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
     assert result["status"] == "dry_run"
     await db_session.refresh(version)
     assert version.last_qualification["blocker"] is None
-    assert version.last_qualification["criterion_coverage"] == {
-        "total": 0,
-        "covered": 0,
-        "attested": 0,
-        "backfilled": 0,
-        "partial": 0,
-        "uncovered": 0,
-        "retracted": 0,
-        "stuck_count": 0,
-        "inactive": 0,
-        "superseded": 0,
-        "criteria": [],
-        "failed_corroboration_keys": [],
-        # get_version_coverage_summary surfaces the open version's persisted
-        # merge-evidence drop reasons (None when the version recorded none).
-        "merge_evidence_gaps": None,
-        # Probed tier: a lower-confidence, time-bounded coverage signal.
-        "probed": 0,
-        # Phantom-bookkeeping drift signal (consumed by operator_attention): a
-        # version with no criteria registers none and references none, so there
-        # is nothing to drift.
-        "phantom_bookkeeping": {
-            "has_drift": False,
-            "phantom_keys": [],
-            "referenced_keys": [],
-            "registered_count": 0,
-            "zero_registered": False,
-        },
-    }
+    coverage = version.last_qualification["criterion_coverage"]
+    assert coverage["total"] == 0
+    assert coverage["covered"] == 0
+    assert coverage["uncovered"] == 0
+    assert coverage["phantom_bookkeeping"]["registered_count"] == 0
+    assert [criterion["criterion_key"] for criterion in coverage["criteria"]] == [
+        "c-test-operator-authorship"
+    ]
     promote_spy.assert_not_called()
 
 

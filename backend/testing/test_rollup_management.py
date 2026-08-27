@@ -1,5 +1,6 @@
 """Tests for rollup management: Alembic combined-chain guard and PR title prefix."""
 
+import asyncio
 import uuid
 
 import pytest
@@ -4360,6 +4361,10 @@ async def test_post_merge_housekeeping_refreshes_all_directions(mocker):
     )
     mocker.patch("app.github.get_pull_request_diff", new_callable=AsyncMock, return_value="")
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._run_rollup_post_merge_effect",
+        new_callable=AsyncMock,
+    )
 
     dir_a = str(uuid.uuid4())
     dir_b = str(uuid.uuid4())
@@ -4413,23 +4418,170 @@ async def test_post_merge_housekeeping_refreshes_all_directions(mocker):
     assert child_a2 not in refreshed_children, "duplicate direction A child must not be refreshed"
 
 
-def test_check_and_trigger_rollup_refreshes_all_directions_at_every_landed_site():
-    """Every inline landed-rollup path in ``_check_and_trigger_rollup`` must
-    refresh EVERY member direction, not just a single representative child.
+@pytest.mark.asyncio
+async def test_post_merge_housekeeping_releases_transaction_before_diff_request(
+    cleanup_db, mocker
+):
+    """The unbounded diff request must not run idle-in-transaction.
 
-    Regression guard for the audit finding: the multi-direction refresh fix was
-    originally applied only to the shared ``_do_rollup_post_merge_housekeeping``
-    helper (covered behaviorally by the test above), while the three inline
-    landed paths inside ``_check_and_trigger_rollup`` still selected one child
-    via ``_dir_child = next(...)`` and refreshed only that direction — leaving
-    the other directions' merged/outcome counts stale.
+    ``session.get(Project, ...)`` autobegins a read transaction.  The helper
+    must commit that transaction before asking GitHub for the PR diff, or a
+    slow response can exceed Postgres' 60-second idle-transaction timeout and
+    make the subsequent snapshot update fail.
+    """
+    from app.rollup_management import _do_rollup_post_merge_housekeeping
 
-    Driving those inline branches end-to-end is impractical (each sits behind a
-    large amount of GitHub I/O), so this asserts the structural invariant on the
-    function's AST: (1) the single-representative ``_dir_child`` pattern is gone,
-    and (2) every ``refresh_direction_outcomes_after_merge`` call in the function
-    is fed the per-direction loop variable ``_rep`` produced by iterating over
-    ``_dir_representatives.values()``.
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    # Force the helper's ``session.get(Project, ...)`` to issue a read and
+    # autobegin a transaction without expiring ``parent`` attributes that the
+    # helper reads synchronously.
+    cleanup_db.expire(project)
+
+    seen_transaction_states: list[bool] = []
+
+    async def _get_diff(*_args, **_kwargs):
+        seen_transaction_states.append(cleanup_db.in_transaction())
+        return ""
+
+    mock_get_diff = mocker.patch(
+        "app.github.get_pull_request_diff",
+        new_callable=AsyncMock,
+        side_effect=_get_diff,
+    )
+    mock_delete_branch = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock
+    )
+    mock_notify = mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message",
+        new_callable=AsyncMock,
+        side_effect=[RuntimeError("transient notification failure"), None],
+    )
+    mock_snapshot = mocker.patch(
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_nudge = mocker.patch(
+        "app.rollup_management._nudge_sibling_rollup_prs", new_callable=AsyncMock
+    )
+
+    await _do_rollup_post_merge_housekeeping(
+        parent=parent,
+        project=project,
+        session=cleanup_db,
+        gh_token="tok",
+        owner="owner",
+        repo="repo",
+        rollup_pr_number=1,
+        staging_branch="staging/test",
+        target_branch="main",
+        completed_children=[],
+        completed_count=0,
+        landed=False,
+        terminal=False,
+    )
+
+    # A later sweep can re-enter this helper while the nonterminal parent stays
+    # EVALUATING. Completed effects stay suppressed, while the failed
+    # notification is immediately retryable and uses a stable idempotency key.
+    await _do_rollup_post_merge_housekeeping(
+        parent=parent,
+        project=project,
+        session=cleanup_db,
+        gh_token="tok",
+        owner="owner",
+        repo="repo",
+        rollup_pr_number=1,
+        staging_branch="staging/test",
+        target_branch="main",
+        completed_children=[],
+        completed_count=0,
+        landed=False,
+        terminal=False,
+    )
+
+    mock_get_diff.assert_awaited_once()
+    mock_delete_branch.assert_awaited_once()
+    assert mock_notify.await_count == 2
+    assert {
+        call.kwargs["idempotency_key"] for call in mock_notify.await_args_list
+    } == {f"rollup-pr-merged:{parent.id}:1"}
+    mock_snapshot.assert_awaited_once()
+    mock_nudge.assert_awaited_once()
+    await cleanup_db.refresh(parent)
+    ledger = parent.context.get("_post_merge_effects") or {}
+    assert ledger.get("pr_number") == 1
+    effects = ledger.get("effects") or {}
+    assert {name: state.get("state") for name, state in effects.items()} == {
+        "delete_staging_branch": "done",
+        "post_merge_notification": "done",
+        "viewport_snapshot": "done",
+        "nudge_sibling_rollups": "done",
+    }
+    assert effects["post_merge_notification"]["attempts"] == 2
+    assert seen_transaction_states == [False], (
+        "get_pull_request_diff ran while the session held an open transaction; "
+        "the GitHub request can exceed Postgres' idle-in-transaction timeout"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_merge_effect_timeout_exits_before_lease_retry(
+    cleanup_db, monkeypatch
+):
+    """A timed-out effect exits and settles before its claim can be reclaimed."""
+    from app import rollup_management as rm
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    monkeypatch.setattr(rm, "_POST_MERGE_EFFECT_OPERATION_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(rm, "_POST_MERGE_EFFECT_SETTLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(rm, "_POST_MERGE_EFFECT_LEASE_S", 0.2)
+
+    active = 0
+    max_active = 0
+    first_exited = asyncio.Event()
+
+    async def _slow_first() -> None:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(1)
+        finally:
+            active -= 1
+            first_exited.set()
+
+    await rm._run_rollup_post_merge_effect(
+        parent, cleanup_db, 17, "bounded_effect", _slow_first
+    )
+    assert first_exited.is_set()
+    assert active == 0
+
+    async def _successful_retry() -> None:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        active -= 1
+
+    await rm._run_rollup_post_merge_effect(
+        parent, cleanup_db, 17, "bounded_effect", _successful_retry
+    )
+    assert max_active == 1
+    await cleanup_db.refresh(parent)
+    effect = parent.context["_post_merge_effects"]["effects"]["bounded_effect"]
+    assert effect["state"] == "done"
+    assert effect["attempts"] == 2
+
+
+def test_every_landed_merge_path_uses_shared_post_merge_housekeeping():
+    """All four true landed-merge paths must use the shared helper.
+
+    The helper is the only production path that spawns the direction-scoped
+    objective grade.  This structural check covers the branches without
+    driving each one through its GitHub-heavy orchestration, while keeping the
+    zero-diff close path explicitly outside the true merge-route set.
     """
     import ast
     import inspect
@@ -4442,14 +4594,69 @@ def test_check_and_trigger_rollup_refreshes_all_directions_at_every_landed_site(
     )
     func = ast.parse(src).body[0]
 
-    # (1) The single-representative selection pattern must no longer exist.
-    assert "_dir_child" not in src, (
-        "_check_and_trigger_rollup still contains a single-representative "
-        "`_dir_child = next(...)` refresh; every landed path must refresh all "
-        "directions via `_dir_representatives`."
+    helper_calls = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_do_rollup_post_merge_housekeeping"
+    ]
+    assert len(helper_calls) == 4, (
+        "every true landed-rollup path must delegate to shared post-merge "
+        f"housekeeping; found {len(helper_calls)} delegations"
     )
 
-    # (2) Every direct refresh call must be driven by the per-direction loop var.
+    # The helper's positional contract ends with completed_count, landed,
+    # terminal.  The four calls should occur in the source's four merge-path
+    # order, while zero_diff_close remains before the auto-success call and
+    # therefore cannot accidentally acquire this trigger.
+    landed_args = [
+        ast.unparse(call.args[11])
+        for call in sorted(helper_calls, key=lambda node: node.lineno)
+    ]
+    assert landed_args == ["_landed", "_landed", "_rp_landed", "_esc_landed"], (
+        "shared housekeeping must receive each path's classified landing flag "
+        f"in existing/auto/re-poll/escalation order, got {landed_args}"
+    )
+
+    marker_lines = {
+        marker: src[: src.index(marker)].count("\n") + 1
+        for marker in (
+            'source="rollup_management.existing_pr_merged"',
+            'source="rollup_management.zero_diff_close"',
+            'source="rollup_management.auto_merge_success"',
+        )
+    }
+    helper_lines = [call.lineno for call in sorted(helper_calls, key=lambda node: node.lineno)]
+    assert (
+        marker_lines['source="rollup_management.existing_pr_merged"']
+        < helper_lines[0]
+        < marker_lines['source="rollup_management.zero_diff_close"']
+    ), "existing-PR merge must delegate, while zero-diff close must remain distinct"
+    assert helper_lines[1] > marker_lines['source="rollup_management.auto_merge_success"'], (
+        "auto-merge success must delegate after its landing classification"
+    )
+
+
+def test_check_and_trigger_rollup_refreshes_all_directions_at_every_landed_site():
+    """Direction refresh is centralized in shared post-merge housekeeping.
+
+    The behavioral helper test above proves that the shared implementation
+    refreshes each distinct direction.  This AST guard prevents a future
+    inline path in ``_check_and_trigger_rollup`` from bypassing that fix.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from app import rollup_management
+
+    src = textwrap.dedent(
+        inspect.getsource(rollup_management._check_and_trigger_rollup)
+    )
+    func = ast.parse(src).body[0]
+
+    assert "_dir_child" not in src
     refresh_calls = [
         node
         for node in ast.walk(func)
@@ -4457,19 +4664,12 @@ def test_check_and_trigger_rollup_refreshes_all_directions_at_every_landed_site(
         and isinstance(node.func, ast.Name)
         and node.func.id == "refresh_direction_outcomes_after_merge"
     ]
-    assert len(refresh_calls) == 3, (
-        f"expected 3 inline refresh sites, found {len(refresh_calls)}"
+    assert len(refresh_calls) == 1, (
+        "_check_and_trigger_rollup may only inline direction refresh for the "
+        f"distinct zero-diff close path, found {len(refresh_calls)} calls"
     )
-    for call in refresh_calls:
-        assert call.args and isinstance(call.args[0], ast.Name), (
-            "refresh_direction_outcomes_after_merge must take a name as its "
-            f"first arg, got {ast.dump(call)}"
-        )
-        assert call.args[0].id == "_rep", (
-            "refresh call must pass `_rep` (the per-direction representative), "
-            f"got `{call.args[0].id}`"
-        )
-
+    assert refresh_calls[0].args and isinstance(refresh_calls[0].args[0], ast.Name)
+    assert refresh_calls[0].args[0].id == "_rep"
     rep_loops = [
         node
         for node in ast.walk(func)
@@ -4477,9 +4677,11 @@ def test_check_and_trigger_rollup_refreshes_all_directions_at_every_landed_site(
         and isinstance(node.target, ast.Name)
         and node.target.id == "_rep"
     ]
-    assert len(rep_loops) == 3, (
-        f"expected 3 per-direction refresh loops, found {len(rep_loops)}"
+    assert len(rep_loops) == 1, (
+        "only the zero-diff close path may retain an inline `_rep` refresh loop"
     )
+    zero_diff_line = src[: src.index('source="rollup_management.zero_diff_close"')].count("\n") + 1
+    assert refresh_calls[0].lineno > zero_diff_line
 
 
 @pytest.mark.asyncio

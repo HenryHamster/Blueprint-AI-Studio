@@ -41,6 +41,9 @@ class). The ratchet still pins that the real generator exists and is the one
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -53,6 +56,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from derived_artifact_merge_resolve import (  # noqa: E402
     MECHANICAL_RESOLVERS,
+    MERGE_DRIVERS,
     PHASE_CONTENT_MERGE,
     PHASE_REGENERATE,
     NEVER_MECHANICAL,
@@ -60,15 +64,19 @@ from derived_artifact_merge_resolve import (  # noqa: E402
     classify_conflicts,
     main,
     merge_driver,
+    register_merge_drivers,
     render_durations,
     resolve_merge,
     union_insert_only,
     unmerged_paths,
 )
+import derived_artifact_merge_resolve as dar  # noqa: E402
 from derived_artifact_repair import AUTOREPAIRABLE  # noqa: E402
 
 DURATIONS = "backend/.test_durations"
 RANKED_QUEUE = "test-estate-ranked-queue.md"
+SIZE_LIMITS = "backend/testing/module_size_limits.json"
+SIZE_LIMITS_DRIVER = "backend/testing/merge_size_limits.py"
 
 # A stand-in for scripts/generate_test_estate_ranked_queue.py: a total function
 # of the tree (it counts the test files it can see), with the same --write /
@@ -312,6 +320,89 @@ def test_resolves_both_derived_conflicts_and_leaves_the_tree_committable(conflic
     assert _git(conflicted_repo, "status", "--porcelain").strip() == ""
 
 
+# --------------------------------------------------------------------------
+# The checkout this runs over is routinely owned by someone else
+# --------------------------------------------------------------------------
+#
+# This module runs as a git MERGE DRIVER, i.e. as a CHILD of another git
+# process, and as a resolver invoked from the agent. ``-c safe.directory=`` is
+# PER-INVOCATION: a parent `git -c safe.directory=... merge` does not pass it
+# down, so the merge itself succeeds and the driver's own reads die with
+# "detected dubious ownership" (exit 128). The failure is expensive rather than
+# loud -- it reads as "this conflict is not mechanically resolvable" and
+# escalates to a VM plus an LLM turn for a conflict with one correct answer.
+
+_DUBIOUS_OWNERSHIP_RC = 128
+
+
+def _foreign_owned_git_or_skip(root: Path) -> None:
+    """Stage "another user owns this checkout" without needing a second uid.
+
+    ``GIT_TEST_ASSUME_DIFFERENT_OWNER=1`` is git's own switch for exactly this
+    condition, so a single-uid container reproduces the real CI failure. Skip
+    rather than assert when this git cannot stage it.
+    """
+    env = {**os.environ, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+    kw = {"cwd": root, "capture_output": True, "text": True, "env": env,
+          "timeout": 15}
+    bare = subprocess.run(["git", "rev-parse", "--show-toplevel"], **kw)
+    safe = subprocess.run(
+        ["git", "-c", f"safe.directory={root}", "rev-parse", "--show-toplevel"], **kw
+    )
+    if bare.returncode != _DUBIOUS_OWNERSHIP_RC or safe.returncode != 0:
+        pytest.skip("this git cannot stage the dubious-ownership condition here")
+    assert "dubious ownership" in bare.stderr, bare.stderr
+
+
+def test_resolves_a_merge_in_a_checkout_git_calls_foreign_owned(
+    conflicted_repo, monkeypatch
+):
+    """Real conflicted tree, real exit-128 git, no mock of the git layer.
+
+    Kills a dropped ``safe.directory`` on either read independently: without it
+    on ``_git`` the pass raises out of ``unmerged_paths``; without it on
+    ``_read_stage`` both sides read as absent and the union refuses as an
+    add/delete divergence.
+    """
+    _foreign_owned_git_or_skip(conflicted_repo)
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+
+    outcome = resolve_merge(conflicted_repo)
+
+    assert outcome.complete, outcome
+    assert set(outcome.resolved) == {DURATIONS, RANKED_QUEUE}
+    assert unmerged_paths(conflicted_repo) == ()
+    merged = json.loads((conflicted_repo / DURATIONS).read_text(encoding="utf-8"))
+    assert merged == {
+        "testing/test_base.py::test_base": 1.5,
+        "testing/test_ours.py::test_x": 2.5,
+        "testing/test_theirs.py::test_x": 3.5,
+    }
+
+
+def test_repo_discovery_works_in_a_checkout_git_calls_foreign_owned(
+    tmp_path, monkeypatch
+):
+    """``--repo`` is optional, so discovery must survive the same condition."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main", ".")
+    _foreign_owned_git_or_skip(repo)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+
+    assert dar._repo_root(None).resolve() == repo.resolve()
+
+
+def test_repo_discovery_still_refuses_outside_a_repository(tmp_path, monkeypatch):
+    """Hardening the READ must not soften the fail-closed CONSEQUENCE."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.chdir(plain)
+    with pytest.raises(SystemExit):
+        dar._repo_root(None)
+
+
 def test_refuses_and_mutates_nothing_when_any_conflict_is_not_mechanical(conflicted_repo):
     """The whole point of the resolver: one real conflict aborts the whole pass."""
     _git(conflicted_repo, "merge", "--abort")
@@ -419,9 +510,15 @@ def test_cli_exits_nonzero_and_names_the_unhandled_path(tmp_path, capsys):
 # --------------------------------------------------------------------------
 
 
-def test_registry_is_exactly_the_two_known_conflict_generators():
-    """A literal pin. Adding a third mechanical merge must be a reviewed edit."""
-    assert set(MECHANICAL_RESOLVERS) == {DURATIONS, RANKED_QUEUE}
+def test_registry_is_exactly_the_three_known_conflict_artifacts():
+    """A literal pin. Adding a fourth mechanical merge must be a reviewed edit.
+
+    Still an exact set equality, so an artifact cannot join the mechanical
+    path by omission -- only the pinned membership grew, and it grew to admit
+    a path this repository ALREADY resolves mechanically via the registered
+    ``sizecap`` merge driver.
+    """
+    assert set(MECHANICAL_RESOLVERS) == {DURATIONS, RANKED_QUEUE, SIZE_LIMITS}
 
 
 def test_mechanical_and_never_mechanical_never_overlap():
@@ -431,7 +528,11 @@ def test_mechanical_and_never_mechanical_never_overlap():
 def test_every_registered_entry_states_why_it_needs_no_judgement():
     for path, entry in MECHANICAL_RESOLVERS.items():
         assert entry.path == path
-        assert entry.strategy in {"json_insert_union", "regenerate"}
+        assert entry.strategy in {
+            "json_insert_union",
+            "regenerate",
+            "sizecap_union",
+        }
         assert len(entry.why.strip()) > 80, f"{path} needs a real justification"
     for path, reason in NEVER_MECHANICAL.items():
         assert len(reason.strip()) > 40, f"{path} needs a real justification"
@@ -441,7 +542,7 @@ def test_registered_artifacts_and_generators_exist_in_this_repository():
     """Pins the real paths, so a rename cannot silently disable the resolver."""
     for path, entry in MECHANICAL_RESOLVERS.items():
         assert (REPO_ROOT / path).is_file(), f"{path} is registered but absent"
-        for command in (entry.regenerate, entry.verify):
+        for command in (entry.regenerate, entry.verify, entry.driver):
             if command:
                 assert (REPO_ROOT / command[0]).is_file(), f"{command[0]} is missing"
 
@@ -599,3 +700,384 @@ def test_gitattributes_registers_the_driver_for_the_durations_path():
     attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
     assert "backend/.test_durations merge=testdurations" in attributes
     assert "backend/.test_durations text eol=lf" in attributes
+
+
+# --------------------------------------------------------------------------
+# The size-cap union: replaying the SHIPPED driver over the merge stages
+#
+# backend/testing/module_size_limits.json is the most-edited file in the repo
+# and the repo already ships a correct mechanical merge for it -- the `sizecap`
+# driver. That driver only ever runs when the merge runs locally in a clone
+# whose config registers it. GitHub computes mergeability server-side with
+# STOCK drivers, and a developer clone has stock drivers too, so the conflict
+# the driver was written to prevent materializes anyway and reaches a human or
+# a fix task. These tests pin the recovery path: same driver, same policy, run
+# over the three merge stages instead of over the working tree.
+# --------------------------------------------------------------------------
+
+
+def _size_limits(**caps: int) -> str:
+    """The exact bytes ``check_size_limits.write_limits`` produces."""
+    payload = {"_doc": "caps never ratchet down", "python": dict(caps)}
+    return json.dumps(payload, indent=2, ensure_ascii=True) + "\n"
+
+
+def _size_cap_conflicted_repo(tmp_path: Path) -> Path:
+    """A repo mid-merge with ONLY module_size_limits.json conflicted.
+
+    Merged with STOCK drivers deliberately: that is what a fresh clone has, and
+    it is how the hosting side computes mergeability, which is precisely why
+    this conflict is reachable at all.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main", ".")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "core.autocrlf", "false")
+    # The real driver, not a stand-in: the recovery path must agree with the
+    # merge path because they are supposed to be one implementation.
+    (repo / "backend" / "testing").mkdir(parents=True)
+    shutil.copy(REPO_ROOT / SIZE_LIMITS_DRIVER, repo / SIZE_LIMITS_DRIVER)
+
+    _write(repo, SIZE_LIMITS, _size_limits(**{"backend/app/shared.py": 300}))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    _git(repo, "checkout", "-q", "-b", "theirs", "main")
+    _write(repo, SIZE_LIMITS, _size_limits(**{
+        "backend/app/shared.py": 400,
+        "backend/app/theirs.py": 90,
+    }))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "theirs raises the shared cap to 400")
+
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, SIZE_LIMITS, _size_limits(**{
+        "backend/app/shared.py": 500,
+        "backend/app/ours.py": 120,
+    }))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "ours raises the shared cap to 500")
+
+    _git(repo, "merge", "--no-commit", "theirs")
+    assert unmerged_paths(repo) == (SIZE_LIMITS,), "the fixture must conflict"
+    return repo
+
+
+def test_resolve_merge_resolves_a_size_cap_conflict_with_a_max_union(tmp_path):
+    """The conflict a human hand-resolves is resolved mechanically instead.
+
+    Both sides only ever raise caps -- policy never ratchets one down -- so the
+    max union is the merge, not a judgement call. Before this entry existed the
+    path was declared NEVER_MECHANICAL and this same conflict came back
+    ``unhandled``, i.e. straight to an LLM.
+    """
+    repo = _size_cap_conflicted_repo(tmp_path)
+
+    outcome = resolve_merge(repo)
+
+    assert outcome.complete, outcome.unhandled
+    assert outcome.resolved == (SIZE_LIMITS,)
+    assert outcome.unhandled == ()
+    merged = json.loads((repo / SIZE_LIMITS).read_text(encoding="utf-8"))
+    assert merged["python"] == {
+        "backend/app/shared.py": 500,   # max(500, 400): never the lower cap
+        "backend/app/ours.py": 120,
+        "backend/app/theirs.py": 90,
+    }
+    staged = _git(repo, "diff", "--cached", "--name-only").split()
+    assert SIZE_LIMITS in staged, "a resolution git cannot see is not a resolution"
+    assert unmerged_paths(repo) == ()
+
+
+def test_size_cap_recovery_is_byte_identical_to_the_shipped_driver(tmp_path):
+    """One implementation, one policy.
+
+    The value of routing recovery through backend/testing/merge_size_limits.py
+    instead of reimplementing "take the larger cap" is that the two paths cannot
+    disagree. Run the driver directly over the same three stages and require the
+    same bytes -- if recovery ever grows its own opinion, this goes red.
+    """
+    repo = _size_cap_conflicted_repo(tmp_path)
+    stages = {}
+    for stage, name in ((1, "base"), (2, "ours"), (3, "theirs")):
+        blob = _git(repo, "show", f":{stage}:{SIZE_LIMITS}")
+        stages[name] = tmp_path / name
+        with open(stages[name], "w", encoding="utf-8", newline="") as handle:
+            handle.write(blob)
+
+    direct = subprocess.run(
+        [
+            sys.executable,
+            str(repo / SIZE_LIMITS_DRIVER),
+            str(stages["base"]),
+            str(stages["ours"]),
+            str(stages["theirs"]),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert direct.returncode == 0, direct.stderr
+
+    resolve_merge(repo)
+
+    assert (repo / SIZE_LIMITS).read_bytes() == stages["ours"].read_bytes()
+
+
+def test_size_cap_entry_names_the_driver_this_repository_already_registers():
+    """The registry entry and .gitattributes must point at the same script.
+
+    Splitting them is how the previous contradiction arose: .gitattributes said
+    this path merges automatically while the resolver's table said a human must
+    decide it. Both halves now name one file.
+    """
+    entry = MECHANICAL_RESOLVERS[SIZE_LIMITS]
+    assert entry.strategy == "sizecap_union"
+    assert entry.driver == (SIZE_LIMITS_DRIVER,)
+    assert entry.regenerate == (), "a cap file is merged, never regenerated"
+    attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert f"{SIZE_LIMITS} merge=sizecap" in attributes
+    sizecap = next(d for d in MERGE_DRIVERS if d.name == "sizecap")
+    assert sizecap.script == SIZE_LIMITS_DRIVER
+
+
+# --------------------------------------------------------------------------
+# Driver registration: the half of the wiring a clone does not carry
+#
+# `.gitattributes` is inert on its own. Until now the only installer of
+# `merge.<name>.driver` was the agent's workspace prep, so the FLEET had the
+# drivers and a developer clone had them nowhere -- the machine where these
+# conflicts are actually hand-resolved was the one machine without the fix.
+# --------------------------------------------------------------------------
+
+
+def test_register_merge_drivers_installs_every_driver_into_a_fresh_clone(tmp_path):
+    repo = tmp_path / "clone"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main", ".")
+    # Not through _git: `config --get` exits 1 when the key is unset, which is
+    # exactly the state being asserted. --local because a developer's GLOBAL
+    # config legitimately carries unrelated merge.* keys (merge.conflictstyle),
+    # and a clone inherits those -- what it never inherits is a driver.
+    for driver in MERGE_DRIVERS:
+        probe = subprocess.run(
+            ["git", "config", "--local", "--get", f"merge.{driver.name}.driver"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert probe.stdout.strip() == "", (
+            f"a fresh clone must not already register merge.{driver.name}.driver"
+        )
+
+    registered, failures = register_merge_drivers(repo)
+
+    assert failures == {}
+    assert set(registered) == {d.name for d in MERGE_DRIVERS}
+    for driver in MERGE_DRIVERS:
+        command = _git(repo, "config", "--get", f"merge.{driver.name}.driver").strip()
+        assert driver.script in command
+        assert command.endswith("%O %A %B"), command
+        # The interpreter is resolved, not the literal string "python3": Git Bash
+        # on a Windows developer host has no python3 on PATH at all.
+        assert sys.executable in command
+        for arg in driver.args:
+            assert arg in command
+        name = _git(repo, "config", "--get", f"merge.{driver.name}.name").strip()
+        assert name == driver.description
+
+
+def test_registered_drivers_make_a_size_cap_merge_conflict_free(tmp_path):
+    """Registration is the fix; the recovery pass is only the safety net.
+
+    Same two competing cap bumps as the conflict fixture, but merged in a clone
+    that ran register_merge_drivers first: git resolves it outright and there is
+    nothing left to recover from.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main", ".")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "core.autocrlf", "false")
+    (repo / "backend" / "testing").mkdir(parents=True)
+    shutil.copy(REPO_ROOT / SIZE_LIMITS_DRIVER, repo / SIZE_LIMITS_DRIVER)
+    _write(repo, ".gitattributes", f"{SIZE_LIMITS} merge=sizecap\n")
+
+    registered, failures = register_merge_drivers(repo)
+    assert "sizecap" in registered and failures == {}
+
+    _write(repo, SIZE_LIMITS, _size_limits(**{"backend/app/shared.py": 300}))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    _git(repo, "checkout", "-q", "-b", "theirs", "main")
+    _write(repo, SIZE_LIMITS, _size_limits(**{
+        "backend/app/shared.py": 400,
+        "backend/app/theirs.py": 90,
+    }))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "theirs")
+
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, SIZE_LIMITS, _size_limits(**{
+        "backend/app/shared.py": 500,
+        "backend/app/ours.py": 120,
+    }))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "ours")
+
+    _git(repo, "merge", "theirs", "--no-edit")
+
+    assert unmerged_paths(repo) == (), "the registered driver should have merged it"
+    merged = json.loads((repo / SIZE_LIMITS).read_text(encoding="utf-8"))
+    assert merged["python"] == {
+        "backend/app/shared.py": 500,
+        "backend/app/ours.py": 120,
+        "backend/app/theirs.py": 90,
+    }
+
+
+def test_every_gitattributes_merge_mapping_has_a_registerable_driver():
+    """A mapping with no registration entry is a silent no-op forever.
+
+    `merge=<name>` in .gitattributes does nothing unless something writes
+    `merge.<name>.driver`. Pinning the two sides together means adding a mapping
+    without an installer goes red instead of quietly never running.
+    """
+    attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+    mapped = set()
+    for line in attributes.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.search(r"\bmerge=([\w.-]+)\b", stripped)
+        if match:
+            mapped.add(match.group(1))
+    assert mapped == {driver.name for driver in MERGE_DRIVERS}
+
+
+def test_agent_workspace_prep_registers_the_same_drivers_as_this_module():
+    """Two installers, one policy.
+
+    agent/src/index.ts registers the drivers for fleet workspaces and this
+    module registers them for every other checkout. They must not drift: the
+    interpreter differs on purpose (the agent image has python3; a Windows
+    developer host does not), the driver names, scripts and arguments must not.
+    """
+    source = (REPO_ROOT / "agent" / "src" / "index.ts").read_text(encoding="utf-8")
+    block = re.search(
+        r"DERIVED_ARTIFACT_MERGE_DRIVERS[^=]*=\s*\[(.*?)\n\];",
+        source,
+        re.DOTALL,
+    )
+    assert block, "agent/src/index.ts no longer declares the driver table"
+    entries = re.findall(
+        r"\[\s*'([^']+)',\s*'([^']*)',\s*'([^']*)'\s*\]", block.group(1), re.DOTALL
+    )
+    assert entries, "could not parse the agent driver table"
+
+    agent_table = {name: (desc, command) for name, desc, command in entries}
+    assert set(agent_table) == {driver.name for driver in MERGE_DRIVERS}
+    for driver in MERGE_DRIVERS:
+        description, command = agent_table[driver.name]
+        assert description == driver.description
+        interpreter, _, tail = command.partition(" ")
+        assert interpreter == "python3", command
+        assert tail == " ".join([driver.script, *driver.args, "%O", "%A", "%B"])
+
+
+def test_the_developer_gate_registers_the_merge_drivers():
+    """./check is the one command run before every iteration in a clone.
+
+    That makes it the only reliable install point for a developer host, which is
+    the host where this repo's derived-artifact conflicts were being resolved by
+    hand. Never fatal there -- it is workspace setup, not a check.
+    """
+    gate = (REPO_ROOT / "scripts" / "check-default.sh").read_text(encoding="utf-8")
+    assert "derived_artifact_merge_resolve.py --register-drivers" in gate
+
+
+def test_the_one_command_wrapper_exists_and_runs_the_resolver():
+    """The three hand-typed commands collapse into one script.
+
+    Pinned because the script's whole purpose is to be the thing a human reaches
+    for; a rename that leaves it undiscoverable is the failure mode.
+    """
+    wrapper = REPO_ROOT / "scripts" / "resolve-derived-conflicts.sh"
+    assert wrapper.is_file()
+    body = wrapper.read_text(encoding="utf-8")
+    assert "derived_artifact_merge_resolve.py" in body
+    assert "--register-drivers" in body
+    # Git Bash on Windows has no python3; hard-coding it would break the script
+    # on exactly the host it exists for.
+    assert "for candidate in python3 python py" in body
+
+
+# --------------------------------------------------------------------------
+# The orchestrator's conflict prompts: run the resolver, don't re-derive it
+#
+# The deterministic pass runs before the agent turn for conflict-only fix
+# tasks, and it is all-or-nothing: a merge carrying BOTH a real source conflict
+# and a derived-artifact one comes back declined, with every conflict still in
+# the tree. The agent then resolves the derived files by hand -- which is how
+# the same test-estate-ranked-queue.md conflict came back five times in one
+# afternoon. These pins keep the one command in front of that agent.
+# --------------------------------------------------------------------------
+
+# Exact counts, so a fourth conflict prompt is a reviewed edit rather than a
+# silently uncovered escalation path.
+CONFLICT_PROMPT_SITES = {
+    # dirty child PR before a review respawn; dirty rollup PR before merge
+    "backend/app/rollup_management.py": 2,
+    # the automated promotion-target -> integration-branch back-merge
+    "backend/app/hotfix_backmerge.py": 1,
+}
+
+
+def _prompt_block() -> str:
+    """Load the constant without importing the `app` package.
+
+    backend/app/derived_conflict_prompt.py imports nothing, so a direct
+    file-based load keeps this scripts-lane test free of the backend's import
+    graph while still reading the real value rather than a copy of it.
+    """
+    import importlib.util
+
+    path = REPO_ROOT / "backend" / "app" / "derived_conflict_prompt.py"
+    spec = importlib.util.spec_from_file_location("derived_conflict_prompt", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.DERIVED_CONFLICT_PROMPT_BLOCK
+
+
+def test_every_conflict_resolution_prompt_names_the_resolver():
+    for rel, expected in CONFLICT_PROMPT_SITES.items():
+        source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert (
+            "from app.derived_conflict_prompt import DERIVED_CONFLICT_PROMPT_BLOCK"
+            in source
+        ), f"{rel} no longer imports the shared block"
+        assert source.count("{DERIVED_CONFLICT_PROMPT_BLOCK}") == expected, (
+            f"{rel} interpolates the block "
+            f"{source.count('{DERIVED_CONFLICT_PROMPT_BLOCK}')} times, expected "
+            f"{expected} -- a conflict prompt was added or dropped"
+        )
+
+
+def test_the_prompt_block_names_the_wrapper_and_every_mechanical_artifact():
+    """The prompt and the registry cannot drift.
+
+    An artifact the resolver handles but the prompt never mentions is one the
+    agent will keep hand-merging; an artifact the prompt claims but the
+    resolver declines is an instruction that fails.
+    """
+    block = _prompt_block()
+    assert "bash scripts/resolve-derived-conflicts.sh" in block
+    for path in MECHANICAL_RESOLVERS:
+        assert path in block, f"{path} is resolved mechanically but unnamed in the prompt"
+    # The all-or-nothing contract is the part an agent must not misread.
+    assert "non-zero" in block and "NOTHING" in block

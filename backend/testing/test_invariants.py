@@ -1497,6 +1497,8 @@ class TestSchemaRevisionSync:
             "get_check_runs_cached",
             "get_pr_files",
             "get_file_text_at_ref",
+            # Read-only compare evidence; it returns filenames and cannot write refs.
+            "get_files_changed_between_refs",
         }
         used = set(re.findall(r"\bgithub\.(\w+)\b", content))
         unexpected = sorted(used - ALLOWED_BACKMERGE_GITHUB_HELPERS)
@@ -1526,6 +1528,7 @@ class TestSchemaRevisionSync:
             "get_check_runs_cached",
             "get_pr_files",
             "get_file_text_at_ref",
+            "get_files_changed_between_refs",
         }, (
             "The back-merge github-helper allowlist must stay the documented read/merge helpers."
         )
@@ -5181,23 +5184,25 @@ class TestOperatorMessageArmingGateCoverage:
             )
 
     # Budget, not a default. This guard reads and parses all 572
-    # backend/app/*.py. The standalone lane runs it under --timeout=30, a
-    # budget sized on a native Linux filesystem; over the Docker-on-Windows
-    # bind mount it died as `Failed: Timeout (>30.0s) from pytest-timeout` at
-    # 29.96s while its three synthetic sibling tests passed -- which reads as
-    # an unguarded operator-message site, when the scan underneath had found
-    # zero offenders. A timeout, not an assertion, is the tell.
+    # backend/app/*.py. Under the THEN-30s lane budget -- a number sized on a
+    # native Linux filesystem -- it died over the Docker-on-Windows bind mount
+    # as `Failed: Timeout (>30.0s) from pytest-timeout` at 29.96s while its
+    # three synthetic sibling tests passed, which reads as an unguarded
+    # operator-message site when the scan underneath had found zero offenders.
+    # A timeout, not an assertion, is the tell. The lane catch-all is
+    # LANE_HANG_DETECTOR_SECONDS (test_harness_timeout_budgets.py) and is much
+    # larger today; this explicit budget stays so the scan reds as itself.
     #
     # Profiled in the lane's own container: read 20.67s, prefilter 2.11s,
     # parse of the 46 surviving files 2.83s; parsing all 572 instead is
     # 10.77s. So the prefilter below removes the reducible half (10.77s ->
     # 2.83s), taking the guard from ~31.6s to 19.21s warm. What is left is one
     # read of every app file, and the guard cannot skip it -- the prefilter
-    # needs the text. At 20.67s that read alone is two thirds of a 30s budget,
-    # before any contention from the 1842-test session it runs inside, and on
-    # a cold page cache the whole guard measured 46.87s. The prefilter is
-    # worth keeping, but it cannot move this guard off a 30s boundary; only a
-    # budget can.
+    # needs the text. At 20.67s that read alone was two thirds of the then-30s
+    # budget, before any contention from the 1842-test session it runs inside,
+    # and on a cold page cache the whole guard measured 46.87s. The prefilter
+    # is worth keeping, but it could not move this guard off that boundary;
+    # only an explicit budget could.
     #
     # 120s is the house budget for corpus-scanning guards
     # (test_string_patch_targets_resolve, test_mock_patch_targets_resolve;
@@ -11934,11 +11939,13 @@ def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] |
 # vacuous-mock guard below reuses it for free), and already memoises the app
 # module parses. What is left is one tokenize pass over the corpus.
 #
-# The standalone lane runs with --timeout=30 sized on a native Linux
-# filesystem. Over the Docker-on-Windows bind mount the same work is ~2.3x
-# slower (~28s), so the guard was landing on the wrong side of its budget and
-# failing as a TIMEOUT -- reporting a slow filesystem as a stale-patch-target
-# defect. 120s matches the house budget for corpus-scanning guards
+# Over the Docker-on-Windows bind mount the same work is ~2.3x slower (~28s),
+# so against the then-30s lane budget the guard was landing on the wrong side
+# and failing as a TIMEOUT -- reporting a slow filesystem as a
+# stale-patch-target defect. The lane catch-all
+# (LANE_HANG_DETECTOR_SECONDS, backend/testing/test_harness_timeout_budgets.py)
+# is far larger now; this marker stays because it bounds the scan as ITSELF.
+# 120s matches the house budget for corpus-scanning guards
 # (test_websocket_emitter_inventory, test_patched_app_symbols_have_production_
 # call_sites at 90s) and leaves ~4x headroom over the bind-mount figure.
 @pytest.mark.timeout(120)
@@ -13172,8 +13179,9 @@ def test_no_deprecated_datetime_utcnow_calls():
         #
         # Why a guard that measures 9.85s needed this at all: that is the
         # isolated cost over the Docker-on-Windows bind mount, but the lane
-        # runs it inside a 1842-test session against --timeout=30, and there
-        # it died on `Failed: Timeout (>30.0s) from pytest-timeout` -- reading
+        # runs it inside a 1842-test session, and against the then-30s lane
+        # budget it died on `Failed: Timeout (>30.0s) from pytest-timeout` --
+        # reading
         # 569 files off a contended bind mount is several times its solo cost,
         # and the failure is intermittent precisely because it sat close to
         # the line. A timeout, not an assertion, reports a slow filesystem as
@@ -15304,6 +15312,40 @@ def _standalone_failure_message(node: ast.AST) -> ast.AST | None:
     return None
 
 
+_NUMERIC_PRESENTATION_TYPES = frozenset("bcdeEfFgGnosxX%")
+
+
+def _numeric_format_spec(node: ast.FormattedValue) -> bool:
+    """Report whether an f-string slot formats its value as a NUMBER.
+
+    ``_collection_names_in_function`` treats ``a - b`` as a set difference,
+    which is right for ``declared - copied`` and wrong for
+    ``time.monotonic() - started``.  The interpolation site settles it without
+    a name heuristic: ``f"{waited:.1f}s"`` would raise ``TypeError`` on any
+    collection, so a slot carrying a numeric presentation type is proof the
+    value is a scalar and its diagnostic names no offenders to mark.
+
+    Deliberately narrow. Only a literal, fully-constant spec ending in a
+    numeric presentation type counts; a bare ``{name}``, a ``!r`` conversion,
+    an alignment-only spec, or a spec built at runtime all stay collections,
+    because none of them rules a collection out.
+    """
+
+    spec = node.format_spec
+    if spec is None:
+        return False
+    if not isinstance(spec, ast.JoinedStr):
+        return False
+    text = ""
+    for piece in spec.values:
+        if not isinstance(piece, ast.Constant) or not isinstance(piece.value, str):
+            # A nested slot means the spec itself is computed at runtime; it
+            # cannot be read as proof of anything here.
+            return False
+        text += piece.value
+    return bool(text) and text[-1] in _NUMERIC_PRESENTATION_TYPES
+
+
 def _rendered_collection_names(
     message: ast.AST,
     collection_names: set[str],
@@ -15345,7 +15387,10 @@ def _rendered_collection_names(
         parent = parents.get(id(child))
         while parent is not None:
             if isinstance(parent, ast.FormattedValue):
-                rendered.add(node.id)
+                # A numerically formatted slot proves the value is a scalar,
+                # so this rendering identifies no offender collection.
+                if not _numeric_format_spec(parent):
+                    rendered.add(node.id)
                 break
             if isinstance(parent, ast.Call):
                 if isinstance(parent.func, ast.Name):
@@ -15367,6 +15412,41 @@ def _rendered_collection_names(
         else:
             rendered.add(node.id)
     return rendered
+
+
+def test_numeric_format_spec_only_excuses_scalar_interpolations():
+    """The scalar discriminator must stay proof, never a blanket excuse.
+
+    ``_collection_names_in_function`` reads ``a - b`` as a set difference.
+    That is right for ``declared - copied`` and wrong for
+    ``time.monotonic() - started``, so a scalar timing assertion used to be
+    charged with failing to name offenders it does not have.
+
+    The interpolation site settles it, but only in one direction: a numeric
+    presentation type cannot format a collection, so it PROVES scalar. No
+    other spec proves anything, and every one of them has to keep counting as
+    a collection -- otherwise this discriminator becomes a way to silence the
+    guard by reformatting a diagnostic.
+    """
+
+    def slot(source: str) -> ast.FormattedValue:
+        return next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FormattedValue)
+        )
+
+    # Proof of a scalar: these raise TypeError on any collection.
+    assert _numeric_format_spec(slot('f"{waited:.1f}s"'))
+    assert _numeric_format_spec(slot('f"{count:d}"'))
+    assert _numeric_format_spec(slot('f"{ratio:.2%}"'))
+
+    # Proof of nothing: a collection renders fine through every one of these,
+    # so the offender-identity requirement still applies.
+    assert not _numeric_format_spec(slot('f"{offenders}"'))
+    assert not _numeric_format_spec(slot('f"{offenders!r}"'))
+    assert not _numeric_format_spec(slot('f"{offenders:>20}"'))
+    assert not _numeric_format_spec(slot('f"{offenders:{width}}"'))
 
 
 def test_standalone_corpus_set_guards_emit_offender_identity():
@@ -15414,12 +15494,13 @@ def test_standalone_corpus_set_guards_emit_offender_identity():
 
 
 # This shells out to scripts/test-backend.sh for a roster read. Measured
-# at 17.8s on an idle Windows host, and the CI lanes run pytest with
-# --timeout=30 -- so under an eight-shard load this lands on the wrong
-# side of its budget and fails as a TIMEOUT, reporting a slow harness
-# boot as a roster defect. 180s leaves ~10x headroom over the measured
-# figure and stays above the 120s inner subprocess timeout below, which
-# is what must be allowed to fire first.
+# at 17.8s on an idle Windows host; under an eight-shard load that landed on
+# the wrong side of the then-30s lane budget and failed as a TIMEOUT,
+# reporting a slow harness boot as a roster defect. 180s leaves ~10x headroom
+# over the measured figure and stays above the 120s inner subprocess timeout
+# below, which is what must be allowed to fire first -- the marker is what
+# keeps this attributable instead of an anonymous LANE_HANG_DETECTOR_SECONDS
+# kill (backend/testing/test_harness_timeout_budgets.py).
 @pytest.mark.timeout(180)
 def test_standalone_offender_roster_covers_the_harness_inventory():
     """The scanned roster is never narrower than the lane the harness runs.

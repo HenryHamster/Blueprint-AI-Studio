@@ -148,6 +148,7 @@ import {
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   TOOL_USE_STALL_TIMEOUT_MS,
+  WORKFLOW_TOOL_STALL_TIMEOUT_MS,
   isWorkflowToolName,
   CLAUDE_STREAM_STALL_MS,
   LLM_NO_PROGRESS_STALL_MS,
@@ -1594,9 +1595,9 @@ describe('isWorkflowToolName', () => {
 // in flight, and (2) refresh lastToolProgressAt on ANY stdout chunk while a tool
 // is in flight, so the tool-use/workflow stall watchdog is kept alive by any
 // output the workflow prints (sub-agent logs, system keepalives, anything),
-// independent of the exact JSON event schema. A workflow that goes FULLY dark
-// (zero stdout) is still caught — by the raw-stdout stall watchdog at
-// CLAUDE_STREAM_STALL_MS — and the wall-clock killTimer is the final backstop.
+// independent of the exact JSON event schema. A tool that goes FULLY dark (zero
+// stdout) remains bounded by the 30/45-minute tool watchdog, and the wall-clock
+// killTimer is the final backstop.
 describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
   type StdoutCb = (data: Buffer) => void;
   type ChildHandlers = {
@@ -1741,44 +1742,106 @@ describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
     killSpy.mockRestore();
   });
 
-  it('STILL SIGTERMs a workflow tool that goes FULLY DARK (zero stdout) — the genuine-hang catch is the raw-stdout stall watchdog, NOT the no-progress watchdog', async () => {
-    // A genuinely hung fan-out: the Task tool launches and then the subprocess
-    // emits ZERO bytes — the signature of a truly dead/wedged sub-agent. With the
-    // no-progress kill suppressed while toolInFlight is true, the genuine-hang
-    // coverage is owned by the raw-stdout stall watchdog (CLAUDE_STREAM_STALL_MS),
-    // which fires on zero-stdout regardless of tool state. So removing the
-    // no-progress kill while in-flight does NOT create an immortal hang.
+  it('keeps a Codex command_execution alive past raw silence, then applies the 30m tool watchdog', async () => {
+    process.env.PROVIDER = 'openai';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.CODEX_HOME = '/tmp/codex-home';
+    refreshRuntimeState();
+
+    // Exact incident parser boundary: Codex emits item.started for an ordinary
+    // command_execution, then buffers all child output from `./check test`.
     const { child, handlers, emitStdout } = makeChild(7903);
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
 
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
+    const statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number } = { value: '' };
+    const promise = runProviderAgent('hello', null, statusRef);
+    // Attach immediately so the expected timeout cannot surface as an unhandled
+    // rejection while fake timers advance past the watchdog boundary.
+    const settled = promise.catch((e: unknown) => e);
+    // Codex performs an async usage-reset preflight before spawning. Drain its
+    // bounded microtask chain without advancing any watchdog clock.
+    for (let i = 0; i < 20 && vi.mocked(spawn).mock.calls.length === 0; i++) {
+      await Promise.resolve();
+    }
+    expect(vi.mocked(spawn).mock.calls[0]?.[0]).toBe('codex');
 
-    // Workflow tool starts, then emits NOTHING further — no JSON sub-progress,
-    // no keepalives, no raw bytes at all.
     emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Task', input: {} }] },
+      type: 'item.started',
+      item: {
+        id: 'item_check_test',
+        type: 'command_execution',
+        command: './check test',
+        aggregated_output: '',
+        status: 'in_progress',
+      },
     }));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(statusRef.value).toBe('Using tool: Bash');
+    expect(statusRef.toolStartedAt).toBeDefined();
 
-    // The Task-launch line itself reset the raw-stdout watchdog. With no further
-    // stdout, the watchdog fires CLAUDE_STREAM_STALL_MS later. It must NOT have
-    // fired before that (the launch line is well within the window).
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 60_000);
+    // Cross the short raw-stream threshold. Before the fix this SIGTERMed here,
+    // twelve minutes into a valid command.
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 60_000);
     expect(killSpy).not.toHaveBeenCalledWith(-7903, 'SIGTERM');
 
-    await vi.advanceTimersByTimeAsync(120_000);
+    // The existing ordinary-tool watchdog remains the bounded owner. Advance
+    // the cumulative silence past its 30-minute budget and one polling tick.
+    await vi.advanceTimersByTimeAsync(
+      TOOL_USE_STALL_TIMEOUT_MS - CLAUDE_STREAM_STALL_MS + 60_001,
+    );
     expect(killSpy).toHaveBeenCalledWith(-7903, 'SIGTERM');
 
-    // The raw-stdout watchdog sets no flag (flags.timedOut stays false so the
-    // wrapper proceeds to commit/push), so a clean SIGTERM close resolves the run
-    // normally rather than as a misclassified rate-limit/no_progress requeue.
     child.exitCode = 143;
     child.signalCode = 'SIGTERM';
     handlers.close?.(143, 'SIGTERM');
     await vi.runAllTimersAsync();
-    const rejection = await promise.catch((e: unknown) => e);
+    const rejection = await settled;
+    expect(rejection).toBeInstanceOf(ClaudeTimeoutError);
+    expect((rejection as Error).message).toBe(
+      'OpenAI Codex mid-stream tool-use stall: tool in-flight for >30 min without result',
+    );
+    expect(rejection).not.toBeInstanceOf(NoProgressTimeoutError);
+    expect(rejection).not.toBeInstanceOf(RateLimitError);
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it('keeps a dark workflow Task past raw silence, then applies the 45m workflow watchdog', async () => {
+    const { child, handlers, emitStdout } = makeChild(7905);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    const settled = promise.catch((e: unknown) => e);
+    await Promise.resolve();
+
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Task', input: { description: 'review' } }] },
+    }));
+
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 60_000);
+    expect(killSpy).not.toHaveBeenCalledWith(-7905, 'SIGTERM');
+
+    // Reach 44 minutes of cumulative silence: still inside the 45-minute
+    // workflow budget and well past repeated raw-stream watchdog intervals.
+    await vi.advanceTimersByTimeAsync(
+      WORKFLOW_TOOL_STALL_TIMEOUT_MS - CLAUDE_STREAM_STALL_MS - 120_000,
+    );
+    expect(killSpy).not.toHaveBeenCalledWith(-7905, 'SIGTERM');
+
+    await vi.advanceTimersByTimeAsync(120_001);
+    expect(killSpy).toHaveBeenCalledWith(-7905, 'SIGTERM');
+
+    child.exitCode = 143;
+    child.signalCode = 'SIGTERM';
+    handlers.close?.(143, 'SIGTERM');
+    await vi.runAllTimersAsync();
+    const rejection = await settled;
+    expect(rejection).toBeInstanceOf(ClaudeTimeoutError);
+    expect((rejection as Error).message).toBe(
+      'Claude Code mid-stream tool-use stall: tool in-flight for >45 min without result',
+    );
     expect(rejection).not.toBeInstanceOf(NoProgressTimeoutError);
     expect(rejection).not.toBeInstanceOf(RateLimitError);
     killSpy.mockRestore();

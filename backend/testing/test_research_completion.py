@@ -5674,12 +5674,24 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
     - Set direction status to terminal 'retired' with auto_completed=True and an
       exhaustion auto_completed_reason
     - Stamp completed_at
-    - Create an INFO 'Direction auto-retired' alert (not the WARNING deadlock alert)
+    - Deliver an 'auto-retired' direction_milestone notice (not the WARNING
+      deadlock alert, and not a durable alert row)
     - NOT auto-pause (no auto_paused / paused_reason) — the direction is terminal.
+
+    2026-08-26: the third bullet used to read "Create an INFO 'Direction
+    auto-retired' alert". ``research.direction_auto_retired`` was already
+    TIMELINE_ONLY in the alert registry on ``origin/automain``, so that durable
+    row was one the policy already forbade -- the retirement backstop sweep
+    cleared it on every pass, and the assertion only passed because it ran inside
+    a single transaction ahead of any sweep. A retirement is a completed fact, so
+    no condition can ever clear a standing row about it. The mint site now asks
+    the policy gate, and the delivery is the ``direction_milestone``
+    ProjectMessage this same code path already posted before the change; the
+    assertions below follow it there and pin the absence of the durable row.
     """
     from datetime import datetime, timedelta
 
-    from app.models import Alert
+    from app.models import Alert, ProjectMessage
     from app.research_direction_state import apply_post_spawn_state
     from test_autonomous_research import _active_direction, _make_research_task
 
@@ -5778,16 +5790,44 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
     )
     assert not d.get("paused_reason"), "no paused_reason on a retired direction"
 
-    # An INFO 'Direction auto-retired' alert is created (not the WARNING deadlock alert).
+    # The retirement is delivered as an 'auto-retired' direction_milestone notice.
+    msgs = (
+        (
+            await db_session.execute(
+                _select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    milestones = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "direction_milestone"
+        and (m.context or {}).get("milestone") == "auto-retired"
+    ]
+    assert len(milestones) == 1, (
+        "expected exactly 1 'auto-retired' direction_milestone message, got "
+        f"{len(milestones)} (all event_types: "
+        f"{[(m.context or {}).get('event_type') for m in msgs]})"
+    )
+    assert "exhausted" in (milestones[0].context.get("reason") or ""), (
+        "the milestone notice must carry the exhaustion reason, got "
+        f"{milestones[0].context.get('reason')!r}"
+    )
+
+    # ... and NOT as a durable, unresolvable operator alert row.
     result = await db_session.execute(
         _select(Alert).where(
             Alert.project_id == project.id,
             Alert.title == "Direction auto-retired",
-            Alert.dismissed_at.is_(None),
         )
     )
-    assert result.scalars().first() is not None, (
-        "expected a 'Direction auto-retired' alert"
+    assert result.scalars().first() is None, (
+        "'Direction auto-retired' is a completed fact, not a standing condition: "
+        "it must not mint a durable alert row that no resolver can ever clear"
     )
 
 
@@ -10243,6 +10283,15 @@ async def test_unmatched_task_hash_prerequisite_escalates_to_parent(db_session, 
     assert (child.context or {}).get("prerequisite_escalation_reason") == (
         "no_live_or_deferred_provider"
     )
+    # The escalation CANCELS the row, so it must record its reason in the
+    # canonical fields too — not only under this bespoke key, which the
+    # ground-truth terminal-reason reader (platform_kill_metrics) deliberately
+    # does not consult. Without these, a fully-explained cancel was still
+    # reported as "we do not know why this task ended".
+    assert (child.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
+    assert (child.context or {}).get("failure_detail") == (
+        "no_live_or_deferred_provider"
+    )
     unresolved = (child.context or {}).get("unresolved_prerequisite", [])
     assert any(
         u.get("kind") == "task" and u.get("ref") == missing_ref
@@ -10703,6 +10752,11 @@ async def test_observation_dependency_escalates_instead_of_blocking(db_session, 
     assert (child.context or {}).get("prerequisite_escalation_reason") == (
         "structurally_unresolvable"
     )
+    # Same canonical terminal-reason stamp as the no-provider branch above: a
+    # CANCELLED row has to be readable by the ground-truth reader, not only by
+    # code that already knows to look under prerequisite_escalation_reason.
+    assert (child.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
+    assert (child.context or {}).get("failure_detail") == "structurally_unresolvable"
 
 
 @_pytest.mark.asyncio

@@ -26,6 +26,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Host interpreter. Git Bash on Windows has no `python3`, so spelling it
+# literally here failed the merge below with exit 127 AFTER a successful
+# measurement run -- the tests passed, the artifact was never written, and the
+# cleanup trap deleted the raw measurement. Resolved through the shared helper
+# so this script and batch-store-durations.sh cannot drift apart. Fail closed
+# when the helper is absent: there is no correct identity fallback for
+# "which interpreter", and a wrong guess loses another measurement.
+if [ ! -f "$SCRIPT_DIR/python-interpreter.sh" ]; then
+  echo "ERROR: $SCRIPT_DIR/python-interpreter.sh is missing; this script needs" >&2
+  echo "       it to resolve a host Python interpreter." >&2
+  exit 1
+fi
+# shellcheck source=scripts/python-interpreter.sh
+source "$SCRIPT_DIR/python-interpreter.sh"
+PYTHON_BIN="$(blueprint_python_interpreter)"
+
 echo "=== Regenerating backend/.test_durations (time-balanced shard seeding) ==="
 if [ "$#" -eq 0 ]; then
   echo "This runs the full backend test suite — expect 15-20 minutes."
@@ -39,8 +55,23 @@ TEST_BACKEND_SCRIPT="${DURATION_TEST_BACKEND_SCRIPT:-$SCRIPT_DIR/test-backend.sh
 MERGE_SRC_DIR=""
 PARTIAL_ROOT=""
 EMPTY_SRC_DIR=""
+# A targeted refresh costs a full Docker+Postgres test run -- minutes at best,
+# twenty at worst -- and PARTIAL_ROOT is the ONLY copy of what it measured.
+# Deleting it unconditionally meant any failure after the run (the merge step
+# most of all) destroyed the measurement and left the operator nothing to
+# retry but the whole run. Retain it on every failing exit and name the path.
+RETAIN_PARTIAL=0
 cleanup() {
+  local status=$?
   [ -z "$EMPTY_SRC_DIR" ] || rm -rf "$EMPTY_SRC_DIR"
+  if [ -n "$PARTIAL_ROOT" ] && [ "$RETAIN_PARTIAL" = "1" ] && [ "$status" -ne 0 ]; then
+    echo "" >&2
+    echo "The raw measurement was NOT deleted: $PARTIAL_ROOT" >&2
+    echo "Re-run only the merge (no re-measurement needed) with:" >&2
+    echo "  $PYTHON_BIN $SCRIPT_DIR/merge_durations.py $PARTIAL_ROOT $BACKEND_DIR/.test_durations" >&2
+    echo "Delete the directory once the merge has landed." >&2
+    return
+  fi
   [ -z "$PARTIAL_ROOT" ] || rm -rf "$PARTIAL_ROOT"
 }
 trap cleanup EXIT
@@ -61,6 +92,7 @@ else
   # concurrent targeted refreshes to overwrite or delete each other's raw
   # measurement before merge_durations.py could consume it.
   PARTIAL_ROOT="$(mktemp -d "$BACKEND_DIR/.duration_refresh.XXXXXX")"
+  RETAIN_PARTIAL=1
   PARTIAL_DIR="$PARTIAL_ROOT/target"
   mkdir -p "$PARTIAL_DIR"
   MERGE_SRC_DIR="$PARTIAL_ROOT"
@@ -86,7 +118,12 @@ if [ -z "$MERGE_SRC_DIR" ]; then
 fi
 # Individual measurement directories may run concurrently, but their final
 # read-modify-write merge must be serialized so neither invocation loses the
-# other's completed measurement.  The lock file is deliberately retained: it
-# is only a flock handle and may have existed before this invocation.
-flock "$BACKEND_DIR/.duration_refresh.lock" \
-  python3 "$SCRIPT_DIR/merge_durations.py" "$MERGE_SRC_DIR" "$BACKEND_DIR/.test_durations"
+# other's completed measurement.  That serialization now lives INSIDE
+# merge_durations.py (see duration_artifact_lock there) rather than in a
+# `flock(1)` wrapper around this line: flock is not present in Git Bash on
+# Windows, so the wrapper turned every merge on that host into an exit-127
+# after the tests had already run.  A lock taken in Python covers every caller
+# of the merge on every platform and needs no external binary.
+"$PYTHON_BIN" "$SCRIPT_DIR/merge_durations.py" "$MERGE_SRC_DIR" "$BACKEND_DIR/.test_durations"
+# Merge landed: the raw measurement is now redundant and may be cleaned up.
+RETAIN_PARTIAL=0

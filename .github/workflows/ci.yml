@@ -520,10 +520,17 @@ jobs:
     # from the merge gate, which is worse than catching a hang 10 min later
     # (fail-fast is false, so a hung shard never blocks its siblings). The real
     # fix is committing .test_durations so pytest-split balances by time.
-    # pytest --timeout=30 uses the thread method, which CANNOT
-    # interrupt a non-Python block (real I/O / C-level / asyncio deadlock); GH
-    # Actions' default job timeout is 360 min, so without this a single hang
-    # stalls the runner for 6h and wedges the rollup. This is the catch-all.
+    # This ceiling is the CATCH-ALL, and it is the only thing standing between a
+    # non-interruptible block and GH Actions' 360-min default. Note the per-test
+    # budget below is --timeout=300 --timeout-method=signal: 300s (raised from
+    # 30s on 2026-08-26) is a HANG detector, not a performance budget. At 30s it
+    # was killing healthy whole-tree read+parse scans under host I/O contention
+    # and reding shards on candidates that had just gone green at the same sha
+    # -- on a promotion PR that deletes the release branch. The inner-operation
+    # ceiling that catches genuine budget inversions stayed at 30s; the two are
+    # now separate constants in backend/testing/test_harness_timeout_budgets.py
+    # and that guard fails if anyone moves them back together. A shard runs ~11
+    # min, so even a full 300s hang leaves real headroom under the 30-min cap.
     timeout-minutes: 30
     needs: [detect, backend-deps]
     if: needs.detect.outputs.backend == 'true'
@@ -748,6 +755,11 @@ jobs:
           # Disable -e so pytest's non-zero exit doesn't short-circuit the
           # failure-extraction below; we propagate the code via $pytest_status.
           set +e
+          # pytest-split writes the shard's timing partial here. It needs its own
+          # WRITABLE mount: /app is bound read-only, so --durations-path cannot
+          # point anywhere under it. Created on the host so it belongs to the
+          # runner user rather than to the container.
+          mkdir -p "$PWD/shard-durations"
           run_shard() {
             # Fail Google Auth's non-GCE metadata probes immediately. On a
             # residential network the default metadata IP can linger long
@@ -756,8 +768,57 @@ jobs:
             # (backend/testing/test_local_runner_terminal_log.py etc.) resolve
             # scripts/ via /repo and HARD-FAIL (not skip) when CI is set, so
             # they enforce in the promotion gate instead of silently skipping.
+            # Pre-create this shard's partial EMPTY and world-writable.
+            #
+            # Writability first, because getting it wrong is expensive out of
+            # all proportion: pytest-split writes the file in
+            # pytest_sessionfinish, and an exception there exits pytest
+            # non-zero with every test PASSED. A container uid that cannot
+            # write the bind mount is enough to do it, so a permissions slip
+            # here reds a green shard on the promotion PR -- the failure class
+            # this whole change is meant to reduce, not add to. Creating the
+            # file 0666 up front means the write needs permission on the FILE
+            # rather than on the directory, which takes the container's uid
+            # mapping out of the equation entirely. Verified by running the
+            # deps image as an unrelated uid against a root-owned mount: it
+            # wrote the partial cleanly.
+            #
+            # EMPTY, because PytestSplitCachePlugin SEEDS its cache by reading
+            # --durations-path at startup and writes that dict back updated.
+            # Seed it with the baseline and the artifact is a "complete" map
+            # that is ~7/8 stale carry-over from other shards -- and merging
+            # eight of those lets one shard's echo clobber another's fresh
+            # measurement. Reproduced directly in #17992; the merge tool
+            # defends against it a second way by treating a value
+            # bit-identical to the baseline as carry-over. Rewriting it per
+            # attempt also stops a retry inheriting its own previous run.
+            printf '{}' > "$PWD/shard-durations/shard-${{ matrix.shard }}.json"
+            chmod 666 "$PWD/shard-durations/shard-${{ matrix.shard }}.json"
+            # --user/HOME/USER: run as the runner user, not root. This is the
+            # idiom scripts/test-backend.sh already applies to every local and
+            # agent-VM run of this same image, so the image is known to work
+            # non-root; these two lanes are the ones that call `docker run`
+            # directly and therefore missed it. Root-owned droppings in a
+            # bind-mounted tree are not cosmetic: on a SHARED self-hosted runner
+            # one poisoned run makes the same SHA pass or fail depending on which
+            # runner picks it up, and a git read inside the container sees a
+            # workspace it does not own (`detected dubious ownership`, exit 128 --
+            # the shape that killed the v45 promotion attempt). HOME is
+            # redirected because it defaults to "/", which a non-root uid cannot
+            # write; USER is exported because --user injects a uid the image's
+            # /etc/passwd does not know and getpass.getuser() raises KeyError.
+            #
+            # The "Reclaim workspace from root-owned container droppings" steps
+            # are deliberately LEFT IN PLACE. If this works they become no-ops;
+            # if it does not, they still protect the next job. Delete them in a
+            # follow-up once a promotion run proves the droppings are gone --
+            # never in the same commit that might create them.
             docker run --rm --network "$CI_NETWORK" -v "$PWD/backend:/app:ro" \
+              --user "$(id -u):$(id -g)" \
+              -e HOME=/tmp \
+              -e USER="$(id -un)" \
               -v "$PWD:/repo:ro" \
+              -v "$PWD/shard-durations:/durations" \
               -e PYTHONDONTWRITEBYTECODE=1 \
               -e GCE_METADATA_IP=127.0.0.1 \
               -e GCE_METADATA_HOST=127.0.0.1:9 \
@@ -768,7 +829,9 @@ jobs:
               -e WS_TICKET_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
               ${{ steps.deps.outputs.image }} \
               python -m pytest testing/ --splits 8 --group ${{ matrix.shard }} \
-                -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
+                --store-durations \
+                --durations-path /durations/shard-${{ matrix.shard }}.json \
+                -v --tb=short --timeout=300 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
             return ${PIPESTATUS[0]}
           }
           # Extract failed/erroring test IDs from pytest's "short test summary
@@ -806,6 +869,43 @@ jobs:
 
           exit $pytest_status
 
+      - name: Prepare shard durations for upload
+        if: always()
+        run: |
+          f="shard-durations/shard-${{ matrix.shard }}.json"
+          # Belt and braces. Since #17990 the shard container runs as the
+          # runner user, so this should already be a no-op -- but the upload
+          # must not be the thing that discovers otherwise, and a root-owned
+          # leftover here fails the NEXT checkout on this shared runner rather
+          # than this job.
+          chmod -R a+rwX shard-durations 2>/dev/null || true
+          # Drop a partial that recorded nothing. The file is pre-created as
+          # "{}" so that the write cannot fail on permissions, which means a
+          # shard that died before pytest_sessionfinish leaves an empty one
+          # behind. merge_shard_durations.py fails CLOSED on an empty duration
+          # file (exit 2) and should keep doing so -- an empty artifact is
+          # otherwise indistinguishable from a truncated one. Don't weaken that
+          # contract; just don't hand it an empty file. With this, an uploaded
+          # artifact means the shard actually measured something, which is what
+          # `if-no-files-found: ignore` on the upload already assumes.
+          if [ ! -s "$f" ] || [ "$(tr -d '[:space:]' < "$f")" = "{}" ]; then
+            echo "::notice::shard ${{ matrix.shard }} recorded no durations; not uploading"
+            rm -f "$f"
+          fi
+
+      # if-no-files-found: ignore -- a shard that died before pytest wrote its
+      # partial must not turn a real test failure into a confusing upload error.
+      # The merge job tolerates a missing shard loudly and keeps those tests'
+      # baseline entries.
+      - name: Upload shard durations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-durations-${{ matrix.shard }}
+          path: shard-durations/shard-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          retention-days: 7
+
       # Standalone host services and installers live outside backend/testing, so
       # the sharded suite above never collects them. Run their pure unit suites
       # once from the read-only repository mount. This covers runner isolation,
@@ -814,7 +914,14 @@ jobs:
       - name: Runner-script suite (scripts/)
         if: matrix.shard == 1
         run: |
+          # Same runner-user mapping as the shard lane above, and for the
+          # same reason -- see the comment there. This lane reads /repo, which
+          # is the mount a container-side `git log` trips over when the uid
+          # inside does not match the checkout's owner.
           docker run --rm -v "$PWD:/repo:ro" -w /repo/scripts \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e USER="$(id -un)" \
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e CI=true \
             ${{ steps.deps.outputs.image }} \
@@ -955,6 +1062,77 @@ jobs:
           fi
           echo "::error::Backend shards result: $R"
           exit 1
+
+  # Reconstruct backend/.test_durations from the timings the shards just
+  # produced, at zero extra compute. ADVISORY BY DESIGN: it uploads a refreshed
+  # artifact and prints the delta, it does not commit and it is not a required
+  # check. A duration merge must never be able to red a promotion PR -- someone
+  # lands the refreshed file deliberately, which is also what keeps the change
+  # reviewable rather than a bot silently rewriting the shard balancer's input.
+  #
+  # No base_ref condition: on.pull_request.branches is [main], so every run of
+  # this workflow already IS a main-targeted promotion PR.
+  backend-durations:
+    name: CI / Backend durations
+    runs-on: [self-hosted, Linux, X64, hamsterwheel, blueprint, kvm]
+    needs: [detect, backend]
+    # always() so a RED shard still contributes the timings it did measure. A
+    # bare `needs: backend` would skip this job on any shard failure -- and a
+    # run where one shard blew its budget is precisely the run whose balance
+    # data is most worth having.
+    if: always() && needs.detect.outputs.backend == 'true'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # See the Detect changes job for why this runs before checkout.
+      - name: Reclaim workspace from root-owned container droppings
+        run: |
+          [ -d "$PWD" ] || exit 0
+          docker run --rm -v "$PWD:/w" --entrypoint sh alpine:3.20 \
+            -c "chown -R $(id -u):$(id -g) /w" 2>/dev/null \
+            || echo "::warning::workspace reclaim failed; a stale root-owned file may fail checkout"
+
+      - uses: actions/checkout@v4
+
+      - name: Download shard durations
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-durations-*
+          path: shard-durations
+          merge-multiple: true
+
+      - name: Merge shard durations over the committed baseline
+        run: |
+          set -euo pipefail
+          if ! ls shard-durations/shard-*.json >/dev/null 2>&1; then
+            echo "::notice::no shard duration artifacts uploaded; nothing to merge"
+            exit 0
+          fi
+          ls -la shard-durations/
+          mkdir -p durations-merged
+          # --output, NOT an in-place rewrite of the checkout: this runner is
+          # shared, and leaving a dirty backend/.test_durations behind would
+          # follow the next job on the same workspace. The tool logs its own
+          # per-shard fresh counts, add/refresh/preserve totals and quality
+          # verdict, so no git diff is needed to see what changed.
+          #
+          # It fails closed (exit 2) on a malformed partial, and tolerates a
+          # MISSING shard loudly -- that shard's baseline entries are kept
+          # rather than dropped, so a merge from 7 of 8 shards degrades the
+          # freshness of one eighth instead of corrupting the balancer.
+          python3 scripts/merge_shard_durations.py \
+            shard-durations/shard-*.json \
+            --baseline backend/.test_durations \
+            --output durations-merged/.test_durations
+
+      - name: Upload merged .test_durations
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-test-durations
+          path: durations-merged/.test_durations
+          if-no-files-found: ignore
+          retention-days: 14
 
   agent:
     name: CI / Agent

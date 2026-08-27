@@ -24,7 +24,9 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Callable, TypedDict
+from typing import Callable, NamedTuple, TypedDict, TypeVar
+
+from app.size_limit_justification import apply_ledger_justifications
 
 
 class GovernanceCapExceededError(ValueError):
@@ -118,6 +120,10 @@ SECTION_EXCLUDED: dict[str, Callable[[str], bool]] = {
 
 def governance_caps_from_source_text(source_text: str) -> list[int]:
     """``*_SIZE_GOVERNANCE_CAP`` int declarations in source text (no disk I/O)."""
+    # Exact, not heuristic: the matcher below accepts only a NAME ending in this
+    # same literal. Skipping ast.parse here: five-section scan 21.25s -> 1.86s.
+    if "_SIZE_GOVERNANCE_CAP" not in source_text:
+        return []
     try:
         tree = ast.parse(source_text)
     except (SyntaxError, ValueError):
@@ -629,6 +635,45 @@ _bump_history_cache: dict[
 ] = {}
 _CACHE_TTL_SECONDS: float = 60.0
 
+# Per-ROOT memo for the git PROBES the history read performs.  Both probes
+# answer a question about the CHECKOUT (which ref scopes the mainline ancestry;
+# does that ancestry cross a shallow boundary), not about any one module, but
+# ``_bump_history_cache`` is keyed per (module_key, section, root) — so a caller
+# that classifies N modules against ONE root re-shelled both probes N times.
+#
+# Measured cost of that gap: the reaper's near-cap sweep
+# (``app.metrics_integrity_sweep.check_near_cap_size_warning``) calls
+# :func:`parse_bump_history` once per near-cap module — 48 modules today — and
+# each call spawned SIX ``git`` processes (1 ``rev-parse --git-path``, 4
+# ``rev-parse --verify`` for the mainline candidates, 1 ``merge-base
+# --is-ancestor``).  288 serial process spawns inside one
+# ``asyncio.to_thread``: 9.3s on an idle dev box, 16.1s inside a CI shard
+# container against that lane's then-30s per-test budget, which red-lit
+# promotion PR #17977 when ordinary host jitter pushed it over.  With the memo
+# the same sweep spawns 6 processes total.
+#
+# The RESOLVED root is the key (never the caller's ``None``): ``_REPO_ROOT`` is
+# monkeypatched by tests and by ``--fix --repo-root``, so keying on the raw
+# argument would let one root's answer serve another — the same poisoning
+# ``_bump_history_cache`` documents above.  Same TTL as the history cache: both
+# describe "what this checkout looks like right now".
+_git_probe_cache: dict[tuple[str, str], tuple[object, float]] = {}
+
+_ProbeT = TypeVar("_ProbeT")
+
+
+def _probe_cached(kind: str, root: str, compute: Callable[[], _ProbeT]) -> _ProbeT:
+    """Return ``compute()`` for ``(kind, root)``, memoised for the cache TTL."""
+    key = (kind, root)
+    now = time.monotonic()
+    cached = _git_probe_cache.get(key)
+    if cached is not None and now - cached[1] < _CACHE_TTL_SECONDS:
+        return cached[0]  # type: ignore[return-value]
+    value = compute()
+    _git_probe_cache[key] = (value, now)
+    return value
+
+
 # Repo root: backend/app/ -> ../../
 _SOURCE_TREE_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..")
@@ -637,6 +682,19 @@ _REPO_ROOT = "/repo" if os.path.isdir("/repo/backend/app") else _SOURCE_TREE_ROO
 _TESTING_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "testing"))
 _MODULE_SIZE_LIMITS_RELPATH = "backend/testing/module_size_limits.json"
 _MODULE_SIZE_LIMITS_PATH = os.path.join(_TESTING_DIR, "module_size_limits.json")
+
+# Every ``git log -p`` / ``git show`` read of the caps file MUST render whole-
+# file context.  Cap attribution needs the enclosing ``"<section>": {`` opener
+# (the same module basename lives in more than one section), and with git's
+# default three lines of context that opener is almost never inside the hunk —
+# git's funcname heuristic finds nothing usable in JSON either, since no line
+# of it starts with an identifier character.  git clamps the value to the file
+# size, so this asks for "the whole file" without hard-coding a length.
+# Measured on the real history (213 commits touching the file): the default
+# ``-U3`` stream is ~330KB, the full-context stream ~3.5MB and ~1s to produce.
+# That is affordable ONLY because callers parse the stream ONCE
+# (:func:`_parse_git_log_bump_records`) instead of re-scanning it per cap key.
+_FULL_CONTEXT_DIFF_ARG = "-U100000"
 
 # Committed cap-bump-history ledger. In the deployed backend layout the git
 # evidence source is structurally unreachable (the production ``app`` stage
@@ -699,6 +757,13 @@ def _mainline_git_ref(repo_root: str | None = None) -> str:
     disagree by construction.
     """
     root = repo_root or _REPO_ROOT
+    return _probe_cached(
+        "mainline_ref", root, lambda: _mainline_git_ref_uncached(root)
+    )
+
+
+def _mainline_git_ref_uncached(root: str) -> str:
+    """Uncached body of :func:`_mainline_git_ref` — up to four ``git`` spawns."""
     for candidate in _MAINLINE_BRANCH_CANDIDATES:
         try:
             # safe.directory: keep the probe working when the checkout is bound
@@ -778,6 +843,13 @@ def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     truncated.  A boundary on an unrelated branch must not fail closed.
     """
     root = repo_root or _REPO_ROOT
+    return _probe_cached(
+        "history_truncated", root, lambda: _git_history_is_truncated_uncached(root)
+    )
+
+
+def _git_history_is_truncated_uncached(root: str) -> bool:
+    """Uncached body of :func:`_git_history_is_truncated`."""
     shallow_path = _git_shallow_file_path(root)
     if not os.path.isfile(shallow_path):
         return False
@@ -877,7 +949,7 @@ def parse_bump_history(
         # ancestry.  A real git failure here is genuine evidence loss and stays
         # fail-closed (raised, not degraded to "no bump history").
         try:
-            records = _read_git_bump_history(module_key, root)
+            records = _read_git_bump_history(module_key, root, section=section)
         except BumpHistoryUnavailableError as err:
             # Cache the failure too: a broken history read stays broken within
             # the TTL, so a reconcile cycle does not re-shell git per file.
@@ -899,8 +971,15 @@ def parse_bump_history(
     return records
 
 
-def _read_git_bump_history(module_key: str, repo_root: str | None = None) -> list[BumpRecord] | None:
+def _read_git_bump_history(
+    module_key: str, repo_root: str | None = None, *, section: str
+) -> list[BumpRecord] | None:
     """Read bump history from git, or ``None`` when git is structurally absent.
+
+    ``section`` names the enclosing object in ``module_size_limits.json``; it
+    is part of a cap's identity because the same module basename exists in
+    more than one section (``test_local_runner.py`` is both a ``testing`` and
+    a ``scripts`` cap, on two different real files).
 
     ``None`` (NOT an error) signals the deployed layout: no git binary on PATH
     or ``repo_root`` (default ``_REPO_ROOT``) is not a git checkout.  The caller
@@ -945,6 +1024,7 @@ def _read_git_bump_history(module_key: str, repo_root: str | None = None) -> lis
                 _mainline_git_ref(root),
                 "--format=COMMIT %H %aI",
                 "-p",
+                _FULL_CONTEXT_DIFF_ARG,
                 "--",
                 _MODULE_SIZE_LIMITS_RELPATH,
             ],
@@ -966,7 +1046,7 @@ def _read_git_bump_history(module_key: str, repo_root: str | None = None) -> lis
             f"git log exited {result.returncode} while reading bump history "
             f"for {module_key!r}"
         )
-    return _parse_git_diff_output(result.stdout, module_key)
+    return _parse_git_diff_output(result.stdout, module_key, section)
 
 
 def _read_cap_bump_history_ledger(section: str, module_key: str) -> list[BumpRecord]:
@@ -1024,12 +1104,13 @@ def _read_cap_bump_history_ledger(section: str, module_key: str) -> list[BumpRec
     return records
 
 
+# A staged cap bump: 4 fields before its commit exists, 6 with git provenance.
+_PendingBump = tuple[str, str, int, int] | tuple[str, str, int, int, str, str]
+
+
 def ledger_with_pending_bumps(
     ledger_data: dict,
-    pending: list[
-        tuple[str, str, int, int]
-        | tuple[str, str, int, int, str, str]
-    ],
+    pending: list[_PendingBump],
 ) -> dict:
     """Return a copy of ``ledger_data`` with ``pending`` bumps reconciled.
 
@@ -1085,10 +1166,8 @@ def rebuild_cap_bump_history_ledger(
     *,
     caps_json_path: str | None = None,
     ledger_path: str | None = None,
-    pending: list[
-        tuple[str, str, int, int]
-        | tuple[str, str, int, int, str, str]
-    ] | None = None,
+    pending: list[_PendingBump] | None = None,
+    justifications: dict | None = None,
     repair_targets: set[tuple[str, str]] | None = None,
     repo_root: str | None = None,
 ) -> dict:
@@ -1117,10 +1196,11 @@ def rebuild_cap_bump_history_ledger(
     including truncated ones — the mirror is then self-healed by pruning only
     records that positive git evidence proves fabricated
     (:func:`phantom_ledger_records`). Missing or otherwise unverifiable evidence
-    is preserved, never treated as proof of fabrication. ``caps_json_path`` /
-    ``ledger_path``
-    default to the shipped files (under ``backend/testing/``); callers with a
-    hermetic fixture repo pass the fixture paths.
+    is preserved, never treated as proof of fabrication. ``justifications``
+    (``{(section, key, old_cap, new_cap): text}``) records operator approval on
+    those bumps and carries recorded ones forward. ``caps_json_path`` /
+    ``ledger_path`` default to the shipped files (under ``backend/testing/``);
+    callers with a hermetic fixture repo pass the fixture paths.
     """
     caps_path = caps_json_path or _MODULE_SIZE_LIMITS_PATH
     out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
@@ -1153,6 +1233,7 @@ def rebuild_cap_bump_history_ledger(
                     _mainline_git_ref(root),
                     "--format=COMMIT %H %aI",
                     "-p",
+                    _FULL_CONTEXT_DIFF_ARG,
                     "--",
                     _MODULE_SIZE_LIMITS_RELPATH,
                 ],
@@ -1186,13 +1267,16 @@ def rebuild_cap_bump_history_ledger(
     if git_output is not None and caps_readable:
         caps_keys: dict[str, set[str]] = {}
         git_histories: dict[str, dict[str, list[BumpRecord]]] = {}
+        # ONE pass over the (full-context, multi-megabyte) log for ALL keys.
+        # Parsing per key would re-scan the whole stream several hundred times.
+        git_records = _parse_git_log_bump_records(git_output)
         for section, keys in caps_data.items():
             if not isinstance(keys, dict):
                 continue
             caps_keys[section] = set(keys)
             section_records: dict[str, list[BumpRecord]] = {}
             for key in keys:
-                recs = _parse_git_diff_output(git_output, key)
+                recs = git_records.get((section, key))
                 if recs:
                     section_records[key] = recs
             if section_records:
@@ -1275,6 +1359,7 @@ def rebuild_cap_bump_history_ledger(
         "history": base_history,
     }
     ledger = ledger_with_pending_bumps(ledger, pending or [])
+    ledger = apply_ledger_justifications(ledger, existing_history, justifications)
     # newline="": this ledger is a tracked file, and platform newline
     # translation on a Windows --fix would rewrite every line as CRLF.
     with open(out_path, "w", encoding="utf-8", newline="") as f:
@@ -1366,6 +1451,7 @@ def missing_ledger_bump_records(
                 _mainline_git_ref(root),
                 "--format=COMMIT %H %aI",
                 "-p",
+                _FULL_CONTEXT_DIFF_ARG,
                 "--",
                 _MODULE_SIZE_LIMITS_RELPATH,
             ],
@@ -1391,6 +1477,11 @@ def missing_ledger_bump_records(
     reachable = _head_reachable_cap_commits(root)
     if reachable is None:
         return []
+
+    # ONE pass over the (full-context, multi-megabyte) log for ALL keys: the
+    # loop below walks several hundred caps, and re-parsing the stream per key
+    # would put gigabytes of regex work inside a single guard call.
+    git_records = _parse_git_log_bump_records(result.stdout)
 
     history = ledger_data.get("history", {}) if isinstance(ledger_data, dict) else {}
     global_start = min(
@@ -1420,7 +1511,7 @@ def missing_ledger_bump_records(
                 ),
                 default=global_start,
             )
-            for record in _parse_git_diff_output(result.stdout, key):
+            for record in git_records.get((section, key), []):
                 if record["commit_sha"] not in reachable:
                     # Mainline-only bump: this branch does not contain the
                     # commit, so its ledger cannot be expected to record it.
@@ -1612,98 +1703,176 @@ def _split_git_log_chunks(output: str) -> list[tuple[str, str, str]]:
     return chunks
 
 
-def _parse_git_diff_output(output: str, module_key: str) -> list[BumpRecord]:
-    """Parse ``git log -p`` output for cap increases of ``module_key``.
+# ``module_size_limits.json`` maps a SECTION (``backend``, ``testing``,
+# ``scripts``, ...) to ``{module_basename: cap}``, and the SAME basename
+# legitimately exists in two sections pointing at two different real files
+# (``test_local_runner.py`` lives in both ``testing/`` and ``scripts/``).  A
+# diff line alone therefore does NOT identify a cap: attribution needs the
+# enclosing section object.  These two scanners recover it from the diff
+# itself; every parser below keys its result by ``(section, key)``, never by
+# ``key`` alone.  Section-blind attribution was wrong in BOTH directions: it
+# reported a bump of ``testing/X.py`` as unrecorded drift in ``scripts/X.py``
+# (a false failure whose ``--fix`` wrote a transition that never happened),
+# and it let a real bump in one section be "justified" by an unrelated ledger
+# record filed under another section with a coincidentally equal cap pair.
+#
+# Order matters: a section opener ends in ``{`` and an entry ends in a number,
+# so the opener must be tested FIRST.  Indentation is deliberately loose
+# because historical revisions of the file need not match today's formatting.
+_SECTION_OPEN_RE = re.compile(r'^([ +-])\s*"([^"]+)"\s*:\s*\{')
+_ENTRY_RE = re.compile(r'^([ +-])\s*"([^"]+)"\s*:\s*(\d+)')
 
-    Splits the output on "COMMIT <sha> <date>" header lines (via
-    :func:`_split_git_log_chunks`), then within each commit's diff looks for
-    ``-    "<key>": <int>`` (removed) and ``+    "<key>": <int>`` (added)
-    lines.  Records only increases (new_cap > old_cap) — a decrease or reset
-    is not a bump.
 
-    Merge-duplicated bump pairs are collapsed: the same cap change
-    (old_cap -> new_cap) is frequently recorded twice in ``git log --all`` —
-    once on the commit that first introduced the new limit value (typically an
+class DiffBumpPairs(NamedTuple):
+    """Section-attributed cap bumps found in ONE commit's diff.
+
+    ``by_section_key`` maps ``(section, key)`` to the increase pairs the diff
+    proves.  ``unattributed_keys`` holds every key whose enclosing section
+    could not be determined from the diff text — evidence that exists but
+    cannot be placed.  Callers must treat those as ABSENT evidence (skip),
+    never as a verdict: skipping is the safe direction for both halves of the
+    ledger guard.  For :func:`missing_ledger_bump_records` (git -> ledger) it
+    avoids raising a ``[ledger-missing]`` failure for a bump we cannot place,
+    and for :func:`phantom_ledger_records` (ledger -> git) it avoids
+    condemning a real record as fabricated because its section was invisible.
+    """
+
+    by_section_key: dict[tuple[str, str], set[tuple[int, int]]]
+    unattributed_keys: frozenset[str]
+
+
+def _scan_diff_bumps(diff_text: str) -> DiffBumpPairs:
+    """Scan one commit's diff for section-attributed cap increases.
+
+    Two independent section cursors are tracked, an OLD-side one and a
+    NEW-side one: a context line (``' '``) advances both, a ``'-'`` line only
+    the old cursor and a ``'+'`` line only the new one.  A removed entry is
+    attributed to the old-side section and an added entry to the new-side
+    section, which stays exact even when a section is added, removed or
+    renamed in the same commit.
+
+    Only an INCREASE is a bump (``new > old``); a decrease or reset is not,
+    which is why a decrease mis-filed in the ledger is a phantom.  At most one
+    pair per ``(section, key)`` per commit is produced — the last ``-``/``+``
+    values seen — matching the historical per-commit behaviour.
+
+    The diff must be rendered with FULL file context (see
+    :data:`_FULL_CONTEXT_DIFF_ARG`); with git's default three context lines the
+    enclosing ``"<section>": {`` opener is almost never inside the hunk and
+    git's funcname heuristic finds nothing usable in JSON, so nearly every
+    bump would land in ``unattributed_keys``.
+    """
+    old_section: str | None = None
+    new_section: str | None = None
+    seen: dict[tuple[str, str], tuple[int | None, int | None]] = {}
+    unattributed: set[str] = set()
+
+    for line in diff_text.split("\n"):
+        opener = _SECTION_OPEN_RE.match(line)
+        if opener is not None:
+            marker, name = opener.group(1), opener.group(2)
+            if marker != "+":
+                old_section = name
+            if marker != "-":
+                new_section = name
+            continue
+        entry = _ENTRY_RE.match(line)
+        if entry is None:
+            continue
+        marker, key, raw_value = entry.group(1), entry.group(2), entry.group(3)
+        if marker == " ":
+            # An unchanged entry is context, not a bump.
+            continue
+        section = old_section if marker == "-" else new_section
+        if section is None:
+            # Fail open: evidence with no attributable section is reported as
+            # ABSENT, never as a verdict in either direction.
+            unattributed.add(key)
+            continue
+        value = int(raw_value)
+        old_cap, new_cap = seen.get((section, key), (None, None))
+        if marker == "-":
+            seen[(section, key)] = (value, new_cap)
+        else:
+            seen[(section, key)] = (old_cap, value)
+
+    by_section_key: dict[tuple[str, str], set[tuple[int, int]]] = {}
+    for section_key, (old_cap, new_cap) in seen.items():
+        if old_cap is not None and new_cap is not None and new_cap > old_cap:
+            by_section_key.setdefault(section_key, set()).add((old_cap, new_cap))
+    return DiffBumpPairs(by_section_key, frozenset(unattributed))
+
+
+def _parse_git_log_bump_records(
+    output: str,
+) -> dict[tuple[str, str], list[BumpRecord]]:
+    """Parse a whole ``git log -p`` stream ONCE into ``(section, key) -> records``.
+
+    Splits the output on ``COMMIT <sha> <date>`` header lines (via
+    :func:`_split_git_log_chunks`), then attributes each commit's cap
+    increases to their enclosing section (:func:`_scan_diff_bumps`).
+
+    Parsing the stream once is load-bearing, not a micro-optimisation: the
+    full-context diff of this file is multiple megabytes and its callers loop
+    over several hundred cap keys.  Re-scanning per key would put gigabytes of
+    regex work inside one guard call and blow the subprocess/CPU budget the
+    checker runs under.
+
+    Merge-duplicated bump pairs are collapsed per ``(section, key)``: the same
+    cap change (old_cap -> new_cap) is frequently recorded twice — once on the
+    commit that first introduced the new limit value (typically an
     integration-branch rollup) and again on a sibling/promotion commit that
     re-applied the identical value (e.g. a main-side "adopt automain" fix).
     Both diffs carry the exact same -/+ pair, so a naive parse would count one
-    logical bump twice and inflate the chronic-offender window/growth triggers.
-    Rule: for each (old_cap, new_cap) pair keep ONLY the record with the
-    earliest commit_date — the commit that first introduced the new limit
-    value — and drop the later duplicate(s).  Records are sorted by actual
-    timestamp (not the ISO string, which mis-orders mixed-offset commits).
-    This keeps regeneration stable and idempotent: the surviving records depend
-    only on the content of the history, not on which refs happen to be fetched
-    or on git's traversal order.
+    logical bump twice and inflate the chronic-offender window/growth
+    triggers.  Rule: for each pair keep ONLY the record with the earliest
+    commit_date — the commit that first introduced the new limit value — and
+    drop the later duplicate(s).  git log emits commits newest-first, so the
+    sibling/promotion duplicate appears BEFORE the commit that introduced it;
+    the survivor must be chosen by TIMESTAMP, not by position.  Records are
+    sorted by actual timestamp (not the ISO string, which mis-orders
+    mixed-offset commits).  This keeps regeneration stable and idempotent: the
+    surviving records depend only on the content of the history, not on which
+    refs happen to be fetched or on git's traversal order.
     """
-    records: list[BumpRecord] = []
-    # Matches +/- diff lines containing the key and a numeric cap value.
-    cap_re = re.compile(rf'^([+-])\s+"{re.escape(module_key)}":\s*(\d+)', re.MULTILINE)
-
+    earliest: dict[tuple[str, str], dict[tuple[int, int], BumpRecord]] = {}
     for sha, date, diff_text in _split_git_log_chunks(output):
-        old_cap: int | None = None
-        new_cap: int | None = None
-        for m in cap_re.finditer(diff_text):
-            sign, val_str = m.group(1), m.group(2)
-            val = int(val_str)
-            if sign == "-":
-                old_cap = val
-            elif sign == "+":
-                new_cap = val
-        if old_cap is not None and new_cap is not None and new_cap > old_cap:
-            records.append(
-                BumpRecord(
-                    commit_sha=sha,
-                    commit_date=date,
-                    old_cap=old_cap,
-                    new_cap=new_cap,
-                )
-            )
-
-    # Collapse merge-duplicated bump pairs to the earliest-dated survivor (see
-    # the docstring for the rule). git log emits commits newest-first, so the
-    # sibling/promotion duplicate of a bump appears BEFORE the commit that
-    # introduced it — the survivor must be chosen by timestamp, not position.
-    earliest_by_pair: dict[tuple[int, int], BumpRecord] = {}
-    for record in records:
-        pair = (record["old_cap"], record["new_cap"])
-        prior = earliest_by_pair.get(pair)
-        if prior is None or _parse_iso(record["commit_date"]) < _parse_iso(
-            prior["commit_date"]
-        ):
-            earliest_by_pair[pair] = record
-    return sorted(
-        earliest_by_pair.values(),
-        key=lambda r: _parse_iso(r["commit_date"]),
-    )
+        for section_key, pairs in _scan_diff_bumps(diff_text).by_section_key.items():
+            slot = earliest.setdefault(section_key, {})
+            for old_cap, new_cap in pairs:
+                prior = slot.get((old_cap, new_cap))
+                if prior is None or _parse_iso(date) < _parse_iso(
+                    prior["commit_date"]
+                ):
+                    slot[(old_cap, new_cap)] = BumpRecord(
+                        commit_sha=sha,
+                        commit_date=date,
+                        old_cap=old_cap,
+                        new_cap=new_cap,
+                    )
+    return {
+        section_key: sorted(
+            records.values(), key=lambda r: _parse_iso(r["commit_date"])
+        )
+        for section_key, records in earliest.items()
+    }
 
 
-def _diff_bump_pairs(diff_text: str) -> dict[str, set[tuple[int, int]]]:
-    """Map every key a diff touches to its bump pairs.
+def _parse_git_diff_output(
+    output: str, module_key: str, section: str
+) -> list[BumpRecord]:
+    """Return ``git log -p`` cap increases for ``module_key`` inside ``section``.
 
-    For one commit's diff text, collect each ``-    "<key>": <old>`` /
-    ``+    "<key>": <new>`` pair and record the pair ONLY when it is an
-    increase (new > old).  A decrease or reset is not a bump and cannot
-    justify a ledger record — which is exactly why a decrease mis-filed in the
-    ledger is a phantom.  Unlike :func:`_parse_git_diff_output` (one key,
-    deduped across commits), this maps EVERY key in the diff, the per-commit
-    source of truth the phantom-ledger check compares ledger records against.
+    ``section`` is REQUIRED: the same basename exists in more than one section
+    of ``module_size_limits.json``, so a key alone cannot identify a cap.  See
+    :func:`_parse_git_log_bump_records` for the collapse rule and
+    :func:`_scan_diff_bumps` for the attribution rule.
+
+    Callers that need more than one key out of the same output must call
+    :func:`_parse_git_log_bump_records` ONCE and index the result instead of
+    calling this per key — see that function's note on the parse budget.
     """
-    cap_re = re.compile(r'^([+-])\s+"([^"]+)":\s*(\d+)', re.MULTILINE)
-    by_key: dict[str, tuple[int | None, int | None]] = {}
-    for m in cap_re.finditer(diff_text):
-        sign, key, val_str = m.group(1), m.group(2), m.group(3)
-        val = int(val_str)
-        old_cap, new_cap = by_key.get(key, (None, None))
-        if sign == "-":
-            by_key[key] = (val, new_cap)
-        elif sign == "+":
-            by_key[key] = (old_cap, val)
-    out: dict[str, set[tuple[int, int]]] = {}
-    for key, (old_cap, new_cap) in by_key.items():
-        if old_cap is not None and new_cap is not None and new_cap > old_cap:
-            out.setdefault(key, set()).add((old_cap, new_cap))
-    return out
+    return _parse_git_log_bump_records(output).get((section, module_key), [])
 
 
 def _is_combined_git_diff(diff_text: str) -> bool:
@@ -1712,7 +1881,7 @@ def _is_combined_git_diff(diff_text: str) -> bool:
     Combined diffs use ``diff --cc``/``diff --combined`` headers and prefix
     hunk lines with one marker per parent.  They are readable, but they do not
     provide the single-parent ``- old/+ new`` evidence consumed by
-    :func:`_diff_bump_pairs`; treating that parser miss as proof of a phantom
+    :func:`_scan_diff_bumps`; treating that parser miss as proof of a phantom
     would delete legitimate ledger records attributed to a merge SHA.
     """
     return any(
@@ -1721,24 +1890,35 @@ def _is_combined_git_diff(diff_text: str) -> bool:
     )
 
 
-def _git_log_bump_map(output: str) -> dict[str, dict[str, set[tuple[int, int]]]]:
-    """Build ``commit_sha -> {key: {(old_cap, new_cap)}}`` from ``git log -p`` output.
+def _git_log_bump_map(
+    output: str,
+) -> dict[str, DiffBumpPairs]:
+    """Build ``commit_sha -> DiffBumpPairs`` from ``git log -p`` output.
 
     The per-commit bump map the phantom-ledger check verifies ledger records
-    against.  Merge-duplicated pairs are NOT collapsed here (unlike
-    :func:`_parse_git_diff_output`): each commit is verified on its own merits,
-    and the same pair legitimately appearing in two commits justifies a ledger
-    record pointing at either one.
+    against.  Pairs are keyed by ``(section, key)``: the same module basename
+    exists in more than one section, so a per-key map would let a record filed
+    under one section be corroborated by a bump that happened in another.
+
+    Merge-duplicated pairs are NOT collapsed here (unlike
+    :func:`_parse_git_log_bump_records`): each commit is verified on its own
+    merits, and the same pair legitimately appearing in two commits justifies
+    a ledger record pointing at either one.
+
+    A commit is present in the map whenever its diff yielded either an
+    attributed pair OR an unattributable key, so the caller can tell "this
+    commit shows nothing for that cap" from "this commit's evidence could not
+    be placed in a section".
     """
-    result: dict[str, dict[str, set[tuple[int, int]]]] = {}
+    result: dict[str, DiffBumpPairs] = {}
     for sha, _date, diff_text in _split_git_log_chunks(output):
         if _is_combined_git_diff(diff_text):
             # A merge's combined diff is not attributable to one parent and
             # must be adjudicated as absent evidence by phantom_ledger_records.
             continue
-        pairs = _diff_bump_pairs(diff_text)
-        if pairs:
-            result[sha] = pairs
+        scanned = _scan_diff_bumps(diff_text)
+        if scanned.by_section_key or scanned.unattributed_keys:
+            result[sha] = scanned
     return result
 
 
@@ -1829,6 +2009,7 @@ def _git_show_file_diff(sha: str, repo_root: str) -> str | None:
                 f"safe.directory={repo_root}",
                 "show",
                 sha,
+                _FULL_CONTEXT_DIFF_ARG,
                 "--",
                 _MODULE_SIZE_LIMITS_RELPATH,
             ],
@@ -2006,6 +2187,7 @@ def _batch_commit_file_diffs(shas: list[str], repo_root: str) -> dict[str, str] 
                 "--stdin",
                 "--format=COMMIT %H %aI",
                 "-p",
+                _FULL_CONTEXT_DIFF_ARG,
                 "--",
                 _MODULE_SIZE_LIMITS_RELPATH,
             ],
@@ -2097,6 +2279,7 @@ def phantom_ledger_records(
                 ref,
                 "--format=COMMIT %H %aI",
                 "-p",
+                _FULL_CONTEXT_DIFF_ARG,
                 "--",
                 _MODULE_SIZE_LIMITS_RELPATH,
             ],
@@ -2145,8 +2328,8 @@ def phantom_ledger_records(
     # apiece: the ancestry probe plus its nested ref lookup, the shallow-file
     # resolve, the parent count, and the diff render.  At the current ledger
     # size that is thousands of forks inside one guard call, which is what
-    # pushed this check past CI's 30s pytest-timeout (run 32805982004, backend
-    # shard 8, inside _commit_in_mainline_ancestry).  Answer all of them up
+    # pushed this check past CI's then-30s pytest-timeout (run 32805982004,
+    # backend shard 8, inside _commit_in_mainline_ancestry).  Answer all of them up
     # front in three forks instead.  Each batch falls back to its per-SHA
     # helper when git cannot read it, so no verdict — and no polarity — moves.
     beyond_log_shas = sorted(
@@ -2172,10 +2355,15 @@ def phantom_ledger_records(
             # commit that bumps the cap exists; nothing to verify against yet.
             continue
         pair = (old_cap, new_cap)
-        commit_pairs = bump_map.get(sha, {}).get(key, set())
-        if sha in bump_map:
+        logged = bump_map.get(sha)
+        if logged is not None:
             # The commit is in the (partial) mainline log — we have its diff.
-            if pair not in commit_pairs:
+            if key in logged.unattributed_keys:
+                # The diff touches this key but its enclosing section could not
+                # be read, so it cannot corroborate OR contradict a record
+                # filed under a particular section. Absent evidence, not proof.
+                continue
+            if pair not in logged.by_section_key.get((section, key), set()):
                 phantoms.append(
                     (
                         section,
@@ -2242,7 +2430,11 @@ def phantom_ledger_records(
             # A merge commit is readable, but its combined diff does not expose
             # the single-parent pair format required for attribution.
             continue
-        shown_pairs = _diff_bump_pairs(diff_text).get(key, set())
+        shown = _scan_diff_bumps(diff_text)
+        if key in shown.unattributed_keys:
+            # Section-unattributable evidence: absent, not contradictory.
+            continue
+        shown_pairs = shown.by_section_key.get((section, key), set())
         if pair not in shown_pairs:
             phantoms.append(
                 (

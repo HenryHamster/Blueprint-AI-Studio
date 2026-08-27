@@ -156,7 +156,8 @@
                 "staged",
                 "dedup_reasoning",
                 "category",
-                "paths"
+                "paths",
+                "cost_budget_usd"
             ],
             "example": {
                 "text": "Deliver a reproducible CPU-scale behavior sweep with a self-contained comparison artifact.",
@@ -168,6 +169,7 @@
                 "A direction is a durable strategic outcome or bet, not a task, file/PR shard, implementation checklist, or live status update.",
                 "Creating an active direction opens a recurring autonomous research lane. Use staged=true when it must not begin yet.",
                 "priority is high|medium|low; category is product|structural|mixed; recommended_mode is audit|fundamentals|ship|pause.",
+                "cost_budget_usd is an optional non-negative USD envelope; zero is a valid declared budget.",
                 "Before creating, inspect existing and recently retired directions. Prefer updating an existing outcome and dispatch bounded one-shot work with spawn-task.",
                 "Use multiple spawn-task calls under one direction to split implementation across tasks — chain them with depends_on when they share contracts or files, and leave them independent only when the work genuinely does not overlap."
             ]
@@ -198,7 +200,8 @@
                 "criterion_keys",
                 "recommended_mode",
                 "system_id",
-                "conflicts_with"
+                "conflicts_with",
+                "cost_budget_usd"
             ],
             "example": {
                 "direction_id": "d-123",
@@ -207,7 +210,8 @@
             },
             "notes": [
                 "Pass fields directly. The legacy {direction_id, changes:{...}} wrapper remains temporarily supported.",
-                "A terminal status update follows the same rationale and terminal_reason contract as retire_direction."
+                "A terminal status update follows the same rationale and terminal_reason contract as retire_direction.",
+                "cost_budget_usd accepts a non-negative USD number; set it to null to clear an existing envelope."
             ]
         }
     },
@@ -635,6 +639,190 @@
             "notes": [
                 "Qualification is expensive; request it only at a meaningful stable checkpoint.",
                 "Omit probes for ordinary code/release judgment. Request walkthrough_e2e only when the release claim requires live product behavior."
+            ]
+        }
+    },
+    {
+        "op": "force_promote",
+        "alias": "force-promote",
+        "description": "Promote the open release version, SKIPPING the release audit gate — it does NOT skip CI: the promotion PR must still go green before it merges.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "reason"
+            ],
+            "fields": [
+                "reason",
+                "candidate_sha"
+            ],
+            "example": {
+                "reason": "Release claims are proven by landed work; only the audit lane is outstanding.",
+                "candidate_sha": "0c45d166455a0f6d3c1a2b4e5d6f708192a3b4c5"
+            },
+            "notes": [
+                "DOES: cut the release branch, open the release-vN -> promotion-target PR, and hand it to the normal CI-wait / managed-check-wait machinery.",
+                "SKIPS: the release AUDIT / qualification scoring gate, and ONLY that.",
+                "DOES NOT SKIP CI. The promotion PR must still go green on the promotion-target required branch-protection checks before anything merges. Never report this to the operator as \"skipping CI\".",
+                "Two-phase by design: the first call cuts the PR and returns a waiting status (commonly promotion_check_wait); call it again once CI is green to land it.",
+                "Refuses as a no-op status rather than an error when there is no open version, credentials are missing, or a promotion is already in flight. Report the returned status and detail verbatim instead of asserting success.",
+                "candidate_sha defaults to the current integration-branch HEAD. Pin it only to promote a specific proven commit.",
+                "Use request-qualification instead when the audit verdict is what is actually wanted."
+            ]
+        }
+    },
+    {
+        "op": "approve_activation",
+        "alias": "approve-activation",
+        "description": "Approve activation of the current promoted version so the deploy agent takes it live. Skips NOTHING: the same preconditions the human in-product lever enforces are evaluated by the same code.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "reason"
+            ],
+            "fields": [
+                "reason"
+            ],
+            "example": {
+                "reason": "v46 promoted green and its release claims are proven by landed work; taking it live."
+            },
+            "notes": [
+                "DOES: stamp activation approval on the CURRENT promoted version - the field the deploy agent polls for before it executes an activation.",
+                "SKIPS: nothing. The same five preconditions the human in-product lever enforces are evaluated by the same code: a promoted version exists, it is not already serving, it has no unresolved deploy failure, its aggregate serving status is re-armable, and re-approval while unconfirmed is idempotent.",
+                "Takes NO target. The approval always aims at the current promoted version, so it can never be pointed at a different or historical artifact, and it binds that version exact promoted_sha.",
+                "Approving is not the same as serving. The deploy agent executes on its next poll and reports a receipt bound to that SHA; a receipt for any other revision is refused.",
+                "Refuses with a stated reason (409) when the version is already serving, has an unresolved deploy failure, or is not awaiting activation. Report that reason verbatim instead of asserting the deploy happened.",
+                "Recorded provenance is honest: mode \"resident_approval\", actor \"strategic_task:<uuid>\". It is never stamped as a human in-product approval."
+            ]
+        }
+    },
+    {
+        "op": "requeue_task",
+        "alias": "requeue-task",
+        "description": "Re-drive one same-project failed, cancelled, blocked, evaluating, or parked task back to QUEUED (this is also the retry verb). Does NOT re-run a qualification and does NOT unpark a review loop.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "target_task_id",
+                "reason"
+            ],
+            "fields": [
+                "target_task_id",
+                "reason",
+                "guidance"
+            ],
+            "example": {
+                "target_task_id": "7b48ce0f-55c6-4f62-904f-ec624bc32763",
+                "reason": "Platform-killed on an AGENT_TIMEOUT; the work itself was never attempted.",
+                "guidance": "The previous attempt died before writing any code. Start from the branch as it stands."
+            },
+            "notes": [
+                "DOES: re-drive one same-project task back to QUEUED through the SAME admin status-transition path an operator PATCH uses, so attempt/runtime reset, cascade rules, and review/fix PR admission all behave identically.",
+                "This is also the RETRY verb. Retrying a failed task IS requeueing it; there is no separate retry op.",
+                "Retryable source statuses are FAILED, CANCELLED, BLOCKED, EVALUATING, and PARKED. Anything else is refused 409 with the current status as the reason.",
+                "DOES NOT re-run a failed release qualification (use request-qualification), DOES NOT unpark a review-fix loop or restore an exhausted iteration cap (use reset-iteration-cap), and DOES NOT resurrect a COMPLETED task.",
+                "guidance is an optional one-shot retry instruction appended to the requeued prompt; it defaults to the reason, because requeueing with no instruction at all is how an agent repeats the attempt that just failed. Never write _original_prompt_suffix; that key is internal retry-dedup metadata and is refused.",
+                "Scoped to the calling project. A cross-project target is refused 403."
+            ]
+        }
+    },
+    {
+        "op": "reset_iteration_cap",
+        "alias": "reset-iteration-cap",
+        "description": "UNPARK a parked review-fix chain and reset its exhausted per-PR/per-chain iteration cap. Does NOT re-spawn any task and never touches the PR.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "target_task_id",
+                "reason"
+            ],
+            "fields": [
+                "target_task_id",
+                "reason"
+            ],
+            "example": {
+                "target_task_id": "7b48ce0f-55c6-4f62-904f-ec624bc32763",
+                "reason": "The cap tripped on three infra timeouts, not on real review iterations."
+            },
+            "notes": [
+                "This is the UNPARK verb for a review-fix chain. A chain parked for operator disposition (review_loop_abandon_candidate, or a stuck/standoff terminal outcome) is released by exactly this operation and by nothing else.",
+                "DOES: archive the FAILED review/fix tasks on the PR so they leave the per-PR cap census, zero the per-chain iteration counter, stamp the reset marker that also releases the merge-gate exact-target respawn budget, clear the abandon-candidate park marker, and clear the approval hold ONLY when that hold provably belongs to this cap episode.",
+                "DOES NOT re-spawn anything. The next orchestrator cycle or an explicit rollup has to pick the chain back up.",
+                "DOES NOT close, merge, or otherwise touch the PR, and DOES NOT stamp resolved:true on the terminal outcome, because a reset is not evidence that the loop converged.",
+                "Requires the task to carry context.review_loop.pr_number or context.rollup_pr_number; a task with no PR is refused 400.",
+                "Same implementation as the operator lever POST /api/admin/tasks/{id}/reset-iteration-cap. One code path, not a parallel one."
+            ]
+        }
+    },
+    {
+        "op": "set_task_priority",
+        "alias": "set-task-priority",
+        "description": "Reprioritise one same-project task by rewriting the integer the dispatch loop orders by. Does NOT dispatch it, raise a cap, or clear a dependency gate.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "target_task_id",
+                "priority",
+                "reason"
+            ],
+            "fields": [
+                "target_task_id",
+                "priority",
+                "reason"
+            ],
+            "example": {
+                "target_task_id": "7b48ce0f-55c6-4f62-904f-ec624bc32763",
+                "priority": "high",
+                "reason": "This unblocks two other directions and should dispatch ahead of queued research."
+            },
+            "notes": [
+                "DOES: rewrite Task.priority, the integer the dispatch loop orders its candidate queue by. priority accepts high|medium|low (100|50|0) or an explicit integer 0-100.",
+                "DOES NOT dispatch the task, raise a concurrency cap, bypass a dependency or landing gate, or unblock a BLOCKED row. Priority only decides ORDER among rows that are already eligible, so raising it on a gated task changes nothing.",
+                "To reprioritise a DIRECTION use update-direction with priority=high|medium|low. This op is for tasks only.",
+                "Scoped to the calling project. A cross-project target is refused 403."
+            ]
+        }
+    },
+    {
+        "op": "unhold_direction",
+        "alias": "unhold-direction",
+        "description": "Clear a consecutive-failure hold so a direction dispatches work again. Does NOT change its status, reset saturation, or spawn anything.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "direction_id",
+                "reason"
+            ],
+            "fields": [
+                "direction_id",
+                "reason"
+            ],
+            "example": {
+                "direction_id": "d-1210b9",
+                "reason": "The three consecutive failures were one platform defect, now root-fixed."
+            },
+            "notes": [
+                "DOES: clear the consecutive-failure hold that stops a direction from dispatching new tasks. Idempotent: was_held=false when the direction was already healthy.",
+                "DOES NOT change the direction status, reset saturation or refractory state, re-activate a retired or staged direction (use activate-direction), or spawn any task. It only removes the failure hold.",
+                "The hold is control-plane state re-evaluated each cycle, so clearing it without fixing the underlying failure just lets the direction fail back into a hold.",
+                "Same implementation as the operator lever POST /api/admin/projects/{id}/directions/{direction_id}/unhold."
             ]
         }
     }

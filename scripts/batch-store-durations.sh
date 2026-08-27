@@ -11,6 +11,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../backend"
 
+# Host interpreter, resolved in one shared place: Git Bash on Windows has no
+# `python3`. Only the HOST-side calls below use it -- the `python3` inside
+# `_run` executes in the Linux test container and is correct as written.
+if [ ! -f "$SCRIPT_DIR/python-interpreter.sh" ]; then
+  echo "ERROR: $SCRIPT_DIR/python-interpreter.sh is missing; this script needs" >&2
+  echo "       it to resolve a host Python interpreter." >&2
+  exit 1
+fi
+# shellcheck source=scripts/python-interpreter.sh
+source "$SCRIPT_DIR/python-interpreter.sh"
+PYTHON_BIN="$(blueprint_python_interpreter)"
+
 TEST_ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 # Resolve deps image
@@ -141,7 +153,7 @@ for w in $(seq 1 $N_WORKERS); do
           if [ -f "$SRC_FILE" ]; then
             cp "$SRC_FILE" "$DUR_FILE"
             rm -f "$SRC_FILE"
-            N=$(python3 -c "import json; print(len(json.load(open('$DUR_FILE'))))" 2>/dev/null || echo "0")
+            N=$("$PYTHON_BIN" -c "import json; print(len(json.load(open('$DUR_FILE'))))" 2>/dev/null || echo "0")
             TOTAL=$((TOTAL + N))
             ELAPSED=$(( $(date +%s) - START_WALL ))
             echo "  [W${w} batch ${BATCH_NUM}] ${N} durations (cumulative ${TOTAL}, ${ELAPSED}s wall)"
@@ -158,7 +170,7 @@ for w in $(seq 1 $N_WORKERS); do
               if [ -f "$SF_SRC" ]; then
                 cp "$SF_SRC" "$SF_DUR"
                 rm -f "$SF_SRC"
-                N=$(python3 -c "import json; print(len(json.load(open('$SF_DUR'))))" 2>/dev/null || echo "0")
+                N=$("$PYTHON_BIN" -c "import json; print(len(json.load(open('$SF_DUR'))))" 2>/dev/null || echo "0")
                 echo "    [W${w}] ${single_f}: ${N} durations"
                 TOTAL=$((TOTAL + N))
               fi
@@ -183,6 +195,6 @@ echo "All workers completed"
 # Delegates to scripts/merge_durations.py (shared outlier cap + quality guards from
 # scripts/durations_quality.py) so the merge logic lives in one lintable, testable place.
 echo ""; echo "=== Merging ==="
-python3 "$SCRIPT_DIR/merge_durations.py" "$SRUN_DIR" "$PWD/.test_durations"
+"$PYTHON_BIN" "$SCRIPT_DIR/merge_durations.py" "$SRUN_DIR" "$PWD/.test_durations"
 
 echo "=== Done ==="

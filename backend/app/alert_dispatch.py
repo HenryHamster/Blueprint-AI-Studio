@@ -1417,14 +1417,16 @@ async def _maybe_create_problem_model_wipe_alert(
         f"usually means the agent is acting on a truncated payload view. "
         f"Investigate recent problem_model writes on this project."
     )
-    alert = Alert(
+    alert, _created, _decision = await create_project_alert_if_allowed(
+        session,
         project_id=project_id,
+        event_type="problem_model.wipe_risk",
         severity=AlertSeverity.WARNING,
         title=title,
         message=message,
-        event_type="problem_model.wipe_risk",
     )
-    session.add(alert)
+    if alert is None:
+        return
     await broadcast_to_project(
         str(project_id),
         "alert_created",
@@ -2671,6 +2673,116 @@ async def _resolve_strategic_cycle_liveness_alerts(
             {"alert_id": str(alert.id), "title": alert.title},
         )
     return len(open_alerts)
+
+
+_STRATEGIC_LANE_DISABLED_ALERT_TITLE = (
+    "Strategic lane deliberately disabled (automatic cycles off)"
+)
+_STRATEGIC_LANE_DISABLED_EVENT_TYPE = "research.strategic_lane_disabled"
+_STRATEGIC_LANE_DISABLED_RESOLUTION_LIMIT = 500
+
+
+def strategic_lane_disabled_dedupe_key(project_id: "uuid.UUID") -> str:
+    """One durable row per project for the deliberate-disable signal."""
+    return f"{_STRATEGIC_LANE_DISABLED_EVENT_TYPE}:{project_id}"
+
+
+def _strategic_lane_disabled_message(admission) -> str:
+    """Render the operator-facing body for a deliberately disabled lane."""
+    return (
+        "Automatic Strategic cycles are OFF for this project via "
+        "build_config.automatic_strategic_cycles_enabled, so the strategic-halt "
+        "detector deliberately excludes it and no completed-cycle receipt is "
+        f"expected. {admission.describe()}. Tactical direction research is "
+        "unaffected and keeps spawning. Explicit/manual Strategic launches and "
+        "the conversational Resident also remain available. Re-enable the flag "
+        "(or let its `until` bound lapse) to restore automatic authorship."
+    )[:1000]
+
+
+async def _resolve_strategic_lane_disabled_alerts(
+    session: AsyncSession, project_ids
+) -> int:
+    """Dismiss the deliberate-disable signal once the lane is live again.
+
+    Batched over every project the caller re-checked, so a sweep across a whole
+    portfolio costs one query rather than one per project.
+    """
+    keys = [strategic_lane_disabled_dedupe_key(pid) for pid in project_ids]
+    if not keys:
+        return 0
+    open_alerts = (
+        (
+            await session.execute(
+                select(Alert)
+                .where(
+                    Alert.dedupe_key.in_(keys),
+                    Alert.dismissed_at.is_(None),
+                )
+                .limit(_STRATEGIC_LANE_DISABLED_RESOLUTION_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not open_alerts:
+        return 0
+    dismissed_at = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = dismissed_at
+        session.add(alert)
+    await session.commit()
+    return len(open_alerts)
+
+
+async def _maybe_create_strategic_lane_disabled_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    admission,
+) -> bool:
+    """Keep exactly one low-severity, non-paging row for a disabled lane.
+
+    Deliberately NOT a fresh row per sweep.  The sweep runs on a short cadence,
+    so a producer that minted (or even just touched) a row per pass would be the
+    same alert-spam defect in a new place: ``dedupe_key`` is looked up FIRST and
+    an unchanged description is a no-op write.  ``occurrence_count`` /
+    ``last_seen_at`` therefore only advance when the disable's DESCRIPTION
+    actually changes (reason edited, ``until`` set or moved, actor recorded),
+    which is exactly when an operator wants to see it re-surface.
+    """
+    dedupe_key = strategic_lane_disabled_dedupe_key(project_id)
+    message = _strategic_lane_disabled_message(admission)
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.dedupe_key == dedupe_key,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None and existing.message == message:
+        return False
+
+    alert, created, decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_STRATEGIC_LANE_DISABLED_EVENT_TYPE,
+        severity=AlertSeverity.INFO,
+        title=_STRATEGIC_LANE_DISABLED_ALERT_TITLE,
+        message=message,
+        source="strategic_lane_disabled",
+        dedupe_key=dedupe_key,
+    )
+    if not decision.emit or alert is None:
+        return False
+    await session.commit()
+    return created
 
 
 async def _maybe_create_strategic_cycle_liveness_alert(

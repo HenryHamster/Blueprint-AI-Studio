@@ -3352,6 +3352,170 @@ def test_local_container_mounts_repo_and_passes_env(monkeypatch):
     assert "REASON=container_image_pull_failed" in wrapper
 
 
+# ---------------------------------------------------------------------------
+# Container image resolution: a local-only image is runnable, an unresolvable
+# one fails closed saying which routes were tried.
+# ---------------------------------------------------------------------------
+
+_FAKE_DOCKER = """#!/usr/bin/env bash
+case "$1" in
+  pull)
+    if [ "$FAKE_PULL_OK" = "1" ]; then
+      echo "Status: Downloaded newer image for $2"
+      exit 0
+    fi
+    echo "Error response from daemon: manifest for $2 not found" >&2
+    exit 1 ;;
+  image)
+    if [ "$2" = "inspect" ]; then
+      if [ "$FAKE_LOCAL_OK" = "1" ]; then
+        echo "[{}]"
+        exit 0
+      fi
+      echo "Error: No such image: $3" >&2
+      exit 1
+    fi ;;
+esac
+exit 0
+"""
+
+
+def _run_image_resolution(tmp_path, *, pull_ok, local_present):
+    """Execute the REAL generated resolution shell against a fake docker.
+
+    Drives the shell the backend actually emits rather than asserting on its
+    text, so a block that reads correctly but behaves wrongly still fails.
+    """
+    import subprocess
+
+    image = "local/trainer:dev"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "docker"
+    fake.write_text(_FAKE_DOCKER)
+    fake.chmod(0o755)
+
+    terminal = tmp_path / "terminal"
+    log = tmp_path / compute_backends_module._CONTAINER_IMAGE_RESOLUTION_LOG
+    block = compute_backends_module._build_container_image_resolution_block(
+        image,
+        terminal_path=shlex.quote(str(terminal)),
+        image_resolution_log=shlex.quote(str(log)),
+    )
+    script = tmp_path / "block.sh"
+    script.write_text(block + "\n")
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["FAKE_PULL_OK"] = "1" if pull_ok else "0"
+    env["FAKE_LOCAL_OK"] = "1" if local_present else "0"
+    # A fake `docker` shim is first on PATH, so this is a millisecond shell
+    # run with no network and no daemon. 20s is ~1000x headroom on a loaded
+    # 2-vCPU runner and stays under the 30s inner-operation ceiling that
+    # backend/testing/test_harness_timeout_budgets.py enforces.
+    proc = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True, timeout=20
+    )
+    return proc.returncode, terminal, log
+
+
+def test_a_locally_built_image_survives_a_failed_pull(tmp_path):
+    """THE DEFECT: an image built on this host could never run.
+
+    The fleet is all local runners, so building a pinned image locally is the
+    ordinary way to get a clean environment onto your own hardware. A tag that
+    exists in no registry can never be pulled, and the pull failure was fatal —
+    so a perfectly good local image became container_image_pull_failed.
+    """
+    rc, terminal, log = _run_image_resolution(
+        tmp_path, pull_ok=False, local_present=True
+    )
+    assert rc == 0, "a present local image must not end the run"
+    assert not terminal.exists()
+    # The path actually taken is recorded, not inferred.
+    assert "already present in this host's image store" in log.read_text()
+
+
+def test_an_unresolvable_image_fails_closed_and_names_both_attempts(tmp_path):
+    """Fail CLOSED when neither route yields an image — and say what was tried."""
+    rc, terminal, _log = _run_image_resolution(
+        tmp_path, pull_ok=False, local_present=False
+    )
+    assert rc == 1
+    reason = next(
+        line for line in terminal.read_text().splitlines() if line.startswith("REASON=")
+    )
+    # The typed token survives for the classifier...
+    assert reason.startswith("REASON=container_image_pull_failed")
+    # ...and the reason names BOTH resolutions and the pull's exit code, so a
+    # human is not sent back to re-derive which route broke.
+    assert "docker pull" in reason
+    assert "docker image inspect" in reason
+    assert "exited 1" in reason
+
+
+def test_the_pull_is_still_attempted_before_the_local_fallback(tmp_path):
+    """The fix must not degrade into "never pull".
+
+    Pulling is what stops a stale cached layer being executed in place of the
+    tag the author named, so it runs FIRST on every containerized job and the
+    local store is consulted only after it has already failed.
+    """
+    block = compute_backends_module._build_container_image_resolution_block(
+        "ghcr.io/acme/trainer:v3",
+        terminal_path="/tmp/t",
+        image_resolution_log="/tmp/l",
+    )
+    assert block.index("docker pull") < block.index("docker image inspect")
+
+    # And a successful pull never consults the local store at all.
+    rc, terminal, _log = _run_image_resolution(
+        tmp_path, pull_ok=True, local_present=False
+    )
+    assert rc == 0
+    assert not terminal.exists()
+
+
+def test_the_pull_error_is_captured_rather_than_discarded(tmp_path):
+    """The registry's own complaint is evidence; /dev/null threw it away."""
+    _rc, _terminal, log = _run_image_resolution(
+        tmp_path, pull_ok=False, local_present=False
+    )
+    assert "manifest for local/trainer:dev not found" in log.read_text()
+
+
+def test_container_image_pull_failed_is_provision_failure_not_code_error():
+    """An image that never resolved is an ENVIRONMENT fault, not a bad command.
+
+    This token matched no classifier rule and fell through to CODE_ERROR — the
+    class reserved for a genuine defect in the experiment's own command. The
+    command never ran at all. CODE_ERROR burns the task's retry budget, dings
+    direction health, and spawns a fix task against code that was never the
+    problem, which then fails identically on the same unresolvable image.
+    """
+    from app.failure_classification import (
+        CODE_ERROR,
+        PROVISION_FAILURE,
+        CONTAINER_IMAGE_UNRESOLVED_TERMINAL_REASON,
+        classify_compute_terminal_reason,
+    )
+
+    # Literal pin: the emitted token and the classified token are the same
+    # string, and neither may drift without this failing.
+    assert CONTAINER_IMAGE_UNRESOLVED_TERMINAL_REASON == "container_image_pull_failed"
+
+    bare = "container_image_pull_failed"
+    assert classify_compute_terminal_reason(bare, None) == PROVISION_FAILURE
+    assert classify_compute_terminal_reason(bare, None) != CODE_ERROR
+
+    # The detailed reason the local wrapper now writes classifies identically.
+    detailed = (
+        "container_image_pull_failed: docker pull local/trainer:dev exited 1 and "
+        "docker image inspect found no copy in this host's image store"
+    )
+    assert classify_compute_terminal_reason(detailed, None) == PROVISION_FAILURE
+
+
 def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
     job_id = uuid.uuid4()
     spec = ComputeLaunchSpec(

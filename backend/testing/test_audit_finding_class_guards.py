@@ -518,8 +518,9 @@ class TestDroppedColumnResidualAbsent:
 
         assert "node_modules" in _PRUNED_DIR_NAMES, (
             "node_modules must stay pruned. Re-admitting it restores the ~200k "
-            "wasted stat calls that made this guard fail as a 30s timeout on the "
-            "Docker-on-Windows bind mount instead of on its assertion."
+            "wasted stat calls that made this guard fail as a timeout on the "
+            "Docker-on-Windows bind mount -- against the then-30s lane budget "
+            "-- instead of on its assertion."
         )
 
     def test_scan_skips_pruned_subtrees_but_still_finds_real_files(self, tmp_path):

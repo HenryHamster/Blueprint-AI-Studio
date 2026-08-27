@@ -189,6 +189,8 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # gets the same audience.
     "runner.update_drain_stuck": OPERATOR_ACTION_NEEDED,
     "runner.cross_project_access": OPERATOR_ACTION_NEEDED,
+    # Execution placement: a local_only project with no eligible runner.
+    "placement.unsatisfiable_local_hold": OPERATOR_ACTION_NEEDED,
     # GCE task-VM proactive resource-health alerts (warm-pool monitoring parity):
     # surfaced to the operator so an OOM- or disk-bound VM is visible in the fleet
     # health summary BEFORE the VM is killed, not only via teardown forensics.
@@ -214,12 +216,14 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "release.ci_unresolved": OPERATOR_FYI,
     "release.build_stalled": OPERATOR_FYI,
     "release.stabilize_stalled": OPERATOR_FYI,
+    "release.version_goal_not_authored": OPERATOR_ACTION_NEEDED,
     "release.approved_pr_stranded": OPERATOR_FYI,
     "release.unshipped_checkpoint_stranded": OPERATOR_ACTION_NEEDED,
     "release.promotion_deploy_failed": OPERATOR_ACTION_NEEDED,
     "release.managed_check_wait_stalled": OPERATOR_FYI,
     "release.qualification_timeout": OPERATOR_ACTION_NEEDED,
     "release.qualification_crash_loop": OPERATOR_ACTION_NEEDED,
+    "release.qualification_trigger_unowned": OPERATOR_ACTION_NEEDED,
     "release.qualification_ci_compliance_block": OPERATOR_FYI,
     "release.walkthrough_key_unmatched": OPERATOR_ACTION_NEEDED,
     # Self-review quality
@@ -234,10 +238,15 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "research.direction_auto_completed": STRATEGIST_INTERNAL,
     "research.direction_auto_retired": STRATEGIST_INTERNAL,
     "research.churn_retirement_recommended": STRATEGIST_INTERNAL,
+    "research.retirement_consideration_needed": STRATEGIST_INTERNAL,
     "research.anomaly_auto_adjusted": STRATEGIST_INTERNAL,
     "research.escalation_delivery_failed": OPERATOR_ACTION_NEEDED,
     "research.diagnosis_stalled": OPERATOR_ACTION_NEEDED,
     "research.strategic_cycle_liveness": OPERATOR_ACTION_NEEDED,
+    # Non-paging companion to the halt alert above: the automatic Strategic
+    # lane is deliberately off.  Operator-visible so a quiet portfolio stays
+    # VISIBLE, FYI so it never pages.
+    "research.strategic_lane_disabled": OPERATOR_FYI,
     "research.strategic_issue": OPERATOR_FYI,
     # Dedup / already-fixed deadlock diagnostics: internal pipeline health
     # signals handled by the strategic agent — not surfaced to the operator.

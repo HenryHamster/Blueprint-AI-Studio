@@ -4832,31 +4832,37 @@ def _latest_heartbeat_progress_at(
     tool_trace,
     active_tool_progress_at: datetime | None,
 ) -> datetime | None:
-    """Return the newest trustworthy progress stamp carried by a heartbeat.
+    """Return the newest trustworthy reaper-progress stamp for a heartbeat.
 
     ``tool_trace`` records top-level tool invocations.  A long-running command
-    can keep producing output after that invocation stamp while task-authored
-    status prose replaces the agent's literal ``Using tool:`` prefix.  The
-    structured ``active_tool_progress_at`` stamp carries that sub-progress so
-    the reaper does not mistake productive verification for an agent stall.
+    can stay validly in flight after its last visible output, especially when a
+    provider buffers command output.  The agent includes
+    ``active_tool_progress_at`` only while that top-level tool is still in
+    flight, so its presence is an active-tool lease: renew the reaper clock to
+    heartbeat receipt time instead of aging from the last buffered output.
+    Once the tool finishes the field is omitted and ordinary progress-stale
+    detection resumes.
 
-    Future values are ignored instead of poisoning the monotonic off-row clock:
-    both VmContact and TaskContact use ``GREATEST``, so accepting a wildly
-    future producer timestamp would otherwise suppress stall detection until
-    wall-clock time caught up.  Five minutes permits ordinary host clock skew.
+    The active stamp's VALUE is never admitted to a persisted clock; only its
+    presence is used, and the server receipt time owns the lease. ``tool_trace``
+    timestamps remain producer-authored evidence, so implausibly future trace
+    values are rejected before they can poison the monotonic off-row clocks.
+    Five minutes permits ordinary host clock skew.
     """
+    received_at = _utcnow()
     trace_at = _parse_latest_tool_use_at(tool_trace)
-    progress_at = active_tool_progress_at
-    if progress_at is not None:
-        if progress_at.tzinfo is not None:
-            progress_at = progress_at.astimezone(timezone.utc).replace(tzinfo=None)
-        if progress_at > _utcnow() + timedelta(minutes=5):
-            logger.warning(
-                "[HEARTBEAT] active_tool_progress_at is implausibly future-dated "
-                "(%s); ignoring it to preserve the monotonic progress clock",
-                progress_at.isoformat(),
-            )
-            progress_at = None
+    if trace_at is not None and trace_at > received_at + timedelta(minutes=5):
+        logger.warning(
+            "[HEARTBEAT] tool_trace tail is implausibly future-dated (%s); "
+            "ignoring it to preserve the monotonic progress clock",
+            trace_at.isoformat(),
+        )
+        trace_at = None
+    # The timestamp value describes the tool's last visible sub-progress, but
+    # presence of the field proves the agent still has that tool in flight. Never
+    # trust the producer's clock value for this lease: normalize every present
+    # value to receipt time, including skewed/future values.
+    progress_at = received_at if active_tool_progress_at is not None else None
     candidates = [stamp for stamp in (trace_at, progress_at) if stamp is not None]
     return max(candidates) if candidates else None
 

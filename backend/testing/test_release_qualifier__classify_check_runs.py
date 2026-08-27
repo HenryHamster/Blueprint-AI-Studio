@@ -55,6 +55,22 @@ async def _with_current_contract(db_session, project, version, record):
     }
 
 
+def _pass_candidate_authorship_gate(mocker):
+    """Keep tests of other finalize gates independent of authorship policy."""
+    mocker.patch.object(
+        rq,
+        "evaluate_candidate_operator_authorship_gate",
+        return_value={
+            "status": "passed",
+            "passed": True,
+            "count": 0,
+            "max_count": 0,
+            "range": {"base_sha": "a" * 40, "head_sha": _LEDGER_SHA_A},
+            "blocker": None,
+        },
+    )
+
+
 # ===========================================================================
 # _classify_check_runs — CI state mapping
 # ===========================================================================
@@ -4890,6 +4906,7 @@ async def test_authorship_contract_finalizes_into_category_ledger_and_gate(
             "suites": {"startup": {"passed": True}},
         },
         version_goal="Ship the release-authorship contract",
+        declare_authorship_budget=False,
     )
     promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
     version.base_sha = "a" * 40
@@ -5070,16 +5087,18 @@ async def test_ci_build_smoke_contract_finalizes_without_grader_category(
     await db_session.commit()
 
     rows = await cvl.get_category_verdicts(db_session, version.id, "feed" * 10)
-    assert len(rows) == 1
-    assert rows[0].category_key == criterion_key
-    assert rows[0].status == expected_status
-    assert rows[0].grader_run_id is None
-    assert rows[0].evidence_provenance["kind"] == "machine"
+    rows_by_key = {row.category_key: row for row in rows}
+    assert set(rows_by_key) == {criterion_key, "c-test-operator-authorship"}
+    assert rows_by_key["c-test-operator-authorship"].status == "met"
+    row = rows_by_key[criterion_key]
+    assert row.status == expected_status
+    assert row.grader_run_id is None
+    assert row.evidence_provenance["kind"] == "machine"
     if with_receipt:
-        assert rows[0].evidence_provenance["source_kind"] == "trusted_ci_workflow"
+        assert row.evidence_provenance["source_kind"] == "trusted_ci_workflow"
         promote_spy.assert_awaited_once()
     else:
-        assert rows[0].evidence_provenance["source_kind"] == (
+        assert row.evidence_provenance["source_kind"] == (
             "release_record_validation"
         )
         assert result.get("blocker") == "criterion_coverage_incomplete"
@@ -6692,10 +6711,9 @@ async def test_reused_blocked_legacy_smoketest_fact_is_ignored(
         "app.release_qualifier.resolve_project_promotion_enabled",
         return_value=False,
     )
+    _pass_candidate_authorship_gate(mocker)
 
     project, version = await _make_project_and_version(db_session)
-    # Keep this fixture's live rubric exactly to the criteria this test declares.
-    await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
@@ -6749,10 +6767,9 @@ async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
+    _pass_candidate_authorship_gate(mocker)
 
     _project, version = await _make_project_and_version(db_session)
-    # Keep this fixture's live rubric exactly to the criteria this test declares.
-    await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
@@ -6804,10 +6821,9 @@ async def test_archival_passed_smoketest_fact_is_ignored(
         "app.release_qualifier.resolve_project_promotion_enabled",
         return_value=False,
     )
+    _pass_candidate_authorship_gate(mocker)
 
     project, version = await _make_project_and_version(db_session)
-    # Keep this fixture's live rubric exactly to the criteria this test declares.
-    await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
@@ -6964,10 +6980,9 @@ async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
+    _pass_candidate_authorship_gate(mocker)
 
     project, version = await _make_project_and_version(db_session)
-    # Keep this fixture's live rubric exactly to the criteria this test declares.
-    await _retract_default_authorship_criterion(db_session, version)
     sha = _LEDGER_SHA_A
     # An active criterion that was never graded into the category-verdict ledger.
     await _add_version_criterion(
@@ -7205,10 +7220,14 @@ async def test_ungraded_acceptance_contract_fails_closed(
     await db_session.refresh(version)
     assert version.last_qualification["blocker"] == "criterion_coverage_incomplete"
     # And the WHY is recorded per category, not just a bare blocker code.
-    _verdicts = version.last_qualification["category_verdicts"]
-    assert {v["category_key"] for v in _verdicts} == {"c-covered1", "c-covered2"}
-    assert all(v["status"] == "not_met" for v in _verdicts)
-    assert all("Not graded" in v["gap"] for v in _verdicts)
+    _verdicts = {
+        verdict["category_key"]: verdict
+        for verdict in version.last_qualification["category_verdicts"]
+    }
+    assert _verdicts["c-test-operator-authorship"]["status"] == "met"
+    ungraded = [_verdicts["c-covered1"], _verdicts["c-covered2"]]
+    assert all(verdict["status"] == "not_met" for verdict in ungraded)
+    assert all("Not graded" in verdict["gap"] for verdict in ungraded)
     promote_spy.assert_not_called()
 
 

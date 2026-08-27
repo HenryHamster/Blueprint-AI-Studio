@@ -32,6 +32,10 @@ from app.release_artifacts import (
     is_activation_rearmable_serving_status,
     version_serving_summary as _version_serving_summary,
 )
+from app.release_activation_approval import (
+    ActivationApprover,
+    approve_latest_promoted_activation,
+)
 from app.qualification_state_resolver import (
     resolve_effective_qualification_state,
     resolve_newest_qualification_verdict,
@@ -171,6 +175,14 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     from app.release_readiness import format_qualification_for_api  # noqa: PLC0415
 
     out = format_qualification_for_api(qual)
+    candidate_gate = qual.get("candidate_operator_authorship_gate")
+    if not isinstance(candidate_gate, dict):
+        sub_scores = qual.get("sub_scores")
+        candidate_gate = (
+            sub_scores.get("candidate_operator_authorship")
+            if isinstance(sub_scores, dict)
+            else None
+        )
     out.update(
         {
             "status": qual.get("status"),
@@ -187,6 +199,10 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
             # operator UI detect when the latest release_audit's findings were computed
             # against a different (older) commit than the version's evaluated candidate.
             "candidate_sha": qual.get("candidate_sha"),
+            # Candidate-range authorship is a promotion gate, not the
+            # historical serving receipt. Preserve its explicit unconfigured
+            # state and null budget so the operator can declare policy.
+            "candidate_operator_authorship_gate": candidate_gate,
             # Infra-failure context (populated only when status=infra_failure).
             "error": qual.get("error"),
             "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
@@ -1158,6 +1174,11 @@ async def set_version_goal(
 
     operator_id = current_user.get("email") or current_user["user_id"]
     _release_version.set_version_goal(open_ver, payload.goal, editor_id=operator_id)
+    # This endpoint is the escape hatch named in the goal-omission alert's own
+    # "TO RESOLVE" line, so taking it must end the condition. set_version_goal
+    # cleared the streak counter; retire the durable alert row too — its
+    # SOURCE_CONDITION retirement mode means no sweep will ever do it for us.
+    await _release_version.resolve_version_goal_omission_alert(session, open_ver)
     session.add(open_ver)
     await session.commit()
     await session.refresh(open_ver)
@@ -1847,97 +1868,18 @@ async def approve_activation(
     never-armed ``serving_status`` NULL) -> 409.
     Idempotent: re-approving a still-unconfirmed version returns the existing
     approval without re-stamping.
+
+    The gates, the target selection and the durable provenance live in
+    ``app.release_activation_approval`` so this human path and the Resident's
+    ``approve_activation`` strategic op cannot drift apart.  This endpoint's
+    only distinct responsibility is establishing WHO is approving.
     """
-    from app.time_utils import _utcnow  # noqa: PLC0415
-
-    project_row = await session.get(Project, project_id)
-    if project_row is None:
-        raise HTTPException(status_code=404, detail="Project not found.")
-
-    version = (
-        (
-            await session.execute(
-                select(ReleaseVersion)
-                .options(selectinload(ReleaseVersion.deploy_artifacts))
-                .where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.status == "promoted",
-                )
-                .order_by(ReleaseVersion.version_number.desc())
-                .limit(1)
-                .with_for_update()
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if version is None:
-        raise HTTPException(
-            status_code=404,
-            detail="No promoted version awaiting activation for this project.",
-        )
-
-    aggregate, _ = _version_serving_summary(version, project_row)
-    aggregate_status = aggregate["serving_status"]
-
-    if version.serving_status == "serving_confirmed" or aggregate_status == "serving_confirmed":
-        raise HTTPException(
-            status_code=409,
-            detail=f"v{version.version_number} is already serving (serving_status={version.serving_status}); nothing left to approve.",
-        )
-    if version.serving_status == "deploy_failed" or aggregate_status == "deploy_failed":
-        raise HTTPException(
-            status_code=409,
-            detail=f"v{version.version_number} deploy failed; clear the deploy failure before approving activation.",
-        )
-    if not is_activation_rearmable_serving_status(aggregate_status):
-        raise HTTPException(
-            status_code=409,
-            detail=f"v{version.version_number} is not awaiting activation (serving_status={version.serving_status}).",
-        )
-
     operator_id = current_user.get("email") or current_user["user_id"]
-    now = _utcnow()
-
-    if (
-        version.activation_requested_at is not None
-        and aggregate_status != "confirmation_timed_out"
-    ):
-        # Idempotent re-approval while still unconfirmed — return the existing
-        # durable approval without re-stamping it. A timed-out approval is a
-        # new execution attempt and must receive a fresh timestamp token.
-        return {
-            "version_number": version.version_number,
-            "project_id": str(project_id),
-            "promoted_sha": version.promoted_sha,
-            "activation_requested_at": utc_iso(version.activation_requested_at),
-            "activation_requested_by": version.activation_requested_by,
-            "serving_status": version.serving_status,
-        }
-
-    # Durable, immutable audit provenance (WHO approved and WHEN); the binding to
-    # project / version / promoted SHA is inherent in this row.
-    qual = dict(version.last_qualification or {})
-    qual["activation_approval"] = {
-        "mode": "in_product_approval",
-        "operator": operator_id,
-        "approved_at": utc_iso(now),
-        "approved_sha": version.promoted_sha,
-    }
-    version.last_qualification = qual
-    version.activation_requested_at = now
-    version.activation_requested_by = operator_id
-    session.add(version)
-    await session.commit()
-    await session.refresh(version)
-    return {
-        "version_number": version.version_number,
-        "project_id": str(project_id),
-        "promoted_sha": version.promoted_sha,
-        "activation_requested_at": utc_iso(version.activation_requested_at),
-        "activation_requested_by": version.activation_requested_by,
-        "serving_status": version.serving_status,
-    }
+    return await approve_latest_promoted_activation(
+        session,
+        project_id,
+        ActivationApprover.human(operator_id),
+    )
 
 
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")

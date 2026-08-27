@@ -11,6 +11,7 @@ normalisation.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import isfinite
 from typing import Any
 
 from fastapi import HTTPException
@@ -36,6 +37,7 @@ UPDATE_DIRECTION_FIELDS = frozenset(
         "successor_id",
         "superseded_by_id",
         "conflicts_with",
+        "cost_budget_usd",
     }
 )
 
@@ -67,6 +69,7 @@ CREATE_DIRECTION_FIELDS = frozenset(
         "conflicts_with",
         "staged",
         "dedup_reasoning",
+        "cost_budget_usd",
         # Retained compatibility fields. New callers should keep file routing
         # and implementation decomposition in spawn_task instead.
         "category",
@@ -103,6 +106,25 @@ def _check_unknown(data: dict[str, Any], allowed: frozenset[str]) -> None:
             unknown[0],
             f"unknown field(s): {', '.join(unknown)}; accepted fields: {', '.join(sorted(allowed))}",
         )
+
+
+def _normalize_cost_budget_usd(value: Any, *, allow_null: bool) -> float | None:
+    """Return a finite non-negative USD budget, with update-only null clears."""
+    if value is None:
+        if allow_null:
+            return None
+        raise _field_error("cost_budget_usd", "must be a non-negative number")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise _field_error("cost_budget_usd", "must be a non-negative number")
+    try:
+        normalized = float(value)
+    except OverflowError:
+        raise _field_error(
+            "cost_budget_usd", "must be a finite non-negative number"
+        ) from None
+    if not isfinite(normalized) or normalized < 0:
+        raise _field_error("cost_budget_usd", "must be a finite non-negative number")
+    return normalized
 
 
 def normalize_create_direction(data: Any) -> dict[str, Any]:
@@ -151,6 +173,10 @@ def normalize_create_direction(data: Any) -> dict[str, Any]:
             raise _field_error(field, "must be a list of strings")
     if "dedup_reasoning" in raw and not isinstance(raw["dedup_reasoning"], Mapping):
         raise _field_error("dedup_reasoning", "must be an object")
+    if "cost_budget_usd" in raw:
+        raw["cost_budget_usd"] = _normalize_cost_budget_usd(
+            raw["cost_budget_usd"], allow_null=False
+        )
     return raw
 
 
@@ -182,10 +208,16 @@ def normalize_update_direction(data: Any) -> dict[str, Any]:
             for key in UPDATE_DIRECTION_METADATA_FIELDS
             if key in raw
         }
-        return {"direction_id": raw["direction_id"], **metadata, **changes}
+        normalized = {"direction_id": raw["direction_id"], **metadata, **changes}
+    else:
+        _check_unknown(raw, UPDATE_DIRECTION_FIELDS)
+        normalized = raw
 
-    _check_unknown(raw, UPDATE_DIRECTION_FIELDS)
-    return raw
+    if "cost_budget_usd" in normalized:
+        normalized["cost_budget_usd"] = _normalize_cost_budget_usd(
+            normalized["cost_budget_usd"], allow_null=True
+        )
+    return normalized
 
 
 def normalize_problem_model_envelope(

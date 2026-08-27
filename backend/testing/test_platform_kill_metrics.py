@@ -38,6 +38,10 @@ from app.platform_kill_metrics import (
     classify_terminal_task,
     compute_platform_kill_metrics,
 )
+from app.task_surface_visibility import (
+    LEGACY_RESIDENT_SESSION_CONTEXT_KEY,
+    RESIDENT_INFRASTRUCTURE_CONTEXT_KEY,
+)
 from testing.factories import make_membership, make_project, make_task
 
 
@@ -334,6 +338,18 @@ class TestComputePlatformKillMetrics:
         r = compute_platform_kill_metrics(self._corpus(), window_days=7, now=NOW)
         assert len(r["daily"]) == 7, "a gap day must appear as 0, not as missing data"
         assert [d["date"] for d in r["daily"]] == sorted(d["date"] for d in r["daily"])
+        daily = {row["date"]: row for row in r["daily"]}
+        assert daily[(NOW - timedelta(days=1)).date().isoformat()][
+            "platform_kills_by_class"
+        ] == {AGENT_TIMEOUT: 2}
+        assert daily[(NOW - timedelta(days=2)).date().isoformat()][
+            "platform_kills_by_class"
+        ] == {PROVISION_FAILURE: 1}
+        assert daily[NOW.date().isoformat()]["platform_kills_by_class"] == {}
+        for row in r["daily"]:
+            assert sum(row["platform_kills_by_class"].values()) == row[
+                "platform_kills"
+            ]
 
     def test_recovered_kills_are_counted_separately(self):
         tasks = [
@@ -396,6 +412,17 @@ class TestPlatformKillMetricsEndpoint:
             make_task(project_id=project_a.id, status=TaskStatus.CANCELLED,
                       context={}, latest_status_message="Cancelled: mystery",
                       completed_at=recent, updated_at=recent),
+            # Resident generations are control-plane audit rows, not project
+            # work. Neither the current nor rollout-compatibility marker may
+            # enter this metric's denominator or consume its query row cap.
+            make_task(project_id=project_a.id, status=TaskStatus.FAILED,
+                      context={RESIDENT_INFRASTRUCTURE_CONTEXT_KEY: True,
+                               "failure_category": AGENT_TIMEOUT},
+                      completed_at=recent, updated_at=recent),
+            make_task(project_id=project_a.id, status=TaskStatus.FAILED,
+                      context={LEGACY_RESIDENT_SESSION_CONTEXT_KEY: True,
+                               "failure_category": AGENT_TIMEOUT},
+                      completed_at=recent, updated_at=recent),
             # other project -> excluded
             make_task(project_id=project_b.id, status=TaskStatus.FAILED,
                       context={"failure_category": PROVISION_FAILURE},
@@ -419,6 +446,14 @@ class TestPlatformKillMetricsEndpoint:
         assert body["work_outcome_count"] == 1
         assert body["unclassified_count"] == 1
         assert body["classified_fraction"] == 0.75
+
+        causal_days = [row for row in body["daily"] if row["platform_kills"]]
+        assert len(causal_days) == 1
+        assert causal_days[0]["platform_kills"] == 2
+        assert causal_days[0]["platform_kills_by_class"] == {
+            AGENT_TIMEOUT: 1,
+            EXTERNAL_API: 1,
+        }
 
         classes = {row["kill_class"] for row in body["by_class"]}
         assert classes == {AGENT_TIMEOUT, EXTERNAL_API}

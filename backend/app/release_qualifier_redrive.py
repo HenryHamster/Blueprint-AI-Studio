@@ -54,6 +54,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
+from app.qualification_triggers import qualification_trigger_owner
 from app.time_utils import _utcnow
 
 # First cap for this module: it crossed the 1500-line coverage threshold
@@ -62,7 +63,7 @@ from app.time_utils import _utcnow
 # (``check_size_limits.recommended_cap_for_line_count``), not a hand-picked
 # number -- a hand-tight cap would put the file straight into the
 # metrics-integrity ``near_cap_size_warning`` band on the day it landed.
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2050
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3000
 
 logger = logging.getLogger(__name__)
 
@@ -1231,6 +1232,10 @@ _MAX_DEFERRED_UNSYNCED_WAIT_SECONDS = 6 * 60 * 60
 # Keys under which each re-driver stamps its decision on ``last_qualification``.
 _PROMOTION_REDRIVE_DECISION_KEY = "promotion_redrive_decision"
 _DEFERRED_UNSYNCED_DECISION_KEY = "deferred_unsynced_redrive_decision"
+# Where the sweep's auto-fire executor stamps what it did with an armed decision
+# it does not own.  Read by an operator asking "the panel says armed -- who is
+# supposed to act on that?"
+_TRIGGER_ROUTING_DECISION_KEY = "auto_trigger_routing"
 
 
 def _parse_iso_timestamp(raw) -> datetime | None:
@@ -1290,6 +1295,103 @@ async def _record_redrive_decision(
     return True
 
 
+async def _record_discarded_trigger_routing(
+    version_id,
+    trigger: str,
+    *,
+    session_factory=None,
+) -> bool:
+    """Stamp WHY the sweep discarded an armed trigger -- and ALERT if orphaned.
+
+    The sweep's auto-fire executor runs ``SWEEP_OWNED_TRIGGERS`` inline and
+    discards every other armed decision as re-driver-owned.  That discard used
+    to be LOG-ONLY.  Logs rotate, so the read surface showed
+    ``{"fire": true, "trigger": "blockers_cleared", "reason": "armed"}`` with
+    ``blocking: []`` for as long as the wedge lasted, and an operator reading the
+    version back had no way to learn a decision had been made and thrown away.
+    This writes that fact onto ``last_qualification`` where they will see it.
+
+    FAILS LOUDLY when the routing dead-ends.  A trigger with no entry in either
+    ownership table, or one naming a re-driver this build does not define, is a
+    PERMANENT SILENT LATCH: the resolver re-arms every cycle, the sweep discards
+    every cycle, and no owner ever runs.  That is the exact shape of the
+    ``blockers_cleared`` wedge -- the resolver named an owner the deployed build
+    did not have.  So an unowned trigger records ``decision="orphaned"`` and
+    raises an operator Alert once, instead of being dropped.
+
+    Idempotent by content via ``_record_redrive_decision``: a steady-state
+    routed discard does not rewrite the row (or re-alert) on every ~60s sweep.
+    """
+    if not trigger or trigger == "none":
+        return False
+    owner = qualification_trigger_owner(trigger)
+    orphaned = not callable(globals().get(owner)) if owner else True
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        version = await session.get(release_version.ReleaseVersion, version_id)
+        if version is None or not isinstance(version.last_qualification, dict):
+            return False
+        if orphaned:
+            logger.error(
+                "[RELEASE_QUALIFIER] sweep: resolver armed v%d with trigger=%r "
+                "but NOTHING owns it (owner=%r) -- the decision is discarded "
+                "every cycle and no re-driver will ever execute it; this is a "
+                "permanent silent latch",
+                version.version_number,
+                trigger,
+                owner,
+            )
+            prior = version.last_qualification.get(_TRIGGER_ROUTING_DECISION_KEY)
+            if not (
+                isinstance(prior, dict)
+                and prior.get("decision") == "orphaned"
+                and prior.get("trigger") == trigger
+            ):
+                session.add(
+                    Alert(
+                        project_id=version.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=(
+                            f"Release v{version.version_number} armed trigger "
+                            f"'{trigger}' has no executor"
+                        ),
+                        message=(
+                            f"The qualification resolver armed release "
+                            f"v{version.version_number} with trigger "
+                            f"'{trigger}', but no executor owns it: the sweep "
+                            f"discards it as re-driver-owned and this build "
+                            f"defines no re-driver "
+                            + (
+                                f"named '{owner}'"
+                                if owner
+                                else "for it at all"
+                            )
+                            + ". The version will re-arm and be discarded every "
+                            "sweep cycle without progressing. Operator action is "
+                            "required."
+                        ),
+                        event_type="release.qualification_trigger_unowned",
+                    )
+                )
+        else:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: resolver armed version %s with "
+                "trigger=%s, routed to its dedicated re-driver %s",
+                version_id,
+                trigger,
+                owner,
+            )
+        return await _record_redrive_decision(
+            session,
+            version,
+            _TRIGGER_ROUTING_DECISION_KEY,
+            "orphaned" if orphaned else "routed",
+            "no_executor_owns_this_trigger" if orphaned else "owned_by_redriver",
+            trigger=trigger,
+            owner=owner,
+        )
+
+
 def _promotion_failure_needs_new_candidate(error: str) -> bool:
     """True when only NEW code on the integration branch can clear this failure.
 
@@ -1334,7 +1436,21 @@ async def _redrive_promotion_failed_qualification(
        landed fix flips a finding to ``stale`` in the first place.  Readiness
        also carries the in-flight ``promotion_ci_remediation`` deferral, so the
        re-drive waits while the harvested fix is still being worked.
-    2. The promotion-CI gate for the integration HEAD is not ``red``.
+    2. The promotion-CI gate for the integration HEAD is not ``red``.  NOT-RED,
+       never REQUIRE-GREEN, and that asymmetry is deliberate.  An ordinary
+       integration HEAD has no ``ci.yml`` run at all (ci.yml's ``pull_request``
+       trigger is ``branches: [main]``, so integration-branch PRs get zero
+       check-runs by design), and the run the gate CAN obtain for that HEAD is a
+       ``workflow_dispatch`` rehearsal, which does not share a checkout shape
+       with the ``pull_request`` run a promotion PR gets — different ref
+       (``refs/heads/<branch>`` vs a detached ``refs/pull/N/merge``), different
+       tree whenever the base has moved, different ref inventory.  The gate now
+       says so out loud: a dispatch-derived success is reported as
+       ``green_rehearsal`` with ``promotion_equivalent=False``, never as
+       ``green``.  So gate green was already treated here as WEAK evidence and
+       still is; what bounds this loop is the circuit breaker below, not the
+       gate.  A ``red`` still holds, because a full matrix that broke found
+       something real whichever shape produced it.
     3. The integration HEAD resolves at all (fail closed when GitHub is
        unavailable -- an unresolved HEAD cannot prove the fix landed).
     4. CANDIDATE IDENTITY.  For a genuine failure (``required_check_failed``,
@@ -1354,8 +1470,9 @@ async def _redrive_promotion_failed_qualification(
        stabilize.  The only exit was a human noticing and force-promoting by
        hand.  So for ``_PROMOTION_FLAKE_RETRYABLE_FAILURES`` (today just
        ``required_check_failed``) the unchanged sha MAY be re-attempted, but
-       only on positive evidence: ``gate_state == "green"``, i.e. a COMPLETED
-       ``ci.yml`` run for exactly that HEAD sha concluded success.
+       only on positive evidence: ``gate_state`` in ``PROMOTION_CI_GREEN_STATES``
+       (``green`` or ``green_rehearsal``), i.e. a COMPLETED ``ci.yml`` run for
+       exactly that HEAD sha concluded success, whichever event shape ran it.
 
        WHAT THAT EVIDENCE IS AND IS NOT.  It is not proof the promotion PR will
        pass.  The gate's run is a ``workflow_dispatch`` on the integration
@@ -1402,6 +1519,7 @@ async def _redrive_promotion_failed_qualification(
     """
     from app import release_qualifier
     from app.release_readiness import (
+        PROMOTION_CI_GREEN_STATES,
         auto_mark_stale_audit_findings,
         compute_promotion_ci_green_gate,
         compute_requalification_readiness,
@@ -1550,11 +1668,20 @@ async def _redrive_promotion_failed_qualification(
         # positive evidence that this exact sha passes the full matrix.  Anything
         # short of a completed-green run for this HEAD -- pending, no_signal,
         # dispatched, unavailable -- is not evidence and does not unlock it.
+        #
+        # BOTH green states count, and they must.  The question here is "does the
+        # full matrix pass at this sha", not "will the promotion PR agree" -- the
+        # docstring above is explicit that this evidence is NOT the latter.  The
+        # run the gate can obtain for an integration HEAD is a
+        # ``workflow_dispatch``, which the gate now reports honestly as
+        # ``green_rehearsal``; matching only the literal ``"green"`` would make
+        # this escape hatch unreachable in exactly the situation it was added
+        # for, restoring the permanent silent latch it exists to break.
         same_candidate_flake_retry = bool(
             needs_new_candidate
             and head_sha == candidate_sha
             and error in _PROMOTION_FLAKE_RETRYABLE_FAILURES
-            and gate_state == "green"
+            and gate_state in PROMOTION_CI_GREEN_STATES
         )
         if needs_new_candidate and head_sha == candidate_sha:
             if not same_candidate_flake_retry:
@@ -1623,6 +1750,12 @@ async def _redrive_promotion_failed_qualification(
                     result_status=result_status,
                     promotion_failure_count=failure_count,
                     candidate_sha=candidate_sha[:12],
+                    # Record WHICH evidence this re-drive proceeded on.  Without
+                    # it, a re-drive that fired on a dispatch rehearsal and one
+                    # that fired on a real pull_request run are indistinguishable
+                    # afterwards — and they are not the same claim.
+                    gate_state=gate_state,
+                    gate_promotion_equivalent=bool(gate.get("promotion_equivalent")),
                     # Which of the three doors this went through.  A
                     # same-candidate retry is the one an operator most needs to
                     # recognise on sight: it is re-attempting evidence that

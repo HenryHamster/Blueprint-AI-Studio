@@ -157,9 +157,12 @@ def _run_check(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         env=env,
-        # 20s, not 60: the CI lanes run pytest with --timeout=30, so a 60s
-        # inner budget could never fire -- the harness would kill this call
-        # first and report a healthy `check` run as an unreproducible flake.
+        # 20s, not 60: MAX_INNER_OPERATION_SECONDS (backend/testing/
+        # test_harness_timeout_budgets.py) is the ceiling at or above which an
+        # inner call must declare its own @pytest.mark.timeout, and an inner
+        # budget that can never fire reports a healthy `check` run as an
+        # unreproducible flake. Sized against that CEILING, not against the
+        # lane's LANE_HANG_DETECTOR_SECONDS catch-all -- two numbers, two jobs.
         # Measured worst case across this file's callers is 1.57s (~13x head).
         timeout=20,
     )
@@ -476,9 +479,12 @@ def test_required_backend_verification_unavailable_is_a_hard_failure(
         capture_output=True,
         text=True,
         env=env,
-        # 20s, not 60: the CI lanes run pytest with --timeout=30, so a 60s
-        # inner budget could never fire -- the harness would kill this call
-        # first and report a healthy `check` run as an unreproducible flake.
+        # 20s, not 60: MAX_INNER_OPERATION_SECONDS (backend/testing/
+        # test_harness_timeout_budgets.py) is the ceiling at or above which an
+        # inner call must declare its own @pytest.mark.timeout, and an inner
+        # budget that can never fire reports a healthy `check` run as an
+        # unreproducible flake. Sized against that CEILING, not against the
+        # lane's LANE_HANG_DETECTOR_SECONDS catch-all -- two numbers, two jobs.
         # Measured worst case across this file's callers is 1.57s (~13x head).
         timeout=20,
     )

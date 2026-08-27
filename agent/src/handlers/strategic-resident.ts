@@ -50,7 +50,7 @@ import {
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   shouldRunAutonomousTurn, actionableFiredWatchRevision, wakeBarrierRevision,
-  hasPendingOwnedWork, explorationWakeProjection,
+  hasPendingOwnedWork, explorationWakeProjection, formatWatchingWorkNote,
   EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
@@ -5042,6 +5042,16 @@ export async function handleStrategicResident(
           'waiting',
           'Operator turn was claimed by another Resident worker',
         );
+        // A conflicting/stale Workday claim is retryable. Pace the retry and
+        // renew this exact Resident process incarnation before re-polling; the
+        // previous immediate return could hot-loop /messages/claim indefinitely,
+        // starving the authoritative session heartbeat until the live worker was
+        // fenced as stale.
+        await sleep(Math.max(cfg.messagePollMs, 1_500));
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested || !residentIncarnationHeld) return 'stop';
+        }
         return 'continue';
       }
       try {
@@ -5659,9 +5669,7 @@ export async function handleStrategicResident(
           // deliberate gated-idle is visibly different from a dark/crashed session.
           const msSinceWatching = Date.now() - lastWatchingEmitAt;
           if (msSinceWatching >= cfg.idleTickMs * 2) {
-            const rawInFlight = hb?.work_state_summary?.in_flight;
-            const inFlight = typeof rawInFlight === 'number' ? rawInFlight : null;
-            const taskNote = inFlight !== null ? `${inFlight} task${inFlight === 1 ? '' : 's'} in flight; ` : '';
+            const taskNote = formatWatchingWorkNote(currentWorkStateSummary);
             streamer.status(
               `watching — ${taskNote}next review ${wakeProjection.nextReview}`
               + (wakeProjection.nextReviewAt ? ' or on state change' : ''),

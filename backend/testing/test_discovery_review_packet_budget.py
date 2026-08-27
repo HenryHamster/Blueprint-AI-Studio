@@ -212,7 +212,7 @@ def test_progressive_degradation_retains_partial_detail_when_it_fits_budget():
     included, coverage = p._evidence_coverage_for_level(
         collections, p._COLLECTION_BASE_DETAIL_COUNTS, level=0
     )
-    full_receipt, full_blockers = p._assemble_receipt(
+    full_receipt, full_blockers, full_codes = p._assemble_receipt(
         source_parent=source_parent,
         included=included,
         stranded_deliveries=[],
@@ -222,6 +222,9 @@ def test_progressive_degradation_retains_partial_detail_when_it_fits_budget():
         compacted=False,
     )
     assert full_blockers == []
+    # The codes are positional with the blockers, so an empty blocker list
+    # must mean an empty code list -- never a code with nothing to explain.
+    assert full_codes == []
     assert p._receipt_fits_evidence_metadata(full_receipt) is False
 
     levels = p._progressive_detail_levels(p._COLLECTION_BASE_DETAIL_COUNTS)
@@ -237,7 +240,7 @@ def test_progressive_degradation_retains_partial_detail_when_it_fits_budget():
     reduced_included, reduced_coverage = p._evidence_coverage_for_level(
         collections, level_one_counts, level=1
     )
-    reduced_receipt, reduced_blockers = p._assemble_receipt(
+    reduced_receipt, reduced_blockers, _ = p._assemble_receipt(
         source_parent=source_parent,
         included=reduced_included,
         stranded_deliveries=[],
@@ -324,7 +327,7 @@ def test_zeroed_nonempty_categories_get_a_floor_and_a_degradation_marker():
     assert evidence_coverage["landed_outcomes"]["included_count"] == 0
 
     fixture = _packet_test_fixture()
-    receipt, blockers = p._repair_zeroed_categories(
+    receipt, blockers, _ = p._repair_zeroed_categories(
         collections=collections,
         included=included,
         evidence_coverage=evidence_coverage,
@@ -364,7 +367,7 @@ def test_genuinely_empty_categories_stay_empty_without_a_marker():
         assert coverage["included_count"] == 0
 
     fixture = _packet_test_fixture()
-    receipt, blockers = p._repair_zeroed_categories(
+    receipt, blockers, _ = p._repair_zeroed_categories(
         collections=collections,
         included=included,
         evidence_coverage=evidence_coverage,
@@ -400,7 +403,7 @@ def test_under_budget_receipt_is_unchanged_without_a_marker():
         collections, p._COLLECTION_BASE_DETAIL_COUNTS, level=0
     )
     fixture = _packet_test_fixture()
-    receipt, blockers = p._assemble_receipt(
+    receipt, blockers, _ = p._assemble_receipt(
         source_parent=fixture["source_parent"],
         included=included,
         stranded_deliveries=[],
@@ -650,9 +653,16 @@ def test_generation_one_bet_shape_also_binds_when_only_the_direction_is_cut():
 def test_a_cut_decision_bearing_key_still_revokes_binding_authority():
     # The other half of the gate, and the reason loosening it is safe. When
     # the authority itself is what does not fit -- not the envelope around it
-    # -- the reviewer genuinely cannot judge the claim it was handed, and
-    # ask_operator is the honest answer. Both offending keys are named in the
-    # blocker so an operator can see which part of the authority was lost.
+    # -- this function must say so, and name both offending keys, so callers
+    # can see exactly which part of the authority the bounded form lost.
+    #
+    # This report is the input to a decision, not the decision. Since
+    # 2026-08-25 the packet builder answers it by PAGING the named keys into an
+    # authority_continuation evidence item rather than revoking authority and
+    # escalating (see
+    # test_oversized_bet_claim_is_paged_into_evidence_instead_of_escalated).
+    # What this function reports is unchanged and still pinned here: the
+    # builder cannot page a key it was never told about.
     p = discovery_review_packet
     bet = {
         "mode": "measure",
@@ -786,9 +796,14 @@ def test_key_cardinality_that_defeats_the_structure_still_revokes_authority():
     # while the key names plus one empty-string value each fit the cap. Past
     # that there is no field-aware form at all, so the snapshot falls back to
     # the historical prefix excerpt -- and when the *structure* is what was
-    # lost, rather than one shortened field inside it, authority must still be
-    # revoked. Otherwise this fix would have traded a false ask_operator for a
-    # false binding decision, which is the worse failure.
+    # lost, rather than one shortened field inside it, this function must
+    # report the loss. Otherwise the fix would have traded a false ask_operator
+    # for a false binding decision, which is the worse failure.
+    #
+    # The 2026-08-25 paging change does not soften that: it pages the authority
+    # keys it can find in the source, and a snapshot like this one -- 2,000
+    # junk keys and not a single authority key -- has none to page, so the
+    # packet still revokes. Fail-safe, not fail-open.
     p = discovery_review_packet
     assert p.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS == 8_000
 
@@ -930,20 +945,41 @@ async def test_oversized_bet_authority_binds_instead_of_stranding_the_direction(
 
 
 @pytest.mark.asyncio
-async def test_oversized_bet_claim_still_spawns_an_operator_question_review(
+async def test_oversized_bet_claim_is_paged_into_evidence_instead_of_escalated(
     db_session,
 ):
-    """When the *claim* is what overflows, ask_operator is the honest verdict.
+    """An overflowing *claim* is delivered, not handed back as a question.
 
-    This keeps the authority-revoked leg of the pre-2026-08-23 test alive
-    against a snapshot where the loss is real: the proposition under judgement
-    itself could not be carried whole, so the reviewer cannot bind a verdict
-    on it. required_evidence_omitted is set, only ask_operator is permitted,
-    and the cycle still gets a review rather than stranding before one.
+    Until 2026-08-25 this asserted the opposite: that when the proposition
+    under judgement is itself what overflows, revoking authority and leaving
+    ``ask_operator`` as the only permitted verdict was "the honest verdict".
+
+    It was not. The 8,000-char snapshot cap bounds ONE FIELD OF THE TASK
+    PAYLOAD. It is not a statement that the engine has lost the claim -- the
+    full text is sitting in ``DiscoveryCycle.bet_snapshot`` the entire time, and
+    the operator being asked to resolve the escalation could only have gone and
+    read it back out of that same row. That is precisely the defect the
+    operator named: the engine asking for something it already has, because a
+    bounded budget overflowed.
+
+    So the overflowing authority is PAGED: carried whole in an
+    ``authority_continuation`` evidence item whose own budget is four times the
+    snapshot's, with the manifest naming exactly which keys were continued
+    there. Authority is no longer revoked, the reviewer decides from the
+    complete claim, and the advance lands.
+
+    The anti-stranding leg is unchanged and still pinned: missing_required_
+    evidence stays empty and the review still spawns. The revocation leg has
+    not been deleted -- it moved to the only case where it is true, that even
+    the continuation budget cannot carry the text, which
+    test_unpageable_bet_authority_still_revokes_binding_authority covers.
     """
 
     project, cycle, source = await _cycle_with_source(db_session)
     cycle.bet_snapshot = {
+        # Keep the frozen direction envelope the fixture commissioned: an
+        # advance revalidates it against current direction authority.
+        **(cycle.bet_snapshot or {}),
         "mode": "research",
         "claim": "c" * 5_000,
         "decision_question": "q" * 5_000,
@@ -958,29 +994,171 @@ async def test_oversized_bet_claim_still_spawns_an_operator_question_review(
 
     review = await db_session.get(Task, spawned.task_id)
     manifest = review.first_payload["evidence_packet_manifest"]
+    # The truncation is still disclosed -- nothing is dropped silently...
     assert manifest["bet_snapshot_truncated"] is True
-    assert any(
-        "bet authority exceeds the bounded decision contract" in blocker
-        for blocker in manifest["binding_action_blockers"]
-    ), manifest["binding_action_blockers"]
-    # The blocker names what was actually lost, so an operator reading the
-    # manifest can tell a truncated claim from a truncated direction envelope.
-    assert any(
-        blocker.endswith("claim, decision_question")
-        for blocker in manifest["binding_action_blockers"]
-    ), manifest["binding_action_blockers"]
+    # ...and the manifest names exactly which authority moved where.
+    assert manifest["authority_continued_in_evidence"] is True
+    assert manifest["authority_continued_keys"] == [
+        "bet.claim",
+        "bet.decision_question",
+    ]
     # Bounded, never absent: the cycle is not held waiting for evidence that
     # no task could ever produce.
     assert manifest["missing_required_evidence"] == []
+    # ...and no longer an authority blocker, because the text was delivered.
+    assert manifest["binding_action_blockers"] == []
+    assert manifest["binding_action_blocker_codes"] == []
+    assert manifest["binding_decision_allowed"] is True
+    assert manifest["required_evidence_omitted"] is False
+
+    # The reviewer receives the FULL claim, not a prefix of it.
+    continuation = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "authority_continuation"
+    )
+    carried = continuation["evidence_metadata"]["snapshot"]["bet_authority"]
+    assert carried["claim"] == cycle.bet_snapshot["claim"]
+    assert carried["decision_question"] == cycle.bet_snapshot["decision_question"]
+
+    # And the binding decision it was always able to make now actually lands.
+    completed = await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="advance"),
+    )
+    await db_session.flush()
+    assert completed.id == cycle.id
+    assert cycle.state == "reviewed"
+    assert cycle.verdict == "advance"
+
+
+def test_a_blocker_with_no_code_beside_it_is_not_budget_class():
+    """An uncoded blocker is of UNKNOWN class, and unknown is not safe.
+
+    The codes are positional: one per blocker. The realistic way this file's
+    guarantee rots is a future authority blocker whose ``append`` lands without
+    the matching code ``append`` beside it -- at which point every code still
+    present is budget-class and a naive ``all()`` would happily call the packet
+    degradable, silently swallowing the one blocker that genuinely wanted an
+    operator. Alignment is therefore part of the claim, not an implementation
+    detail of it.
+    """
+
+    budget = discovery_review_packet.DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE
+    assert discovery_review_packet._blockers_are_budget_class(["b"], [budget]) is True
+    assert (
+        discovery_review_packet._blockers_are_budget_class(
+            ["b", "an authority question nobody gave a code"], [budget]
+        )
+        is False
+    )
+    assert discovery_review_packet._blockers_are_budget_class(["b"], []) is False
+    assert discovery_review_packet._blockers_are_budget_class([], []) is False
+
+
+@pytest.mark.asyncio
+async def test_unpageable_bet_authority_still_revokes_binding_authority(db_session):
+    """The revocation leg, at the only size where it is still true.
+
+    Paging is not unlimited: the continuation item has its own bound
+    (DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS). A claim too long for even that
+    genuinely cannot reach the reviewer, so authority is withheld -- and the
+    blocker says so in machine-readable form rather than only in prose.
+    """
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    cycle.bet_snapshot = {
+        "mode": "research",
+        "claim": "c" * 60_000,
+        "decision_question": "Does it hold?",
+        "success_evidence": "The metric moves.",
+        "retirement_condition": "Two flat generations.",
+    }
+    db_session.add(cycle)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True, spawned.reason
+
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["authority_continued_in_evidence"] is False
     assert manifest["binding_decision_allowed"] is False
     assert manifest["required_evidence_omitted"] is True
-
+    assert manifest["binding_action_blocker_codes"] == [
+        discovery_review_packet.DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE
+    ]
+    # Still a budget condition, not an authority question -- which is what
+    # lets the decision boundary degrade it rather than ask a human.
+    assert manifest["binding_blockers_budget_class_only"] is True
+    assert manifest["missing_required_evidence"] == []
     with pytest.raises(DiscoveryReviewResultError, match="incomplete packet semantics"):
         await complete_discovery_review(
             db_session,
             task=review,
             raw_result=_result(cycle, review, action="advance"),
         )
+
+
+@pytest.mark.asyncio
+async def test_one_side_paging_does_not_cover_for_the_side_that_could_not(db_session):
+    """Paged-or-blocked is per side; a sibling's success is not a substitute.
+
+    The continuation is written as ONE all-or-nothing evidence item, so the
+    tempting shape -- "did we emit a continuation? then nothing was lost" --
+    is wrong whenever only one of the two authorities actually contributed to
+    it. Here the bet's claim pages cleanly while the intent snapshot's
+    structure is omitted outright *and* holds none of the authority keys, so
+    there is nothing of the intent to page. If the blocker were gated on the
+    item's mere existence, the bet's success would silently vouch for authority
+    the packet never delivered -- which is the same silent-loss failure this
+    whole change exists to remove, just pointed the other way.
+    """
+
+    project, cycle, source = await _cycle_with_source(db_session)
+    # Key names alone exceed the snapshot budget, so no field-aware form fits
+    # and the snapshot falls back to the structure-omitted excerpt. None of
+    # these keys is an intent authority key, so nothing is available to page.
+    cycle.intent_snapshot = {
+        f"unpageable_context_field_number_{index:05d}": "x" for index in range(400)
+    }
+    cycle.bet_snapshot = {
+        **(cycle.bet_snapshot or {}),
+        "mode": "research",
+        "claim": "c" * 5_000,
+        "decision_question": "q" * 5_000,
+        "success_evidence": "The metric moves.",
+        "retirement_condition": "Two flat generations.",
+    }
+    db_session.add(cycle)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True, spawned.reason
+
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["intent_snapshot_truncated"] is True
+    assert manifest["bet_snapshot_truncated"] is True
+    # The bet's authority was delivered whole...
+    assert manifest["authority_continued_in_evidence"] is True
+    assert manifest["authority_continued_keys"] == [
+        "bet.claim",
+        "bet.decision_question",
+    ]
+    # ...and the intent's, which was not, still says so.
+    assert manifest["binding_decision_allowed"] is False
+    assert manifest["binding_action_blocker_codes"] == [
+        discovery_review_packet.DISCOVERY_AUTHORITY_SNAPSHOT_UNPAGEABLE
+    ]
+    assert any(
+        "intent authority" in blocker
+        for blocker in manifest["binding_action_blockers"]
+    )
+    # Still a budget class, so the decision boundary degrades rather than asks.
+    assert manifest["binding_blockers_budget_class_only"] is True
+    assert manifest["missing_required_evidence"] == []
 
 
 @pytest.mark.asyncio
@@ -1023,8 +1201,20 @@ async def test_oversized_intent_context_binds_without_stranding(db_session):
 
 
 @pytest.mark.asyncio
-async def test_oversized_intent_purpose_still_blocks_binding(db_session):
-    """A purpose too long to carry whole is a real authority loss."""
+async def test_oversized_intent_purpose_is_paged_rather_than_escalated(db_session):
+    """A purpose too long for the snapshot is still a purpose the engine holds.
+
+    Until 2026-08-25 this asserted "a real authority loss". A 12,000-character
+    user_purpose does not fit the 8,000-character bounded snapshot -- but it
+    fits the 32,000-character continuation budget four times over, and it never
+    left ``DiscoveryCycle.intent_snapshot``. Revoking authority over it forced
+    ``ask_operator``, i.e. asked the operator to restate a purpose they had
+    already written down and the engine was still holding.
+
+    Now it is paged, whole, and the reviewer judges the bet against the real
+    purpose. The anti-stranding leg (missing_required_evidence empty, review
+    still spawns) is unchanged.
+    """
 
     project, cycle, source = await _cycle_with_source(db_session)
     cycle.intent_snapshot = {
@@ -1040,15 +1230,23 @@ async def test_oversized_intent_purpose_still_blocks_binding(db_session):
 
     review = await db_session.get(Task, spawned.task_id)
     manifest = review.first_payload["evidence_packet_manifest"]
+    # Disclosed, never silent.
     assert manifest["intent_snapshot_truncated"] is True
-    assert any(
-        "intent authority exceeds the bounded decision contract: user_purpose"
-        in blocker
-        for blocker in manifest["binding_action_blockers"]
-    ), manifest["binding_action_blockers"]
+    assert manifest["authority_continued_in_evidence"] is True
+    assert manifest["authority_continued_keys"] == ["intent.user_purpose"]
     assert manifest["missing_required_evidence"] == []
-    assert manifest["binding_decision_allowed"] is False
-    assert manifest["required_evidence_omitted"] is True
+    assert manifest["binding_action_blockers"] == []
+    assert manifest["binding_action_blocker_codes"] == []
+    assert manifest["binding_decision_allowed"] is True
+    assert manifest["required_evidence_omitted"] is False
+
+    continuation = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "authority_continuation"
+    )
+    carried = continuation["evidence_metadata"]["snapshot"]["intent_authority"]
+    assert carried["user_purpose"] == cycle.intent_snapshot["user_purpose"]
 
 
 # ---------------------------------------------------------------------------
@@ -1175,7 +1373,7 @@ def test_one_verbose_omitted_item_neither_starves_the_cohort_nor_revokes_authori
         collections, counts, level=3
     )
     fixture = _packet_test_fixture()
-    receipt, blockers = p._assemble_receipt(
+    receipt, blockers, _ = p._assemble_receipt(
         source_parent=fixture["source_parent"],
         included=included,
         stranded_deliveries=[],
@@ -1271,7 +1469,7 @@ def test_pathological_omitted_cardinality_still_revokes_binding_authority():
         collections, _digest_detail_counts(), level=4
     )
     fixture = _packet_test_fixture()
-    receipt, blockers = p._assemble_receipt(
+    receipt, blockers, _ = p._assemble_receipt(
         source_parent=fixture["source_parent"],
         included=included,
         stranded_deliveries=[],
@@ -1413,7 +1611,7 @@ def test_semantic_digest_complete_still_means_verbatim_but_no_longer_gates_autho
     # ...and the receipt built from it is still binding, which is the whole
     # point: the 2026-08-23 stranding was authority revoked over prose.
     fixture = _packet_test_fixture()
-    receipt, blockers = p._assemble_receipt(
+    receipt, blockers, _ = p._assemble_receipt(
         source_parent=fixture["source_parent"],
         included=included,
         stranded_deliveries=[],

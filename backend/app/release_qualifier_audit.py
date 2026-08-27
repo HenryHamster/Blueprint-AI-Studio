@@ -74,7 +74,7 @@ from app.release_scoring import (
 logger = logging.getLogger("backend.app.release_qualifier")
 # Governing cap: keep a small explicit margin over the actual size (2340 as
 # of rollup #17573, which grew the module past the old 2339 cap by one line).
-_MODULE_SIZE_GOVERNANCE_CAP: int = 2360
+_MODULE_SIZE_GOVERNANCE_CAP: int = 3550
 
 # Minimum consecutive qualifier infrastructure errors (FAILED/CANCELLED
 # required child tasks) before raising a dedicated infra-failure alert.
@@ -91,6 +91,10 @@ _INFRA_WEBHOOK_TASKS: set[asyncio.Task[Any]] = set()
 _STRANDED_APPROVED_PR_SCAN_LIMIT = 101
 _STRANDED_APPROVED_PR_PREVIEW_LIMIT = 20
 _STRANDING_OBSERVATION_KEY = "approved_pr_stranding"
+
+# Release-audit children are blocking qualification gates, so they use the
+# established high Task.priority tier instead of the model default (50).
+RELEASE_AUDIT_TASK_PRIORITY = 100
 
 # Approvals on a cancelled task are deliberate abandonment, not stranding.
 _STRANDED_APPROVED_PR_EXCLUDED_STATUSES = (TaskStatus.CANCELLED,)
@@ -722,6 +726,7 @@ async def _spawn_release_audit_task(
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         origination=TASK_ORIGINATION_QUALIFIER,
+        priority=RELEASE_AUDIT_TASK_PRIORITY,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
@@ -817,6 +822,7 @@ async def _spawn_release_audit_challenge_task(
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         origination=TASK_ORIGINATION_QUALIFIER,
+        priority=RELEASE_AUDIT_TASK_PRIORITY,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,

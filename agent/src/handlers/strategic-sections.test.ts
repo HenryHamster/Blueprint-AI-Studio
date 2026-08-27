@@ -1525,6 +1525,45 @@ describe('buildDirSummaryText', () => {
     expect(result).not.toContain('CHURN-RETIRE');
   });
 
+  it('renders COST-RETIRE-CONSIDER marker and evidence when flagged', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-cost-rec',
+      text: 'cost outlier direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 12,
+      retirement_consideration_needed: true,
+      retirement_consideration_reason: 'Recent cost/merge $0.79 exceeded threshold $0.72.',
+      retirement_consideration_at: '2026-08-21T07:38:45+00:00',
+      retirement_consideration_evidence: {
+        direction_cost_per_merge_usd: 0.79,
+        threshold_usd: 0.72,
+        window_cycles: 6,
+      },
+    }]);
+    expect(result).toContain('[COST-RETIRE-CONSIDER]');
+    expect(result).toContain('COST-RETIREMENT-CONSIDERATION');
+    // The decision must be stated as owed, and the reason carried verbatim.
+    expect(result).toContain('keep-or-retire decision is owed');
+    expect(result).toContain('Recent cost/merge $0.79 exceeded threshold $0.72.');
+    expect(result).toContain('0.79');
+    expect(result).toContain('0.72');
+    expect(result).toContain('2026-08-21T07:38:45+00:00');
+    // A cost breach alone must not read as proof the direction is low value.
+    expect(result).toContain('NOT proof of low value');
+  });
+
+  it('omits COST-RETIRE marker when retirement_consideration_needed is absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-no-cost-rec',
+      text: 'ordinary active direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 3,
+    }]);
+    expect(result).not.toContain('COST-RETIRE');
+  });
+
   it('renders retired_direction_grounding when present on an active direction', () => {
     const result = buildDirSummaryText([{
       id: 'd-grounding',

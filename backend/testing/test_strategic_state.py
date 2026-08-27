@@ -537,15 +537,19 @@ async def test_chat_send_does_not_bind_active_resident_left_by_mode_leave(
         client, db_session, mode="chat", task_status=TaskStatus.IN_PROGRESS,
         key="chat-before-resident-stop",
     )
-    assert (body["status"], body["wakeup_state"], body["arming"] != "resident_session") == (
-        "created", "paused", True
+    # The subject is non-binding: a resident the operator has already left must
+    # not claim this turn. It is now ``steering``/``queued`` rather than
+    # ``paused`` because an unbound conversation turn arms the cadence instead
+    # of stranding -- unbound must never mean unread.
+    assert (body["status"], body["wakeup_state"], body["arming"]) == (
+        "created", "queued", "steering"
     )
     assert stored is not None
     assert (stored.resident_session_id, stored.handling_state) == (
         None, MessageHandlingState.PENDING
     )
     assert (stored.handled_by_task_id, stored.conversation_claim_id) == (None, None)
-    assert stored.context["_operator_wakeup_state"] == "paused"
+    assert stored.context["_operator_wakeup_state"] == "queued"
     assert resident == stale
     assert [(row.id, row.status) for row in tasks] == [(task_id, TaskStatus.IN_PROGRESS)]
 
@@ -675,8 +679,10 @@ async def test_operator_send_racing_mode_leave_commits_unbound_chat_message(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["status"] == "created"
-    assert body["arming"] != "resident_session"
-    assert body["wakeup_state"] == "paused"
+    # Unbound from the resident the race left behind, but still served: the
+    # turn arms the cadence rather than stranding with no reader at all.
+    assert body["arming"] == "steering"
+    assert body["wakeup_state"] == "queued"
     async with factory() as verify:
         stored_project = await verify.get(Project, project_id)
         stored = await verify.get(ProjectMessage, uuid.UUID(body["id"]))
@@ -694,7 +700,7 @@ async def test_operator_send_racing_mode_leave_commits_unbound_chat_message(
     assert stored.resident_session_id is None
     assert stored.handling_state == MessageHandlingState.PENDING
     assert stored.conversation_claim_id is None
-    assert stored.context["_operator_wakeup_state"] == "paused"
+    assert stored.context["_operator_wakeup_state"] == "queued"
     assert prefs is not None
     assert prefs.prefs["_strategic_workbench"]["interaction_mode"] == "chat"
     assert tasks == []
@@ -4725,9 +4731,20 @@ async def test_strategic_session_message_response_survives_arming_rollback(
 
 
 @pytest.mark.asyncio
-async def test_strategic_session_note_message_is_passive(
+async def test_strategic_session_note_message_is_a_served_conversation_turn(
     client: AsyncClient, db_session
 ):
+    """A NOTE typed at the Resident is a conversation turn, never a parked memo.
+
+    This test previously asserted the opposite (``passive_note`` / ``paused``)
+    and so pinned the operator-steerability defect in place: with no Workday
+    session bound, the CLI default ``--type NOTE`` from ``blueprint strategic
+    send`` armed nothing, bound to nobody, and was eventually failed by the
+    reaper as unhandled. The row shape assertions below are unchanged; only the
+    serviceability verdict is corrected. The message-board leg still classifies
+    the same NOTE as passive -- see
+    ``test_chat_mode_strategic_note_arms_a_reader_instead_of_stranding``.
+    """
     project = await _make_project(db_session)
 
     body = {
@@ -4746,11 +4763,14 @@ async def test_strategic_session_note_message_is_passive(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "created"
-    assert resp.json()["arming"] == "passive_note"
-    assert resp.json()["wakeup_state"] == "paused"
+    assert resp.json()["arming"] == "steering"
+    # ``coalesced`` rather than ``queued`` only because this fixture project
+    # already carries a pending operator marker; both are SERVED states. The
+    # defect was ``paused`` -- accepted, stored, and read by nobody.
+    assert resp.json()["wakeup_state"] == "coalesced"
     assert duplicate.status_code == 200, duplicate.text
     assert duplicate.json()["status"] == "duplicate"
-    assert duplicate.json()["wakeup_state"] == "paused"
+    assert duplicate.json()["wakeup_state"] == "coalesced"
     msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
     assert msg.from_type == "user"
     assert msg.message_type == MessageType.NOTE
@@ -5220,7 +5240,9 @@ async def test_strategic_session_message_without_snapshot_preserves_workbench(
     )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["arming"] == "passive_note"
+    # A conversation turn is steering whatever its message type; this test is
+    # about workbench freshness, not the arming policy.
+    assert resp.json()["arming"] == "steering"
     stored = (
         await db_session.execute(
             select(MessagesNoisePrefs).where(

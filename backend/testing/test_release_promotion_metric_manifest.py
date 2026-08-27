@@ -26,8 +26,10 @@ The test is DB-free, deterministic, and standalone-smoke compatible.
 
 import ast
 import datetime as _dt
+import uuid
 
 from app import release_readiness
+from app.release_models import QualificationVerdict
 from app.release_readiness import PROMOTION_READINESS_METRIC_MANIFEST
 from testing.fixgate_attribution import format_offender_marker
 
@@ -136,3 +138,36 @@ def test_manifest_values_are_well_formed():
             f"{field}: manifest entry must declare EXACTLY ONE of "
             f"'consumer' or 'status' (got consumer={has_consumer}, status={has_status})"
         )
+
+
+def test_force_promote_provenance_is_read_from_immutable_verdict():
+    """The promotion read surface exposes durable operator force provenance."""
+    forced_at = _dt.datetime(2026, 8, 26, 12, 34, 56)
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="candidate",
+        terminal_status="promoted",
+        forced_promote_by="operator-42",
+        forced_promote_at=forced_at,
+        forced_promote_reason="production incident requires immediate release",
+    )
+
+    out = release_readiness.format_verdict_for_api(verdict)
+
+    assert out["forced_promote_by"] == "operator-42"
+    assert out["forced_promote_at"] == "2026-08-26T12:34:56"
+    assert out["forced_promote_reason"] == (
+        "production incident requires immediate release"
+    )
+
+    legacy = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="legacy",
+        terminal_status="not_promoted",
+    )
+    legacy_out = release_readiness.format_verdict_for_api(legacy)
+    assert legacy_out["forced_promote_by"] is None
+    assert legacy_out["forced_promote_at"] is None
+    assert legacy_out["forced_promote_reason"] is None

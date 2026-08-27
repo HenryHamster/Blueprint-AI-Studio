@@ -53,9 +53,9 @@ def test_extract_reason_retirement_reason():
     assert _extract_reason(d, "active", "retired") == "work completed"
 
 
-def test_extract_reason_last_note():
-    d = _make_direction(notes=[{"text": "some note"}, {"text": "final note"}])
-    assert _extract_reason(d, "active", "paused") == "final note"
+def test_extract_reason_notes_are_not_transition_reasons():
+    d = _make_direction(notes=[{"text": "unrelated note"}])
+    assert _extract_reason(d, "active", "paused") is None
 
 
 def test_extract_reason_none():
@@ -111,6 +111,40 @@ async def test_event_status_changed():
     assert added.prior_status == "active"
     assert added.new_status == "paused"
     assert added.reason == "churn"
+
+
+@pytest.mark.asyncio
+async def test_bare_pause_event_reports_no_reason_not_the_activation_note():
+    """End-to-end pin for the production shape that motivated this fix.
+
+    The strategist's update_direction pause path wrote status only - no
+    paused_reason - so the event row fell back to whatever note was last on the
+    direction.  For a direction previously resumed by staged activation that
+    note said "Auto-activated ... staged work resumed", so the trail recorded an
+    active->paused transition whose stated reason was an ACTIVATION.  The row
+    must now carry no reason rather than a contradictory one.
+    """
+    session = _make_session()
+    d = _make_direction(
+        status="paused",
+        notes=[
+            {
+                "text": "Auto-activated: v32 promoted - staged work resumed",
+                "added_at": "2026-08-20T12:00:00",
+            }
+        ],
+    )
+    await maybe_record_direction_event(
+        session, uuid.uuid4(), d, prior_row=_make_prior_row(status="active")
+    )
+    added = session.add.call_args[0][0]
+    assert added.event_kind == "status_changed"
+    assert added.prior_status == "active"
+    assert added.new_status == "paused"
+    assert added.reason is None
+    # The snapshot still carries the note, so nothing is lost - only the
+    # false CLAIM that the note explains this transition.
+    assert added.snapshot_data["notes"][-1]["text"].startswith("Auto-activated")
 
 
 @pytest.mark.asyncio

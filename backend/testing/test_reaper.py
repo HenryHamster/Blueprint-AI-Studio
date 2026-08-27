@@ -77,6 +77,7 @@ from app.reaper_orphan_classify import (
 from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
 import app.reaper_sweeps as _rs
+import app.strategic_cycle as _strategic_cycle
 from app.reaper_sweeps import event_driven_unblock_on_knowledge
 from app.time_utils import _utcnow
 from app.workbench_state import (
@@ -1116,6 +1117,65 @@ async def test_in_progress_stalled_but_fresh_offrow_tool_use_not_reaped(
         "Reaper killed a lock-starved-but-progressing agent — off-row "
         "vmcontact.last_tool_use_at progress override (Fix 3b) regressed"
     )
+
+
+@pytest.mark.asyncio
+async def test_active_long_tool_lease_survives_stale_output_while_dead_task_reaps(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A live long tool lease wins over stale output, without masking death.
+
+    Regression for task 45364a8f: a medium-scope ``./check test`` remained in
+    flight and heartbeated every 30 seconds, but provider-buffered output left
+    its last visible progress 764 seconds old. The task-scoped active-tool lease
+    must prevent that progress-only reap. A peer with a stale heartbeat and no
+    lease remains a genuine orphan and must still be reaped.
+    """
+    from app.models import TaskContact
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    live = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "scope": "medium"}],
+        vm_instance_id="runner:active-long-tool",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=now - timedelta(minutes=20),
+        last_heartbeat=now - timedelta(seconds=15),
+        last_tool_use_at=now - timedelta(minutes=14),
+        context={"scope": "medium", "llm_provider": "openai"},
+    )
+    dead = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "scope": "medium"}],
+        vm_instance_id="vm-dead-long-tool-control",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=now - timedelta(minutes=20),
+        last_heartbeat=now - timedelta(minutes=10),
+        last_tool_use_at=now - timedelta(minutes=14),
+        context={"scope": "medium", "llm_provider": "openai"},
+    )
+    reaper_db.add_all([live, dead])
+    await reaper_db.flush()
+    reaper_db.add(
+        TaskContact(
+            task_id=live.id,
+            last_contact_at=now - timedelta(seconds=15),
+            last_tool_use_at=now - timedelta(seconds=15),
+        )
+    )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(live)
+    await reaper_db.refresh(dead)
+
+    assert live.status == TaskStatus.IN_PROGRESS
+    assert live.attempt_count == 0
+    assert dead.status == TaskStatus.QUEUED
+    assert dead.attempt_count == 1
 
 
 @pytest.mark.asyncio
@@ -4107,10 +4167,10 @@ async def test_step5_parent_task_not_resurrected(
 
 
 @pytest.mark.asyncio
-async def test_step5_resurrection_creates_info_alert(
+async def test_step5_resurrection_records_status_without_durable_alert(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """Each resurrected task gets an INFO alert referencing its failure class."""
+    """Resurrection is a timeline fact, not a permanent unresolved alert."""
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
@@ -4123,15 +4183,16 @@ async def test_step5_resurrection_creates_info_alert(
     await reaper_db.commit()
 
     await _run_reaper_once()
+    await reaper_db.refresh(t)
 
     alerts = (
         (await reaper_db.execute(_select(Alert).where(Alert.task_id == t.id)))
         .scalars()
         .all()
     )
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.INFO
-    assert "PROVISION_FAILURE" in (alerts[0].message or "")
+    assert t.status == TaskStatus.QUEUED
+    assert "PROVISION_FAILURE" in (t.latest_status_message or "")
+    assert alerts == []
 
 
 @pytest.mark.asyncio
@@ -6471,9 +6532,195 @@ async def test_step7_wedged_queued_phase_task_without_activity_still_reaped(
     assert stalled == 1
     assert task.status == TaskStatus.FAILED
     assert cycle.outcome == "stalled_phase2"
-    assert cycle.failure_reason == (
-        "reaper_stall: cycle in phase2 >3h with no completion"
+    # The reason now names the CAUSE, not just the state: this task never left
+    # QUEUED, so no agent ever ran and no completion handler could fire.
+    assert cycle.failure_reason.startswith(
+        "reaper_stall (attempt 1, cause phase2:queued_never_dispatched):"
+    ), cycle.failure_reason
+    assert "never left QUEUED" in cycle.failure_reason
+    assert cycle.cycle_metadata["stall_signature"] == (
+        "phase2:queued_never_dispatched"
     )
+
+
+@pytest.mark.asyncio
+async def test_step7_missing_phase2_start_is_repaired_not_borrowed_from_phase1(
+    reaper_db, mocker
+):
+    """A NULL ``phase2_started_at`` must not be measured with phase 1's clock.
+
+    Row shape produced by ``0047_add_strategic_cycle_table``: ``phase2_running``
+    backfilled straight from the legacy JSONB, ``phase2_started_at`` left NULL
+    because the entry had no parseable ``phase1_completed_at``, and
+    ``phase1_started_at`` COALESCEd to a long-past timestamp. The old
+    ``phase2_started_at or phase1_started_at`` fallback then reported phase 1's
+    age as ">3h in phase2" and force-terminated a phase-2 task that had been
+    running for minutes.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2-just-started",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        # Phase 1 started long ago; phase 2 started when the task was created.
+        phase1_started_at=_utcnow() - timedelta(hours=9),
+        phase2_started_at=None,
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 0, (
+        "phase 2 started minutes ago; only phase 1's clock is >3h old and it is "
+        "not evidence about phase 2"
+    )
+    assert task.status == TaskStatus.IN_PROGRESS, (
+        "the phase-2 task must not be force-terminated on a duration nothing "
+        "measured"
+    )
+    assert cycle.outcome == "phase2_running"
+    # The missing fact is REPAIRED from evidence, not left for a human: the
+    # phase-2 task is created at phase-2 start, so its created_at IS the start.
+    assert cycle.phase2_started_at is not None
+    assert cycle.phase2_started_at == task.created_at
+    repair = cycle.cycle_metadata["phase_start_repair"]
+    assert repair["phase"] == "phase2"
+    assert repair["source"] == "linked_task_created_at"
+
+
+@pytest.mark.asyncio
+async def test_step7_repaired_phase2_start_still_stalls_a_wedged_cycle(
+    reaper_db, mocker
+):
+    """Mutation guard: the repair must not become a shield.
+
+    Same NULL ``phase2_started_at`` shape, but the phase-2 task really has been
+    QUEUED for 9h with no heartbeat and no lifecycle write. Repairing the start
+    from the task's ``created_at`` must produce an HONEST >3h measurement and
+    the ordinary stall, with the reason naming both the cause and the repair.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2-wedged-null-start",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    from sqlalchemy import update as _sa_update
+
+    await reaper_db.execute(
+        _sa_update(Task)
+        .where(Task.id == task.id)
+        .values(
+            created_at=_utcnow() - timedelta(hours=9),
+            updated_at=_utcnow() - timedelta(hours=9),
+        )
+    )
+    await reaper_db.commit()
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=10),
+        phase2_started_at=None,
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 1
+    assert task.status == TaskStatus.FAILED
+    assert cycle.outcome == "stalled_phase2"
+    assert cycle.failure_reason.startswith(
+        "reaper_stall (attempt 1, cause phase2:queued_never_dispatched):"
+    ), cycle.failure_reason
+    # Surface the REASON, including where the clock came from — a cycle that
+    # stalls on the first sweep that ever measured it otherwise reads as the
+    # reaper inventing a deadline.
+    assert "phase2 start timestamp was missing and was repaired" in (
+        cycle.failure_reason
+    ), cycle.failure_reason
+    assert "linked_task_created_at" in cycle.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_step7_phase2_start_repair_is_idempotent_and_bounded(reaper_db, mocker):
+    """A repaired row is not repaired again, and repair alone is not a stall."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    from app import strategic_cycle as _sc
+
+    project = await _make_project(reaper_db)
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        # No phase-2 task and no phase-1 completion: the row carries no evidence
+        # of phase 2 ever starting, so the clock starts at the observation.
+        phase2_task_id=None,
+        phase1_started_at=_utcnow() - timedelta(hours=9),
+        phase1_completed_at=None,
+        phase2_started_at=None,
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    first = await _sc.repair_missing_phase_starts(reaper_db)
+    await reaper_db.commit()
+    assert len(first) == 1
+    assert first[0]["source"] == "observed_at_repair"
+
+    await reaper_db.refresh(cycle)
+    assert cycle.phase2_started_at is not None
+    # Deciding costs at most one extra window; it never asserts an unmeasured age.
+    assert cycle.phase2_started_at > _utcnow() - timedelta(minutes=5)
+
+    second = await _sc.repair_missing_phase_starts(reaper_db)
+    await reaper_db.commit()
+    assert second == [], "a repaired row must not match the predicate again"
 
 
 @pytest.mark.asyncio
@@ -6772,9 +7019,9 @@ async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
     assert payload["completion"]["status_message"] == (
         "reaper declared strategic cycle stalled in phase1 after >3h"
     )
-    assert payload["completion"]["failure_reason"] == (
-        "reaper_stall: cycle in phase1 >3h with no completion"
-    )
+    assert payload["completion"]["failure_reason"].startswith(
+        "reaper_stall (attempt 1, cause phase1:agent_heartbeat_lost):"
+    ), payload["completion"]["failure_reason"]
     assert events.index("commit") < events.index(alert) < events.index(completion)
 
 
@@ -6836,9 +7083,9 @@ async def test_step7_stalled_phase2_completion_broadcasts_after_commit(reaper_db
     assert completion[2]["completion"]["status_message"] == (
         "reaper declared strategic cycle stalled in phase2 after >3h"
     )
-    assert completion[2]["completion"]["failure_reason"] == (
-        "reaper_stall: cycle in phase2 >3h with no completion"
-    )
+    assert completion[2]["completion"]["failure_reason"].startswith(
+        "reaper_stall (attempt 1, cause phase2:"
+    ), completion[2]["completion"]["failure_reason"]
     assert events.index("commit") < events.index(alert) < events.index(completion)
 
 
@@ -21150,3 +21397,518 @@ async def test_reaper_cycle_runs_the_review_park_disposition_sweep(
         "the sweep must be handed the cycle's clock, not left to read its own"
     )
 
+
+# -- local_only placement holds vs the stalled-cycle reaper -------------------
+#
+# Live platform defect: a project with execution placement policy ``local_only``
+# whose only bound runner was PAUSED had zero live runners, so its strategic
+# phase task sat QUEUED under the policy's deliberately-unbounded wait. This
+# sweep force-terminated it at 3h -- and that force-termination was itself the
+# event that released ``_has_active_strategic_task``, letting a fresh cycle be
+# cut against the identical unsatisfiable condition. 16 cycles died that way.
+
+
+async def _local_only_project(db: AsyncSession) -> Project:
+    project = Project(
+        name="reaper-local-only",
+        user_id="user1",
+        build_config={
+            "resource_envelope": {"execution_placement_policy": "local_only"}
+        },
+    )
+    db.add(project)
+    await db.commit()
+    await db.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_skips_migrated_local_only_placement_hold(
+    reaper_db, mocker
+):
+    """The migrated hold must not be reaped -- and the loop must stay closed.
+
+    The task is put into the real post-migration state by actually running
+    ``_fail_stale_local_runner_holds``, which STRIPS the strategic hold keys the
+    older ``task_is_strategic_local_runner_hold`` skip tests. That strip is why
+    the pre-existing skip did not cover this task, so a test that hand-wrote the
+    context would not track the real migration.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+    from app.orchestrator_runner_dispatch import _fail_stale_local_runner_holds
+    from app.orchestrator_runner_placement import (
+        EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY,
+        task_is_local_only_placement_hold,
+    )
+    from app.strategic_runtime_work import task_is_strategic_local_runner_hold
+    from app.task_lifecycle import _has_active_strategic_task
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+    )
+
+    project = await _local_only_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: (
+                _utcnow() - timedelta(hours=4)
+            ).isoformat(),
+        },
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    # Real migration, not a hand-written context.
+    await _fail_stale_local_runner_holds(reaper_db)
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY in (task.context or {})
+    # The seam: the OLD skip no longer covers this task at all.
+    assert task_is_strategic_local_runner_hold(task) is False
+    assert task_is_local_only_placement_hold(task) is True
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    assert stalled == 0
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert task.status == TaskStatus.QUEUED
+    assert cycle.outcome == "phase2_running"
+    # The loop is broken, not merely quieter: the surviving QUEUED task keeps the
+    # strategic admission guard closed, so no replacement cycle can be cut
+    # against the same unsatisfiable condition.
+    assert await _has_active_strategic_task(project.id, reaper_db) is True
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_still_reaps_strategic_task_without_placement_hold(
+    reaper_db, mocker
+):
+    """Negative control: the skip must be narrow.
+
+    Same project policy, same >3h phase age, same strategic task type -- the
+    ONLY difference is that this task carries no placement wait. It must still
+    be declared stalled and force-terminated, or the fix has simply disabled the
+    watchdog.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+    from app.orchestrator_runner_placement import EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY
+
+    project = await _local_only_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    assert EXECUTION_PLACEMENT_WAIT_CONTEXT_KEY not in (task.context or {})
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    assert stalled == 1
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert task.status == TaskStatus.FAILED
+    assert cycle.outcome == "stalled_phase2"
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_alert_dedupes_across_two_cycle_ids(
+    reaper_db, mocker
+):
+    """One aging row per (project, phase) -- not one immortal row per cycle.
+
+    The pre-fix raw ``Alert(...)`` insert titled itself with the cycle id, so N
+    stalls on one project minted N rows that nothing could ever retire, and each
+    row's ``created_at`` restarted the clock any age-based escalation would read.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    cycle_ids = []
+    for _ in range(2):
+        task = Task(
+            project_id=project.id,
+            title="strategic-phase2",
+            payloads=[{"type": "strategic_review", "scope": "medium"}],
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=_utcnow() - timedelta(hours=1),
+        )
+        reaper_db.add(task)
+        await reaper_db.commit()
+        await reaper_db.refresh(task)
+        cycle = StrategicCycle(
+            id=_make_cycle_id(),
+            project_id=project.id,
+            outcome="phase2_running",
+            phase2_task_id=task.id,
+            phase1_started_at=_utcnow() - timedelta(hours=5),
+            phase2_started_at=_utcnow() - timedelta(hours=4),
+        )
+        cycle_ids.append(cycle.id)
+        reaper_db.add(cycle)
+        await reaper_db.commit()
+        assert (
+            await _rs.sweep_stalled_strategic_cycles(
+                reaper_db,
+                _utcnow(),
+                heartbeat_stale_cutoff_fn=lambda _t, now: now - timedelta(minutes=5),
+            )
+            == 1
+        )
+
+    rows = await reaper_db.execute(
+        _select(Alert).where(
+            Alert.project_id == project.id,
+            Alert.event_type == "research.diagnosis_stalled",
+        )
+    )
+    alerts = list(rows.scalars().all())
+    assert len(alerts) == 1, [a.title for a in alerts]
+    alert = alerts[0]
+    assert alert.dedupe_key == f"research.diagnosis_stalled:{project.id}:phase2"
+    assert alert.occurrence_count == 2
+    # The row ages from the FIRST stall, but its message names the LATEST cycle.
+    assert cycle_ids[0] not in alert.title
+    assert cycle_ids[1] in alert.message
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_alert_names_the_reason_not_just_the_state(
+    reaper_db, mocker
+):
+    """"Stalled in phase2" is a state. The alert must carry the CAUSE.
+
+    A phase task that never left QUEUED means no agent ever ran, which is a
+    different operator action from an agent that died mid-run — and the alert
+    is the only place that distinction reaches a human.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+        blocked_reason="no eligible runner bound to project",
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    # Force updated_at into the past (bypassing the onupdate hook) so the row
+    # counts as untouched since long before the liveness window.
+    from sqlalchemy import update as _sa_update
+
+    await reaper_db.execute(
+        _sa_update(Task)
+        .where(Task.id == task.id)
+        .values(
+            updated_at=_utcnow() - timedelta(hours=2),
+            created_at=_utcnow() - timedelta(hours=4),
+        )
+    )
+    await reaper_db.commit()
+
+    assert (
+        await _rs.sweep_stalled_strategic_cycles(
+            reaper_db,
+            _utcnow(),
+            heartbeat_stale_cutoff_fn=lambda _t, now: now - timedelta(minutes=5),
+        )
+        == 1
+    )
+
+    alert = (
+        await reaper_db.execute(
+            _select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.event_type == "research.diagnosis_stalled",
+            )
+        )
+    ).scalars().one()
+    # The cause key, the human sentence, and the operator's own blocked_reason
+    # all reach the alert.
+    assert "phase2:queued_never_dispatched" in alert.message
+    assert "never left QUEUED" in alert.message
+    assert "no eligible runner bound to project" in alert.message
+    # First stall of three: still a retryable WARNING, and it says so.
+    assert alert.severity == AlertSeverity.WARNING
+    assert "Stall 1 of 3" in alert.message
+
+    # And the cause is durable on the cycle row, not only in the alert text.
+    await reaper_db.refresh(cycle)
+    assert cycle.cycle_metadata["stall_signature"] == "phase2:queued_never_dispatched"
+    assert "never left QUEUED" in cycle.cycle_metadata["stall_reason"]
+
+
+@pytest.mark.asyncio
+async def test_step7_repeated_same_cause_stalls_escalate_one_alert_to_error(
+    reaper_db, mocker
+):
+    """19 identical WARNINGs was the defect. One row escalates instead.
+
+    Same dedupe key across attempts, so the occurrence count climbs on ONE row
+    and the severity crosses to ERROR at the retry bound — the point at which
+    the pipeline has stopped re-minting and only a human can clear it.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    for _ in range(_strategic_cycle.MAX_CONSECUTIVE_STALLS):
+        task = Task(
+            project_id=project.id,
+            title="strategic-phase2",
+            payloads=[{"type": "strategic_review", "scope": "medium"}],
+            status=TaskStatus.QUEUED,
+            last_heartbeat=None,
+        )
+        reaper_db.add(task)
+        await reaper_db.commit()
+        await reaper_db.refresh(task)
+        cycle = StrategicCycle(
+            id=_make_cycle_id(),
+            project_id=project.id,
+            outcome="phase2_running",
+            phase2_task_id=task.id,
+            phase1_started_at=_utcnow() - timedelta(hours=5),
+            phase2_started_at=_utcnow() - timedelta(hours=4),
+        )
+        reaper_db.add(cycle)
+        await reaper_db.commit()
+        # Age the row past the liveness window so the sweep sees a task that
+        # has not been touched, not one whose recovery is in flight.
+        from sqlalchemy import update as _sa_update
+
+        await reaper_db.execute(
+            _sa_update(Task)
+            .where(Task.id == task.id)
+            .values(
+                updated_at=_utcnow() - timedelta(hours=2),
+                created_at=_utcnow() - timedelta(hours=4),
+            )
+        )
+        await reaper_db.commit()
+        assert (
+            await _rs.sweep_stalled_strategic_cycles(
+                reaper_db,
+                _utcnow(),
+                heartbeat_stale_cutoff_fn=lambda _t, now: now - timedelta(minutes=5),
+            )
+            == 1
+        )
+
+    alerts = list(
+        (
+            await reaper_db.execute(
+                _select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.event_type == "research.diagnosis_stalled",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # ONE row, not one per stall.
+    assert len(alerts) == 1, [a.title for a in alerts]
+    alert = alerts[0]
+    assert alert.occurrence_count == _strategic_cycle.MAX_CONSECUTIVE_STALLS
+    # Escalated, and the message says retrying has stopped.
+    assert alert.severity == AlertSeverity.ERROR
+    assert "automatic retry stopped" in alert.title
+    assert "SUPPRESSED" in alert.message
+    assert "stall 3 in a row" in alert.message
+
+    # The final cycle's failure_reason carries the attempt count and cause.
+    last = (
+        (
+            await reaper_db.execute(
+                _select(StrategicCycle)
+                .where(StrategicCycle.project_id == project.id)
+                .order_by(StrategicCycle.phase1_started_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert "attempt 3" in last.failure_reason
+    assert "phase2:queued_never_dispatched" in last.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_step7_stall_streak_does_not_leak_across_projects(reaper_db, mocker):
+    """The cutoff is per project; one project's stalls must not bound another."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.strategic_events.broadcast_to_project", new_callable=AsyncMock)
+
+    noisy = await _make_project(reaper_db)
+    for _ in range(_strategic_cycle.MAX_CONSECUTIVE_STALLS):
+        reaper_db.add(
+            StrategicCycle(
+                id=_make_cycle_id(),
+                project_id=noisy.id,
+                outcome="stalled_phase2",
+                phase1_started_at=_utcnow() - timedelta(hours=9),
+                cycle_metadata={
+                    "stall_signature": "phase2:queued_never_dispatched",
+                    "stall_reason": "phase2 task never left QUEUED",
+                },
+            )
+        )
+    await reaper_db.commit()
+
+    quiet = await _make_project(reaper_db)
+    task = Task(
+        project_id=quiet.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    reaper_db.add(
+        StrategicCycle(
+            id=_make_cycle_id(),
+            project_id=quiet.id,
+            outcome="phase2_running",
+            phase2_task_id=task.id,
+            phase1_started_at=_utcnow() - timedelta(hours=5),
+            phase2_started_at=_utcnow() - timedelta(hours=4),
+        )
+    )
+    await reaper_db.commit()
+
+    # Force updated_at into the past (bypassing the onupdate hook) so the row
+    # counts as untouched since long before the liveness window.
+    from sqlalchemy import update as _sa_update
+
+    await reaper_db.execute(
+        _sa_update(Task)
+        .where(Task.id == task.id)
+        .values(
+            updated_at=_utcnow() - timedelta(hours=2),
+            created_at=_utcnow() - timedelta(hours=4),
+        )
+    )
+    await reaper_db.commit()
+
+    assert (
+        await _rs.sweep_stalled_strategic_cycles(
+            reaper_db,
+            _utcnow(),
+            heartbeat_stale_cutoff_fn=lambda _t, now: now - timedelta(minutes=5),
+        )
+        == 1
+    )
+
+    alert = (
+        await reaper_db.execute(
+            _select(Alert).where(
+                Alert.project_id == quiet.id,
+                Alert.event_type == "research.diagnosis_stalled",
+            )
+        )
+    ).scalars().one()
+    # First stall for THIS project despite the neighbour's exhausted streak.
+    assert alert.severity == AlertSeverity.WARNING
+    assert "Stall 1 of 3" in alert.message
+
+
+def test_stall_cutoff_skip_is_not_a_healthy_idle_receipt():
+    """A cutoff skip must not suppress the strategic-starvation alert.
+
+    The cutoff writes into the same ``_strategic_no_delta_skips`` log as an
+    ordinary quiet-project skip, but it means the strategist is BLOCKED. If it
+    counted as an intentional-idle receipt the cutoff would mute the one
+    detector that notices a halted strategic loop.
+    """
+    cutoff = _utcnow() - timedelta(hours=6)
+    recent = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    blocked = {
+        "_strategic_no_delta_skips": [
+            {
+                "skipped_at": recent,
+                "reason": (
+                    "stall_cutoff: 3 consecutive strategic cycles stalled "
+                    "with the same cause [phase2:queued_never_dispatched]"
+                ),
+            }
+        ]
+    }
+    assert _rs._recent_no_delta_skip_at(blocked, cutoff) is None
+
+    # A genuine quiet-project skip still counts.
+    quiet = {
+        "_strategic_no_delta_skips": [
+            {
+                "skipped_at": recent,
+                "reason": "no_meaningful_delta_since_last_cycle",
+            }
+        ]
+    }
+    assert _rs._recent_no_delta_skip_at(quiet, cutoff) is not None
+
+    # Legacy entries predate the reason key and must keep counting.
+    legacy = {"_strategic_no_delta_skips": [{"skipped_at": recent}]}
+    assert _rs._recent_no_delta_skip_at(legacy, cutoff) is not None

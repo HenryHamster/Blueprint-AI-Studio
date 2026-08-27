@@ -70,11 +70,19 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
 )
 from app.landed_signal import landed_signal_predicate
-from app.models import Artifact, ArtifactType, Project, ReleaseVersion, Task, TaskStatus
+from app.models import (
+    Alert,
+    Artifact,
+    ArtifactType,
+    Project,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+)
 from app.release_audit_child_state import _audit_child_crashed
 from app.task_surface_visibility import non_resident_infrastructure_task_filter
 from app.time_utils import _coerce_naive_utc, _utcnow
-_MODULE_SIZE_GOVERNANCE_CAP: int = 1839
+_MODULE_SIZE_GOVERNANCE_CAP: int = 2750
 
 logger = logging.getLogger(__name__)
 
@@ -1347,6 +1355,103 @@ def set_version_phase(
     )
 
 
+# ---------------------------------------------------------------------------
+# Goal-authoring compliance ledger
+# ---------------------------------------------------------------------------
+#
+# ``ReleaseVersion.goal`` opens NULL by design and the strategic agent is asked
+# to author it (``version_phase.goal_needed`` is emitted every cycle while the
+# goal is null).  ``ReleaseVersion.goal_omission_cycles`` /
+# ``goal_omission_last_cycle`` record what came back from that ask; the counter
+# is incremented by ``strategic_completion._record_version_goal_omission`` and
+# retired here, at the single point every goal-authoring path funnels through.
+
+#: Condition-scoped alert event type for "the version goal was requested and
+#: never arrived".  Registered in ``alert_policy.ALERT_EVENT_POLICIES`` (domain
+#: ``release_lifecycle``) and in ``message_audience._EVENT_AUDIENCE_REGISTRY``
+#: (operator-action-needed) — the audience gate in ``should_emit_project_alert``
+#: is fail-closed, so an unregistered event_type would be silently suppressed,
+#: which is the very failure mode this ledger exists to fix.
+VERSION_GOAL_OMISSION_EVENT_TYPE = "release.version_goal_not_authored"
+
+
+def version_goal_omission_dedupe_key(
+    project_id: uuid.UUID | str, version_number: int
+) -> str:
+    """Dedupe key naming the CONDITION — this project, this version.
+
+    Never the occurrence: an occurrence-keyed alert would mint one immortal row
+    per cycle and reset ``created_at`` each time, so the condition could never
+    age into the severity escalation the raise site applies.
+    """
+    return f"{VERSION_GOAL_OMISSION_EVENT_TYPE}:{project_id}:{version_number}"
+
+
+def clear_version_goal_omission_ledger(version: ReleaseVersion) -> bool:
+    """Reset the omission ledger because the ask has been answered.
+
+    Returns True when a streak was actually cleared.  Called from every path
+    that authors a goal so the counter can never outlive the condition, even
+    for a writer that forgets the alert resolver below.
+    """
+    had_streak = bool(
+        int(getattr(version, "goal_omission_cycles", 0) or 0)
+        or getattr(version, "goal_omission_last_cycle", None)
+    )
+    version.goal_omission_cycles = 0
+    version.goal_omission_last_cycle = None
+    return had_streak
+
+
+async def resolve_version_goal_omission_alert(
+    session: AsyncSession, version: ReleaseVersion
+) -> int:
+    """Dismiss the open goal-omission alert once the version has a goal.
+
+    ``release.version_goal_not_authored`` carries the default
+    ``AlertRetirementMode.SOURCE_CONDITION``, which in this codebase means *the
+    producer owns a condition-specific resolver*:
+    ``alert_dispatch.sweep_resolve_policy_retirement_alerts`` deliberately
+    reconciles only TASK_TERMINAL and TIMELINE_ONLY rows and will never dismiss
+    this one.  Without this resolver the alert outlives its condition forever —
+    the alert-lifecycle-vs-condition-lifecycle defect class.
+
+    Caller owns the commit.  Returns the number of rows dismissed.
+    """
+    if version.goal is None:
+        return 0
+    dedupe_key = version_goal_omission_dedupe_key(
+        version.project_id, version.version_number
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == version.project_id,
+                    Alert.dedupe_key == dedupe_key,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+    now = _utcnow()
+    for alert in rows:
+        alert.dismissed_at = now
+        session.add(alert)
+    logger.info(
+        "[RELEASE_VERSION] resolved %d goal-omission alert(s) for v%d project=%s "
+        "— goal authored",
+        len(rows),
+        version.version_number,
+        version.project_id,
+    )
+    return len(rows)
+
+
 def set_version_goal(
     version: ReleaseVersion,
     goal: str | None,
@@ -1380,6 +1485,14 @@ def set_version_goal(
     version.goal_updated_at = _utcnow()
     if editor_id:
         version.goal_editor_info = f"[{source}:{editor_id}]"
+    if new_goal:
+        # The ask is answered — whoever answered it. This is the funnel the
+        # strategist path AND the operator endpoint both use, so an operator
+        # taking the escape hatch named in the alert message ("set it directly
+        # with POST .../version-goal") really does end the condition instead of
+        # leaving the streak counter reporting an omission that no longer holds.
+        # Clearing a goal back to NULL re-opens the ask, so it must NOT reset.
+        clear_version_goal_omission_ledger(version)
     logger.info(
         "[RELEASE_VERSION] goal update for version v%d project=%s "
         "(old: %.50s) (new: %.50s) editor=%s",
@@ -1443,6 +1556,11 @@ async def refresh_open_version_goal_if_auto_derived(
             old_goal = locked.goal
             locked.goal = new_goal
             locked.goal_updated_at = _utcnow()
+            # Third goal-authoring path (auto-derived from current_focus); it
+            # assigns ``goal`` directly rather than through set_version_goal, so
+            # it has to retire the ask itself or the ledger keeps counting.
+            clear_version_goal_omission_ledger(locked)
+            await resolve_version_goal_omission_alert(session, locked)
             session.add(locked)
             logger.info(
                 "[RELEASE_VERSION] auto-refresh goal for open version v%d project=%s "

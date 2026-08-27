@@ -1424,11 +1424,22 @@ def test_verified_merge_ignores_absent_targeted_green_signal():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_named_test_unrelated_seam_fails_closed():
+def test_named_test_unrelated_seam_never_proven():
     """A declared test whose module name does not match the changed production
-    seam fails closed — test_widget.py cannot be proven by a change to
+    seam is never PROVEN — test_widget.py cannot be proven by a change to
     unrelated_module.py, even though the diff has both test + production files
-    and CI ran green."""
+    and CI ran green.
+
+    The proof axis is unchanged. The CREDIT axis changed: because this PR SHIPPED
+    the declared test alongside production code under a verified merge, it is
+    credited soft rather than hard-failed. Hard-failing it inverted the incentive
+    — the IDENTICAL diff declaring NOTHING earns ``inferred_test_cochange`` and
+    counts as verified, so declaring evidence scored strictly worse than declaring
+    nothing (see ``_ungrounded_seam_cochange_reason`` and
+    ``test_declaring_acceptance_never_scores_below_declaring_nothing``). The
+    name-drop shape — declared test NOT in the diff — still fails closed,
+    pinned below.
+    """
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
@@ -1442,9 +1453,26 @@ def test_named_test_unrelated_seam_fails_closed():
     )
     verdict = evaluate_code_acceptance(task)
     assert verdict.declared is True
-    assert verdict.satisfied is False
-    assert "does not semantically correspond" in verdict.reason
-    assert verdict.proven is False
+    assert verdict.proven is False, "an ungrounded seam must never mint proof"
+    assert verdict.satisfied is True, verdict.reason
+    assert "does not correspond BY MODULE NAME" in verdict.reason
+
+    # Name-drop: the SAME ungrounded seam with the declared test ABSENT from the
+    # diff. It exists and ran green (targeted), so the rejection is grounding,
+    # not absence — and it is still a hard fail.
+    namedrop = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/unrelated_module.py"],
+        unverified_reason=None,
+        targeted_green=True,
+    )
+    namedrop_verdict = evaluate_code_acceptance(namedrop)
+    assert namedrop_verdict.satisfied is False, namedrop_verdict.reason
+    assert namedrop_verdict.proven is False
+    assert "does not semantically correspond" in namedrop_verdict.reason
 
 
 def test_named_test_several_seams_one_matches_passes():
@@ -1558,10 +1586,16 @@ def test_named_test_frontend_mts_suffix_grounded_proven():
     assert verdict.proven is True
 
 
-def test_named_test_frontend_stem_mismatch_fails_closed():
-    """A frontend test whose stem matches no changed production seam fails
-    closed — `ComputeJobsPanel.test.tsx` cannot be proven by a change to an
-    unrelated `KnowledgeBrowser.tsx`, even with a real merge verdict."""
+def test_named_test_frontend_stem_mismatch_never_proven():
+    """A frontend test whose stem matches no changed production seam is never
+    PROVEN — `ComputeJobsPanel.test.tsx` cannot be proven by a change to an
+    unrelated `KnowledgeBrowser.tsx`, even with a real merge verdict.
+
+    Shipped alongside production code it earns the soft co-change floor (never
+    proof); name-dropped with the test absent from the diff it still fails
+    closed. Same two halves as
+    ``test_named_test_unrelated_seam_never_proven``, on the JS/TS stem shape.
+    """
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
@@ -1575,9 +1609,23 @@ def test_named_test_frontend_stem_mismatch_fails_closed():
     )
     verdict = evaluate_code_acceptance(task)
     assert verdict.declared is True
-    assert verdict.satisfied is False
-    assert "does not semantically correspond" in verdict.reason
-    assert verdict.proven is False
+    assert verdict.proven is False, "a stem mismatch must never mint proof"
+    assert verdict.satisfied is True, verdict.reason
+    assert "does not correspond BY MODULE NAME" in verdict.reason
+
+    namedrop = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "admin-ui/src/components/ComputeJobsPanel.test.tsx",
+        },
+        changed_files=["admin-ui/src/components/KnowledgeBrowser.tsx"],
+        unverified_reason=None,
+        targeted_green=True,
+    )
+    namedrop_verdict = evaluate_code_acceptance(namedrop)
+    assert namedrop_verdict.satisfied is False, namedrop_verdict.reason
+    assert namedrop_verdict.proven is False
+    assert "does not semantically correspond" in namedrop_verdict.reason
 
 
 def test_named_test_python_suffix_convention_grounded_proven():
@@ -1609,10 +1657,15 @@ def test_named_test_python_suffix_convention_grounded_proven():
     assert verdict.proof_ref == "backend/testing/local_runner_test.py"
 
 
-def test_named_test_suffix_convention_stem_mismatch_fails_closed():
-    """A ``<module>_test.py`` whose stem matches no changed seam still fails
-    closed — the new suffix grounding grants proof only on a real stem match,
-    not to any suffix-named test with an unrelated production change."""
+def test_named_test_suffix_convention_stem_mismatch_never_proven():
+    """A ``<module>_test.py`` whose stem matches no changed seam is never PROVEN
+    — the suffix grounding grants proof only on a real stem match, not to any
+    suffix-named test with an unrelated production change.
+
+    Shipped alongside production code it earns the soft co-change floor (never
+    proof); name-dropped with the test absent from the diff it still fails
+    closed.
+    """
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
@@ -1626,9 +1679,23 @@ def test_named_test_suffix_convention_stem_mismatch_fails_closed():
     )
     verdict = evaluate_code_acceptance(task)
     assert verdict.declared is True
-    assert verdict.satisfied is False
-    assert verdict.proven is False
-    assert "does not semantically correspond" in verdict.reason
+    assert verdict.proven is False, "a suffix-stem mismatch must never mint proof"
+    assert verdict.satisfied is True, verdict.reason
+    assert "does not correspond BY MODULE NAME" in verdict.reason
+
+    namedrop = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/local_runner_test.py",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],
+        unverified_reason=None,
+        targeted_green=True,
+    )
+    namedrop_verdict = evaluate_code_acceptance(namedrop)
+    assert namedrop_verdict.satisfied is False, namedrop_verdict.reason
+    assert namedrop_verdict.proven is False
+    assert "does not semantically correspond" in namedrop_verdict.reason
 
 
 def test_test_module_stem_covers_suffix_conventions():
@@ -1700,11 +1767,16 @@ def test_variant_suffixed_test_module_grounds_against_base_module():
     assert pre.satisfied is True
 
 
-def test_variant_suffixed_test_module_stem_mismatch_fails_closed():
+def test_variant_suffixed_test_module_stem_mismatch_never_proven():
     """A ``test_<module>__<variant>.py`` test whose BASE module matches no
-    changed seam still fails closed — the variant truncation grants proof only
-    on a real base-module (or underscore-family) match, not to any variant-named
-    test with an unrelated production change."""
+    changed seam is never PROVEN — the variant truncation grants proof only on
+    a real base-module (or underscore-family) match, not to any variant-named
+    test with an unrelated production change.
+
+    Shipped alongside production code it earns the soft co-change floor (never
+    proof); name-dropped with the test absent from the diff it still fails
+    closed.
+    """
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
@@ -1720,9 +1792,25 @@ def test_variant_suffixed_test_module_stem_mismatch_fails_closed():
     )
     verdict = evaluate_code_acceptance(task)
     assert verdict.declared is True
-    assert verdict.satisfied is False
-    assert verdict.proven is False
-    assert "does not semantically correspond" in verdict.reason
+    assert verdict.proven is False, "a variant-stem mismatch must never mint proof"
+    assert verdict.satisfied is True, verdict.reason
+    assert "does not correspond BY MODULE NAME" in verdict.reason
+
+    namedrop = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": (
+                "backend/testing/test_release_qualifier__sweep_stuck_qualifications.py"
+            ),
+        },
+        changed_files=["backend/app/acceptance_gate.py"],
+        unverified_reason=None,
+        targeted_green=True,
+    )
+    namedrop_verdict = evaluate_code_acceptance(namedrop)
+    assert namedrop_verdict.satisfied is False, namedrop_verdict.reason
+    assert namedrop_verdict.proven is False
+    assert "does not semantically correspond" in namedrop_verdict.reason
 
 
 def test_extracted_submodule_rename_grounds_against_base_and_vice_versa():
@@ -1769,8 +1857,11 @@ def test_extracted_submodule_rename_grounds_against_base_and_vice_versa():
     )
     assert sub_verdict.proven is True
 
-    # A submodule-named test whose changed seam is in a DIFFERENT family still
-    # fails closed — the family match is strictly an underscore-prefix relation.
+    # A submodule-named test whose changed seam is in a DIFFERENT family is
+    # never PROVEN — the family match is strictly an underscore-prefix
+    # relation. Shipped alongside production code it takes the soft co-change
+    # floor; the proof axis (the thing the family broadening widened) is
+    # untouched.
     unrelated = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
@@ -1783,9 +1874,26 @@ def test_extracted_submodule_rename_grounds_against_base_and_vice_versa():
         unverified_reason=None,
     )
     unrelated_verdict = evaluate_code_acceptance(unrelated)
-    assert unrelated_verdict.satisfied is False
-    assert unrelated_verdict.proven is False
-    assert "does not semantically correspond" in unrelated_verdict.reason
+    assert unrelated_verdict.proven is False, (
+        "a cross-family seam must never mint proof"
+    )
+    assert unrelated_verdict.satisfied is True, unrelated_verdict.reason
+    assert "does not correspond BY MODULE NAME" in unrelated_verdict.reason
+
+    # ...and with the declared test ABSENT from the diff it still fails closed.
+    unrelated_namedrop = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_release_qualifier_sweep.py",
+        },
+        changed_files=["backend/app/acceptance_gate.py"],
+        unverified_reason=None,
+        targeted_green=True,
+    )
+    namedrop_verdict = evaluate_code_acceptance(unrelated_namedrop)
+    assert namedrop_verdict.satisfied is False, namedrop_verdict.reason
+    assert namedrop_verdict.proven is False
+    assert "does not semantically correspond" in namedrop_verdict.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5487,3 +5595,219 @@ def test_name_dropped_test_with_no_existence_evidence_still_hard_fails():
     )
     assert verdict_out.proven is False
     assert "not among the PR's changed files" in verdict_out.reason
+# ─────────────────────────────────────────────────────────────────────────────
+# Ungrounded-seam co-change floor — declaring evidence must never score BELOW
+# declaring nothing (the merge-credit inversion that zeroed direction scores).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The four acceptance buckets ``direction_outcomes`` counts toward
+# ``verified_prs_merged`` (and therefore toward every direction merge_rate /
+# productivity score downstream). Pinned LITERALLY here rather than imported from
+# the module under test: a diff that drops a bucket from the verified set must
+# fail this file, not silently redefine its own expectation.
+_VERIFIED_ACCEPTANCE_BUCKETS_PIN = (
+    "proven",
+    "satisfied_unproven",
+    "inferred_test_cochange",
+    "undeclared",
+)
+
+
+def test_ungrounded_seam_with_shipped_test_earns_cochange_floor():
+    """A CI-verified merge that SHIPPED its declared test alongside production
+    code is credited soft even when filename grounding fails.
+
+    Real shape from production (PR #17907): ``test_orchestrator_liveness.py``
+    genuinely covers ``reaper_sweeps.py``, but the stem heuristic compares
+    ``orchestrator_liveness`` against ``reaper_sweeps`` and rejects it. Before the
+    floor this merge earned ``declared_unsatisfied`` — ZERO direction credit —
+    while the identical diff with NO declaration earned
+    ``inferred_test_cochange`` and counted as verified.
+    """
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_orchestrator_liveness.py",
+        },
+        changed_files=[
+            "backend/testing/test_orchestrator_liveness.py",
+            "backend/app/reaper_sweeps.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True, verdict.reason
+    # Soft, never machine-proven: semantic grounding is still required for proof.
+    assert verdict.proven is False, verdict.reason
+    assert "does not correspond BY MODULE NAME" in verdict.reason
+    assert "shipped the declared test ITSELF" in verdict.reason
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    recorded_dict = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert acceptance_blocks_success(recorded_dict) is False
+    assert acceptance_is_proven(recorded_dict) is False
+    bucket = classify_merged_acceptance(task)
+    assert bucket == "satisfied_unproven"
+    assert bucket in _VERIFIED_ACCEPTANCE_BUCKETS_PIN
+
+
+def test_ungrounded_seam_namedrop_without_shipped_test_still_fails_closed():
+    """The anti-fraud guard is untouched: a declaration naming a test the PR did
+    NOT ship, grounded to nothing that changed, is still a hard fail routed to the
+    ``named_test_ungrounded_seam`` cause."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_orchestrator_liveness.py",
+        },
+        # The declared test is absent from the diff; an UNRELATED test ships, so
+        # the diff still has test + production files.
+        changed_files=[
+            "backend/testing/test_something_else.py",
+            "backend/app/reaper_sweeps.py",
+        ],
+        unverified_reason=None,
+        targeted_green=True,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False, verdict.reason
+    assert verdict.proven is False
+    assert "does not semantically correspond" in verdict.reason
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert acceptance_blocks_success(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
+    assert classify_unsatisfied_reason(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) == (
+        "named_test_ungrounded_seam"
+    )
+    assert classify_merged_acceptance(task) == "declared_unsatisfied"
+
+
+def test_declaring_acceptance_never_scores_below_declaring_nothing():
+    """Monotonicity invariant: for one and the same merge, DECLARING a named test
+    must never land in a worse acceptance bucket than declaring NOTHING.
+
+    This is the inversion that zeroed ``verified_prs_merged`` (and with it
+    ``merge_rate`` and ``productivity_score``) on directions with real merges: an
+    undeclared merge that co-changed a test and a production file under green CI
+    was credited ``inferred_test_cochange``, while the SAME merge that also named
+    the test it shipped was credited ``declared_unsatisfied`` — nothing. Honest
+    declaration was strictly penalised, and the penalty was invisible because
+    nothing compared the two shapes.
+    """
+    changed = [
+        "backend/testing/test_orchestrator_liveness.py",
+        "backend/app/reaper_sweeps.py",
+    ]
+    undeclared = _make_code_task(changed_files=changed, unverified_reason=None)
+    # No declaration at all: the merge must qualify for the inferred floor, or
+    # this test is not exercising the inversion it claims to.
+    undeclared_bucket = classify_merged_acceptance_context(undeclared.context)
+    assert undeclared_bucket == "inferred_test_cochange"
+    assert undeclared_bucket in _VERIFIED_ACCEPTANCE_BUCKETS_PIN
+
+    declared = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_orchestrator_liveness.py",
+        },
+        changed_files=changed,
+        unverified_reason=None,
+    )
+    assert record_code_acceptance_verdict(declared) is not None
+    declared_bucket = classify_merged_acceptance(declared)
+    assert declared_bucket in _VERIFIED_ACCEPTANCE_BUCKETS_PIN, (
+        f"declaring a named test scored {declared_bucket!r}, below the "
+        f"{undeclared_bucket!r} the SAME merge earns with no declaration at all "
+        "— declaring acceptance evidence must never be penalised"
+    )
+
+
+def test_premerge_ungrounded_seam_with_shipped_test_is_not_a_structural_defect():
+    """The pre-merge gate mirrors the merge gate, so an open PR shipping its
+    declared test is not routed into the review/fix loop as an unsatisfiable
+    structural defect (an ungrounded filename match is not something a fix agent
+    can repair, so that routing burned review cycles forever)."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_notification_dispatch.py",
+        },
+        changed_files=[
+            "backend/testing/test_notification_dispatch.py",
+            "backend/app/alert_dispatch.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_premerge_acceptance(task)
+    assert verdict is not None
+    assert verdict.declared is True
+    assert verdict.satisfied is True, verdict.reason
+    assert verdict.proven is False
+    assert stamp_premerge_acceptance_finding(task) is None
+    assert premerge_acceptance_finding(task) is None
+
+
+def test_acceptance_rule_version_pins_the_cochange_floor_rule():
+    """LITERAL pin. The co-change floor changes what an already-stamped verdict
+    MEANS, so the rule version must have moved past 3 — otherwise
+    :func:`effective_acceptance_verdict` trusts every v3 ``declared_unsatisfied``
+    stamp verbatim and the fix never reaches work that already merged."""
+    assert ACCEPTANCE_RULE_VERSION == 4
+    assert REDERIVED_BY_QUALIFIER == "qualifier:v4"
+
+
+def test_classify_merged_acceptance_rederives_a_stale_rule_verdict():
+    """Direction merge credit must read the CURRENT rule, not the land-time stamp.
+
+    Before this, only the release qualifier re-derived retired-rule verdicts;
+    ``classify_merged_acceptance`` — the classifier direction productivity reads
+    — took the frozen dict verbatim. A rule fix therefore reached release
+    qualification but NEVER reached merge credit: a direction zeroed by a
+    since-corrected rule kept scoring 0, and any cycle recomputed before the
+    qualifier's window pass re-froze the stale answer into ``research_history``.
+    """
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_orchestrator_liveness.py",
+        },
+        changed_files=[
+            "backend/testing/test_orchestrator_liveness.py",
+            "backend/app/reaper_sweeps.py",
+        ],
+        unverified_reason=None,
+    )
+    # Freeze the verdict the RETIRED v3 rule produced for exactly this merge.
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "declared": True,
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "rule_version": ACCEPTANCE_RULE_VERSION - 1,
+        "stamped_at_land_time": True,
+        "reason": (
+            "declared named_test 'backend/testing/test_orchestrator_liveness.py' "
+            "exercises a production seam that does not semantically correspond to "
+            "the declared test module"
+        ),
+    }
+    # Stamp the CURRENT input fingerprint so the ONLY thing stale about this row
+    # is its rule version — otherwise the fingerprint mismatch would drive the
+    # re-derivation and this test would not prove what it claims.
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY]["input_fingerprint"] = (
+        acceptance_input_fingerprint(task.first_payload, task.context, task.project_id)
+    )
+
+    # The raw-context classifier still reports what was frozen — unchanged.
+    assert classify_merged_acceptance_context(task.context) == "declared_unsatisfied"
+    # The task-level classifier re-derives under the current rule and credits it.
+    bucket = classify_merged_acceptance(task)
+    assert bucket == "satisfied_unproven", bucket
+    assert bucket in _VERIFIED_ACCEPTANCE_BUCKETS_PIN
+    # Re-derivation is read-only here: the durable re-stamp is the qualifier's job,
+    # so the recorded row is untouched by classification.
+    assert task.context[CODE_ACCEPTANCE_VERDICT_KEY]["rule_version"] == (
+        ACCEPTANCE_RULE_VERSION - 1
+    )

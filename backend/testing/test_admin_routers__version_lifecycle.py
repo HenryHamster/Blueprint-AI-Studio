@@ -510,6 +510,56 @@ class TestSetVersionGoal:
         await db_session.refresh(version)
         assert version.goal == "locked goal"
 
+    @pytest.mark.asyncio
+    async def test_set_goal_over_http_retires_the_omission_ask(
+        self, client: AsyncClient, db_session
+    ):
+        """The operator escape hatch named in the alert must END the condition.
+
+        ``release.version_goal_not_authored`` carries
+        ``AlertRetirementMode.SOURCE_CONDITION``: the backstop sweep in
+        ``alert_dispatch.sweep_resolve_policy_retirement_alerts`` reconciles only
+        TASK_TERMINAL and TIMELINE_ONLY rows, so if this endpoint does not
+        dismiss the alert itself nothing ever will -- and the operator who did
+        exactly what the alert's own "TO RESOLVE" line asked keeps staring at it.
+        """
+        from app.models import AlertSeverity
+
+        project = await _make_project(db_session, name="Goal Omission Hatch")
+        version = await _make_open_version(db_session, project.id)
+        version.goal_omission_cycles = 4
+        version.goal_omission_last_cycle = "cycle-open"
+        db_session.add(version)
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            domain="release_lifecycle",
+            event_type=rv.VERSION_GOAL_OMISSION_EVENT_TYPE,
+            title=f"Version goal not authored - v{version.version_number}",
+            message="asked and not delivered",
+            source="version_goal_omission",
+            dedupe_key=rv.version_goal_omission_dedupe_key(
+                project.id, version.version_number
+            ),
+        )
+        db_session.add(alert)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-goal",
+            json={"goal": "Answer the ask that has been open for four cycles."},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(version)
+        await db_session.refresh(alert)
+        assert version.goal_omission_cycles == 0
+        assert version.goal_omission_last_cycle is None
+        assert alert.dismissed_at is not None, (
+            "Setting the goal over the operator endpoint must dismiss the "
+            "goal-omission alert; SOURCE_CONDITION means no sweep will."
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_acceptance_criteria.py — Version Acceptance Criteria
@@ -2563,6 +2613,14 @@ class TestVersionLifecycleGateLatch:
                 "blocker": "candidate_operator_authorship_nonzero",
                 "candidate_sha": "abc1234567890",
                 "finalized_at": "2026-05-27T00:00:00",
+                "candidate_operator_authorship_gate": {
+                    "status": "unconfigured",
+                    "passed": False,
+                    "count": 0,
+                    "max_count": None,
+                    "blocker": "candidate_operator_authorship_evidence_missing",
+                    "reason": "no_operator_authorship_contract_declared",
+                },
             },
         )
         db_session.add(version)
@@ -2620,6 +2678,14 @@ class TestVersionLifecycleGateLatch:
         assert resp.status_code == 200, resp.text
         cv = resp.json()["current_version"]
         assert cv["last_qualification"]["is_permanent_gate_incapacity"] is None
+        assert cv["last_qualification"]["candidate_operator_authorship_gate"] == {
+            "status": "unconfigured",
+            "passed": False,
+            "count": 0,
+            "max_count": None,
+            "blocker": "candidate_operator_authorship_evidence_missing",
+            "reason": "no_operator_authorship_contract_declared",
+        }
         assert cv["gate_latch"] is not None
         assert cv["gate_latch"]["gate"] == "candidate_operator_authorship_nonzero"
         assert cv["gate_latch"]["compare_range"] == "deadbeef...abc1234567890"

@@ -28,6 +28,7 @@ from app.strategic_review_effort import (
 from app.direction_metrics import (
     _compute_direction_quality_score,
     canonical_cost_per_merged_pr,
+    unproductive_streak_summary,
 )
 from app.direction_outcomes import (
     compute_direction_autonomy_state,
@@ -5409,6 +5410,37 @@ def _build_direction_stats(
         ).strip()
         if _retirement_condition:
             stat_entry["retirement_condition"] = _retirement_condition[:_DIR_FIELD_MAX]
+        # ---- Dud evidence: WHY a direction may deserve retirement -------------
+        # ``retirement_eligible`` above is a SUCCESS/graduation milestone (enough
+        # VERIFIED autonomous merges with zero operator actions) — it says a
+        # direction has proven itself, NOT that it is a dud. The cost/merge
+        # ``retirement_consideration_*`` flag DOES already reach this payload
+        # (below), but the per-cycle productivity judgment did not: the strategist
+        # — the only actor that can call ``retire_direction`` — could see that a
+        # direction was EXPENSIVE, never that it had been unproductive for N cycles
+        # running, nor why. Surface that here, with reasons rather than a bare
+        # counter, so a keep-or-retire call is made on evidence.
+        #
+        # Deliberately NOT an automatic cull: retirement stays a single judged
+        # decision through ``retire_direction`` (guarded by
+        # ``validate_direction_terminal_transition``). See the PR rationale.
+        _unproductive = int(d.get("consecutive_unproductive_cycles", 0) or 0)
+        if _unproductive > 0:
+            stat_entry["consecutive_unproductive_cycles"] = _unproductive
+            _streak = unproductive_streak_summary(d)
+            if _streak:
+                stat_entry["unproductive_streak"] = _streak[:_DIR_FIELD_MAX]
+        _last_productivity = d.get("last_productivity_reason")
+        if isinstance(_last_productivity, dict) and _last_productivity.get(
+            "reason_code"
+        ):
+            stat_entry["last_productivity_reason"] = {
+                "productive": bool(_last_productivity.get("productive")),
+                "reason_code": str(_last_productivity.get("reason_code"))[
+                    :_DIR_FIELD_MAX
+                ],
+                "detail": str(_last_productivity.get("detail") or "")[:_DIR_FIELD_MAX],
+            }
         # Retired-origin grounding: when this direction was created as a
         # continuation/re-staffing of a retired one, strategic_completion stores
         # a compact grounding object under context["retired_direction_grounding"]
@@ -5509,6 +5541,27 @@ def _build_direction_stats(
                 stat_entry["churn_retirement_recommended_at"] = d.get(
                     "churn_retirement_recommended_at"
                 )
+        # Cost-efficiency retirement consideration (direction_lifecycle raises it
+        # when a direction's rolling cost/merge exceeds a multiple of the project
+        # median). This is the cull signal that actually fires in practice, and
+        # until now it was written to the direction dict and consumed by nothing
+        # but the admin-ui card — so the strategist chose directions with no
+        # visibility of it and no keep-or-retire decision was ever owed. Surface
+        # the flag, the reason and the bounded evidence next to the churn
+        # recommendation so the same decision path can act on it.
+        if d.get("retirement_consideration_needed"):
+            stat_entry["retirement_consideration_needed"] = True
+            if d.get("retirement_consideration_reason"):
+                stat_entry["retirement_consideration_reason"] = d.get(
+                    "retirement_consideration_reason"
+                )
+            if d.get("retirement_consideration_at"):
+                stat_entry["retirement_consideration_at"] = d.get(
+                    "retirement_consideration_at"
+                )
+            _rc_ev = d.get("retirement_consideration_evidence")
+            if _rc_ev:
+                stat_entry["retirement_consideration_evidence"] = _rc_ev
         # Surface non-default recommended_mode so the strategic agent can bias
         # its direction decisions (audit/fundamentals → prefer non-feature work;
         # pause → tactical spawning should be skipped by autonomous_research).
@@ -5587,6 +5640,7 @@ async def _finalize_strategic_review_spawn(
     steering_excerpt: str | None,
     launched_by_user_id: str | None = None,
     runner_pin_id: str | None = None,
+    task_priority: int | None = None,
     integrity_conflict_counts: dict[str, int] | None = None,
     effort_tier: str | None = None,
     effort_reason: str | None = None,
@@ -5759,19 +5813,22 @@ async def _finalize_strategic_review_spawn(
         born_status = TaskStatus.QUEUED
         born_vm_provisioned_at = None
 
-    new_task = Task(
-        project_id=project_id,
-        title=f"Strategic review: {project_name}",
-        description="Vision and direction review",
-        payloads=[payload],
-        vm_instance_id=born_vm_instance_id,
-        status=born_status,
-        vm_provisioned_at=born_vm_provisioned_at,
-        created_by="ORCHESTRATOR",
-        launched_by_user_id=launched_by_user_id,
-        context=task_context,
-        strategic_cycle_id=cycle_id,
-    )
+    task_kwargs: dict[str, Any] = {
+        "project_id": project_id,
+        "title": f"Strategic review: {project_name}",
+        "description": "Vision and direction review",
+        "payloads": [payload],
+        "vm_instance_id": born_vm_instance_id,
+        "status": born_status,
+        "vm_provisioned_at": born_vm_provisioned_at,
+        "created_by": "ORCHESTRATOR",
+        "launched_by_user_id": launched_by_user_id,
+        "context": task_context,
+        "strategic_cycle_id": cycle_id,
+    }
+    if task_priority is not None:
+        task_kwargs["priority"] = task_priority
+    new_task = Task(**task_kwargs)
     session.add(new_task)
     await session.flush()  # assign new_task.id for the cycle update below
     history = TaskHistory(
@@ -5848,6 +5905,7 @@ async def _spawn_strategic_review(
     extra_payload: dict[str, Any] | None = None,
     resident_minimal: bool = False,
     runner_pin_id: str | None = None,
+    task_priority: int | None = None,
     *,
     launched_by_user_id: str | None = None,
     apply_spawn_budget_guard: bool = False,
@@ -6366,6 +6424,7 @@ async def _spawn_strategic_review(
             # spawn path passes this; cadence spawns leave it None → QUEUED as before)
             # so POST /api/runner/next-task claims it directly.
             runner_pin_id=runner_pin_id,
+            task_priority=task_priority,
             effort_tier=_res_effort_tier,
             effort_reason=_res_effort_reason,
             expected_legacy_generation=expected_legacy_generation,
@@ -6745,6 +6804,22 @@ async def _spawn_strategic_review(
                     **(
                         {"goal_needed": True}
                         if _open_version.goal is None
+                        else {}
+                    ),
+                    # How many consecutive completed cycles have already been
+                    # asked for this goal and did not deliver it. Emitted only
+                    # while the ask is still open and at least one cycle has
+                    # missed, so the re-ask can name what was asked and what
+                    # came back instead of repeating an identical request that
+                    # has already been ignored N times.
+                    **(
+                        {
+                            "goal_omission_cycles": int(
+                                _open_version.goal_omission_cycles or 0
+                            )
+                        }
+                        if _open_version.goal is None
+                        and int(_open_version.goal_omission_cycles or 0) > 0
                         else {}
                     ),
                 }
@@ -8672,6 +8747,7 @@ async def _spawn_strategic_review(
         operator_steered=operator_steered,
         steering_excerpt=steering_excerpt,
         launched_by_user_id=launched_by_user_id,
+        task_priority=task_priority,
         integrity_conflict_counts=_integrity_counts,
         effort_tier=_effort_tier,
         effort_reason=_effort_reason,

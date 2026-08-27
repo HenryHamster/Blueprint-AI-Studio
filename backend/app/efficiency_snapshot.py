@@ -4951,7 +4951,10 @@ async def maybe_alert_overdue_snapshot_cadence(
     when a fresh snapshot lands. Runs every hourly snapshot tick for every
     project. Returns ``True`` when an alert fired, else ``None``.
     """
-    from app.alert_policy import create_project_alert_if_allowed
+    from app.alert_policy import (
+        create_project_alert_if_allowed,
+        resolve_project_alert_by_dedupe_key,
+    )
     from app.models import AlertSeverity
     from app.project_telemetry import get_project_telemetry
     from app.task_locking import with_project_telemetry_locked
@@ -4990,6 +4993,11 @@ async def maybe_alert_overdue_snapshot_cadence(
             return  # no transition — leave the marker untouched
         c[LAST_ALERTED_OVERDUE_CADENCE_KEY] = new_state
         changed["fire"] = overdue  # only the overdue crossing raises an alert
+        # ...and only the HEALTHY crossing resolves the row it raised. Re-arming
+        # the marker without this left the alert standing after the condition
+        # cleared: the snapshot service recovered, the next lapse could alert
+        # again, and the original WARNING stayed in the operator feed forever.
+        changed["recovered"] = not overdue
         changed["container"] = c
 
     await with_project_telemetry_locked(
@@ -5000,6 +5008,23 @@ async def maybe_alert_overdue_snapshot_cadence(
         design_doc_fallback=_proj.design_doc,
         skip_locked=False,
     )
+    if changed.get("recovered"):
+        # SOURCE_CONDITION retirement: a snapshot landed, so the condition the
+        # alert describes is false. Dismiss the row the overdue crossing opened.
+        resolved = await resolve_project_alert_by_dedupe_key(
+            session,
+            project_id,
+            f"{SNAPSHOT_CADENCE_OVERDUE_EVENT_TYPE}:{project_id}",
+            broadcast=True,
+        )
+        if resolved:
+            await session.commit()
+            logger.info(
+                "[SNAPSHOT_CADENCE_ALERT] project=%s resolved (cadence recovered)",
+                project_id,
+            )
+        return None
+
     if not changed["fire"]:
         return None
 

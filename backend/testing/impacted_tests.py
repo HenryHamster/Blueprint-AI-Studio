@@ -419,8 +419,8 @@ def corpus_lane_required_sentinels(repo_root: str) -> "list[str]":
     it -- which is how ``test_scripts_dir_resolution_guard.py`` (registered on
     ``backend/**/*.py``, and whose own manifest entry states in writing that it
     is deliberately kept OUT of the standalone lane because it reads the whole
-    backend tree over a bind mount under a 30s timeout) turned a correct
-    registration into a red promotion matrix.
+    backend tree over a bind mount under whatever the lane passes as pytest's
+    ``--timeout``) turned a correct registration into a red promotion matrix.
 
     Reading it off the manifest closes that: to make a sentinel exempt you now
     have to take its non-backend surface away, which visibly shrinks what the
@@ -894,11 +894,14 @@ def collect_create_true_patch_targets(testing_dir: str) -> "list[tuple[str, str]
             # all. Skipping the parse for the other 618 takes this scan from
             # 10.93s to 0.74s (14.8x) on the current checkout.
             #
-            # This is a false-failure fix, not a nicety. The standalone lane
-            # runs with ``--timeout=30``; over the Docker-on-Windows bind mount
-            # the 10.9s native scan crosses it, and the guard then dies on a
-            # timeout rather than its assertion -- reporting "slow filesystem"
-            # while claiming to report a redundant-patch defect.
+            # This is a false-failure fix, not a nicety. When the standalone
+            # lane ran at 30s (before LANE_HANG_DETECTOR_SECONDS was raised;
+            # see backend/testing/test_harness_timeout_budgets.py) the 10.9s
+            # native scan crossed it over the Docker-on-Windows bind mount, and
+            # the guard died on a timeout rather than its assertion --
+            # reporting "slow filesystem" while claiming to report a
+            # redundant-patch defect. The prefilter is what keeps this scan
+            # cheap regardless of where the lane budget sits.
             if not _CREATE_TRUE_HINT.search(source):
                 continue
             tree = ast.parse(source, filename=fname)

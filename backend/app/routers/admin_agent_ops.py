@@ -11,9 +11,10 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from typing import Any, List, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import func as _func
@@ -56,7 +57,9 @@ from app.direction_lifecycle import (
     apply_churn_retirement_keep,
     apply_churn_retirement_retire,
     direction_has_churn_retirement_recommendation,
+    pause_direction_autonomously,
     reactivate_paused_direction,
+    strategist_pause_reason,
 )
 from app.direction_priority import direction_task_priority
 from app.direct_research_spawn import (
@@ -139,7 +142,9 @@ from app.strategic_watches import (
     serialize_watch,
 )
 from app.workbench_state import (
+    renew_strategic_local_continuation_from_resident_work,
     strategic_local_continuation_status_from_vision,
+    strategic_local_continuation_work_renewal_is_due,
 )
 from app.strategic_constants import (
     STRATEGIC_DIRECTION_TEXT_MAX,
@@ -240,6 +245,15 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "begin_autonomous_turn",
     "report_autonomous_finding",
     "end_autonomous_turn",
+    # Pipeline ACTION verbs. Each re-enters the SAME server-side implementation
+    # the equivalent operator lever calls (app/strategic_pipeline_actions.py has
+    # the op -> implementation table); none of them is a parallel reimplementation.
+    "force_promote",
+    "approve_activation",
+    "requeue_task",
+    "reset_iteration_cap",
+    "set_task_priority",
+    "unhold_direction",
 })
 
 def _cap_str(
@@ -1067,13 +1081,111 @@ async def agent_annotate(
     return response
 
 
+def _resident_process_task(candidate: Task) -> bool:
+    """Return whether *candidate* is a Resident process incarnation.
+
+    A Continuous Workday generation runs AS a ``strategic_review`` Task, so
+    payload type alone cannot tell a Resident worker apart from a one-shot
+    strategic cycle. The server-owned context markers can, and the same two
+    markers are already the canonical discriminator in
+    ``app.strategic_completion`` / ``app.strategic_cycle``, where a Resident
+    generation is explicitly classified as "process infrastructure, not a
+    one-shot strategic result".
+    """
+    context = getattr(candidate, "context", None) or {}
+    return (
+        context.get("_resident_session") is True
+        or context.get("_resident_infrastructure") is True
+    )
+
+
+def _competing_one_shot_strategic_task(candidates: Iterable[Task]) -> Task | None:
+    """Return the first candidate that is a LIVE one-shot Strategic writer.
+
+    "Live one-shot Strategic writer" is the exact thing the Resident mutation
+    fence must not race, and it is narrower than "any active task whose payload
+    type is strategic":
+
+    * Resident process incarnations are excluded. Single-writer among Resident
+      workers is already enforced — far more precisely — by the session-id,
+      worker-generation and process-incarnation checks the caller runs
+      immediately before this fence. Counting a sibling Resident row here only
+      mutes the live Resident during a handoff (predecessor generation still
+      winding down, adopted cadence duplicate, retry re-provision), which is
+      exactly the window in which the operator is talking to it.
+    * A one-shot that has never begun executing is excluded. It has issued no
+      strategic op and holds no pre-mutation snapshot, so there is nothing for
+      the Resident's write to clobber (and nothing of the Resident's for its
+      completion to clobber: it will read state fresh when it does start).
+      ``started_at is None`` is the same "not-yet-executing" predicate
+      ``strategic_resident_session._task_is_adoptable`` uses. A QUEUED one-shot
+      that cannot dispatch would otherwise fence the Resident indefinitely.
+    * Archived rows are excluded.
+
+    An IN_PROGRESS / EVALUATING one-shot still fences even if ``started_at`` was
+    never stamped: those statuses mean an agent ran, so a claim-time bookkeeping
+    gap must not open the race.
+    """
+    for candidate in candidates:
+        if getattr(candidate, "archived", False):
+            continue
+        if (candidate.first_payload or {}).get("type") not in STRATEGIC_TASK_TYPES:
+            continue
+        if _resident_process_task(candidate):
+            continue
+        if candidate.started_at is None and candidate.status not in (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ):
+            continue
+        return candidate
+    return None
+
+
 async def _enforce_resident_mutation_fence(
     session: AsyncSession,
     project: Project,
     task: Task,
     op: str,
 ) -> None:
-    """Require fresh continuation and sole Strategic-lane ownership for mutations."""
+    """Require an OWNED continuation and sole Strategic-lane ownership for mutations.
+
+    The invariant being protected is *one Strategic writer per project*: a
+    one-shot ``design_doc_update`` / ``strategic_review`` cycle applies a
+    whole-cycle result derived from the state it read when it started, so it
+    must not interleave with the Resident's incremental mutations in either
+    direction. It is NOT "no other strategic-typed row may exist" — see
+    ``_competing_one_shot_strategic_task`` for why those are different.
+
+    The two continuation-lease conditions protect different things and are
+    satisfiable in different ways:
+
+    * **Ownership** (below). The continuation marker must exist, be armed, and
+      belong to the operator who owns this Resident session. Those are identity
+      facts — a mismatch means this worker is not the lane's writer — so they
+      stay hard refusals.
+    * **Freshness** is NOT an authority condition and no longer refuses.
+      Continuation freshness governs the *local-runner pin*
+      (``strategic_local_runner_required``); its lapse is what hands the
+      Strategic lane back to the cloud cadence. Whether a live Resident may
+      write is already fully decided upstream by the session-id / task-id /
+      worker-generation / process-incarnation checks against the freshly locked
+      ``Project`` and ``Task`` rows, plus the Strategic-lane check below.
+      Treating a stale pin as revoked authority also made the failure
+      self-reinforcing: the lapse lets the cadence spawn a cloud one-shot, and
+      that one-shot then trips the lane check, so a lease the Resident could not
+      renew by working fenced it behind a task its own lapse created.
+      Instead, an identity-verified mutation RENEWS the anchor — the Resident
+      re-arms by working. This is strictly narrower than the heartbeat, which
+      already renews the same anchor on a bare ``continuous_liveness`` beat.
+      The dead-man's switch is unchanged for its real purpose: a session that
+      issues no ops and no heartbeats still goes stale inside the TTL and still
+      releases the pin.
+
+    Every refusal carries WHY (which lease condition failed, or which task owns
+    the lane and in what state); a bare state name leaves the Resident unable to
+    tell the operator what blocked it.
+    """
     if op in ("create_message", "resolve_message"):
         return
     resident_blob = _read_resident_session(project.vision)
@@ -1087,12 +1199,55 @@ async def _enforce_resident_mutation_fence(
     if (
         not operator_user_id
         or not continuation.get("enabled")
-        or not continuation.get("fresh")
         or not continuation.get("owned_by_current_operator")
     ):
         raise HTTPException(
             status_code=409,
-            detail="Resident continuation expired or ownership changed",
+            detail=(
+                "Resident continuation is not armed for this operator "
+                f"(reason={continuation.get('reason')}; "
+                f"operator_user_id={'present' if operator_user_id else 'missing'}; "
+                f"enabled={bool(continuation.get('enabled'))}; "
+                f"fresh={bool(continuation.get('fresh'))}; "
+                f"ownership={continuation.get('ownership')}; "
+                f"owned_by_current_operator="
+                f"{bool(continuation.get('owned_by_current_operator'))}; "
+                f"expires_at={continuation.get('expires_at')}). "
+                "Continuation freshness is NOT the blocker: a stale-but-owned "
+                "lease is renewed by this mutation. This refusal means the "
+                "marker is absent, disabled, or owned by another operator "
+                "session — restart the Workday session to re-arm it."
+            ),
+        )
+
+    # Self-renewal: the mutation IS the liveness proof. A no-op unless the
+    # marker is already armed for exactly this operator, so it can neither mint
+    # a marker nor resurrect one that Stop or a Chat-mode switch popped. It
+    # rides this request's transaction under the Project lock we already hold,
+    # so a refused op below rolls it back with everything else.
+    #
+    # The pacing check is OUTSIDE the locked write on purpose. ``_with_vision_locked``
+    # calls ``flag_modified`` on ``project.vision`` unconditionally, so handing it
+    # a mutate_fn that decides to do nothing still emits a full JSONB UPDATE of
+    # the column — an op burst would rewrite it once per op, which is exactly
+    # what the pacing threshold exists to prevent. We hold the Project row lock,
+    # so ``project.vision`` here is the same row the write would re-read.
+    if strategic_local_continuation_work_renewal_is_due(
+        project.vision,
+        operator_user_id=operator_user_id,
+    ):
+
+        def _renew_continuation_from_work(vision: dict[str, Any]) -> None:
+            renew_strategic_local_continuation_from_resident_work(
+                vision,
+                operator_user_id=operator_user_id,
+            )
+
+        await _with_vision_locked(
+            session,
+            project.id,
+            _renew_continuation_from_work,
+            _locked_project=project,
         )
 
     active_candidates = (
@@ -1111,13 +1266,20 @@ async def _enforce_resident_mutation_fence(
             )
         )
     ).scalars()
-    if any(
-        (candidate.first_payload or {}).get("type") in STRATEGIC_TASK_TYPES
-        for candidate in active_candidates
-    ):
+    blocking = _competing_one_shot_strategic_task(active_candidates)
+    if blocking is not None:
+        blocking_type = (blocking.first_payload or {}).get("type")
+        blocking_status = getattr(blocking.status, "value", blocking.status)
         raise HTTPException(
             status_code=409,
-            detail="Resident no longer owns the Strategic mutation lane",
+            detail=(
+                "Resident no longer owns the Strategic mutation lane: one-shot "
+                f"{blocking_type} task {blocking.id} is {blocking_status} and "
+                "owns the Strategic writer lane, so writing now would make two "
+                "writers. This is TRANSIENT and needs no operator action: it "
+                "clears by itself when that task reaches a terminal status — "
+                "retry the mutation then."
+            ),
         )
 
 
@@ -1288,6 +1450,7 @@ async def _reject_dependency_cycles(
 async def strategic_operation(
     request: Request,
     payload: StrategicOp,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
@@ -1902,6 +2065,8 @@ async def strategic_operation(
             new_dir["system_id"] = _cap_str(
                 data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings
             )
+        if "cost_budget_usd" in data:
+            new_dir["cost_budget_usd"] = data["cost_budget_usd"]
         # Persist the direction→gap linkage so reconciliation can map an active
         # direction back to the problem-model gap it works on. Optional and
         # string-cast; additive on the JSONB direction dict (no migration).
@@ -2190,6 +2355,20 @@ async def strategic_operation(
                                     "reason": "Cannot reactivate user-paused direction",
                                 }
                             )
+                    elif changes["status"] == "paused":
+                        # A strategist-initiated pause IS an automatic pause by
+                        # definition, so it must go through the shared seam. A
+                        # bare `d["status"] = "paused"` here leaves no
+                        # auto_paused/paused_at/paused_reason markers, which
+                        # makes the direction indistinguishable from a genuine
+                        # operator hold and latches it paused forever: cooldown
+                        # auto-recovery skips it (no auto_paused/paused_at) and
+                        # reactivate_paused_direction refuses the strategist
+                        # (allow_user_paused=False). Only a human PATCH on
+                        # /directions may produce a user-pause.
+                        pause_direction_autonomously(
+                            d, reason=strategist_pause_reason(rationale)
+                        )
                     else:
                         d["status"] = changes["status"]
                     if changes["status"] == "superseded":
@@ -2222,6 +2401,11 @@ async def strategic_operation(
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:
                         d["recommended_mode"] = mode
+                if "cost_budget_usd" in changes:
+                    if changes["cost_budget_usd"] is None:
+                        d.pop("cost_budget_usd", None)
+                    else:
+                        d["cost_budget_usd"] = changes["cost_budget_usd"]
                 # Allow updating (or clearing) the direction→gap linkage so the
                 # agent can re-ground an existing direction to a different gap.
                 if "gap_id" in changes:
@@ -4974,7 +5158,11 @@ async def strategic_operation(
         )
         _qr_task_id = task.id
         _qr_project_id = project.id
-        await _apply_new_version_goal(
+        # ``_received`` says the field survived extraction; ``_applied`` says it
+        # actually reached the open version. They differ when there is no open
+        # ReleaseVersion, and the gap is the point: without it the agent reads
+        # "received" and believes the objective landed.
+        _nvg_applied = await _apply_new_version_goal(
             new_version_goal, task, project, session, path="api_inline"
         )
         await _apply_new_acceptance_criteria(
@@ -5046,6 +5234,7 @@ async def strategic_operation(
                 "version_phase_decision_received": version_phase_decision is not None,
                 "qualify_request_received": qualify_request is not None,
                 "new_version_goal_received": new_version_goal is not None,
+                "new_version_goal_applied": bool(_nvg_applied),
                 "new_acceptance_criteria_received": new_acceptance_criteria is not None,
             }
         )
@@ -7010,6 +7199,395 @@ async def strategic_operation(
                 "op": "request_qualification",
                 "reason_received": (qualify_request or {}).get("reason") or None,
                 "probes_received": (qualify_request or {}).get("probes") or [],
+            }
+        )
+
+    # ── Pipeline ACTION verbs ────────────────────────────────────────────────
+    # The strategist could describe the pipeline but could not act on it: no
+    # verb existed for promote, requeue/retry, unpark, reprioritise, or
+    # iteration-cap reset, so every one of those instructions bottlenecked on a
+    # human driving the operator HTTP levers by hand. Each op below re-enters
+    # the SAME server-side implementation its operator lever calls; the op ->
+    # implementation table lives in app/strategic_pipeline_actions.py.
+    #
+    # Two rules these handlers all obey:
+    #   1. Slow GitHub I/O runs POST-COMMIT on a fresh session, never under the
+    #      Project/Task FOR UPDATE locks this dispatch holds (see the module
+    #      docstring, and request_qualification above for the same shape).
+    #   2. They report the REASON an action did not happen instead of asserting
+    #      success. force_promote in particular skips the release AUDIT gate and
+    #      ONLY that -- CI still gates the merge.
+
+    elif payload.op == "force_promote":
+        # Data shape: {"reason": "<required>", "candidate_sha": "<optional>"}.
+        # Re-enters release_qualifier.force_promote_current_version, the same
+        # function behind the owner-only POST /projects/{id}/promote/force.
+        #
+        # WHAT IT SKIPS: the release AUDIT / qualification scoring gate, and
+        # only that. WHAT IT DOES NOT SKIP: CI. The release branch is still cut,
+        # the release-vN -> promotion-target PR is still opened, and the normal
+        # CI-wait / managed-check-wait machinery still has to see the promotion
+        # target's required branch-protection checks go green before anything
+        # merges. Reporting this to an operator as "skipping CI" would be false.
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            apply_force_promote_post_commit,
+            parse_force_promote,
+            summarize_promotion,
+        )
+
+        try:
+            _fp_reason, _fp_candidate_sha = parse_force_promote(data)
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _fp_project_id = project.id
+        _fp_actor = f"strategic_task:{task.id}"
+        await session.commit()
+        _fp_outcome = await apply_force_promote_post_commit(
+            project_id=_fp_project_id,
+            actor=_fp_actor,
+            reason=_fp_reason,
+            candidate_sha=_fp_candidate_sha,
+        )
+        _fp_promotion = summarize_promotion(_fp_outcome["promotion"])
+        return _resp(
+            {
+                "status": "ok",
+                "op": "force_promote",
+                "promoted": _fp_outcome["promoted"],
+                "promotion_status": _fp_promotion.get("status"),
+                "promotion": _fp_promotion,
+                "audit_gate": "skipped",
+                "ci_gate": (
+                    "NOT skipped — the promotion PR must still go green on the "
+                    "promotion target's required checks before it merges"
+                ),
+            }
+        )
+
+    elif payload.op == "approve_activation":
+        # Data shape: {"reason": "<required>"}.
+        # Re-enters app.release_activation_approval, the SAME implementation
+        # behind the admin-only POST /projects/{id}/approve-activation. It
+        # takes no target: the approval always aims at the current promoted
+        # version, so it can never be aimed at a different or historical
+        # artifact.
+        #
+        # This was the last step of the pipeline that could only be taken by a
+        # human. Promotion already had a verb; the version then sat awaiting
+        # activation until someone clicked approve, because
+        # ``activation_requested_at`` had exactly one writer and it was
+        # human-authed. The Resident now writes it under its own honest
+        # provenance -- mode ``resident_approval``, actor
+        # ``strategic_task:<uuid>`` -- and CANNOT stamp itself as a human
+        # in-product approval: ActivationApprover.resident() is the only
+        # constructor it can reach and that constructor hard-codes its mode.
+        #
+        # WHAT IT SKIPS: nothing. The five preconditions (promoted version
+        # exists, not already serving, no unresolved deploy failure, aggregate
+        # status re-armable, idempotent while unconfirmed) are the human
+        # lever's own gates, evaluated by the same code.
+        from app.release_activation_approval import (  # noqa: PLC0415
+            ActivationApprover,
+            approve_latest_promoted_activation,
+        )
+
+        _aa_reason = str((data or {}).get("reason") or "").strip()
+        if not _aa_reason:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "approve_activation requires a non-empty 'reason' "
+                    "recording why this version should go live."
+                ),
+            )
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        # Commits internally; every write is a local UPDATE, so no network I/O
+        # runs under the Project/Task locks this dispatch holds.
+        _aa_result = await approve_latest_promoted_activation(
+            session,
+            project.id,
+            ActivationApprover.resident(task.id),
+            reason=_aa_reason,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "approve_activation",
+                **_aa_result,
+                "deploy_gate": (
+                    "activation approved — the deploy agent executes it on its "
+                    "next poll and reports a serving receipt bound to this "
+                    "exact promoted_sha"
+                ),
+            }
+        )
+
+    elif payload.op == "requeue_task":
+        # Data shape: {"target_task_id": "<uuid>", "reason": "<required>",
+        #              "guidance": "<optional retry instruction>"}.
+        # This is also the RETRY verb -- retrying a failed task IS requeueing
+        # it. Re-enters admin_task_mutations.modify_task_apply, the same
+        # function behind PATCH /api/admin/tasks/{id} and the project-operator
+        # requeue lever, so attempt/runtime reset, blocker clearing, cascade
+        # rules, and review/fix PR admission are identical.
+        #
+        # Runs post-commit: a review/fix requeue fetches the PR from GitHub
+        # inside modify_task_apply, which must not happen under our locks.
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            apply_requeue_post_commit,
+            load_same_project_task,
+            parse_requeue_task,
+        )
+
+        try:
+            _rt_task_id, _rt_reason, _rt_guidance = parse_requeue_task(data)
+            # Cheap same-project check under the lock so an obviously wrong
+            # target is refused before anything is committed.
+            await load_same_project_task(
+                session,
+                target_task_id=_rt_task_id,
+                project_id=project.id,
+                op="requeue_task",
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _rt_project_id = project.id
+        await _record_workday_entity("task", _rt_task_id)
+        await session.commit()
+        try:
+            _rt_result = await apply_requeue_post_commit(
+                target_task_id=_rt_task_id,
+                project_id=_rt_project_id,
+                guidance=_rt_guidance,
+                background_tasks=background_tasks,
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        logger.info(
+            "[STRATEGIC API] requeue_task: task %s re-drove %s from %s to QUEUED "
+            "(reason=%s) for project %s",
+            task.id,
+            _rt_task_id,
+            _rt_result["previous_status"],
+            _rt_reason,
+            _rt_project_id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "requeue_task",
+                "target_task_id": str(_rt_task_id),
+                "previous_status": _rt_result["previous_status"],
+                "new_status": TaskStatus.QUEUED.value,
+            }
+        )
+
+    elif payload.op == "reset_iteration_cap":
+        # Data shape: {"target_task_id": "<uuid>", "reason": "<required>"}.
+        # This is the UNPARK verb for a review-fix chain: per
+        # app.review_park_disposition a chain parked for operator disposition is
+        # released by exactly this operation. Re-enters
+        # iteration_cap_reset.apply_iteration_cap_reset -- the same body behind
+        # POST /api/admin/tasks/{id}/reset-iteration-cap, extracted so the two
+        # callers cannot drift.
+        #
+        # Pure DB work, so it runs inline; the helper commits, which also
+        # persists the _strategic_api_called stamp and the workday entity below.
+        from app.iteration_cap_reset import (
+            IterationCapResetError,
+            apply_iteration_cap_reset,
+        )
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            load_same_project_task,
+            parse_reset_iteration_cap,
+        )
+
+        try:
+            _ic_task_id, _ic_reason = parse_reset_iteration_cap(data)
+            await load_same_project_task(
+                session,
+                target_task_id=_ic_task_id,
+                project_id=project.id,
+                op="reset_iteration_cap",
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await _record_workday_entity("task", _ic_task_id)
+        try:
+            _ic_result = await apply_iteration_cap_reset(
+                session,
+                task_id=_ic_task_id,
+                project_id=project.id,
+                actor=f"strategic_task:{task.id}",
+            )
+        except IterationCapResetError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        logger.info(
+            "[STRATEGIC API] reset_iteration_cap: task %s unparked %s (PR #%s, "
+            "reason=%s) — nothing was re-spawned",
+            task.id,
+            _ic_task_id,
+            _ic_result.get("pr_number"),
+            _ic_reason,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "reset_iteration_cap",
+                "respawned": False,
+                **_ic_result,
+            }
+        )
+
+    elif payload.op == "set_task_priority":
+        # Data shape: {"target_task_id": "<uuid>", "priority": "high|medium|low"
+        #              or 0-100, "reason": "<required>"}.
+        # Rewrites Task.priority, the integer the dispatch loop's candidate
+        # query orders by. This is the one pipeline action verb with no
+        # pre-existing operator HTTP lever to re-enter, so the write is inline
+        # here -- exactly as cancel_task writes target_task.status inline above.
+        #
+        # DOES NOT dispatch the task, raise a cap, or clear a dependency gate.
+        # Priority only decides ORDER among rows that are ALREADY eligible, so
+        # raising it on a gated row changes nothing; the response reports the
+        # target's status so the caller can say that rather than imply progress.
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            load_same_project_task,
+            parse_set_task_priority,
+        )
+
+        try:
+            _sp_task_id, _sp_priority, _sp_reason = parse_set_task_priority(data)
+            _sp_target = await load_same_project_task(
+                session,
+                target_task_id=_sp_task_id,
+                project_id=project.id,
+                op="set_task_priority",
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        _sp_previous = (
+            _sp_target.priority if _sp_target.priority is not None else 50
+        )
+        _sp_target.priority = _sp_priority
+        _sp_ctx = dict(_sp_target.context or {})
+        _sp_ctx["priority_set_by_strategic_task_id"] = str(task.id)
+        _sp_ctx["priority_set_reason"] = _sp_reason
+        _sp_target.context = _sp_ctx
+        flag_modified(_sp_target, "context")
+        session.add(_sp_target)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _sp_status = getattr(
+            _sp_target.status, "value", str(_sp_target.status)
+        )
+        await _record_workday_entity("task", _sp_task_id)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] set_task_priority: task %s set %s priority %s→%s "
+            "(status=%s, reason=%s)",
+            task.id,
+            _sp_task_id,
+            _sp_previous,
+            _sp_priority,
+            _sp_status,
+            _sp_reason,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_task_priority",
+                "target_task_id": str(_sp_task_id),
+                "previous_priority": _sp_previous,
+                "priority": _sp_priority,
+                "target_status": _sp_status,
+                "dispatched": False,
+            }
+        )
+
+    elif payload.op == "unhold_direction":
+        # Data shape: {"direction_id": "d-1210b9", "reason": "<required>"}.
+        # Clears the consecutive-failure hold that stops a direction from
+        # dispatching new tasks -- the same app.shared_state helpers behind
+        # POST /projects/{id}/directions/{direction_id}/unhold, including its
+        # 404 when the id is not one of this project's directions.
+        #
+        # DOES NOT change the direction's status, reset saturation, re-activate
+        # a retired/staged direction, or spawn anything. The hold is re-derived
+        # each cycle, so clearing it without fixing the underlying failure just
+        # lets the direction fail back into a hold.
+        from app.strategic_pipeline_actions import (
+            PipelineActionError,
+            clear_direction_hold_for_project,
+            parse_unhold_direction,
+        )
+
+        try:
+            _uh_direction_id, _uh_reason = parse_unhold_direction(data)
+            _uh_was_held = await clear_direction_hold_for_project(
+                session,
+                project_id=project.id,
+                direction_id=_uh_direction_id,
+            )
+        except PipelineActionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail
+            ) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await _record_workday_entity("direction", _uh_direction_id)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] unhold_direction: task %s cleared hold on %s "
+            "(was_held=%s, reason=%s) for project %s",
+            task.id,
+            _uh_direction_id,
+            _uh_was_held,
+            _uh_reason,
+            project.id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "unhold_direction",
+                "direction_id": _uh_direction_id,
+                "was_held": _uh_was_held,
+                "spawned": False,
             }
         )
 
