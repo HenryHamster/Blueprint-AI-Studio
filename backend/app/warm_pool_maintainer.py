@@ -1559,18 +1559,38 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
             continue
         task = None
         stranded = False
+        # The sweep already knows WHICH of the three strand causes fired; the
+        # recovery prompt used to guess ("was cancelled or killed"), which is
+        # wrong for two of them. Capture the observed cause here and hand it to
+        # the recovery worker verbatim.
+        strand_detail = ""
         if lane.current_task_id is None:
             stranded = True
+            strand_detail = (
+                "the lane had no current task at all (current_task_id was NULL) "
+                "— the prior phase task never bound to the lane, or was unbound "
+                "without a replacement"
+            )
         else:
             task = tasks_by_id.get(lane.current_task_id)
             if task is None:
                 stranded = True
+                strand_detail = (
+                    f"the lane pointed at task {lane.current_task_id}, but no "
+                    f"such task row was found — the row is gone or belongs to "
+                    f"another project"
+                )
             elif task.status in _LANE_TERMINAL_TASK_STATUSES:
                 # A terminal row with a write-ahead continuation marker still
                 # owns its review/fix handoff. The post-commit sweeper must
                 # finish or clear that marker before lane recovery may replace
                 # it with another writer.
                 stranded = not task.post_commit_pending
+                strand_detail = (
+                    f"the prior phase task {task.id} reached terminal status "
+                    f"{task.status} without writing a checkpoint, and left no "
+                    f"post-commit continuation marker"
+                )
         if not stranded:
             continue
 
@@ -1713,13 +1733,19 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                     # to find the lane when the recovery task completes.
                     recovery_ctx[LANE_CHAIN_ID_KEY] = str(lane.id)
                     strip_transient_lane_context(recovery_ctx)
+                    # Categorical bucket — _compute_checkpoint_recovery_waste
+                    # groups on this string, so it stays stable.  The observed
+                    # cause rides alongside it as free text.
                     recovery_ctx[LANE_RECOVERY_REASON_KEY] = "stranded_terminal_task"
                     recovery_ctx[LANE_RECOVERY_ATTEMPT_KEY] = attempt
+                    if strand_detail:
+                        recovery_ctx["_lane_strand_detail"] = strand_detail
 
                     recovery_prompt = (
-                        f"Lane checkpoint recovery for PR #{pr_number}. The prior "
-                        f"phase task was cancelled or killed before writing a "
-                        f"checkpoint. Starting from a FRESH clone of {branch}, "
+                        f"Lane checkpoint recovery for PR #{pr_number} "
+                        f"(recovery attempt {attempt}). Why you are here: "
+                        f"{strand_detail or 'the lane was found stranded'}. "
+                        f"Starting from a FRESH clone of {branch}, "
                         f"re-verify the work on this PR and push any needed changes."
                     )
                     recovery_payload = validate_internal_payload(

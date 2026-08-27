@@ -19,7 +19,7 @@ from app.findings_index import (
     FINALIZED_RESEARCH_FINDINGS_KEY,
     finalized_research_findings,
 )
-from app.landed_signal import has_landed_signal
+from app.landed_signal import has_landed_signal, suppresses_redispatch
 from app.models import (
     Artifact,
     ArtifactType,
@@ -1460,6 +1460,63 @@ def _repair_zeroed_categories(
     return receipt, binding_action_blockers, blocker_codes
 
 
+def _settled_non_delivery(
+    task: Task,
+    *,
+    task_type: str,
+    pr_number: int,
+    source: Task | None,
+    source_settled_unlanded: bool,
+) -> dict[str, Any] | None:
+    """Classify a COMPLETED write task whose PR carries no landed receipt.
+
+    Returns a settled-fact record when the missing receipt is ALREADY DECIDED,
+    so the review judges it as an outcome; returns ``None`` only when a receipt
+    is genuinely still in flight and the cycle must keep waiting for it.
+
+    Two dispositions are settled, not pending:
+
+    ``no_op``
+        The completion affirmatively determined its deliverable was already
+        present on base (:func:`suppresses_redispatch` -- a reproduce verdict of
+        ``already_resolved``, or the legacy ``./done --already-done`` marker).
+        Such a task ships nothing of its own, so a PR number it carries is
+        inherited provenance from an earlier attempt, not a delivery awaiting a
+        receipt. Waiting for that receipt waits forever.
+
+    ``stranded``
+        The research parent settled FAILED/CANCELLED and never rolled its
+        staging branch up, so a child PR merged into that branch can never gain
+        a landed receipt.
+
+    Neither is dropped: the review still sees that a PR exists without a
+    receipt, which disposition applies, and why that absence is final.
+    """
+    if suppresses_redispatch(task):
+        return {
+            "task_id": str(task.id),
+            "task_type": task_type,
+            "pr_number": pr_number,
+            "disposition": "no_op",
+            "reason": (
+                "completion affirmatively determined the deliverable was "
+                "already present on base, so it shipped nothing of its own"
+            ),
+        }
+    if source_settled_unlanded and source is not None:
+        return {
+            "task_id": str(task.id),
+            "task_type": task_type,
+            "pr_number": pr_number,
+            "disposition": "stranded",
+            "reason": (
+                f"research parent settled {_enum_value(source.status)} "
+                "before rollup"
+            ),
+        }
+    return None
+
+
 async def build_discovery_review_packet(
     session,
     cycle: DiscoveryCycle,
@@ -1731,18 +1788,15 @@ async def build_discovery_review_packet(
         pr_number = _pr_number(task)
         landed_signal = has_landed_signal(task)
         if pr_number is not None and not landed_signal:
-            if source_settled_unlanded:
-                stranded_deliveries.append(
-                    {
-                        "task_id": str(task.id),
-                        "task_type": task_type,
-                        "pr_number": pr_number,
-                        "reason": (
-                            "research parent settled "
-                            f"{_enum_value(source.status)} before rollup"
-                        ),
-                    }
-                )
+            settled = _settled_non_delivery(
+                task,
+                task_type=task_type,
+                pr_number=pr_number,
+                source=source,
+                source_settled_unlanded=source_settled_unlanded,
+            )
+            if settled is not None:
+                stranded_deliveries.append(settled)
             else:
                 missing.append(
                     f"delivery task {task.id} has PR {pr_number} without landed receipt"
@@ -2021,6 +2075,14 @@ async def build_discovery_review_packet(
         "semantic_receipt_checksum": outcome_item.checksum,
         "exact_landed_sha": landed_sha,
         "stranded_delivery_count": len(stranded_deliveries),
+        # Settled non-deliveries split by WHY the receipt is final, so a
+        # reviewer is not told a completed no-op was stranded by a failed
+        # parent -- two different facts with two different next moves.
+        "no_op_delivery_count": sum(
+            1
+            for entry in stranded_deliveries
+            if entry.get("disposition") == "no_op"
+        ),
         "missing_required_evidence": missing_reasons,
         "binding_action_blockers": binding_action_blockers,
         # Positional machine-readable vocabulary for the blockers above, so the

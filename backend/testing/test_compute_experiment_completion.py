@@ -7101,3 +7101,135 @@ async def test_sweep_aggregate_best_effort_when_arm_wedged_past_deadline(
     assert "arm-B-wedged" in prompt or "QUEUED" in prompt, (
         f"Aggregate prompt must reference the wedged arm; got: {prompt[:300]!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_sweep_aggregate_followon_carries_the_terminal_evidence(
+    db_session, _quiet_compute_io, mocker
+):
+    """The diagnose child is shown WHY the sweep died, not just that it did.
+
+    ``_maybe_spawn_sweep_aggregate_followon`` takes ``compute_result`` and
+    ``logs`` and used to read neither: the per-arm loop can only render an arm's
+    persisted ``plan_output['compute_result']``, so an arm that died before
+    writing one rendered as ``Result: (none - arm status=FAILED)`` and the
+    diagnosing agent was handed a sweep id and nothing to diagnose from. Callers
+    pass the traceback deliberately (the single-arm sibling spawner persists the
+    same two values); this proves it now survives the handoff.
+    """
+    from app.task_completion import _maybe_spawn_sweep_aggregate_followon
+    from app.task_locking import AUTOMATIC_TASK_CREATION_ALLOWED
+
+    sweep_id = f"sweep-{uuid.uuid4().hex[:12]}"
+
+    project = Project(name="SweepEvidenceTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    arm = Task(
+        project_id=project.id,
+        title="compute_experiment: arm-A-crashed",
+        status=TaskStatus.FAILED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": "arm-A-crashed",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(arm)
+    await db_session.commit()
+    await db_session.refresh(arm)
+
+    traceback_tail = (
+        "Traceback (most recent call last):\n"
+        '  File "train.py", line 41, in <module>\n'
+        "RuntimeError: CUDA out of memory; tried to allocate 12.00 GiB"
+    )
+
+    result = await _maybe_spawn_sweep_aggregate_followon(
+        db_session,
+        arm,
+        sweep_id,
+        {"terminal_reason": "deadline_exceeded"},
+        traceback_tail,
+        failure_mode=True,
+        automatic_admission=AUTOMATIC_TASK_CREATION_ALLOWED,
+        locked_project=project,
+    )
+    await db_session.commit()
+
+    assert result is not None, "expected the aggregate diagnose follow-on to spawn"
+    prompt = (result.first_payload or {}).get("prompt", "")
+
+    # The WHY, in both channels: readable in the prompt...
+    assert "deadline_exceeded" in prompt, (
+        f"terminal reason must reach the diagnosing agent; got: {prompt[:400]!r}"
+    )
+    assert "CUDA out of memory" in prompt, (
+        f"captured traceback must reach the diagnosing agent; got: {prompt[:400]!r}"
+    )
+    assert str(arm.id) in prompt, "the evidence must be attributed to its arm"
+    # ...and machine-readable in context, under the same key the single-arm
+    # follow-on uses, so tooling reads one vocabulary for both spawn shapes.
+    assert (result.context or {}).get("compute_terminal_reason") == "deadline_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_sweep_aggregate_success_mode_does_not_inject_failure_evidence(
+    db_session, _quiet_compute_io, mocker
+):
+    """A clean sweep's reason-and-ship prompt stays a reason-and-ship prompt.
+
+    The evidence block is failure-mode only: pasting a stray log tail into the
+    success framing would tell a shipping agent it is diagnosing a crash.
+    """
+    from app.task_completion import _maybe_spawn_sweep_aggregate_followon
+    from app.task_locking import AUTOMATIC_TASK_CREATION_ALLOWED
+
+    sweep_id = f"sweep-{uuid.uuid4().hex[:12]}"
+
+    project = Project(name="SweepEvidenceCleanTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    arm = Task(
+        project_id=project.id,
+        title="compute_experiment: arm-A-clean",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": "arm-A-clean",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    arm.plan_output = {"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 0.25}}
+    db_session.add(arm)
+    await db_session.commit()
+    await db_session.refresh(arm)
+
+    result = await _maybe_spawn_sweep_aggregate_followon(
+        db_session,
+        arm,
+        sweep_id,
+        {},
+        "ignored-noise-that-is-not-a-failure",
+        failure_mode=False,
+        automatic_admission=AUTOMATIC_TASK_CREATION_ALLOWED,
+        locked_project=project,
+    )
+    await db_session.commit()
+
+    assert result is not None
+    prompt = (result.first_payload or {}).get("prompt", "")
+    assert "Terminal evidence" not in prompt
+    assert "ignored-noise-that-is-not-a-failure" not in prompt

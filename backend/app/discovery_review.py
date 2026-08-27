@@ -79,6 +79,15 @@ DISCOVERY_REVIEW_TASK_TYPE = "discovery_review"
 DISCOVERY_REVIEW_SWEEP_LIMIT = 40
 DISCOVERY_REVIEW_ROUTINE_EFFORT = "medium"
 DISCOVERY_EVIDENCE_ESCALATION_GRACE = timedelta(hours=2)
+# Hard ceiling on how long a cycle may WAIT for required evidence. Escalation
+# only raises a notice; without a terminal bound the hold is unbounded, and a
+# single unsatisfiable evidence item then halts every direction behind it
+# indefinitely (observed: one cycle held 18h+, ~200 strategic cycles minted and
+# failed with zero output, because the engine had no way to stop waiting).
+# Past this deadline the decision is spawned anyway with the unmet evidence
+# declared in the packet, which restricts the reviewer to ask_operator. Asking
+# once, visibly, beats waiting silently forever.
+DISCOVERY_EVIDENCE_TERMINAL_GRACE = timedelta(hours=6)
 # Total decision-task attempts (original + respawns) before a cycle fails
 # closed into review_blocked. Attempts are counted from the task ledger
 # (terminal discovery_review tasks on the cycle), not from mutable cycle
@@ -571,6 +580,35 @@ def _parsed_timestamp(value: Any) -> datetime | None:
         return None
 
 
+def _evidence_hold_state(
+    cycle: DiscoveryCycle,
+    *,
+    packet_checksum: str,
+    missing: list[str],
+) -> tuple[bool, datetime | None]:
+    """Whether the cycle is already waiting on THIS gap, and since when.
+
+    A gap counts as unchanged only while both the packet checksum and the exact
+    missing list still match; any change means the cycle is now waiting on
+    something different and the wait restarts. Both the escalation notice and
+    the terminal deadline read this, so the side that waits and the side that
+    stops waiting can never disagree about which gap is being timed.
+
+    The timestamp is ``None`` for a new gap (nothing has been stamped yet) or a
+    prior stamp that will not parse; callers treat that as "keep waiting", and
+    the very next hold writes a parseable one.
+    """
+    prior = dict(cycle.review_result or {})
+    same_gap = (
+        prior.get("status") == "EVIDENCE_PENDING"
+        and prior.get("packet_checksum") == packet_checksum
+        and prior.get("missing_required_evidence") == missing
+    )
+    if not same_gap:
+        return False, None
+    return True, _parsed_timestamp(prior.get("first_seen_at"))
+
+
 async def _hold_for_evidence(
     session,
     *,
@@ -581,14 +619,10 @@ async def _hold_for_evidence(
     force_wake: bool = False,
 ) -> str:
     prior = dict(cycle.review_result or {})
-    same_gap = (
-        prior.get("status") == "EVIDENCE_PENDING"
-        and prior.get("packet_checksum") == packet_checksum
-        and prior.get("missing_required_evidence") == missing
+    same_gap, first_seen_at = _evidence_hold_state(
+        cycle, packet_checksum=packet_checksum, missing=missing
     )
-    first_seen = (
-        _parsed_timestamp(prior.get("first_seen_at")) if same_gap else None
-    ) or now
+    first_seen = first_seen_at or now
     was_escalated = bool(prior.get("escalated_at")) if same_gap else False
     should_escalate = force_wake or now >= (
         first_seen + DISCOVERY_EVIDENCE_ESCALATION_GRACE
@@ -1015,16 +1049,31 @@ async def maybe_close_and_spawn_discovery_review(
         if str(item).strip()
     ]
     if missing:
-        pending_reason = await _hold_for_evidence(
-            session,
-            cycle=cycle,
-            missing=missing,
-            packet_checksum=packet_checksum,
-            now=now,
+        _, held_since = _evidence_hold_state(
+            cycle, packet_checksum=packet_checksum, missing=missing
         )
-        return DiscoveryReviewSpawnResult(
-            cycle.id, None, False, False, pending_reason
-        )
+        if held_since is None or now < held_since + DISCOVERY_EVIDENCE_TERMINAL_GRACE:
+            pending_reason = await _hold_for_evidence(
+                session,
+                cycle=cycle,
+                missing=missing,
+                packet_checksum=packet_checksum,
+                now=now,
+            )
+            return DiscoveryReviewSpawnResult(
+                cycle.id, None, False, False, pending_reason
+            )
+        # Deadline reached: stop waiting and decide with what exists. The gap is
+        # carried into the packet rather than hidden, and
+        # ``required_evidence_omitted`` already restricts the reviewer to
+        # ask_operator, so this degrades the decision without widening it.
+        packet_manifest = {
+            **packet_manifest,
+            "required_evidence_omitted": True,
+            "unmet_required_evidence": missing,
+            "evidence_wait_started_at": held_since.isoformat(),
+            "evidence_wait_expired_at": now.isoformat(),
+        }
 
     review_revision = int(cycle.revision or 0) + 1
     task = Task(

@@ -150,6 +150,13 @@ _SECTION_EXCLUSION: dict[str, object] = {
 #     opens a PR back to automain — exactly the shape we want.
 _RESOLUTION_TASK_TYPE = "create"
 
+# Cap on how many overlapping files the resolver prompt names.  The list is
+# evidence, not an inventory: a back-merge whose two sides overlap on hundreds
+# of files is a different (and much larger) problem, and an unbounded list
+# would push the per-conflict resolution policy out of the agent's context.
+# The full count is always reported alongside the truncated list.
+_CONFLICT_FILE_EVIDENCE_CAP = 40
+
 # Terminal task statuses — a resolution plan in one of these no longer counts
 # as "open" for the (fast, GH-free) duplicate-spawn guard.
 _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
@@ -925,6 +932,13 @@ async def open_backmerge_pr(
     #    land and wasn't flagged a conflict, fetch the PR and treat
     #    ``mergeable_state == "dirty"`` as a conflict too.
     is_conflict = bool(merge_result.get("conflict"))
+    # HOW the conflict was recognised is part of the reason, not bookkeeping:
+    # the 405 "not mergeable" message GitHub returns on the dirty-PR path says
+    # nothing useful on its own, so the resolver needs to be told the verdict
+    # came from the PR's own ``mergeable_state`` rather than from the merge API.
+    conflict_detected_via = (
+        "merge API reported a conflict (409)" if is_conflict else ""
+    )
     pr_detail: dict[str, Any] | None = None
     if not is_conflict:
         try:
@@ -956,6 +970,10 @@ async def open_backmerge_pr(
                 return {"status": "merged", "pr_url": pr_url}
             if str(pr_detail.get("mergeable_state") or "").lower() == "dirty":
                 is_conflict = True
+                conflict_detected_via = (
+                    "the merge API returned 'not mergeable' without a conflict "
+                    "flag and the PR resource reports mergeable_state=dirty"
+                )
         except Exception as exc:  # noqa: BLE001 — best-effort; fall through to blocked
             logger.debug(
                 "[BACKMERGE] could not read mergeable_state for PR #%s: %s",
@@ -980,6 +998,9 @@ async def open_backmerge_pr(
             project=project,
             message=str(msg),
             periodic=periodic,
+            detected_via=conflict_detected_via,
+            head_sha=fresh_head_sha,
+            base_sha=fresh_base_sha,
             token=token,
             owner=owner,
             repo=repo,
@@ -1234,6 +1255,9 @@ async def _handle_conflict(
     token: str | None = None,
     owner: str | None = None,
     repo: str | None = None,
+    detected_via: str = "",
+    head_sha: str = "",
+    base_sha: str = "",
 ) -> None:
     """Raise a conflict Alert and (if not already open) spawn a resolution task.
 
@@ -1340,6 +1364,17 @@ async def _handle_conflict(
             project_id,
         )
     elif task_creation_allowed:
+        # Evidence lookup happens ONLY on the branch that actually spawns: it
+        # costs two GitHub compares and this function holds a transaction-scoped
+        # advisory lock, so the dedup/held branches must not pay for it.
+        file_evidence = await _conflict_file_evidence(
+            token,
+            owner,
+            repo,
+            project_id,
+            integration_branch=integration_branch,
+            promotion_target=promotion_target,
+        )
         spawned_task = await _spawn_resolution_task(
             session,
             project_id,
@@ -1348,6 +1383,11 @@ async def _handle_conflict(
             hotfix_task_id,
             trigger_desc,
             project=project,
+            merge_report=message,
+            detected_via=detected_via,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            file_evidence=file_evidence,
         )
     else:
         logger.info(
@@ -1365,6 +1405,126 @@ async def _handle_conflict(
         )
 
 
+async def _conflict_file_evidence(
+    token: str | None,
+    owner: str | None,
+    repo: str | None,
+    project_id: uuid.UUID,
+    *,
+    integration_branch: str,
+    promotion_target: str,
+) -> dict[str, Any]:
+    """Best-effort: the file set a back-merge conflict must live inside.
+
+    GitHub exposes no conflicted-file list — not on the merge 409, not on the
+    PR resource.  But a textual merge conflict can only occur in a file that
+    BOTH sides changed since the merge base, so the intersection of the two
+    ``compare`` file lists is a *sound over-approximation*: it can name a file
+    that merged cleanly, but it can never omit one that conflicted.  That is
+    the closest available answer to "which files", and it is narrow enough to
+    hand the resolver directly instead of making it re-derive the merge state.
+
+    Returns ``{}`` whenever the lookup is unavailable for ANY reason.  This is
+    evidence enrichment, never a gate: a back-merge conflict still needs a
+    resolver even when GitHub will not say which files are involved, so no
+    failure here may stop the spawn.
+    """
+    if not (token and owner and repo):
+        return {}
+    try:
+        # compare(base...head) reports head's changes since the merge base, so
+        # the two directions give each side's divergence independently.
+        target_side = await github.get_files_changed_between_refs(
+            token, owner, repo, integration_branch, promotion_target, str(project_id)
+        )
+        integration_side = await github.get_files_changed_between_refs(
+            token, owner, repo, promotion_target, integration_branch, str(project_id)
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory evidence; never block the spawn
+        logger.debug(
+            "[BACKMERGE] conflict file evidence unavailable for %s/%s (%s -> %s): %s",
+            owner,
+            repo,
+            promotion_target,
+            integration_branch,
+            exc,
+        )
+        return {}
+    if target_side is None or integration_side is None:
+        return {}
+    overlap = sorted(set(target_side) & set(integration_side))
+    return {
+        "overlapping_files": overlap[:_CONFLICT_FILE_EVIDENCE_CAP],
+        "overlapping_file_count": len(overlap),
+        "target_changed_file_count": len(target_side),
+        "integration_changed_file_count": len(integration_side),
+    }
+
+
+def _render_conflict_evidence_section(
+    *,
+    pr_number: int,
+    pr_url: str,
+    integration_branch: str,
+    promotion_target: str,
+    merge_report: str,
+    detected_via: str,
+    head_sha: str,
+    base_sha: str,
+    file_evidence: dict[str, Any],
+) -> str:
+    """Render the observed-conflict evidence the spawner had in hand.
+
+    Everything here was known at spawn time and would otherwise be discarded:
+    the resolver would have to re-run the merge just to learn what the
+    orchestrator already saw.
+    """
+    lines = [
+        "\n## What the back-merge attempt actually reported",
+        f"- Back-merge PR: #{pr_number} ({pr_url or 'no URL'})",
+    ]
+    if head_sha or base_sha:
+        lines.append(
+            f"- Observed at: `{promotion_target}`@{(head_sha or 'unknown')[:12]} "
+            f"-> `{integration_branch}`@{(base_sha or 'unknown')[:12]} "
+            f"(both branches have moved on since; merge the CURRENT "
+            f"`origin/{promotion_target}`, these SHAs are provenance)"
+        )
+    if detected_via:
+        lines.append(f"- Conflict detected via: {detected_via}")
+    lines.append(
+        f"- GitHub reported: \"{(merge_report or 'no message').strip()[:400]}\""
+    )
+
+    overlapping = list(file_evidence.get("overlapping_files") or [])
+    overlap_count = int(file_evidence.get("overlapping_file_count") or 0)
+    if overlapping:
+        shown = "\n".join(f"  - `{name}`" for name in overlapping)
+        more = (
+            f"\n  - …and {overlap_count - len(overlapping)} more"
+            if overlap_count > len(overlapping)
+            else ""
+        )
+        lines.append(
+            f"- Changed on BOTH sides since the merge base ({overlap_count} "
+            f"file{'s' if overlap_count != 1 else ''}) — **every conflict is "
+            f"inside this set**, so start here (a listed file may still merge "
+            f"cleanly; none outside it can conflict):\n{shown}{more}"
+        )
+    elif file_evidence:
+        lines.append(
+            "- Changed on BOTH sides since the merge base: none. The textual "
+            "conflict surface should be empty, so treat a conflict here as "
+            "suspicious — re-check the merge base and say so in the PR body."
+        )
+    else:
+        lines.append(
+            "- Overlapping-file evidence was unavailable at spawn time; derive "
+            "the conflict surface yourself from the merge."
+        )
+    return "\n".join(lines) + "\n"
+
+
 async def _spawn_resolution_task(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1374,6 +1534,11 @@ async def _spawn_resolution_task(
     trigger_desc: str,
     *,
     project: Project | None = None,
+    merge_report: str = "",
+    detected_via: str = "",
+    head_sha: str = "",
+    base_sha: str = "",
+    file_evidence: dict[str, Any] | None = None,
 ) -> Task:
     """Create + queue a high-priority refactor task to resolve the conflict.
 
@@ -1394,14 +1559,39 @@ async def _spawn_resolution_task(
     gate in task_lifecycle.py (a back-merge resolution PR must be merged with
     ``merge_method="merge"``, never squash — otherwise ``main`` does not
     appear as a parent of ``automain`` and the merge-base never advances).
+
+    ``merge_report`` / ``detected_via`` / ``head_sha`` / ``base_sha`` /
+    ``file_evidence`` are the OBSERVED conflict — what the merge attempt
+    reported, how the conflict was recognised, at which commits, and which
+    files the two sides both touched.  The caller has all of it in hand (it
+    already interpolates the merge report into the operator Alert), and until
+    2026-08-26 none of it crossed the handoff: the resolver was handed a
+    generic "there was a conflict, here is how to resolve conflicts" prompt
+    and had to re-run the merge to learn what the orchestrator already knew.
+    Carrying it is the point of this signature — it is also mirrored into
+    ``context`` and the SPAWNED history row so the evidence survives a prompt
+    rewrite and stays queryable after the fact.
     """
     integration_branch, promotion_target = _lts_branch_names(project)
     trigger_clause = f" ({trigger_desc})" if trigger_desc else ""
+    file_evidence = dict(file_evidence or {})
+    evidence_section = _render_conflict_evidence_section(
+        pr_number=pr_number,
+        pr_url=pr_url,
+        integration_branch=integration_branch,
+        promotion_target=promotion_target,
+        merge_report=merge_report,
+        detected_via=detected_via,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        file_evidence=file_evidence,
+    )
     prompt = (
         f"The automated `{promotion_target} -> {integration_branch}` back-merge PR #{pr_number} "
         f"({pr_url or 'no URL'}) hit a merge conflict and could not be merged. "
         f"`{integration_branch}` must absorb `{promotion_target}`{trigger_clause}, or the next "
-        f"`{integration_branch} -> {promotion_target}` promotion will conflict.\n\n"
+        f"`{integration_branch} -> {promotion_target}` promotion will conflict.\n"
+        f"{evidence_section}\n"
         f"From a fresh branch off `{integration_branch}`, run `git merge origin/{promotion_target}`, "
         f"resolve every conflict per the policy below, commit the merge, push, "
         f"and open a PR back to `{integration_branch}` so the orchestrator can land it.\n\n"
@@ -1466,13 +1656,29 @@ async def _spawn_resolution_task(
         # The resolution-task payload is tiny; a too-large error is a real bug.
         raise
 
+    # The description is the operator-facing one-liner; it states the observed
+    # reason, not just the state, so an inbox row answers "why" without opening
+    # the payload.
+    report_snippet = (merge_report or "").strip()[:160]
+    overlap_count = int(file_evidence.get("overlapping_file_count") or 0)
+    description_reason = (
+        f'GitHub reported "{report_snippet}"'
+        if report_snippet
+        else "no merge report was recorded"
+    )
+    if file_evidence:
+        description_reason += (
+            f"; {overlap_count} file{'s' if overlap_count != 1 else ''} "
+            f"changed on both sides"
+        )
+
     task = Task(
         project_id=project_id,
         title=f"Resolve back-merge conflict: {promotion_target} -> {integration_branch}",
         description=(
             f"The automated {promotion_target} -> {integration_branch} back-merge PR #{pr_number} hit a "
-            f"merge conflict; resolve it on {integration_branch} so the next promotion "
-            f"does not conflict."
+            f"merge conflict ({description_reason}); resolve it on {integration_branch} "
+            f"so the next promotion does not conflict."
         ),
         priority=_RESOLUTION_PRIORITY,
         payloads=[payload],
@@ -1485,6 +1691,24 @@ async def _spawn_resolution_task(
             "hotfix_task_id": hotfix_task_id,
             "backmerge_pr_number": pr_number,
             "backmerge_pr_url": pr_url,
+            # The observed conflict, structured. The prompt renders it for the
+            # agent; these keys keep it queryable (and survive a prompt rewrite)
+            # so "why was this spawned" is answerable from the row alone.
+            "backmerge_conflict_report": report_snippet,
+            "backmerge_conflict_detected_via": detected_via,
+            "backmerge_head_sha": head_sha,
+            "backmerge_base_sha": base_sha,
+            **(
+                {
+                    "backmerge_conflict_files": file_evidence.get(
+                        "overlapping_files"
+                    )
+                    or [],
+                    "backmerge_conflict_file_count": overlap_count,
+                }
+                if file_evidence
+                else {}
+            ),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -1502,16 +1726,23 @@ async def _spawn_resolution_task(
                 "priority": _RESOLUTION_PRIORITY,
                 "backmerge_pr_number": pr_number,
                 "hotfix_task_id": hotfix_task_id,
+                "merge_report": report_snippet,
+                "detected_via": detected_via,
+                "overlapping_file_count": overlap_count if file_evidence else None,
             },
         )
     )
     logger.warning(
         "[BACKMERGE] spawned conflict-resolution task %s "
-        "(priority=%d, type=%s) for back-merge PR #%s",
+        "(priority=%d, type=%s) for back-merge PR #%s — detected_via=%s "
+        "report=%r overlapping_files=%s",
         task.id,
         _RESOLUTION_PRIORITY,
         _RESOLUTION_TASK_TYPE,
         pr_number,
+        detected_via or "unspecified",
+        report_snippet,
+        overlap_count if file_evidence else "unavailable",
     )
     return task
 

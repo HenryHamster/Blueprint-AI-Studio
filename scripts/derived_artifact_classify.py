@@ -316,7 +316,11 @@ def vitest_live(repo: Path, suite: str) -> set[str]:
 # Same row shape the guard itself matches. Kept here as a literal on purpose:
 # the guard's regex is the contract, and a classifier that imported it would
 # report "fresh" for a queue whose rows the guard can no longer parse.
-_RANKED_ROW = re.compile(r"^\| \d+ \| \S+ \| \S+ \| `([^`]+)` \|", re.MULTILINE)
+#
+# `| P2 | backend | `path` | ...` -- no leading rank ordinal. The ordinal was
+# removed because it renumbered every row below an insertion, which is what made
+# this artifact conflict on 40% of merges; see the generator's module docstring.
+_RANKED_ROW = re.compile(r"^\| \S+ \| \S+ \| `([^`]+)` \|", re.MULTILINE)
 
 
 def ranked_queue_recorded(repo: Path) -> set[str]:

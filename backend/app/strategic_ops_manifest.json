@@ -670,6 +670,34 @@
         }
     },
     {
+        "op": "approve_activation",
+        "alias": "approve-activation",
+        "description": "Approve activation of the current promoted version so the deploy agent takes it live. Skips NOTHING: the same preconditions the human in-product lever enforces are evaluated by the same code.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "reason"
+            ],
+            "fields": [
+                "reason"
+            ],
+            "example": {
+                "reason": "v46 promoted green and its release claims are proven by landed work; taking it live."
+            },
+            "notes": [
+                "DOES: stamp activation approval on the CURRENT promoted version - the field the deploy agent polls for before it executes an activation.",
+                "SKIPS: nothing. The same five preconditions the human in-product lever enforces are evaluated by the same code: a promoted version exists, it is not already serving, it has no unresolved deploy failure, its aggregate serving status is re-armable, and re-approval while unconfirmed is idempotent.",
+                "Takes NO target. The approval always aims at the current promoted version, so it can never be pointed at a different or historical artifact, and it binds that version exact promoted_sha.",
+                "Approving is not the same as serving. The deploy agent executes on its next poll and reports a receipt bound to that SHA; a receipt for any other revision is refused.",
+                "Refuses with a stated reason (409) when the version is already serving, has an unresolved deploy failure, or is not awaiting activation. Report that reason verbatim instead of asserting the deploy happened.",
+                "Recorded provenance is honest: mode \"resident_approval\", actor \"strategic_task:<uuid>\". It is never stamped as a human in-product approval."
+            ]
+        }
+    },
+    {
         "op": "requeue_task",
         "alias": "requeue-task",
         "description": "Re-drive one same-project failed, cancelled, blocked, evaluating, or parked task back to QUEUED (this is also the retry verb). Does NOT re-run a qualification and does NOT unpark a review loop.",

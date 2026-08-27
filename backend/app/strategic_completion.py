@@ -6347,12 +6347,11 @@ async def _handle_strategic_completion(
                 # Translate recommended_mode='pause' to paused status so the
                 # existing spawn-skip (status != 'active') mechanism handles it.
                 if rec_mode == "pause" and not staged_create:
-                    new_dir["status"] = "paused"
-                    new_dir["auto_paused"] = True
-                    new_dir["paused_reason"] = (
-                        "Strategic review: recommended_mode=pause"
+                    from app.direction_lifecycle import pause_direction_autonomously
+
+                    pause_direction_autonomously(
+                        new_dir, reason="Strategic review: recommended_mode=pause"
                     )
-                    new_dir["paused_at"] = _utcnow().isoformat()
                 directions.append(new_dir)
                 _delta_created.append(new_dir)
                 # Stage the gap this fresh active direction staffs (active_moves
@@ -6485,6 +6484,12 @@ async def _handle_strategic_completion(
                         terminal_reason_fb = op_entry.get(
                             "terminal_reason"
                         ) or changes.get("terminal_reason")
+                        # Hoisted: both the terminal-transition guard below and
+                        # the strategist pause seam record the strategist's own
+                        # rationale.
+                        rationale_fb = op_entry.get("rationale") or changes.get(
+                            "rationale"
+                        )
                         if requested_status in {"expired", "superseded"} and d.get(
                             "status"
                         ) not in {"expired", "superseded"}:
@@ -6492,9 +6497,6 @@ async def _handle_strategic_completion(
                                 validate_direction_terminal_transition,
                             )
 
-                            rationale_fb = op_entry.get("rationale") or changes.get(
-                                "rationale"
-                            )
                             terminal_ok, terminal_error = (
                                 validate_direction_terminal_transition(
                                     d,
@@ -6602,6 +6604,28 @@ async def _handle_strategic_completion(
                                     logger.warning(
                                         f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}"
                                     )
+                            elif changes["status"] == "paused":
+                                # A strategist-initiated pause IS an automatic
+                                # pause by definition, so it must go through the
+                                # shared seam. A bare `d["status"] = "paused"`
+                                # here leaves no auto_paused/paused_at/
+                                # paused_reason markers, which makes the
+                                # direction indistinguishable from a genuine
+                                # operator hold and latches it paused forever:
+                                # cooldown auto-recovery skips it (no
+                                # auto_paused/paused_at) and
+                                # reactivate_paused_direction refuses the
+                                # strategist (allow_user_paused=False). Only a
+                                # human PATCH on /directions may produce a
+                                # user-pause.
+                                from app.direction_lifecycle import (
+                                    pause_direction_autonomously,
+                                    strategist_pause_reason,
+                                )
+
+                                pause_direction_autonomously(
+                                    d, reason=strategist_pause_reason(rationale_fb)
+                                )
                             else:
                                 d["status"] = changes["status"]
                                 if requested_status in {
@@ -6741,12 +6765,14 @@ async def _handle_strategic_completion(
                             d.get("recommended_mode") == "pause"
                             and d.get("status") == "active"
                         ):
-                            d["status"] = "paused"
-                            d["auto_paused"] = True
-                            d["paused_reason"] = (
-                                "Strategic review: recommended_mode=pause"
+                            from app.direction_lifecycle import (
+                                pause_direction_autonomously,
                             )
-                            d["paused_at"] = _utcnow().isoformat()
+
+                            pause_direction_autonomously(
+                                d,
+                                reason="Strategic review: recommended_mode=pause",
+                            )
                         if criterion_keys_supplied:
                             d["criterion_keys"] = criterion_keys
                             if update_criterion_release_version_id is not None:

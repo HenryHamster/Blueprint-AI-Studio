@@ -2607,10 +2607,23 @@ async def test_already_fixed_deadlock_auto_retires_via_apply_post_spawn(db_sessi
     HEAD) make the direction genuinely exhausted. When a fresh no-findings cycle is
     applied and the direction is neither code-failing nor externally frozen, it is
     routed to non-success terminal status='retired' with an exhaustion reason and
-    an INFO 'Direction auto-retired' alert. Exhaustion must not masquerade as
+    a 'Direction auto-retired' milestone notice. Exhaustion must not masquerade as
     evidence that the direction achieved its declared outcome.
+
+    2026-08-26: this test used to demand a durable ``Alert`` row. It was asserting
+    a row the registry already forbade: ``research.direction_auto_retired`` was
+    already in ``_TIMELINE_ONLY_RETIREMENT_EVENTS`` on ``origin/automain``, so the
+    retirement backstop sweep retired that row on every pass -- the assertion only
+    held because it ran inside one transaction, before any sweep. "Direction X was
+    retired at T" is a completed fact; no condition can clear it, so a durable
+    operator row for it is unresolvable by construction. The mint site now asks the
+    policy gate, which suppresses the row, and the delivery is the
+    ``direction_milestone`` ProjectMessage that the same code path already posted
+    before this change. The assertion is re-pointed at that live observable and
+    additionally pins the absence of the durable row, so a regression that
+    re-introduces the raw insert fails here.
     """
-    from app.models import Alert
+    from app.models import Alert, ProjectMessage
     from app.research_direction_state import apply_post_spawn_state
     from test_autonomous_research import _active_direction, _make_research_task
 
@@ -2680,15 +2693,44 @@ async def test_already_fixed_deadlock_auto_retires_via_apply_post_spawn(db_sessi
         f"auto_completed_reason must reflect exhaustion, got {d.get('auto_completed_reason')!r}"
     )
 
+    # The retirement is delivered as a direction_milestone notice ...
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    milestones = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "direction_milestone"
+        and (m.context or {}).get("milestone") == "auto-retired"
+    ]
+    assert len(milestones) == 1, (
+        "expected exactly 1 'auto-retired' direction_milestone message, got "
+        f"{len(milestones)} (all event_types: "
+        f"{[(m.context or {}).get('event_type') for m in msgs]})"
+    )
+    assert "exhausted" in (milestones[0].context.get("reason") or ""), (
+        "the milestone notice must carry the exhaustion reason, got "
+        f"{milestones[0].context.get('reason')!r}"
+    )
+
+    # ... and NOT as a durable, unresolvable operator alert row.
     result = await db_session.execute(
         select(Alert).where(
             Alert.project_id == project.id,
             Alert.title == "Direction auto-retired",
-            Alert.dismissed_at.is_(None),
         )
     )
-    assert result.scalars().first() is not None, (
-        "expected a 'Direction auto-retired' alert"
+    assert result.scalars().first() is None, (
+        "'Direction auto-retired' is a completed fact, not a standing condition: "
+        "it must not mint a durable alert row that no resolver can ever clear"
     )
 
 
@@ -5473,3 +5515,231 @@ async def test_keep_decision_during_pending_tick_cancels_the_cull(db_session, mo
     assert not any(m.get("id") == "d-undecided" for m in retired_mem), (
         "a kept direction must never record retired memory"
     )
+
+
+# ---------------------------------------------------------------------------
+# pause_direction_autonomously: the shared active->paused seam
+#
+# Regression cover for the strategist pause ONE-WAY LATCH. Before the seam
+# existed, the two strategist update_direction sites wrote
+# `d["status"] = changes["status"]` bare, producing a paused direction with no
+# auto_paused / paused_at / paused_reason markers. Such a direction is
+# indistinguishable from a genuine operator hold, so:
+#   * cooldown auto-recovery skips it forever (its guard requires
+#     status == "paused" AND auto_paused AND paused_at), and
+#   * reactivate_paused_direction refuses the strategist
+#     (allow_user_paused=False).
+# The engine could therefore park its own portfolio and never restart it.
+# ---------------------------------------------------------------------------
+from app.direction_lifecycle import (
+    STRATEGIST_PAUSE_REASON_FALLBACK,
+    pause_direction_autonomously,
+    strategist_pause_reason,
+)
+
+
+def _strategist_pause_target() -> dict:
+    return {
+        "id": "d-autopause",
+        "text": "active direction the strategist wants parked",
+        "status": "active",
+        "priority": "medium",
+        "research_history": [],
+    }
+
+
+def test_pause_direction_autonomously_stamps_every_recovery_marker():
+    """All three markers the auto-recovery guard reads must be present.
+
+    This is the exact tuple `_process_direction_lifecycle` requires
+    (`status == "paused" and auto_paused and paused_at`); losing any one of
+    them strands the direction paused forever.
+    """
+    d = _strategist_pause_target()
+    pause_direction_autonomously(d, reason="Strategic review: out of budget")
+
+    assert d["status"] == "paused"
+    assert d["auto_paused"] is True
+    assert d["paused_at"], "paused_at is required by the cooldown recovery guard"
+    # paused_at must parse — the recovery guard skips a malformed value.
+    datetime.fromisoformat(d["paused_at"])
+    assert d["paused_reason"] == "Strategic review: out of budget"
+    assert d["auto_pause_count"] == 1
+
+
+def test_pause_direction_autonomously_increments_existing_pause_count():
+    d = _strategist_pause_target()
+    d["auto_pause_count"] = 3
+    pause_direction_autonomously(d, reason="again")
+    assert d["auto_pause_count"] == 4
+
+
+def test_pause_direction_autonomously_consumes_grace_marker():
+    """A re-pause consumes auto_recovered_at.
+
+    Leaving the grace marker set on a paused direction would make
+    _check_direction_health skip its history-based rules after the direction
+    came back, hiding the very history that justified the pause.
+    """
+    d = _strategist_pause_target()
+    d["auto_recovered_at"] = "2026-01-01T00:00:00"
+    pause_direction_autonomously(d, reason="re-pause")
+    assert "auto_recovered_at" not in d
+
+
+def test_pause_direction_autonomously_leaves_retirement_ladders_alone():
+    """The strategist's free-text rationale must not advance a retirement ladder.
+
+    churn_family_pause_count / lifetime_burn_pause_count are driven by the
+    lifecycle's own classified health reasons, not by an engine pause.
+    """
+    d = _strategist_pause_target()
+    d["churn_family_pause_count"] = 2
+    d["lifetime_burn_pause_count"] = 1
+    pause_direction_autonomously(d, reason="Strategic review: churn is scary")
+    assert d["churn_family_pause_count"] == 2
+    assert d["lifetime_burn_pause_count"] == 1
+
+
+def test_strategist_pause_reason_prefixes_rationale():
+    assert (
+        strategist_pause_reason("waiting on the v45 deploy")
+        == "Strategic review: waiting on the v45 deploy"
+    )
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_strategist_pause_reason_falls_back_when_blank(blank):
+    """A pause always carries a reason — never an empty paused_reason."""
+    assert strategist_pause_reason(blank) == STRATEGIST_PAUSE_REASON_FALLBACK
+    assert STRATEGIST_PAUSE_REASON_FALLBACK.strip(), "fallback must be non-empty"
+
+
+def test_strategist_pause_reason_caps_unbounded_rationale():
+    """paused_reason is persisted JSONB rendered in operator surfaces; an
+    unbounded model-authored string must not land there."""
+    reason = strategist_pause_reason("x" * 5000)
+    assert len(reason) == 500, "literal cap pin (STRATEGIST_PAUSE_REASON_MAX)"
+    assert reason.startswith("Strategic review: ")
+
+
+def test_strategist_pause_then_strategist_reactivate_round_trip():
+    """THE LATCH REGRESSION: what the strategist paused, the strategist can resume.
+
+    With the bare `d["status"] = "paused"` write this fails —
+    reactivate_paused_direction sees paused-without-auto_paused, classifies it
+    as a user pause, and returns False with allow_user_paused=False.
+    """
+    d = _strategist_pause_target()
+    pause_direction_autonomously(d, reason=strategist_pause_reason("park it"))
+    assert d["status"] == "paused"
+
+    assert reactivate_paused_direction(d, allow_user_paused=False) is True, (
+        "the strategist must be able to resume a direction it paused itself"
+    )
+    assert d["status"] == "active"
+    assert d.get("auto_recovered_at") is not None
+    for key in ("auto_paused", "paused_reason", "paused_at"):
+        assert key not in d
+
+
+def test_operator_pause_still_blocks_strategist_reactivation():
+    """The user-paused block is NOT weakened by the new seam.
+
+    Only a human PATCH produces a paused direction with no auto_paused marker,
+    and the strategist still may not resume it.
+    """
+    d = _strategist_pause_target()
+    # Exactly what routers/directions.py does for an operator PATCH pause: a
+    # bare status write, deliberately leaving no auto_paused marker.
+    d["status"] = "paused"
+
+    assert reactivate_paused_direction(d, allow_user_paused=False) is False
+    assert d["status"] == "paused"
+    # ...but the operator themselves may still resume it.
+    assert reactivate_paused_direction(d, allow_user_paused=True) is True
+    assert d["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_strategist_paused_direction_auto_recovers_after_cooldown(db_session):
+    """A strategist-paused direction is picked up by cooldown auto-recovery.
+
+    The 48h default is pinned as a LITERAL here rather than read back from
+    runtime_config: asserting the constant against itself would make a change
+    to the default self-certifying.
+    """
+    assert _ss.runtime_config.get("direction_auto_recovery_hours") == 48, (
+        "direction_auto_recovery_hours default changed; update this literal pin"
+    )
+
+    d = _strategist_pause_target()
+    d["id"] = "d-strat-cooldown"
+    pause_direction_autonomously(d, reason=strategist_pause_reason("park it"))
+    # Back-date the pause past the 48h default cooldown.
+    d["paused_at"] = (_utcnow() - timedelta(hours=49)).isoformat()
+
+    project = Project(
+        name="Strategist Pause Cooldown",
+        user_id="u-strat-cooldown",
+        autonomous_enabled=True,
+        directions=[d],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=_utcnow(),
+    )
+    await db_session.refresh(project)
+
+    recovered = next(x for x in project.directions if x["id"] == "d-strat-cooldown")
+    assert recovered["status"] == "active", (
+        "a strategist-paused direction must time-recover like any auto-pause; "
+        "a marker-less bare write would be skipped by the recovery guard forever"
+    )
+    for key in ("auto_paused", "paused_reason", "paused_at"):
+        assert key not in recovered
+
+
+@pytest.mark.asyncio
+async def test_marker_less_paused_direction_never_auto_recovers(db_session):
+    """Counterpart pin: the latch is real.
+
+    A paused direction WITHOUT the auto-pause markers (a genuine operator hold,
+    or the pre-fix bare strategist write) is never time-recovered. This is the
+    behaviour that made the bare write fatal, and it must stay intact so
+    operator holds are honoured.
+    """
+    d = _strategist_pause_target()
+    d["id"] = "d-markerless"
+    d["status"] = "paused"  # bare write: no auto_paused, no paused_at
+
+    project = Project(
+        name="Marker-less Pause",
+        user_id="u-markerless",
+        autonomous_enabled=True,
+        directions=[d],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=_utcnow(),
+    )
+    await db_session.refresh(project)
+
+    stuck = next(x for x in project.directions if x["id"] == "d-markerless")
+    assert stuck["status"] == "paused"

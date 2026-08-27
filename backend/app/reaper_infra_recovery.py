@@ -13,13 +13,13 @@ from datetime import timedelta
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+from app.alert_policy import create_project_alert_if_allowed
 from app.compute import any_zone_available
 from app.failure_classification import (
     RESURRECTION_BLOCK_PR_PIPELINE_TASK,
     infra_resurrection_block_reason,
 )
 from app.models import (
-    Alert,
     AlertSeverity,
     Project,
     Task,
@@ -441,31 +441,39 @@ async def run_infra_recovery_and_hold_maintenance(
             )
             session.add(_t)
 
-            # INFO alert so the user knows recovery happened.
+            # Recovery notice.  ``deployment.auto_resume`` is registered
+            # ROUTE_TIMELINE/TIMELINE_ONLY: "the task was re-queued" is a
+            # completed fact, so no later state makes it false and no resolver
+            # could clear it.  Minting it raw gave every infra recovery a
+            # permanent INFO row -- one per resurrected task, forever.  The
+            # summary log below still records the recovery.
             try:
                 _task_type_label = (_t.first_payload or {}).get("type", "unknown")
-                _res_alert = Alert(
-                    project_id=_t.project_id,
-                    severity=AlertSeverity.INFO,
-                    title=f"Task auto-resurrected: {_t.title or str(_t.id)[:8]}",
-                    message=(
-                        f"Task type: {_task_type_label}. "
-                        f"Infrastructure failure ({_fail_cat}) resolved — "
-                        f"task re-queued automatically."
-                    ),
-                    task_id=_t.id,
-                    event_type="deployment.auto_resume",
+                _res_alert, _res_created, _res_decision = (
+                    await create_project_alert_if_allowed(
+                        session,
+                        project_id=_t.project_id,
+                        event_type="deployment.auto_resume",
+                        severity=AlertSeverity.INFO,
+                        title=f"Task auto-resurrected: {_t.title or str(_t.id)[:8]}",
+                        message=(
+                            f"Task type: {_task_type_label}. "
+                            f"Infrastructure failure ({_fail_cat}) resolved — "
+                            f"task re-queued automatically."
+                        ),
+                        task_id=_t.id,
+                    )
                 )
-                session.add(_res_alert)
-                await broadcast_to_project(
-                    str(_t.project_id),
-                    "alert_created",
-                    {
-                        "alert_id": str(_res_alert.id),
-                        "severity": "INFO",
-                        "title": _res_alert.title,
-                    },
-                )
+                if _res_alert is not None:
+                    await broadcast_to_project(
+                        str(_t.project_id),
+                        "alert_created",
+                        {
+                            "alert_id": str(_res_alert.id),
+                            "severity": "INFO",
+                            "title": _res_alert.title,
+                        },
+                    )
             except Exception as _alert_err:  # noqa: BLE001
                 logger.warning(
                     f"[REAPER] Resurrection alert failed for {_t.id}: {_alert_err}"

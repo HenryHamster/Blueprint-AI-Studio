@@ -4311,6 +4311,12 @@ async def request_changes(
                     f"{REVIEW_FIX_GOAL_PREAMBLE}A human reviewer flagged this PR. "
                     f"Feedback:\n\n{payload.feedback}"
                 ),
+                # Explicit, not implicit: an omitted fix_reason silently
+                # DEFAULTS to "code_review" at every consumer. Same routing,
+                # but stating it is what lets the spawn-site manifest guard
+                # tell "a human reviewer's feedback" apart from "nobody
+                # thought about the lane".
+                fix_reason="code_review",
                 original_task_id=str(request_task_id),
                 source_spawn_authority=source_authority,
                 source_spawn_publication=source_publication,

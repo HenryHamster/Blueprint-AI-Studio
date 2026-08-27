@@ -6,9 +6,16 @@ THE DEFECT THIS CLOSES
 Two derived artifacts are committed to this repository and are rewritten by
 essentially every PR that touches the test estate:
 
-* ``test-estate-ranked-queue.md`` -- a ~1200-line generated report whose rank
-  column shifts for the WHOLE table when any test file is added or resized, so
-  two concurrent PRs cannot both touch the estate without colliding.
+* ``test-estate-ranked-queue.md`` -- a ~1200-line generated report. FIXED AT
+  THE SOURCE 2026-08-26: its ``Rank`` ordinal column and its estate-summary
+  table were GLOBAL fields that rewrote the whole table when any test file was
+  added or resized, so two concurrent PRs could not both touch the estate
+  without colliding. Both are gone. Every row is now a function of exactly one
+  test file, so two branches adding two files produce disjoint insertions and
+  the ordinary three-way merge reproduces a fresh ``--write`` byte for byte --
+  under stock git, and therefore on GitHub too. The entry below stays as the
+  fallback for the residual case (two branches adding files that rank
+  adjacently, or a hand-edit).
 * ``backend/.test_durations`` -- a ~21000-line sorted JSON map. Both sides of a
   typical merge only INSERT keys, yet git still reports a textual conflict,
   because appending at the end of a JSON object rewrites the previous last
@@ -39,7 +46,13 @@ developer clone has, and exactly how GitHub computes ``mergeable`` server-side.
 Nine conflicted. ``test-estate-ranked-queue.md`` accounted for eight of those
 nine (40% of all merges); ``module_size_limits.json`` for two and
 ``cap_bump_history.json`` for one; only three carried a real source conflict.
-So the dominant cost of a merge in this repository is not merging code.
+So the dominant cost of a merge in this repository was not merging code.
+
+That 40% is precisely what the ranked queue's line-local rewrite removes. With
+the ordinal and the summary gone, those eight replayed conflicts become disjoint
+single-line insertions that merge with no driver, no resolver and no
+regeneration step. What is left for this module is the genuinely unmergeable
+residue: the measurement map and the cap file.
 
 WHY THESE PATHS, AND ONLY THESE
 -------------------------------
@@ -117,10 +130,18 @@ call it, so a clone that has ever run either one has the drivers live.
 ``--resolve`` is the recovery pass for a conflict that materialized anyway --
 because GitHub computes ``mergeable`` server-side with stock drivers and never
 consults this one, so a PR still goes unmergeable and the orchestrator still
-spawns a fix task. It also covers ``test-estate-ranked-queue.md``, which cannot
-be a merge driver at all: a driver is handed three blobs, and the one correct
-resolution here is a function of the whole MERGED TREE, which does not exist yet
-at driver time.
+spawns a fix task. Measured 2026-08-26: the server honours no ``.gitattributes``
+merge attribute at all, not even a BUILT-IN one. A two-commit probe whose only
+change was each side appending one line to a path marked ``merge=union`` merges
+cleanly under stock local git and is reported CONFLICTING by the GitHub API
+(throwaway PR #18024). So a driver can never be the whole answer for a path that
+must merge on the server -- which is why the ranked queue was fixed in its
+RENDERING rather than given one.
+
+``--resolve`` also still covers ``test-estate-ranked-queue.md``, which could
+never have been a merge driver in any case: a driver is handed three blobs, and
+the one correct resolution here is a function of the whole MERGED TREE, which
+does not exist yet at driver time.
 
 Both spellings share :func:`union_insert_only`, so the insert-only premise is
 proven in exactly one place and cannot drift between them.

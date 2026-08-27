@@ -856,6 +856,11 @@ async def run_request_changes(
         branch,
         base_branch,
         fix_prompt=fix_prompt_text,
+        # Explicit, not implicit: every consumer defaults an omitted
+        # fix_reason to "code_review", so this is the same routing it
+        # already got -- but stated, so the spawn-site manifest guard can
+        # tell a deliberate lane from an unconsidered one.
+        fix_reason="code_review",
         original_prompt=original_prompt,
         original_task_id=original_task_id,
         current_feedback=feedback,
