@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,65 +51,17 @@ _UNSET: object = object()  # sentinel for unset prior_status_snapshot
 # Maximum length for the captured reason string.
 _REASON_MAX = 512
 
-# A note is accepted as a transition's reason only when it was written as part
-# of that same transition.  Note-append sites write the note and the status in
-# one operation, so the true gap is sub-second; this window is slack for slow
-# transactions and clock skew, not a licence to attribute older notes.
-_NOTE_REASON_MAX_AGE = timedelta(minutes=15)
-
-# Marks a reason that was INFERRED from a nearby note rather than recorded by
-# the transition.  Keeps "we know why" distinguishable from "we guessed".
-_INFERRED_REASON_PREFIX = "note: "
-
-
-def _note_written_for_this_transition(
-    note: Dict[str, Any], now: datetime | None = None
-) -> bool:
-    """True when ``note`` was appended as part of the transition being recorded.
-
-    Every note-append site stamps an ISO ``added_at`` in the same breath as the
-    status write it annotates (``directions_repo`` staged activation,
-    ``task_completion`` remediation, ``admin_agent_ops`` strategic ops, ...), so
-    the note that explains a transition is always seconds old when the event row
-    is built.  A note left over from an EARLIER transition is, by construction,
-    not the reason for this one.
-
-    A note with no parseable ``added_at`` cannot be tied to any transition, so it
-    is rejected: an unattributable note is exactly the input that produced wrong
-    reasons before.
-    """
-    raw = note.get("added_at")
-    if not raw:
-        return False
-    try:
-        added_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return False
-    reference = now or _utcnow()
-    if added_at.tzinfo is None:
-        added_at = added_at.replace(tzinfo=timezone.utc)
-    if reference.tzinfo is None:
-        reference = reference.replace(tzinfo=timezone.utc)
-    # Future-stamped notes (clock skew) are still same-transition writes.
-    return abs(reference - added_at) <= _NOTE_REASON_MAX_AGE
-
-
 def _extract_reason(direction: Dict[str, Any], prior_status: str | None, new_status: str | None) -> str | None:
     """Extract a human-readable reason for THIS status transition.
 
-    Three layers, most authoritative first:
-
-    1. A canonical reason field written by the transition itself.
-    2. A note demonstrably appended as part of the same transition, tagged
-       ``note:`` so a reader can tell an inferred reason from a recorded one.
-    3. ``None`` — the honest answer when the writer recorded no reason.
-
-    Layer 3 exists because guessing is worse than silence here.  This function
+    Only canonical reason fields written by the transition qualify.  This function
     used to fall back to ``notes[-1]`` unconditionally, which made ``active ->
     paused`` rows read "Auto-activated: v32 promoted - staged work resumed" (the
     note from the direction's LAST activation, written days earlier by
     ``directions_repo`` staged activation).  The event trail then actively
-    misdirected anyone reading it to find out why directions were parked.
+    misdirected anyone reading it to find out why directions were parked.  A
+    nearby timestamp cannot prove causality, so ``None`` is the honest answer
+    when the transition writer recorded no reason.
     """
     # paused_reason is the canonical field for pause-family transitions.
     if direction.get("paused_reason"):
@@ -119,12 +70,6 @@ def _extract_reason(direction: Dict[str, Any], prior_status: str | None, new_sta
     for key in ("retirement_reason", "retired_reason", "retire_reason"):
         if direction.get(key):
             return str(direction[key])[:_REASON_MAX]
-    # Fall back to the newest note ONLY when it annotates this transition.
-    notes = direction.get("notes") or []
-    if notes and isinstance(notes[-1], dict) and _note_written_for_this_transition(notes[-1]):
-        text = str(notes[-1].get("text", "")).strip()
-        if text:
-            return f"{_INFERRED_REASON_PREFIX}{text}"[:_REASON_MAX]
     return None
 
 

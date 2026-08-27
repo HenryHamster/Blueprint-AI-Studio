@@ -9,7 +9,6 @@ Covers:
 """
 
 import uuid
-from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 
@@ -18,19 +17,11 @@ from app.direction_event_trail import (
     record_direction_pruned,
     _extract_reason,
     _extract_actor,
-    _NOTE_REASON_MAX_AGE,
 )
 from app.models import DirectionEvent
 
 
 # ── helper fixtures ─────────────────────────────────────────────────────────
-
-def _iso_ago(**delta) -> str:
-    """Naive-UTC isoformat stamp N units in the past - the shape note sites write."""
-    return (
-        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(**delta)
-    ).isoformat()
-
 
 def _make_direction(status="active", **extra):
     base = {"id": "d-test01", "status": status, "text": "test direction"}
@@ -62,93 +53,8 @@ def test_extract_reason_retirement_reason():
     assert _extract_reason(d, "active", "retired") == "work completed"
 
 
-def test_extract_reason_recent_note_is_used_and_tagged_inferred():
-    """A note written as part of this transition IS the reason - but it is
-    tagged so a reader can tell an inferred reason from a recorded one."""
-    fresh = _iso_ago(seconds=2)
-    d = _make_direction(
-        notes=[
-            {"text": "some note", "added_at": _iso_ago(days=3)},
-            {"text": "final note", "added_at": fresh},
-        ]
-    )
-    assert _extract_reason(d, "active", "paused") == "note: final note"
-
-
-def test_extract_reason_stale_note_is_not_attributed_to_this_transition():
-    """REGRESSION: the exact production lie this fix exists to kill.
-
-    A direction activated by staged-activation days ago carries the note
-    "Auto-activated: v32 promoted - staged work resumed".  When the strategist
-    later pauses it WITHOUT recording a paused_reason, the event row used to
-    report that activation note as the reason for an active->paused transition,
-    which is not merely unhelpful - it points a reader in the opposite
-    direction.  No reason is the honest answer here.
-    """
-    d = _make_direction(
-        status="paused",
-        notes=[
-            {
-                "text": "Auto-activated: v32 promoted - staged work resumed",
-                "added_at": _iso_ago(days=4),
-            }
-        ],
-    )
-    assert _extract_reason(d, "active", "paused") is None
-
-
-def test_extract_reason_note_without_added_at_is_rejected():
-    """An undated note cannot be tied to any transition, so it is not used."""
-    d = _make_direction(notes=[{"text": "undated note"}])
-    assert _extract_reason(d, "active", "paused") is None
-
-
-def test_extract_reason_note_with_unparseable_added_at_is_rejected():
-    d = _make_direction(notes=[{"text": "bad stamp", "added_at": "not-a-date"}])
-    assert _extract_reason(d, "active", "paused") is None
-
-
-def test_extract_reason_canonical_field_beats_a_recent_note():
-    """A recorded reason always outranks an inferred one."""
-    d = _make_direction(
-        paused_reason="churn guardrail tripped",
-        notes=[{"text": "unrelated fresh note", "added_at": _iso_ago(seconds=1)}],
-    )
-    assert _extract_reason(d, "active", "paused") == "churn guardrail tripped"
-
-
-def test_note_attribution_window_is_pinned_at_fifteen_minutes():
-    """Literal pin: widening this window silently re-admits stale notes."""
-    assert timedelta(minutes=15) == _NOTE_REASON_MAX_AGE
-
-
-def test_extract_reason_note_just_inside_the_window_is_used():
-    d = _make_direction(
-        notes=[{"text": "inside", "added_at": _iso_ago(minutes=14, seconds=30)}]
-    )
-    assert _extract_reason(d, "active", "paused") == "note: inside"
-
-
-def test_extract_reason_note_just_outside_the_window_is_rejected():
-    d = _make_direction(
-        notes=[{"text": "outside", "added_at": _iso_ago(minutes=15, seconds=30)}]
-    )
-    assert _extract_reason(d, "active", "paused") is None
-
-
-def test_extract_reason_tolerates_timezone_aware_and_naive_stamps():
-    """Note sites write naive-UTC isoformat; some legacy rows carry a Z suffix."""
-    aware = (
-        (datetime.now(timezone.utc) - timedelta(seconds=5))
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    d = _make_direction(notes=[{"text": "zulu", "added_at": aware}])
-    assert _extract_reason(d, "active", "paused") == "note: zulu"
-
-
-def test_extract_reason_empty_note_text_falls_through_to_none():
-    d = _make_direction(notes=[{"text": "   ", "added_at": _iso_ago(seconds=1)}])
+def test_extract_reason_notes_are_not_transition_reasons():
+    d = _make_direction(notes=[{"text": "unrelated note"}])
     assert _extract_reason(d, "active", "paused") is None
 
 
@@ -224,7 +130,7 @@ async def test_bare_pause_event_reports_no_reason_not_the_activation_note():
         notes=[
             {
                 "text": "Auto-activated: v32 promoted - staged work resumed",
-                "added_at": _iso_ago(days=4),
+                "added_at": "2026-08-20T12:00:00",
             }
         ],
     )
