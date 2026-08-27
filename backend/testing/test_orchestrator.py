@@ -5591,9 +5591,11 @@ class TestHealthAwareDispatch:
     # _health_score_task) descending with a stable sort, so by injecting a
     # constant predict_fn the confidence component is uniform and
     # _health_score_task becomes the sole differentiator — isolating exactly the
-    # health-score ordering the originals meant to assert.  A single degradation
-    # signal (slots_available below 50% of max) is forced so the reorder
-    # activates; the confidence floor is set to 0 so nothing is dropped.
+    # health-score ordering the originals meant to assert. All Task instances use
+    # the same default task priority, so priority remains the primary key without
+    # masking the health-score behavior. A single degradation signal
+    # (slots_available below 50% of max) is forced so the reorder activates; the
+    # confidence floor is set to 0 so nothing is dropped.
 
     @staticmethod
     async def _reorder(ids, task_by_id, session):

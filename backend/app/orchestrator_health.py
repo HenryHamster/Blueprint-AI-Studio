@@ -465,12 +465,13 @@ async def reorder_eligible_by_health(
     failure rate > 30% over the last 10 results, or available slots < 50% of the
     max VM cap.
 
-    Under degradation the list is sorted by predicted P(success)
-    (``predict_fn``, injected — normally ``spawn_calibration.predict_spawn_success``)
-    with ``_health_score_task`` as the tiebreak, and a configurable confidence
-    floor (``runtime_config['dispatch_confidence_floor']``) drops tasks whose
-    P(success) is below the floor so scarce slots go to higher-confidence work.
-    Skipped tasks remain QUEUED and become eligible again next cycle.
+    Under degradation the list keeps task priority as its primary ordering key,
+    then sorts within a priority tier by predicted P(success) (``predict_fn``,
+    injected — normally ``spawn_calibration.predict_spawn_success``) with
+    ``_health_score_task`` as the tiebreak. A configurable confidence floor
+    (``runtime_config['dispatch_confidence_floor']``) drops tasks whose P(success)
+    is below the floor so scarce slots go to higher-confidence work. Skipped
+    tasks remain QUEUED and become eligible again next cycle.
 
     Returns the (possibly reordered / filtered) ``eligible_ids`` list. A no-op
     when there are <= 1 eligible tasks or no degradation signal is present.
@@ -547,9 +548,15 @@ async def reorder_eligible_by_health(
         _confidence_cache[cache_key] = score
         return score
 
+    def _task_priority(tid) -> int:
+        task = _task_by_id.get(tid)
+        priority = getattr(task, "priority", None)
+        return priority if priority is not None else -1
+
     eligible_ids = sorted(
         eligible_ids,
         key=lambda tid: (
+            _task_priority(tid),
             _confidence_score(tid),
             _health_score_task(_task_by_id[tid]) if tid in _task_by_id else 0,
         ),
@@ -558,7 +565,8 @@ async def reorder_eligible_by_health(
     if eligible_ids != _original_order:
         logger.info(
             "[ORCHESTRATOR] Health-aware reordering applied (%s): "
-            "%d eligible tasks reordered by P(success) confidence",
+            "%d eligible tasks reordered within priority tiers by "
+            "P(success) confidence",
             ", ".join(_degradation_signals),
             len(eligible_ids),
         )

@@ -2818,8 +2818,8 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 
-                # Step 2.8: Health-aware reordering — boost small/low-risk tasks when degraded.
-                # Only activates under degradation so normal priority ordering is preserved.
+                # Step 2.8: Health-aware reordering — within each priority tier,
+                # boost small/low-risk tasks when degraded.
                 # Degradation signals: any zone in cooldown, failure rate > 30%, or slots < 50% of max.
                 # Extracted to orchestrator_health.reorder_eligible_by_health; predict_spawn_success
                 # is injected to keep that seam free of a spawn_calibration import.

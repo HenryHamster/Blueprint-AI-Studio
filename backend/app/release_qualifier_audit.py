@@ -92,6 +92,10 @@ _STRANDED_APPROVED_PR_SCAN_LIMIT = 101
 _STRANDED_APPROVED_PR_PREVIEW_LIMIT = 20
 _STRANDING_OBSERVATION_KEY = "approved_pr_stranding"
 
+# Release-audit children are blocking qualification gates, so they use the
+# established high Task.priority tier instead of the model default (50).
+RELEASE_AUDIT_TASK_PRIORITY = 100
+
 # Approvals on a cancelled task are deliberate abandonment, not stranding.
 _STRANDED_APPROVED_PR_EXCLUDED_STATUSES = (TaskStatus.CANCELLED,)
 
@@ -722,6 +726,7 @@ async def _spawn_release_audit_task(
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         origination=TASK_ORIGINATION_QUALIFIER,
+        priority=RELEASE_AUDIT_TASK_PRIORITY,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
@@ -817,6 +822,7 @@ async def _spawn_release_audit_challenge_task(
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         origination=TASK_ORIGINATION_QUALIFIER,
+        priority=RELEASE_AUDIT_TASK_PRIORITY,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
