@@ -21912,3 +21912,194 @@ async def test_goal_omission_alert_does_not_escalate_under_operator_ack(db_sessi
         "condition is a re-page they explicitly suppressed."
     )
     assert alerts[0].occurrence_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Strategist pause is an AUTOMATIC pause (one-way-latch regression)
+#
+# Both strategist update_direction sites used to write
+# `d["status"] = changes["status"]` bare. For status="paused" that produced a
+# direction with no auto_paused / paused_at / paused_reason markers, which is
+# indistinguishable from a genuine operator hold: cooldown auto-recovery skips
+# it (its guard requires all three) and reactivate_paused_direction refuses the
+# strategist (allow_user_paused=False). The engine progressively parked its own
+# portfolio and had no way back.
+# ---------------------------------------------------------------------------
+
+
+def _strategist_pause_active_direction(direction_id: str) -> dict:
+    return {
+        "id": direction_id,
+        "text": "active direction the strategist parks",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "notes": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_strategic_http_pause_then_reactivate_round_trip(
+    client, db_session, mocker
+):
+    """What the strategist paused over HTTP, the strategist can resume.
+
+    Pre-fix this fails at the second call: the bare pause write left no
+    auto_paused marker, so the reactivation came back "blocked".
+    """
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="STRAT-PAUSE-ROUNDTRIP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[_strategist_pause_active_direction("d-http-strat-pause")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-strat-pause-roundtrip",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-strat-pause-roundtrip", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-strat-pause",
+                "rationale": "blocked on the v45 deploy",
+                "changes": {"status": "paused"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    parked = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-strat-pause"
+    )
+    assert parked["status"] == "paused"
+    # The three markers the cooldown recovery guard reads.
+    assert parked["auto_paused"] is True
+    assert parked["paused_at"]
+    # Surfaces the WHY: the strategist's own rationale, not a bare state flip.
+    assert parked["paused_reason"] == "Strategic review: blocked on the v45 deploy"
+    assert parked["auto_pause_count"] == 1
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-strat-pause",
+                "rationale": "deploy landed, resume",
+                "changes": {"status": "active"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("status") != "blocked", (
+        "the strategist must be able to resume a direction it paused itself"
+    )
+
+    await db_session.refresh(project)
+    resumed = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-strat-pause"
+    )
+    assert resumed["status"] == "active"
+    assert resumed.get("auto_recovered_at") is not None
+    for key in ("auto_paused", "paused_reason", "paused_at"):
+        assert key not in resumed
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_direction_pause_stamps_auto_pause_markers(
+    db_session, mocker
+):
+    """The fallback (log-parsing) strategist path stamps the same markers.
+
+    This is the path the 663 consecutive failed-phase2 cycles ran through, so
+    it must not be able to produce a marker-less pause either.
+    """
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackStrategistPause",
+        user_id="u-fallback-strat-pause",
+        vision={"purpose": "test", "revision": 0},
+        directions=[_strategist_pause_active_direction("d-fallback-strat-pause")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-fallback-strat-pause",
+                    "changes": {"status": "paused"},
+                    "rationale": "parking pending upstream fix",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-fallback-strat-pause")
+    assert d["status"] == "paused"
+    assert d["auto_paused"] is True
+    assert d["paused_at"]
+    assert d["paused_reason"] == "Strategic review: parking pending upstream fix"
+    assert d["auto_pause_count"] == 1
+    # ...and the strategist can therefore resume it.
+    from app.direction_lifecycle import reactivate_paused_direction
+
+    assert reactivate_paused_direction(d, allow_user_paused=False) is True

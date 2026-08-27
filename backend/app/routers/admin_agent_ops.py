@@ -57,7 +57,9 @@ from app.direction_lifecycle import (
     apply_churn_retirement_keep,
     apply_churn_retirement_retire,
     direction_has_churn_retirement_recommendation,
+    pause_direction_autonomously,
     reactivate_paused_direction,
+    strategist_pause_reason,
 )
 from app.direction_priority import direction_task_priority
 from app.direct_research_spawn import (
@@ -2351,6 +2353,20 @@ async def strategic_operation(
                                     "reason": "Cannot reactivate user-paused direction",
                                 }
                             )
+                    elif changes["status"] == "paused":
+                        # A strategist-initiated pause IS an automatic pause by
+                        # definition, so it must go through the shared seam. A
+                        # bare `d["status"] = "paused"` here leaves no
+                        # auto_paused/paused_at/paused_reason markers, which
+                        # makes the direction indistinguishable from a genuine
+                        # operator hold and latches it paused forever: cooldown
+                        # auto-recovery skips it (no auto_paused/paused_at) and
+                        # reactivate_paused_direction refuses the strategist
+                        # (allow_user_paused=False). Only a human PATCH on
+                        # /directions may produce a user-pause.
+                        pause_direction_autonomously(
+                            d, reason=strategist_pause_reason(rationale)
+                        )
                     else:
                         d["status"] = changes["status"]
                     if changes["status"] == "superseded":
