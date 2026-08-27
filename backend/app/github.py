@@ -1519,6 +1519,8 @@ from app.github_auth import (  # noqa: F401
     generate_github_app_jwt,
     get_repo_installation_token,
     get_repo_installation_read_token,
+    mint_repo_installation_token_with_permissions,
+    GitHubInstallationPermissionError,
     exchange_oauth_code,
     get_app_info,
     get_user_installations,

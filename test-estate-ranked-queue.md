@@ -50,7 +50,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_release_qualifier__classify_check_runs.py` | 7,550 | 134 | critical (>5000 LOC) | 30.084s measured | — |
 | P2 | backend | `backend/testing/test_rollup_management.py` | 6,428 | 109 | critical (>5000 LOC) | 26.818s measured | — |
 | P2 | backend | `backend/testing/test_direction_outcomes.py` | 10,397 | 191 | critical (>5000 LOC) | 26.802s measured | — |
-| P2 | backend | `backend/testing/test_github.py` | 5,931 | 187 | critical (>5000 LOC) | 17.135s measured | — |
+| P2 | backend | `backend/testing/test_github.py` | 6,154 | 193 | critical (>5000 LOC) | 17.135s measured | — |
 | P2 | backend | `backend/testing/test_direction_lifecycle.py` | 5,886 | 103 | critical (>5000 LOC) | 13.910s measured | — |
 | P2 | agent | `agent/src/handlers/strategic-resident.test.ts` | 9,229 | 136 | critical (>5000 LOC) | 13.729s measured | protected; declared floor 136 |
 | P2 | backend | `backend/testing/test_salvage_bundle_standalone.py` | 7,778 | 239 | critical (>5000 LOC) | 8.485s measured | — |
@@ -58,7 +58,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_agent_strategic_fetch.py` | 7,132 | 140 | critical (>5000 LOC) | 7.724s measured | protected; declared floor 140 |
 | P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification_2.py` | 7,027 | 112 | critical (>5000 LOC) | 5.220s measured | — |
 | P2 | backend | `backend/testing/test_strategic_state.py` | 10,654 | 174 | critical (>5000 LOC) | 4.542s measured | protected; declared floor 174 |
-| P2 | backend | `backend/testing/test_release_qualifier__sweep_stuck_qualifications.py` | 7,146 | 145 | critical (>5000 LOC) | 3.776s measured | — |
+| P2 | backend | `backend/testing/test_release_qualifier__sweep_stuck_qualifications.py` | 7,336 | 149 | critical (>5000 LOC) | 3.776s measured | — |
 | P2 | backend | `backend/testing/test_release_qualifier__finalize_qualification.py` | 7,663 | 106 | critical (>5000 LOC) | 3.708s measured | — |
 | P2 | backend | `backend/testing/test_warm_pool_maintainer.py` | 5,921 | 123 | critical (>5000 LOC) | 3.564s measured | — |
 | P2 | admin-ui | `admin-ui/src/components/VersionLifecyclePanel.test.tsx` | 5,098 | 177 | critical (>5000 LOC) | 2.891s measured | — |
@@ -297,7 +297,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_rollup_size_preflight.py` | 1,259 | 38 | under 1500 LOC | 12.728s measured | — |
 | G | backend | `backend/testing/test_alert_mint_sites.py` | 422 | 6 | under 1500 LOC | 12.544s measured | — |
 | G | backend | `backend/testing/test_project_operator_access.py` | 1,006 | 16 | under 1500 LOC | 12.497s measured | — |
-| G | backend | `backend/testing/test_release_qualifier__trigger_and_dispatch_regressions.py` | 946 | 17 | under 1500 LOC | 12.452s measured | — |
+| G | backend | `backend/testing/test_release_qualifier__trigger_and_dispatch_regressions.py` | 1,003 | 19 | under 1500 LOC | 12.452s measured | — |
 | G | backend | `backend/testing/test_admin_approval_comment_recovery.py` | 514 | 12 | under 1500 LOC | 12.320s measured | — |
 | G | backend | `backend/testing/test_rollup_lineage_fence.py` | 1,089 | 30 | under 1500 LOC | 12.206s measured | — |
 | G | backend | `backend/testing/test_strategic_spawn_requests.py` | 1,089 | 20 | under 1500 LOC | 11.955s measured | — |
@@ -608,6 +608,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_migration_0698_cochange_state.py` | 217 | 2 | under 1500 LOC | 0.525s measured | — |
 | G | backend | `backend/testing/test_rate_limit_verbatim_corpus.py` | 269 | 2 | under 1500 LOC | 0.520s measured | — |
 | G | backend | `backend/testing/test_rollup_open_pr_reconciliation.py` | 94 | 1 | under 1500 LOC | 0.517s measured | — |
+| G | backend | `backend/testing/test_release_promotion_github_preflight.py` | 260 | 9 | under 1500 LOC | 0.510s measured | — |
 | G | backend | `backend/testing/test_branch_resolution_alerts.py` | 100 | 2 | under 1500 LOC | 0.509s measured | — |
 | G | admin-ui | `admin-ui/src/components/WarmReuseVsCostTrend.test.tsx` | 218 | 9 | under 1500 LOC | 0.492s measured | — |
 | G | admin-ui | `admin-ui/src/components/FixLoopConvergenceWidget.test.tsx` | 156 | 2 | under 1500 LOC | 0.491s measured | — |

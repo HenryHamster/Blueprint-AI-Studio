@@ -48,7 +48,7 @@ requires the linked identity for its preview-first flow.
 | Identity | What it proves | Where it is used |
 |---|---|---|
 | Caller's linked GitHub OAuth credential or fine-grained PAT | The person creating the project has `push` or `admin` permission on this exact repository. | Repository picker and onboarding authorization. The token is stored through the existing user secret reference; it is never placed in the OAuth resume snapshot or onboarding payload. |
-| Blueprint GitHub App installation | The Blueprint service can reach the repository with its configured Contents, Pull requests, Commit statuses, Issues, and Checks permissions. | Repository detection, initialization, agent Git operations, checks, issues, and PR workflows. |
+| Blueprint GitHub App installation | The Blueprint service can reach the repository with its configured Actions, Contents, Pull requests, Commit statuses, Issues, and Checks permissions. | Repository detection, initialization, agent Git operations, checks, issues, PR workflows, and bounded promotion-CI reruns. |
 
 In **New Project**, connect your GitHub account first. The repository picker is
 the intersection of repositories writable by your linked identity and
@@ -64,8 +64,10 @@ to include it):
 1. Go to the GitHub App's public page (the App you created in
    [Deploy.md → GitHub App Setup](../Deploy.md#github-app-setup)).
 2. Click **Install** / **Configure** and grant access to the target repository.
-3. Confirm the App has the required repository permissions: Contents (R&W),
-   Pull requests (R&W), Commit statuses (R&W), Issues (R&W), Checks (R).
+3. Confirm the App has the required repository permissions: Actions (R&W),
+   Contents (R&W), Pull requests (R&W), Commit statuses (R&W), Issues (R&W),
+   Checks (R). Existing installations must approve permission changes before
+   Blueprint can use them.
 
 ### How the App installation token is resolved
 
@@ -370,7 +372,7 @@ for the `ReleaseVersion` and `QualificationVerdict` schemas.
 1. Link the creating user's GitHub OAuth identity or fine-grained PAT; confirm it
    has `push` or `admin` permission on the exact repository.
 2. Install the platform GitHub App on the target repo
-   (Contents/PRs/Statuses/Issues/Checks) and confirm `GITHUB_APP_ID` /
+   (Actions/Contents/PRs/Statuses/Issues/Checks) and confirm `GITHUB_APP_ID` /
    `GITHUB_PRIVATE_KEY` are configured server-side.
 3. Create the project via **New Project** (or
    `POST /api/admin/projects/onboard`). Treat 403 caller authorization, 422 App

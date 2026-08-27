@@ -4887,6 +4887,229 @@ async def test_invalidate_repo_installation_token_forces_remint(mocker):
 
 
 @pytest.mark.asyncio
+async def test_capability_mint_proves_actual_receipt_and_evicts_under_lock(mocker):
+    """Promotion receives the explicitly scoped token whose receipt was verified."""
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    required = {
+        "actions": "write",
+        "checks": "read",
+        "contents": "write",
+        "pull_requests": "write",
+        "statuses": "write",
+    }
+    gh_auth._repo_installation_token_cache["acme/widget"] = (
+        "old-token",
+        _t.monotonic(),
+    )
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+    calls = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        calls.append((method, url, kwargs.get("json")))
+        if method == "GET":
+            return MockResponse(200, {"id": 555, "permissions": required})
+        assert "acme/widget" not in gh_auth._repo_installation_token_cache
+        return MockResponse(
+            201,
+            {"token": "capability-token", "permissions": required},
+        )
+
+    mocker.patch.object(gh_auth, "_github_request", side_effect=_fake_request)
+
+    token = await gh_auth.mint_repo_installation_token_with_permissions(
+        "acme", "widget", required, installation_id="555"
+    )
+
+    assert token == "capability-token"
+    assert [call[0] for call in calls] == ["GET", "POST"]
+    assert calls[1][2] == {"repositories": ["widget"], "permissions": required}
+    assert "acme/widget" not in gh_auth._repo_installation_token_cache
+    gh_auth._installation_id_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_capability_mint_wins_after_concurrent_generic_mint(mocker):
+    """A generic mint cannot repopulate the cache between eviction and proof."""
+    import asyncio
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    required = {"actions": "write", "contents": "write"}
+    gh_auth._repo_installation_token_cache.clear()
+    gh_auth._installation_id_cache["acme/widget"] = ("555", _t.time())
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+    generic_started = asyncio.Event()
+    release_generic = asyncio.Event()
+    calls = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        body = kwargs.get("json") or {}
+        if method == "POST" and "permissions" not in body:
+            calls.append("generic-post")
+            generic_started.set()
+            await release_generic.wait()
+            return MockResponse(201, {"token": "generic-token"})
+        if method == "GET":
+            calls.append("capability-get")
+            return MockResponse(200, {"id": 555, "permissions": required})
+        calls.append("capability-post")
+        return MockResponse(
+            201,
+            {"token": "verified-capability-token", "permissions": required},
+        )
+
+    mocker.patch.object(gh_auth, "_github_request", side_effect=_fake_request)
+
+    generic_task = asyncio.create_task(
+        gh_auth.get_repo_installation_token("acme", "widget")
+    )
+    await asyncio.wait_for(generic_started.wait(), timeout=1)
+    capability_task = asyncio.create_task(
+        gh_auth.mint_repo_installation_token_with_permissions(
+            "acme", "widget", required
+        )
+    )
+    await asyncio.sleep(0)
+    release_generic.set()
+
+    generic_token, capability_token = await asyncio.gather(
+        generic_task, capability_task
+    )
+
+    assert generic_token == "generic-token"
+    assert capability_token == "verified-capability-token"
+    assert calls == ["generic-post", "capability-get", "capability-post"]
+    assert "acme/widget" not in gh_auth._repo_installation_token_cache
+    gh_auth._installation_id_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_capability_mint_rejects_permission_missing_from_actual_receipt(mocker):
+    import app.github_auth as gh_auth
+
+    required = {"actions": "write", "contents": "write"}
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+    mocker.patch(
+        "app.github_auth._github_request",
+        new=AsyncMock(
+            side_effect=[
+                MockResponse(200, {"id": 555, "permissions": required}),
+                MockResponse(
+                    201,
+                    {
+                        "token": "under-scoped-token",
+                        "permissions": {"actions": "read", "contents": "write"},
+                    },
+                ),
+            ]
+        ),
+    )
+
+    with pytest.raises(gh_auth.GitHubInstallationPermissionError):
+        await gh_auth.mint_repo_installation_token_with_permissions(
+            "acme", "widget", required
+        )
+
+
+@pytest.mark.asyncio
+async def test_capability_mint_treats_missing_receipt_permissions_as_unknown(mocker):
+    import app.github_auth as gh_auth
+
+    required = {"actions": "write", "contents": "write"}
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+    mocker.patch(
+        "app.github_auth._github_request",
+        new=AsyncMock(
+            side_effect=[
+                MockResponse(200, {"id": 555, "permissions": required}),
+                MockResponse(201, {"token": "receipt-without-permissions"}),
+            ]
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="receipt omitted permissions"):
+        await gh_auth.mint_repo_installation_token_with_permissions(
+            "acme", "widget", required
+        )
+
+
+@pytest.mark.asyncio
+async def test_capability_mint_returns_none_when_app_installation_disappeared(mocker):
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    gh_auth._repo_installation_token_cache["acme/widget"] = (
+        "stale-token",
+        _t.monotonic(),
+    )
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+    request = mocker.patch(
+        "app.github_auth._github_request",
+        new=AsyncMock(return_value=MockResponse(404, {})),
+    )
+
+    token = await gh_auth.mint_repo_installation_token_with_permissions(
+        "acme", "widget", {"actions": "write"}
+    )
+
+    assert token is None
+    assert request.await_count == 1
+    assert "acme/widget" not in gh_auth._repo_installation_token_cache
+
+
+@pytest.mark.asyncio
+async def test_capability_mint_evicts_cache_on_confirmed_permission_shortfall(mocker):
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    required = {"actions": "write", "contents": "write"}
+    gh_auth._repo_installation_token_cache["acme/widget"] = (
+        "stale-token",
+        _t.monotonic(),
+    )
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+    request = mocker.patch(
+        "app.github_auth._github_request",
+        new=AsyncMock(
+            return_value=MockResponse(
+                200,
+                {
+                    "id": 555,
+                    "permissions": {"actions": "read", "contents": "write"},
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(gh_auth.GitHubInstallationPermissionError) as exc_info:
+        await gh_auth.mint_repo_installation_token_with_permissions(
+            "acme", "widget", required
+        )
+
+    assert exc_info.value.missing_permissions == ("actions",)
+    assert request.await_count == 1
+    assert "acme/widget" not in gh_auth._repo_installation_token_cache
+
+
+@pytest.mark.asyncio
 async def test_generate_installation_access_token_includes_permissions(mocker):
     """generate_installation_access_token passes the permissions dict in the POST body."""
     import app.github_auth as gh_auth

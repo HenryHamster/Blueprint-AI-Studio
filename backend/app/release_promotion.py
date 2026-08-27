@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -67,6 +68,36 @@ logger = logging.getLogger(__name__)
 # time to boot and stabilize before the deadline, while a boot-crashed deploy
 # surfaces as a loud failure within an hour.
 _DEPLOY_CONFIRM_WINDOW_SECONDS = 60 * 60
+_PROMOTION_GITHUB_APP_PERMISSIONS: dict[str, str] = {
+    "actions": "write",
+    "checks": "read",
+    "contents": "write",
+    "pull_requests": "write",
+    "statuses": "write",
+}
+_PROMOTION_CAPABILITY_FAILURES: frozenset[str] = frozenset(
+    {
+        "github_actions_write_required",
+        "github_promotion_permissions_required",
+        "github_actions_permission_preflight_unavailable",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _ResolvedGitHubCredential:
+    token: str
+    owner: str
+    repo: str
+    source: str
+    installation_id: str | None = None
+
+
+def _promotion_failure_counts_toward_cap(error: str | None) -> bool:
+    """Capability preflight holds do not spend a promotion/CI attempt."""
+    return str(error or "") not in _PROMOTION_CAPABILITY_FAILURES
+
+
 # ---------------------------------------------------------------------------
 # Branch-name helpers
 # ---------------------------------------------------------------------------
@@ -87,16 +118,77 @@ def _lts_branch_names(project=None) -> tuple[str, str]:
     )
 
 
+async def _preflight_promotion_rerun_token(
+    token: str,
+    owner: str,
+    repo: str,
+    *,
+    credential_source: str | None = None,
+    installation_id: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Prove rerun capability without switching the selected credential."""
+    from app.release_promotion_ci_rerun import _promotion_ci_rerun_budget
+
+    if _promotion_ci_rerun_budget() <= 0:
+        return token, None, None
+
+    # PATs and explicit caller-supplied tokens keep their identity. GitHub App
+    # installation metadata says nothing about those credentials and must never
+    # cause a capable PAT to be rejected or silently replaced.
+    if credential_source != "app":
+        return token, None, None
+
+    try:
+        refreshed = await github.mint_repo_installation_token_with_permissions(
+            owner,
+            repo,
+            _PROMOTION_GITHUB_APP_PERMISSIONS,
+            installation_id=installation_id,
+        )
+    except github.GitHubInstallationPermissionError as exc:
+        missing_permissions = tuple(getattr(exc, "missing_permissions", ()))
+        if missing_permissions == ("actions",):
+            return (
+                None,
+                "github_actions_write_required",
+                "GitHub App installation requires repository permission "
+                "Actions: Read and write for bounded promotion CI reruns",
+            )
+        missing_detail = ", ".join(
+            f"{name} ({_PROMOTION_GITHUB_APP_PERMISSIONS.get(name, 'required')})"
+            for name in missing_permissions
+        ) or "one or more required promotion permissions"
+        return (
+            None,
+            "github_promotion_permissions_required",
+            "GitHub App installation lacks required promotion permissions: "
+            f"{missing_detail}",
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown capability must fail closed
+        return (
+            None,
+            "github_actions_permission_preflight_unavailable",
+            f"GitHub App permission preflight failed: {exception_reason(exc)}",
+        )
+    if not refreshed:
+        return (
+            None,
+            "github_actions_permission_preflight_unavailable",
+            "Selected GitHub App installation is unavailable for this repository",
+        )
+    return refreshed, None, None
+
+
 # ---------------------------------------------------------------------------
 # GitHub credential resolution
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_github_with_session(
+async def _resolve_github_credential_with_session(
     session: AsyncSession,
     project: Project,
-) -> tuple[str, str, str] | None:
-    """Resolve ``(token, owner, repo)`` using the active session for fallbacks.
+) -> _ResolvedGitHubCredential | None:
+    """Resolve a credential and preserve its authentication provenance.
 
     Same resolution order as ``get_github_token_for_task``: App-level discovery,
     then the user's stored installation id, then their PAT.  The session is
@@ -111,9 +203,15 @@ async def _resolve_github_with_session(
         )
         return None
 
-    token: str | None = None
     try:
-        token = await github.get_repo_installation_token(owner, repo)
+        app_token = await github.get_repo_installation_token(owner, repo)
+        if app_token:
+            return _ResolvedGitHubCredential(
+                token=app_token,
+                owner=owner,
+                repo=repo,
+                source="app",
+            )
     except Exception:  # noqa: BLE001
         logger.debug(
             "[RELEASE_QUALIFIER] App-level token discovery failed for %s/%s",
@@ -121,7 +219,7 @@ async def _resolve_github_with_session(
             repo,
         )
 
-    if not token and project.user_id:
+    if project.user_id:
         from app.field_encryption import decrypt_field
         from app.github import generate_installation_access_token
         from app.models import UserIntegration
@@ -140,19 +238,34 @@ async def _resolve_github_with_session(
         )
         if integration and integration.github_installation_id:
             try:
-                token = await generate_installation_access_token(
+                installation_token = await generate_installation_access_token(
                     integration.github_installation_id, repositories=[repo]
                 )
+                if installation_token:
+                    return _ResolvedGitHubCredential(
+                        token=installation_token,
+                        owner=owner,
+                        repo=repo,
+                        source="app",
+                        installation_id=str(integration.github_installation_id),
+                    )
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "[RELEASE_QUALIFIER] stored installation token failed for %s/%s",
                     owner,
                     repo,
                 )
-        if not token and integration and integration.github_pat:
+        if integration and integration.github_pat:
             try:
                 decrypted_pat_ref = decrypt_field(integration.github_pat)
-                token = await get_user_secret(decrypted_pat_ref)
+                pat = await get_user_secret(decrypted_pat_ref)
+                if pat:
+                    return _ResolvedGitHubCredential(
+                        token=pat,
+                        owner=owner,
+                        repo=repo,
+                        source="pat",
+                    )
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "[RELEASE_QUALIFIER] PAT retrieval failed for %s/%s",
@@ -160,14 +273,23 @@ async def _resolve_github_with_session(
                     repo,
                 )
 
-    if not token:
-        logger.warning(
-            "[RELEASE_QUALIFIER] no GitHub token available for %s/%s",
-            owner,
-            repo,
-        )
+    logger.warning(
+        "[RELEASE_QUALIFIER] no GitHub token available for %s/%s",
+        owner,
+        repo,
+    )
+    return None
+
+
+async def _resolve_github_with_session(
+    session: AsyncSession,
+    project: Project,
+) -> tuple[str, str, str] | None:
+    """Compatibility wrapper returning the established token/owner/repo triple."""
+    credential = await _resolve_github_credential_with_session(session, project)
+    if credential is None:
         return None
-    return token, owner, repo
+    return credential.token, credential.owner, credential.repo
 
 
 # ---------------------------------------------------------------------------
@@ -1219,9 +1341,11 @@ async def promote(
         )
 
     # The row lock is now released — all the I/O below runs unlocked.
+    credential_source: str | None = None
+    credential_installation_id: str | None = None
     if not token or not owner or not repo:
-        resolved = await _resolve_github_with_session(session, project)
-        if resolved is None:
+        credential = await _resolve_github_credential_with_session(session, project)
+        if credential is None:
             return await _record_promotion_failure(
                 session,
                 version,
@@ -1229,7 +1353,11 @@ async def promote(
                 "no_credentials",
                 lock_released=True,
             )
-        token, owner, repo = resolved
+        token = credential.token
+        owner = credential.owner
+        repo = credential.repo
+        credential_source = credential.source
+        credential_installation_id = credential.installation_id
 
     # --- Exact idempotency receipt (audit R4-C1 / R4-H1) --------------------
     # A crash after GitHub merged but before the DB commit is successful only
@@ -1271,6 +1399,32 @@ async def promote(
             empty_diff=bool(existing_receipt.get("empty_diff")),
             promoted_sha=existing_receipt["merge_commit_sha"],
             already_landed=True,
+        )
+
+    token, permission_error, permission_detail = (
+        await _preflight_promotion_rerun_token(
+            token,
+            owner,
+            repo,
+            credential_source=credential_source,
+            installation_id=credential_installation_id,
+        )
+    )
+    if permission_error or not token:
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: refusing to create %s for v%d because "
+            "the promotion CI rerun capability is unavailable: %s",
+            release_branch,
+            version.version_number,
+            permission_detail,
+        )
+        return await _record_promotion_failure(
+            session,
+            version,
+            base_record,
+            permission_error or "github_actions_permission_preflight_unavailable",
+            detail=permission_detail,
+            lock_released=True,
         )
 
     # 0. Create the release branch pinned to the qualified candidate commit
@@ -1968,12 +2122,15 @@ async def _record_promotion_failure(
         )
         or ""
     ).strip()
+    _attempt_increment = int(_promotion_failure_counts_toward_cap(error))
     record = {
         **base_record,
         "status": "promotion_failed",
         "error": error,
-        "promotion_failure_count": _prev_count + 1,
+        "promotion_failure_count": _prev_count + _attempt_increment,
     }
+    if not _attempt_increment:
+        record["promotion_attempt_spent"] = False
     if _pinned_candidate:
         record["candidate_sha"] = _pinned_candidate
     else:
@@ -2029,16 +2186,29 @@ async def _record_promotion_failure(
         error,
     )
     failure_detail = f": {detail}" if detail else ""
-    await _notify_operator(
-        session,
-        version,
-        "release_promotion_failed",
-        (
+    if error in _PROMOTION_CAPABILITY_FAILURES:
+        operator_summary = (
+            f"Promotion of v{version.version_number} is held before release "
+            f"branch or PR creation because the required bounded CI-rerun "
+            f"capability could not be proven ({error}{failure_detail}). main "
+            f"was NOT advanced; the version stays open and returns to stabilize."
+        )
+    else:
+        operator_summary = (
             f"Promotion of v{version.version_number} failed — it cleared the "
             f"qualifier but the automain → main merge failed "
             f"({error}{failure_detail}). main was NOT advanced; the version "
             f"stays open and returns to stabilize."
+        )
+    await _notify_operator(
+        session,
+        version,
+        (
+            "release_promotion_capability_blocked"
+            if error in _PROMOTION_CAPABILITY_FAILURES
+            else "release_promotion_failed"
         ),
+        operator_summary,
         extra={
             "error": error,
             "detail": detail,

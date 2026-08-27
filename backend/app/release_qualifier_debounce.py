@@ -21,11 +21,13 @@ qualification.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.time_utils import _coerce_naive_utc
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +74,9 @@ async def compute_automain_head_quiet_seconds(
         first_seen: datetime | None = None
         if isinstance(marker, dict) and marker.get("head_sha") == automain_sha:
             try:
-                first_seen = datetime.fromisoformat(
-                    marker.get("first_seen_at") or ""
+                first_seen = _coerce_naive_utc(
+                    datetime.fromisoformat(marker.get("first_seen_at") or "")
                 )
-                if first_seen.tzinfo is None:
-                    first_seen = first_seen.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 first_seen = None
         if first_seen is not None:
