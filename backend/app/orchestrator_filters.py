@@ -21,7 +21,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.migration_path import is_migration_file
-from app.models import Task, TaskStatus
+from app.models import TASK_ORIGINATION_QUALIFIER, Task, TaskStatus
 from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
 from app.time_utils import _utcnow
 from app.task_capabilities import (
@@ -1425,6 +1425,13 @@ async def cap_pipeline_slots(
 _RESERVATION_PRIORITY_FENCE = 100
 
 
+def _normalized_priority(value, *, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def reserve_slots_for_types(
     eligible_ids: list,
     candidate_tasks: list[Task],
@@ -1456,12 +1463,10 @@ def reserve_slots_for_types(
     types_by_id = {
         t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
     }
-    priority_by_id = {}
-    for task in candidate_tasks:
-        try:
-            priority_by_id[task.id] = int(task.priority)
-        except (AttributeError, TypeError, ValueError):
-            priority_by_id[task.id] = 50
+    priority_by_id = {
+        task.id: _normalized_priority(getattr(task, "priority", None), default=50)
+        for task in candidate_tasks
+    }
     reserved_types = set(reserved_config.keys())
     # ``reorder_by_completion_priority`` returns a list subclass carrying the
     # small set of EVALUATING delivery-owner dependencies that must not be
@@ -1657,6 +1662,49 @@ _DELIVERY_OWNER_SOURCE_CONTEXT_KEYS = (
 _QUALITY_GRADER_SOURCE_CONTEXT_KEY = "quality_grader_for_task_id"
 # Task types that represent brand-new top-level work (lowest completion priority).
 _NEW_WORK_TASK_TYPES = frozenset({"research", "web_research"})
+_BLOCKING_RELEASE_GATE_TASK_TYPES = frozenset(
+    {"release_audit", "release_audit_challenge"}
+)
+
+
+def _is_trusted_blocking_release_gate(task: Task | object | None) -> bool:
+    """Return whether *task* is a server-authored qualifier release gate.
+
+    ``Task.priority`` is writable through ordinary task creation and therefore
+    cannot confer this privilege. Require the server-owned author/origination
+    pair plus a self-consistent version, attempt, and candidate binding.
+    """
+    if task is None:
+        return False
+    payload = getattr(task, "first_payload", None)
+    context = getattr(task, "context", None)
+    if not isinstance(payload, dict) or not isinstance(context, dict):
+        return False
+    task_type = payload.get("type")
+    if (
+        task_type not in _BLOCKING_RELEASE_GATE_TASK_TYPES
+        or getattr(task, "created_by", None) != "ORCHESTRATOR"
+        or getattr(task, "origination", None) != TASK_ORIGINATION_QUALIFIER
+        or _normalized_priority(getattr(task, "priority", None), default=0)
+        < _RESERVATION_PRIORITY_FENCE
+    ):
+        return False
+    release_version_id = context.get("release_version_id")
+    qualification_attempt_id = context.get("qualification_attempt_id")
+    candidate_sha = context.get("candidate_sha")
+    try:
+        uuid.UUID(str(release_version_id))
+        uuid.UUID(str(qualification_attempt_id))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return (
+        isinstance(candidate_sha, str)
+        and len(candidate_sha) == 40
+        and all(char in "0123456789abcdef" for char in candidate_sha)
+        and payload.get("candidate_sha") == candidate_sha
+        and str(payload.get("qualification_attempt_id") or "")
+        == str(qualification_attempt_id)
+    )
 
 
 class _CompletionPriorityOrder(list):
@@ -1675,12 +1723,15 @@ def apply_completion_priority(
     rollup_parent_ids: set,
     evaluating_delivery_owner_ids: set | None = None,
     delivery_owner_id_by_id: dict | None = None,
+    trusted_release_gate_ids: set | frozenset | None = None,
 ) -> list:
     """Reorder eligible tasks so tree-completing work outranks new work.
 
     Assigns completion tiers and stably sorts so that tasks closer to finishing
     an already-started tree appear before brand-new top-level work:
 
+      0. Server-authored qualifier release gates whose provenance and candidate
+         binding were verified by the caller.
       1. review/fix tasks whose parent plan already issued a rollup PR
          (``parent_id`` in ``rollup_parent_ids``) — these close whole plan trees.
       2. review/fix tasks on ordinary in-flight PRs (parent not a rollup).
@@ -1706,15 +1757,19 @@ def apply_completion_priority(
         delivery_owner_id_by_id: optional semantic owner mapping for candidates
             whose delivery edge is not ``parent_task_id`` (notably parentless
             grader/challenge sidecars linked through their source-task context).
+        trusted_release_gate_ids: exact candidate IDs proven by
+            :func:`_is_trusted_blocking_release_gate`. These gates stay ahead of
+            completion tiers and cannot be displaced by slot reservation.
 
     Returns:
         The reordered ``eligible_ids`` (same length / membership, stable within tier).
     """
     evaluating_delivery_owner_ids = evaluating_delivery_owner_ids or set()
     delivery_owner_id_by_id = delivery_owner_id_by_id or parent_id_by_id
+    trusted_release_gate_ids = frozenset(trusted_release_gate_ids or ())
     finish_priority_parent_ids = active_task_ids | evaluating_delivery_owner_ids
 
-    reservation_protected_ids = {
+    reservation_protected_ids = trusted_release_gate_ids | {
         tid
         for tid in eligible_ids
         if delivery_owner_id_by_id.get(tid) in evaluating_delivery_owner_ids
@@ -1726,6 +1781,8 @@ def apply_completion_priority(
         task_type = types_by_id.get(tid) or ""
         parent_id = parent_id_by_id.get(tid)
         delivery_owner_id = delivery_owner_id_by_id.get(tid)
+        if tid in trusted_release_gate_ids:
+            return 0  # trusted qualifier blocker
         if task_type in _PIPELINE_TASK_TYPES:
             if parent_id and parent_id in rollup_parent_ids:
                 return 1  # rollup tree-completing review/fix — highest priority
@@ -1745,7 +1802,7 @@ def apply_completion_priority(
             tier_counts[tier] = tier_counts.get(tier, 0) + 1
         logger.info(
             "[ORCHESTRATOR] Finish-before-start: tier distribution "
-            f"{tier_counts} (1=rollup-review, 2=review/fix, "
+            f"{tier_counts} (0=urgent, 1=rollup-review, 2=review/fix, "
             "3=delivery-owner-child, 4=new-work)"
         )
     return _CompletionPriorityOrder(result, reservation_protected_ids)
@@ -1823,6 +1880,11 @@ async def reorder_by_completion_priority(
 
     types_by_id = {
         t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
+    }
+    trusted_release_gate_ids = {
+        task.id
+        for task in candidate_tasks
+        if task.id in eligible_ids and _is_trusted_blocking_release_gate(task)
     }
     candidate_by_id = {t.id: t for t in candidate_tasks}
     parent_id_by_id = {t.id: t.parent_task_id for t in candidate_tasks}
@@ -1963,6 +2025,7 @@ async def reorder_by_completion_priority(
         rollup_parent_ids,
         evaluating_delivery_owner_ids,
         delivery_owner_id_by_id,
+        trusted_release_gate_ids,
     )
 
 

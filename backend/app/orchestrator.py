@@ -36,7 +36,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
-from sqlalchemy import func as _func, inspect as sa_inspect
+from sqlalchemy import case as _case, func as _func, inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
@@ -68,6 +68,7 @@ from app.execution_principal import resolve_project_execution_principal
 from app.models import (
     DeploymentState,
     Project,
+    TASK_ORIGINATION_QUALIFIER,
     Task,
     TaskStatus,
     advance_task_lifetime_attempt,
@@ -800,7 +801,70 @@ CANDIDATE_LIGHT_COLUMNS = (
     # their server-owned creator. Omitting this column makes the raiseloaded
     # candidate access abort the entire dispatch cycle.
     Task.created_by,
+    # Trusted qualifier release gates also require the server-owned origination
+    # class. Keep it in the raiseloaded projection with ``created_by``.
+    Task.origination,
 )
+
+
+def _candidate_task_statement(slots_available: int):
+    """Build the bounded candidate scan with qualifier gates admitted first."""
+
+    per_project_cap = max(slots_available * 2, 20)
+    active_project_ids = select(Project.id).where(
+        Project.not_archived(),
+        Project.paused.is_(False),
+    )
+    base_predicates = (
+        Task.status == TaskStatus.QUEUED,
+        Task.requires_approval.is_(False),
+        _agent_executed_task_type_filter(),
+        Task.project_id.in_(active_project_ids),
+    )
+    qualifier_gate_rank = _case(
+        (
+            (
+                (Task.created_by == "ORCHESTRATOR")
+                & (Task.origination == TASK_ORIGINATION_QUALIFIER)
+                & (Task.priority >= 100)
+                & (
+                    Task.payloads[0]["type"].as_string().in_(
+                        ("release_audit", "release_audit_challenge")
+                    )
+                )
+            ),
+            1,
+        ),
+        else_=0,
+    )
+    row_number = (
+        _func.row_number()
+        .over(
+            partition_by=Task.project_id,
+            order_by=[
+                qualifier_gate_rank.desc(),
+                Task.priority.desc().nullslast(),
+                Task.created_at.asc(),
+            ],
+        )
+        .label("row_num")
+    )
+    candidate_id_subquery = (
+        select(Task.id, row_number).where(*base_predicates).subquery()
+    )
+
+    return (
+        select(Task)
+        .where(
+            Task.id.in_(
+                select(candidate_id_subquery.c.id).where(
+                    candidate_id_subquery.c.row_num <= per_project_cap
+                )
+            )
+        )
+        .options(load_only(*CANDIDATE_LIGHT_COLUMNS, raiseload=True))
+        .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
+    )
 
 
 # Light column set for parked-BLOCKED file-conflict holders (Step 2.5
@@ -2198,60 +2262,11 @@ async def orchestrator_worker():
                 # starve tasks from under-cap projects that sit just beyond the
                 # limit — the resource-envelope filter then defers every
                 # candidate and no other project dispatches that cycle.
-                _per_project_cap = max(slots_available * 2, 20)
-                _rn_col = (
-                    _func.row_number()
-                    .over(
-                        partition_by=Task.project_id,
-                        order_by=[
-                            Task.priority.desc().nullslast(),
-                            Task.created_at.asc(),
-                        ],
-                    )
-                    .label("row_num")
-                )
-                _cand_id_sq = (
-                    select(Task.id, _rn_col)
-                    # Exclude tasks owned by an archived OR paused project — both
-                    # halt new dispatch of the project's QUEUED work. Pause is a
-                    # first-class persisted switch distinct from terminal status
-                    # and from autonomous_enabled: while paused, no new dispatch
-                    # (cold OR warm-pool) may select the project's work, though
-                    # in-flight PROVISIONING/IN_PROGRESS tasks drain. Filtering via
-                    # a project-id subquery (rather than a JOIN) keeps the
-                    # load_only/scalars() shape and the MissingGreenlet-safe
-                    # Task-only column set untouched.
-                    .where(
-                        Task.status == TaskStatus.QUEUED,
-                        Task.requires_approval.is_(False),
-                        _agent_executed_task_type_filter(),
-                        Task.project_id.in_(
-                            select(Project.id).where(
-                                Project.not_archived(),
-                                Project.paused.is_(False),
-                            )
-                        ),
-                    )
-                    .subquery()
-                )
-                candidate_stmt = (
-                    select(Task)
-                    .where(
-                        Task.id.in_(
-                            select(_cand_id_sq.c.id).where(
-                                _cand_id_sq.c.row_num <= _per_project_cap
-                            )
-                        )
-                    )
-                    # CANDIDATE_LIGHT_COLUMNS drops heavy JSONB but carries every
-                    # column a Step-2.5 filter reads on a candidate (status_log,
-                    # parent_task_id, title, ...). Excluding any of them makes the
-                    # downstream access a sync lazy-load from async context →
-                    # MissingGreenlet that crashes the whole dispatch cycle. See the
-                    # constant's docstring and reference_load_only_event_listeners.md.
-                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS, raiseload=True))
-                    .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
-                )
+                # The per-project cap remains bounded, but server-authored
+                # qualifier release gates rank ahead of ordinary work inside
+                # each partition so agent-authored priority-100 tasks cannot
+                # exclude a release blocker before the trusted Python reorder.
+                candidate_stmt = _candidate_task_statement(slots_available)
                 candidate_tasks = (
                     (await session.execute(candidate_stmt)).scalars().all()
                 )

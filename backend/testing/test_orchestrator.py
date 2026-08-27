@@ -14541,6 +14541,169 @@ class TestFinishBeforeStartPriority:
             "ORCHESTRATOR"
         )
 
+    @pytest.mark.asyncio
+    async def test_projected_candidate_loads_release_gate_provenance(
+        self, db_session
+    ):
+        """The real raiseloaded scan can authenticate a qualifier gate."""
+
+        from sqlalchemy import select
+        from sqlalchemy.orm import load_only
+
+        from app.models import TASK_ORIGINATION_QUALIFIER
+        from app.orchestrator import CANDIDATE_LIGHT_COLUMNS
+        from app.orchestrator_filters import reorder_by_completion_priority
+
+        project = make_project(name="ReleaseGateProjection", user_id=_TEST_USER)
+        db_session.add(project)
+        await db_session.flush()
+        version_id = uuid.uuid4()
+        attempt_id = uuid.uuid4()
+        audit_id = uuid.uuid4()
+        review_id = uuid.uuid4()
+        candidate_sha = "a" * 40
+        audit = Task(
+            id=audit_id,
+            project_id=project.id,
+            title="Blocking release audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "candidate_sha": candidate_sha,
+                    "qualification_attempt_id": str(attempt_id),
+                }
+            ],
+            context={
+                "release_version_id": str(version_id),
+                "qualification_attempt_id": str(attempt_id),
+                "candidate_sha": candidate_sha,
+            },
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_QUALIFIER,
+            priority=100,
+        )
+        review = Task(
+            id=review_id,
+            project_id=project.id,
+            title="Ordinary review",
+            payloads=[{"type": "review"}],
+            context={},
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            priority=50,
+        )
+        db_session.add_all([audit, review])
+        await db_session.commit()
+        db_session.expire_all()
+
+        candidates = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.id.in_([audit_id, review_id]))
+                    .options(load_only(*CANDIDATE_LIGHT_COLUMNS, raiseload=True))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        reordered = await reorder_by_completion_priority(
+            [review_id, audit_id], candidates, set(), db_session
+        )
+
+        assert reordered == [audit_id, review_id]
+        loaded_audit = next(task for task in candidates if task.id == audit_id)
+        assert loaded_audit.origination == TASK_ORIGINATION_QUALIFIER
+
+    @pytest.mark.asyncio
+    async def test_candidate_cap_admits_newer_trusted_release_gate(self, db_session):
+        """Older agent priority cannot exclude a qualifier gate before reorder."""
+
+        from app.models import TASK_ORIGINATION_QUALIFIER
+        from app.orchestrator import _candidate_task_statement
+        from app.orchestrator_filters import reorder_by_completion_priority
+
+        project = make_project(name="ReleaseGateAdmission", user_id=_TEST_USER)
+        other_project = make_project(name="OtherAdmission", user_id=_TEST_USER)
+        db_session.add_all([project, other_project])
+        await db_session.flush()
+
+        gate_id = uuid.uuid4()
+        version_id = uuid.uuid4()
+        attempt_id = uuid.uuid4()
+        candidate_sha = "b" * 40
+        now = _utcnow()
+        ordinary_ids = [uuid.uuid4() for _ in range(20)]
+        ordinary_tasks = [
+            Task(
+                id=task_id,
+                project_id=project.id,
+                title=f"Older agent task {index}",
+                payloads=[{"type": "create"}],
+                context={},
+                status=TaskStatus.QUEUED,
+                created_by="AGENT",
+                priority=100,
+                created_at=now - timedelta(minutes=20 - index),
+            )
+            for index, task_id in enumerate(ordinary_ids)
+        ]
+        gate = Task(
+            id=gate_id,
+            project_id=project.id,
+            title="Newer blocking release audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "candidate_sha": candidate_sha,
+                    "qualification_attempt_id": str(attempt_id),
+                }
+            ],
+            context={
+                "release_version_id": str(version_id),
+                "qualification_attempt_id": str(attempt_id),
+                "candidate_sha": candidate_sha,
+            },
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_QUALIFIER,
+            priority=100,
+            created_at=now,
+        )
+        other_id = uuid.uuid4()
+        other_task = Task(
+            id=other_id,
+            project_id=other_project.id,
+            title="Other project task",
+            payloads=[{"type": "create"}],
+            context={},
+            status=TaskStatus.QUEUED,
+            created_by="AGENT",
+            priority=50,
+            created_at=now,
+        )
+        db_session.add_all([*ordinary_tasks, gate, other_task])
+        await db_session.commit()
+        db_session.expire_all()
+
+        candidates = (
+            (await db_session.execute(_candidate_task_statement(slots_available=1)))
+            .scalars()
+            .all()
+        )
+        candidate_ids = {task.id for task in candidates}
+
+        assert len(candidate_ids & set(ordinary_ids)) == 19
+        assert gate_id in candidate_ids
+        assert other_id in candidate_ids
+        assert len(candidate_ids) == 21
+
+        ordered = await reorder_by_completion_priority(
+            [task.id for task in candidates], candidates, set(), db_session
+        )
+        assert ordered[0] == gate_id
+
     @pytest.mark.parametrize(
         "violation",
         ["agent_created", "wrong_type", "cross_project", "wrong_awaited_id"],

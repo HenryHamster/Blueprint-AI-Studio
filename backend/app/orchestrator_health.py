@@ -30,7 +30,7 @@ from app.landed_signal import (
 from app.rollup_management import _FORCE_DROP_REASONS
 import app.sequenced_spawn as _seqdep
 from app.models import Project, Task, TaskStatus
-from app.orchestrator_filters import _prod_files
+from app.orchestrator_filters import _is_trusted_blocking_release_gate, _prod_files
 from app.task_capabilities import CODE_PRODUCING_TASK_TYPES
 from app.time_utils import _utcnow
 
@@ -469,9 +469,11 @@ async def reorder_eligible_by_health(
     then sorts within a priority tier by predicted P(success) (``predict_fn``,
     injected — normally ``spawn_calibration.predict_spawn_success``) with
     ``_health_score_task`` as the tiebreak. A configurable confidence floor
-    (``runtime_config['dispatch_confidence_floor']``) drops tasks whose P(success)
-    is below the floor so scarce slots go to higher-confidence work. Skipped
-    tasks remain QUEUED and become eligible again next cycle.
+    (``runtime_config['dispatch_confidence_floor']``) drops ordinary tasks whose
+    P(success) is below the floor so scarce slots go to higher-confidence work.
+    Server-authored blocking release gates are exempt because deferring them
+    prevents the release tree from making progress. Skipped tasks remain QUEUED
+    and become eligible again next cycle.
 
     Returns the (possibly reordered / filtered) ``eligible_ids`` list. A no-op
     when there are <= 1 eligible tasks or no degradation signal is present.
@@ -578,7 +580,10 @@ async def reorder_eligible_by_health(
     if _conf_floor > 0:
         _before_floor = list(eligible_ids)
         eligible_ids = [
-            tid for tid in eligible_ids if _confidence_score(tid) >= _conf_floor
+            tid
+            for tid in eligible_ids
+            if _is_trusted_blocking_release_gate(_task_by_id.get(tid))
+            or _confidence_score(tid) >= _conf_floor
         ]
         _skipped = len(_before_floor) - len(eligible_ids)
         if _skipped > 0:
