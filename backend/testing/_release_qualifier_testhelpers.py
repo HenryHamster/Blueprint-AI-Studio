@@ -713,32 +713,7 @@ async def _seed_qualification_children(
         version.goal = version_goal
 
     if declare_authorship_budget:
-        # Production no longer seeds an implicit authorship budget. Qualification
-        # fixtures that exercise a normal promotion path must declare the policy
-        # explicitly, just as an owner-controlled project does.
-        existing_authorship = (
-            await db_session.execute(
-                select(VersionAcceptanceCriterion).where(
-                    VersionAcceptanceCriterion.release_version_id == version.id,
-                    VersionAcceptanceCriterion.criterion_key
-                    == "c-test-operator-authorship",
-                )
-            )
-        ).scalar_one_or_none()
-        if existing_authorship is None:
-            db_session.add(
-                VersionAcceptanceCriterion(
-                    project_id=project.id,
-                    release_version_id=version.id,
-                    criterion_key="c-test-operator-authorship",
-                    text="test fixture declares candidate authorship budget",
-                    status="active",
-                    created_by="test",
-                    evidence_contract=default_authorship_evidence_contract(),
-                    evidence_contract_updated_by="test",
-                )
-            )
-            await db_session.flush()
+        await _declare_test_authorship_budget(db_session, project, version)
 
     rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
         db_session, version
@@ -1046,6 +1021,34 @@ async def _delete_default_authorship_criterion(db_session, version) -> None:
     )
     for row in rows:
         await db_session.delete(row)
+    await db_session.flush()
+
+
+async def _declare_test_authorship_budget(db_session, project, version) -> None:
+    """Give promotion-path fixtures the explicit authorship policy production requires."""
+    existing_authorship = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.release_version_id == version.id,
+                VersionAcceptanceCriterion.criterion_key
+                == "c-test-operator-authorship",
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_authorship is not None:
+        return
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key="c-test-operator-authorship",
+            text="test fixture declares candidate authorship budget",
+            status="active",
+            created_by="test",
+            evidence_contract=default_authorship_evidence_contract(),
+            evidence_contract_updated_by="test",
+        )
+    )
     await db_session.flush()
 
 
@@ -1547,6 +1550,7 @@ async def _seed_pending_qualification(
     await db_session.refresh(audit_task)
     await db_session.refresh(smoke_task)
 
+    await _declare_test_authorship_budget(db_session, project, version)
     version.last_qualification = {
         "status": "pending",
         **(await _live_rubric_projection(db_session, version)),
@@ -1802,6 +1806,7 @@ async def _seed_audit_only_pending_qualification(
             )
         )
 
+    await _declare_test_authorship_budget(db_session, project, version)
     version.last_qualification = {
         "status": "pending",
         **(await _live_rubric_projection(db_session, version)),

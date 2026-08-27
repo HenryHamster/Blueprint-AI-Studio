@@ -690,6 +690,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_filter_malformed_payload.py` | 159 | 8 | under 1500 LOC | 0.186s measured | — |
 | G | admin-ui | `admin-ui/src/components/ProblemModelViewer.test.tsx` | 418 | 13 | under 1500 LOC | 0.180s measured | — |
 | G | backend | `backend/testing/test_verification_toolchain.py` | 203 | 5 | under 1500 LOC | 0.179s measured | — |
+| G | backend | `backend/testing/test_resident_supersession_livelock.py` | 395 | 19 | under 1500 LOC | 0.178s measured | — |
 | G | backend | `backend/testing/test_runbook_drift.py` | 103 | 5 | under 1500 LOC | 0.177s measured | — |
 | G | backend | `backend/testing/test_migration_0716_strategic_memory_source_control_plane.py` | 112 | 2 | under 1500 LOC | 0.176s measured | — |
 | G | admin-ui | `admin-ui/src/hooks/useConversation.test.tsx` | 1,218 | 36 | under 1500 LOC | 0.174s measured | protected; declared floor 36 |
