@@ -1122,6 +1122,11 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "churn_retirement_recommended",
         "retirement_consideration_needed",
         "retirement_consideration_at",
+        # Dud evidence: how many cycles running this direction has produced
+        # nothing. Allowlisted alongside the cost/merge consideration flag — a
+        # trimmed payload that keeps "expensive" but drops "unproductive" hands
+        # the strategist half the retirement picture.
+        "consecutive_unproductive_cycles",
     ):
         _put_present(out, stat, key)
     for key in (
@@ -1132,6 +1137,11 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "retirement_condition",
         "outcome_scaffolding_evidence",
         "retirement_consideration_reason",
+        # The operator-readable "N consecutive unproductive cycle(s); reasons:
+        # ..." sentence. Surface reasons, not states: the bare counter above
+        # cannot distinguish a direction that spawned nothing from one that
+        # spawned plenty and merged nothing.
+        "unproductive_streak",
     ):
         _put_present(out, stat, key, text_cap=_DIRECTION_SUMMARY_LONG_TEXT_CAP)
     research_context = _bounded_text(
@@ -1146,6 +1156,10 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "recent_findings_challenge_summary",
         "churn_retirement_evidence",
         "retirement_consideration_evidence",
+        # The most recent per-cycle productivity judgment (productive /
+        # reason_code / detail) — a flat scalar mapping, so the shared
+        # bounded-mapping compactor handles it.
+        "last_productivity_reason",
     ):
         compact = _compact_scalar_mapping(stat.get(key), text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
         if compact:
