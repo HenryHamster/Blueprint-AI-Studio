@@ -1422,6 +1422,9 @@ async def cap_pipeline_slots(
     return kept
 
 
+_RESERVATION_PRIORITY_FENCE = 100
+
+
 def reserve_slots_for_types(
     eligible_ids: list,
     candidate_tasks: list[Task],
@@ -1434,8 +1437,9 @@ def reserve_slots_for_types(
     slots when they're queued behind self-perpetuating review/fix chains. Only
     activates when queue pressure exists (more eligible tasks than open slots) and
     there are reserved-type tasks waiting beyond the dispatch cutoff. Reservation
-    is subordinate to explicit ``Task.priority``: a promoted task cannot displace
-    a strictly higher-priority task. The reserved minimums come from
+    remains an anti-starvation policy among ordinary tasks, but it cannot displace
+    work at the urgent priority fence unless the promoted task is at least as
+    urgent. The reserved minimums come from
     ``runtime_config['reserved_slots_for_types']`` (defaults to
     ``{"create": 1, "research": 1}``).
 
@@ -1494,7 +1498,11 @@ def reserve_slots_for_types(
                     if i not in displacement_indexes
                     and types_by_id.get(initial[i]) not in reserved_types
                     and initial[i] not in completion_protected_ids
-                    and priority_by_id.get(initial[i], 50) <= promoted_priority
+                    and (
+                        priority_by_id.get(initial[i], 50)
+                        < _RESERVATION_PRIORITY_FENCE
+                        or priority_by_id.get(initial[i], 50) <= promoted_priority
+                    )
                 ),
                 None,
             )
