@@ -1349,6 +1349,7 @@ async def _claim_rollup_post_merge_effect(
 
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
 
+    parent_id = parent.id
     # Preserve pending direction-grade/evidence state before populate_existing
     # refreshes the identity-map row. Test sessions deliberately disable
     # autoflush, matching a valid production configuration.
@@ -1356,7 +1357,7 @@ async def _claim_rollup_post_merge_effect(
     locked_parent = (
         await session.execute(
             select(Task)
-            .where(Task.id == parent.id)
+            .where(Task.id == parent_id)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -1365,7 +1366,7 @@ async def _claim_rollup_post_merge_effect(
         await session.rollback()
         logger.warning(
             "[ROLLUP] Parent %s disappeared before post-merge effect claim",
-            parent.id,
+            parent_id,
         )
         return None
     ctx = dict(locked_parent.context or {})
