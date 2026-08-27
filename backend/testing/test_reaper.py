@@ -4108,10 +4108,10 @@ async def test_step5_parent_task_not_resurrected(
 
 
 @pytest.mark.asyncio
-async def test_step5_resurrection_creates_info_alert(
+async def test_step5_resurrection_records_status_without_durable_alert(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """Each resurrected task gets an INFO alert referencing its failure class."""
+    """Resurrection is a timeline fact, not a permanent unresolved alert."""
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
@@ -4124,15 +4124,16 @@ async def test_step5_resurrection_creates_info_alert(
     await reaper_db.commit()
 
     await _run_reaper_once()
+    await reaper_db.refresh(t)
 
     alerts = (
         (await reaper_db.execute(_select(Alert).where(Alert.task_id == t.id)))
         .scalars()
         .all()
     )
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.INFO
-    assert "PROVISION_FAILURE" in (alerts[0].message or "")
+    assert t.status == TaskStatus.QUEUED
+    assert "PROVISION_FAILURE" in (t.latest_status_message or "")
+    assert alerts == []
 
 
 @pytest.mark.asyncio

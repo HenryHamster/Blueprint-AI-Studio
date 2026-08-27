@@ -395,7 +395,11 @@ def test_adding_a_test_file_only_inserts_lines(tmp_path: Path) -> None:
         render_queue(base).splitlines(), render_queue(grown).splitlines()
     )
     added = [line for lines in inserts.values() for line in lines]
-    assert len(added) == 1, f"one added test file must add exactly one row: {added!r}"
+    assert len(added) == 1, (
+        f"one added test file must add exactly one row: {added!r}"
+        + "\n"
+        + format_offender_marker(added)
+    )
     assert "backend/testing/test_alpha.py" in added[0]
 
 

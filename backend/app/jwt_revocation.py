@@ -41,6 +41,17 @@ _LISTEN_PROBE_TIMEOUT = 10
 _CONNECTION_LONGEVITY_RESET_SECONDS = 30
 
 
+def _sync_session_uses_postgres(session) -> bool:
+    """Require both the process configuration and the bound session dialect."""
+    if not _IS_POSTGRES:
+        return False
+    try:
+        bind = session.get_bind()
+    except Exception:
+        bind = getattr(session, "bind", None)
+    return getattr(getattr(bind, "dialect", None), "name", None) == "postgresql"
+
+
 async def _wait_terminated_or_dead(conn: object, terminated_event: asyncio.Event) -> None:
     """Block until the connection terminates OR a SELECT-1 probe fails.
 
@@ -269,7 +280,7 @@ def emit_task_terminated_notify(session, task_id: str) -> None:
     No-ops on non-Postgres dialects (SQLite in tests).  Exceptions are
     swallowed so a NOTIFY failure never aborts the status mutation.
     """
-    if not _IS_POSTGRES:
+    if not _sync_session_uses_postgres(session):
         return
     try:
         session.execute(
@@ -300,7 +311,7 @@ def emit_task_revived_notify(session, task_id: str) -> None:
     after commit. No-ops on non-Postgres dialects; exceptions are swallowed so
     a NOTIFY failure never aborts the status mutation.
     """
-    if not _IS_POSTGRES:
+    if not _sync_session_uses_postgres(session):
         return
     try:
         session.execute(
