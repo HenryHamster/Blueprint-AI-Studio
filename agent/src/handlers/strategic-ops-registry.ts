@@ -94,11 +94,12 @@ const INPUTS = {
   update_direction: {
     kind: 'json' as const,
     required: ['direction_id'],
-    fields: ['direction_id', 'text', 'priority', 'status', 'gap_id', 'success_evidence', 'retirement_condition', 'rationale', 'terminal_reason', 'criterion_keys', 'recommended_mode', 'system_id', 'conflicts_with'],
+    fields: ['direction_id', 'text', 'priority', 'status', 'gap_id', 'success_evidence', 'retirement_condition', 'rationale', 'terminal_reason', 'criterion_keys', 'recommended_mode', 'system_id', 'conflicts_with', 'cost_budget_usd'],
     example: { direction_id: 'd-123', priority: 'high', gap_id: 'g-4' },
     notes: [
       'Pass fields directly. The legacy {direction_id, changes:{...}} wrapper remains temporarily supported.',
       'A terminal status update follows the same rationale and terminal_reason contract as retire_direction.',
+      'cost_budget_usd accepts a non-negative USD number; set it to null to clear an existing envelope.',
     ],
   },
   create_direction: {
@@ -108,7 +109,7 @@ const INPUTS = {
       'text', 'success_evidence', 'retirement_condition', 'rationale',
       'priority', 'gap_id', 'implementation_constraints', 'criterion_keys',
       'recommended_mode', 'system_id', 'conflicts_with', 'staged',
-      'dedup_reasoning', 'category', 'paths',
+      'dedup_reasoning', 'category', 'paths', 'cost_budget_usd',
     ],
     example: {
       text: 'Deliver a reproducible CPU-scale behavior sweep with a self-contained comparison artifact.',
@@ -120,6 +121,7 @@ const INPUTS = {
       'A direction is a durable strategic outcome or bet, not a task, file/PR shard, implementation checklist, or live status update.',
       'Creating an active direction opens a recurring autonomous research lane. Use staged=true when it must not begin yet.',
       'priority is high|medium|low; category is product|structural|mixed; recommended_mode is audit|fundamentals|ship|pause.',
+      'cost_budget_usd is an optional non-negative USD envelope; zero is a valid declared budget.',
       'Before creating, inspect existing and recently retired directions. Prefer updating an existing outcome and dispatch bounded one-shot work with spawn-task.',
       'Use multiple spawn-task calls under one direction to split implementation across tasks — chain them with depends_on when they share contracts or files, and leave them independent only when the work genuinely does not overlap.',
     ],

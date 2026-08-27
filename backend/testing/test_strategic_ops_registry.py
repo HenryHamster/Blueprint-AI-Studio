@@ -108,6 +108,34 @@ def test_create_direction_manifest_matches_backend_contract():
     )
 
 
+def test_update_direction_manifest_matches_backend_contract():
+    """The public update schema remains a validated subset of backend fields."""
+    from app.strategic_op_contracts import UPDATE_DIRECTION_FIELDS
+
+    manifest = _load_manifest()
+    update = next(entry for entry in manifest if entry["op"] == "update_direction")
+    contract = update["input"]
+    assert set(contract["required"]) == {"direction_id"}
+    assert set(contract["fields"]) == {
+        "direction_id",
+        "text",
+        "priority",
+        "status",
+        "gap_id",
+        "success_evidence",
+        "retirement_condition",
+        "rationale",
+        "terminal_reason",
+        "criterion_keys",
+        "recommended_mode",
+        "system_id",
+        "conflicts_with",
+        "cost_budget_usd",
+    }
+    assert set(contract["fields"]) <= UPDATE_DIRECTION_FIELDS
+    assert any("cost_budget_usd" in note for note in contract["notes"])
+
+
 def test_dispatch_accepts_exactly_the_manifest_ops():
     """The dispatch chain and the manifest must list the SAME op set — no more,
     no less. A backend op with no manifest entry (silent addition) or a manifest

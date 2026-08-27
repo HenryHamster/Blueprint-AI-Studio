@@ -3266,38 +3266,6 @@
       "workbench_resource": null
     },
     {
-      "callee": "broadcast_to_project",
-      "canonical_callee": "broadcast_to_project",
-      "classification": "legacy_project_event",
-      "event": "task_updated",
-      "event_expression": null,
-      "event_is_literal": true,
-      "lineno": 4992,
-      "notes": "",
-      "occurrence": 12,
-      "payload_arg_kind": "dict:status,task_id",
-      "scope": "_check_and_trigger_rollup",
-      "source_path": "backend/app/rollup_management.py",
-      "workbench_action": null,
-      "workbench_resource": null
-    },
-    {
-      "callee": "broadcast_to_project",
-      "canonical_callee": "broadcast_to_project",
-      "classification": "legacy_project_event",
-      "event": "task_updated",
-      "event_expression": null,
-      "event_is_literal": true,
-      "lineno": 5021,
-      "notes": "",
-      "occurrence": 13,
-      "payload_arg_kind": "dict:status,task_id",
-      "scope": "_check_and_trigger_rollup",
-      "source_path": "backend/app/rollup_management.py",
-      "workbench_action": null,
-      "workbench_resource": null
-    },
-    {
       "callee": "emit_strategic_updated",
       "canonical_callee": "emit_strategic_updated",
       "classification": "strategic_v1_helper",
@@ -5685,7 +5653,7 @@
   "schema_version": 1,
   "summary": {
     "legacy_global_event": 16,
-    "legacy_project_event": 227,
+    "legacy_project_event": 225,
     "legacy_review_required": 32,
     "message_v1_payload": 29,
     "raw_websocket_control": 3,

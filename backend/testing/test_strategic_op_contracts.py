@@ -42,6 +42,46 @@ def test_create_direction_accepts_existing_mixed_category():
     assert normalized["category"] == "mixed"
 
 
+def test_direction_cost_budget_normalization_accepts_zero_and_update_clear():
+    created = normalize_create_direction(
+        {
+            "text": "Keep campaign spend bounded",
+            "success_evidence": "Spend remains inside the declared envelope",
+            "retirement_condition": "The campaign lands or the bet is retired",
+            "cost_budget_usd": 0,
+        }
+    )
+    assert created["cost_budget_usd"] == 0.0
+
+    assert normalize_update_direction(
+        {"direction_id": "d-budget", "cost_budget_usd": 12.5}
+    )["cost_budget_usd"] == 12.5
+    assert normalize_update_direction(
+        {"direction_id": "d-budget", "changes": {"cost_budget_usd": None}}
+    )["cost_budget_usd"] is None
+
+
+@pytest.mark.parametrize(
+    "value", [True, "12.5", -1, float("nan"), float("inf"), 10**400]
+)
+def test_direction_cost_budget_rejects_non_numeric_or_negative_values(value):
+    create = {
+        "text": "Keep campaign spend bounded",
+        "success_evidence": "Spend remains inside the declared envelope",
+        "retirement_condition": "The campaign lands or the bet is retired",
+        "cost_budget_usd": value,
+    }
+    for normalizer, payload in (
+        (normalize_create_direction, create),
+        (normalize_update_direction, {"direction_id": "d-budget", "cost_budget_usd": value}),
+    ):
+        with pytest.raises(HTTPException) as rejected:
+            normalizer(payload)
+        assert rejected.value.status_code == 400
+        assert rejected.value.detail["code"] == "invalid_strategic_input"
+        assert rejected.value.detail["field"] == "cost_budget_usd"
+
+
 @pytest.mark.parametrize(
     ("data", "field"),
     [

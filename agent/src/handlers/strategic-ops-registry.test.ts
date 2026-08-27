@@ -102,8 +102,12 @@ describe('generated ./strategic CLI derives from the registry', () => {
     ]);
     expect(create?.fields).toContain('staged');
     expect(create?.fields).toContain('gap_id');
+    expect(create?.fields).toContain('cost_budget_usd');
     expect(create?.notes?.join('\n')).toContain('recurring autonomous research lane');
     expect(create?.notes?.join('\n')).toContain('multiple spawn-task calls under one direction');
+    const update = cliOpInput('update-direction');
+    expect(update?.fields).toContain('cost_budget_usd');
+    expect(update?.notes?.join('\n')).toContain('set it to null to clear');
     const spawn = cliOpInput('spawn-task');
     expect(spawn?.example).toMatchObject({ direction_id: 'd-pipeline-reliability' });
     expect(spawn?.fields).toContain('depends_on');

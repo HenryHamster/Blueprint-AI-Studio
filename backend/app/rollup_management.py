@@ -106,6 +106,11 @@ from app.ci_merge_helpers import effective_pr_number
 
 logger = logging.getLogger(__name__)
 
+_POST_MERGE_EFFECTS_KEY = "_post_merge_effects"
+_POST_MERGE_EFFECT_LEASE_S = 900
+_POST_MERGE_EFFECT_OPERATION_TIMEOUT_S = 300
+_POST_MERGE_EFFECT_SETTLE_TIMEOUT_S = 120
+
 
 def _set_independent_approval_hold(task: Task, reason: str) -> bool:
     """Install this rollup hold once, superseding any older approval owner."""
@@ -1333,6 +1338,186 @@ async def _nudge_sibling_rollup_prs(
             )
 
 
+async def _claim_rollup_post_merge_effect(
+    parent: Task,
+    session: "AsyncSession",
+    rollup_pr_number: int,
+    effect: str,
+) -> str | None:
+    """Claim one resumable post-merge effect under the parent row lock."""
+    import uuid  # noqa: PLC0415
+
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    # Preserve pending direction-grade/evidence state before populate_existing
+    # refreshes the identity-map row. Test sessions deliberately disable
+    # autoflush, matching a valid production configuration.
+    await session.commit()
+    locked_parent = (
+        await session.execute(
+            select(Task)
+            .where(Task.id == parent.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if locked_parent is None:
+        await session.rollback()
+        logger.warning(
+            "[ROLLUP] Parent %s disappeared before post-merge effect claim",
+            parent.id,
+        )
+        return None
+    ctx = dict(locked_parent.context or {})
+    ledger = dict(ctx.get(_POST_MERGE_EFFECTS_KEY) or {})
+    if ledger.get("pr_number") != rollup_pr_number:
+        ledger = {"pr_number": rollup_pr_number, "effects": {}}
+    effects = dict(ledger.get("effects") or {})
+    prior = dict(effects.get(effect) or {})
+    now = time.time()
+    if prior.get("state") == "done" or (
+        prior.get("state") == "claimed"
+        and float(prior.get("lease_expires_at") or 0) > now
+    ):
+        await session.commit()
+        return None
+    claim_token = uuid.uuid4().hex
+    effects[effect] = {
+        **prior,
+        "state": "claimed",
+        "claim_token": claim_token,
+        "claimed_at": now,
+        "lease_expires_at": now + _POST_MERGE_EFFECT_LEASE_S,
+        "attempts": int(prior.get("attempts") or 0) + 1,
+    }
+    ledger["effects"] = effects
+    ctx[_POST_MERGE_EFFECTS_KEY] = ledger
+    locked_parent.context = ctx
+    flag_modified(locked_parent, "context")
+    session.add(locked_parent)
+    await session.commit()
+    return claim_token
+
+
+async def _finish_rollup_post_merge_effect(
+    parent: Task,
+    session: "AsyncSession",
+    rollup_pr_number: int,
+    effect: str,
+    claim_token: str,
+    error: Exception | None = None,
+) -> None:
+    """Finish an exact-token effect claim as done or immediately retryable."""
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    locked_parent = (
+        await session.execute(
+            select(Task)
+            .where(Task.id == parent.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if locked_parent is None:
+        await session.rollback()
+        return
+    ctx = dict(locked_parent.context or {})
+    ledger = dict(ctx.get(_POST_MERGE_EFFECTS_KEY) or {})
+    effects = dict(ledger.get("effects") or {})
+    prior = dict(effects.get(effect) or {})
+    if (
+        ledger.get("pr_number") != rollup_pr_number
+        or prior.get("claim_token") != claim_token
+    ):
+        await session.commit()
+        return
+    prior.pop("claim_token", None)
+    prior.pop("lease_expires_at", None)
+    if error is None:
+        prior.update({"state": "done", "completed_at": time.time()})
+        prior.pop("last_error", None)
+    else:
+        prior.update(
+            {
+                "state": "retryable",
+                "failed_at": time.time(),
+                "last_error": f"{type(error).__name__}: {error}"[:500],
+            }
+        )
+    effects[effect] = prior
+    ledger["effects"] = effects
+    ctx[_POST_MERGE_EFFECTS_KEY] = ledger
+    locked_parent.context = ctx
+    flag_modified(locked_parent, "context")
+    session.add(locked_parent)
+    await session.commit()
+
+
+async def _run_rollup_post_merge_effect(
+    parent: Task,
+    session: "AsyncSession",
+    rollup_pr_number: int,
+    effect: str,
+    operation,
+) -> None:
+    """Run one leased effect and durably record its retryable outcome."""
+    import asyncio  # noqa: PLC0415
+
+    if (
+        _POST_MERGE_EFFECT_OPERATION_TIMEOUT_S
+        + _POST_MERGE_EFFECT_SETTLE_TIMEOUT_S
+        >= _POST_MERGE_EFFECT_LEASE_S
+    ):
+        raise RuntimeError("post-merge effect time budgets exceed the claim lease")
+    claim_token = await _claim_rollup_post_merge_effect(
+        parent, session, rollup_pr_number, effect
+    )
+    if claim_token is None:
+        return
+    try:
+        async with asyncio.timeout(_POST_MERGE_EFFECT_OPERATION_TIMEOUT_S):
+            await operation()
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 - best-effort, durably retryable effect
+        try:
+            async with asyncio.timeout(_POST_MERGE_EFFECT_SETTLE_TIMEOUT_S):
+                await session.rollback()
+                await _finish_rollup_post_merge_effect(
+                    parent,
+                    session,
+                    rollup_pr_number,
+                    effect,
+                    claim_token,
+                    error=exc,
+                )
+        except Exception as settle_exc:  # noqa: BLE001 - lease expiry recovers it
+            logger.warning(
+                "[ROLLUP] Could not settle failed post-merge effect %s for PR #%s: %s",
+                effect,
+                rollup_pr_number,
+                settle_exc,
+            )
+        logger.warning(
+            "[ROLLUP] Post-merge effect %s failed for PR #%s; retryable: %s",
+            effect,
+            rollup_pr_number,
+            exc,
+        )
+        return
+    try:
+        async with asyncio.timeout(_POST_MERGE_EFFECT_SETTLE_TIMEOUT_S):
+            await _finish_rollup_post_merge_effect(
+                parent, session, rollup_pr_number, effect, claim_token
+            )
+    except Exception as settle_exc:  # noqa: BLE001 - lease expiry recovers it
+        logger.warning(
+            "[ROLLUP] Could not settle completed post-merge effect %s for PR #%s: %s",
+            effect,
+            rollup_pr_number,
+            settle_exc,
+        )
+
+
 async def _do_rollup_post_merge_housekeeping(
     parent: Task,
     project: "Project | None",
@@ -1348,13 +1533,17 @@ async def _do_rollup_post_merge_housekeeping(
     landed: bool,
     terminal: bool,
 ) -> None:
-    """Post-merge housekeeping shared by the main, re-poll, and escalation merge paths.
+    """Post-merge housekeeping shared by all four true rollup merge paths.
+
+    Callers are the existing-PR, main auto-merge-success, re-poll, and
+    escalation merge paths. The zero-diff close path is intentionally separate;
+    it is merge-equivalent rather than a true merge route.
 
     Must be called AFTER ``session.add(parent); await session.commit()`` so the
     FOR UPDATE lock is released before any GitHub/notification I/O. Performs:
-    direction-outcomes refresh, staging-branch deletion, PR-merged notification,
-    viewport-coverage snapshot, a second commit, optional terminal cleanup +
-    broadcast, and the merge-train sibling nudge.
+    direction-outcomes refresh, once-per-PR staging-branch deletion, PR-merged
+    notification, viewport-coverage snapshot and merge-train sibling nudge, plus
+    optional terminal cleanup + broadcast.
     """
     from app.broadcast import broadcast_to_project
     from app.github import delete_branch, get_pull_request_diff
@@ -1388,14 +1577,11 @@ async def _do_rollup_post_merge_housekeeping(
                 logger.warning(
                     f"[ROLLUP] Failed to spawn direction merge grade: {_mg_exc}"
                 )
-    try:
+    async def _delete_staging_branch() -> None:
         await delete_branch(gh_token, owner, repo, staging_branch)
-    except Exception as del_err:
-        logger.warning(
-            f"[ROLLUP] Failed to delete staging branch {staging_branch}: {del_err}"
-        )
-    logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}")
-    try:
+        logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}")
+
+    async def _post_merge_notification() -> None:
         from app.notification_dispatch import post_pr_merged_message
 
         _direction_id = (parent.context or {}).get("direction_id")
@@ -1414,22 +1600,44 @@ async def _do_rollup_post_merge_housekeeping(
             _direction_text,
             completed_count,
             parent.id,
+            idempotency_key=f"rollup-pr-merged:{parent.id}:{rollup_pr_number}",
         )
-    except Exception as _e:
-        logger.warning(f"[NOTIFY] Failed to post PR merged message: {_e}")
-    try:
+
+    async def _update_viewport_snapshot() -> None:
         _snap_proj = await session.get(Project, parent.project_id)
-        if _snap_proj is not None:
-            _diff_text = await get_pull_request_diff(
-                gh_token, owner, repo, rollup_pr_number
-            )
-            await update_viewport_coverage_snapshot_from_diff(
-                session, _snap_proj, rollup_pr_number, _diff_text
-            )
-    except Exception as _snap_e:
-        logger.warning(
-            f"[ROLLUP] Failed to update viewport_coverage_snapshot: {_snap_e}"
+        if _snap_proj is None:
+            return
+        # ``session.get`` above AUTOBEGINS a transaction. Release it before
+        # unbounded GitHub I/O to avoid idle_in_transaction_session_timeout.
+        await session.commit()
+        _diff_text = await get_pull_request_diff(
+            gh_token, owner, repo, rollup_pr_number
         )
+        await update_viewport_coverage_snapshot_from_diff(
+            session, _snap_proj, rollup_pr_number, _diff_text
+        )
+
+    await _run_rollup_post_merge_effect(
+        parent,
+        session,
+        rollup_pr_number,
+        "delete_staging_branch",
+        _delete_staging_branch,
+    )
+    await _run_rollup_post_merge_effect(
+        parent,
+        session,
+        rollup_pr_number,
+        "post_merge_notification",
+        _post_merge_notification,
+    )
+    await _run_rollup_post_merge_effect(
+        parent,
+        session,
+        rollup_pr_number,
+        "viewport_snapshot",
+        _update_viewport_snapshot,
+    )
     await session.commit()
     if terminal:
         await _cleanup_branches(parent, session)
@@ -1441,7 +1649,7 @@ async def _do_rollup_post_merge_housekeeping(
                 "status": TaskStatus.COMPLETED,
             },
         )
-    try:
+    async def _nudge_siblings() -> None:
         await _nudge_sibling_rollup_prs(
             parent,
             session,
@@ -1451,11 +1659,14 @@ async def _do_rollup_post_merge_housekeeping(
             target_branch,
             merged_pr_number=rollup_pr_number,
         )
-    except Exception as _queue_exc:
-        logger.warning(
-            f"[MERGE-QUEUE] Sibling nudge after rollup PR "
-            f"#{rollup_pr_number} failed: {_queue_exc}"
-        )
+
+    await _run_rollup_post_merge_effect(
+        parent,
+        session,
+        rollup_pr_number,
+        "nudge_sibling_rollups",
+        _nudge_siblings,
+    )
 
 
 async def _maybe_spawn_direction_merge_grade(
@@ -1814,7 +2025,6 @@ async def _check_and_trigger_rollup(
         create_pull_request,
         merge_pull_request,
         get_pull_request,
-        get_pull_request_diff,
         get_pr_files,
         get_branch_sha,
         close_pull_request,
@@ -3372,37 +3582,20 @@ async def _check_and_trigger_rollup(
                                 )
                             session.add(parent)
                             await session.commit()
-                            if _landed:
-                                from app.direction_outcomes import (
-                                    refresh_direction_outcomes_after_merge,
-                                )
-
-                                _dir_representatives: dict[str, Task] = {}
-                                for _c in completed_children:
-                                    _ctx = _c.context or {}
-                                    _did = _ctx.get("direction_id")
-                                    _rid = _ctx.get("research_task_id")
-                                    if (
-                                        _did
-                                        and _rid
-                                        and _did not in _dir_representatives
-                                    ):
-                                        _dir_representatives[_did] = _c
-                                for _rep in _dir_representatives.values():
-                                    await refresh_direction_outcomes_after_merge(
-                                        _rep, session
-                                    )
-                                await _record_completed_children_merge_evidence(
-                                    completed_children, session
-                                )
-                            await _cleanup_branches(parent, session)
-                            await broadcast_to_project(
-                                str(parent.project_id),
-                                "task_updated",
-                                {
-                                    "task_id": str(parent.id),
-                                    "status": parent.status,
-                                },
+                            await _do_rollup_post_merge_housekeeping(
+                                parent,
+                                project,
+                                session,
+                                gh_token,
+                                owner,
+                                repo,
+                                existing_pr,
+                                staging_branch,
+                                target_branch,
+                                completed_children,
+                                completed_count,
+                                _landed,
+                                _terminal_rollup_merge,
                             )
                             return
                         if pr_state.get("state") == "closed":
@@ -4753,123 +4946,21 @@ async def _check_and_trigger_rollup(
                             )
                         session.add(parent)
                         await session.commit()
-                        if _landed:
-                            from app.direction_outcomes import (
-                                refresh_direction_outcomes_after_merge,
-                            )
-
-                            _dir_representatives: dict[str, Task] = {}
-                            for _c in completed_children:
-                                _ctx = _c.context or {}
-                                _did = _ctx.get("direction_id")
-                                _rid = _ctx.get("research_task_id")
-                                if (
-                                    _did
-                                    and _rid
-                                    and _did not in _dir_representatives
-                                ):
-                                    _dir_representatives[_did] = _c
-                            for _rep in _dir_representatives.values():
-                                await refresh_direction_outcomes_after_merge(
-                                    _rep, session
-                                )
-                            await _record_completed_children_merge_evidence(
-                                completed_children, session
-                            )
-                        try:
-                            await delete_branch(gh_token, owner, repo, staging_branch)
-                        except Exception as del_err:
-                            logger.warning(
-                                f"[ROLLUP] Failed to delete staging branch {staging_branch}: {del_err}"
-                            )
-                        logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}")
-                        try:
-                            from app.notification_dispatch import post_pr_merged_message
-
-                            _direction_id = (parent.context or {}).get("direction_id")
-                            _direction_text = "unknown direction"
-                            if _direction_id:
-                                _proj = await session.get(Project, parent.project_id)
-                                if _proj:
-                                    for _d in _proj.directions or []:
-                                        if str(_d.get("id", "")) == str(_direction_id):
-                                            _direction_text = _d.get(
-                                                "text", "unknown direction"
-                                            )
-                                            break
-                            await post_pr_merged_message(
-                                session,
-                                parent.project_id,
-                                rollup_pr_number,
-                                _direction_text,
-                                completed_count,
-                                parent.id,
-                            )
-                        except Exception as _e:
-                            logger.warning(
-                                f"[NOTIFY] Failed to post PR merged message: {_e}"
-                            )
-                        try:
-                            from app.github import get_pull_request_diff
-                            from app.viewport_coverage import (
-                                update_viewport_coverage_snapshot_from_diff,
-                            )
-
-                            _snap_proj = await session.get(Project, parent.project_id)
-                            if _snap_proj is not None:
-                                # MAJOR 6: ``session.get`` above AUTOBEGINS a
-                                # transaction (the merge-success commit ended the
-                                # previous one), so without this commit the
-                                # ``get_pull_request_diff`` below — an unbounded
-                                # GitHub call — would run idle-in-transaction and
-                                # race the 60s idle_in_transaction_session_timeout.
-                                # Committing ends that read-only txn; it does NOT
-                                # expire ``parent``/``_snap_proj``
-                                # (expire_on_commit=False), and the snapshot helper
-                                # below opens its own txn as needed.
-                                await session.commit()
-                                _diff_text = await get_pull_request_diff(
-                                    gh_token, owner, repo, rollup_pr_number
-                                )
-                                await update_viewport_coverage_snapshot_from_diff(
-                                    session, _snap_proj, rollup_pr_number, _diff_text
-                                )
-                        except Exception as _snap_e:
-                            logger.warning(
-                                f"[ROLLUP] Failed to update viewport_coverage_snapshot: {_snap_e}"
-                            )
-                        await session.commit()
-                        if _terminal_rollup_merge:
-                            await _cleanup_branches(parent, session)
-                            await broadcast_to_project(
-                                str(parent.project_id),
-                                "task_updated",
-                                {
-                                    "task_id": str(parent.id),
-                                    "status": TaskStatus.COMPLETED,
-                                },
-                            )
-                        # Rollup merge train: this merge just staleness-bumped
-                        # every sibling rollup PR queued against target_branch.
-                        # Proactively update-branch them (FIFO by PR created_at)
-                        # instead of waiting for lazy CI-poll recovery. Best-
-                        # effort — a queue failure never un-merges this rollup.
-                        try:
-                            await _nudge_sibling_rollup_prs(
-                                parent,
-                                session,
-                                gh_token,
-                                owner,
-                                repo,
-                                target_branch,
-                                merged_pr_number=rollup_pr_number,
-                            )
-                        except Exception as _queue_exc:
-                            # Merge train is strictly best-effort post-merge work.
-                            logger.warning(
-                                f"[MERGE-QUEUE] Sibling nudge after rollup PR "
-                                f"#{rollup_pr_number} failed: {_queue_exc}"
-                            )
+                        await _do_rollup_post_merge_housekeeping(
+                            parent,
+                            project,
+                            session,
+                            gh_token,
+                            owner,
+                            repo,
+                            rollup_pr_number,
+                            staging_branch,
+                            target_branch,
+                            completed_children,
+                            completed_count,
+                            _landed,
+                            _terminal_rollup_merge,
+                        )
                         return
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up

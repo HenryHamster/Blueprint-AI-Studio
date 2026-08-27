@@ -1084,6 +1084,7 @@ async def post_pr_merged_message(
     direction_text: str,
     task_count: int,
     task_id: Optional[uuid.UUID] = None,
+    idempotency_key: str | None = None,
 ) -> ProjectMessage:
     """Post a message when a rollup PR is auto-merged."""
     summary = f"PR #{pr_number} merged — {task_count} subtask(s) shipped for direction: {direction_text}"
@@ -1098,6 +1099,7 @@ async def post_pr_merged_message(
             "direction_text": direction_text[:120],
         },
         task_id=task_id,
+        idempotency_key=idempotency_key,
     )
 
 
