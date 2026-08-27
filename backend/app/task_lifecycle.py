@@ -2963,9 +2963,21 @@ async def _process_post_commit(
                                 }
                                 if recovery_type == "fix":
                                     spawn_kwargs["fix_reason"] = "merge_conflict"
+                                    # What GitHub actually said is in hand here
+                                    # (it is logged verbatim above) and
+                                    # ``build_merge_conflict_fix_prompt`` offers a
+                                    # ``merge_error=`` channel for exactly this.
+                                    # Omitting it handed the resolver a prompt that
+                                    # asserted mergeable_state='dirty' without a
+                                    # shred of the evidence that produced it.
                                     spawn_kwargs["fix_prompt"] = (
                                         build_merge_conflict_fix_prompt(
-                                            pr_number, base_branch
+                                            pr_number,
+                                            base_branch,
+                                            merge_error=str(
+                                                merge_result.get("message") or ""
+                                            )
+                                            or None,
                                         )
                                     )
                                 elif recovery_type == "review":

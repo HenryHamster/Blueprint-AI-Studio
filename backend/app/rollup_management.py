@@ -4514,6 +4514,17 @@ async def _check_and_trigger_rollup(
                             f"down_revision pointing at the current head, then bump "
                             f"EXPECTED_SCHEMA_REVISION in backend/app/main.py to match."
                         )
+                        # The prompt names the collision, but the CATEGORICAL
+                        # reason was dropped -- and it is read, not decorative:
+                        # ``_spawn_pipeline_task`` routes "migration_guard" to
+                        # LANE_CONFLICT (review_pipeline.py), while an omitted
+                        # fix_reason falls through to LANE_REVIEW_CONVERGENCE,
+                        # charging an Alembic re-chain against the code-review
+                        # convergence sub-cap it has nothing to do with.
+                        from app.migration_guard_recovery import (
+                            MIGRATION_GUARD_FIX_REASON,
+                        )
+
                         await _spawn_pipeline_task(
                             parent,
                             "fix",
@@ -4522,6 +4533,7 @@ async def _check_and_trigger_rollup(
                             staging_branch,
                             target_branch,
                             fix_prompt=_alembic_fix_prompt,
+                            fix_reason=MIGRATION_GUARD_FIX_REASON,
                             original_task_id=str(parent.id),
                         )
                         logger.warning(

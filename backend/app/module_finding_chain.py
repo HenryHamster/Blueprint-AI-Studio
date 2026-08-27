@@ -253,9 +253,23 @@ def _guard_remediation_task(chain: ModuleFindingChain, *, base_branch: str) -> T
             "effort": "medium",
             "base_branch": base_branch,
             "title": "Resolve recurring baseline guard suppression",
+            # The prompt has to NAME the failure. It used to say "remove the
+            # named inherited guard failure" and name nothing, leaving the
+            # worker to reverse-engineer which identity it was sent after --
+            # while the chain row in scope carried all of it, and the operator
+            # escalation two functions below already printed every field.
             "prompt": (
-                "Remove the named inherited guard failure and verify a clean "
-                "publication-gate receipt. Do not suppress or rename the identity."
+                f"A baseline guard failure has survived {chain.occurrences} "
+                f"chained occurrence(s) on the "
+                f"`{chain.suppression_lane or 'unknown'}` lane and is now "
+                f"inherited rather than fixed.\n\n"
+                f"Failure identity: `{chain.failure_identity or 'unrecorded'}`\n"
+                f"Finding key: `{chain.finding_key}`\n\n"
+                f"Remove THAT failure and verify a clean publication-gate "
+                f"receipt. Do not suppress it, do not rename the identity, and "
+                f"do not re-baseline around it -- the identity is what the "
+                f"chain is keyed on, so renaming it restarts the chain instead "
+                f"of resolving it."
             ),
         },
         GUARD_REMEDIATION_SPAWN_CONTEXT,
