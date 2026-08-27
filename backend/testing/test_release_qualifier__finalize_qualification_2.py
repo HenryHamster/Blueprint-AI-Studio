@@ -139,6 +139,7 @@ class TestFinalizeInfraFailure:
 
         shared_state.runtime_config["promotion_enabled"] = False
         project, version = await _make_project_and_version(db_session)
+        await _declare_test_authorship_budget(db_session, project, version)
         audit_task, smoke_task = await _seed_infra_failure_children(
             db_session,
             project,
@@ -621,6 +622,7 @@ class TestFinalizeInfraFailure:
         shared_state.runtime_config["promotion_enabled"] = False
 
         project, version = await _make_project_and_version(db_session)
+        await _declare_test_authorship_budget(db_session, project, version)
         # Audit COMPLETED with a valid report; smoketest disabled.
         audit_task = Task(
             project_id=project.id,
@@ -5651,6 +5653,8 @@ async def test_pending_to_finalized_attempt_identity_continuity(db_session):
         "finalized_at": "2026-07-15T10:05:00",
         "confidence": 0.91,
         "threshold": 0.9,
+        "migration_safety_detail": {"state": "clean"},
+        "migration_apply_safety_detail": {},
     }
     version.last_qualification = finalized
     db_session.add(version)
@@ -5672,6 +5676,8 @@ async def test_pending_to_finalized_attempt_identity_continuity(db_session):
         )
     ).scalar_one()
     assert verdict.qualification_attempt_id == attempt_id
+    assert verdict.migration_safety_detail == '{"state":"clean"}'
+    assert verdict.migration_apply_safety_detail == "{}"
     assert version.last_qualification["qualification_attempt_id"] == str(attempt_id)
 
 
