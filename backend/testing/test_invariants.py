@@ -1497,6 +1497,8 @@ class TestSchemaRevisionSync:
             "get_check_runs_cached",
             "get_pr_files",
             "get_file_text_at_ref",
+            # Read-only compare evidence; it returns filenames and cannot write refs.
+            "get_files_changed_between_refs",
         }
         used = set(re.findall(r"\bgithub\.(\w+)\b", content))
         unexpected = sorted(used - ALLOWED_BACKMERGE_GITHUB_HELPERS)
@@ -1526,6 +1528,7 @@ class TestSchemaRevisionSync:
             "get_check_runs_cached",
             "get_pr_files",
             "get_file_text_at_ref",
+            "get_files_changed_between_refs",
         }, (
             "The back-merge github-helper allowlist must stay the documented read/merge helpers."
         )
