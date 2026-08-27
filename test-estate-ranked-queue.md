@@ -667,6 +667,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_migration_0714_strategic_conversation_correctness.py` | 414 | 3 | under 1500 LOC | 0.238s measured | — |
 | G | admin-ui | `admin-ui/src/components/VersionLifecyclePanelPrimitives.test.tsx` | 1,063 | 107 | under 1500 LOC | 0.237s measured | — |
 | G | agent | `agent/src/handlers/verify-tests.test.ts` | 1,356 | 62 | under 1500 LOC | 0.234s measured | — |
+| G | backend | `backend/testing/test_release_activation_approval.py` | 128 | 6 | under 1500 LOC | 0.233s measured | — |
 | G | admin-ui | `admin-ui/src/components/ProjectBuildConfigSection.test.tsx` | 129 | 2 | under 1500 LOC | 0.229s measured | — |
 | G | admin-ui | `admin-ui/src/components/NullBranchDiagnosticsPanel.test.tsx` | 147 | 10 | under 1500 LOC | 0.228s measured | — |
 | G | admin-ui | `admin-ui/src/components/ProjectMembers.test.tsx` | 111 | 7 | under 1500 LOC | 0.226s measured | — |

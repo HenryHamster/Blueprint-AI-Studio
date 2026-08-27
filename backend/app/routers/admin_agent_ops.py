@@ -247,6 +247,7 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     # the equivalent operator lever calls (app/strategic_pipeline_actions.py has
     # the op -> implementation table); none of them is a parallel reimplementation.
     "force_promote",
+    "approve_activation",
     "requeue_task",
     "reset_iteration_cap",
     "set_task_priority",
@@ -7243,6 +7244,67 @@ async def strategic_operation(
                 "ci_gate": (
                     "NOT skipped — the promotion PR must still go green on the "
                     "promotion target's required checks before it merges"
+                ),
+            }
+        )
+
+    elif payload.op == "approve_activation":
+        # Data shape: {"reason": "<required>"}.
+        # Re-enters app.release_activation_approval, the SAME implementation
+        # behind the admin-only POST /projects/{id}/approve-activation. It
+        # takes no target: the approval always aims at the current promoted
+        # version, so it can never be aimed at a different or historical
+        # artifact.
+        #
+        # This was the last step of the pipeline that could only be taken by a
+        # human. Promotion already had a verb; the version then sat awaiting
+        # activation until someone clicked approve, because
+        # ``activation_requested_at`` had exactly one writer and it was
+        # human-authed. The Resident now writes it under its own honest
+        # provenance -- mode ``resident_approval``, actor
+        # ``strategic_task:<uuid>`` -- and CANNOT stamp itself as a human
+        # in-product approval: ActivationApprover.resident() is the only
+        # constructor it can reach and that constructor hard-codes its mode.
+        #
+        # WHAT IT SKIPS: nothing. The five preconditions (promoted version
+        # exists, not already serving, no unresolved deploy failure, aggregate
+        # status re-armable, idempotent while unconfirmed) are the human
+        # lever's own gates, evaluated by the same code.
+        from app.release_activation_approval import (  # noqa: PLC0415
+            ActivationApprover,
+            approve_latest_promoted_activation,
+        )
+
+        _aa_reason = str((data or {}).get("reason") or "").strip()
+        if not _aa_reason:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "approve_activation requires a non-empty 'reason' "
+                    "recording why this version should go live."
+                ),
+            )
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        # Commits internally; every write is a local UPDATE, so no network I/O
+        # runs under the Project/Task locks this dispatch holds.
+        _aa_result = await approve_latest_promoted_activation(
+            session,
+            project.id,
+            ActivationApprover.resident(task.id),
+            reason=_aa_reason,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "approve_activation",
+                **_aa_result,
+                "deploy_gate": (
+                    "activation approved — the deploy agent executes it on its "
+                    "next poll and reports a serving receipt bound to this "
+                    "exact promoted_sha"
                 ),
             }
         )
