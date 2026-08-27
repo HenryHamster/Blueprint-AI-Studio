@@ -190,6 +190,63 @@ async def _age_automain_head_marker(db_session, project_id, head_sha, *, seconds
 
 
 @pytest.mark.asyncio
+async def test_automain_head_quiet_seconds_keeps_naive_utc_contract(db_session):
+    """The durable marker must remain comparable with the sweep's naive UTC clock."""
+    from datetime import datetime, timedelta
+
+    from app.release_qualifier_debounce import compute_automain_head_quiet_seconds
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    head_sha = "settled-head"
+    first_seen = datetime(2026, 8, 27, 12, 0, 0)
+
+    assert await compute_automain_head_quiet_seconds(
+        db_session,
+        project.id,
+        head_sha,
+        version_id=version.id,
+        now=first_seen,
+    ) == 0.0
+    assert await compute_automain_head_quiet_seconds(
+        db_session,
+        project.id,
+        head_sha,
+        version_id=version.id,
+        now=first_seen + timedelta(seconds=90),
+    ) == 90.0
+
+
+@pytest.mark.asyncio
+async def test_automain_head_quiet_seconds_normalizes_aware_marker(db_session):
+    """Older offset-bearing markers normalize to the same naive UTC boundary."""
+    from datetime import datetime
+
+    from app.project_telemetry import upsert_telemetry
+    from app.release_qualifier_debounce import (
+        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+        compute_automain_head_quiet_seconds,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    head_sha = "offset-head"
+    await upsert_telemetry(
+        db_session,
+        project.id,
+        _AUTOMAIN_HEAD_FIRST_SEEN_KEY,
+        {"head_sha": head_sha, "first_seen_at": "2026-08-27T05:00:00-07:00"},
+    )
+    await db_session.commit()
+
+    assert await compute_automain_head_quiet_seconds(
+        db_session,
+        project.id,
+        head_sha,
+        version_id=version.id,
+        now=datetime(2026, 8, 27, 12, 1, 30),
+    ) == 90.0
+
+
+@pytest.mark.asyncio
 async def test_advanced_not_promoted_authorship_candidate_redrives(db_session, mocker):
     """An advanced candidate invalidates the old SHA's authorship blocker."""
     from app import shared_state

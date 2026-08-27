@@ -1999,6 +1999,12 @@ async def test_promote_idempotent_when_exact_receipt_already_landed(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
     )
+    preflight = mocker.patch(
+        "app.release_promotion._preflight_promotion_rerun_token",
+        new=AsyncMock(
+            side_effect=AssertionError("receipt must precede preflight")
+        ),
+    )
     # The exact receipt's immutable merge commit is reachable from main.
     ancestor_mock = mocker.patch(
         "app.github.is_ancestor_of",
@@ -2047,6 +2053,7 @@ async def test_promote_idempotent_when_exact_receipt_already_landed(
     branch_mock.assert_not_called()
     create_mock.assert_not_called()
     merge_mock.assert_not_called()
+    preflight.assert_not_awaited()
     # The release branch a prior attempt may have left behind is cleaned up.
     delete_mock.assert_awaited()
 
@@ -3408,6 +3415,10 @@ async def test_promote_pending_ci_enters_managed_check_wait_no_failure(db_sessio
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
     )
+    mocker.patch(
+        "app.github.mint_repo_installation_token_with_permissions",
+        new=AsyncMock(return_value="capability-token"),
+    )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     # PR not yet merged (pending CI, not a conflict).
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
@@ -3460,6 +3471,63 @@ async def test_promote_pending_ci_enters_managed_check_wait_no_failure(db_sessio
     assert lq.get("sub_scores") == {"ci": 1.0}
     # The merge must NOT clobber the "pending" status the substate relies on.
     assert lq.get("status") == "pending"
+
+
+@pytest.mark.asyncio
+async def test_promote_without_actions_write_creates_no_release_artifacts(
+    db_session, mocker
+):
+    """A confirmed missing rerun capability fails before branch or PR creation."""
+    _project, version = await _make_project_and_version(db_session)
+    candidate = "actions0" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="read-only-token"),
+    )
+    from app.github import GitHubInstallationPermissionError
+
+    mocker.patch(
+        "app.github.mint_repo_installation_token_with_permissions",
+        new=AsyncMock(
+            side_effect=GitHubInstallationPermissionError(
+                "missing actions", missing_permissions=("actions",)
+            )
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    create_branch = mocker.patch(
+        "app.github.create_branch", new=_create_branch_mock()
+    )
+    create_pr = mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 99, "html_url": "http://pr/99"}),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        candidate,
+        composite={"confidence": 0.9},
+        base_record={"candidate_sha": candidate, "confidence": 0.9},
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promotion_failed"
+    assert result["error"] == "github_actions_write_required"
+    create_branch.assert_not_awaited()
+    create_pr.assert_not_awaited()
+    await db_session.refresh(version)
+    assert version.phase == "stabilize"
+    assert version.last_qualification["error"] == "github_actions_write_required"
+    assert "Actions: Read and write" in version.last_qualification["detail"]
+    assert version.last_qualification["promotion_failure_count"] == 0
+    assert version.last_qualification["promotion_attempt_spent"] is False
+    messages = await _messages_for(
+        db_session, version.project_id, "release_promotion_capability_blocked"
+    )
+    assert len(messages) == 1
+    assert messages[0].context["error"] == "github_actions_write_required"
 
 
 @pytest.mark.asyncio
@@ -4604,6 +4672,38 @@ async def test_notify_operator_swallows_failure(db_session, mocker):
     )
     # Must return normally despite post_event_message raising.
     await rq._notify_operator(db_session, version, "release_promoted", "summary text")
+
+
+@pytest.mark.asyncio
+async def test_notify_operator_keeps_capability_hold_distinct_from_later_failure(
+    db_session,
+):
+    """A later attempted-promotion failure is not hidden by the earlier hold."""
+    project, version = await _make_project_and_version(db_session)
+
+    for _ in range(2):
+        await rq._notify_operator(
+            db_session,
+            version,
+            "release_promotion_capability_blocked",
+            "promotion held before branch creation",
+        )
+        await rq._notify_operator(
+            db_session,
+            version,
+            "release_promotion_failed",
+            "promotion attempted and merge failed",
+        )
+    await db_session.commit()
+
+    assert len(
+        await _messages_for(
+            db_session, project.id, "release_promotion_capability_blocked"
+        )
+    ) == 1
+    assert len(
+        await _messages_for(db_session, project.id, "release_promotion_failed")
+    ) == 1
 
 
 # ===========================================================================
@@ -6756,6 +6856,96 @@ async def test_promotion_failed_redrive_retries_mechanics_failure_same_sha(
 
     assert fired is True
     mock_run_qual.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_promotion_capability_redrive_holds_then_recovers_same_candidate(
+    db_session, mocker
+):
+    """A repaired permission releases the parked candidate without CI churn."""
+    from app.release_qualifier_redrive import (
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(
+        db_session,
+        error="github_actions_write_required",
+        promotion_failure_count=0,
+    )
+    mock_run_qual = _patch_promotion_redrive_inputs(
+        mocker, head_sha=_FAILED_CANDIDATE
+    )
+    capability = mocker.patch(
+        "app.release_qualifier_redrive._promotion_rerun_capability_status",
+        new=AsyncMock(
+            side_effect=[
+                (
+                    False,
+                    "github_actions_write_required",
+                    "Actions write is not approved",
+                ),
+                (True, None, None),
+            ]
+        ),
+    )
+
+    held = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert held is False
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["reason"] == "promotion_rerun_capability_unavailable"
+    assert decision["capability_error"] == "github_actions_write_required"
+    assert version.last_qualification["promotion_failure_count"] == 0
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True
+    assert capability.await_count == 2
+    mock_run_qual.assert_called_once()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["retry_class"] == "promotion_capability_recovered"
+
+
+@pytest.mark.asyncio
+async def test_promotion_capability_failure_at_existing_cap_escalates(
+    db_session, mocker
+):
+    """A later capability hold cannot resurrect an already exhausted budget."""
+    from app.release_qualifier_redrive import (
+        _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+        _PROMOTION_REDRIVE_DECISION_KEY,
+        _redrive_promotion_failed_qualification,
+    )
+
+    _project, version = await _seed_promotion_failed(
+        db_session,
+        error="github_actions_write_required",
+        promotion_failure_count=_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    )
+    mock_run_qual = _patch_promotion_redrive_inputs(mocker)
+    capability = mocker.patch(
+        "app.release_qualifier_redrive._promotion_rerun_capability_status",
+        new=AsyncMock(return_value=(True, None, None)),
+    )
+
+    fired = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    capability.assert_not_awaited()
+    mock_run_qual.assert_not_called()
+    await db_session.refresh(version)
+    decision = version.last_qualification[_PROMOTION_REDRIVE_DECISION_KEY]
+    assert decision["reason"] == "promotion_failure_cap"
 
 
 @pytest.mark.asyncio
