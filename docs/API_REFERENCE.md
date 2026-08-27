@@ -627,7 +627,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | resolve_discovery | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | report_autonomous_finding | consume_knowledge | dismiss_knowledge | request_qualification | force_promote | requeue_task | reset_iteration_cap | set_task_priority | unhold_direction",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | resolve_discovery | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | report_autonomous_finding | consume_knowledge | dismiss_knowledge | request_qualification | force_promote | approve_activation | requeue_task | reset_iteration_cap | set_task_priority | unhold_direction",
   "data": { }
 }
 ```
