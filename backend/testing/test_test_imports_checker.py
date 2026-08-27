@@ -104,7 +104,7 @@ def _identity(violation: cti.Violation) -> str:
 # revalidation stat, which is the part the bind mount taxes:
 #
 #            stats            native wall      bind-mount wall
-#   unfrozen 13,562           20.92s           42.37s   <-- blows the 30s lane
+#   unfrozen 13,562           20.92s           42.37s   <-- blew the then-30s lane
 #   frozen    2,830 (4.8x)    18.41s           27.13s
 #
 # Natively the freeze is worth nothing (1.14x, inside run-to-run noise). Over
@@ -112,10 +112,13 @@ def _identity(violation: cti.Violation) -> str:
 # stat costs ~100x what it costs on native Linux. That is the entire defect
 # class this marker and that context manager exist for.
 #
-# 27.13s against the standalone lane's --timeout=30 is not a pass, it is a
+# 27.13s against the standalone lane's THEN-30s budget was not a pass, it was a
 # coin flip -- and measured end-to-end through pytest the same guard came in at
 # 30.87s and FAILED as a timeout, reporting a slow filesystem as a stale-import
-# defect. The remaining 27s is read+parse of the corpus, which is irreducible:
+# defect. (The lane catch-all is LANE_HANG_DETECTOR_SECONDS in
+# test_harness_timeout_budgets.py and is far larger now; the marker below stays
+# because it bounds this scan as ITSELF rather than as an anonymous lane kill.)
+# The remaining 27s is read+parse of the corpus, which is irreducible:
 # there is no prefilter for "this file imports from app", every one of them
 # does. So the budget is the honest lever here. 120s matches the house number
 # for corpus-scanning guards and leaves ~4x headroom over the measured figure,
@@ -134,8 +137,11 @@ def test_backend_testing_corpus_has_no_stale_app_imports() -> None:
     # freeze, 1,538 with it (8.0x fewer). Natively that buys nothing in wall
     # clock; over the Docker-on-Windows bind mount, where stat is ~100x slower,
     # the syscall count is what pushes this guard toward the standalone lane's
-    # 30s budget -- at which point it dies on a timeout and reports a slow
-    # filesystem as a stale-import defect.
+    # budget -- LANE_HANG_DETECTOR_SECONDS in
+    # backend/testing/test_harness_timeout_budgets.py, which the lane passes as
+    # pytest's --timeout -- at which point it dies on a timeout and reports a
+    # slow filesystem as a stale-import defect. The freeze was sized against
+    # the then-30s budget; the number moved, the syscalls did not.
     with cti.frozen_app_tree():
         violations = cti.find_stale_test_imports(root=REPO_ROOT)
     offenders = sorted(_identity(violation) for violation in violations)

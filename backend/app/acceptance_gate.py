@@ -162,6 +162,15 @@ FINDING_CLEARANCE_VERIFICATION_KEY = "finding_clearance_verification"
 # :func:`effective_acceptance_verdict` (rung 3), which re-derives any recorded
 # row whose stamp predates the current rule.
 #
+# v4: the named_test ungrounded-seam rule changed — a CI-verified merge that
+# SHIPPED its declared test alongside production code is now credited SOFT
+# instead of hard-failing when the filename-grounding heuristic cannot tie the
+# test to a changed module (see :func:`_ungrounded_seam_cochange_reason`). A row
+# stamped ``declared_unsatisfied`` under v3 scores differently under the current
+# core, so bumping retires those v3 stamps and rung 3 re-derives them. This is
+# the mechanism that heals ALREADY-MERGED work whose direction credit the v3
+# rule zeroed; without the bump the fix would only reach future merges.
+#
 # v3: rollup children now carry an authoritative changed-file signal derived from
 # their own immutable PR commit range.  That provenance is distinct from the
 # parent's union diff, so a matching named test may earn machine proof.
@@ -171,7 +180,7 @@ FINDING_CLEARANCE_VERIFICATION_KEY = "finding_clearance_verification"
 # and the window-corroboration marker semantics changed, so a row stamped under v1
 # can score differently under the current core. Bumping retires those v1 stamps so
 # rung 3 re-derives them instead of trusting a verdict the retired rule produced.
-ACCEPTANCE_RULE_VERSION = 3
+ACCEPTANCE_RULE_VERSION = 4
 
 # ``rederived_by`` stamped on a re-derived verdict (design doc c50453ef §5).
 # Identifies the actor that re-scored already-merged work so an auditor can tell
@@ -638,6 +647,62 @@ def _test_semantically_grounded(
         if _paths_match(known, declared_test_path):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Ungrounded-seam reasons (shared by the merge-time and pre-merge named_test
+# gates so ``classify_unsatisfied_reason`` maps both identically).
+# ---------------------------------------------------------------------------
+def _ungrounded_seam_reason(declared_path: str) -> str:
+    """Hard-fail reason: the declared test grounds to NO changed production
+    module AND the PR did not ship the declared test itself.
+
+    This is the name-drop shape — a declaration pointing at a test the PR never
+    touched and whose module name ties it to nothing that changed. It carries no
+    corroborating signal at all, so it stays a fail-closed
+    ``declared_unsatisfied``.
+    """
+    return (
+        f"declared named_test {declared_path!r} exercises a production seam "
+        "that does not semantically correspond to the declared test module — "
+        "none of the changed production files match the test file's module name"
+    )
+
+
+def _ungrounded_seam_cochange_reason(declared_path: str, seam_count: int) -> str:
+    """Soft-credit reason: the filename heuristic could not ground the declared
+    test, but the PR SHIPPED that test alongside production code.
+
+    :func:`_test_semantically_grounded` is a *filename* proxy for "does this test
+    exercise this change" — it matches ``test_<module>.py`` against
+    ``<module>.py``. Real coverage routinely crosses that boundary
+    (``test_orchestrator_liveness.py`` genuinely covers ``reaper_sweeps.py``),
+    and the proxy cannot see it.
+
+    Failing such a merge CLOSED inverted the incentive: an undeclared merge with
+    the SAME diff earns ``inferred_test_cochange`` (CI-verified + a test file + a
+    production file — see :func:`classify_merged_acceptance_context`) and
+    counts as verified, while declaring a named test whose *filename* did not
+    match earned ``declared_unsatisfied`` and ZERO credit. Declaring acceptance
+    evidence was strictly worse than declaring nothing.
+
+    The floor removes that inversion using the strictly STRONGER signal the gate
+    already holds at this point: the merge is CI-verified (or the declared test
+    ran green under a targeted execution), the diff ships production code, and
+    the declared test is IN the diff. That is every condition
+    ``inferred_test_cochange`` requires PLUS a declaration naming the test. It is
+    credited SOFT — ``proven`` still requires semantic grounding, so the
+    machine-proof axis is unchanged and an ungrounded declaration can never mint
+    ``proven``.
+    """
+    return (
+        f"declared named_test {declared_path!r} does not correspond BY MODULE "
+        f"NAME to any of the {seam_count} changed production file(s), but this "
+        "PR shipped the declared test ITSELF alongside them — a same-PR "
+        "test/production co-change is direct evidence the declaration is not a "
+        "name-drop, which filename matching cannot see. Credited soft without "
+        "machine proof (semantic grounding is still required for proven)"
+    )
 
 
 def _merge_was_test_verified(context: Mapping[str, Any] | None) -> bool:
@@ -1381,13 +1446,23 @@ def _evaluate_named_test(
             "change it could exercise (the diff is test-only)",
         )
     if not _test_semantically_grounded(declared_path, seam_files):
+        if not test_present:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                _ungrounded_seam_reason(declared_path),
+            )
+        # Co-change floor: the PR shipped the declared test alongside production
+        # code, so this merge already satisfies every condition an UNDECLARED
+        # merge needs to earn ``inferred_test_cochange``. Crediting it BELOW that
+        # would penalise declaring evidence — see
+        # :func:`_ungrounded_seam_cochange_reason`. Soft only; never ``proven``.
         return AcceptanceGateVerdict(
             True,
-            False,
+            True,
             evidence.kind,
-            f"declared named_test {declared_path!r} exercises a production seam "
-            "that does not semantically correspond to the declared test module — "
-            "none of the changed production files match the test file's module name",
+            _ungrounded_seam_cochange_reason(declared_path, len(seam_files)),
         )
     if parent_derived:
         # The changed-file list was inherited from a rollup parent's combined
@@ -1508,13 +1583,23 @@ def _evaluate_named_test_premerge(
             "change it could exercise (the diff is test-only)",
         )
     if not _test_semantically_grounded(declared_path, seam_files):
+        if not test_present:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                _ungrounded_seam_reason(declared_path),
+            )
+        # Co-change floor: the PR shipped the declared test alongside production
+        # code, so this merge already satisfies every condition an UNDECLARED
+        # merge needs to earn ``inferred_test_cochange``. Crediting it BELOW that
+        # would penalise declaring evidence — see
+        # :func:`_ungrounded_seam_cochange_reason`. Soft only; never ``proven``.
         return AcceptanceGateVerdict(
             True,
-            False,
+            True,
             evidence.kind,
-            f"declared named_test {declared_path!r} exercises a production seam "
-            "that does not semantically correspond to the declared test module — "
-            "none of the changed production files match the test file's module name",
+            _ungrounded_seam_cochange_reason(declared_path, len(seam_files)),
         )
     if parent_derived:
         return AcceptanceGateVerdict(
@@ -2568,6 +2653,19 @@ def classify_merged_acceptance_context(context: Mapping[str, Any] | None) -> str
                 if has_test and has_prod:
                     return "inferred_test_cochange"
         return "undeclared"
+    return classify_recorded_acceptance_verdict(recorded)
+
+
+def classify_recorded_acceptance_verdict(recorded: Mapping[str, Any]) -> str:
+    """Classify one RECORDED acceptance-verdict dict into its declared bucket.
+
+    The shared tail of :func:`classify_merged_acceptance_context` (which reads
+    the frozen land-time row off a context) and :func:`classify_merged_acceptance`
+    (which classifies the CURRENT-rule verdict from
+    :func:`effective_acceptance_verdict`). Factored so both cannot drift: a
+    re-derived verdict must land in exactly the bucket its frozen equivalent
+    would have.
+    """
     if acceptance_blocks_success(recorded):
         return "declared_unsatisfied"
     if recorded.get("satisfied") is True:
@@ -2968,10 +3066,29 @@ def classify_merged_acceptance(task: Task) -> str:
         satisfied / unsatisfied value.
 
     Undeclared / legacy rows stay neutral by falling into ``undeclared``.
+
+    A recorded verdict is classified as it stands under the CURRENT
+    :data:`ACCEPTANCE_RULE_VERSION`, not as it was frozen at land time: the row
+    is passed through :func:`effective_acceptance_verdict` (rung 3) first. Without
+    this, an evidence-rule improvement reached the release qualifier — which
+    already re-derives — but NEVER reached direction productivity, which reads
+    this classifier. A direction whose merges were zeroed by a rule that has since
+    been corrected would keep scoring 0 until the qualifier's window pass happened
+    to re-stamp those exact rows, and any cycle recomputed before that re-froze the
+    stale answer into ``research_history``. Re-deriving here makes a rule fix reach
+    merge credit deterministically on the next recompute.
+
+    Pure and side-effect-free: :func:`effective_acceptance_verdict` does not
+    mutate ``task.context``, so this never writes. ``None`` (no recorded verdict)
+    falls through to the context path, preserving the
+    ``inferred_test_cochange`` / ``undeclared`` classification unchanged.
     """
     if merge_verification_status(task) == "unverified_degraded":
         return "merged_unverified_degraded"
-    return classify_merged_acceptance_context(task.context or {})
+    effective = effective_acceptance_verdict(task)
+    if effective is None:
+        return classify_merged_acceptance_context(task.context or {})
+    return classify_recorded_acceptance_verdict(effective)
 
 
 def summarize_version_acceptance_aggregate(

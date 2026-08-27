@@ -557,10 +557,11 @@ class AssetSecurityTests(unittest.TestCase):
 
     # Its worst case is the `hard_timeout` sample: a child that traps TERM and
     # sleeps 5s, so the attempt costs the full sleep rather than the 2s budget,
-    # times up to three attempts -- ~15s against the lanes' --timeout=30. That
-    # was already marginal before this marker, and the inner subprocess budget
-    # below could never fire underneath it. 120s gives real headroom and lets
-    # the inner timeout report a genuinely hung retry loop as itself.
+    # times up to three attempts -- ~15s. That was already marginal against the
+    # then-30s lane budget, and the inner subprocess budget below could never
+    # fire underneath it. 120s gives real headroom and lets the inner timeout
+    # report a genuinely hung retry loop as itself rather than as an anonymous
+    # LANE_HANG_DETECTOR_SECONDS kill.
     @pytest.mark.timeout(120)
     def test_viewport_retry_distinguishes_infrastructure_from_child_exit(self):
         bash = None

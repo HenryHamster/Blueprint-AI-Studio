@@ -68,14 +68,17 @@ Same code, same container: ~7-9ms per file open across the bind mount against
 ~5us on a local filesystem, over ~1400 files read up to three times. The scan
 is cheap in CI and expensive on a Windows developer box.
 
-The standalone lane runs ``pytest --timeout=30``. In CI that is ~12x headroom
-and no marker would be needed; across the bind mount the two big sections land
-on the WRONG SIDE of it, and a slow filesystem then gets reported as a size
-defect -- the harness-budget-inversion class that killed promotion PR #17674.
-The marker below exists for that second case and only that case. 120s is the
-house budget for corpus-scanning guards (``test_string_patch_targets_resolve``
-and ``test_mock_patch_targets_resolve`` in test_invariants.py both carry it
-for the same reason) and leaves ~3x headroom over the slowest bind-mount figure.
+The lane's own pytest-timeout is ``LANE_HANG_DETECTOR_SECONDS``
+(backend/testing/test_harness_timeout_budgets.py) -- a catch-all for a genuine
+hang, deliberately generous. It was 30s until 2026-08-26, and at 30s the two big
+sections landed on the WRONG SIDE of it across the bind mount, so a slow
+filesystem got reported as a size defect -- the harness-budget-inversion class
+that killed promotion PR #17674. The marker below exists for that case: it is a
+TIGHTER, attributable bound than the lane catch-all, so this scan reds as itself
+rather than as an anonymous lane timeout. 120s is the house budget for
+corpus-scanning guards (``test_string_patch_targets_resolve`` and
+``test_mock_patch_targets_resolve`` in test_invariants.py both carry it for the
+same reason) and leaves ~3x headroom over the slowest bind-mount figure.
 
 The parse half of the cost was already removed:
 ``size_limit_policy.governance_caps_from_source_text`` now screens for the

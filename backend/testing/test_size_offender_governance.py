@@ -1114,9 +1114,11 @@ def _real_repo_checkout() -> str | None:
                 cwd=root,
                 capture_output=True,
                 text=True,
-                # Two orders of magnitude under the lanes' --timeout=30: this
-                # reads one ref. A budget that could not fire is the bug class
-                # backend/testing/test_harness_timeout_budgets.py guards.
+                # Comfortably under MAX_INNER_OPERATION_SECONDS (backend/
+                # testing/test_harness_timeout_budgets.py): this reads one ref.
+                # A budget that could not fire is the bug class that module
+                # guards. Sized against the CEILING, not the lane's
+                # LANE_HANG_DETECTOR_SECONDS catch-all.
                 timeout=10,
                 check=False,
             )
@@ -1130,10 +1132,11 @@ def _real_repo_checkout() -> str | None:
 # `git log -p -- backend/testing/module_size_limits.json` materialises a diff
 # for every commit that ever touched a large, constantly-churned file, on a
 # runner already carrying eight parallel shards. The inner subprocess budget
-# below is 30s and the CI lanes run pytest with --timeout=30 -- identical
-# numbers, so any work before or after the call guarantees the harness kill
-# lands first and this guard reds as an unreproducible flake (CI run
-# 32805982004, backend shard 8).
+# below is 30s, which is exactly MAX_INNER_OPERATION_SECONDS
+# (test_harness_timeout_budgets.py) -- an inner call AT the ceiling, so without
+# the marker below any work before or after it guarantees the harness kill lands
+# first and this guard reds as an unreproducible flake (CI run 32805982004,
+# backend shard 8, when the lane budget was also 30s).
 #
 # 120s, down from a deliberately oversized 900s. The `git log -p` above is
 # NOT where the time went -- measured, it is ~1s. The cost was
@@ -1141,10 +1144,10 @@ def _real_repo_checkout() -> str | None:
 # SHA the (shallow, on CI) log cannot serve: ~2,660 spawns, measured at
 # 683.69s on a truncated clone. #17888 batched those probes into a constant
 # number of forks -- measured 5.37s over the same 714 records with an
-# element-wise identical phantom list -- so the whole file now runs in 15.49s
-# under the lanes' --timeout=30. 120s is ~8x headroom over the file and ~22x
-# over this test; it stays a marker because the lane budget is 30s and a
-# shallow-clone cold cache is still slower than a warm one.
+# element-wise identical phantom list -- so the whole file now runs in 15.49s.
+# 120s is ~8x headroom over the file and ~22x over this test; it stays a marker
+# because the inner call sits at MAX_INNER_OPERATION_SECONDS and a shallow-clone
+# cold cache is still slower than a warm one.
 @pytest.mark.timeout(120)
 def test_cap_bump_history_ledger_matches_git():
     """The committed cap-bump-history ledger must mirror the git-recorded bumps.
@@ -2200,7 +2203,7 @@ def test_per_root_git_probes_do_not_rescale_with_module_count(tmp_path, mocker):
     ``parse_bump_history`` once per near-cap module -- 48 of them today -- from
     inside a single ``asyncio.to_thread`` in the reaper cycle, so ONE cycle
     spawned ~288 git processes serially.  Measured at 9.3s on an idle dev box
-    and 16.1s inside a CI shard container, against that lane's 30s per-test
+    and 16.1s inside a CI shard container, against that lane's then-30s per-test
     budget; ordinary host jitter pushed it over and red-lit promotion PR #17977
     (``TestReaperService::test_recent_heartbeat_task_is_not_reaped``, nominal
     duration 0.68s).
