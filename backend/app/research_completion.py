@@ -953,26 +953,29 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
             )
 
     for info in _auto_complete_info:
-        from app.models import Alert, AlertSeverity
+        from app.alert_policy import create_project_alert_if_allowed
+        from app.models import AlertSeverity
 
         _successful = info.get("outcome") == "success_evidence_met"
         _milestone = "auto-completed" if _successful else "auto-retired"
         _title = "Direction auto-completed" if _successful else "Direction auto-retired"
-        session.add(
-            Alert(
-                project_id=task.project_id,
-                severity=AlertSeverity.INFO,
-                event_type=(
-                    "research.direction_auto_completed"
-                    if _successful
-                    else "research.direction_auto_retired"
-                ),
-                title=_title,
-                message=(
-                    f"Direction '{info['text'][:80]}' reached {_milestone}: "
-                    f"{info['reason']}."
-                ),
-            )
+        # TIMELINE_ONLY through the policy gate; the milestone message below is
+        # the delivery. "Direction X reached auto-completed" is a completed
+        # fact, so a durable operator row for it could never be resolved.
+        await create_project_alert_if_allowed(
+            session,
+            project_id=task.project_id,
+            severity=AlertSeverity.INFO,
+            event_type=(
+                "research.direction_auto_completed"
+                if _successful
+                else "research.direction_auto_retired"
+            ),
+            title=_title,
+            message=(
+                f"Direction '{info['text'][:80]}' reached {_milestone}: "
+                f"{info['reason']}."
+            ),
         )
         try:
             from app.notification_dispatch import (

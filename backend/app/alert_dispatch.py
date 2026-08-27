@@ -1417,14 +1417,16 @@ async def _maybe_create_problem_model_wipe_alert(
         f"usually means the agent is acting on a truncated payload view. "
         f"Investigate recent problem_model writes on this project."
     )
-    alert = Alert(
+    alert, _created, _decision = await create_project_alert_if_allowed(
+        session,
         project_id=project_id,
+        event_type="problem_model.wipe_risk",
         severity=AlertSeverity.WARNING,
         title=title,
         message=message,
-        event_type="problem_model.wipe_risk",
     )
-    session.add(alert)
+    if alert is None:
+        return
     await broadcast_to_project(
         str(project_id),
         "alert_created",

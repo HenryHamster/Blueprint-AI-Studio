@@ -20,7 +20,6 @@ from app.database import AsyncSessionLocal
 from app.models import (
     Task,
     TaskStatus,
-    Alert,
     AlertSeverity,
 )
 import app.shared_state as _shared_state
@@ -510,28 +509,38 @@ async def _run_stale_branch_cleanup():
             # INFO alert when many branches cleaned in one cycle
             if project_deleted > 10:
                 try:
-                    alert = Alert(
-                        project_id=project.id,
-                        event_type="branch.cleanup_summary",
-                        severity=AlertSeverity.INFO,
-                        title=f"Cleaned up {project_deleted} stale branches",
-                        message=(
-                            f"Stale branch cleanup removed {project_deleted} branches from "
-                            f"{owner}/{repo} that were older than {_STALE_BRANCH_AGE_DAYS} days "
-                            f"with no corresponding active tasks."
-                        ),
+                    # TIMELINE_ONLY through the policy gate. "Cleaned up N
+                    # stale branches" is a completed housekeeping fact, and the
+                    # raw insert had NO dedupe of any kind -- the cleanup
+                    # service loops forever, so every cycle that deleted >10
+                    # branches minted another permanent INFO row.
+                    from app.alert_policy import create_project_alert_if_allowed
+
+                    alert, _created, _decision = (
+                        await create_project_alert_if_allowed(
+                            session,
+                            project_id=project.id,
+                            event_type="branch.cleanup_summary",
+                            severity=AlertSeverity.INFO,
+                            title=f"Cleaned up {project_deleted} stale branches",
+                            message=(
+                                f"Stale branch cleanup removed {project_deleted} branches from "
+                                f"{owner}/{repo} that were older than {_STALE_BRANCH_AGE_DAYS} days "
+                                f"with no corresponding active tasks."
+                            ),
+                        )
                     )
-                    session.add(alert)
                     await session.commit()
-                    await broadcast_to_project(
-                        str(project.id),
-                        "alert_created",
-                        {
-                            "alert_id": str(alert.id),
-                            "severity": "INFO",
-                            "title": alert.title,
-                        },
-                    )
+                    if alert is not None:
+                        await broadcast_to_project(
+                            str(project.id),
+                            "alert_created",
+                            {
+                                "alert_id": str(alert.id),
+                                "severity": "INFO",
+                                "title": alert.title,
+                            },
+                        )
                 except Exception as e:
                     logger.warning(
                         f"[BRANCH CLEANUP] Failed to create cleanup alert: {e}"

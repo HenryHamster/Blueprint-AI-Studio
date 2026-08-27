@@ -28,6 +28,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.alert_policy import create_project_alert_if_allowed
 from app.message_audience import stamp_message_audience
 from app.project_message_creation import build_project_message
 from app.broadcast import broadcast_to_project
@@ -352,17 +353,19 @@ async def _maybe_autocomplete_exhausted_direction(
     # Capture diagnosis info for the deferred design_doc archive write (same as the
     # proven-merge route), performed after the directions commit.
     pending_archived.append((dict(d), did))
-    session.add(
-        Alert(
-            project_id=task.project_id,
-            severity=AlertSeverity.INFO,
-            event_type="research.direction_auto_retired",
-            title="Direction auto-retired",
-            message=(
-                f"Direction '{d.get('text', did)[:80]}' was auto-retired as "
-                f"exhausted: {reason}."
-            ),
-        )
+    # TIMELINE_ONLY through the policy gate: the milestone message below is the
+    # delivery. A raw insert here also wrote a durable operator row for a fact
+    # ("direction retired at T") that no resolver could ever make false.
+    await create_project_alert_if_allowed(
+        session,
+        project_id=task.project_id,
+        severity=AlertSeverity.INFO,
+        event_type="research.direction_auto_retired",
+        title="Direction auto-retired",
+        message=(
+            f"Direction '{d.get('text', did)[:80]}' was auto-retired as "
+            f"exhausted: {reason}."
+        ),
     )
     try:
         from app.notification_dispatch import (
@@ -1108,7 +1111,10 @@ async def apply_post_spawn_state(
                             # Capture diagnosis info for deferred design_doc write
                             # inside with_design_doc_locked (after the directions commit).
                             _pending_archived_diagnoses.append((dict(d), did))
-                            alert = Alert(
+                            # TIMELINE_ONLY through the policy gate; the
+                            # milestone message below is the delivery.
+                            await create_project_alert_if_allowed(
+                                session,
                                 project_id=task.project_id,
                                 severity=AlertSeverity.INFO,
                                 event_type="research.direction_auto_completed",
@@ -1120,7 +1126,6 @@ async def apply_post_spawn_state(
                                     f"{total_cycles} cycles)."
                                 ),
                             )
-                            session.add(alert)
                             try:
                                 from app.notification_dispatch import (
                                     post_direction_milestone_message,

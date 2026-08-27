@@ -11308,8 +11308,22 @@ async def test_batch_cap_and_health_gate_deferrals_combine(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_anomaly_adjustment_creates_warning_alert(db_session, mocker):
-    """WARNING alert created in DB when anomaly adjustments first activate."""
+async def test_anomaly_adjustment_publishes_a_timeline_notice_not_a_durable_alert(
+    db_session, mocker
+):
+    """The auto-adjust notice is broadcast, and leaves NO standing alert row.
+
+    2026-08-26: this used to assert a durable ``Alert`` row.  The registry has
+    always classified ``research.anomaly_auto_adjusted`` as strategist-internal
+    (so the row was filtered out of the operator feed on read) and the statement
+    it carried -- "max_concurrent_vms was reduced from 8 to 4" -- is a completed
+    past fact with no future state that makes it false, so nothing could ever
+    resolve it.  The row was permanent, invisible, and unclearable.  The mint now
+    goes through the policy gate, which routes it to the timeline.
+
+    The assertions are not weakened: every number the alert message pinned is
+    still pinned, on the broadcast payload that actually reaches a consumer.
+    """
     direction = _active_direction("d-anomaly01", "Improve stability")
     project = Project(
         name="Anomaly Alert Test",
@@ -11335,7 +11349,7 @@ async def test_anomaly_adjustment_creates_warning_alert(db_session, mocker):
             }
         ),
     )
-    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+    broadcast = mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification", new=AsyncMock()
     )
@@ -11346,13 +11360,23 @@ async def test_anomaly_adjustment_creates_warning_alert(db_session, mocker):
         select(Alert).where(Alert.project_id == project.id)
     )
     alerts = result.scalars().all()
-    adjustment_alerts = [a for a in alerts if "auto-adjusted" in a.title]
-    assert len(adjustment_alerts) == 1
-    alert = adjustment_alerts[0]
-    assert alert.severity == AlertSeverity.WARNING
-    assert "4" in alert.message  # new max_concurrent_vms
-    assert "8" in alert.message  # pre_adjustment value
-    assert "PROVISION_FAILURE" in alert.message
+    assert not [a for a in alerts if "auto-adjusted" in a.title], (
+        "research.anomaly_auto_adjusted is TIMELINE_ONLY: a durable row for a "
+        "completed adjustment can never be resolved and never reaches the "
+        "operator feed anyway"
+    )
+
+    payloads = [
+        call.args[2]
+        for call in broadcast.await_args_list
+        if len(call.args) >= 3 and call.args[1] == "anomaly_adjustment"
+    ]
+    assert len(payloads) == 1, broadcast.await_args_list
+    payload = payloads[0]
+    assert payload["max_concurrent_vms"] == 4
+    assert payload["pre_adjustment_max_vms"] == 8
+    assert payload["failure_gate_threshold"] == 0.6
+    assert "PROVISION_FAILURE" in payload["trigger_anomalies"]
 
 
 @pytest.mark.asyncio
@@ -11384,7 +11408,7 @@ async def test_anomaly_already_active_does_not_duplicate_alert(db_session, mocke
         ),
     )
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
-    mocker.patch(
+    dispatch = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification", new=AsyncMock()
     )
 
@@ -11396,11 +11420,30 @@ async def test_anomaly_already_active_does_not_duplicate_alert(db_session, mocke
     alerts = result.scalars().all()
     adjustment_alerts = [a for a in alerts if "auto-adjusted" in a.title]
     assert len(adjustment_alerts) == 0, "No alert when adjustment already active"
+    # 2026-08-26: the durable row is gone for BOTH is_new values now that the
+    # event routes to the timeline, so the row assertion above no longer
+    # distinguishes this case from the is_new=True one -- it would pass whatever
+    # the code did. Pin the observable that still differs: an already-active
+    # adjustment must not re-notify.
+    assert not [
+        call
+        for call in dispatch.call_args_list
+        if len(call.args) >= 2 and call.args[1] == "ANOMALY_ADJUSTMENT"
+    ], "already-active adjustment must not re-send the external notification"
 
 
 @pytest.mark.asyncio
-async def test_anomaly_restoration_creates_info_alert(db_session, mocker):
-    """INFO alert created in DB when anomaly adjustments are restored."""
+async def test_anomaly_restoration_publishes_a_notice_and_leaves_no_alert(
+    db_session, mocker
+):
+    """Recovery is announced, and does NOT add a second permanent row.
+
+    2026-08-26: this used to assert a durable INFO ``Alert``.  As a raw insert
+    the restoration row did not dismiss the adjustment row it recovered from --
+    it minted a SECOND permanent row, so a fully recovered pipeline read as two
+    open alerts forever.  Routing through the policy gate makes the recovery a
+    timeline notice, which is what a recovery announcement is.
+    """
     direction = _active_direction("d-anomaly03", "Monitor health")
     project = Project(
         name="Anomaly Restore Test",
@@ -11423,7 +11466,7 @@ async def test_anomaly_restoration_creates_info_alert(db_session, mocker):
             }
         ),
     )
-    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+    broadcast = mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification", new=AsyncMock()
     )
@@ -11434,12 +11477,19 @@ async def test_anomaly_restoration_creates_info_alert(db_session, mocker):
         select(Alert).where(Alert.project_id == project.id)
     )
     alerts = result.scalars().all()
-    restore_alerts = [a for a in alerts if "restored" in a.title]
-    assert len(restore_alerts) == 1
-    alert = restore_alerts[0]
-    assert alert.severity == AlertSeverity.INFO
-    assert "8" in alert.message  # restored max_concurrent_vms
-    assert "0.8" in alert.message  # restored failure gate
+    assert not [a for a in alerts if "restored" in a.title], (
+        "a recovery announcement must not leave a standing row of its own"
+    )
+
+    payloads = [
+        call.args[2]
+        for call in broadcast.await_args_list
+        if len(call.args) >= 3 and call.args[1] == "anomaly_adjustment"
+    ]
+    assert len(payloads) == 1, broadcast.await_args_list
+    assert payloads[0]["action"] == "restored"
+    assert payloads[0]["max_concurrent_vms"] == 8
+    assert payloads[0]["failure_gate_threshold"] == 0.8
 
 
 @pytest.mark.asyncio

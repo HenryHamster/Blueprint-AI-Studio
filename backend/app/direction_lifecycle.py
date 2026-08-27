@@ -1013,20 +1013,25 @@ async def _process_direction_lifecycle_locked(
             f"[AUTONOMOUS] Auto-retired lifetime-burn direction {did} after "
             f"{lb_pause_count} burn-pause cycles: {d.get('text', '')[:60]}"
         )
-        from app.models import Alert, AlertSeverity
+        from app.alert_policy import create_project_alert_if_allowed
+        from app.models import AlertSeverity
 
-        session.add(
-            Alert(
-                project_id=project.id,
-                event_type="research.direction_auto_retired",
-                severity=AlertSeverity.INFO,
-                title="Direction auto-retired (lifetime burn)",
-                message=(
-                    f"Direction '{d.get('text', '')[:80]}' was auto-retired after "
-                    f"{lb_pause_count} lifetime burn backstop pauses. "
-                    f"Slot freed for strategic agent to create a replacement."
-                ),
-            )
+        # Routed through the policy gate, not a raw ``Alert(...)`` insert.
+        # ``research.direction_auto_retired`` is TIMELINE_ONLY: the milestone
+        # message below IS the delivery. The raw insert also wrote a durable
+        # operator row that nothing could ever resolve -- "direction X was
+        # retired at T" has no future state in which it becomes false.
+        await create_project_alert_if_allowed(
+            session,
+            project_id=project.id,
+            event_type="research.direction_auto_retired",
+            severity=AlertSeverity.INFO,
+            title="Direction auto-retired (lifetime burn)",
+            message=(
+                f"Direction '{d.get('text', '')[:80]}' was auto-retired after "
+                f"{lb_pause_count} lifetime burn backstop pauses. "
+                f"Slot freed for strategic agent to create a replacement."
+            ),
         )
         try:
             from app.notification_dispatch import (
@@ -1086,22 +1091,23 @@ async def _process_direction_lifecycle_locked(
             _window_days,
             (d.get("text", "") or "")[:60],
         )
-        from app.models import Alert, AlertSeverity
+        from app.alert_policy import create_project_alert_if_allowed
+        from app.models import AlertSeverity
 
-        session.add(
-            Alert(
-                project_id=project.id,
-                event_type="research.direction_auto_retired",
-                severity=AlertSeverity.INFO,
-                title="Direction auto-retired (churn recommendation undecided)",
-                message=(
-                    f"Direction '{(d.get('text', '') or '')[:80]}' was recommended for "
-                    f"churn retirement and went undecided for {_undecided_h}h "
-                    f"(window {_window_days}d). The recommended retirement was applied "
-                    f"automatically. Slot freed for the strategic agent to create a "
-                    f"replacement; the direction remains resurrectable."
-                ),
-            )
+        # TIMELINE_ONLY via the policy gate; see the lifetime-burn site above.
+        await create_project_alert_if_allowed(
+            session,
+            project_id=project.id,
+            event_type="research.direction_auto_retired",
+            severity=AlertSeverity.INFO,
+            title="Direction auto-retired (churn recommendation undecided)",
+            message=(
+                f"Direction '{(d.get('text', '') or '')[:80]}' was recommended for "
+                f"churn retirement and went undecided for {_undecided_h}h "
+                f"(window {_window_days}d). The recommended retirement was applied "
+                f"automatically. Slot freed for the strategic agent to create a "
+                f"replacement; the direction remains resurrectable."
+            ),
         )
         try:
             from app.notification_dispatch import (
@@ -1246,21 +1252,30 @@ async def _process_direction_lifecycle_locked(
                     "remediation_attempts": int(d.get("remediation_attempts", 0)),
                 },
             )
-            from app.models import Alert, AlertSeverity
+            from app.alert_policy import create_project_alert_if_allowed
+            from app.models import AlertSeverity
 
-            session.add(
-                Alert(
-                    project_id=project.id,
-                    event_type="research.escalation_delivery_failed",
-                    severity=AlertSeverity.ERROR,
-                    title="Escalation notification delivery failed",
-                    message=(
-                        f"Direction {d.get('id')} ('{(d.get('text') or '')[:80]}') needs manual "
-                        f"intervention but the BLOCKER notification could not be delivered after "
-                        f"{retries} retries. Fingerprint={d.get('error_fingerprint') or '(unknown)'}, "
-                        f"remediation_attempts={int(d.get('remediation_attempts', 0))}."
-                    ),
-                )
+            # Routed through the policy gate, and DELIBERATELY still durable:
+            # message_audience classifies this event OPERATOR_ACTION_NEEDED, so
+            # suppressing it would delete an operator signal rather than move
+            # it to another surface. Its retirement mode is MANUAL -- honest,
+            # because nothing in the codebase resolves it -- and the dedupe_key
+            # is what stops a direction that keeps failing delivery from
+            # minting one indistinguishable ERROR row per lifecycle pass:
+            # repeats now bump occurrence_count on the single open row.
+            await create_project_alert_if_allowed(
+                session,
+                project_id=project.id,
+                event_type="research.escalation_delivery_failed",
+                severity=AlertSeverity.ERROR,
+                title="Escalation notification delivery failed",
+                dedupe_key=f"escalation_delivery_failed:{d.get('id')}",
+                message=(
+                    f"Direction {d.get('id')} ('{(d.get('text') or '')[:80]}') needs manual "
+                    f"intervention but the BLOCKER notification could not be delivered after "
+                    f"{retries} retries. Fingerprint={d.get('error_fingerprint') or '(unknown)'}, "
+                    f"remediation_attempts={int(d.get('remediation_attempts', 0))}."
+                ),
             )
             d.pop("escalation_notification_pending", None)
             directions_modified = True
@@ -2162,9 +2177,13 @@ async def _process_direction_lifecycle_locked(
                     f"[AUTONOMOUS] Auto-retired direction {did} after "
                     f"{code_pause_count} code-failure auto-pause cycles: {d.get('text', '')[:60]}"
                 )
-                from app.models import Alert, AlertSeverity
+                from app.alert_policy import create_project_alert_if_allowed
+                from app.models import AlertSeverity
 
-                alert = Alert(
+                # TIMELINE_ONLY via the policy gate; the milestone message below
+                # is the delivery.
+                await create_project_alert_if_allowed(
+                    session,
                     project_id=project.id,
                     event_type="research.direction_auto_retired",
                     severity=AlertSeverity.INFO,
@@ -2175,7 +2194,6 @@ async def _process_direction_lifecycle_locked(
                         f"Slot freed for strategic agent to create a replacement."
                     ),
                 )
-                session.add(alert)
                 try:
                     from app.notification_dispatch import (
                         post_direction_milestone_message,

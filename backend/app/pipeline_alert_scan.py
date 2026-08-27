@@ -185,6 +185,17 @@ async def _run_signal_staleness_watchdog(
             f"ago; freshness window is {round(threshold.total_seconds() / 3600, 1)}h."
         )
         if not await _alert_exists(session, project_id, title):
+            # DELIBERATE, DOCUMENTED BYPASS (see _POLICY_BYPASS_ALLOWLIST in
+            # backend/testing/test_alert_mint_sites.py).  ``sr.signal_stale`` is
+            # registered ``route=ROUTE_HEALTH``, so routing this insert through
+            # ``create_project_alert_if_allowed`` would suppress it outright --
+            # and this emitter has no other observable, so the staleness signal
+            # would vanish rather than move surfaces.  The contradiction between
+            # the registered route and the only live producer is a real defect
+            # and is owed a decision (give the condition a resolver and register
+            # it ROUTE_ALERT, or retire the emitter); it is NOT resolved by
+            # silently deleting the signal.  Retirement stays MANUAL so the
+            # policy backstop does not churn against a live producer.
             session.add(
                 Alert(
                     project_id=project_id,
@@ -216,6 +227,8 @@ async def _run_signal_staleness_watchdog(
                 "The trend is frozen."
             )
             if not await _alert_exists(session, project_id, title):
+                # Same registered-route contradiction as the staleness loop
+                # above; same allowlisted bypass, same owed decision.
                 session.add(
                     Alert(
                         project_id=project_id,
