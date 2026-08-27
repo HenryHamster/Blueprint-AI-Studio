@@ -115,6 +115,39 @@ def test_bot_trailer_and_recursive_title_only_merge_are_classified(
     assert cli_result["releases"][0]["provenance"]["merged_parent"] == 1
 
 
+def test_generated_pr_helper_blueprint_agent_trailer_is_classified(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    _run(repo, "switch", "-c", "release", "-q")
+    _commit(
+        repo,
+        "engine-authored fix",
+        "Blueprint Agent",
+        "blueprint-agent@automated.dev",
+        "Co-authored-by: Blueprint Agent <blueprint-agent@automated.dev>",
+    )
+    _run(repo, "switch", "main", "-q")
+    merge_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "GitHub",
+        "GIT_AUTHOR_EMAIL": "noreply@github.com",
+        "GIT_COMMITTER_NAME": "GitHub",
+        "GIT_COMMITTER_EMAIL": "noreply@github.com",
+    }
+    _run(repo, "merge", "--no-ff", "release", "-m", "Merge pull request #2", env=merge_env)
+    _run(repo, "tag", "-a", "v100", "-m", "Release v100")
+
+    row = report.measure_report(repo, ["v100"])["releases"][0]
+
+    assert row["total_commits"] == 2
+    assert row["provenance"] == {
+        "bot_identity": 0,
+        "co_authored_by": 1,
+        "merged_parent": 1,
+        "unattributed": 0,
+    }
+    assert row["zero_unattributed_commits"] is True
+
+
 def test_title_only_merge_does_not_create_provenance(tmp_path: Path) -> None:
     repo, _ = _release_fixture(tmp_path, trusted_side=False)
 
