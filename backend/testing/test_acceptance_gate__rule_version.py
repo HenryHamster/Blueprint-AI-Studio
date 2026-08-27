@@ -288,6 +288,36 @@ def _acceptance_rule_behavior_corpus() -> list[tuple[str, Task]]:
                 changed_files=[],
             ),
         ),
+        # named_test — ungrounded seam, declared test SHIPPED in the diff:
+        # the co-change floor credits it soft (never proven). This branch had no
+        # corpus entry before v4, which is why the rule-version guard could not
+        # have caught the floor landing without a bump.
+        (
+            "named_test_ungrounded_seam_test_shipped",
+            _make_code_task(
+                acceptance_evidence={
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_orchestrator_liveness.py",
+                },
+                changed_files=[
+                    "backend/app/reaper_sweeps.py",
+                    "backend/testing/test_orchestrator_liveness.py",
+                ],
+            ),
+        ),
+        # named_test — ungrounded seam, declared test ABSENT from the diff (it
+        # exists and ran green): the name-drop shape, still a hard fail.
+        (
+            "named_test_ungrounded_seam_namedrop",
+            _make_code_task(
+                acceptance_evidence={
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_orchestrator_liveness.py",
+                },
+                changed_files=["backend/app/reaper_sweeps.py"],
+                targeted_green=True,
+            ),
+        ),
         # unknown/future kind — fail closed.
         (
             "unknown_kind",
@@ -355,6 +385,13 @@ _ACCEPTANCE_RULE_BEHAVIOR_DIGESTS: dict[int, str] = {
     # of trusting a verdict the retired rule produced.
     2: "42d52a7f2d622758e02b936ad38f96836d4918c79729d5957886b4396e8006e8",
     3: "42d52a7f2d622758e02b936ad38f96836d4918c79729d5957886b4396e8006e8",
+    # v4 retires the v3 rule for the ungrounded-seam branch: a declared
+    # named_test that the PR SHIPPED alongside production code under a verified
+    # merge is now credited SOFT (satisfied, never proven) instead of hard-failed.
+    # The digest necessarily moves off the v1-v3 value because this bump also adds
+    # the two ungrounded-seam corpus entries that branch never had — the reason
+    # the pin could not have caught the change on its own.
+    4: "11cc501314a34b94437fc7d648b1d2f07125933644820cb0a870bba300ca3f60",
 }
 
 
@@ -467,11 +504,12 @@ async def test_rule_version_bump_rederives_merged_work_during_qualification(
         unsatisfied. The current rule judges the SAME persisted merge record
         proven (test in diff + verified merge + grounded seam), so the tally
         must flip it out of ``declared_unsatisfied`` into ``proven``.
-      * ``downgrade_task`` — verdict stamped under the RETIRED rule as proven.
-        The current rule judges the same record UNSATISFIED (its production
-        seam no longer grounds the declared test — a hard fail, not a soft
-        unproven), so re-derivation is honest, not monotonic: the downgrade
-        happens and is reported.
+        * ``downgrade_task`` — verdict stamped under the RETIRED rule as proven.
+          The current rule judges the same record satisfied but UNPROVEN (the PR
+          shipped its declared test, but its production seam does not ground the
+          test by module name), so re-derivation is honest, not monotonic: the
+          proof downgrade happens and is reported without recreating the merge-
+          credit inversion fixed by v4.
       * ``control_task``   — verdict stamped under the CURRENT rule,
         unsatisfied. Trusted verbatim, never re-derived.
 
@@ -545,9 +583,9 @@ async def test_rule_version_bump_rederives_merged_work_during_qualification(
         ],
         status=TaskStatus.COMPLETED,
         context=_stale_context(
-            # consumer.py does NOT semantically ground test_widget.py — the
-            # retired rule stamped it proven, the current rule caps it at
-            # satisfied/unproven.
+                # consumer.py does NOT semantically ground test_widget.py. The
+                # retired rule stamped it proven; v4 credits the shipped-test
+                # co-change floor but caps it at satisfied/unproven.
             changed_files=[
                 "backend/app/consumer.py",
                 "backend/testing/test_widget.py",
@@ -600,7 +638,7 @@ async def test_rule_version_bump_rederives_merged_work_during_qualification(
     assert eff_upgrade["proven"] is True
     eff_downgrade = effective_acceptance_verdict(downgrade_task)
     assert eff_downgrade is not downgrade_task.context[CODE_ACCEPTANCE_VERDICT_KEY]
-    assert eff_downgrade["satisfied"] is False
+    assert eff_downgrade["satisfied"] is True
     assert eff_downgrade["proven"] is False
     assert (
         effective_acceptance_verdict(control_task)
@@ -614,16 +652,16 @@ async def test_rule_version_bump_rederives_merged_work_during_qualification(
 
     agg = await rq._compute_acceptance_window_aggregate(db_session, version)
 
-    # (a) Tally: the upgrade flips into proven; the downgrade and the current-rule
-    # control both land in declared_unsatisfied. Without re-derivation the upgrade
-    # would ALSO sit in declared_unsatisfied and the fraction would be 0/3 instead
-    # of 1/3 — the bump is what changes already-merged work's score.
+    # (a) Tally: the upgrade flips into proven; the proof downgrade lands in
+    # satisfied_unproven; only the current-rule control stays unsatisfied. Without
+    # re-derivation the upgrade would still sit in declared_unsatisfied and the
+    # retired proof would remain overstated.
     assert agg["acceptance_window_total"] == 3
-    assert agg["acceptance_window_verified"] == 1
-    assert agg["acceptance_window_fraction"] == pytest.approx(1 / 3)
+    assert agg["acceptance_window_verified"] == 2
+    assert agg["acceptance_window_fraction"] == pytest.approx(2 / 3)
     assert agg["acceptance_window_buckets"]["proven"] == 1
-    assert agg["acceptance_window_buckets"]["satisfied_unproven"] == 0
-    assert agg["acceptance_window_buckets"]["declared_unsatisfied"] == 2
+    assert agg["acceptance_window_buckets"]["satisfied_unproven"] == 1
+    assert agg["acceptance_window_buckets"]["declared_unsatisfied"] == 1
 
     # (b) The stamp is recorded DURABLY on the already-merged tasks — not a
     # per-drive throwaway: the re-derived verdict carries the CURRENT rule and
@@ -649,7 +687,7 @@ async def test_rule_version_bump_rederives_merged_work_during_qualification(
         ACCEPTANCE_RULE_VERSION
     )
     assert down_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["proven"] is False
-    assert down_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["satisfied"] is False
+    assert down_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["satisfied"] is True
     assert down_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["land_time_verdict"]["proven"] is True
     # A current-rule stamp is untouched — verbatim.
     assert (
