@@ -21,6 +21,7 @@ from app.github import (
     create_pr_comment,
     create_pr_review_comment,
     create_pull_request,
+    reconcile_open_pull_request,
     get_check_runs_cached,
     get_issues,
     get_pull_request,
@@ -328,12 +329,34 @@ async def agent_github_create_pr(
             pr_number = int(existing_artifact.pr_url.rstrip("/").split("/")[-1])
             pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             if pr_data.get("state") == "open":
+                if req.expected_head_sha is None:
+                    logger.info(
+                        f"[PR] Task {req.task_id} already has open PR artifact: "
+                        f"{existing_artifact.pr_url}; legacy caller omitted exact head SHA"
+                    )
+                    return {
+                        "status": "success",
+                        "data": {"html_url": existing_artifact.pr_url},
+                    }
                 logger.info(
-                    f"[PR] Task {req.task_id} already has open PR artifact: {existing_artifact.pr_url}"
+                    f"[PR] Task {req.task_id} already has open PR artifact; "
+                    f"reconciling its fresh title/body: {existing_artifact.pr_url}"
                 )
+                result = await reconcile_open_pull_request(
+                    gh_token,
+                    owner,
+                    repo,
+                    pr_data,
+                    title=req.title,
+                    body=req.body,
+                    expected_head=req.head,
+                    expected_head_sha=req.expected_head_sha,
+                    expected_base=req.base,
+                )
+                result.setdefault("html_url", existing_artifact.pr_url)
                 return {
                     "status": "success",
-                    "data": {"html_url": existing_artifact.pr_url},
+                    "data": result,
                 }
             logger.warning(
                 f"[PR] Task {req.task_id} cached PR #{pr_number} is {pr_data.get('state')} "
@@ -371,6 +394,8 @@ async def agent_github_create_pr(
         head=req.head,
         base=req.base,
         body=req.body,
+        reconcile_existing=req.expected_head_sha is not None,
+        expected_head_sha=req.expected_head_sha,
     )
 
     pr_url = result.get("html_url", "")

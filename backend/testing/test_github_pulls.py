@@ -148,8 +148,7 @@ async def test_create_pr_proceeds_when_lookup_confirms_none(mocker):
 
 @pytest.mark.asyncio
 async def test_create_pr_dedups_to_existing_open_pr(mocker):
-    """An existing open PR (real HTTP 200 with a PR) is returned as-is; the
-    create POST is never sent."""
+    """A legacy caller without exact SHA gets the existing PR without PATCH."""
     from app import github_pulls
 
     existing_pr = {"number": 9, "html_url": "https://github.com/owner/repo/pull/9"}
@@ -159,7 +158,14 @@ async def test_create_pr_dedups_to_existing_open_pr(mocker):
     )
 
     result = await github_pulls.create_pull_request(
-        "ghs_token", "owner", "repo", "Title", "feature-head", "main"
+        "ghs_token",
+        "owner",
+        "repo",
+        "Title",
+        "feature-head",
+        "main",
+        reconcile_existing=False,
+        expected_head_sha=None,
     )
 
     assert result == existing_pr

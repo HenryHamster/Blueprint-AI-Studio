@@ -1537,7 +1537,11 @@ describe('failure category classification', () => {
   });
 
   it('pushAndCreatePR does not embed token in remote set-url', async () => {
-    vi.mocked(execFileSync).mockReturnValue('');
+    const pushedHeadSha = 'a'.repeat(40);
+    vi.mocked(execFileSync).mockImplementation((_cmd, args) => {
+      if (Array.isArray(args) && args.join(' ') === 'rev-parse HEAD') return pushedHeadSha;
+      return '';
+    });
     vi.mocked(spawn).mockImplementation(() => {
       const proc = {
         pid: 123,
@@ -1574,11 +1578,20 @@ describe('failure category classification', () => {
       expect(urlInCall).not.toContain('x-access-token');
       expect(urlInCall).not.toContain('fresh-push-token');
     }
+    const prRequest = vi.mocked(fetch).mock.calls[1];
+    const prRequestBody = (prRequest[1] as RequestInit).body;
+    expect(typeof prRequestBody).toBe('string');
+    expect(JSON.parse(prRequestBody as string)).toMatchObject({
+      expected_head_sha: pushedHeadSha,
+    });
   });
 
   it('pushAndCreatePR attaches pr_creation_failed when GitHub PR creation returns 403', async () => {
     // Allow all execFileSync calls (git remote set-url, curl heartbeat)
-    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(execFileSync).mockImplementation((_cmd, args) => {
+      if (Array.isArray(args) && args.join(' ') === 'rev-parse HEAD') return 'b'.repeat(40);
+      return '';
+    });
     // Mock spawn to make gitAsync push succeed
     vi.mocked(spawn).mockImplementation(() => {
       const proc = {
