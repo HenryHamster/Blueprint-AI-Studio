@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -657,6 +657,23 @@ def test_phase_start_evidence_never_uses_phase1_start_for_phase2():
     )
     assert source == strategic_cycle.PHASE_START_FROM_PHASE1_COMPLETED
     assert value == cycle.phase1_completed_at
+
+
+def test_phase_start_evidence_rejects_non_utc_aware_observation():
+    cycle = StrategicCycle(
+        id="sc-evidence-offset",
+        project_id=uuid.uuid4(),
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow() - timedelta(hours=9),
+        phase1_completed_at=None,
+        phase2_started_at=None,
+    )
+    non_utc = _utcnow().replace(tzinfo=timezone(timedelta(hours=1)))
+
+    with pytest.raises(ValueError, match="Expected UTC or naive datetime"):
+        strategic_cycle.phase_start_evidence(
+            cycle, phase="phase2", linked_task=None, now=non_utc
+        )
 
 
 def test_phase_start_evidence_phase1_falls_back_to_the_cycle_row():

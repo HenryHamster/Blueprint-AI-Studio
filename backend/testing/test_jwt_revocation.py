@@ -24,6 +24,7 @@ def _make_sync_session(dialect_name="postgresql"):
     bind.dialect.name = dialect_name
     session = MagicMock()
     session.bind = bind
+    session.get_bind.return_value = bind
     session.execute = MagicMock()
     return session
 
@@ -46,6 +47,14 @@ class TestEmitTaskTerminatedNotify:
         from app.jwt_revocation import emit_task_terminated_notify
 
         session = _make_sync_session()
+        emit_task_terminated_notify(session, "some-task-id")
+        session.execute.assert_not_called()
+
+    def test_noop_when_process_is_postgres_but_session_is_sqlite(self, monkeypatch):
+        monkeypatch.setattr("app.jwt_revocation._IS_POSTGRES", True)
+        from app.jwt_revocation import emit_task_terminated_notify
+
+        session = _make_sync_session("sqlite")
         emit_task_terminated_notify(session, "some-task-id")
         session.execute.assert_not_called()
 
@@ -84,6 +93,14 @@ class TestEmitTaskRevivedNotify:
         from app.jwt_revocation import emit_task_revived_notify
 
         session = _make_sync_session()
+        emit_task_revived_notify(session, "some-task-id")
+        session.execute.assert_not_called()
+
+    def test_noop_when_process_is_postgres_but_session_is_sqlite(self, monkeypatch):
+        monkeypatch.setattr("app.jwt_revocation._IS_POSTGRES", True)
+        from app.jwt_revocation import emit_task_revived_notify
+
+        session = _make_sync_session("sqlite")
         emit_task_revived_notify(session, "some-task-id")
         session.execute.assert_not_called()
 

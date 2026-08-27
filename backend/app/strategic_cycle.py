@@ -43,7 +43,7 @@ from app.orchestrator_runner_placement import (
 from app.problem_model import sanitize_problem_model_raw
 from app.strategic_constants import CYCLE_SUMMARY_MAX
 from app.strategic_runtime_work import task_is_strategic_local_runner_hold
-from app.time_utils import _utcnow
+from app.time_utils import _strip_tz_assume_utc, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -1131,15 +1131,6 @@ def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
 # ── Missing phase-start repair ──────────────────────────────────────────────
 
 
-def _as_naive_utc(value):
-    """Naive-UTC copy of ``value``.  ``None`` passes through unchanged."""
-    if value is None:
-        return None
-    if getattr(value, "tzinfo", None) is not None:
-        return value.replace(tzinfo=None)
-    return value
-
-
 def phase_start_evidence(
     cycle: StrategicCycle,
     *,
@@ -1167,7 +1158,7 @@ def phase_start_evidence(
     DECIDES (no operator is asked for a fact the row simply lost) and refuses to
     assert an age nothing measured.
     """
-    resolved_now = _as_naive_utc(now) or _utcnow()
+    resolved_now = _strip_tz_assume_utc(now) or _utcnow()
     if phase == "phase2":
         candidates = (
             (getattr(linked_task, "created_at", None), PHASE_START_FROM_LINKED_TASK),
@@ -1179,7 +1170,7 @@ def phase_start_evidence(
             (cycle.created_at, PHASE_START_FROM_CYCLE_CREATED),
         )
     for value, source in candidates:
-        naive = _as_naive_utc(value)
+        naive = _strip_tz_assume_utc(value)
         if naive is not None:
             return naive, source
     return resolved_now, PHASE_START_FROM_OBSERVATION
@@ -1244,7 +1235,7 @@ async def repair_missing_phase_starts(
     """
     from app import pause_clock  # noqa: PLC0415 — local import avoids load cycle
 
-    resolved_now = _as_naive_utc(now) or _utcnow()
+    resolved_now = _strip_tz_assume_utc(now) or _utcnow()
     stmt = (
         select(StrategicCycle)
         .where(

@@ -28,6 +28,7 @@ from app.strategic_review_effort import (
 from app.direction_metrics import (
     _compute_direction_quality_score,
     canonical_cost_per_merged_pr,
+    unproductive_streak_summary,
 )
 from app.direction_outcomes import (
     compute_direction_autonomy_state,
@@ -5409,6 +5410,37 @@ def _build_direction_stats(
         ).strip()
         if _retirement_condition:
             stat_entry["retirement_condition"] = _retirement_condition[:_DIR_FIELD_MAX]
+        # ---- Dud evidence: WHY a direction may deserve retirement -------------
+        # ``retirement_eligible`` above is a SUCCESS/graduation milestone (enough
+        # VERIFIED autonomous merges with zero operator actions) — it says a
+        # direction has proven itself, NOT that it is a dud. The cost/merge
+        # ``retirement_consideration_*`` flag DOES already reach this payload
+        # (below), but the per-cycle productivity judgment did not: the strategist
+        # — the only actor that can call ``retire_direction`` — could see that a
+        # direction was EXPENSIVE, never that it had been unproductive for N cycles
+        # running, nor why. Surface that here, with reasons rather than a bare
+        # counter, so a keep-or-retire call is made on evidence.
+        #
+        # Deliberately NOT an automatic cull: retirement stays a single judged
+        # decision through ``retire_direction`` (guarded by
+        # ``validate_direction_terminal_transition``). See the PR rationale.
+        _unproductive = int(d.get("consecutive_unproductive_cycles", 0) or 0)
+        if _unproductive > 0:
+            stat_entry["consecutive_unproductive_cycles"] = _unproductive
+            _streak = unproductive_streak_summary(d)
+            if _streak:
+                stat_entry["unproductive_streak"] = _streak[:_DIR_FIELD_MAX]
+        _last_productivity = d.get("last_productivity_reason")
+        if isinstance(_last_productivity, dict) and _last_productivity.get(
+            "reason_code"
+        ):
+            stat_entry["last_productivity_reason"] = {
+                "productive": bool(_last_productivity.get("productive")),
+                "reason_code": str(_last_productivity.get("reason_code"))[
+                    :_DIR_FIELD_MAX
+                ],
+                "detail": str(_last_productivity.get("detail") or "")[:_DIR_FIELD_MAX],
+            }
         # Retired-origin grounding: when this direction was created as a
         # continuation/re-staffing of a retired one, strategic_completion stores
         # a compact grounding object under context["retired_direction_grounding"]

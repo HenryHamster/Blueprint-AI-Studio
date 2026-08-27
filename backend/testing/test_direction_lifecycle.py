@@ -5743,3 +5743,144 @@ async def test_marker_less_paused_direction_never_auto_recovers(db_session):
 
     stuck = next(x for x in project.directions if x["id"] == "d-markerless")
     assert stuck["status"] == "paused"
+# ─────────────────────────────────────────────────────────────────────────────
+# Dud evidence reaches the strategist — the only actor that can retire a
+# direction — as REASONS, not a bare counter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _unproductive_direction(direction_id: str, cycles: int) -> dict:
+    """An active direction that has been unproductive for ``cycles`` cycles, with
+    the reason ring the production writers record."""
+    from app.direction_metrics import record_direction_productivity
+
+    d: dict = {
+        "id": direction_id,
+        "text": "A direction that stopped producing",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    for i in range(cycles):
+        record_direction_productivity(
+            d,
+            productive=False,
+            reason_code=(
+                "no_actionable_findings" if i % 2 else "no_children_no_findings"
+            ),
+            detail=f"research cycle {i} attributed neither a child task nor a finding",
+            task_id=f"task-{i}",
+            at_iso=f"2026-08-2{i}T00:00:00+00:00",
+        )
+    return d
+
+
+def test_strategist_direction_stats_surface_the_unproductive_streak_and_why():
+    """``retire_direction`` is a strategist op, and the strategist decides from
+    this payload. The cost/merge ``retirement_consideration_*`` flag already
+    reached it; the per-cycle productivity judgment did not, so a direction could
+    be visibly EXPENSIVE but never visibly UNPRODUCTIVE. Both halves must be
+    present, and the productivity half must carry its reasons — a bare
+    ``consecutive_unproductive_cycles: 5`` cannot distinguish a direction that
+    spawned nothing from one that spawned plenty and merged nothing.
+    """
+    from types import SimpleNamespace
+
+    from app.strategic_spawning import _build_direction_stats
+
+    dud = _unproductive_direction("d-dud", 5)
+    productive = {
+        "id": "d-healthy",
+        "text": "A direction still producing",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "last_cycle_productive": True,
+        "consecutive_unproductive_cycles": 0,
+    }
+    _included, stats = _build_direction_stats(
+        SimpleNamespace(directions=[dud, productive])
+    )
+    by_id = {s["id"]: s for s in stats}
+
+    dud_stat = by_id["d-dud"]
+    assert dud_stat["consecutive_unproductive_cycles"] == 5
+    streak = dud_stat["unproductive_streak"]
+    assert "5 consecutive unproductive cycle(s)" in streak
+    # Surface REASONS, not states: the distinct causes are named.
+    assert "no_actionable_findings" in streak
+    assert "no_children_no_findings" in streak
+    last = dud_stat["last_productivity_reason"]
+    assert last["productive"] is False
+    assert last["reason_code"] in ("no_actionable_findings", "no_children_no_findings")
+    assert last["detail"]
+
+    # A productive direction carries no dud noise at all: a zero streak is
+    # omitted rather than emitted as a 0, so the strategist's attention is not
+    # split across every healthy direction.
+    healthy_stat = by_id["d-healthy"]
+    assert "consecutive_unproductive_cycles" not in healthy_stat
+    assert "unproductive_streak" not in healthy_stat
+
+
+def test_strategist_direction_stats_tolerate_a_legacy_direction_without_reasons():
+    """A direction carrying the legacy counter but no reason ring (written before
+    this landed) still surfaces its streak — fail-safe, reasons simply omitted."""
+    from types import SimpleNamespace
+
+    from app.strategic_spawning import _build_direction_stats
+
+    legacy = {
+        "id": "d-legacy",
+        "text": "Legacy direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "last_cycle_productive": False,
+        "consecutive_unproductive_cycles": 3,
+    }
+    _included, stats = _build_direction_stats(SimpleNamespace(directions=[legacy]))
+    stat = stats[0]
+    assert stat["consecutive_unproductive_cycles"] == 3
+    assert stat["unproductive_streak"] == "3 consecutive unproductive cycle(s)"
+    assert "last_productivity_reason" not in stat
+
+
+def test_strategic_payload_compaction_keeps_the_unproductive_streak():
+    """The dud signal must survive payload trimming, or the strategist never sees
+    it. ``_compact_direction_summary_entry`` is an ALLOWLIST: a key that is not
+    named there is dropped silently, which is exactly how a signal can be
+    computed, alerted on, rendered in the UI, and still never reach the decision.
+    """
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    out = _compact_direction_summary_entry(
+        {
+            "id": "d-dud",
+            "status": "active",
+            "consecutive_unproductive_cycles": 4,
+            "unproductive_streak": (
+                "4 consecutive unproductive cycle(s); reasons: "
+                "no_actionable_findings, no_children_no_findings"
+            ),
+            "last_productivity_reason": {
+                "productive": False,
+                "reason_code": "no_actionable_findings",
+                "detail": "research cycle completed with zero actionable findings",
+                "consecutive_unproductive_cycles": 4,
+            },
+        }
+    )
+    assert out.get("consecutive_unproductive_cycles") == 4
+    assert "4 consecutive unproductive cycle(s)" in (out.get("unproductive_streak") or "")
+    assert "no_actionable_findings" in (out.get("unproductive_streak") or "")
+    compacted_reason = out.get("last_productivity_reason") or {}
+    assert compacted_reason.get("reason_code") == "no_actionable_findings"
+    assert compacted_reason.get("productive") is False
+    assert compacted_reason.get("detail")

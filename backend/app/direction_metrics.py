@@ -36,6 +36,141 @@ _PROOF_WEIGHT_PROVEN = 1.0
 _PROOF_WEIGHT_DECLARED_UNPROVEN = 0.7
 _PROOF_WEIGHT_UNDECLARED = 0.4
 
+# ---------------------------------------------------------------------------
+# Per-cycle productivity judgment, recorded WITH its reason.
+# ---------------------------------------------------------------------------
+# Every writer of ``last_cycle_productive`` / ``consecutive_unproductive_cycles``
+# routes through :func:`record_direction_productivity` so the judgment is never a
+# bare boolean. A direction that reads ``last_cycle_productive: false`` with no
+# stated cause is unactionable: an operator (and the strategist, which is the ONLY
+# actor that can retire a direction) cannot tell a direction that spawned nothing
+# from one that spawned plenty and merged nothing, and the two want opposite
+# responses.
+
+# Bounded ring of per-cycle productivity judgments kept on a direction. Ten
+# matches ``research_history``'s retention so a reader can line the two up cycle
+# for cycle without one outliving the other.
+PRODUCTIVITY_REASON_HISTORY_MAX = 10
+
+# The mutually-exclusive reason codes a per-cycle productivity judgment can
+# carry. Machine-stable keys for filtering/aggregation; the human sentence lives
+# in the accompanying ``detail``.
+#
+#   * ``spawned_children``        - productive: the cycle spawned >=1 child task.
+#   * ``non_spawn_findings``      - productive: no children, but the cycle
+#                                   recorded verification/metadata findings.
+#   * ``no_children_no_findings`` - UNPRODUCTIVE: the cycle attributed neither a
+#                                   child task nor a finding to this direction.
+#   * ``no_actionable_findings``  - UNPRODUCTIVE: research completed with zero
+#                                   actionable findings (the early-return path).
+#   * ``research_cycle_failed``   - UNPRODUCTIVE: the research task itself failed.
+PRODUCTIVITY_REASON_CODES: tuple[str, ...] = (
+    "spawned_children",
+    "non_spawn_findings",
+    "no_children_no_findings",
+    "no_actionable_findings",
+    "research_cycle_failed",
+)
+
+# Maximum stored length of a productivity ``detail`` sentence. Bounded because
+# the ring is persisted inside the project's directions JSONB and is rendered
+# into the strategist's bounded per-direction stat block.
+PRODUCTIVITY_REASON_DETAIL_MAX = 300
+
+
+def record_direction_productivity(
+    direction: dict,
+    *,
+    productive: bool,
+    reason_code: str,
+    detail: str,
+    task_id: str | None = None,
+    at_iso: str | None = None,
+    bump: bool = True,
+) -> int:
+    """Record one cycle's productivity judgment on ``direction`` WITH its reason.
+
+    Writes the two legacy fields unchanged (``last_cycle_productive`` and, when
+    ``bump``, ``consecutive_unproductive_cycles``) and additionally records:
+
+      * ``last_productivity_reason`` - the current judgment: reason code, the
+        operator-readable detail sentence, the deciding research task id, the
+        timestamp, and the resulting consecutive-unproductive count;
+      * ``productivity_reason_history`` - the last
+        :data:`PRODUCTIVITY_REASON_HISTORY_MAX` such judgments, so "which cycles
+        were unproductive, and why each one was" is answerable from the direction
+        record alone instead of requiring a log dig.
+
+    ``bump=False`` records the judgment WITHOUT advancing/resetting the
+    consecutive counter - for the caller that re-stamps the same research task's
+    verdict idempotently and must not double-count one cycle.
+
+    Returns the direction's resulting ``consecutive_unproductive_cycles``.
+
+    Pure dict mutation, no I/O; safe to call inside a ``with_directions_locked``
+    mutator.
+    """
+    direction["last_cycle_productive"] = productive
+    if bump:
+        if productive:
+            direction["consecutive_unproductive_cycles"] = 0
+        else:
+            direction["consecutive_unproductive_cycles"] = (
+                int(direction.get("consecutive_unproductive_cycles", 0) or 0) + 1
+            )
+    consecutive = int(direction.get("consecutive_unproductive_cycles", 0) or 0)
+    record = {
+        "productive": productive,
+        "reason_code": reason_code,
+        "detail": (detail or "")[:PRODUCTIVITY_REASON_DETAIL_MAX],
+        "consecutive_unproductive_cycles": consecutive,
+    }
+    if task_id:
+        record["task_id"] = str(task_id)
+    if at_iso:
+        record["at"] = at_iso
+    direction["last_productivity_reason"] = record
+    history = direction.get("productivity_reason_history")
+    if not isinstance(history, list):
+        history = []
+    if not bump and history:
+        # ``bump=False`` is an idempotent re-stamp of the current cycle. Keep the
+        # reason fresh without manufacturing a second history entry for it.
+        history = [*history[:-1], record]
+    else:
+        history = [*history, record]
+    direction["productivity_reason_history"] = history[-PRODUCTIVITY_REASON_HISTORY_MAX:]
+    return consecutive
+
+
+def unproductive_streak_summary(direction: dict) -> str | None:
+    """One operator-readable sentence naming the direction's unproductive streak
+    and the distinct reasons behind it, or ``None`` when the streak is zero.
+
+    Reads only what :func:`record_direction_productivity` persists, so it is safe
+    on legacy directions that carry a counter but no reason ring (the reasons
+    clause is simply omitted). This is the string the strategist sees next to a
+    dud direction - the "which cycles, which missing signal" the bare
+    ``consecutive_unproductive_cycles`` integer never carried.
+    """
+    consecutive = int(direction.get("consecutive_unproductive_cycles", 0) or 0)
+    if consecutive <= 0:
+        return None
+    history = direction.get("productivity_reason_history")
+    reasons: list[str] = []
+    if isinstance(history, list):
+        for record in reversed(history):
+            if not isinstance(record, dict) or record.get("productive") is not False:
+                break
+            code = record.get("reason_code")
+            if isinstance(code, str) and code and code not in reasons:
+                reasons.append(code)
+    summary = f"{consecutive} consecutive unproductive cycle(s)"
+    if reasons:
+        summary += f"; reasons: {', '.join(reasons)}"
+    return summary
+
+
 def _weight_merged(
     verified: int, merged_write: int, proven: int, declared: int
 ) -> float:
@@ -985,6 +1120,5 @@ def canonical_cost_per_merged_pr(
     if total_merged_prs <= 0:
         return None
     return round(total_cost / total_merged_prs, 4)
-
 
 
