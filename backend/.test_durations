@@ -17792,7 +17792,6 @@
   "testing/test_resource_envelope_enforcement.py::test_dispatch_passes_task_under_spend_ceiling": 0.5888207160169259,
   "testing/test_resource_envelope_enforcement.py::test_dispatch_passes_task_under_vm_cap": 0.4471032320288941,
   "testing/test_resource_envelope_enforcement.py::test_dispatch_passes_task_with_no_envelope": 0.5079076079418883,
-  "testing/test_resource_envelope_enforcement.py::test_dispatch_projected_count_stops_double_admit": 0.5163277560495771,
   "testing/test_resource_envelope_enforcement.py::test_dispatch_resource_cache_refreshes_project_expired_by_rollback": 0.38186267600394785,
   "testing/test_resource_envelope_enforcement.py::test_filter_broadcasts_on_new_defer_message": 0.6096662389463745,
   "testing/test_resource_envelope_enforcement.py::test_filter_no_broadcast_when_message_unchanged": 0.5149504749570042,
