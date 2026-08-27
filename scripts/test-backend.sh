@@ -883,6 +883,7 @@ if [ "${1:-}" = "--standalone" ]; then
     testing/test_audit_finding_class_guards.py
     testing/test_admin_auth_invariant.py
     testing/test_release_promotion_metric_manifest.py
+    testing/test_discovery_evidence_bound.py
     testing/test_dependency_deprecations.py
     testing/test_websocket_emitter_inventory.py
     testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
