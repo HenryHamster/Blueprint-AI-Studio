@@ -437,6 +437,13 @@ def _qualifier_ci_resolves_green(mocker, monkeypatch):
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
     )
+    # Promotion tests use the synthetic App token above. Default its explicit
+    # rerun-capability mint to a verified token; capability-specific tests
+    # re-patch this helper after the fixture and therefore override it.
+    mocker.patch(
+        "app.github.mint_repo_installation_token_with_permissions",
+        new=AsyncMock(return_value="promotion-capability-token"),
+    )
     mocker.patch(
         "app.release_prepromotion_rehearsal.github.dispatch_workflow_run",
         new=AsyncMock(return_value=True),

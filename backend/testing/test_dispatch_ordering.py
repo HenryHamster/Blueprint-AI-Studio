@@ -21,13 +21,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.orchestrator_filters import (
-    apply_completion_priority,
     cap_pipeline_slots,
     reserve_slots_for_types,
     apply_project_fairness,
     dispatch_window_size,
     filter_failing_types,
     _project_fairness_weight,
+    reorder_by_completion_priority,
 )
 from app.orchestrator_health import reorder_eligible_by_health
 
@@ -43,6 +43,7 @@ def _task(tid, *, ttype=None, scope=None, risk=None, project_id=None):
     return SimpleNamespace(
         id=tid,
         context=ctx,
+        parent_task_id=None,
         project_id=project_id,
         first_payload=payload,
     )
@@ -295,30 +296,50 @@ def test_reserve_no_promotion_when_reserved_type_already_present():
     assert out == ["c1", "r1", "r2"]
 
 
+@pytest.mark.parametrize("gate_type", ["release_audit", "release_audit_challenge"])
 @pytest.mark.asyncio
-async def test_urgent_release_audit_survives_all_dispatch_reorders():
-    audit = _task("audit", ttype="release_audit", scope="medium")
+async def test_urgent_release_audit_survives_all_dispatch_reorders(gate_type):
+    audit = _task("audit", ttype=gate_type, scope="medium")
     audit.priority = 100
-    ordinary = _task("ordinary", ttype="create", scope="small", risk="low")
-    ordinary.priority = 50
-    tasks = [audit, ordinary]
+    audit.created_by = "ORCHESTRATOR"
+    audit.origination = "QUALIFIER"
+    audit.context.update(
+        {
+            "release_version_id": "11111111-1111-4111-8111-111111111111",
+            "qualification_attempt_id": "22222222-2222-4222-8222-222222222222",
+            "candidate_sha": "a" * 40,
+        }
+    )
+    audit.first_payload.update(
+        {
+            "candidate_sha": "a" * 40,
+            "qualification_attempt_id": "22222222-2222-4222-8222-222222222222",
+        }
+    )
+    review = _task("review", ttype="review", scope="small", risk="low")
+    review.priority = 50
+    create = _task("create", ttype="create", scope="small", risk="low")
+    create.priority = 100
+    create.created_by = "AGENT"
+    create.origination = "AGENT"
+    tasks = [audit, review, create]
 
     health_ordered = await reorder_eligible_by_health(
-        [audit.id, ordinary.id],
+        [audit.id, review.id, create.id],
         tasks,
         recent_results=[],
         slots_available=1,
-        runtime_config={"max_concurrent_vms": 8, "dispatch_confidence_floor": 0.0},
+        runtime_config={"max_concurrent_vms": 8, "dispatch_confidence_floor": 0.5},
         zone_summary=_HEALTHY_ZONES,
         session=_FakeSession(0),
         predict_fn=lambda scope, direction, proj: 0.2 if scope == "medium" else 0.9,
     )
-    completion_ordered = apply_completion_priority(
+    assert audit.id in health_ordered, "a trusted release gate must bypass the floor"
+    completion_ordered = await reorder_by_completion_priority(
         health_ordered,
-        {audit.id: "release_audit", ordinary.id: "create"},
-        {audit.id: None, ordinary.id: None},
+        tasks,
         set(),
-        set(),
+        None,
     )
     reserved = reserve_slots_for_types(
         completion_ordered,
@@ -327,7 +348,39 @@ async def test_urgent_release_audit_survives_all_dispatch_reorders():
         slots_available=1,
     )
 
-    assert reserved == [audit.id, ordinary.id]
+    assert reserved == [audit.id, review.id, create.id]
+
+
+@pytest.mark.asyncio
+async def test_agent_authored_priority_cannot_claim_release_gate_tier():
+    agent_work = _task("agent-work", ttype="release_audit", scope="small")
+    agent_work.priority = 100
+    agent_work.created_by = "AGENT"
+    agent_work.origination = "AGENT"
+    agent_work.context.update(
+        {
+            "release_version_id": "11111111-1111-4111-8111-111111111111",
+            "qualification_attempt_id": "22222222-2222-4222-8222-222222222222",
+            "candidate_sha": "a" * 40,
+        }
+    )
+    agent_work.first_payload.update(
+        {
+            "candidate_sha": "a" * 40,
+            "qualification_attempt_id": "22222222-2222-4222-8222-222222222222",
+        }
+    )
+    review = _task("review", ttype="review", scope="small")
+    review.priority = 50
+
+    ordered = await reorder_by_completion_priority(
+        [agent_work.id, review.id],
+        [agent_work, review],
+        set(),
+        None,
+    )
+
+    assert ordered == [review.id, agent_work.id]
 
 
 # ---------------------------------------------------------------------------

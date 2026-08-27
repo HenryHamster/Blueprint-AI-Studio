@@ -134,11 +134,11 @@ Create at https://github.com/settings/apps/new with these settings:
 | Webhook URL | `<CLOUD_RUN_URL>/api/github/webhook` |
 | Webhook secret | Any random string (must match what you give setup.sh) |
 
-**Repository permissions:** Contents (R&W), Pull requests (R&W), Commit statuses (R&W), Issues (R&W), Checks (R)
+**Repository permissions:** Actions (R&W), Contents (R&W), Pull requests (R&W), Commit statuses (R&W), Issues (R&W), Checks (R)
 
 **Subscribe to events:** Push, Pull request, Check runs
 
-> **Note:** Existing GitHub App installations will need to accept the updated permissions before check_run webhooks are delivered.
+> **Note:** Existing GitHub App installations must accept updated permissions. Actions (R&W) is required for the promotion manager's bounded failed-job rerun; without it, promotion fails closed before opening a release PR.
 
 After creating, grab: App ID, Client ID, Client Secret, private key .pem file.
 

@@ -34,6 +34,7 @@ import { writePrHelper } from './pr-helper.js';
 // /tmp, so the cross-process file handoff cannot be observed — skip there. The
 // suite runs in full on Linux CI.
 const describePosix = process.platform === 'win32' ? describe.skip : describe;
+const fixtureHeadSha = 'a'.repeat(40);
 
 describePosix('writePrHelper', () => {
   let capturedScripts: Record<string, string> = {};
@@ -63,10 +64,33 @@ describePosix('writePrHelper', () => {
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
     const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const srRendererSource = realFs.readFileSync(realPath.join(process.cwd(), 'sr-pr-section.js'), 'utf8');
+    vi.mocked(fs.readFileSync).mockImplementation((...args: unknown[]) => {
+      const [filePath] = args;
+      return String(filePath).endsWith('sr-pr-section.js') ? srRendererSource : '';
+    });
 
     const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'pr-helper-'));
     try {
       setup(dir, realFs);
+      const gitPath = realPath.join(dir, 'bin', 'git');
+      if (realFs.existsSync(gitPath)) {
+        const gitFixture = realFs.readFileSync(gitPath, 'utf8');
+        if (!gitFixture.includes('rev-parse HEAD')) {
+          realFs.renameSync(gitPath, `${gitPath}.fixture`);
+          realFs.writeFileSync(
+            gitPath,
+            `#!/bin/sh
+if [ "$*" = "rev-parse HEAD" ]; then
+  printf '%s\\n' '${fixtureHeadSha}'
+  exit 0
+fi
+exec "$(dirname "$0")/git.fixture" "$@"
+`,
+            { mode: 0o755 },
+          );
+        }
+      }
       const scriptPath = realPath.join(dir, 'pr');
       realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
       try {
@@ -771,6 +795,7 @@ esac
     expect(parsed.title).toBe(specialTitle);
     expect(parsed.head).toBe('blueprint/task-nojq-1');
     expect(parsed.base).toBe('main');
+    expect(parsed.expected_head_sha).toBe(fixtureHeadSha);
     expect(parsed.body).toContain(specialBody);
     expect(parsed.body).toContain('- Status: passed');
 
@@ -1805,6 +1830,244 @@ esac
     realFs.rmSync(prPath, { force: true });
   }, 15_000);
 
+  it('single-flights overlapping publication and remotely reconciles a completed retry', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const taskId = `task-singleflight-${randomUUID()}`;
+    const lockPath = `/tmp/blueprint_pr_open_${taskId}.lock`;
+    const ownerPath = `${lockPath}.owner`;
+    const legacyReceiptPath = `/tmp/pr_publication_receipt_${taskId}`;
+    const selfReviewPath = `/tmp/self_review_${taskId}.json`;
+    const prPath = `/tmp/pr_url_${taskId}`;
+    const initialHead = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const changedHead = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const srRendererSource = realFs.readFileSync(
+      realPath.join(process.cwd(), 'sr-pr-section.js'),
+      'utf8',
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((...args: unknown[]) => {
+      const [filePath] = args;
+      return String(filePath).endsWith('sr-pr-section.js') ? srRendererSource : '';
+    });
+    const script = writeScript({
+      taskId,
+      workBranch: `blueprint/${taskId}`,
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: true,
+    });
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'pr-singleflight-'));
+    const bin = realPath.join(dir, 'bin');
+    const scriptPath = realPath.join(dir, 'pr');
+    const checkStartedPath = realPath.join(dir, 'check.started');
+    const checkCallsPath = realPath.join(dir, 'check.calls');
+    const prCallsPath = realPath.join(dir, 'pr.calls');
+    realFs.rmSync(ownerPath, { force: true });
+    realFs.rmSync(legacyReceiptPath, { force: true });
+    realFs.rmSync(selfReviewPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+
+    try {
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+      realFs.writeFileSync(
+        realPath.join(dir, 'check'),
+        '#!/bin/sh\nif [ -n "$*" ]; then printf "%s\\n" "$*"; else printf "<none>\\n"; fi >> "$WORKSPACE/check.calls"\n: > "$WORKSPACE/check.started"\nif [ ! -e "$WORKSPACE/check.slow.done" ]; then : > "$WORKSPACE/check.slow.done"; sleep 2; fi\nexit 0\n',
+        { mode: 0o755 },
+      );
+      realFs.writeFileSync(
+        realPath.join(bin, 'git'),
+        `#!/bin/sh
+case "$*" in
+  *"rev-parse HEAD"*) cat "$WORKSPACE/head.sha"; exit 0 ;;
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) cat "$WORKSPACE/diff.path"; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only HEAD"*) cat "$WORKSPACE/diff.path"; exit 0 ;;
+  *"diff --name-only"*) cat "$WORKSPACE/diff.path"; exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"ls-remote --heads origin refs/heads/blueprint/${taskId}"*) exit 0 ;;
+  *"push --force-with-lease="*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+      realFs.writeFileSync(
+        realPath.join(bin, 'curl'),
+        `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+INPUT=$(cat)
+case "$ARGS" in
+  *"/api/agent/heartbeat"*) [ -n "$OUT" ] && printf '{}' > "$OUT"; printf '200'; exit 0 ;;
+  *"/api/agent/github/token?task_id=${taskId}"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) OUTCOME=create; HTTP=201; if [ -s "$WORKSPACE/pr.calls" ]; then OUTCOME=update; HTTP=200; fi; STATE=$(cat "$WORKSPACE/pr.state"); HEAD=$(cat "$WORKSPACE/head.sha"); printf '%s:%s:%s\\n' "$OUTCOME" "$STATE" "$HEAD" >> "$WORKSPACE/pr.calls"; printf '%s\\n---PAYLOAD---\\n' "$INPUT" >> "$WORKSPACE/pr.payloads"; [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/77"}}' > "$OUT"; printf '%s' "$HTTP"; exit 0 ;;
+  *"PATCH"*"/pulls/77"*) printf 'close\\n' >> "$WORKSPACE/close.calls"; [ -n "$OUT" ] && printf '{}' > "$OUT"; printf '200'; exit 0 ;;
+  *"/pulls/77"*) STATE=$(cat "$WORKSPACE/pr.state"); if [ "$STATE" = dirty ]; then printf '{"state":"open","merged":false,"mergeable":false,"mergeable_state":"dirty"}'; elif [ "$STATE" = merged ]; then printf '{"state":"closed","merged":true,"mergeable":true,"mergeable_state":"clean"}'; elif [ "$STATE" = closed ]; then printf '{"state":"closed","merged":false,"mergeable":true,"mergeable_state":"clean"}'; else printf '{"state":"open","merged":false,"mergeable":true,"mergeable_state":"clean"}'; fi; exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+      realFs.writeFileSync(
+        realPath.join(bin, 'jq'),
+        '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/77\\n\' ;;\n  *".mergeable_state"*) if [ "$(cat "$WORKSPACE/pr.state")" = dirty ]; then printf \'dirty\\n\'; else printf \'clean\\n\'; fi ;;\n  *".mergeable // \\"null\\""*) if [ "$(cat "$WORKSPACE/pr.state")" = dirty ]; then printf \'false\\n\'; else printf \'true\\n\'; fi ;;\n  *) printf \'{}\\n\' ;;\nesac\n',
+        { mode: 0o755 },
+      );
+      realFs.writeFileSync(realPath.join(dir, 'diff.path'), 'docs/readme.md\n');
+      realFs.writeFileSync(realPath.join(dir, 'head.sha'), `${initialHead}\n`);
+      realFs.writeFileSync(realPath.join(dir, 'pr.state'), 'open\n');
+
+      const env = {
+        ...process.env,
+        PR_GATE_TIMEOUT_SECONDS: '10',
+        PR_GATE_HARD_TIMEOUT_SECONDS: '15',
+        WORKSPACE: dir,
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        ORCHESTRATOR_URL: 'https://orchestrator.example',
+        AGENT_API_TOKEN: 'token-123',
+      };
+      const openArgs = ['open', '--title', 'title', '--body', 'body'];
+      const invoke = (
+        args: string[] = openArgs,
+      ): Promise<{ status: number; stdout: string; stderr: string }> =>
+        new Promise((resolve, reject) => {
+          const child = realCp.spawn(
+            'bash',
+            [scriptPath, ...args],
+            { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] },
+          );
+          let stdout = '';
+          let stderr = '';
+          child.stdout.setEncoding('utf8');
+          child.stderr.setEncoding('utf8');
+          child.stdout.on('data', (chunk: string) => {
+            stdout += chunk;
+          });
+          child.stderr.on('data', (chunk: string) => {
+            stderr += chunk;
+          });
+          child.on('error', reject);
+          child.on('close', (code) => {
+            resolve({ status: code ?? -1, stdout, stderr });
+          });
+        });
+
+      const first = invoke();
+      const waitDeadline = Date.now() + 5_000;
+      while (!realFs.existsSync(checkStartedPath) && Date.now() < waitDeadline) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 25);
+        });
+      }
+      expect(realFs.existsSync(checkStartedPath)).toBe(true);
+
+      const overlapStarted = Date.now();
+      const overlapping = await invoke();
+      expect(overlapping.status).toBe(75);
+      expect(Date.now() - overlapStarted).toBeLessThan(1_000);
+      expect(overlapping.stderr).toContain('publication already in progress');
+      expect(overlapping.stderr).toContain('no second gate was started');
+
+      const completed = await first;
+      expect(completed.status).toBe(0);
+      expect(realFs.readFileSync(checkCallsPath, 'utf8').trim().split('\n')).toHaveLength(1);
+      expect(realFs.readFileSync(prPath, 'utf8').trim()).toBe(
+        'https://github.com/acme/repo/pull/77',
+      );
+      expect(realFs.readFileSync(prCallsPath, 'utf8').trim().split('\n')).toHaveLength(1);
+      expect(realFs.readFileSync(realPath.join(dir, 'pr.payloads'), 'utf8')).toContain(
+        `"expected_head_sha":"${initialHead}"`,
+      );
+
+      const retried = await invoke();
+      expect(retried.status).toBe(0);
+      expect(retried.stdout).not.toContain('exact request already published');
+      expect(realFs.readFileSync(checkCallsPath, 'utf8').trim().split('\n')).toHaveLength(2);
+      expect(realFs.readFileSync(prCallsPath, 'utf8').trim().split('\n')).toHaveLength(2);
+      expect(realFs.readFileSync(prCallsPath, 'utf8').trim().split('\n')[1]).toMatch(
+        /^update:open:/,
+      );
+
+      // A receipt from the reviewed implementation may still exist on a warm
+      // worker. It is deliberately ignored: local state cannot authoritatively
+      // establish current PR lifecycle, exact head, normalized body, or gate.
+      realFs.writeFileSync(
+        legacyReceiptPath,
+        `${initialHead}\nlegacy-request-hash\nhttps://github.com/acme/repo/pull/77\n`,
+      );
+      const closed = await invoke(['close', '--pr-number', '77']);
+      expect(closed.status).toBe(0);
+      expect(realFs.readFileSync(realPath.join(dir, 'close.calls'), 'utf8').trim()).toBe('close');
+      expect(realFs.existsSync(legacyReceiptPath)).toBe(true);
+
+      realFs.writeFileSync(realPath.join(dir, 'pr.state'), 'closed\n');
+      expect((await invoke()).status).toBe(0);
+      // The remote endpoint reconciled the explicit close above. Simulate an
+      // independent actor closing it again after that successful reopen.
+      realFs.writeFileSync(realPath.join(dir, 'pr.state'), 'open\n');
+      realFs.writeFileSync(realPath.join(dir, 'pr.state'), 'closed\n');
+      expect((await invoke()).status).toBe(0);
+      realFs.writeFileSync(realPath.join(dir, 'pr.state'), 'merged\n');
+      expect((await invoke()).status).toBe(0);
+      const lifecycleCalls = realFs.readFileSync(prCallsPath, 'utf8');
+      expect(lifecycleCalls.match(new RegExp(`closed:${initialHead}`, 'g'))).toHaveLength(2);
+      expect(lifecycleCalls).toContain(`merged:${initialHead}`);
+
+      realFs.writeFileSync(realPath.join(dir, 'pr.state'), 'open\n');
+      realFs.writeFileSync(realPath.join(dir, 'head.sha'), `${changedHead}\n`);
+      expect((await invoke()).status).toBe(0);
+      expect(realFs.readFileSync(prCallsPath, 'utf8')).toContain(`open:${changedHead}`);
+      expect(realFs.readFileSync(realPath.join(dir, 'pr.payloads'), 'utf8')).toContain(
+        `"expected_head_sha":"${changedHead}"`,
+      );
+
+      realFs.writeFileSync(
+        selfReviewPath,
+        JSON.stringify({ verdict: 'unknown', skip_reason: 'dynamic-review-v2' }),
+      );
+      expect((await invoke()).status).toBe(0);
+      expect(realFs.readFileSync(realPath.join(dir, 'pr.payloads'), 'utf8')).toContain(
+        'dynamic-review-v2',
+      );
+
+      realFs.writeFileSync(realPath.join(dir, 'diff.path'), 'agent/src/index.ts\n');
+      expect((await invoke()).status).toBe(0);
+      const checkCalls = realFs.readFileSync(checkCallsPath, 'utf8').trim().split('\n');
+      expect(checkCalls.at(-1)).toBe('test');
+      expect(checkCalls.slice(0, -1)).toContain('<none>');
+
+      realFs.writeFileSync(realPath.join(dir, 'pr.state'), 'dirty\n');
+      const conflicted = await invoke();
+      expect(conflicted.status).toBe(4);
+      expect(conflicted.stdout).toContain('merge conflicts with origin/main');
+      expect(realFs.readFileSync(prCallsPath, 'utf8')).toContain(`dirty:${changedHead}`);
+      expect(realFs.existsSync(legacyReceiptPath)).toBe(true);
+    } finally {
+      vi.mocked(fs.readFileSync).mockReturnValue('');
+      realFs.rmSync(dir, { recursive: true, force: true });
+      realFs.rmSync(ownerPath, { force: true });
+      realFs.rmSync(legacyReceiptPath, { force: true });
+      realFs.rmSync(selfReviewPath, { force: true });
+      realFs.rmSync(prPath, { force: true });
+      // The persistent empty flock inode is safe to remove after all children
+      // have exited; production keeps it so no unlink/new-inode race exists.
+      realFs.rmSync(lockPath, { force: true });
+    }
+  }, 30_000);
+
   it('still terminates a genuinely wedged gate at the absolute hard bound', async () => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const receiptPath = '/tmp/pr_gate_receipt_task-gate-wedge.json';
@@ -2162,6 +2425,40 @@ describe('writePrHelper — generated script content', () => {
       const [path, content] = args as [string, string];
       capturedScripts[path] = content;
     });
+  });
+
+  it('owns publication before the local gate and keeps the flock inode stable', () => {
+    writePrHelper({
+      taskId: 'task-singleflight-static',
+      workBranch: 'blueprint/task-singleflight-static',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    expect(script.indexOf('_acquire_pr_open_lock')).toBeLessThan(script.indexOf('run_pr_gate()'));
+    expect(script).toContain('flock -n 9');
+    expect(script).toContain('return 75');
+    expect(script).toContain('no second gate was started');
+    expect(script).toContain('refusing publication without a single-flight boundary');
+    expect(script).not.toContain('_PR_PUBLICATION_RECEIPT=');
+    expect(script).not.toContain('exact request already published');
+    expect(script).not.toContain('_pr_open_request_hash');
+    expect(script).not.toContain('rm -f "$_PR_OPEN_LOCK_FILE"');
+  });
+
+  it('bakes and probes flock in both supported agent images', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const repoRoot = realPath.resolve(process.cwd(), '..');
+    const dockerfile = realFs.readFileSync(realPath.join(process.cwd(), 'Dockerfile'), 'utf8');
+    const packer = realFs.readFileSync(realPath.join(repoRoot, 'infra', 'packer', 'agent.pkr.hcl'), 'utf8');
+    for (const imageSource of [dockerfile, packer]) {
+      expect(imageSource).toContain('util-linux');
+      expect(imageSource).toContain('command -v flock >/dev/null');
+    }
   });
 
   it('stamps engine-authored commits with classifier-accepted provenance', () => {

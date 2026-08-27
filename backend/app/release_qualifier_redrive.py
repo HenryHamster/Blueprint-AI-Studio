@@ -55,6 +55,11 @@ from app import release_version
 from app.database import AsyncSessionLocal
 from app.models import Alert, AlertSeverity, Project
 from app.qualification_triggers import qualification_trigger_owner
+from app.release_promotion import (
+    _PROMOTION_CAPABILITY_FAILURES,
+    _preflight_promotion_rerun_token,
+    _resolve_github_credential_with_session,
+)
 from app.time_utils import _utcnow
 
 # First cap for this module: it crossed the 1500-line coverage threshold
@@ -1186,7 +1191,7 @@ _PROMOTION_MECHANICS_FAILURES: frozenset[str] = frozenset(
         "promotion_claim_abandoned",
         "merge_error",
     }
-)
+) | _PROMOTION_CAPABILITY_FAILURES
 
 # Genuine (non-mechanics) promotion failures whose verdict can be NON-DETERMINISTIC
 # for an unchanged candidate, and which may therefore be re-attempted on the same
@@ -1404,6 +1409,23 @@ def _promotion_failure_needs_new_candidate(error: str) -> bool:
     return error not in _PROMOTION_MECHANICS_FAILURES
 
 
+async def _promotion_rerun_capability_status(
+    session, project: Project
+) -> tuple[bool, str | None, str | None]:
+    """Reconcile the selected credential's bounded CI-rerun capability."""
+    credential = await _resolve_github_credential_with_session(session, project)
+    if credential is None:
+        return False, "no_credentials", "No GitHub credential is available"
+    refreshed, error, detail = await _preflight_promotion_rerun_token(
+        credential.token,
+        credential.owner,
+        credential.repo,
+        credential_source=credential.source,
+        installation_id=credential.installation_id,
+    )
+    return bool(refreshed and not error), error, detail
+
+
 async def _redrive_promotion_failed_qualification(
     version_id,
     *,
@@ -1578,6 +1600,28 @@ async def _redrive_promotion_failed_qualification(
         project = await redrive_session.get(Project, version.project_id)
         if project is None:
             return False
+        if error in _PROMOTION_CAPABILITY_FAILURES:
+            try:
+                capability_ready, capability_error, capability_detail = (
+                    await _promotion_rerun_capability_status(
+                        redrive_session, project
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - unknown stays held
+                capability_ready = False
+                capability_error = "github_actions_permission_preflight_unavailable"
+                capability_detail = f"{type(exc).__name__}: {exc}"
+            if not capability_ready:
+                await _record_redrive_decision(
+                    redrive_session,
+                    version,
+                    _PROMOTION_REDRIVE_DECISION_KEY,
+                    "held",
+                    "promotion_rerun_capability_unavailable",
+                    capability_error=capability_error or "unknown",
+                    detail=str(capability_detail or "")[:400],
+                )
+                return False
         try:
             from app.release_qualifier_sweep import (
                 _current_integration_audited_surface,
@@ -1766,7 +1810,11 @@ async def _redrive_promotion_failed_qualification(
                         else (
                             "head_advanced"
                             if needs_new_candidate
-                            else "promotion_mechanics"
+                            else (
+                                "promotion_capability_recovered"
+                                if error in _PROMOTION_CAPABILITY_FAILURES
+                                else "promotion_mechanics"
+                            )
                         )
                     ),
                 )

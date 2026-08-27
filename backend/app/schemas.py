@@ -1084,6 +1084,9 @@ class GitHubCreatePRRequest(BaseModel):
     title: str = Field(..., min_length=1)
     head: str = Field(..., pattern="^[a-zA-Z0-9_./:-]+$")
     base: str = Field(..., pattern="^[a-zA-Z0-9_./:-]+$")
+    expected_head_sha: str | None = Field(
+        default=None, pattern="^[0-9a-fA-F]{40}$"
+    )
     body: str = ""
 
 

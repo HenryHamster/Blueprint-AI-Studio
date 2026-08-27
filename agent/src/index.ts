@@ -3430,12 +3430,16 @@ export async function pushAndCreatePR(
   execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', cleanPushUrl], { encoding: 'utf-8' });
   await gitAsync(['push', 'origin', workBranch]);
   sendLog(ws, `Pushed to branch: ${workBranch}\n`);
+  const pushedHeadSha = git(['rev-parse', 'HEAD']);
+  if (!/^[0-9a-f]{40}$/.test(pushedHeadSha)) {
+    throw new Error(`Cannot prove the exact pushed HEAD for ${workBranch}`);
+  }
   // Record the pushed head NOW, before PR creation. A heartbeat 4xx that
   // self-terminates the agent in the window between this line and the PR
   // actually being created (below) would otherwise orphan a real commit —
   // nothing else links a bare `git push` to the task yet.
   try {
-    recordPushedWork(workBranch, git(['rev-parse', 'HEAD']));
+    recordPushedWork(workBranch, pushedHeadSha);
   } catch { /* best-effort — worst case the cancellation record has no head to cite */ }
 
   // Heartbeat after push, before PR creation — ensures the reaper sees fresh activity
@@ -3451,7 +3455,7 @@ export async function pushAndCreatePR(
     // slow path, so tasks failed with AbortError.
     const prRes = await apiPost('/api/agent/github/pull-requests', {
       task_id: taskId, owner, repo, title,
-      head: workBranch, base: baseBranch, body,
+      head: workBranch, base: baseBranch, expected_head_sha: pushedHeadSha, body,
     }, API_MAX_RETRIES, 240_000) as { data?: { html_url?: string } };
     prUrl = prRes.data?.html_url ?? '';
     sendLog(ws, `PR created: ${prUrl}\n`);

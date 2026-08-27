@@ -95,6 +95,39 @@ _repo_installation_read_token_cache: dict[str, tuple[str, float]] = {}
 _repo_installation_read_token_lock = asyncio.Lock()
 
 
+class GitHubInstallationPermissionError(RuntimeError):
+    """The selected App installation cannot grant the requested permissions."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        missing_permissions: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.missing_permissions = missing_permissions
+
+
+def _missing_installation_permissions(
+    actual: dict[str, str], required: dict[str, str]
+) -> tuple[str, ...]:
+    """Return requested permission names not granted at the required level."""
+    rank = {"none": 0, "read": 1, "write": 2, "admin": 3}
+    return tuple(
+        name
+        for name, level in required.items()
+        if rank.get(str(actual.get(name) or "none").lower(), -1)
+        < rank.get(str(level).lower(), 99)
+    )
+
+
+def _installation_permissions_satisfy(
+    actual: dict[str, str], required: dict[str, str]
+) -> bool:
+    """Return whether ``actual`` grants every requested repository permission."""
+    return not _missing_installation_permissions(actual, required)
+
+
 def invalidate_repo_installation_token_cache(owner: str, repo: str) -> None:
     """Drop a repo's cached installation token, forcing a re-mint on next use.
 
@@ -271,6 +304,105 @@ async def get_repo_installation_token(owner: str, repo: str) -> str | None:
         return token
 
 
+async def mint_repo_installation_token_with_permissions(
+    owner: str,
+    repo: str,
+    required_permissions: dict[str, str],
+    *,
+    installation_id: str | None = None,
+) -> str | None:
+    """Mint and verify an explicitly scoped token for one App installation.
+
+    The fresh installation lookup, generic-cache eviction, and mint are one
+    locked operation. The returned token is proven by the permissions in the
+    actual token receipt, not inferred from a prior installation lookup. It is
+    intentionally not stored in the generic write-token cache because its
+    narrow permission set may not satisfy unrelated callers.
+    """
+    if not GITHUB_APP_ID or not GITHUB_PRIVATE_KEY:
+        return None
+
+    cache_key = f"{owner}/{repo}"
+    async with _repo_installation_token_lock:
+        app_jwt = generate_github_app_jwt()
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/installation",
+            {
+                "Authorization": f"Bearer {app_jwt}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        if response.status_code == 404:
+            _installation_id_cache.pop(cache_key, None)
+            _repo_installation_token_cache.pop(cache_key, None)
+            return None
+        if response.status_code != 200:
+            raise RuntimeError(
+                "GitHub App installation permission lookup returned "
+                f"HTTP {response.status_code}"
+            )
+
+        payload = response.json()
+        resolved_installation_id = str(payload.get("id") or "").strip()
+        if not resolved_installation_id:
+            raise RuntimeError("GitHub App installation response omitted its id")
+        if installation_id and resolved_installation_id != str(installation_id):
+            raise RuntimeError(
+                "Selected GitHub App credential no longer matches the repository "
+                "installation"
+            )
+        granted = payload.get("permissions")
+        if not isinstance(granted, dict):
+            raise RuntimeError("GitHub App installation response omitted permissions")
+        normalized_granted = {
+            str(name): str(level)
+            for name, level in granted.items()
+            if isinstance(name, str) and isinstance(level, str)
+        }
+        missing_permissions = _missing_installation_permissions(
+            normalized_granted, required_permissions
+        )
+        if missing_permissions:
+            _repo_installation_token_cache.pop(cache_key, None)
+            raise GitHubInstallationPermissionError(
+                "GitHub App installation does not grant every requested permission",
+                missing_permissions=missing_permissions,
+            )
+
+        _installation_id_cache[cache_key] = (resolved_installation_id, time.time())
+        # Evict under the same lock that protects generic cache-miss minting.
+        # A concurrent generic mint therefore cannot repopulate an old token
+        # between invalidation and this capability-proving mint.
+        _repo_installation_token_cache.pop(cache_key, None)
+        receipt = await _generate_installation_access_token_receipt(
+            resolved_installation_id,
+            repositories=[repo],
+            permissions=required_permissions,
+        )
+        token = receipt.get("token")
+        actual_permissions = receipt.get("permissions")
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("GitHub App token receipt omitted the token")
+        if not isinstance(actual_permissions, dict):
+            raise RuntimeError("GitHub App token receipt omitted permissions")
+        normalized_actual_permissions = {
+            str(name): str(level)
+            for name, level in actual_permissions.items()
+            if isinstance(name, str) and isinstance(level, str)
+        }
+        missing_permissions = _missing_installation_permissions(
+            normalized_actual_permissions, required_permissions
+        )
+        if missing_permissions:
+            raise GitHubInstallationPermissionError(
+                "Minted GitHub App token receipt did not grant every requested permission",
+                missing_permissions=missing_permissions,
+            )
+        return token
+
+
 async def exchange_oauth_code(code: str, redirect_uri: str | None = None) -> dict:
     """Exchange a GitHub OAuth code for a user access token."""
     if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
@@ -379,11 +511,11 @@ async def get_github_user(user_token: str) -> dict:
     return resp.json()
 
 
-async def generate_installation_access_token(
+async def _generate_installation_access_token_receipt(
     installation_id: str,
     repositories: list[str] | None = None,
     permissions: dict | None = None,
-) -> str:
+) -> dict:
     """
     Exchanges the GitHub App JWT for a short-lived Installation Access Token.
 
@@ -426,7 +558,27 @@ async def generate_installation_access_token(
             detail="Failed to authenticate with GitHub App",
         )
 
-    return response.json().get("token")
+    receipt = response.json()
+    if not isinstance(receipt, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="GitHub App returned an invalid token receipt",
+        )
+    return receipt
+
+
+async def generate_installation_access_token(
+    installation_id: str,
+    repositories: list[str] | None = None,
+    permissions: dict | None = None,
+) -> str:
+    """Exchange an App JWT for a short-lived installation access token."""
+    receipt = await _generate_installation_access_token_receipt(
+        installation_id,
+        repositories=repositories,
+        permissions=permissions,
+    )
+    return receipt.get("token")
 
 
 async def validate_fine_grained_pat(token: str, target_repo: str | None = None) -> dict:
@@ -494,5 +646,3 @@ async def validate_fine_grained_pat(token: str, target_repo: str | None = None) 
         "message": "Fine-Grained PAT is valid and properly scoped.",
         "user": user_response.json().get("login"),
     }
-
-
