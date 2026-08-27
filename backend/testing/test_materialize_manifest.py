@@ -458,7 +458,7 @@ class TestAnthropicTrustMaterialization:
 
 class TestNssBypass:
     def test_lookup_reads_passwd_not_pwd_module(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ):
         """Regression: the point of _lookup_uid_gid is to avoid
         pwd.getpwnam / grp.getgrnam because NSS can hang. Assert the
@@ -475,18 +475,20 @@ class TestNssBypass:
         monkeypatch.setattr(pwd_module, "getpwnam", _boom)
         monkeypatch.setattr(grp_module, "getgrnam", _boom)
 
-        # Stub /etc/passwd and /etc/group via a chdir? Simpler: patch open()
-        # — but here we just call _lookup_uid_gid against the real files.
-        # On any system that has a current user in passwd, this will succeed.
-        import pwd
+        import builtins
+        import io
 
-        me = pwd.getpwuid(os.getuid()).pw_name if hasattr(os, "getuid") else "root"
-        # Roll back the boom patch just for getpwuid, which we used above
-        # to find the test user name. Then re-apply for the real call.
-        monkeypatch.setattr(pwd_module, "getpwnam", _boom)
-        uid, gid = materialize_manifest._lookup_uid_gid(me)
-        assert uid >= 0
-        assert gid >= 0
+        files = {
+            "/etc/passwd": "fixture-user:x:1234:5678::/home/fixture-user:/bin/sh\n",
+            "/etc/group": "fixture-user:x:5678:\n",
+        }
+        monkeypatch.setattr(
+            builtins,
+            "open",
+            lambda path, **_kwargs: io.StringIO(files[str(path)]),
+        )
+
+        assert materialize_manifest._lookup_uid_gid("fixture-user") == (1234, 5678)
 
     def test_lookup_raises_on_missing_user(self, tmp_path: Path):
         with pytest.raises(RuntimeError, match="missing from /etc/passwd"):
