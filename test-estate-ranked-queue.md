@@ -369,6 +369,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/test/mock-factory-export-coverage.test.ts` | 1,173 | 17 | under 1500 LOC | 5.549s measured | — |
 | G | backend | `backend/testing/test_user_management.py` | 186 | 17 | under 1500 LOC | 5.533s measured | — |
 | G | backend | `backend/testing/test_local_runner_holds.py` | 1,299 | 31 | under 1500 LOC | 5.507s measured | — |
+| G | backend | `backend/testing/test_backend_harness_selector_parsing.py` | 463 | 14 | under 1500 LOC | 5.406s measured | — |
 | G | agent | `agent/src/viewport-snapshot-script.test.ts` | 337 | 18 | under 1500 LOC | 5.405s measured | — |
 | G | backend | `backend/testing/test_release_qualifier_walkthrough_request.py` | 495 | 6 | under 1500 LOC | 5.299s measured | — |
 | G | backend | `backend/testing/test_github_token_resolver.py` | 799 | 20 | under 1500 LOC | 5.069s measured | — |
