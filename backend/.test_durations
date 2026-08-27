@@ -15667,7 +15667,7 @@
   "testing/test_reaper.py::test_step5_rate_limit_resurrected_when_account_available": 0.4522695979994751,
   "testing/test_reaper.py::test_step5_resurrection_clears_failure_class": 0.4719089279988111,
   "testing/test_reaper.py::test_step5_resurrection_count_guard_skips_second_attempt": 0.4449776780002139,
-  "testing/test_reaper.py::test_step5_resurrection_creates_info_alert": 0.44794500499847345,
+  "testing/test_reaper.py::test_step5_resurrection_records_status_without_durable_alert": 0.44794500499847345,
   "testing/test_reaper.py::test_step6_alert_broadcasts_after_commit": 0.33481500900234096,
   "testing/test_reaper.py::test_step6_alert_does_not_broadcast_on_commit_failure": 0.3342649860005622,
   "testing/test_reaper.py::test_step6_duplicate_tier1_suppressed": 0.4406505820006714,
