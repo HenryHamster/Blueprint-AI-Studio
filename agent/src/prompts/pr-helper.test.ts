@@ -2164,6 +2164,25 @@ describe('writePrHelper — generated script content', () => {
     });
   });
 
+  it('stamps engine-authored commits with classifier-accepted provenance', () => {
+    writePrHelper({
+      taskId: 'task-provenance-1',
+      workBranch: 'blueprint/task-provenance-1',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    expect(script).toContain(
+      "git -c user.email=blueprint-agent@automated.dev -c user.name='Blueprint Agent' \\",
+    );
+    expect(script).toContain(
+      "commit -m \"$TITLE\" \\\n      -m 'Co-authored-by: Blueprint Agent <blueprint-agent@automated.dev>'",
+    );
+  });
+
   it('wires the GATE-ENVIRONMENT marker surfacing into the ./check test branch', () => {
     writePrHelper({
       taskId: 'task-static-1',
