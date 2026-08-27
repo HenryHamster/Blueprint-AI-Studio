@@ -1914,10 +1914,11 @@ async def sweep_release_expired_activity_claims(
     Resident broad-inbox claims have immutable membership.  If an expired
     singleton Activity claim precedes an unclaimed sibling, the next Resident
     polls both and the coordinator correctly rejects the enlarged batch.  This
-    sweep releases the *whole* Activity-only claim group only when every member
-    is stale on both clocks and its owning task is terminal/missing or its
-    generation is authoritatively superseded.  Conversation/mixed-surface
-    groups and live or ambiguous owners remain untouched.
+    sweep releases the unresolved members of an Activity-only claim group only
+    when every such member is stale on both clocks and its owning task is
+    terminal/missing or its generation is authoritatively superseded.  Already
+    terminal siblings remain immutable audit history.  Conversation/mixed-
+    surface groups and live or ambiguous owners remain untouched.
     """
     from app.broadcast import broadcast_to_project as _bcast
     from app.conversation_coordinator import (
@@ -2029,11 +2030,35 @@ async def sweep_release_expired_activity_claims(
         )
         if not group:
             continue
-        owner_ids = {row.handled_by_task_id for row in group}
+        terminal_states = {
+            MessageHandlingState.RESPONDED,
+            MessageHandlingState.SUPERSEDED,
+            MessageHandlingState.FAILED,
+        }
+        if any(
+            row.surface != MessageSurface.ACTIVITY or row.from_type != "user"
+            for row in group
+        ):
+            continue
+        unresolved = [
+            row
+            for row in group
+            if row.status == "open"
+            and row.handling_state == MessageHandlingState.CLAIMED
+        ]
+        unresolved_ids = {row.id for row in unresolved}
+        if any(
+            row.id not in unresolved_ids
+            and row.handling_state not in terminal_states
+            for row in group
+        ):
+            continue
+        owner_ids = {row.handled_by_task_id for row in unresolved}
         generations = {row.conversation_claim_generation for row in group}
         incarnations = {row.conversation_claim_incarnation for row in group}
         if (
-            len(owner_ids) != 1
+            not unresolved
+            or len(owner_ids) != 1
             or None in owner_ids
             or len(generations) != 1
             or len(incarnations) != 1
@@ -2042,7 +2067,9 @@ async def sweep_release_expired_activity_claims(
         owner_id = next(iter(owner_ids))
         if owner_id != candidate_owner_id:
             continue
-        stale_reason = _activity_claim_owner_stale_reason(group[0], task, project)
+        stale_reason = _activity_claim_owner_stale_reason(
+            unresolved[0], task, project
+        )
         if stale_reason is None:
             continue
 
@@ -2060,12 +2087,12 @@ async def sweep_release_expired_activity_claims(
                 <= _stranded_naive_utc(cutoff)
             )
             and not _stranded_sweep_is_excluded(dict(row.context or {}))
-            for row in group
+            for row in unresolved
         )
         if not group_is_releasable:
             continue
 
-        for msg in group:
+        for msg in unresolved:
             prior_session_id = msg.resident_session_id
             prior_deaths = (msg.context or {}).get(
                 _OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY

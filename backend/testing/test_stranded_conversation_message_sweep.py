@@ -861,6 +861,123 @@ async def test_dead_activity_claim_release_recovers_mixed_membership(sweep_db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["resolved", "open"])
+async def test_dead_activity_claim_release_preserves_terminal_sibling(
+    sweep_db, terminal_status
+):
+    """A terminal member cannot strand an unresolved member of its old claim."""
+    project = await _make_project(sweep_db)
+    dead_task = await _add_resident_task(
+        sweep_db,
+        project,
+        session_id="resident-old",
+        generation=1,
+        status=TaskStatus.FAILED,
+    )
+    responder_task = await _add_resident_task(
+        sweep_db,
+        project,
+        session_id="resident-responder",
+        generation=1,
+        status=TaskStatus.COMPLETED,
+    )
+    live_task = await _add_resident_task(
+        sweep_db,
+        project,
+        session_id="resident-current",
+        generation=2,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    _set_resident_authority(
+        project,
+        live_task,
+        session_id="resident-current",
+        generation=2,
+    )
+    sweep_db.add(project)
+    await sweep_db.commit()
+
+    stale = _minutes_ago(EXPIRED_ACTIVITY_CLAIM_RELEASE_AFTER_MINUTES + 5)
+    claim_id = uuid.uuid4()
+    incarnation_id = uuid.uuid4()
+    claimed = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        message_type=MessageType.QUESTION,
+        content="unanswered member",
+        handled_by_task_id=dead_task.id,
+        resident_session_id="resident-old",
+        conversation_claim_id=claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_incarnation=incarnation_id,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        sequence=1,
+    )
+    resolved_at = _utcnow()
+    terminal = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        message_type=MessageType.BUG_REPORT,
+        content="completed member",
+        status=terminal_status,
+        handling_state=MessageHandlingState.RESPONDED,
+        handled_by_task_id=responder_task.id,
+        resident_session_id="resident-old",
+        conversation_claim_id=claim_id,
+        conversation_claim_generation=1,
+        conversation_claim_incarnation=incarnation_id,
+        conversation_claim_expires_at=stale,
+        created_at=stale + timedelta(seconds=1),
+        updated_at=resolved_at,
+        sequence=2,
+    )
+    terminal_snapshot = (
+        terminal.status,
+        terminal.handling_state,
+        terminal.handled_by_task_id,
+        terminal.conversation_claim_id,
+        terminal.conversation_claim_generation,
+        terminal.conversation_claim_incarnation,
+        terminal.conversation_claim_expires_at,
+        terminal.updated_at,
+    )
+
+    assert await sweep_release_expired_activity_claims(sweep_db, _utcnow()) == 1
+    await sweep_db.refresh(claimed)
+    await sweep_db.refresh(terminal)
+    assert claimed.handling_state == MessageHandlingState.PENDING
+    assert claimed.conversation_claim_id is None
+    assert claimed.handled_by_task_id is None
+    assert (
+        terminal.status,
+        terminal.handling_state,
+        terminal.handled_by_task_id,
+        terminal.conversation_claim_id,
+        terminal.conversation_claim_generation,
+        terminal.conversation_claim_incarnation,
+        terminal.conversation_claim_expires_at,
+        terminal.updated_at,
+    ) == terminal_snapshot
+
+    replacement_claim = await claim_operator_messages(
+        sweep_db,
+        project_id=project.id,
+        session_id="resident-current",
+        task_id=live_task.id,
+        worker_generation=2,
+        incarnation_id=uuid.uuid4(),
+        message_ids=[claimed.id],
+        lease_seconds=45,
+    )
+    assert replacement_claim is not None
+    assert [row.id for row in replacement_claim.rows] == [claimed.id]
+
+
+@pytest.mark.asyncio
 async def test_expired_activity_claim_current_authority_is_preserved(sweep_db):
     """Clock staleness alone never steals from the authoritative Resident."""
     project = await _make_project(sweep_db)
