@@ -18,6 +18,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 import app.shared_state as _shared_state
+from app.alert_policy import create_project_alert_if_allowed
 from app.database import AsyncSessionLocal, engine, init_db
 from app.models import (
     AllowedUser,
@@ -2250,15 +2251,25 @@ async def lifespan(app):
                                         .scalars()
                                         .all()
                                     )
+                                    # ``deployment.auto_resume`` is registered
+                                    # ROUTE_TIMELINE/TIMELINE_ONLY: a restart
+                                    # that already happened is a notice, not a
+                                    # standing condition, so nothing could ever
+                                    # resolve the row.  This emitter fanned one
+                                    # such INFO row out to EVERY project (up to
+                                    # 5000) per restart and never asked the
+                                    # policy.  The restart itself is already on
+                                    # the log line above, so routing through the
+                                    # gate loses no signal.
                                     for project_id in project_ids:
-                                        alert = Alert(
+                                        await create_project_alert_if_allowed(
+                                            alert_session,
                                             project_id=project_id,
+                                            event_type="deployment.auto_resume",
                                             severity=AlertSeverity.INFO,
                                             title=f"Background service restarted: {name}",
                                             message=f"Service '{name}' was automatically restarted (attempt #{state['attempts']}).",
-                                            event_type="deployment.auto_resume",
                                         )
-                                        alert_session.add(alert)
                                     await alert_session.commit()
                             except Exception as alert_exc:
                                 logger.warning(

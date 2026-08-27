@@ -3588,6 +3588,99 @@ async def test_sweep_stranded_lanes_creates_recovery_task_when_context_available
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "terminal_status",
+    [TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.COMPLETED],
+)
+async def test_recovery_prompt_states_the_observed_strand_cause(
+    db_session, lanes_on, mocker, terminal_status
+):
+    """The recovery worker is TOLD why it was spawned, not left to guess.
+
+    The sweep observes exactly which task, in exactly which terminal status,
+    stranded the lane — and used to throw all of it away, handing the worker a
+    prompt that asserted the task "was cancelled or killed". That is a guess,
+    and for two of the three terminal statuses in
+    ``_LANE_TERMINAL_TASK_STATUSES`` it is a WRONG guess: a COMPLETED task that
+    never wrote a checkpoint is neither cancelled nor killed.
+
+    Parametrizing over all three statuses is what makes this a real pin: a
+    hardcoded string cannot satisfy three different expected substrings.
+    """
+    from app.models import Task as _Task
+    from app.review_fix_lane_pilot import (
+        LANE_RECOVERY_ATTEMPT_KEY,
+        LANE_RECOVERY_REASON_KEY,
+    )
+
+    project = await _make_project(db_session, name="Strand Cause")
+    stranded_task = await _make_task_with_pr(
+        db_session, project, terminal_status, pr_number=77
+    )
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=stranded_task.id,
+        phase_requeues=0,
+        name="strand-cause",
+    )
+
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "base-a"},
+                "head": {"sha": "head-a"},
+            }
+        ),
+    )
+
+    assert (
+        await sweep_stranded_lanes(
+            db_session, _utcnow(), runtime_config=_runtime_config
+        )
+        == 1
+    )
+
+    await db_session.refresh(lane)
+    recovery = await db_session.get(_Task, lane.current_task_id)
+    assert recovery is not None
+    prompt = (recovery.first_payload or {}).get("prompt") or ""
+
+    # The observed cause, verbatim: which task, which terminal status, and the
+    # fact that no post-commit continuation marker was left behind.
+    assert str(stranded_task.id) in prompt, (
+        "the prompt must name the task that actually stranded the lane"
+    )
+    assert str(terminal_status.value) in prompt, (
+        "the prompt must name the OBSERVED terminal status, not a guess"
+    )
+    assert "without writing a checkpoint" in prompt
+    assert "post-commit continuation marker" in prompt
+    assert "was cancelled or killed" not in prompt, (
+        "the old guess is wrong for COMPLETED and for FAILED"
+    )
+    # The description shown to a human carries the same statement.
+    assert recovery.description == prompt
+
+    # The categorical bucket that lane_baseline_snapshot._compute_checkpoint_
+    # recovery_waste groups on is UNCHANGED — the free-text cause rides
+    # alongside it, it does not replace it.
+    ctx = recovery.context or {}
+    assert ctx.get(LANE_RECOVERY_REASON_KEY) == "stranded_terminal_task"
+    assert ctx.get(LANE_RECOVERY_ATTEMPT_KEY) == 1
+    assert str(stranded_task.id) in (ctx.get("_lane_strand_detail") or "")
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("case", "denial"),
     [
         ("lookup_failure", "retryable"),

@@ -368,3 +368,239 @@ def test_named_remediation_spawners_validate_their_payload_contract() -> None:
         assert (module, function) not in PAYLOAD_CONTRACT_UNVALIDATED, (module, function)
         scope = inventories[module].functions[function]
         assert _validates_payload_contract(scope), (module, function)
+
+
+# ---------------------------------------------------------------------------
+# fix_reason ratchet.
+#
+# Project authority answers "may this task be created", and the payload-contract
+# ratchet above answers "can the agent run it".  Neither answers "does the task
+# say what it is for".  ``_spawn_pipeline_task`` declares ``fix_reason: str = ""``,
+# and that default is not inert: every consumer reads it, and every consumer
+# treats absence as ``"code_review"`` --
+#
+#   * review_pipeline: fix_reason in ("merge_conflict", "update_branch_failed",
+#     "migration_guard") -> LANE_CONFLICT; "ci_failure" -> LANE_CI; "" or
+#     "code_review" -> LANE_REVIEW_CONVERGENCE, a different sub-cap.
+#   * review_heuristics.review_fix_iteration_limit: "ci_failure" gets 8
+#     iterations, everything else 10-16.
+#   * routers.admin_analytics: the per-lane diagnostics group on it.
+#
+# So an omitted fix_reason is not "unset", it is a silent vote for the
+# code-review lane -- an Alembic re-chain or a merge-conflict rebase gets
+# budgeted and sub-capped as if a human had left review comments on it.
+#
+# A RUNTIME non-empty constraint was considered and rejected: it converts a
+# mislabeled fix into NO fix, and these spawners exist precisely to unstick a PR
+# that is already blocked.  Refusing task creation there wedges the lane the fix
+# was supposed to free.  This guard is static instead -- it fails CI, where a
+# human is already looking, and it cannot refuse to create a task in production.
+FIX_REASON_SPAWNER = "_spawn_pipeline_task"
+
+# The values the consumers actually branch on.  A value outside this set is not
+# rejected anywhere -- it falls through every ``if`` chain and lands in the
+# review-convergence lane, which is exactly what an omitted value does.  A typo
+# is therefore invisible at runtime, which is why it is pinned here.
+FIX_REASON_ROUTED_VOCABULARY = frozenset(
+    {
+        "code_review",
+        "ci_failure",
+        "merge_conflict",
+        "update_branch_failed",
+        "migration_guard",
+        "rollup_deliverable_restoration",
+    }
+)
+
+# Call sites whose ``task_type`` is computed at runtime, so a static reader
+# cannot tell whether a given call spawns a fix.  Each is reviewed here; naming
+# them means a NEW dynamically-typed spawn site cannot appear unexamined.
+FIX_REASON_DYNAMIC_SPAWN_SITES: dict[tuple[str, str], str] = {
+    ("rollup_management", "_check_and_trigger_rollup"): (
+        "task_type is a variable; the fix branch passes a conditional fix_reason"
+    ),
+    ("task_lifecycle", "_process_post_commit"): (
+        "task_type is a variable and kwargs arrive via **spawn_kwargs; the fix "
+        "branch sets spawn_kwargs['fix_reason'] = 'merge_conflict'"
+    ),
+}
+
+
+class _FixSpawnInventory(ast.NodeVisitor):
+    """Every ``_spawn_pipeline_task`` call, keyed by containing function."""
+
+    def __init__(self, module: str) -> None:
+        self.module = module
+        self.function_stack: list[str] = []
+        # (function, lineno, task_type_or_None, fix_reason_keyword_or_None)
+        self.calls: list[tuple[str, int, str | None, ast.keyword | None]] = []
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.function_stack.append(node.name)
+        self.generic_visit(node)
+        self.function_stack.pop()
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        name = (
+            func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        )
+        if name == FIX_REASON_SPAWNER:
+            task_type: str | None = None
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                value = node.args[1].value
+                task_type = value if isinstance(value, str) else None
+            keyword = next((kw for kw in node.keywords if kw.arg == "fix_reason"), None)
+            assert self.function_stack, (
+                f"module-level {FIX_REASON_SPAWNER} call in {self.module}"
+            )
+            self.calls.append((self.function_stack[-1], node.lineno, task_type, keyword))
+        self.generic_visit(node)
+
+
+_FIX_SPAWN_INVENTORY_CACHE: dict[str, _FixSpawnInventory] = {}
+
+
+def _fix_spawn_inventories() -> dict[str, _FixSpawnInventory]:
+    if _FIX_SPAWN_INVENTORY_CACHE:
+        return _FIX_SPAWN_INVENTORY_CACHE
+    for path in APP_ROOT.rglob("*.py"):
+        module = path.relative_to(APP_ROOT).with_suffix("").as_posix().replace("/", ".")
+        inventory = _FixSpawnInventory(module)
+        inventory.visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        _FIX_SPAWN_INVENTORY_CACHE[module] = inventory
+    return _FIX_SPAWN_INVENTORY_CACHE
+
+
+def _value_literals(node: ast.AST) -> set[str]:
+    """String constants this expression can EVALUATE to.
+
+    Deliberately not ``ast.walk``: for ``"merge_conflict" if kind == "fix" else ""``
+    the operands of the *test* are not candidate values, and counting them would
+    make the guard flag its own condition.
+    """
+    if isinstance(node, ast.Constant):
+        return {node.value} if isinstance(node.value, str) else set()
+    if isinstance(node, ast.IfExp):
+        return _value_literals(node.body) | _value_literals(node.orelse)
+    if isinstance(node, ast.BoolOp):
+        return set().union(*(_value_literals(value) for value in node.values))
+    # Name / Call / attribute lookup: a value this reader cannot resolve. Not an
+    # error -- the constants those resolve to are pinned where they are defined.
+    return set()
+
+
+def test_every_fix_spawn_states_why_it_is_spawning() -> None:
+    """A ``fix`` spawn must name its lane; it cannot inherit one by omission."""
+    inventories = _fix_spawn_inventories()
+
+    silent = {
+        (module, function)
+        for module, inventory in inventories.items()
+        for function, _line, task_type, keyword in inventory.calls
+        if task_type == "fix" and keyword is None
+    }
+    assert not silent, (
+        f"{FIX_REASON_SPAWNER}(..., 'fix', ...) must pass fix_reason=. An "
+        "omitted fix_reason is not neutral -- every consumer reads it as "
+        "'code_review', so a conflict/CI/migration fix is silently budgeted and "
+        "sub-capped as a code-review iteration.\n"
+        f"  silent fix spawns: {sorted(silent)}"
+    )
+
+    dynamic = {
+        (module, function)
+        for module, inventory in inventories.items()
+        for function, _line, task_type, _keyword in inventory.calls
+        if task_type is None
+    }
+    assert dynamic == set(FIX_REASON_DYNAMIC_SPAWN_SITES), (
+        "A spawn site whose task_type is computed at runtime cannot be checked "
+        "statically and must be reviewed by hand in "
+        "FIX_REASON_DYNAMIC_SPAWN_SITES.\n"
+        f"  new dynamic sites: {sorted(dynamic - set(FIX_REASON_DYNAMIC_SPAWN_SITES))}\n"
+        f"  stale exemptions:  {sorted(set(FIX_REASON_DYNAMIC_SPAWN_SITES) - dynamic)}"
+    )
+
+
+def test_every_fix_reason_literal_routes_to_a_real_lane() -> None:
+    """A typo'd fix_reason is silently indistinguishable from an omitted one.
+
+    Nothing at runtime rejects an unknown value: it falls through every
+    consumer's ``if`` chain into the review-convergence lane, i.e. it behaves
+    exactly like the bug this ratchet exists to stop.  So the vocabulary is
+    pinned here rather than derived from the consumers.
+    """
+    inventories = _fix_spawn_inventories()
+    unrouted: dict[str, set[str]] = defaultdict(set)
+    blanked: set[tuple[str, str]] = set()
+    for module, inventory in inventories.items():
+        for function, _line, task_type, keyword in inventory.calls:
+            if keyword is None:
+                continue
+            literals = _value_literals(keyword.value)
+            # "" is a legitimate value on the NON-fix branch of a conditional
+            # (a review spawn carries no fix lane) -- but never for a call the
+            # reader can see is a fix.
+            if task_type == "fix" and "" in literals:
+                blanked.add((module, function))
+            for literal in literals - {""}:
+                if literal not in FIX_REASON_ROUTED_VOCABULARY:
+                    unrouted[f"{module}.{function}"].add(literal)
+
+    assert not blanked, (
+        "A fix spawn passed fix_reason=\"\" explicitly. That is the same silent "
+        "vote for the review-convergence lane as omitting it, only harder to "
+        "spot in review.\n"
+        f"  {sorted(blanked)}"
+    )
+    assert not unrouted, (
+        "fix_reason literal outside the routed vocabulary. It will not raise; "
+        "it will quietly route to the review-convergence lane, which is the "
+        "same failure as passing nothing at all. Either fix the typo, or add "
+        "the value to FIX_REASON_ROUTED_VOCABULARY *and* to the routing "
+        "branches in review_pipeline / review_heuristics that must honour it.\n"
+        f"  {dict(sorted((key, sorted(vals)) for key, vals in unrouted.items()))}"
+    )
+
+
+# Companion to the fix_reason ratchet, one level down: the fix_reason says WHICH
+# lane, the prompt has to say WHAT went wrong.  ``build_merge_conflict_fix_prompt``
+# offers a ``merge_error=`` channel precisely so the resolver is shown GitHub's
+# own message; on 2026-08-26 the auto-merge recovery path in
+# ``task_lifecycle._process_post_commit`` was found logging that message and then
+# calling the builder without it, handing the resolver a prompt that asserted
+# ``mergeable_state='dirty'`` and nothing else.  The evidence was in scope; the
+# call simply did not pass it.
+MERGE_CONFLICT_PROMPT_BUILDER = "build_merge_conflict_fix_prompt"
+
+
+def test_merge_conflict_prompts_carry_the_merge_error() -> None:
+    silent: list[str] = []
+    for path in APP_ROOT.rglob("*.py"):
+        module = path.relative_to(APP_ROOT).with_suffix("").as_posix().replace("/", ".")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", None)
+            )
+            if name != MERGE_CONFLICT_PROMPT_BUILDER:
+                continue
+            if not any(kw.arg == "merge_error" for kw in node.keywords):
+                silent.append(f"{module}:{node.lineno}")
+
+    assert not silent, (
+        f"{MERGE_CONFLICT_PROMPT_BUILDER} must be called with merge_error=. Every "
+        "caller reaches it from a failed merge whose message it already has (and "
+        "logs); dropping it leaves the resolver to reverse-engineer the conflict "
+        "from the branch state.\n"
+        f"  callers without merge_error: {silent}"
+    )

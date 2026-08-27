@@ -3564,13 +3564,58 @@ _TERMINAL_TASK_STATUSES = frozenset(
 _SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS = 24
 
 
+def _terminal_failure_evidence_lines(
+    compute_result: dict[str, Any] | None,
+    logs: str | None,
+) -> list[str]:
+    """Render the WHY of a terminal compute job: reason first, then output tail.
+
+    Mirrors what ``_build_act_on_verdict_prompt`` shows a single-arm follow-on.
+    Returns ``[]`` when neither a terminal reason nor any captured output is
+    available, so callers can append unconditionally.
+    """
+    lines: list[str] = []
+    terminal_reason = _compute_terminal_reason_of(compute_result or {}, logs or "")
+    if terminal_reason:
+        lines.append(f"Terminal reason (why the job ended): {terminal_reason}")
+    record = _parse_compute_result_record(logs or "")
+    log_tail = (record or {}).get("command_log_text")
+    raw = (
+        log_tail
+        if isinstance(log_tail, str) and log_tail.strip()
+        else ((logs or "") if record is None else "")
+    )
+    raw = (raw or "").strip()
+    if raw:
+        if len(raw) > _ACT_ON_VERDICT_LOG_CHARS:
+            raw = raw[-_ACT_ON_VERDICT_LOG_CHARS:]
+            lines.append("(truncated — showing the tail of the output)")
+        lines.append(
+            "Captured stderr / traceback tail (diagnose from this):"
+        )
+        lines.append(raw)
+    return lines
+
+
 def _build_sweep_aggregate_prompt(
     tasks: list,
     sweep_id: str,
     *,
     failure_mode: bool = False,
+    trigger_arm_id: str = "",
+    trigger_compute_result: dict[str, Any] | None = None,
+    trigger_logs: str = "",
 ) -> str:
-    """Build the aggregate follow-on prompt covering all arms of a sweep."""
+    """Build the aggregate follow-on prompt covering all arms of a sweep.
+
+    ``trigger_*`` carry the terminal evidence of the arm whose completion fired
+    this aggregate. The per-arm loop below can only show ``plan_output``'s
+    ``compute_result`` — an arm that died before writing one renders as
+    ``Result: (none — arm status=FAILED)``, i.e. the diagnosing agent is told
+    that something failed and nothing about why. The caller has the terminal
+    reason and the captured traceback in hand (and passes them deliberately);
+    this used to accept both and read neither.
+    """
     if failure_mode:
         lines = [
             "You are a fresh, independent engineer acting on a FAILED compute-experiment "
@@ -3614,6 +3659,14 @@ def _build_sweep_aggregate_prompt(
             lines.append(f"  Result: (none — arm status={arm.status})")
     lines.append("")
     if failure_mode:
+        evidence = _terminal_failure_evidence_lines(
+            trigger_compute_result, trigger_logs
+        )
+        if evidence:
+            _where = f" (task {trigger_arm_id})" if trigger_arm_id else ""
+            lines.append(f"Terminal evidence from the arm that closed this sweep{_where}:")
+            lines.extend(evidence)
+            lines.append("")
         lines.append(
             "Diagnose the root cause(s) of the failure(s), then: implement fixes, "
             "add regression guards, and open a PR. If a failure is a transient infra "
@@ -3749,7 +3802,12 @@ async def _maybe_spawn_sweep_aggregate_followon(
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
 
     prompt = _build_sweep_aggregate_prompt(
-        list(sibling_rows), sweep_id, failure_mode=effective_failure_mode
+        list(sibling_rows),
+        sweep_id,
+        failure_mode=effective_failure_mode,
+        trigger_arm_id=str(task.id),
+        trigger_compute_result=compute_result,
+        trigger_logs=logs,
     )
 
     # Collect durable artifact pointers from all arms (Pillar 5 spawn-forward).
@@ -3806,6 +3864,11 @@ async def _maybe_spawn_sweep_aggregate_followon(
         _ACT_ON_VERDICT_SWEEP_KEY: sweep_id,
         "sweep_arm_task_ids": [str(t.id) for t in sibling_rows],
     }
+    # Machine-readable WHY, same key the single-arm follow-on stamps, so tooling
+    # reads one vocabulary for both spawn shapes.
+    _trigger_terminal_reason = _compute_terminal_reason_of(compute_result, logs)
+    if _trigger_terminal_reason:
+        context["compute_terminal_reason"] = _trigger_terminal_reason[:500]
     if artifact_prereqs:
         context[ARTIFACT_PREREQUISITES_KEY] = artifact_prereqs
 

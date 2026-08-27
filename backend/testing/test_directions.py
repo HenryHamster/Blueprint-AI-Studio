@@ -3714,7 +3714,22 @@ async def test_put_directions_completion_criteria_too_long(client: AsyncClient, 
 
 @pytest.mark.asyncio
 async def test_auto_completion_triggers(db_session, mocker):
-    """A saturated direction completes only with challenge-approved success proof."""
+    """A saturated direction completes only with challenge-approved success proof.
+
+    2026-08-26: the tail of this test used to assert that exactly one INFO ``Alert``
+    row existed with "auto-completed" in its title.
+    ``research.direction_auto_completed`` was already TIMELINE_ONLY in the alert
+    registry on ``origin/automain``, so that durable row was one the policy already
+    forbade -- the retirement backstop sweep cleared it on every pass, and the
+    assertion only passed because it ran inside a single transaction ahead of any
+    sweep. "Direction X was auto-completed" is a completed fact; no condition can
+    clear it, so a standing operator row for it is unresolvable by construction.
+    The mint site now asks the policy gate, and the delivery is the
+    ``direction_milestone`` ProjectMessage this same code path already posted
+    before the change. The assertion is re-pointed there, keeps the "exactly one"
+    cardinality it was really testing, and additionally pins the absence of the
+    durable row so a regression that restores the raw insert fails here.
+    """
     direction_id = "d-autocomp"
     direction = {
         "id": direction_id,
@@ -3814,7 +3829,36 @@ async def test_auto_completion_triggers(db_session, mocker):
     assert "auto_completed_reason" in d
     assert "3" in d["auto_completed_reason"]  # mentions the PR count
 
-    # Verify an INFO alert was created
+    # Verify the completion is delivered as a direction_milestone notice ...
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    milestones = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "direction_milestone"
+        and (m.context or {}).get("milestone") == "auto-completed"
+    ]
+    assert len(milestones) == 1, (
+        "expected exactly 1 'auto-completed' direction_milestone message, got "
+        f"{len(milestones)} (all event_types: "
+        f"{[(m.context or {}).get('event_type') for m in msgs]})"
+    )
+    # The reason still has to carry the PR count the direction status pinned above.
+    assert "3" in (milestones[0].context.get("reason") or ""), (
+        "the milestone notice must carry the merged-PR count, got "
+        f"{milestones[0].context.get('reason')!r}"
+    )
+
+    # ... and NOT as a durable, unresolvable INFO alert row.
     result = await db_session.execute(
         select(Alert).where(
             Alert.project_id == project.id,
@@ -3822,8 +3866,11 @@ async def test_auto_completion_triggers(db_session, mocker):
         )
     )
     alerts = result.scalars().all()
-    assert len(alerts) == 1
-    assert "auto-completed" in alerts[0].title.lower()
+    assert alerts == [], (
+        "'Direction auto-completed' is a completed fact, not a standing "
+        "condition: it must not mint a durable alert row that no resolver can "
+        f"ever clear (got {[a.title for a in alerts]})"
+    )
 
 
 @pytest.mark.asyncio

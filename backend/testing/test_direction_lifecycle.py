@@ -2607,10 +2607,23 @@ async def test_already_fixed_deadlock_auto_retires_via_apply_post_spawn(db_sessi
     HEAD) make the direction genuinely exhausted. When a fresh no-findings cycle is
     applied and the direction is neither code-failing nor externally frozen, it is
     routed to non-success terminal status='retired' with an exhaustion reason and
-    an INFO 'Direction auto-retired' alert. Exhaustion must not masquerade as
+    a 'Direction auto-retired' milestone notice. Exhaustion must not masquerade as
     evidence that the direction achieved its declared outcome.
+
+    2026-08-26: this test used to demand a durable ``Alert`` row. It was asserting
+    a row the registry already forbade: ``research.direction_auto_retired`` was
+    already in ``_TIMELINE_ONLY_RETIREMENT_EVENTS`` on ``origin/automain``, so the
+    retirement backstop sweep retired that row on every pass -- the assertion only
+    held because it ran inside one transaction, before any sweep. "Direction X was
+    retired at T" is a completed fact; no condition can clear it, so a durable
+    operator row for it is unresolvable by construction. The mint site now asks the
+    policy gate, which suppresses the row, and the delivery is the
+    ``direction_milestone`` ProjectMessage that the same code path already posted
+    before this change. The assertion is re-pointed at that live observable and
+    additionally pins the absence of the durable row, so a regression that
+    re-introduces the raw insert fails here.
     """
-    from app.models import Alert
+    from app.models import Alert, ProjectMessage
     from app.research_direction_state import apply_post_spawn_state
     from test_autonomous_research import _active_direction, _make_research_task
 
@@ -2680,15 +2693,44 @@ async def test_already_fixed_deadlock_auto_retires_via_apply_post_spawn(db_sessi
         f"auto_completed_reason must reflect exhaustion, got {d.get('auto_completed_reason')!r}"
     )
 
+    # The retirement is delivered as a direction_milestone notice ...
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    milestones = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "direction_milestone"
+        and (m.context or {}).get("milestone") == "auto-retired"
+    ]
+    assert len(milestones) == 1, (
+        "expected exactly 1 'auto-retired' direction_milestone message, got "
+        f"{len(milestones)} (all event_types: "
+        f"{[(m.context or {}).get('event_type') for m in msgs]})"
+    )
+    assert "exhausted" in (milestones[0].context.get("reason") or ""), (
+        "the milestone notice must carry the exhaustion reason, got "
+        f"{milestones[0].context.get('reason')!r}"
+    )
+
+    # ... and NOT as a durable, unresolvable operator alert row.
     result = await db_session.execute(
         select(Alert).where(
             Alert.project_id == project.id,
             Alert.title == "Direction auto-retired",
-            Alert.dismissed_at.is_(None),
         )
     )
-    assert result.scalars().first() is not None, (
-        "expected a 'Direction auto-retired' alert"
+    assert result.scalars().first() is None, (
+        "'Direction auto-retired' is a completed fact, not a standing condition: "
+        "it must not mint a durable alert row that no resolver can ever clear"
     )
 
 

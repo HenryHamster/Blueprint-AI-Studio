@@ -43,34 +43,133 @@ from testing.factories import make_project, make_task
 
 
 def test_every_operator_action_needed_event_type_declares_a_retirement_rule():
-    """Durable operator-action alerts must state how their condition ends."""
-    from app.alert_policy import ALERT_EVENT_POLICIES, AlertRetirementMode
+    """Durable operator-action alerts must state how their condition ends.
+
+    2026-08-26: the previous body asserted that no registered event had
+    ``retirement is None``.  ``alert_policy`` rebuilds the registry with
+    ``replace(policy, retirement=_RETIREMENT_MODE_BY_EVENT[event_type])``, so
+    ``retirement`` is never ``None`` and that assertion could not fail.  It was
+    the test-side half of a pair of vacuous guards; the other lived in
+    ``alert_policy`` itself, and between them a new alert silently inherited
+    SOURCE_CONDITION -- the one mode that ASSERTS a producer-owned resolver
+    exists -- with nothing verifying one did.
+
+    Restating the import-time invariant here would be vacuous for the same
+    reason: ``build_retirement_map`` raises on an undeclared, double-declared,
+    or unregistered event, so a registry that violated it would not import and
+    this module could not have been collected.  The falsifiable half of that
+    contract is the ``test_retirement_map_rejects_*`` cases below, which hand
+    the builder adversarial input directly.
+
+    What is left for THIS test is what the import-time check does NOT cover:
+    that a declared mode is compatible with the route the policy registers.
+    """
+    from app.alert_policy import (
+        ALERT_EVENT_POLICIES,
+        ROUTE_ALERT,
+        AlertRetirementMode,
+    )
     from app.message_audience import get_operator_event_types
 
     operator_alerts = sorted(
         set(ALERT_EVENT_POLICIES).intersection(get_operator_event_types())
     )
     assert operator_alerts, "the contract must exercise the operator alert registry"
-    missing = [
+
+    # TIMELINE_ONLY means "never create a durable row". Registered ROUTE_ALERT
+    # the gateway mints one anyway and sweep_resolve_policy_retirement_alerts
+    # retires it on the next pass, forever: two subsystems churning against each
+    # other, and a retirement mode the route contradicts.
+    contradicted = sorted(
+        event_type
+        for event_type, policy in ALERT_EVENT_POLICIES.items()
+        if policy.retirement == AlertRetirementMode.TIMELINE_ONLY
+        and policy.route == ROUTE_ALERT
+    )
+    assert not contradicted, (
+        "TIMELINE_ONLY events registered ROUTE_ALERT -- the gateway mints a "
+        "durable row the retirement backstop then clears on every pass: "
+        + ", ".join(contradicted)
+    )
+
+    # An operator-action-needed event declared TIMELINE_ONLY asks the operator
+    # to act on a row that is never created.
+    invisible = sorted(
         event_type
         for event_type in operator_alerts
-        if ALERT_EVENT_POLICIES[event_type].retirement is None
-    ]
-    assert not missing, (
-        "operator-action-needed alert events without a retirement rule: "
-        + ", ".join(missing)
+        if ALERT_EVENT_POLICIES[event_type].retirement
+        == AlertRetirementMode.TIMELINE_ONLY
+        and ALERT_EVENT_POLICIES[event_type].action_required
     )
-    assert all(
-        isinstance(ALERT_EVENT_POLICIES[event_type].retirement, AlertRetirementMode)
-        for event_type in operator_alerts
-        if event_type
+    assert not invisible, (
+        "operator-action-needed events declared TIMELINE_ONLY: the operator is "
+        "asked to act on an alert row that is never created: "
+        + ", ".join(invisible)
     )
+
     assert any(
-        ALERT_EVENT_POLICIES[event_type].retirement
-        == AlertRetirementMode.MANUAL
+        ALERT_EVENT_POLICIES[event_type].retirement == AlertRetirementMode.MANUAL
         for event_type in operator_alerts
-        if event_type
     )
+
+
+def test_retirement_map_rejects_an_event_declared_in_two_modes():
+    """The contract must be able to FAIL — proven with adversarial input.
+
+    The live registry can never exercise the raise, because a registry that
+    tripped it would not import.  Calling the builder directly is what makes
+    this guard falsifiable rather than decorative.
+    """
+    from app.alert_policy import AlertRetirementMode, build_retirement_map
+
+    with pytest.raises(RuntimeError, match="more than one retirement mode"):
+        build_retirement_map(
+            {"a.event"},
+            (
+                (frozenset({"a.event"}), AlertRetirementMode.MANUAL),
+                (frozenset({"a.event"}), AlertRetirementMode.SOURCE_CONDITION),
+            ),
+        )
+
+
+def test_retirement_map_rejects_an_event_with_no_declared_mode():
+    """A registered alert that never says how it ends fails at import."""
+    from app.alert_policy import AlertRetirementMode, build_retirement_map
+
+    with pytest.raises(RuntimeError, match="must declare a retirement mode"):
+        build_retirement_map(
+            {"a.event", "b.undeclared"},
+            ((frozenset({"a.event"}), AlertRetirementMode.MANUAL),),
+        )
+
+
+def test_retirement_map_rejects_a_mode_declared_for_an_unregistered_event():
+    """A retirement declaration for an event nobody registered is a typo."""
+    from app.alert_policy import AlertRetirementMode, build_retirement_map
+
+    with pytest.raises(RuntimeError, match="missing from"):
+        build_retirement_map(
+            {"a.event"},
+            (
+                (
+                    frozenset({"a.event", "typo.event"}),
+                    AlertRetirementMode.MANUAL,
+                ),
+            ),
+        )
+
+
+def test_retirement_map_resolves_the_live_registry_without_defaults():
+    """The live registry resolves cleanly through the same falsifiable path."""
+    from app.alert_policy import (
+        ALERT_EVENT_POLICIES,
+        AlertRetirementMode,
+        build_retirement_map,
+    )
+
+    resolved = build_retirement_map(set(ALERT_EVENT_POLICIES))
+    assert set(resolved) == set(ALERT_EVENT_POLICIES)
+    assert all(isinstance(mode, AlertRetirementMode) for mode in resolved.values())
 
 
 @pytest.mark.asyncio

@@ -191,6 +191,13 @@ def _patch_github(
     mocker.patch(
         "app.github.get_pull_request_diff", new=AsyncMock(return_value="")
     )
+    # Conflict-evidence compare (step 6). Default: unavailable (None), which is
+    # the "GitHub would not say" branch — the resolver is still spawned, just
+    # without an overlapping-file list. Conflict tests that assert the evidence
+    # override this.
+    mocker.patch(
+        "app.github.get_files_changed_between_refs", new=AsyncMock(return_value=None)
+    )
     mocker.patch(
         "app.github.list_versions_at_ref", new=AsyncMock(return_value=[])
     )
@@ -489,9 +496,13 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     assert len(tasks) == 1
     resolution = tasks[0]
     assert resolution.title == "Resolve back-merge conflict: main -> automain"
+    # The description states the OBSERVED reason, not just the state: an
+    # operator inbox row answers "why" without opening the payload.
     assert (
         resolution.description
-        == "The automated main -> automain back-merge PR #55 hit a merge conflict; resolve it on automain so the next promotion does not conflict."
+        == 'The automated main -> automain back-merge PR #55 hit a merge conflict '
+        '(GitHub reported "merge conflict"); resolve it on automain so the next '
+        "promotion does not conflict."
     )
     payload = resolution.first_payload
     # ``create`` (not ``plan``): single direct task so resolver guardrails
@@ -516,6 +527,15 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     assert resolution.context["backmerge_conflict"] is True
     assert resolution.context["hotfix_task_id"] == str(hotfix_id)
     assert resolution.context["backmerge_pr_number"] == 55
+    # ...and the OBSERVED conflict, so "why was this spawned" is answerable
+    # from the row alone and survives a prompt rewrite.
+    assert resolution.context["backmerge_conflict_report"] == "merge conflict"
+    assert (
+        resolution.context["backmerge_conflict_detected_via"]
+        == "merge API reported a conflict (409)"
+    )
+    assert resolution.context["backmerge_head_sha"] == "deadbeef"
+    assert resolution.context["backmerge_base_sha"] == "basebeef"
 
     # A SPAWNED history row was written for the resolution task.
     history = (
@@ -573,6 +593,183 @@ async def test_open_backmerge_pr_dirty_pr_detected_as_conflict_spawns_resolver(
     assert len(resolvers) == 1
     assert resolvers[0].context["backmerge_conflict"] is True
     assert resolvers[0].first_payload["base_branch"] == "automain"
+    # On THIS path GitHub's own message ("Pull Request is not mergeable") says
+    # nothing useful, so the resolver must be told HOW the verdict was reached
+    # — otherwise it cannot distinguish a dirty PR from a rejected merge.
+    assert (
+        resolvers[0].context["backmerge_conflict_detected_via"]
+        == "the merge API returned 'not mergeable' without a conflict flag and "
+        "the PR resource reports mergeable_state=dirty"
+    )
+    assert (
+        "mergeable_state=dirty" in resolvers[0].first_payload["prompt"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_backmerge_conflict_resolver_carries_the_observed_conflict(
+    db_session, mocker
+):
+    """The resolver must be handed the conflict the ORCHESTRATOR observed.
+
+    Regression guard for the "surface reasons, not states" defect: the spawner
+    knew what the merge attempt reported and which files both branches had
+    touched, interpolated the merge report into the operator Alert, and then
+    handed the executing agent a generic "there was a conflict, here is how to
+    resolve conflicts" prompt.  The resolver had to re-run the merge just to
+    learn what the orchestrator already knew.
+
+    A textual conflict can only occur in a file BOTH sides changed since the
+    merge base, so the intersection of the two compares is a sound
+    over-approximation of the conflict surface and is what the prompt names.
+    """
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 91, "html_url": "http://pr/91"},
+        merge_return={
+            "merged": False,
+            "conflict": True,
+            "message": "Merge conflict in backend/app/lifecycle.py",
+        },
+    )
+
+    # compare(automain...main) -> main's divergence; compare(main...automain)
+    # -> automain's divergence. Only the intersection can conflict.
+    async def _compare(token, owner, repo, base_ref, head_ref, project_id=None):
+        if (base_ref, head_ref) == ("automain", "main"):
+            return ["backend/app/lifecycle.py", "backend/app/hotfix_only.py"]
+        if (base_ref, head_ref) == ("main", "automain"):
+            return ["backend/app/lifecycle.py", "backend/app/refactor_only.py"]
+        raise AssertionError(f"unexpected compare {base_ref}...{head_ref}")
+
+    mocker.patch(
+        "app.github.get_files_changed_between_refs",
+        new=AsyncMock(side_effect=_compare),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+    assert result["status"] == "conflict"
+
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [t for t in tasks if (t.first_payload or {}).get("type") == "create"]
+    assert len(resolvers) == 1
+    resolver = resolvers[0]
+    prompt = resolver.first_payload["prompt"]
+
+    # 1. What the merge attempt actually reported reaches the agent verbatim.
+    assert "Merge conflict in backend/app/lifecycle.py" in prompt
+    assert (
+        resolver.context["backmerge_conflict_report"]
+        == "Merge conflict in backend/app/lifecycle.py"
+    )
+
+    # 2. WHICH files — the both-sides intersection, not either side alone.
+    assert "`backend/app/lifecycle.py`" in prompt
+    assert "hotfix_only.py" not in prompt, (
+        "a file only main touched cannot conflict — naming it sends the "
+        "resolver to a file with nothing to resolve"
+    )
+    assert "refactor_only.py" not in prompt
+    assert resolver.context["backmerge_conflict_files"] == [
+        "backend/app/lifecycle.py"
+    ]
+    assert resolver.context["backmerge_conflict_file_count"] == 1
+
+    # 3. Which branches, at which commits (provenance, not merge instructions).
+    assert resolver.context["backmerge_head_sha"] == "deadbeef"
+    assert resolver.context["backmerge_base_sha"] == "basebeef"
+    assert "deadbeef" in prompt
+
+    # 4. The evidence is also on the SPAWNED history row, so the reason is
+    #    recoverable after any later prompt/context rewrite.
+    history = (
+        (
+            await db_session.execute(
+                select(TaskHistory).where(TaskHistory.task_id == resolver.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    spawned = [h for h in history if h.action == "SPAWNED"]
+    assert len(spawned) == 1
+    assert (
+        spawned[0].details["merge_report"]
+        == "Merge conflict in backend/app/lifecycle.py"
+    )
+    assert spawned[0].details["overlapping_file_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_backmerge_conflict_resolver_spawns_when_file_evidence_unavailable(
+    db_session, mocker
+):
+    """A GitHub compare failure must NOT stop the resolver from being spawned.
+
+    The overlapping-file list is evidence enrichment, never a gate: a back-merge
+    conflict still needs a resolver even when GitHub will not say which files
+    are involved.  The prompt says so explicitly instead of silently omitting
+    the section, so the agent knows the list is absent rather than empty.
+    """
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 92, "html_url": "http://pr/92"},
+        merge_return={"merged": False, "conflict": True, "message": "merge conflict"},
+    )
+    mocker.patch(
+        "app.github.get_files_changed_between_refs",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+    assert result["status"] == "conflict"
+
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [t for t in tasks if (t.first_payload or {}).get("type") == "create"]
+    assert len(resolvers) == 1, "compare failure must never suppress the resolver"
+    prompt = resolvers[0].first_payload["prompt"]
+    assert "Overlapping-file evidence was unavailable" in prompt
+    # The merge report still crosses the handoff — the part that never needed
+    # a network call must not be lost with the part that did.
+    assert "merge conflict" in prompt
+    assert "backmerge_conflict_files" not in resolvers[0].context
+
+
+@pytest.mark.asyncio
+async def test_backmerge_conflict_file_evidence_is_capped(db_session, mocker):
+    """The overlapping-file list is capped, and the FULL count is still stated.
+
+    An unbounded list would push the per-conflict resolution policy out of the
+    agent's context window, which is the one thing the prompt exists to deliver.
+    """
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 93, "html_url": "http://pr/93"},
+        merge_return={"merged": False, "conflict": True, "message": "merge conflict"},
+    )
+    both_sides = [f"backend/app/mod_{i:03d}.py" for i in range(120)]
+    mocker.patch(
+        "app.github.get_files_changed_between_refs",
+        new=AsyncMock(return_value=both_sides),
+    )
+
+    await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+
+    tasks = await _tasks_for(db_session, project.id)
+    resolver = next(
+        t for t in tasks if (t.first_payload or {}).get("type") == "create"
+    )
+    assert len(resolver.context["backmerge_conflict_files"]) == 40
+    assert resolver.context["backmerge_conflict_file_count"] == 120
+    assert "…and 80 more" in resolver.first_payload["prompt"]
+    # The count the operator sees must be the real one, not the truncated one.
+    assert "120 files changed on both sides" in resolver.description
 
 
 @pytest.mark.asyncio
@@ -773,9 +970,13 @@ async def test_open_backmerge_pr_conflict_uses_custom_branch_names_for_resolver(
 
     task = (await _tasks_for(db_session, project.id))[0]
     assert task.title == "Resolve back-merge conflict: stable -> trunk"
-    assert (
-        task.description
-        == "The automated stable -> trunk back-merge PR #88 hit a merge conflict; resolve it on trunk so the next promotion does not conflict."
+    # The description names the configured branches AND quotes what the merge
+    # attempt actually reported -- the branch names alone never told the worker
+    # what went wrong.
+    assert task.description == (
+        'The automated stable -> trunk back-merge PR #88 hit a merge conflict '
+        '(GitHub reported "conflict"); resolve it on trunk so the next '
+        "promotion does not conflict."
     )
 
 
