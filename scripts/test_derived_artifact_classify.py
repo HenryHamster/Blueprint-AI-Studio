@@ -124,12 +124,15 @@ def _write_vitest_durations(root: Path, suite: str, files: list[dict]) -> None:
 
 
 def _write_ranked_queue(root: Path, paths: tuple[str, ...]) -> None:
-    """Render only what the guard's row regex reads: rank, cols, and the path."""
-    rows = "\n".join(
-        f"| {index} | P2 | 120 | `{path}` |" for index, path in enumerate(paths, 1)
-    )
+    """Render only what the guard's row regex reads: two cols, then the path.
+
+    Mirrors the real rendering, which carries no rank ordinal: that column was
+    removed because it renumbered every row below an insertion, which made the
+    artifact conflict with every concurrent branch.
+    """
+    rows = "\n".join(f"| P2 | backend | `{path}` | 120 |" for path in paths)
     (root / "test-estate-ranked-queue.md").write_text(
-        "# queue\n\n| # | pri | lines | path |\n|---|---|---|---|\n" + rows + "\n",
+        "# queue\n\n| pri | area | path | lines |\n|---|---|---|---|\n" + rows + "\n",
         encoding="utf-8",
         newline="",
     )

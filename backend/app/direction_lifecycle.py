@@ -261,6 +261,75 @@ def reactivate_paused_direction(direction: dict, *, allow_user_paused: bool) -> 
     return True
 
 
+STRATEGIST_PAUSE_REASON_PREFIX = "Strategic review: "
+STRATEGIST_PAUSE_REASON_FALLBACK = "Strategic review: direction paused"
+# Bounds the free-text rationale copied into paused_reason. The reason is
+# rendered in operator surfaces (digest, anomaly report, admin debug) and
+# persisted in the project.directions JSONB, so it must not carry an unbounded
+# model-authored string.
+STRATEGIST_PAUSE_REASON_MAX = 500
+
+
+def strategist_pause_reason(rationale: str | None) -> str:
+    """Build the ``paused_reason`` recorded for a strategist-initiated pause.
+
+    Surfaces the WHY: the strategist's own rationale, prefixed so operator
+    surfaces can tell an engine pause from a lifecycle-health pause at a
+    glance. Falls back to a fixed marker when the strategist supplied no
+    rationale — a pause always carries a reason, never an empty string.
+    """
+    text = str(rationale or "").strip()
+    if not text:
+        return STRATEGIST_PAUSE_REASON_FALLBACK
+    return (STRATEGIST_PAUSE_REASON_PREFIX + text)[:STRATEGIST_PAUSE_REASON_MAX]
+
+
+def pause_direction_autonomously(direction: dict, *, reason: str) -> None:
+    """Transition a direction to ``paused`` as an AUTOMATIC (engine) pause.
+
+    The symmetric counterpart to :func:`reactivate_paused_direction`, and the
+    only sanctioned way for a non-human caller to park a direction.
+
+    A strategist-initiated pause IS an automatic pause by definition: the
+    engine parked the direction, so the engine must be able to un-park it.
+    Writing ``status = "paused"`` directly instead of calling this leaves the
+    direction with no ``auto_paused`` / ``paused_at`` / ``paused_reason``
+    markers, which makes it indistinguishable from a genuine operator hold and
+    creates a ONE-WAY LATCH:
+
+    * cooldown auto-recovery requires ``status == "paused" and auto_paused and
+      paused_at``, so a marker-less direction never time-recovers; and
+    * :func:`reactivate_paused_direction` classifies ``paused`` with no
+      ``auto_paused`` as user-paused and refuses the strategist
+      (``allow_user_paused=False``) — so the strategist cannot reactivate the
+      direction it paused itself.
+
+    A project whose directions were all parked that way is fully halted with no
+    automatic way back: the engine progressively parks its own portfolio and
+    then cannot restart it. Only a genuine human PATCH may produce a user-pause.
+
+    Mirrors the field stamping of the lifecycle health pause so both pause
+    paths converge on identical state: sets ``paused_reason`` / ``paused_at`` /
+    ``auto_paused``, increments ``auto_pause_count``, and consumes any
+    ``auto_recovered_at`` grace marker (leaving it set would let
+    ``_check_direction_health`` skip history-based rules after a re-pause).
+
+    Ladder counters keyed on the specific health reason
+    (``churn_family_pause_count``, ``lifetime_burn_pause_count``) are
+    deliberately NOT incremented here: those ladders are driven by the
+    lifecycle's own classified health reasons, and a strategist's free-text
+    rationale must not advance a retirement ladder.
+    """
+    direction["status"] = "paused"
+    direction["paused_reason"] = (
+        str(reason).strip() or STRATEGIST_PAUSE_REASON_FALLBACK
+    )
+    direction["paused_at"] = _utcnow().isoformat()
+    direction["auto_paused"] = True
+    direction["auto_pause_count"] = direction.get("auto_pause_count", 0) + 1
+    direction.pop("auto_recovered_at", None)  # Grace period consumed on re-pause
+
+
 # Auto-retire ladder counters reset when a direction is resurrected. Keeping the
 # tuple next to the ladder constants above makes the reset<->accumulate pairing
 # explicit: every counter incremented by _process_direction_lifecycle is zeroed

@@ -2378,13 +2378,12 @@ async def update_report(
     runner: LocalRunner = Depends(get_current_runner),
     session: AsyncSession = Depends(get_session),
 ):
-    """Create an operator alert for a runner's self-update outcome.
+    """Accept a runner's self-update outcome report.
 
     Called best-effort by ``blueprint-runner update`` after the update
-    completes (or fails).  Creates an INFO alert on success, WARNING on
-    failure, and broadcasts it so the operator console surfaces the outcome
-    immediately — no need to SSH or grep logs to see if the version bump
-    landed.
+    completes (or fails).  The ``runner.self_update`` event is a point-in-time
+    notice routed through the shared alert policy.  Its ``TIMELINE_ONLY``
+    retirement contract deliberately prevents a durable alert row.
 
     Authenticated via the runner's bearer token (same as heartbeat).
     Best-effort contract: the runner never blocks its own update CLI on

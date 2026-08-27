@@ -271,6 +271,18 @@ _RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS = 120
 # reclaimed. Comfortably longer than a spawn takes (~30-60s).
 _RESIDENT_START_CLAIM_STALE_SECONDS = 300  # 5 min
 
+# Supersession cause vocabulary. See the module docstring there for why a
+# single fixed "heartbeat became stale" sentence was not good enough.
+from app.resident_supersede_reasons import (  # noqa: E402
+    RESIDENT_SUPERSEDE_ORPHANED_IDENTITY,
+    RESIDENT_SUPERSEDE_PINNED_RUNNER_OFFLINE,
+    RESIDENT_SUPERSEDE_REASON_TEXT,
+    RESIDENT_SUPERSEDE_START_CLAIM_STALE,
+    RESIDENT_SUPERSEDE_WORKER_HEARTBEAT_STALE,
+    RESIDENT_SUPERSEDE_WORKER_TASK_MISSING,
+    RESIDENT_SUPERSEDE_WORKER_TASK_TERMINAL,
+)
+
 # Operator-authored message ``from_type`` values that count as an operator
 # interaction for the unattended cap (operator messages are stored as ``user``;
 # ``operator`` is included defensively).
@@ -1728,19 +1740,47 @@ def _start_claim_is_stale(blob: dict[str, Any] | None, now: datetime) -> bool:
     return (now - started).total_seconds() > _RESIDENT_START_CLAIM_STALE_SECONDS
 
 
-def _resident_worker_task_is_healthy(
-    task: Task | None, blob: dict[str, Any], now: datetime
-) -> bool:
-    """Return whether the recorded worker is healthy enough to reuse."""
+def _resident_task_awaiting_runner_pull(task: Task | None) -> bool:
+    """True iff *task* is a local-runner pin the operator's runner has not pulled.
+
+    Delegates to the canonical ``reaper_orphan_classify._is_runner_pinned_awaiting_pull``
+    (``vm_instance_id`` prefixed ``runner:`` + ``started_at IS NULL``) so this
+    predicate and the reaper carve-out can never drift apart. Imported lazily to
+    keep the reaper's import graph off this module's load path.
+    """
     if task is None:
         return False
+    from app.reaper_orphan_classify import _is_runner_pinned_awaiting_pull
+
+    return _is_runner_pinned_awaiting_pull(task)
+
+
+def _resident_worker_health_verdict(
+    task: Task | None,
+    blob: dict[str, Any],
+    now: datetime,
+    *,
+    pinned_runner_live: bool | None = None,
+) -> str | None:
+    """Return ``None`` when the recorded worker is reusable, else WHY it is not.
+
+    The return value is one of the ``RESIDENT_SUPERSEDE_*`` cause codes, so the
+    caller can record an accurate reason on the row it cancels rather than a
+    fixed sentence.
+
+    ``pinned_runner_live`` is the liveness of the runner a not-yet-pulled task is
+    pinned to (``None`` = not resolved / unknown). It is the ONLY thing that can
+    condemn a runner pin still awaiting its pull — see the carve-out below.
+    """
+    if task is None:
+        return RESIDENT_SUPERSEDE_WORKER_TASK_MISSING
     if task.status not in {
         TaskStatus.QUEUED,
         TaskStatus.PROVISIONING,
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
     }:
-        return False
+        return RESIDENT_SUPERSEDE_WORKER_TASK_TERMINAL
     if task.status in {TaskStatus.QUEUED, TaskStatus.PROVISIONING}:
         retry_until = task.retry_after_until
         if retry_until is not None and retry_until.tzinfo is not None:
@@ -1748,7 +1788,7 @@ def _resident_worker_task_is_healthy(
         if retry_until is not None and retry_until > now:
             # The Task column is authoritative. The blob is an operator-facing
             # projection that may transiently lag its post-commit mirror.
-            return True
+            return None
         # A retry deadline is not a claim guarantee: the retry scheduler and
         # runner still need a little time to turn an elapsed durable hold into
         # an IN_PROGRESS worker.  Keep the exact persisted retry generation
@@ -1763,8 +1803,51 @@ def _resident_worker_task_is_healthy(
             and (now - blob_retry_until).total_seconds()
             <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
         ):
-            return True
+            return None
     if task.status in {TaskStatus.QUEUED, TaskStatus.PROVISIONING}:
+        # --- Runner pin still AWAITING ITS PULL ---------------------------
+        # A task hard-pinned to the operator's local runner sits PROVISIONING
+        # with ``started_at IS NULL`` until that runner polls
+        # ``POST /api/runner/next-task``. There is NO worker yet, so there is no
+        # worker liveness to have gone stale — and the wait is bounded by the
+        # RUNNER'S QUEUE DEPTH, which is routinely tens of minutes on a busy
+        # single-runner fleet, not by anything this session controls.
+        #
+        # Judging that state by the start-claim clock below is what produced the
+        # phase-2 supersession loop: the pin was condemned at the 5-minute mark,
+        # the replacement generation spawned a BRAND-NEW task at the BACK of the
+        # same runner queue, and the reset repeated — 177 generations deep, ~10
+        # cycles/hour, zero completions, because the queue position was thrown
+        # away faster than the runner could ever reach it. Supersession is only
+        # meant to settle a genuine race between two live workers; applied to a
+        # queued pin it is a self-inflicted livelock that can never converge.
+        #
+        # The reaper already reached this conclusion for the same state
+        # (``_is_runner_pinned_awaiting_pull``): let the work wait for the runner
+        # instead of churning requeue -> repin -> reap. Mirror it here. The only
+        # thing that can condemn a pin awaiting pull is the PINNED RUNNER being
+        # gone — an unresolved/unknown liveness never supersedes, because a
+        # false "offline" here destroys queued work. A genuinely abandoned
+        # local-required session is still bounded elsewhere by the orchestrator's
+        # ``_fail_stale_local_runner_holds`` cloud-fallback sweep.
+        #
+        # Scoped to a VIRGIN pin — one that has never had a worker at all. A task
+        # that has already heartbeated, or that carries a retry deadline / a
+        # ``retry_wait`` session state, HAS a worker history and a bounded retry
+        # contract of its own; those keep the existing reclaim behaviour below,
+        # because for them a missing heartbeat is evidence of a DEAD worker
+        # rather than of a worker that was never born. All 240 rows from the
+        # production incident satisfy every clause here (240/240 pinned with
+        # ``attempt_count = 0`` and no retry deadline).
+        if (
+            _resident_task_awaiting_runner_pull(task)
+            and task.last_heartbeat is None
+            and task.retry_after_until is None
+            and blob.get("worker_state") != "retry_wait"
+        ):
+            if pinned_runner_live is False:
+                return RESIDENT_SUPERSEDE_PINNED_RUNNER_OFFLINE
+            return None
         # A resident failure can requeue the exact task between worker attempts.
         # Its original session start is no longer a useful health signal once the
         # session has been alive for five minutes: the runner may have just sent
@@ -1780,17 +1863,19 @@ def _resident_worker_task_is_healthy(
             if (
                 now - heartbeat
             ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS:
-                return True
+                return None
         started = _parse_iso_naive(blob.get("started_at"))
-        return bool(
+        if (
             started
             and (now - started).total_seconds() <= _RESIDENT_START_CLAIM_STALE_SECONDS
-        )
+        ):
+            return None
+        return RESIDENT_SUPERSEDE_START_CLAIM_STALE
     worker_heartbeat = _parse_iso_naive(blob.get("worker_heartbeat_at"))
     if worker_heartbeat is not None:
         worker_age = (now - worker_heartbeat).total_seconds()
         if worker_age <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS:
-            return True
+            return None
         heartbeat = task.last_heartbeat
         if heartbeat is not None:
             if heartbeat.tzinfo is not None:
@@ -1798,15 +1883,13 @@ def _resident_worker_task_is_healthy(
             task_fresh = (
                 now - heartbeat
             ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
-            return bool(
-                task_fresh
-                and worker_age
-                <= (
-                    _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
-                    + _RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS
-                )
-            )
-        return False
+            if task_fresh and worker_age <= (
+                _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+                + _RESIDENT_TASK_HEARTBEAT_CORROBORATION_GRACE_SECONDS
+            ):
+                return None
+            return RESIDENT_SUPERSEDE_WORKER_HEARTBEAT_STALE
+        return RESIDENT_SUPERSEDE_WORKER_HEARTBEAT_STALE
 
     # During startup an absent heartbeat is expected until the resident handler
     # makes its first lease renewal. Keep the start claim briefly even when the
@@ -1816,13 +1899,33 @@ def _resident_worker_task_is_healthy(
         startup_seen is None
         or (now - startup_seen).total_seconds() > _RESIDENT_START_CLAIM_STALE_SECONDS
     ):
-        return False
+        return RESIDENT_SUPERSEDE_START_CLAIM_STALE
     heartbeat = task.last_heartbeat
     if heartbeat is None:
-        return True
+        return None
     if heartbeat.tzinfo is not None:
         heartbeat = heartbeat.astimezone(timezone.utc).replace(tzinfo=None)
-    return (now - heartbeat).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS
+    if (
+        now - heartbeat
+    ).total_seconds() <= _RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS:
+        return None
+    return RESIDENT_SUPERSEDE_WORKER_HEARTBEAT_STALE
+
+
+def _resident_worker_task_is_healthy(
+    task: Task | None,
+    blob: dict[str, Any],
+    now: datetime,
+    *,
+    pinned_runner_live: bool | None = None,
+) -> bool:
+    """Return whether the recorded worker is healthy enough to reuse."""
+    return (
+        _resident_worker_health_verdict(
+            task, blob, now, pinned_runner_live=pinned_runner_live
+        )
+        is None
+    )
 
 
 async def sync_resident_worker_retry_wait(
@@ -2787,11 +2890,25 @@ def _mark_resident_task_superseded(
     *,
     now_iso: str,
     replacement_generation: int,
+    reason: str,
+    replacement_session_id: str | None = None,
 ) -> None:
-    """Cancel one exact stale resident task while its row lock is held."""
+    """Cancel one exact stale resident task while its row lock is held.
+
+    Records WHY this row lost and WHICH generation/session won, so an operator
+    reading the cancelled task can tell a genuine two-worker race from an
+    infrastructure condemnation. The pre-fix code hard-coded a single
+    "heartbeat became stale" sentence onto every supersession, which misreported
+    the dominant real-world case: a runner pin that had never been pulled and so
+    never had a heartbeat at all.
+    """
     task.status = TaskStatus.CANCELLED
+    cause = RESIDENT_SUPERSEDE_REASON_TEXT.get(reason, reason)
+    winner = f"generation {replacement_generation}"
+    if replacement_session_id:
+        winner += f" (session {replacement_session_id})"
     task.latest_status_message = (
-        "Resident worker superseded after its resident heartbeat became stale"
+        f"Resident worker superseded by {winner} because {cause}"
     )
     context = dict(task.context or {})
     context["failure_category"] = ADMIN_CANCEL
@@ -2800,6 +2917,9 @@ def _mark_resident_task_superseded(
     context["_resident_superseded"] = True
     context["_resident_superseded_at"] = now_iso
     context["_resident_superseded_by_generation"] = replacement_generation
+    context["_resident_superseded_reason"] = reason
+    if replacement_session_id:
+        context["_resident_superseded_by_session_id"] = replacement_session_id
     task.context = context
     flag_modified(task, "context")
 
@@ -2933,6 +3053,41 @@ def _resident_runner_is_available(runner: Any) -> bool:
         and _local_runner_handles_task_type(runner, _RESIDENT_STRATEGIC_TASK_TYPE)
         and _local_runner_agent_available(runner)
     )
+
+
+async def _pinned_runner_is_live(
+    session: AsyncSession, task: Task | None
+) -> bool | None:
+    """Liveness of the local runner *task* is hard-pinned to.
+
+    ``None`` means "no opinion" — the task is not runner-pinned, or the pin is
+    unparseable — and callers MUST treat that as non-condemning.
+
+    Deliberately gates on LIVENESS ONLY (``_local_runner_is_live``: active status
+    + recent heartbeat), NOT the fuller ``_resident_runner_is_available`` gate
+    used to *select* a device. Choosing where to start a new session may be
+    picky; deciding whether to destroy already-queued work may not. A live runner
+    that transiently reports ``agent_available: false`` or a momentarily narrowed
+    task-type list will still drain its pin queue, and cancelling its pin would
+    throw away the queue position the task has already earned.
+    """
+    vm_id = getattr(task, "vm_instance_id", None)
+    if not isinstance(vm_id, str) or not vm_id.startswith("runner:"):
+        return None
+    try:
+        runner_uuid = uuid.UUID(vm_id.split(":", 1)[1].strip())
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    from app.models import LocalRunner
+    from app.strategic_spawning import _local_runner_is_live
+
+    runner = await session.get(LocalRunner, runner_uuid)
+    if runner is None or getattr(runner, "status", None) == "deleted":
+        # The pin names a device that no longer exists: nothing will ever pull
+        # it, so this is the one case where waiting is strictly worse.
+        return False
+    return bool(_local_runner_is_live(runner))
 
 
 async def _load_resident_runner_rows(
@@ -3800,6 +3955,7 @@ async def start_resident_session(
     # Project→Task is the canonical order. Identity, health, retirement, and
     # the replacement claim become visible together at the commit below.
     stale_locked_task: Task | None = None
+    stale_locked_reason: str | None = None
     stale_orphan_task_ids: list[uuid.UUID] = []
     superseded_task_ids: list[uuid.UUID] = []
     async with project_lock(session, project.id, skip_locked=False) as locked_project:
@@ -3875,9 +4031,20 @@ async def start_resident_session(
                         async with task_lock(
                             session, fresh_task_uuid, skip_locked=False
                         ) as locked_task:
-                            if _resident_worker_task_is_healthy(
-                                locked_task, fresh, now
-                            ):
+                            # A pin the runner has not pulled yet is judged on
+                            # its DEVICE's liveness, never on the start clock —
+                            # resolve that here, under the same lock, so the
+                            # verdict and the row it condemns agree.
+                            pinned_runner_live = await _pinned_runner_is_live(
+                                session, locked_task
+                            )
+                            health_verdict = _resident_worker_health_verdict(
+                                locked_task,
+                                fresh,
+                                now,
+                                pinned_runner_live=pinned_runner_live,
+                            )
+                            if health_verdict is None:
                                 decision["mode"] = (
                                     "runner_mismatch"
                                     if runner_mismatch
@@ -3885,6 +4052,7 @@ async def start_resident_session(
                                 )
                             else:
                                 stale_locked_task = locked_task
+                                stale_locked_reason = health_verdict
                                 carried_blacklisted_accounts = (
                                     _resident_blacklisted_accounts(
                                         dict(locked_task.context or {})
@@ -3947,6 +4115,11 @@ async def start_resident_session(
                     stale_locked_task,
                     now_iso=now_iso,
                     replacement_generation=worker_generation,
+                    reason=(
+                        stale_locked_reason
+                        or RESIDENT_SUPERSEDE_WORKER_HEARTBEAT_STALE
+                    ),
+                    replacement_session_id=session_id,
                 )
                 session.add(stale_locked_task)
                 superseded_task_ids.append(stale_locked_task.id)
@@ -3968,6 +4141,8 @@ async def start_resident_session(
                             orphan_task,
                             now_iso=now_iso,
                             replacement_generation=worker_generation,
+                            reason=RESIDENT_SUPERSEDE_ORPHANED_IDENTITY,
+                            replacement_session_id=session_id,
                         )
                         session.add(orphan_task)
                         superseded_task_ids.append(orphan_task.id)

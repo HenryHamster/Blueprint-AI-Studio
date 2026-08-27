@@ -3,12 +3,15 @@
  *
  * THE DEFECT
  * ----------
- * Two committed derived artifacts re-conflict every open PR whenever anything
- * merges into `automain`: `test-estate-ranked-queue.md` (a ~1200-line generated
- * report whose ranks shift table-wide when any test file is added) and
+ * Committed derived artifacts re-conflict every open PR whenever anything merges
+ * into `automain`. The worst offender was `test-estate-ranked-queue.md`, a
+ * ~1200-line generated report whose rank ordinal and estate-summary table shifted
+ * table-wide when any test file was added; both of those GLOBAL fields were
+ * removed on 2026-08-26, so its rows now merge as disjoint insertions under stock
+ * git and it is no longer a routine conflict source. What remains is
  * `backend/.test_durations` (a ~21000-line sorted JSON map where both sides only
  * ever INSERT keys, yet appending rewrites the previous last line to add a comma,
- * so git still reports a textual conflict).
+ * so git still reports a textual conflict) and `module_size_limits.json`.
  *
  * The pipeline's answer to a conflict is expensive. `orchestrator_ci_monitor.py`
  * sees the PR go unmergeable and spawns a `fix` task — a provisioned VM plus a
@@ -27,9 +30,18 @@
  *  - GitHub computes `mergeable` server-side with stock drivers and never
  *    consults ours, so the PR still goes unmergeable and the fix task is still
  *    spawned. Something has to end the turn cheaply once it exists.
- *  - `test-estate-ranked-queue.md` cannot be a merge driver at all. A driver is
- *    handed three blobs, and the one correct resolution is a function of the
- *    whole MERGED TREE, which does not exist yet at driver time.
+ *  - `test-estate-ranked-queue.md` could never be a merge driver at all. A driver
+ *    is handed three blobs, and the one correct resolution is a function of the
+ *    whole MERGED TREE, which does not exist yet at driver time. Its residual
+ *    conflicts (two branches adding files that rank adjacently, a hand-edit) still
+ *    come here.
+ *
+ * The server-side gap is not specific to CUSTOM drivers. Measured 2026-08-26: a
+ * two-commit probe whose only change was each side appending one line to a path
+ * marked with the BUILT-IN `merge=union` merges cleanly under stock local git and
+ * is reported CONFLICTING by the GitHub API. GitHub honours no `.gitattributes`
+ * merge attribute, so no driver of any kind can keep a PR mergeable — only a
+ * rendering that merges under stock three-way can.
  *
  * WHAT IT REFUSES TO DO
  * ---------------------

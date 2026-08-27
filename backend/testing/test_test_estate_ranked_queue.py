@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import importlib.util
 import json
 import os
@@ -157,7 +158,10 @@ def test_repository_root_resolution_never_raises_on_a_missing_checkout(
     assert _first_root_with_generator([tmp_path, REPOSITORY_ROOT]) == REPOSITORY_ROOT
 
 
-_RANKED_ROW = re.compile(r"^\| \d+ \| \S+ \| \S+ \| `([^`]+)` \|", re.MULTILINE)
+# `| P2 | backend | `path` | ...`. There is deliberately no leading rank
+# ordinal: an ordinal renumbers every row below an insertion, which is what
+# made this artifact conflict on 40% of merges. See the generator docstring.
+_RANKED_ROW = re.compile(r"^\| \S+ \| \S+ \| `([^`]+)` \|", re.MULTILINE)
 
 
 # Measured cost of the one full sweep this guard runs: 15.8s on a native
@@ -283,6 +287,166 @@ def test_measured_frontend_cost_is_directional_signal(tmp_path: Path) -> None:
     assert output.index("0.125s measured") < output.index(
         "backend/testing/test_example.py"
     )
+
+
+# ---------------------------------------------------------------------------
+# The merge-stability contract
+#
+# These two tests are the reason the report carries no rank ordinal and no
+# estate-summary table. Both of those were GLOBAL fields, and a global field
+# turns a one-file change into a whole-file rewrite, so any two branches that
+# touched the test estate conflicted here -- measured at 8 of 20 real
+# origin/automain re-sync merges on 2026-08-26, more than every source conflict
+# in that window combined. Nothing on the git side can fix that: a custom merge
+# driver is handed three blobs while the right answer is a function of the
+# merged TREE, and GitHub's server-side merge ignores .gitattributes merge
+# attributes outright (probed 2026-08-26: a `merge=union` path that stock local
+# git merges cleanly is reported CONFLICTING by the API).
+#
+# So the property is enforced HERE, where it is cheap, instead of being paid for
+# on every merge. Re-adding an ordinal column or a running total makes the first
+# test report `replace` operations where only `insert` is allowed.
+# ---------------------------------------------------------------------------
+
+# Backend modules present on every side of the merge simulation, sized so the
+# rows they produce are spread across the ranking rather than adjacent -- two
+# branches inserting at the SAME base line is a real conflict, and a fixture
+# that always did so would prove nothing about the ordinary case.
+_BASE_ESTATE = {"test_big.py": 1000, "test_mid.py": 500, "test_small.py": 100}
+
+
+def _add_backend_test(root: Path, name: str, size: int) -> str:
+    """Write a backend test module of a controlled length; return its repo path."""
+    body = (
+        "def test_x():" + NL + "    assert True" + NL + ("# pad" + NL) * max(size - 2, 0)
+    )
+    (root / "backend" / "testing" / name).write_text(body, encoding="utf-8")
+    return "backend/testing/" + name
+
+
+def _estate_root(tmp_path: Path, label: str, extras: "dict[str, int]") -> Path:
+    root = tmp_path / label
+    root.mkdir()
+    _write_fixture_root(root)
+    for name, size in {**_BASE_ESTATE, **extras}.items():
+        _add_backend_test(root, name, size)
+    return root
+
+
+def _insertions(
+    base_lines: "list[str]", side_lines: "list[str]"
+) -> "dict[int, list[str]]":
+    """Base line index -> lines *side* inserts there. Fails if not insert-only.
+
+    A side that only ADDS a test file must only ADD lines. Any ``replace`` or
+    ``delete`` here means some rendered line depends on more than the one file
+    it names -- which is exactly the ordinal/aggregate shape this contract
+    forbids, and exactly what git reports as a conflict on the other branch.
+    """
+    matcher = difflib.SequenceMatcher(a=base_lines, b=side_lines, autojunk=False)
+    inserts: "dict[int, list[str]]" = {}
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        assert tag == "insert", (
+            "adding one test file rewrote existing rendered lines: "
+            f"{tag} of base lines {i1}:{i2} -> {side_lines[j1:j2][:3]!r}" + NL
+            + "The queue rendering must stay line-local -- no rank ordinals, no "
+            "running totals, no per-area aggregates. See the module docstring "
+            "of scripts/generate_test_estate_ranked_queue.py."
+        )
+        inserts.setdefault(i1, []).extend(side_lines[j1:j2])
+    return inserts
+
+
+def _three_way_merge(
+    base_lines: "list[str]", ours: "list[str]", theirs: "list[str]"
+) -> "list[str]":
+    """Merge two insert-only sides the way git's three-way merge does.
+
+    Deliberately reimplemented in a dozen lines rather than shelling out to
+    ``git merge-file``: this file also runs inside the backend test image, where
+    a git binary is not guaranteed, and a guard that silently skips is not a
+    guard. Same conflict rule git uses -- both sides inserting at one base
+    position is a conflict, disjoint positions are not.
+    """
+    ours_inserts = _insertions(base_lines, ours)
+    theirs_inserts = _insertions(base_lines, theirs)
+    both = sorted(set(ours_inserts) & set(theirs_inserts))
+    assert not both, (
+        f"both branches inserted at base line(s) {both!r}; git would report a "
+        "conflict there. Widen the fixture's line-count spread."
+    )
+    merged: "list[str]" = []
+    for index in range(len(base_lines) + 1):
+        merged.extend(ours_inserts.get(index, ()))
+        merged.extend(theirs_inserts.get(index, ()))
+        if index < len(base_lines):
+            merged.append(base_lines[index])
+    return merged
+
+
+def test_adding_a_test_file_only_inserts_lines(tmp_path: Path) -> None:
+    """One new test file changes exactly the lines that name it, and no others."""
+    base = _estate_root(tmp_path, "base", {})
+    grown = _estate_root(tmp_path, "grown", {"test_alpha.py": 900})
+
+    inserts = _insertions(
+        render_queue(base).splitlines(), render_queue(grown).splitlines()
+    )
+    added = [line for lines in inserts.values() for line in lines]
+    assert len(added) == 1, f"one added test file must add exactly one row: {added!r}"
+    assert "backend/testing/test_alpha.py" in added[0]
+
+
+def test_two_independent_additions_merge_to_the_full_render(tmp_path: Path) -> None:
+    """Two branches, two new test files: the merged bytes ARE the fresh render.
+
+    This is the whole claim. Because every line is a function of one file, the
+    ordinary three-way merge of the two branches reproduces byte-for-byte what
+    ``--write`` emits from the merged tree, so the merge needs no driver, no
+    resolver and no regeneration step -- on a developer clone, on the fleet, and
+    on GitHub's server-side merge, which honours none of those.
+    """
+    base = _estate_root(tmp_path, "base", {})
+    ours = _estate_root(tmp_path, "ours", {"test_alpha.py": 900})
+    theirs = _estate_root(tmp_path, "theirs", {"test_theta.py": 300})
+    merged_tree = _estate_root(
+        tmp_path, "merged", {"test_alpha.py": 900, "test_theta.py": 300}
+    )
+
+    merged = _three_way_merge(
+        render_queue(base).splitlines(),
+        render_queue(ours).splitlines(),
+        render_queue(theirs).splitlines(),
+    )
+
+    assert merged == render_queue(merged_tree).splitlines()
+
+
+def test_summary_totals_are_available_but_never_committed(tmp_path: Path) -> None:
+    """The estate totals still exist; they are just not in the merged artifact.
+
+    Dropping an aggregate to win a merge would be a real loss if the numbers
+    went away with it. They do not: ``--summary`` renders them from the same
+    sweep. What changed is only that no branch commits them, so no two branches
+    rewrite the same line.
+    """
+    root = _estate_root(tmp_path, "estate", {})
+    generator = _require_generator()
+
+    assert main(["--summary", "--root", str(root)]) == 0
+    summary = generator.render_summary(root)
+    assert "| Area | Files |" in summary
+    assert "| backend |" in summary
+
+    assert main(["--write", "--root", str(root)]) == 0
+    queue = (root / "test-estate-ranked-queue.md").read_text(encoding="utf-8")
+    assert "| Area | Files |" not in queue, (
+        "the per-area totals are back in the committed artifact; every branch "
+        "that adds a test now rewrites the same line again"
+    )
+    assert "--summary" in queue, "the report must say where the totals went"
 
 
 def _each_row_ids(source: str, path: Path) -> set[str]:
