@@ -63,7 +63,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_warm_pool_maintainer.py` | 5,921 | 123 | critical (>5000 LOC) | 3.564s measured | — |
 | P2 | admin-ui | `admin-ui/src/components/VersionLifecyclePanel.test.tsx` | 5,098 | 177 | critical (>5000 LOC) | 2.891s measured | — |
 | P2 | agent | `agent/src/handlers/research-plan.test.ts` | 5,390 | 396 | critical (>5000 LOC) | 2.122s measured | — |
-| P2 | backend | `backend/testing/test_acceptance_gate.py` | 5,813 | 133 | critical (>5000 LOC) | 1.800s measured | — |
+| P2 | backend | `backend/testing/test_acceptance_gate.py` | 5,813 | 133 | critical (>5000 LOC) | 1.790s measured | — |
 | P2 | backend | `backend/testing/test_max_plan_pool.py` | 6,364 | 359 | critical (>5000 LOC) | 1.344s measured | — |
 | P2 | backend | `backend/testing/test_capability_trial_verdict.py` | 5,371 | 286 | critical (>5000 LOC) | 0.804s measured | — |
 | P2 | backend | `backend/testing/test_problem_model.py` | 6,802 | 304 | critical (>5000 LOC) | 0.769s measured | — |
