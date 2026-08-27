@@ -1865,7 +1865,8 @@ class TestCheckModePreflightEndToEnd(_LocalRunnerTestCase):
                 env=env,
                 capture_output=True,
                 text=True,
-                # Under the lane's --timeout=30 so a genuine hang reports
+                # Under MAX_INNER_OPERATION_SECONDS (backend/testing/
+                # test_harness_timeout_budgets.py) so a genuine hang reports
                 # here rather than as a pytest-timeout flake. This call's old
                 # 120s budget is the shape that killed promotion PR #17674;
                 # #17681 took --check to 0.44s, so 25s is ~55x headroom.
@@ -9512,9 +9513,11 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
                 self.assertTrue(spawned)
 
                 self.assertTrue(
-                    # 20s, not 30: the lanes run pytest with --timeout=30, so
-                    # a 30s wait can only ever be killed by the harness and
-                    # reported as an unreproducible flake, never as itself.
+                    # 20s, not 30: 30 is MAX_INNER_OPERATION_SECONDS
+                    # (backend/testing/test_harness_timeout_budgets.py), the
+                    # ceiling at which a blocking wait must declare its own
+                    # marker. Staying under it keeps this wait able to report
+                    # itself instead of surfacing as a harness kill.
                     drained.wait(timeout=20.0),
                     "the tee thread never read the agent's stdout to EOF "
                     "within 20s, so the per-task log file cannot be checked",

@@ -71,10 +71,13 @@ REPO_ROOT_CANDIDATES: tuple[Path, ...] = (
 # ``.git``: see the module docstring's truth table.
 _REPO_ROOT_MARKERS: tuple[str, ...] = ("backend/app", "scripts", ".gitignore")
 
-# Two orders of magnitude under the lanes' ``--timeout=30``: these read one ref
-# or one index.  An inner budget that cannot fire before the harness kills the
-# test is the budget-inversion class
-# backend/testing/test_harness_timeout_budgets.py polices.
+# Comfortably under ``MAX_INNER_OPERATION_SECONDS`` (backend/testing/
+# test_harness_timeout_budgets.py), the ceiling at which an inner call must
+# declare its own ``@pytest.mark.timeout``: these read one ref or one index.  An
+# inner budget that cannot fire before the harness kills the test is the
+# budget-inversion class that module polices.  The CEILING binds here, not the
+# lane's far larger ``LANE_HANG_DETECTOR_SECONDS`` catch-all -- two numbers,
+# two jobs; never reason about this one from the lane budget.
 GIT_TIMEOUT_SECONDS = 10
 
 

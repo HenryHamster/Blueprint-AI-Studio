@@ -376,9 +376,11 @@ class TestRunnerDispatchSiblingModulesImportLeafFirst:
 
     # Each parametrisation spawns an interpreter that imports one backend
     # module; measured worst case 12.73s
-    # (app.orchestrator_compute_experiment_dispatch) on an idle host against
-    # the lanes' --timeout=30. 120s leaves ~9x headroom and stays above the
-    # inner subprocess timeout so a genuinely hung import reports as itself.
+    # (app.orchestrator_compute_experiment_dispatch) on an idle host. 120s
+    # leaves ~9x headroom over that and stays above the inner subprocess
+    # timeout so a genuinely hung import reports as itself rather than as an
+    # anonymous LANE_HANG_DETECTOR_SECONDS kill (backend/testing/
+    # test_harness_timeout_budgets.py).
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("module_name", sorted(DISPATCH_EXTRACTED_SYMBOLS))
     def test_leaf_module_imports_standalone(self, module_name: str):
