@@ -79,6 +79,144 @@ def _raise_create_pr_retryable(head: str, base: str, retry_after: int | None) ->
     )
 
 
+def _validate_reconcilable_open_pr(
+    pr: dict,
+    *,
+    expected_repo_full_name: str,
+    expected_head: str,
+    expected_head_sha: str | None,
+    expected_base: str,
+    failure_status: int = 409,
+) -> int:
+    """Return the PR number only when its live lifecycle is the requested one."""
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    actual_head = head.get("ref")
+    actual_head_sha = head.get("sha")
+    actual_head_repo = (head.get("repo") or {}).get("full_name")
+    actual_base = base.get("ref")
+    actual_base_repo = (base.get("repo") or {}).get("full_name")
+    expected_repo_identity = expected_repo_full_name.casefold()
+    actual_head_repo_identity = (
+        actual_head_repo.casefold() if isinstance(actual_head_repo, str) else None
+    )
+    actual_base_repo_identity = (
+        actual_base_repo.casefold() if isinstance(actual_base_repo, str) else None
+    )
+    try:
+        pr_number = int(pr.get("number"))
+    except (TypeError, ValueError):
+        pr_number = 0
+    if (
+        pr.get("state") != "open"
+        or not expected_head_sha
+        or actual_head != expected_head
+        or actual_head_sha != expected_head_sha
+        or actual_head_repo_identity != expected_repo_identity
+        or actual_base != expected_base
+        or actual_base_repo_identity != expected_repo_identity
+        or pr_number <= 0
+    ):
+        raise HTTPException(
+            status_code=failure_status,
+            detail=(
+                "Refusing to reconcile pull request: expected open "
+                f"{expected_head} -> {expected_base}, observed "
+                f"state={pr.get('state')!r}, head={actual_head!r}, "
+                f"head_sha={actual_head_sha!r}, head_repo={actual_head_repo!r}, "
+                f"base={actual_base!r}, base_repo={actual_base_repo!r}, "
+                f"number={pr.get('number')!r}"
+            ),
+        )
+    return pr_number
+
+
+def _raise_reconcile_pr_retryable(
+    pr_number: int, response=None, *, reason: str | None = None
+) -> None:
+    retry_after = _clamped_retry_after(
+        _retry_after_seconds_from_response(response) if response is not None else None
+    )
+    status_code = getattr(response, "status_code", None)
+    detail = reason or f"GitHub returned HTTP {status_code}"
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            f"Could not reconcile pull request #{pr_number} title/body with the "
+            f"fresh publication payload ({detail}); retry before reporting success"
+        ),
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+async def reconcile_open_pull_request(
+    token: str,
+    owner: str,
+    repo: str,
+    pr: dict,
+    *,
+    title: str,
+    body: str,
+    expected_head: str,
+    expected_head_sha: str | None,
+    expected_base: str,
+    project_id: str | None = None,
+) -> dict:
+    """Refresh title/body on one exact open PR without changing lifecycle refs."""
+    pr_number = _validate_reconcilable_open_pr(
+        pr,
+        expected_repo_full_name=f"{owner}/{repo}",
+        expected_head=expected_head,
+        expected_head_sha=expected_head_sha,
+        expected_base=expected_base,
+    )
+    payload = {"title": title[:256], "body": body[:65536]}
+    if pr.get("title") == payload["title"] and (pr.get("body") or "") == payload["body"]:
+        return pr
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        response = await _github_request(
+            "PATCH",
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+            headers,
+            json=payload,
+            project_id=project_id,
+        )
+    # Any ambiguous transport outcome must retry; stale metadata is not success.
+    except Exception as exc:  # noqa: BLE001
+        _raise_reconcile_pr_retryable(pr_number, reason=str(exc))
+    if response.status_code != 200:
+        _raise_reconcile_pr_retryable(pr_number, response)
+
+    try:
+        updated = response.json()
+        _validate_reconcilable_open_pr(
+            updated,
+            expected_repo_full_name=f"{owner}/{repo}",
+            expected_head=expected_head,
+            expected_head_sha=expected_head_sha,
+            expected_base=expected_base,
+            failure_status=503,
+        )
+        if updated.get("title") != payload["title"] or (
+            updated.get("body") or ""
+        ) != payload["body"]:
+            raise HTTPException(
+                status_code=503,
+                detail="GitHub did not return the freshly supplied title/body",
+            )
+    except HTTPException as exc:
+        _raise_reconcile_pr_retryable(pr_number, reason=str(exc.detail))
+    except Exception as exc:  # noqa: BLE001
+        _raise_reconcile_pr_retryable(pr_number, reason=str(exc))
+    return updated
+
+
 def _raise_merge_pr_retryable(pr_number: int, retry_after: int | None) -> None:
     """Surface a rate-limited merge as retryable (503 + Retry-After), not a 500.
 
@@ -367,6 +505,8 @@ async def create_pull_request(
     base: str,
     body: str = "",
     project_id: str | None = None,
+    reconcile_existing: bool = False,
+    expected_head_sha: str | None = None,
 ) -> dict:
     """
     Creates a new pull request in the specified repository.
@@ -391,6 +531,28 @@ async def create_pull_request(
             f"[PR] Open PR #{lookup.pr.get('number')} already exists for "
             f"{head} -> {base} — returning it instead of creating a duplicate"
         )
+        if reconcile_existing:
+            matches = lookup.matches or [lookup.pr]
+            if len(matches) != 1:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Found {len(matches)} open pull requests for {head} -> {base}; "
+                        "refusing ambiguous metadata reconciliation"
+                    ),
+                )
+            return await reconcile_open_pull_request(
+                token,
+                owner,
+                repo,
+                matches[0],
+                title=title,
+                body=body,
+                expected_head=head,
+                expected_head_sha=expected_head_sha,
+                expected_base=base,
+                project_id=project_id,
+            )
         return lookup.pr
     if lookup.outcome == "uncertain":
         _raise_create_pr_retryable(head, base, lookup.retry_after)
@@ -424,6 +586,29 @@ async def create_pull_request(
                     headers, owner, repo, head, base, project_id
                 )
                 if lookup.pr is not None:
+                    if reconcile_existing:
+                        matches = lookup.matches or [lookup.pr]
+                        if len(matches) != 1:
+                            raise HTTPException(
+                                status_code=503,
+                                detail=(
+                                    f"Found {len(matches)} open pull requests for "
+                                    f"{head} -> {base}; refusing ambiguous metadata "
+                                    "reconciliation"
+                                ),
+                            )
+                        return await reconcile_open_pull_request(
+                            token,
+                            owner,
+                            repo,
+                            matches[0],
+                            title=title,
+                            body=body,
+                            expected_head=head,
+                            expected_head_sha=expected_head_sha,
+                            expected_base=base,
+                            project_id=project_id,
+                        )
                     return lookup.pr
                 # GitHub says a PR exists but we could not fetch it (the lookup
                 # was itself rate-limited). Surface retryable rather than a 422

@@ -205,6 +205,76 @@ done
 
 [ -z "$TITLE" ] && { echo "Error: --title is required" >&2; exit 2; }
 
+# ── Publication single-flight boundary ────────────────────────────────────────
+# A model/tool timeout can return control to the agent while the original
+# ./pr open process (and its bounded ./check descendant) is still alive.  A
+# second invocation against that same mutable checkout would otherwise launch
+# another gate and race the first process through commit/push.  Own publication
+# from before evidence collection until the helper returns its PR outcome.
+_PR_OPEN_LOCK_FILE="/tmp/blueprint_pr_open_${cfg.taskId}.lock"
+_PR_OPEN_LOCK_OWNER="$_PR_OPEN_LOCK_FILE.owner"
+_PR_OPEN_LOCK_HELD=0
+
+_release_pr_open_lock() {
+  [ "$_PR_OPEN_LOCK_HELD" = "1" ] || return 0
+  local owner_pid
+  owner_pid=$(sed -n '1p' "$_PR_OPEN_LOCK_OWNER" 2>/dev/null || true)
+  if [ "$owner_pid" = "$$" ]; then
+    rm -f "$_PR_OPEN_LOCK_OWNER"
+  fi
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+  _PR_OPEN_LOCK_HELD=0
+}
+
+_acquire_pr_open_lock() {
+  local owner_pid owner_workspace owner_started
+  command -v flock >/dev/null 2>&1 || {
+    echo "[pr] flock is unavailable; refusing publication without a single-flight boundary" >&2
+    return 1
+  }
+  exec 9>>"$_PR_OPEN_LOCK_FILE" || return 1
+  if ! flock -n 9; then
+    owner_pid=$(sed -n '1p' "$_PR_OPEN_LOCK_OWNER" 2>/dev/null || true)
+    owner_workspace=$(sed -n '2p' "$_PR_OPEN_LOCK_OWNER" 2>/dev/null || true)
+    owner_started=$(sed -n '3p' "$_PR_OPEN_LOCK_OWNER" 2>/dev/null || true)
+    echo "[pr] publication already in progress for task ${cfg.taskId}; no second gate was started." >&2
+    echo "[pr] owner pid=\${owner_pid:-<unknown>} workspace=\${owner_workspace:-<unknown>} started=\${owner_started:-<unknown>}" >&2
+    echo "[pr] wait for the active helper to return, then retry through the authoritative remote PR path." >&2
+    exec 9>&-
+    return 75
+  fi
+
+  printf '%s\n%s\n%s\n' \
+    "$$" "$WORKSPACE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$_PR_OPEN_LOCK_OWNER.$$" || {
+      rm -f "$_PR_OPEN_LOCK_OWNER.$$"
+      flock -u 9 2>/dev/null || true
+      exec 9>&-
+      return 1
+    }
+  mv "$_PR_OPEN_LOCK_OWNER.$$" "$_PR_OPEN_LOCK_OWNER" || {
+    rm -f "$_PR_OPEN_LOCK_OWNER.$$"
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+    return 1
+  }
+  _PR_OPEN_LOCK_HELD=1
+  return 0
+}
+
+_acquire_pr_open_lock
+_PR_LOCK_STATUS=$?
+if [ "$_PR_LOCK_STATUS" != "0" ]; then
+  exit "$_PR_LOCK_STATUS"
+fi
+trap _release_pr_open_lock EXIT
+
+# Completed retries deliberately continue through normalization, verification,
+# the immutable push lease, and the orchestrator's idempotent PR endpoint.  A
+# local receipt cannot prove that the PR is still open, still targets this HEAD,
+# or still carries the body assembled below from dynamic evidence.
+
 # ── Self-review section injection ─────────────────────────────────────────────
 # Reads /tmp/self_review_<taskId>.json if present, renders the
 # <!-- blueprint:self-review --> block, strips any prior block from BODY
@@ -725,6 +795,11 @@ TASK_ID="${cfg.taskId}"
 # writer.  Snapshot the exact remote SHA once, reconcile a lost response only
 # when remote == our HEAD, and otherwise fail closed on any competing advance.
 _PR_REMOTE_REF="refs/heads/${cfg.workBranch}"
+_PR_PUSH_SHA=$(git rev-parse HEAD 2>/dev/null || true)
+if ! printf '%s' "$_PR_PUSH_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "[pr] cannot resolve an exact 40-character HEAD SHA for publication" >&2
+  exit 1
+fi
 # This task's own unshipped-work checkpoint subject (task-checkpoint.ts
 # writes it verbatim).  A tip carrying THIS subject is state we authored on
 # an earlier attempt's fail-closed path; prepareTaskWorkBranch already
@@ -769,7 +844,6 @@ for attempt in 1 2 3; do
   if classify_push_error "$(cat /tmp/pr_push.log)"; then
     exit 1
   fi
-  _PR_LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null || true)
   _PR_OBSERVED_QUERY=$(git ls-remote --heads origin "$_PR_REMOTE_REF" 2>/tmp/pr_ls_remote.log)
   _PR_OBSERVED_QUERY_STATUS=$?
   if [ "$_PR_OBSERVED_QUERY_STATUS" -ne 0 ]; then
@@ -778,7 +852,7 @@ for attempt in 1 2 3; do
     exit 1
   fi
   _PR_OBSERVED_REMOTE_SHA=$(printf '%s\n' "$_PR_OBSERVED_QUERY" | awk 'NR == 1 {print $1}')
-  if [ -n "$_PR_LOCAL_HEAD" ] && [ "$_PR_OBSERVED_REMOTE_SHA" = "$_PR_LOCAL_HEAD" ]; then
+  if [ "$_PR_OBSERVED_REMOTE_SHA" = "$_PR_PUSH_SHA" ]; then
     echo "[pr] push response was lost, but the exact remote ref equals local HEAD — reconciled."
     PUSH_OK=1
     break
@@ -869,9 +943,10 @@ if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ] || [ -n "$GATE_SECTION" ]; th
   fi
 fi
 ` : `
-PR_PAYLOAD=$(printf '{"task_id":%s,"owner":${JSON.stringify(cfg.owner)},"repo":${JSON.stringify(cfg.repo)},"title":%s,"head":${JSON.stringify(cfg.workBranch)},"base":${JSON.stringify(cfg.baseBranch)},"body":%s}' \\
+PR_PAYLOAD=$(printf '{"task_id":%s,"owner":${JSON.stringify(cfg.owner)},"repo":${JSON.stringify(cfg.repo)},"title":%s,"head":${JSON.stringify(cfg.workBranch)},"base":${JSON.stringify(cfg.baseBranch)},"expected_head_sha":%s,"body":%s}' \\
   "$(_json_str "$TASK")" \\
   "$(_json_str "$TITLE")" \\
+  "$(_json_str "$_PR_PUSH_SHA")" \\
   "$(_json_str "$BODY")")
 PR_RESP=""
 PR_OK=0

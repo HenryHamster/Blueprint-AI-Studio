@@ -1590,6 +1590,7 @@ from app.github_pulls import (  # noqa: F401
     pr_is_not_behind,
     pr_is_not_behind_for,
     create_pull_request,
+    reconcile_open_pull_request,
     get_pull_request,
     get_branch_head_sha,
     get_pull_request_review_decision,

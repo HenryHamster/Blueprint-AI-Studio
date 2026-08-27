@@ -15155,8 +15155,7 @@ async def test_agent_create_pr_recreates_when_cached_pr_closed(
 async def test_agent_create_pr_returns_cached_when_open(
     client: AsyncClient, db_session, mocker
 ):
-    """If the cached PR artifact points at an OPEN PR, the endpoint should
-    short-circuit and return its URL without calling create_pull_request."""
+    """A cached OPEN PR is refreshed with the latest normalized evidence."""
     from unittest.mock import AsyncMock
 
     project = Project(name="Open PR Cached", user_id="test-user-open-pr")
@@ -15187,9 +15186,31 @@ async def test_agent_create_pr_returns_cached_when_open(
         "app.routers.agent.get_github_token_for_task",
         new=AsyncMock(return_value=("tok", "foo", "bar")),
     )
+    expected_head_sha = "a" * 40
+    cached_pr = {
+        "number": 7,
+        "html_url": "https://github.com/foo/bar/pull/7",
+        "state": "open",
+        "merged": False,
+        "head": {
+            "ref": "blueprint/task-cafef00d",
+            "sha": expected_head_sha,
+            "repo": {"full_name": "foo/bar"},
+        },
+        "base": {"ref": "main", "repo": {"full_name": "foo/bar"}},
+        "title": "stale title",
+        "body": "stale body",
+    }
     mocker.patch(
         "app.routers.agent_github.get_pull_request",
-        new=AsyncMock(return_value={"state": "open", "merged": False}),
+        new=AsyncMock(return_value=cached_pr),
+    )
+    mock_reconcile = AsyncMock(
+        return_value={**cached_pr, "title": "fresh normalized title", "body": "fresh body"}
+    )
+    mocker.patch(
+        "app.routers.agent_github.reconcile_open_pull_request",
+        new=mock_reconcile,
     )
     mock_create = AsyncMock()
     mocker.patch("app.routers.agent_github.create_pull_request", new=mock_create)
@@ -15202,16 +15223,51 @@ async def test_agent_create_pr_returns_cached_when_open(
             "task_id": str(task.id),
             "owner": "foo",
             "repo": "bar",
-            "title": "should not be created",
+            "title": "fresh normalized title",
             "head": "blueprint/task-cafef00d",
             "base": "main",
-            "body": "body",
+            "expected_head_sha": expected_head_sha,
+            "body": "fresh body",
         },
         headers=headers,
     )
 
     assert resp.status_code == 200
     assert resp.json()["data"]["html_url"] == "https://github.com/foo/bar/pull/7"
+    mock_create.assert_not_called()
+    mock_reconcile.assert_awaited_once_with(
+        "tok",
+        "foo",
+        "bar",
+        cached_pr,
+        title="fresh normalized title",
+        body="fresh body",
+        expected_head="blueprint/task-cafef00d",
+        expected_head_sha=expected_head_sha,
+        expected_base="main",
+    )
+
+    mock_reconcile.reset_mock()
+    legacy_resp = await client.post(
+        "/api/agent/github/pull-requests",
+        json={
+            "task_id": str(task.id),
+            "owner": "foo",
+            "repo": "bar",
+            "title": "legacy title",
+            "head": "blueprint/task-cafef00d",
+            "base": "main",
+            "body": "legacy body",
+        },
+        headers=headers,
+    )
+
+    assert legacy_resp.status_code == 200
+    assert (
+        legacy_resp.json()["data"]["html_url"]
+        == "https://github.com/foo/bar/pull/7"
+    )
+    mock_reconcile.assert_not_awaited()
     mock_create.assert_not_called()
 
 
@@ -15241,14 +15297,15 @@ async def test_agent_create_pr_persists_pr_linkage_on_task(
         "app.routers.agent.get_github_token_for_task",
         new=AsyncMock(return_value=("tok", "foo", "bar")),
     )
+    mock_create = AsyncMock(
+        return_value={
+            "html_url": "https://github.com/foo/bar/pull/8618",
+            "number": 8618,
+        }
+    )
     mocker.patch(
         "app.routers.agent_github.create_pull_request",
-        new=AsyncMock(
-            return_value={
-                "html_url": "https://github.com/foo/bar/pull/8618",
-                "number": 8618,
-            }
-        ),
+        new=mock_create,
     )
 
     token = create_agent_token(str(task.id), "agent-vm-linkage")
@@ -15261,6 +15318,7 @@ async def test_agent_create_pr_persists_pr_linkage_on_task(
             "title": "feat: thing",
             "head": "blueprint/task-67cedea6",
             "base": "main",
+            "expected_head_sha": "b" * 40,
             "body": "body",
         },
         headers={"x-agent-token": token},
@@ -15270,6 +15328,8 @@ async def test_agent_create_pr_persists_pr_linkage_on_task(
     await db_session.refresh(task)
     assert task.first_payload.get("pr_number") == 8618
     assert task.first_payload.get("branch") == "blueprint/task-67cedea6"
+    assert mock_create.await_args.kwargs["reconcile_existing"] is True
+    assert mock_create.await_args.kwargs["expected_head_sha"] == "b" * 40
 
 
 @pytest.mark.asyncio

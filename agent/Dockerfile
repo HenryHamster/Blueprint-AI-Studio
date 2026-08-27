@@ -31,7 +31,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # universal-ctags: the code-reading handlers.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl git wget gnupg ca-certificates apt-transport-https jq universal-ctags \
+        curl git wget gnupg ca-certificates apt-transport-https jq universal-ctags util-linux \
+    && command -v flock >/dev/null \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20.x via NodeSource — exactly as agent.pkr.hcl:92-93.
