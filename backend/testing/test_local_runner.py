@@ -6167,10 +6167,10 @@ class TestRunnerEndpoints:
         )
 
     @pytest.mark.asyncio
-    async def test_update_report_creates_alert_on_success(
+    async def test_update_report_does_not_create_durable_alert_on_success(
         self, client: AsyncClient, db_session
     ):
-        """POST /api/runner/update-report with status=success creates an INFO Alert."""
+        """A successful point-in-time update report never becomes a durable alert."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(
             db_session, project.id, hostname="runner-update-test"
@@ -6189,7 +6189,6 @@ class TestRunnerEndpoints:
         body = resp.json()
         assert body["ok"] is True
 
-        # Verify an alert was created.
         rows = (
             await db_session.execute(
                 select(Alert).where(
@@ -6198,18 +6197,13 @@ class TestRunnerEndpoints:
                 )
             )
         ).scalars().all()
-        assert len(rows) == 1
-        alert = rows[0]
-        assert alert.severity == AlertSeverity.INFO
-        assert "succeeded" in alert.title
-        assert runner.hostname in alert.title or str(runner.id)[:8] in alert.title
-        assert "aaaaaaaaaa → bbbbbbbbbb" in alert.message
+        assert rows == []
 
     @pytest.mark.asyncio
-    async def test_update_report_creates_alert_on_failure(
+    async def test_update_report_does_not_create_durable_alert_on_failure(
         self, client: AsyncClient, db_session
     ):
-        """POST /api/runner/update-report with status=failure creates a WARNING Alert."""
+        """A failed point-in-time update report never becomes a durable alert."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
 
@@ -6230,10 +6224,7 @@ class TestRunnerEndpoints:
                 )
             )
         ).scalars().all()
-        assert len(rows) == 1
-        alert = rows[0]
-        assert alert.severity == AlertSeverity.WARNING
-        assert "failed" in alert.title
+        assert rows == []
 
     @pytest.mark.asyncio
     async def test_update_report_rejects_invalid_status(
