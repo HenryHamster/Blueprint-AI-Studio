@@ -6349,7 +6349,7 @@ async def test_workflow_run_projection_carries_the_run_shape(mocker):
                 "status": "completed",
                 "conclusion": "success",
                 "html_url": "https://gh/run/32836106177",
-                "event": "workflow_dispatch",
+                "head_sha": "deadbeef1234", "event": "workflow_dispatch",
                 "head_branch": "automain",
                 "created_at": "2026-08-25T10:13:00Z",
             }
@@ -6367,7 +6367,7 @@ async def test_workflow_run_projection_carries_the_run_shape(mocker):
     assert result is not None
     assert result["run_id"] == 32836106177
     assert result["conclusion"] == "success"
-    assert result["event"] == "workflow_dispatch"
+    assert (result["head_sha"], result["event"]) == ("deadbeef1234", "workflow_dispatch")
     assert result["head_branch"] == "automain"
 
 

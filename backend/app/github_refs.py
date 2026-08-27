@@ -682,6 +682,85 @@ _COMMIT_DATE_CACHE: "dict[tuple[str, str, str], datetime]" = {}
 _COMMIT_DATE_CACHE_MAX = 5000
 
 
+async def get_git_commit_identity(
+    token: str,
+    owner: str,
+    repo: str,
+    sha: str,
+    *,
+    project_id: str | None = None,
+) -> dict | None:
+    """Return an exact commit's immutable tree and ordered parent identities.
+
+    This intentionally accepts only a canonical full commit SHA and verifies the
+    response repeats that exact SHA.  Callers use it as positive provenance, so
+    an API error or malformed response returns ``None`` rather than guessing.
+    """
+    from app.github_commit_resolution import is_full_commit_sha
+
+    if not is_full_commit_sha(sha):
+        return None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/git/commits/{sha}",
+            headers,
+            project_id=project_id,
+        )
+    except Exception as exc:  # noqa: BLE001 -- provenance lookup fails closed
+        logger.warning(
+            "[GITHUB] get_git_commit_identity failed for %s/%s@%s: %s",
+            owner,
+            repo,
+            sha[:8],
+            exc,
+        )
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] get_git_commit_identity: %s/%s sha=%s returned %s",
+            owner,
+            repo,
+            sha[:8],
+            response.status_code,
+        )
+        return None
+    try:
+        body = response.json()
+        if not isinstance(body, dict):
+            return None
+        resolved_sha = body.get("sha")
+        tree = body.get("tree")
+        raw_parents = body.get("parents")
+        if (
+            not isinstance(resolved_sha, str)
+            or not isinstance(tree, dict)
+            or not isinstance(tree.get("sha"), str)
+            or not isinstance(raw_parents, list)
+        ):
+            return None
+        tree_sha = tree["sha"]
+        parents = []
+        for parent in raw_parents:
+            if not isinstance(parent, dict) or not isinstance(parent.get("sha"), str):
+                return None
+            parents.append(parent["sha"])
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if (
+        resolved_sha != sha
+        or not is_full_commit_sha(tree_sha)
+        or any(not is_full_commit_sha(parent) for parent in parents)
+    ):
+        return None
+    return {"sha": resolved_sha, "tree_sha": tree_sha, "parents": parents}
+
+
 async def get_commit_date(
     token: str, owner: str, repo: str, sha: str
 ) -> "datetime | None":
