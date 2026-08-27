@@ -1614,6 +1614,13 @@ STRANDED_DEFERRED_CONVERSATION_MESSAGE_AFTER_MINUTES = 1_500
 # lease this far past its expiry cannot belong to a running worker.
 EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES = 15
 
+# Activity rows share the durable claim columns with conversation turns, but
+# they are read through the Resident's broad inbox.  A dead Activity claim at
+# the head of that inbox can therefore poison an otherwise-unclaimed batch.
+# Keep the same conservative clock bound as conversation claims, then require
+# separate authoritative owner death/supersession evidence below.
+EXPIRED_ACTIVITY_CLAIM_RELEASE_AFTER_MINUTES = 15
+
 # Context markers that take a row out of this sweep (or into the deferred
 # window). Resolved from the canonical definitions so a rename upstream breaks
 # loudly here instead of silently re-widening the predicate.
@@ -1825,6 +1832,296 @@ async def sweep_release_expired_conversation_claims(
             "[REAPER] Step 25a: released %d expired conversation claim(s)",
             released,
         )
+    return released
+
+
+def _activity_claim_owner_stale_reason(msg, task, project) -> str | None:
+    """Explain why an Activity claimant has definitively lost authority.
+
+    A stale lease alone is insufficient for Activity: the current Resident may
+    still own broad-inbox work while recovering from a transient pause.  A
+    terminal/missing task cannot act, and an older well-formed Resident
+    generation cannot act once the Project names a different active authority.
+    Malformed or non-Resident live owners fail closed and remain untouched.
+    """
+    from app.models import TaskStatus
+
+    if task is None:
+        return f"claimant task {msg.handled_by_task_id} no longer exists"
+    if task.status in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }:
+        status_value = str(getattr(task.status, "value", task.status)).lower()
+        return f"claimant task {task.id} is terminal ({status_value})"
+
+    task_context = dict(task.context or {})
+    if task_context.get("_resident_session") is not True:
+        return None
+    if task.status not in {TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING}:
+        status_value = str(getattr(task.status, "value", task.status)).lower()
+        return f"claimant Resident task {task.id} cannot claim ({status_value})"
+    try:
+        task_generation = int(task_context.get("_resident_worker_generation"))
+        claim_generation = int(msg.conversation_claim_generation)
+    except (TypeError, ValueError):
+        return None
+    task_session_id = str(task_context.get("strategic_session_id") or "")
+    if (
+        task_generation < 1
+        or claim_generation != task_generation
+        or not task_session_id
+    ):
+        return None
+
+    resident = dict((project.vision or {}).get("_resident_strategic_session") or {})
+    try:
+        current_generation = int(resident.get("worker_generation"))
+    except (TypeError, ValueError):
+        return None
+    current_session_id = str(resident.get("session_id") or "")
+    current_task_id = str(resident.get("task_id") or "")
+    if (
+        resident.get("status") != "active"
+        or bool(resident.get("stop_requested"))
+        or current_generation < 1
+        or not current_session_id
+        or not current_task_id
+    ):
+        return None
+    if (
+        current_task_id == str(task.id)
+        and current_session_id == task_session_id
+        and current_generation == claim_generation
+    ):
+        return None
+    return (
+        f"claimant Resident {task.id}/{task_session_id}/generation "
+        f"{claim_generation} was superseded by {current_task_id}/"
+        f"{current_session_id}/generation {current_generation}"
+    )
+
+
+async def sweep_release_expired_activity_claims(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 25b: release dead Activity claims without stealing live work.
+
+    Resident broad-inbox claims have immutable membership.  If an expired
+    singleton Activity claim precedes an unclaimed sibling, the next Resident
+    polls both and the coordinator correctly rejects the enlarged batch.  This
+    sweep releases the *whole* Activity-only claim group only when every member
+    is stale on both clocks and its owning task is terminal/missing or its
+    generation is authoritatively superseded.  Conversation/mixed-surface
+    groups and live or ambiguous owners remain untouched.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.conversation_coordinator import (
+        _OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY,
+        reset_conversation_claim_for_session_handoff,
+    )
+    from app.models import (
+        MessageHandlingState,
+        MessageSurface,
+        Project,
+        ProjectMessage,
+        Task,
+    )
+    from app.project_message_projection import message_updated_event_payload
+    from app.session_message_handoff import (
+        RESIDENT_HANDOFF_AT_CONTEXT_KEY,
+        RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+    )
+    from app.shared_state import runtime_config
+
+    release_after_minutes = int(
+        runtime_config.get(
+            "expired_activity_claim_release_after_minutes",
+            EXPIRED_ACTIVITY_CLAIM_RELEASE_AFTER_MINUTES,
+        )
+    )
+    cutoff = now - timedelta(minutes=release_after_minutes)
+    candidates = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.surface == MessageSurface.ACTIVITY,
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.status == "open",
+                    ProjectMessage.handling_state == MessageHandlingState.CLAIMED,
+                    ProjectMessage.conversation_claim_id.is_not(None),
+                    ProjectMessage.handled_by_task_id.is_not(None),
+                    ProjectMessage.updated_at <= cutoff,
+                    or_(
+                        ProjectMessage.conversation_claim_expires_at.is_(None),
+                        ProjectMessage.conversation_claim_expires_at <= cutoff,
+                    ),
+                )
+                .order_by(ProjectMessage.project_id, ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(candidates) >= batch_size:
+        logger.warning(
+            "[REAPER] expired-Activity-claim release sweep hit cap=%d -- "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+    if not candidates:
+        return 0
+
+    released = 0
+    processed_claims: set[tuple[uuid.UUID, uuid.UUID]] = set()
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for candidate in candidates:
+        claim_id = candidate.conversation_claim_id
+        if claim_id is None:
+            continue
+        group_key = (candidate.project_id, claim_id)
+        if group_key in processed_claims:
+            continue
+        processed_claims.add(group_key)
+
+        # Project authority is the deciding generation fence.  Lock it before
+        # the message group, matching the Resident claim endpoint's lock order.
+        project = (
+            await session.execute(
+                select(Project)
+                .where(Project.id == candidate.project_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if project is None:
+            continue
+        candidate_owner_id = candidate.handled_by_task_id
+        task = (
+            await session.execute(
+                select(Task)
+                .where(Task.id == candidate_owner_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        group = (
+            (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == candidate.project_id,
+                        ProjectMessage.conversation_claim_id == claim_id,
+                    )
+                    .order_by(ProjectMessage.created_at, ProjectMessage.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not group:
+            continue
+        owner_ids = {row.handled_by_task_id for row in group}
+        generations = {row.conversation_claim_generation for row in group}
+        incarnations = {row.conversation_claim_incarnation for row in group}
+        if (
+            len(owner_ids) != 1
+            or None in owner_ids
+            or len(generations) != 1
+            or len(incarnations) != 1
+        ):
+            continue
+        owner_id = next(iter(owner_ids))
+        if owner_id != candidate_owner_id:
+            continue
+        stale_reason = _activity_claim_owner_stale_reason(group[0], task, project)
+        if stale_reason is None:
+            continue
+
+        group_is_releasable = all(
+            row.surface == MessageSurface.ACTIVITY
+            and row.from_type == "user"
+            and row.status == "open"
+            and row.handling_state == MessageHandlingState.CLAIMED
+            and row.updated_at is not None
+            and _stranded_naive_utc(row.updated_at)
+            <= _stranded_naive_utc(cutoff)
+            and (
+                row.conversation_claim_expires_at is None
+                or _stranded_naive_utc(row.conversation_claim_expires_at)
+                <= _stranded_naive_utc(cutoff)
+            )
+            and not _stranded_sweep_is_excluded(dict(row.context or {}))
+            for row in group
+        )
+        if not group_is_releasable:
+            continue
+
+        for msg in group:
+            prior_session_id = msg.resident_session_id
+            prior_deaths = (msg.context or {}).get(
+                _OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY
+            )
+            deaths = int(prior_deaths or 0) + 1
+            attempt = int(msg.conversation_claim_attempt or 0)
+            reason = (
+                f"Activity claim {claim_id} was stale and its {stale_reason}; "
+                f"attempt={attempt}, dead_claims={deaths}; released to PENDING "
+                "for exact-membership redelivery"
+            )
+            reset_conversation_claim_for_session_handoff(msg)
+            msg.handling_state = MessageHandlingState.PENDING
+            msg.handled_by_task_id = None
+            msg.resident_session_id = None
+            context = {
+                **dict(msg.context or {}),
+                "_conversation_claim_released_at": now.isoformat(),
+                "_conversation_claim_release_reason": reason,
+                _OPERATOR_TURN_DEAD_CLAIMS_CONTEXT_KEY: deaths,
+            }
+            if prior_session_id:
+                context[RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY] = prior_session_id
+                context[RESIDENT_HANDOFF_AT_CONTEXT_KEY] = now.isoformat()
+            msg.context = context
+            msg.updated_at = now
+            session.add(msg)
+            released += 1
+            pending_broadcasts.append(
+                (str(msg.project_id), message_updated_event_payload(msg))
+            )
+            logger.info(
+                "[REAPER] Step 25b: released expired Activity claim on message "
+                "%s (%s)",
+                msg.id,
+                reason,
+            )
+
+    if released:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 25b: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 25b: released %d expired Activity claim message(s)",
+            released,
+        )
+    else:
+        # Release the authority/message locks acquired for fail-closed groups.
+        await session.rollback()
     return released
 
 
