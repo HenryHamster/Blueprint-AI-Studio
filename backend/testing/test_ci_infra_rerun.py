@@ -12,6 +12,7 @@ from app.github_checks import (
     _GITHUB_SETUP_STEPS,
     _job_failed_only_at_setup,
     rerun_failed_jobs,
+    rerun_failed_jobs_outcome,
 )
 
 
@@ -102,3 +103,17 @@ async def test_rerun_swallows_exception(monkeypatch):
 
     monkeypatch.setattr(gh_module, "_github_request", fake_request)
     assert await rerun_failed_jobs("tok", "o", "r", 123) is False
+
+
+async def test_rerun_outcome_distinguishes_rejection_from_ambiguity(monkeypatch):
+    async def rejected_request(method, url, headers, **kwargs):
+        return _Resp(403, "forbidden")
+
+    monkeypatch.setattr(gh_module, "_github_request", rejected_request)
+    assert await rerun_failed_jobs_outcome("tok", "o", "r", 123) == "rejected"
+
+    async def ambiguous_request(method, url, headers, **kwargs):
+        raise RuntimeError("response lost")
+
+    monkeypatch.setattr(gh_module, "_github_request", ambiguous_request)
+    assert await rerun_failed_jobs_outcome("tok", "o", "r", 123) == "ambiguous"

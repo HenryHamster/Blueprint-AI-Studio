@@ -645,6 +645,58 @@ async def test_get_check_runs_log_fetch_timeout(mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_check_runs_projects_failed_workflow_attempt(mocker):
+    """Failed run identity includes GitHub's monotonic rerun attempt number."""
+    from app.github import get_check_runs
+
+    async def mock_request(_method, url, *_args, **_kwargs):
+        if "/commits/" in url:
+            return MockResponse(
+                200,
+                {
+                    "check_runs": [
+                        {
+                            "id": 777,
+                            "name": "Backend Tests",
+                            "status": "completed",
+                            "conclusion": "failure",
+                        }
+                    ]
+                },
+            )
+        if "/actions/runs?" in url:
+            return MockResponse(
+                200,
+                {"workflow_runs": [{"id": 12345, "run_attempt": 4}]},
+            )
+        if "/actions/runs/12345/jobs" in url:
+            return MockResponse(
+                200,
+                {
+                    "jobs": [
+                        {
+                            "id": 777,
+                            "name": "Backend Tests",
+                            "conclusion": "failure",
+                            "steps": [],
+                        }
+                    ]
+                },
+            )
+        if "/actions/jobs/777/logs" in url:
+            return MockResponse(200, text="FAILED test_example.py::test_failure")
+        raise AssertionError(f"unexpected GitHub request: {url}")
+
+    mocker.patch("app.github_checks._deferrable_quota_active", return_value=False)
+    mocker.patch("app.github_checks._github_request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "head-sha")
+
+    assert result["failed_run_ids"] == [12345]
+    assert result["failed_run_attempts"] == {"12345": 4}
+
+
+@pytest.mark.asyncio
 async def test_get_check_runs_paginates_all_pages_failing_run_on_later_page(mocker):
     """
     get_check_runs() must fetch all pages of check-runs, not just the first page
@@ -1258,6 +1310,152 @@ async def test_get_check_runs_cached_invalidate_clears_entry(mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_check_runs_cached_invalidation_fences_late_writer(mocker):
+    """A fetch invalidated in flight retries before returning to its caller."""
+    import app.github as gh
+
+    owner = "race-owner"
+    repo = "race-repo"
+    head_sha = "race-cache-sha"
+    cache_key = (owner, repo, head_sha, True, True)
+    gh.invalidate_check_runs_cache(owner, repo, head_sha)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    stale_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [],
+        "failed_logs": "stale",
+    }
+    fresh_result = {
+        "status": "in_progress",
+        "conclusion": None,
+        "details": [],
+        "failed_logs": "",
+    }
+    calls = 0
+
+    async def slow_fetch(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            return stale_result
+        return fresh_result
+
+    mock_inner = mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        side_effect=slow_fetch,
+    )
+    fetch_task = asyncio.create_task(
+        gh.get_check_runs_cached("tok", owner, repo, head_sha)
+    )
+    await started.wait()
+
+    gh.invalidate_check_runs_cache(owner, repo, head_sha)
+    release.set()
+    assert await fetch_task == fresh_result
+    assert mock_inner.await_count == 2
+    assert gh._check_runs_cache[cache_key][0] == fresh_result
+    gh.invalidate_check_runs_cache(owner, repo, head_sha)
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_cached_unrelated_invalidation_does_not_retry(mocker):
+    """Per-key generations do not churn an unrelated in-flight lookup."""
+    import app.github as gh
+
+    owner = "isolated-owner"
+    repo = "isolated-repo"
+    head_sha = "isolated-sha-a"
+    cache_key = (owner, repo, head_sha, True, True)
+    gh.invalidate_check_runs_cache(owner, repo, head_sha)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    result = {
+        "status": "completed",
+        "conclusion": "success",
+        "details": [],
+        "failed_logs": "",
+    }
+
+    async def slow_fetch(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+        return result
+
+    mock_inner = mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        side_effect=slow_fetch,
+    )
+    fetch_task = asyncio.create_task(
+        gh.get_check_runs_cached("tok", owner, repo, head_sha)
+    )
+    await started.wait()
+    gh.invalidate_check_runs_cache(owner, repo, "isolated-sha-b")
+    release.set()
+
+    assert await fetch_task == result
+    mock_inner.assert_awaited_once()
+    assert gh._check_runs_cache[cache_key][0] == result
+    gh.invalidate_check_runs_cache(owner, repo, head_sha)
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_cached_repeated_invalidation_fails_closed(mocker):
+    """Two generation races return pending, never either stale response."""
+    import app.github as gh
+
+    owner = "double-race-owner"
+    repo = "double-race-repo"
+    head_sha = "double-race-sha"
+    cache_key = (owner, repo, head_sha, True, True)
+    gh.invalidate_check_runs_cache(owner, repo, head_sha)
+
+    started = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    calls = 0
+
+    async def slow_fetch(*_args, **_kwargs):
+        nonlocal calls
+        index = calls
+        calls += 1
+        started[index].set()
+        await release[index].wait()
+        return {
+            "status": "completed",
+            "conclusion": "failure",
+            "details": [],
+            "failed_logs": f"stale-{index}",
+        }
+
+    mock_inner = mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        side_effect=slow_fetch,
+    )
+    fetch_task = asyncio.create_task(
+        gh.get_check_runs_cached("tok", owner, repo, head_sha)
+    )
+    for index in range(2):
+        await started[index].wait()
+        gh.invalidate_check_runs_cache(owner, repo, head_sha)
+        release[index].set()
+
+    result = await fetch_task
+    assert result["status"] == "pending"
+    assert result["_from_cache_generation_race"] is True
+    assert mock_inner.await_count == 2
+    assert cache_key not in gh._check_runs_cache
+    gh.invalidate_check_runs_cache(owner, repo, head_sha)
+
+
+@pytest.mark.asyncio
 async def test_scan_pr_for_injection_cached_by_head_sha(mocker):
     """Two scans on the same PR head_sha should fetch PR data once (for the
     head_sha lookup) but skip the diff + commits fetches on the second call."""
@@ -1673,7 +1871,8 @@ def _make_check_run_payload(
     head_sha: str,
     *,
     action: str = "completed",
-    conclusion: str = "success",
+    status: str = "completed",
+    conclusion: str | None = "success",
     head_branch: str = "feature/test",
     pr_numbers: list[int] | None = None,
 ) -> bytes:
@@ -1690,7 +1889,7 @@ def _make_check_run_payload(
             "check_run": {
                 "id": 999,
                 "name": "CI / test",
-                "status": "completed",
+                "status": status,
                 "conclusion": conclusion,
                 "head_sha": head_sha,
                 "pull_requests": _prs,
@@ -2385,17 +2584,37 @@ async def test_pr_merged_no_matching_artifact_is_noop(client, db_session, mocker
 @pytest.mark.asyncio
 async def test_check_run_non_completed_action_is_ignored(client, db_session, mocker):
     """
-    A check_run webhook with action != 'completed' is immediately ignored.
+    A check_run start transition evicts stale exact-head state without
+    reconciling a non-terminal result.
     """
+    from app.github_checks import _check_runs_cache, invalidate_check_runs_cache
+
     mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mock_handle_ci = mocker.patch(
+        "app.ci_completion.handle_ci_completion", new_callable=AsyncMock
+    )
+
+    owner = "ciorg"
+    repo = "cirepo"
+    head_sha = "abc123"
+    cache_key = (owner, repo, head_sha, True, True)
+    _check_runs_cache[cache_key] = (
+        {"status": "completed", "conclusion": "failure"},
+        time.time(),
+    )
 
     payload_bytes = _make_check_run_payload(
-        "ciorg", "cirepo", "abc123", action="created"
+        owner, repo, head_sha, action="created", status="queued", conclusion=None
     )
-    resp = await _post_webhook(client, payload_bytes, "check_run")
+    try:
+        resp = await _post_webhook(client, payload_bytes, "check_run")
 
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "ignored"
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ignored"
+        assert cache_key not in _check_runs_cache
+        mock_handle_ci.assert_not_awaited()
+    finally:
+        invalidate_check_runs_cache(owner, repo, head_sha)
 
 
 @pytest.mark.asyncio
@@ -2483,6 +2702,84 @@ async def test_check_run_completed_calls_handle_ci_completion(
     mock_handle_ci.assert_called_once()
     called_task = mock_handle_ci.call_args[0][0]
     assert called_task.id == task.id
+
+
+@pytest.mark.asyncio
+async def test_check_run_completed_evicts_stale_exact_head_before_reconcile(
+    client, db_session, mocker
+):
+    """A matching webhook must not reconcile from the prior attempt's cache."""
+    from app.github_checks import _check_runs_cache, invalidate_check_runs_cache
+    from app.models import Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    owner = "freshorg"
+    repo = "freshrepo"
+    head_sha = "freshhead1234567890abcdef"
+    gh_token = "gh-test-token"
+    cache_key = (owner, repo, head_sha, True, True)
+    _check_runs_cache[cache_key] = (
+        {
+            "status": "completed",
+            "conclusion": "failure",
+            "failed_logs": "stale failure",
+        },
+        time.time(),
+    )
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=(gh_token, owner, repo),
+    )
+    mock_get_check_runs = mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        return_value={
+            "status": "in_progress",
+            "conclusion": None,
+            "failed_logs": "",
+        },
+    )
+    mock_handle_ci = mocker.patch(
+        "app.ci_completion.handle_ci_completion",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Fresh CI webhook",
+        user_id="user1",
+        github_owner=owner,
+        github_repo=repo,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Waiting for rerun",
+        payloads=[
+            {"type": "review", "pr_number": 11, "branch": "feature/rerun"}
+        ],
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {"ci_waiting": True, "head_sha": head_sha}},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    try:
+        payload_bytes = _make_check_run_payload(owner, repo, head_sha)
+        resp = await _post_webhook(client, payload_bytes, "check_run")
+
+        assert resp.status_code == 200
+        mock_get_check_runs.assert_awaited_once()
+        mock_handle_ci.assert_not_awaited()
+        assert _check_runs_cache[cache_key][0]["status"] == "in_progress"
+    finally:
+        invalidate_check_runs_cache(owner, repo, head_sha)
 
 
 @pytest.mark.asyncio

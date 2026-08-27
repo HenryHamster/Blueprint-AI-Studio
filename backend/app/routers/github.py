@@ -798,9 +798,6 @@ async def github_webhook(
 
     elif event_type == "check_run":
         action = data.get("action")
-        if action != "completed":
-            return {"status": "ignored"}
-
         check_run = data.get("check_run", {})
         head_sha = check_run.get("head_sha")
         repo_full = data.get("repository", {}).get("full_name", "")
@@ -808,6 +805,21 @@ async def github_webhook(
             return {"status": "ignored"}
 
         owner, repo = repo_full.split("/", 1)
+        if action != "completed":
+            if action in {"created", "rerequested"} or check_run.get("status") in {
+                "queued",
+                "in_progress",
+                "waiting",
+                "requested",
+                "pending",
+            }:
+                # Signature verification and delivery dedupe have already run.
+                # A start/rerun transition supersedes any exact-head verdict,
+                # but it is not itself a terminal result to reconcile.
+                from app.github import invalidate_check_runs_cache
+
+                invalidate_check_runs_cache(owner, repo, head_sha)
+            return {"status": "ignored"}
 
         # Find ci_waiting tasks matching this commit SHA, scoped to this repo's project
         project_result = await session.execute(
@@ -960,9 +972,14 @@ async def github_webhook(
         # shares the same head_sha, so the cached variant collapses N calls
         # into 1 (webhook fan-out was one of the biggest per-event burners
         # when rollup PRs had many children).
-        from app.github import get_check_runs_cached
+        from app.github import get_check_runs_cached, invalidate_check_runs_cache
         from app.routers.agent import get_github_token_for_task
         from app.ci_completion import handle_ci_completion
+
+        # A completed check_run is newer transition evidence than any local
+        # exact-head cache entry. Evict once before sibling fan-out so the first
+        # task fetches the new attempt and the remaining tasks reuse that result.
+        invalidate_check_runs_cache(owner, repo, head_sha)
 
         for task in matching:
             try:

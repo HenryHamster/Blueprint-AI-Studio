@@ -22,6 +22,7 @@ import copy
 import contextlib
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -67,6 +68,426 @@ logger = logging.getLogger(__name__)
 # Configured as a module constant so it's trivially overridable for testing;
 # set to 0 to disable the general rerun gate entirely.
 _CI_RERUN_BUDGET = 1
+_CI_RERUN_RECHECK_SECONDS = 15
+_CI_RERUN_ACCEPTANCE_FENCE_SECONDS = 90
+_CI_RERUN_JOURNAL_KEY = "ci_rerun_journal"
+_CI_RERUN_HOLD_STATES = {"reserved", "accepted", "ambiguous"}
+
+
+def _failed_run_attempts(ci_result: dict) -> dict[str, int]:
+    raw_attempts = ci_result.get("failed_run_attempts") or {}
+    if not isinstance(raw_attempts, dict):
+        return {}
+    return {
+        str(run_id): attempt
+        for run_id, attempt in raw_attempts.items()
+        if isinstance(attempt, int) and not isinstance(attempt, bool)
+    }
+
+
+def _clear_ci_rerun_journal(task: Task) -> None:
+    context = dict(task.context or {})
+    if context.pop(_CI_RERUN_JOURNAL_KEY, None) is None:
+        return
+    task.context = context
+    flag_modified(task, "context")
+
+
+def _ci_rerun_identity(
+    task: Task,
+    *,
+    ci_pr_number: int | None,
+    checked_head_sha: str | None,
+) -> tuple[int | None, str]:
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    exact_head_sha = str(
+        checked_head_sha or review_loop.get("head_sha") or ""
+    ).strip()
+    return ci_pr_number, exact_head_sha
+
+
+def _failed_run_ids(ci_result: dict) -> list[int]:
+    return sorted(
+        {
+            int(run_id)
+            for run_id in (ci_result.get("failed_run_ids") or [])
+            if isinstance(run_id, int) and not isinstance(run_id, bool)
+        }
+    )
+
+
+def _reserve_ci_rerun(
+    task: Task,
+    ci_result: dict,
+    *,
+    ci_pr_number: int | None,
+    checked_head_sha: str | None,
+    kind: str,
+) -> str | None:
+    """Durably-authorizable journal state, populated before any GitHub POST."""
+    pr_number, exact_head_sha = _ci_rerun_identity(
+        task,
+        ci_pr_number=ci_pr_number,
+        checked_head_sha=checked_head_sha,
+    )
+    failure_run_ids = _failed_run_ids(ci_result)
+    if not exact_head_sha or pr_number is None or not failure_run_ids:
+        return None
+
+    now = _utcnow()
+    journal_id = str(uuid.uuid4())
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    prior_poll = {
+        "ci_last_polled_present": "ci_last_polled" in review_loop,
+        "ci_last_polled": review_loop.get("ci_last_polled"),
+        "ci_poll_interval_present": "ci_poll_interval" in review_loop,
+        "ci_poll_interval": review_loop.get("ci_poll_interval"),
+    }
+    journal = {
+        "id": journal_id,
+        "state": "reserved",
+        "kind": kind,
+        "pr_number": int(pr_number),
+        "head_sha": exact_head_sha,
+        "failure_run_ids": failure_run_ids,
+        "run_attempts": _failed_run_attempts(ci_result),
+        "run_outcomes": {str(run_id): "reserved" for run_id in failure_run_ids},
+        "reserved_at": now.isoformat(),
+        "deadline_at": (
+            now + timedelta(seconds=_CI_RERUN_ACCEPTANCE_FENCE_SECONDS)
+        ).isoformat(),
+        "prior_poll": prior_poll,
+    }
+    if kind == "infra":
+        journal["prior_budget_value"] = context.get("ci_infra_rerun_done")
+        journal["prior_budget_present"] = "ci_infra_rerun_done" in context
+        context["ci_infra_rerun_done"] = True
+    else:
+        consumed = context.get("ci_rerun_consumed", 0)
+        journal["prior_budget_value"] = consumed
+        journal["prior_budget_present"] = "ci_rerun_consumed" in context
+        context["ci_rerun_consumed"] = consumed + 1
+    context[_CI_RERUN_JOURNAL_KEY] = journal
+    task.context = context
+    flag_modified(task, "context")
+    return journal_id
+
+
+def _ci_rerun_journal_disposition(
+    task: Task,
+    ci_result: dict,
+    *,
+    ci_pr_number: int | None,
+    checked_head_sha: str | None,
+) -> str:
+    """Classify a prior journal as none, hold, distinct, rejected, or expired."""
+    context = dict(task.context or {})
+    journal = context.get(_CI_RERUN_JOURNAL_KEY)
+    if not isinstance(journal, dict):
+        return "none"
+    pr_number, exact_head_sha = _ci_rerun_identity(
+        task,
+        ci_pr_number=ci_pr_number,
+        checked_head_sha=checked_head_sha,
+    )
+    if (
+        not exact_head_sha
+        or pr_number is None
+        or str(journal.get("head_sha") or "") != exact_head_sha
+        or str(journal.get("pr_number")) != str(pr_number)
+    ):
+        _clear_ci_rerun_journal(task)
+        return "distinct"
+
+    observed_run_ids = set(_failed_run_ids(ci_result))
+    fenced_run_ids = {
+        int(run_id)
+        for run_id in (journal.get("failure_run_ids") or [])
+        if isinstance(run_id, int) and not isinstance(run_id, bool)
+    }
+    if observed_run_ids and observed_run_ids != fenced_run_ids:
+        _clear_ci_rerun_journal(task)
+        return "distinct"
+
+    observed_attempts = _failed_run_attempts(ci_result)
+    fenced_attempts = journal.get("run_attempts") or {}
+    if isinstance(fenced_attempts, dict):
+        for run_id, old_attempt in fenced_attempts.items():
+            new_attempt = observed_attempts.get(str(run_id))
+            if (
+                isinstance(old_attempt, int)
+                and not isinstance(old_attempt, bool)
+                and isinstance(new_attempt, int)
+                and not isinstance(new_attempt, bool)
+                and new_attempt > old_attempt
+            ):
+                _clear_ci_rerun_journal(task)
+                return "distinct"
+
+    state = str(journal.get("state") or "")
+    if state == "rejected":
+        return "rejected"
+    if state == "timed_out":
+        return "expired"
+    if state not in _CI_RERUN_HOLD_STATES:
+        return "expired"
+
+    try:
+        deadline = datetime.fromisoformat(str(journal.get("deadline_at") or ""))
+    except (TypeError, ValueError):
+        return "expired"
+    now = _utcnow()
+    if now.tzinfo is None and deadline.tzinfo is not None:
+        deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
+    elif now.tzinfo is not None and deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    if now >= deadline:
+        return "expired"
+
+    if state == "reserved":
+        journal = dict(journal)
+        journal["state"] = "ambiguous"
+        journal["recovered_at"] = _utcnow().isoformat()
+        context[_CI_RERUN_JOURNAL_KEY] = journal
+        task.context = context
+        flag_modified(task, "context")
+    return "hold"
+
+
+def _record_ci_rerun_outcomes(
+    task: Task, journal_id: str, outcomes: dict[int, str]
+) -> str | None:
+    context = dict(task.context or {})
+    journal = context.get(_CI_RERUN_JOURNAL_KEY)
+    if not isinstance(journal, dict) or journal.get("id") != journal_id:
+        return None
+    journal = dict(journal)
+    journal["run_outcomes"] = {
+        str(run_id): outcome for run_id, outcome in sorted(outcomes.items())
+    }
+    if any(
+        outcome not in {"accepted", "rejected"} for outcome in outcomes.values()
+    ):
+        state = "ambiguous"
+    elif any(outcome == "accepted" for outcome in outcomes.values()):
+        state = "accepted"
+    else:
+        state = "rejected"
+    journal["state"] = state
+    journal["updated_at"] = _utcnow().isoformat()
+    context[_CI_RERUN_JOURNAL_KEY] = journal
+    task.context = context
+    flag_modified(task, "context")
+    return state
+
+
+def _rollback_rejected_ci_rerun(task: Task) -> None:
+    context = dict(task.context or {})
+    journal = context.get(_CI_RERUN_JOURNAL_KEY)
+    if not isinstance(journal, dict) or journal.get("state") != "rejected":
+        return
+    kind = journal.get("kind")
+    budget_key = (
+        "ci_infra_rerun_done" if kind == "infra" else "ci_rerun_consumed"
+    )
+    if journal.get("prior_budget_present"):
+        context[budget_key] = journal.get("prior_budget_value")
+    else:
+        context.pop(budget_key, None)
+
+    review_loop = dict(context.get("review_loop") or {})
+    prior_poll = journal.get("prior_poll") or {}
+    for key in ("ci_last_polled", "ci_poll_interval"):
+        if prior_poll.get(f"{key}_present"):
+            review_loop[key] = prior_poll.get(key)
+        else:
+            review_loop.pop(key, None)
+    context["review_loop"] = review_loop
+    task.context = context
+    flag_modified(task, "context")
+
+
+def _mark_ci_rerun_timed_out(task: Task) -> None:
+    context = dict(task.context or {})
+    journal = context.get(_CI_RERUN_JOURNAL_KEY)
+    if isinstance(journal, dict):
+        journal = dict(journal)
+        journal["state"] = "timed_out"
+        journal["timed_out_at"] = _utcnow().isoformat()
+        context[_CI_RERUN_JOURNAL_KEY] = journal
+    task.context = context
+    flag_modified(task, "context")
+
+
+
+def _arm_ci_rerun_recheck(
+    task: Task,
+    *,
+    owner: str,
+    repo: str,
+    checked_head_sha: str | None,
+) -> None:
+    """Evict the accepted attempt's verdict and schedule a prompt fresh read."""
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    exact_head_sha = str(
+        checked_head_sha or review_loop.get("head_sha") or ""
+    ).strip()
+
+    if exact_head_sha:
+        from app.github_checks import invalidate_check_runs_cache
+
+        invalidate_check_runs_cache(owner, repo, exact_head_sha)
+
+    # Give GitHub a short settlement window after accepting the rerun. A
+    # completed check_run webhook remains the immediate path; this timestamp
+    # guarantees the polling fallback re-reads within 15 seconds instead of
+    # serving the prior attempt for the cache's full 30-second TTL.
+    review_loop["ci_last_polled"] = _utcnow().isoformat()
+    review_loop["ci_poll_interval"] = _CI_RERUN_RECHECK_SECONDS
+    context["review_loop"] = review_loop
+    task.context = context
+    flag_modified(task, "context")
+
+
+async def _execute_ci_rerun(
+    task: Task,
+    ci_result: dict,
+    gh_token: str,
+    owner: str,
+    repo: str,
+    session: AsyncSession,
+    *,
+    ci_pr_number: int | None,
+    checked_head_sha: str | None,
+    kind: str,
+) -> tuple[Task, str]:
+    """Reserve, send without a row lock, then durably record the POST outcome."""
+    journal_id = _reserve_ci_rerun(
+        task,
+        ci_result,
+        ci_pr_number=ci_pr_number,
+        checked_head_sha=checked_head_sha,
+        kind=kind,
+    )
+    if journal_id is None:
+        return task, "not_attempted"
+
+    _arm_ci_rerun_recheck(
+        task,
+        owner=owner,
+        repo=repo,
+        checked_head_sha=checked_head_sha,
+    )
+    task.latest_status_message = (
+        f"CI rerun reserved on PR #{ci_pr_number} — contacting GitHub"
+    )
+    task_id = task.id
+    session.add(task)
+    await session.commit()
+
+    # Revalidate immediately before the external mutation. The reservation is
+    # already durable, so a crash anywhere after this point is reconciled as an
+    # ambiguous send and is never replayed.
+    preflight_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if preflight_task is None:
+        await session.rollback()
+        return task, "held"
+    preflight_journal = (preflight_task.context or {}).get(_CI_RERUN_JOURNAL_KEY)
+    if (
+        preflight_task.status != TaskStatus.EVALUATING
+        or not isinstance(preflight_journal, dict)
+        or preflight_journal.get("id") != journal_id
+        or preflight_journal.get("state") != "reserved"
+    ):
+        await session.commit()
+        return preflight_task, "held"
+    await session.commit()
+
+    from app.github_checks import rerun_failed_jobs_outcome
+
+    outcomes: dict[int, str] = {}
+    for run_id in _failed_run_ids(ci_result):
+        outcomes[run_id] = await rerun_failed_jobs_outcome(
+            gh_token, owner, repo, run_id
+        )
+
+    outcome_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if outcome_task is None:
+        await session.rollback()
+        return preflight_task, "held"
+
+    state = _record_ci_rerun_outcomes(outcome_task, journal_id, outcomes)
+    if state is None:
+        await session.commit()
+        return outcome_task, "held"
+    if state in {"accepted", "ambiguous"}:
+        _arm_ci_rerun_recheck(
+            outcome_task,
+            owner=owner,
+            repo=repo,
+            checked_head_sha=checked_head_sha,
+        )
+        outcome_task.latest_status_message = (
+            f"CI rerun {state} on PR #{ci_pr_number} — waiting for a new attempt"
+        )
+        session.add(outcome_task)
+        await session.commit()
+        return outcome_task, "held"
+
+    _rollback_rejected_ci_rerun(outcome_task)
+    outcome_task.latest_status_message = (
+        f"CI rerun rejected on PR #{ci_pr_number} — proceeding to fix"
+    )
+    session.add(outcome_task)
+    await session.commit()
+
+    # Keep the remainder of the failure path under the same row authority it
+    # had on entry. A peer that acquired the released row wins and this sweep
+    # defers; the persisted rejected journal prevents another POST.
+    rejected_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if rejected_task is None:
+        await session.rollback()
+        return outcome_task, "held"
+    if rejected_task.status != TaskStatus.EVALUATING:
+        await session.commit()
+        return rejected_task, "held"
+    return rejected_task, "rejected"
 
 
 def _establish_ci_approval_hold(task: Task, *, reason: str) -> None:
@@ -2370,6 +2791,7 @@ async def handle_ci_completion(
         return False
 
     if ci_result["conclusion"] == "success":
+        _clear_ci_rerun_journal(task)
         # Record the CI gate signal. JSONB columns don't track in-place dict
         # mutations — flag_modified ensures the change is flushed to disk.
         ci_loop["ci_passed"] = True
@@ -2861,6 +3283,49 @@ async def handle_ci_completion(
         )
     else:
         # CI failed — spawn fix task
+        _rerun_disposition = _ci_rerun_journal_disposition(
+            task,
+            ci_result,
+            ci_pr_number=ci_pr_number,
+            checked_head_sha=checked_head_sha,
+        )
+        if _rerun_disposition == "hold":
+            _arm_ci_rerun_recheck(
+                task,
+                owner=owner,
+                repo=repo,
+                checked_head_sha=checked_head_sha,
+            )
+            task.latest_status_message = (
+                f"CI rerun outcome is not yet confirmed on PR #{ci_pr_number} — "
+                "waiting for GitHub to publish a new attempt"
+            )
+            session.add(task)
+            await session.commit()
+            logger.info(
+                f"[CI] PR #{ci_pr_number} held same-attempt CI failure behind "
+                f"durable rerun journal ({source})"
+            )
+            return False
+        if _rerun_disposition == "expired":
+            _mark_ci_rerun_timed_out(task)
+            _hold_reason = "ci_rerun_outcome_unconfirmed"
+            _establish_ci_approval_hold(task, reason=_hold_reason)
+            _timeout_message = (
+                f"CI rerun outcome on PR #{ci_pr_number} remained unconfirmed "
+                "past its deadline; manual GitHub verification is required"
+            )
+            task.latest_status_message = _timeout_message
+            await _maybe_create_failure_alert(task, session, _timeout_message)
+            session.add(task)
+            await session.commit()
+            logger.error(
+                f"[CI] PR #{ci_pr_number} rerun journal timed out; set manual "
+                f"approval hold ({source})"
+            )
+            return True
+        _rerun_rejected = _rerun_disposition == "rejected"
+
         # Phase F3 (H5): push pr_number filter into SQL via cast(..., Integer)
         # so ``ix_task_payloads_pr_number`` (alembic 0057) is usable on
         # Postgres. status_log included for the Task event listeners under
@@ -2936,27 +3401,13 @@ async def handle_ci_completion(
         # so it's repo-agnostic. Capped at one rerun per task via a context flag:
         # a genuinely broken setup fails the rerun too and falls through to the
         # normal fix path on the next poll.
-        if ci_result.get("setup_phase_failure") and not (task.context or {}).get(
-            "ci_infra_rerun_done"
+        _rerun_kind: str | None = None
+        if (
+            not _rerun_rejected
+            and ci_result.get("setup_phase_failure")
+            and not (task.context or {}).get("ci_infra_rerun_done")
         ):
-            from app.github_checks import rerun_failed_jobs
-
-            _reran_any = False
-            for _run_id in ci_result.get("failed_run_ids") or []:
-                if await rerun_failed_jobs(gh_token, owner, repo, _run_id):
-                    _reran_any = True
-            if _reran_any:
-                _ctx = dict(task.context or {})
-                _ctx["ci_infra_rerun_done"] = True
-                task.context = _ctx
-                flag_modified(task, "context")
-                session.add(task)
-                await session.commit()
-                logger.info(
-                    f"[CI] PR #{ci_pr_number} CI failure is setup-phase infra — "
-                    f"re-ran failed jobs, deferring fix spawn to next poll ({source})"
-                )
-                return False
+            _rerun_kind = "infra"
 
         # ── General CI rerun gate (flake-tolerant) ──
         # If the CI failure involves user/test steps (not just GitHub built-in
@@ -2968,29 +3419,29 @@ async def handle_ci_completion(
         # counter; a genuinely broken test fails the rerun too and falls through
         # to the normal fix path on the next sweep.
         _rerun_consumed = (task.context or {}).get("ci_rerun_consumed", 0)
-        if _rerun_consumed < _CI_RERUN_BUDGET:
-            from app.github_checks import rerun_failed_jobs
+        if (
+            not _rerun_rejected
+            and not ci_result.get("setup_phase_failure")
+            and _rerun_consumed < _CI_RERUN_BUDGET
+        ):
+            _rerun_kind = "general"
 
-            _reran_any = False
-            for _run_id in ci_result.get("failed_run_ids") or []:
-                if await rerun_failed_jobs(gh_token, owner, repo, _run_id):
-                    _reran_any = True
-            if _reran_any:
-                _ctx = dict(task.context or {})
-                _ctx["ci_rerun_consumed"] = _rerun_consumed + 1
-                task.context = _ctx
-                flag_modified(task, "context")
-                task.latest_status_message = (
-                    f"CI failed on PR #{ci_pr_number} — re-ran failed jobs "
-                    f"({_rerun_consumed + 1}/{_CI_RERUN_BUDGET}), "
-                    f"deferring fix spawn to next sweep"
-                )
-                session.add(task)
-                await session.commit()
+        if _rerun_kind is not None:
+            task, _rerun_result = await _execute_ci_rerun(
+                task,
+                ci_result,
+                gh_token,
+                owner,
+                repo,
+                session,
+                ci_pr_number=ci_pr_number,
+                checked_head_sha=checked_head_sha,
+                kind=_rerun_kind,
+            )
+            if _rerun_result == "held":
                 logger.info(
-                    f"[CI] PR #{ci_pr_number} CI failure — general rerun "
-                    f"({_rerun_consumed + 1}/{_CI_RERUN_BUDGET}), "
-                    f"deferring fix spawn to next sweep ({source})"
+                    f"[CI] PR #{ci_pr_number} {_rerun_kind} rerun reserved; "
+                    f"deferring fix spawn ({source})"
                 )
                 return False
 
