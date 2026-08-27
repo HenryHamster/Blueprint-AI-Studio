@@ -3488,6 +3488,70 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
+  it('paces legacy Workday claim conflicts while renewing the Resident incarnation', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'legacy-workday-conflict', content: 'continue the existing Workday thread',
+      created_at: new Date().toISOString(), from_type: 'user', context: {},
+    };
+    const claimTimes: number[] = [];
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?')) return Promise.resolve(null);
+      return Promise.resolve({ messages: [operatorMessage], claim_required: true });
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        heartbeatBodies.push(body ?? {});
+        return Promise.resolve(heartbeatBodies.length === 1
+          ? {
+              authority_held: true,
+              resident_incarnation_held: true,
+              stop_requested: false,
+              leased_until: new Date(Date.now() + 180_000).toISOString(),
+            }
+          : {
+              authority_held: false,
+              resident_incarnation_held: false,
+              stop_requested: true,
+            });
+      }
+      if (url.includes('/messages/claim')) {
+        claimTimes.push(Date.now());
+        return Promise.reject(new Error('409: operator batch already claimed'));
+      }
+      return Promise.resolve({});
+    });
+    const workday = makeSession(() => turnResult(), () => true);
+    mockStartSession.mockReturnValue(workday);
+
+    const handling = run('legacy-workday-conflict-task', {
+      project_name: 'P',
+      open_messages: [],
+      strategic_session_autonomous: false,
+      strategic_session_id: 'legacy-workday-conflict-session',
+      strategic_session_idle_tick_seconds: 300,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(31_000);
+    await handling;
+
+    expect(claimTimes.length).toBeGreaterThan(1);
+    expect(claimTimes.every((at, index) => (
+      index === 0 || at - claimTimes[index - 1] >= 1_500
+    ))).toBe(true);
+    expect(heartbeatBodies.length).toBeGreaterThanOrEqual(2);
+    expect(heartbeatBodies.at(-1)).toEqual(expect.objectContaining({
+      session_id: 'legacy-workday-conflict-session',
+      task_id: 'legacy-workday-conflict-task',
+      worker_generation: 1,
+      resident_incarnation_id: expect.any(String),
+      progress: false,
+    }));
+    expect(workday.touch).toHaveBeenCalled();
+    expect(workday.sendTurn).not.toHaveBeenCalled();
+  });
+
   it('releases the exact lease after a failed readiness probe without starting a Fast turn', async () => {
     const releases: Array<Record<string, unknown> | undefined> = [];
     mockApiGet.mockResolvedValue({ messages: [] });

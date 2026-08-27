@@ -121,6 +121,9 @@ RESIDENT_SESSION_KEY = "_resident_strategic_session"
 RESIDENT_INFRASTRUCTURE_CONTEXT_KEY = "_resident_infrastructure"
 RESIDENT_LIFECYCLE_DISPOSITION_CONTEXT_KEY = "_resident_lifecycle_disposition"
 _RESIDENT_WORKER_INCARNATION_PROTOCOL = 1
+# Runner pulls sort by priority before age. Resident is persistent infrastructure,
+# so it must take the next free local slot ahead of ordinary high-priority work.
+RESIDENT_TASK_PRIORITY = 101
 
 # A call is deliberately a bounded, nested lease on the existing Workday
 # session record, not a third interaction_mode or a new persistent table.  The
@@ -3005,6 +3008,7 @@ async def _spawn_resident_strategic_task(
         # pre-building it at spawn time is unnecessary — the born-context flags +
         # runner pin still ride in via ``extra_context``.
         resident_minimal=True,
+        task_priority=RESIDENT_TASK_PRIORITY,
         launched_by_user_id=str(operator_user_id),
     )
     # Recover ONLY the task born from this exact session/generation claim. A
@@ -3418,6 +3422,7 @@ def _stamp_resident_context(
         task.status = TaskStatus.PROVISIONING
         task.vm_instance_id = f"runner:{runner_id}"
         task.vm_provisioned_at = _utcnow()
+    task.priority = max(int(task.priority or 0), RESIDENT_TASK_PRIORITY)
     task.context = context
     flag_modified(task, "context")
 
@@ -3443,6 +3448,68 @@ def _task_is_adoptable(task: Task | None) -> bool:
         return False
     payload = task.first_payload or {}
     return payload.get("type") == _RESIDENT_STRATEGIC_TASK_TYPE
+
+
+def _uplift_unstarted_resident_task_priority(
+    task: Task | None,
+    *,
+    expected_project_id: uuid.UUID,
+    session_id: str,
+    worker_generation: int,
+) -> bool:
+    """Raise one exact unstarted canonical Resident above ordinary runner work."""
+    if task is None or task.archived:
+        return False
+    if task.project_id != expected_project_id:
+        return False
+    if task.status not in {TaskStatus.QUEUED, TaskStatus.PROVISIONING}:
+        return False
+    if task.started_at is not None:
+        return False
+    if (task.first_payload or {}).get("type") != _RESIDENT_STRATEGIC_TASK_TYPE:
+        return False
+    if not _task_matches_resident_identity(
+        task,
+        session_id=session_id,
+        worker_generation=worker_generation,
+    ):
+        return False
+    if int(task.priority or 0) >= RESIDENT_TASK_PRIORITY:
+        return False
+    task.priority = RESIDENT_TASK_PRIORITY
+    return True
+
+
+async def _ensure_existing_resident_task_priority(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    session_id: str,
+    task_id: uuid.UUID,
+    worker_generation: int,
+) -> bool:
+    """Idempotently uplift an unpulled Resident under Project -> Task locks."""
+    async with project_lock(session, project_id, skip_locked=False) as locked_project:
+        if locked_project is None:
+            return False
+        current = read_resident_session(locked_project.vision)
+        if (
+            not resident_session_is_active(current)
+            or current.get("session_id") != session_id
+            or str(current.get("task_id")) != str(task_id)
+            or int(current.get("worker_generation") or 1) != worker_generation
+        ):
+            return False
+        async with task_lock(session, task_id, skip_locked=False) as locked_task:
+            changed = _uplift_unstarted_resident_task_priority(
+                locked_task,
+                expected_project_id=locked_project.id,
+                session_id=session_id,
+                worker_generation=worker_generation,
+            )
+            if changed:
+                session.add(locked_task)
+            return changed
 
 
 def _arm_and_finalize_vision(
@@ -3881,6 +3948,17 @@ async def start_resident_session(
                         "current session before changing devices"
                     ),
                 )
+            existing_session_id = str(existing.get("session_id"))
+            existing_generation = int(existing.get("worker_generation") or 1)
+            if live is not None and await _ensure_existing_resident_task_priority(
+                session,
+                project.id,
+                session_id=existing_session_id,
+                task_id=live.id,
+                worker_generation=existing_generation,
+            ):
+                await session.commit()
+                await session.refresh(live)
             snapshot = (
                 resident_session_snapshot_for_task(project.vision, live, now=now) or {}
             )
@@ -4019,6 +4097,25 @@ async def start_resident_session(
             )
             if fresh_task_id:
                 if stale_predecessor is None or fresh_identity != stale_predecessor:
+                    if not runner_mismatch:
+                        try:
+                            existing_task_uuid = uuid.UUID(str(fresh_task_id))
+                        except (TypeError, ValueError):
+                            existing_task_uuid = None
+                        if existing_task_uuid is not None:
+                            # The Project lock remains held here. Its current
+                            # session identity authorizes the nested Task lock
+                            # and the exact, unstarted-only priority repair.
+                            async with task_lock(
+                                session, existing_task_uuid, skip_locked=False
+                            ) as existing_task:
+                                if _uplift_unstarted_resident_task_priority(
+                                    existing_task,
+                                    expected_project_id=locked_project.id,
+                                    session_id=str(fresh.get("session_id")),
+                                    worker_generation=fresh_generation,
+                                ):
+                                    session.add(existing_task)
                     decision["mode"] = (
                         "runner_mismatch" if runner_mismatch else "existing"
                     )

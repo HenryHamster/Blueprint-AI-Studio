@@ -64,6 +64,7 @@ from app.strategic_resident_session import (
     OPERATOR_DECISION_ABSENT_NOTIFIED_KEY,
     OPERATOR_DECISION_CAPTURE_MIN_SAMPLE,
     RESIDENT_SESSION_KEY,
+    RESIDENT_TASK_PRIORITY,
     STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
     _OPERATOR_DECISION_SUMMARY_STALE_SECONDS,
     acquire_resident_call_lease,
@@ -1479,6 +1480,7 @@ async def test_start_adopts_task_and_liveness_heartbeat_renews_lease(db_session,
     )
     assert refreshed_task.first_payload["typed_fast_models"]["anthropic"]
     assert refreshed_task.launched_by_user_id == TEST_USER_ID
+    assert refreshed_task.priority == RESIDENT_TASK_PRIORITY
 
     project = await db_session.get(Project, project.id)
     progress = await renew_resident_session_lease(
@@ -1505,6 +1507,172 @@ async def test_start_adopts_task_and_liveness_heartbeat_renews_lease(db_session,
     refreshed = await db_session.get(Project, project.id)
     marker = refreshed.vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
     assert marker["last_renewal_reason"] == "continuous_liveness"
+
+
+@pytest.mark.asyncio
+async def test_repeated_start_uplifts_only_unstarted_canonical_resident(db_session):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    runner = await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+    )
+    original_identity = (
+        started["session_id"],
+        started["task_id"],
+        started["worker_generation"],
+    )
+    task.priority = 50
+    db_session.add(task)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    first_ensure = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+    )
+    second_ensure = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+    )
+
+    await db_session.refresh(task)
+    assert task.priority == RESIDENT_TASK_PRIORITY
+    assert task.started_at is None
+    assert (
+        first_ensure["session_id"],
+        first_ensure["task_id"],
+        first_ensure["worker_generation"],
+    ) == original_identity
+    assert (
+        second_ensure["session_id"],
+        second_ensure["task_id"],
+        second_ensure["worker_generation"],
+    ) == original_identity
+
+
+def test_priority_uplift_rejects_exact_identity_from_another_project():
+    expected_project_id = uuid.uuid4()
+    other_project_id = uuid.uuid4()
+    task = Task(
+        project_id=other_project_id,
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.PROVISIONING,
+        priority=50,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": "ss-cross-project",
+            "_resident_worker_generation": 3,
+        },
+    )
+
+    changed = resident_session_module._uplift_unstarted_resident_task_priority(
+        task,
+        expected_project_id=expected_project_id,
+        session_id="ss-cross-project",
+        worker_generation=3,
+    )
+
+    assert changed is False
+    assert task.priority == 50
+
+
+@pytest.mark.asyncio
+async def test_repeated_start_does_not_uplift_cross_project_vision_pointer(db_session):
+    project = await _make_project(db_session)
+    resident_task = await _make_task(db_session, project)
+    runner = await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+    )
+
+    other_project = await _make_project(db_session)
+    foreign_task = await _make_task(db_session, other_project)
+    await db_session.refresh(resident_task)
+    foreign_task.context = dict(resident_task.context or {})
+    foreign_task.status = TaskStatus.PROVISIONING
+    foreign_task.vm_instance_id = f"runner:{runner.id}"
+    foreign_task.vm_provisioned_at = _utcnow()
+    foreign_task.priority = 50
+
+    await db_session.refresh(project)
+    vision = dict(project.vision or {})
+    resident = dict(vision[RESIDENT_SESSION_KEY])
+    resident["task_id"] = str(foreign_task.id)
+    vision[RESIDENT_SESSION_KEY] = resident
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, foreign_task])
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    ensured = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+    )
+
+    await db_session.refresh(foreign_task)
+    assert foreign_task.project_id == other_project.id
+    assert foreign_task.priority == 50
+    assert ensured["session_id"] == started["session_id"]
+    assert ensured["task_id"] == str(foreign_task.id)
+    assert ensured["worker_generation"] == started["worker_generation"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "started_at"),
+    [
+        (TaskStatus.IN_PROGRESS, None),
+        (TaskStatus.PROVISIONING, _utcnow()),
+    ],
+)
+async def test_repeated_start_does_not_rewrite_started_resident_priority(
+    db_session, status, started_at
+):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    runner = await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+    )
+    task.priority = 50
+    task.status = status
+    task.started_at = started_at
+    task.last_heartbeat = _utcnow()
+    db_session.add(task)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    ensured = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(runner.id),
+    )
+
+    await db_session.refresh(task)
+    assert task.priority == 50
+    assert task.status == status
+    assert task.started_at == started_at
+    assert ensured["session_id"] == started["session_id"]
+    assert ensured["task_id"] == started["task_id"]
+    assert ensured["worker_generation"] == started["worker_generation"]
 
 
 @pytest.mark.asyncio
@@ -2453,6 +2621,7 @@ async def test_member_started_resident_spawn_persists_launcher(db_session, monke
     assert task is not None
     assert task.launched_by_user_id == member_user_id
     assert task.context["_resident_session"] is True
+    assert task.priority == RESIDENT_TASK_PRIORITY
 
 
 @pytest.mark.asyncio
@@ -2492,6 +2661,9 @@ async def test_resident_heartbeat_fences_overlapping_process_incarnations(
     )
     assert first["resident_incarnation_held"] is True
     assert first["resident_incarnation_id"] == str(first_incarnation)
+    owner_blob = read_resident_session(project.vision)
+    owner_heartbeat = owner_blob["worker_heartbeat_at"]
+    owner_expiry = owner_blob["worker_incarnation_expires_at"]
 
     project = await db_session.get(Project, project.id)
     competing = await renew_resident_session_lease(
@@ -2505,6 +2677,10 @@ async def test_resident_heartbeat_fences_overlapping_process_incarnations(
     assert competing["resident_incarnation_held"] is False
     assert competing["authority_held"] is False
     assert competing["stop_requested"] is True
+    persisted_after_competitor = read_resident_session(project.vision)
+    assert persisted_after_competitor["worker_incarnation_id"] == str(first_incarnation)
+    assert persisted_after_competitor["worker_incarnation_expires_at"] == owner_expiry
+    assert persisted_after_competitor["worker_heartbeat_at"] == owner_heartbeat
 
     project = await db_session.get(Project, project.id)
     owner = await renew_resident_session_lease(
