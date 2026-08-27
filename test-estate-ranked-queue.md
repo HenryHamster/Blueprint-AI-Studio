@@ -464,7 +464,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_release_promotion_compute_image_refresh.py` | 124 | 3 | under 1500 LOC | 2.584s measured | — |
 | G | admin-ui | `admin-ui/src/components/ResearchBrowser.test.tsx` | 839 | 33 | under 1500 LOC | 2.577s measured | — |
 | G | backend | `backend/testing/test_required_runtime_env.py` | 261 | 14 | under 1500 LOC | 2.514s measured | — |
-| G | backend | `backend/testing/test_platform_kill_metrics.py` | 465 | 26 | under 1500 LOC | 2.491s measured | — |
+| G | backend | `backend/testing/test_platform_kill_metrics.py` | 500 | 26 | under 1500 LOC | 2.491s measured | — |
 | G | backend | `backend/testing/test_reaper_sweeps_viewable_retire.py` | 273 | 8 | under 1500 LOC | 2.471s measured | — |
 | G | backend | `backend/testing/test_strategic_memory_control.py` | 319 | 7 | under 1500 LOC | 2.444s measured | — |
 | G | admin-ui | `admin-ui/src/components/ArchiveView.test.tsx` | 216 | 5 | under 1500 LOC | 2.432s measured | — |

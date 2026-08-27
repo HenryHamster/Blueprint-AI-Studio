@@ -707,6 +707,7 @@ def compute_platform_kill_metrics(
       ``platform_kills_per_day``  the headline metric
       ``unclassified_count``      rows we could not classify
       ``classified_fraction``     1.0 - unclassified/terminal
+      ``daily``                   zero-filled totals plus each day's class mix
 
     A reader who sees ``platform_kills_per_day: 0.0`` next to
     ``classified_fraction: 0.31`` knows the zero is meaningless. That pairing is
@@ -723,6 +724,7 @@ def compute_platform_kill_metrics(
     verdict_counts: Counter[str] = Counter()
     by_class: Dict[str, _ClassRollup] = {}
     per_day_kills: Dict[str, int] = defaultdict(int)
+    per_day_kills_by_class: Dict[str, Counter[str]] = defaultdict(Counter)
     per_day_terminal: Dict[str, int] = defaultdict(int)
     unclassified_reasons: Counter[str] = Counter()
     unclassified_samples: List[Dict[str, Any]] = []
@@ -745,6 +747,7 @@ def compute_platform_kill_metrics(
             if verdict.work_continued:
                 kills_recovered += 1
             cls = verdict.kill_class or "unknown"
+            per_day_kills_by_class[day_key][cls] += 1
             rollup = by_class.setdefault(cls, _ClassRollup(reason=verdict.reason))
             rollup.count += 1
             if verdict.work_continued:
@@ -775,6 +778,9 @@ def compute_platform_kill_metrics(
             {
                 "date": day_key,
                 "platform_kills": per_day_kills.get(day_key, 0),
+                "platform_kills_by_class": dict(
+                    sorted(per_day_kills_by_class.get(day_key, {}).items())
+                ),
                 "terminal_tasks": per_day_terminal.get(day_key, 0),
             }
         )

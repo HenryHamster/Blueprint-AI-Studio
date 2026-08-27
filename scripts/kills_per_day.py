@@ -764,7 +764,17 @@ def render_human(report: dict, out=sys.stdout) -> None:
               "rows -- see the dating line above)\n")
         for day in daily:
             count = day.get("platform_kills", 0)
-            w(f"  {day.get('date')}  {count:3d}  {_bar(count, peak)}\n")
+            causes = ", ".join(
+                f"{kill_class}={class_count}"
+                for kill_class, class_count in sorted(
+                    (day.get("platform_kills_by_class") or {}).items()
+                )
+            )
+            cause_suffix = f"  [{causes}]" if causes else ""
+            w(
+                f"  {day.get('date')}  {count:3d}  {_bar(count, peak)}"
+                f"{cause_suffix}\n"
+            )
 
     probe = report.get("derived_probe")
     if probe:
