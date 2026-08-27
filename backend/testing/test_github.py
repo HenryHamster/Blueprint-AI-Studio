@@ -667,12 +667,16 @@ async def test_get_check_runs_projects_failed_workflow_attempt(mocker):
         if "/actions/runs?" in url:
             return MockResponse(
                 200,
-                {"workflow_runs": [{"id": 12345, "run_attempt": 4}]},
+                {
+                    "total_count": 1,
+                    "workflow_runs": [{"id": 12345, "run_attempt": 4}],
+                },
             )
         if "/actions/runs/12345/jobs" in url:
             return MockResponse(
                 200,
                 {
+                    "total_count": 1,
                     "jobs": [
                         {
                             "id": 777,
@@ -694,6 +698,21 @@ async def test_get_check_runs_projects_failed_workflow_attempt(mocker):
 
     assert result["failed_run_ids"] == [12345]
     assert result["failed_run_attempts"] == {"12345": 4}
+    assert result["failed_run_ids_complete"] is True
+
+
+def test_jobs_projection_complete_requires_full_page():
+    from app.github_checks import _jobs_projection_complete
+
+    assert _jobs_projection_complete(
+        MockResponse(200, {"total_count": 1, "jobs": [{"id": 1}]})
+    )
+    assert not _jobs_projection_complete(
+        MockResponse(200, {"total_count": 2, "jobs": [{"id": 1}]})
+    )
+    assert not _jobs_projection_complete(
+        MockResponse(200, {"jobs": [{"id": 1}]})
+    )
 
 
 @pytest.mark.asyncio

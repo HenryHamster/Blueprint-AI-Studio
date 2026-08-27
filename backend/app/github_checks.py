@@ -131,6 +131,27 @@ def _job_failed_only_at_setup(job: dict) -> bool:
     return bool(failed_steps) and all(s in _GITHUB_SETUP_STEPS for s in failed_steps)
 
 
+def _jobs_projection_complete(result: object) -> bool:
+    """Whether one Actions jobs response contains its full paginated set."""
+    if isinstance(result, Exception) or getattr(result, "status_code", None) != 200:
+        return False
+    json_method = getattr(result, "json", None)
+    if not callable(json_method):
+        return False
+    try:
+        data = json_method()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    total_count = data.get("total_count") if isinstance(data, dict) else None
+    return bool(
+        isinstance(jobs, list)
+        and isinstance(total_count, int)
+        and not isinstance(total_count, bool)
+        and total_count <= len(jobs)
+    )
+
+
 async def update_commit_status(
     token: str,
     owner: str,
@@ -342,6 +363,7 @@ async def get_check_runs(
          "details": [{"name": str, "status": str, "conclusion": str|None}],
          "failed_logs": str,
          "failed_run_attempts": {str(run_id): int},
+         "failed_run_ids_complete": bool,
          "genuine_failure": bool}
 
     ``genuine_failure`` (additive — consumers use ``.get``): whether the
@@ -399,6 +421,7 @@ async def get_check_runs(
                 "details": [],
                 "failed_logs": "",
                 "failed_run_attempts": {},
+                "failed_run_ids_complete": False,
                 "genuine_failure": False,
                 "_from_api_error": True,
             }
@@ -422,6 +445,7 @@ async def get_check_runs(
                 "details": [],
                 "failed_logs": "",
                 "failed_run_attempts": {},
+                "failed_run_ids_complete": True,
                 "genuine_failure": False,
             }
         # No CI configured on this repo — treat as passed so the
@@ -432,6 +456,7 @@ async def get_check_runs(
             "details": [],
             "failed_logs": "",
             "failed_run_attempts": {},
+            "failed_run_ids_complete": True,
             "genuine_failure": False,
         }
 
@@ -477,6 +502,7 @@ async def get_check_runs(
     setup_phase_failure = False
     failed_run_ids: list[int] = []
     failed_run_attempts: dict[str, int] = {}
+    failed_run_ids_complete = False
     if failed_names and not include_failed_logs:
         # Caller reads only status/conclusion/details (e.g. the agent check-runs
         # proxy, which discards failed_logs) — skip the 3-10+ call failure fan-out
@@ -489,6 +515,7 @@ async def get_check_runs(
             "setup_phase_failure": False,
             "failed_run_ids": [],
             "failed_run_attempts": {},
+            "failed_run_ids_complete": False,
             "genuine_failure": _details_have_genuine_failure(details),
         }
     if failed_names and _deferrable_quota_active():
@@ -504,6 +531,7 @@ async def get_check_runs(
             "setup_phase_failure": False,
             "failed_run_ids": [],
             "failed_run_attempts": {},
+            "failed_run_ids_complete": False,
             "genuine_failure": _details_have_genuine_failure(details),
         }
     if failed_names:
@@ -519,17 +547,30 @@ async def get_check_runs(
                 timeout=5.0,
             )
             if runs_resp.status_code == 200:
-                wf_runs = runs_resp.json().get("workflow_runs", [])
+                runs_data = runs_resp.json()
+                wf_runs = runs_data.get("workflow_runs", [])
                 jobs_coros = [
                     _github_request(
                         "GET",
-                        f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{wf_run['id']}/jobs?filter=latest&per_page=30",
+                        (
+                            f"https://api.github.com/repos/{owner}/{repo}/actions/"
+                            f"runs/{wf_run['id']}/jobs?filter=latest&per_page=100"
+                        ),
                         headers,
                         timeout=5.0,
                     )
                     for wf_run in wf_runs
                 ]
                 jobs_results = await asyncio.gather(*jobs_coros, return_exceptions=True)
+                total_count = runs_data.get("total_count")
+                failed_run_ids_complete = bool(
+                    isinstance(total_count, int)
+                    and not isinstance(total_count, bool)
+                    and total_count <= len(wf_runs)
+                    and all(
+                        _jobs_projection_complete(result) for result in jobs_results
+                    )
+                )
                 for wf_run, result in zip(wf_runs, jobs_results, strict=True):
                     if isinstance(result, Exception) or result.status_code != 200:
                         continue
@@ -664,6 +705,7 @@ async def get_check_runs(
         "setup_phase_failure": setup_phase_failure,
         "failed_run_ids": failed_run_ids,
         "failed_run_attempts": failed_run_attempts,
+        "failed_run_ids_complete": failed_run_ids_complete,
         "genuine_failure": _details_have_genuine_failure(details),
     }
 
@@ -1280,6 +1322,7 @@ async def get_check_runs_cached(
                 "setup_phase_failure": False,
                 "failed_run_ids": [],
                 "failed_run_attempts": {},
+                "failed_run_ids_complete": False,
                 "genuine_failure": False,
                 "_from_cache_generation_race": True,
             }

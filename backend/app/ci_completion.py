@@ -33,6 +33,7 @@ from app.admin_approval_authority import (
     APPROVAL_FOLLOWUP_CLAIM_KEY,
     APPROVAL_HOLD_PROVENANCE_KEY,
     approval_hold_provenance,
+    consume_approval_hold_metadata,
     establish_independent_approval_hold,
 )
 # Merge-helper layer (scope-aware retry-cap policy, merge-error normalization,
@@ -69,6 +70,7 @@ logger = logging.getLogger(__name__)
 # set to 0 to disable the general rerun gate entirely.
 _CI_RERUN_BUDGET = 1
 _CI_RERUN_RECHECK_SECONDS = 15
+_CI_RERUN_SEND_LEASE_SECONDS = 15
 _CI_RERUN_ACCEPTANCE_FENCE_SECONDS = 90
 _CI_RERUN_JOURNAL_KEY = "ci_rerun_journal"
 _CI_RERUN_HOLD_STATES = {"reserved", "accepted", "ambiguous"}
@@ -117,6 +119,24 @@ def _failed_run_ids(ci_result: dict) -> list[int]:
     )
 
 
+def _ci_rerun_deadline(value: object) -> datetime | None:
+    try:
+        deadline = datetime.fromisoformat(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    now = _utcnow()
+    if now.tzinfo is None and deadline.tzinfo is not None:
+        return deadline.astimezone(timezone.utc).replace(tzinfo=None)
+    if now.tzinfo is not None and deadline.tzinfo is None:
+        return deadline.replace(tzinfo=timezone.utc)
+    return deadline
+
+
+def _ci_rerun_sender_lease_active(journal: dict) -> bool:
+    lease_until = _ci_rerun_deadline(journal.get("sender_lease_until"))
+    return lease_until is not None and _utcnow() < lease_until
+
+
 def _reserve_ci_rerun(
     task: Task,
     ci_result: dict,
@@ -155,6 +175,9 @@ def _reserve_ci_rerun(
         "run_attempts": _failed_run_attempts(ci_result),
         "run_outcomes": {str(run_id): "reserved" for run_id in failure_run_ids},
         "reserved_at": now.isoformat(),
+        "sender_lease_until": (
+            now + timedelta(seconds=_CI_RERUN_SEND_LEASE_SECONDS)
+        ).isoformat(),
         "deadline_at": (
             now + timedelta(seconds=_CI_RERUN_ACCEPTANCE_FENCE_SECONDS)
         ).isoformat(),
@@ -207,9 +230,16 @@ def _ci_rerun_journal_disposition(
         for run_id in (journal.get("failure_run_ids") or [])
         if isinstance(run_id, int) and not isinstance(run_id, bool)
     }
-    if observed_run_ids and observed_run_ids != fenced_run_ids:
-        _clear_ci_rerun_journal(task)
-        return "distinct"
+    if observed_run_ids != fenced_run_ids:
+        # A newly observed workflow-run ID is positive evidence of a distinct
+        # attempt even when the fan-out was partial. Disappearance of a fenced
+        # ID is trustworthy only when github_checks proved that every workflow
+        # run and jobs page was projected successfully.
+        if observed_run_ids - fenced_run_ids or ci_result.get(
+            "failed_run_ids_complete"
+        ) is True:
+            _clear_ci_rerun_journal(task)
+            return "distinct"
 
     observed_attempts = _failed_run_attempts(ci_result)
     fenced_attempts = journal.get("run_attempts") or {}
@@ -234,19 +264,20 @@ def _ci_rerun_journal_disposition(
     if state not in _CI_RERUN_HOLD_STATES:
         return "expired"
 
-    try:
-        deadline = datetime.fromisoformat(str(journal.get("deadline_at") or ""))
-    except (TypeError, ValueError):
+    deadline = _ci_rerun_deadline(journal.get("deadline_at"))
+    if deadline is None:
         return "expired"
     now = _utcnow()
-    if now.tzinfo is None and deadline.tzinfo is not None:
-        deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
-    elif now.tzinfo is not None and deadline.tzinfo is None:
-        deadline = deadline.replace(tzinfo=timezone.utc)
     if now >= deadline:
         return "expired"
 
     if state == "reserved":
+        # The reserving handler commits before reacquiring the row for its
+        # final pre-send validation. A concurrent poll/webhook must not steal
+        # that live reservation during this bounded lease; after the lease a
+        # crash is conservatively recovered as an ambiguous possible send.
+        if _ci_rerun_sender_lease_active(journal):
+            return "hold"
         journal = dict(journal)
         journal["state"] = "ambiguous"
         journal["recovered_at"] = _utcnow().isoformat()
@@ -320,6 +351,78 @@ def _mark_ci_rerun_timed_out(task: Task) -> None:
     task.context = context
     flag_modified(task, "context")
 
+
+def resolve_timed_out_ci_rerun(
+    task: Task,
+    *,
+    journal_id: str,
+    disposition: str,
+    resolved_by: str,
+    note: str,
+) -> dict:
+    """Apply an authenticated operator's exact timed-out journal verdict."""
+    context = dict(task.context or {})
+    journal = context.get(_CI_RERUN_JOURNAL_KEY)
+    provenance = context.get(APPROVAL_HOLD_PROVENANCE_KEY)
+    hold_episode = approval_hold_provenance(task)
+    if not (
+        task.status == TaskStatus.EVALUATING
+        and task.requires_approval is True
+        and isinstance(journal, dict)
+        and journal.get("id") == journal_id
+        and journal.get("state") == "timed_out"
+        and isinstance(provenance, dict)
+        and provenance.get("owner") == "ci_completion"
+        and provenance.get("reason") == "ci_rerun_outcome_unconfirmed"
+        and provenance.get("episode")
+        and provenance.get("episode") == hold_episode.get("episode")
+        and provenance.get("set_at") == hold_episode.get("set_at")
+        and hold_episode.get("reason") == "ci_rerun_outcome_unconfirmed"
+        and hold_episode.get("review_wait_hold") is None
+    ):
+        raise ValueError("CI rerun journal is not the current operator hold")
+    if disposition not in {"accepted", "rejected"}:
+        raise ValueError("Unsupported CI rerun disposition")
+
+    now = _utcnow()
+    journal = dict(journal)
+    journal["state"] = disposition
+    journal["updated_at"] = now.isoformat()
+    journal["operator_resolution"] = {
+        "disposition": disposition,
+        "resolved_at": now.isoformat(),
+        "resolved_by": str(resolved_by),
+        "note": str(note),
+    }
+    if disposition == "accepted":
+        journal["deadline_at"] = (
+            now + timedelta(seconds=_CI_RERUN_ACCEPTANCE_FENCE_SECONDS)
+        ).isoformat()
+    context[_CI_RERUN_JOURNAL_KEY] = journal
+    task.context = context
+    flag_modified(task, "context")
+
+    if disposition == "rejected":
+        _rollback_rejected_ci_rerun(task)
+    context = dict(task.context or {})
+    review_loop = dict(context.get("review_loop") or {})
+    review_loop["ci_last_polled"] = None
+    review_loop["ci_poll_interval"] = _CI_RERUN_RECHECK_SECONDS
+    context["review_loop"] = review_loop
+    task.context = context
+    consumed = consume_approval_hold_metadata(
+        task,
+        expected_episode=hold_episode,
+    )
+    if not consumed:
+        raise ValueError("CI rerun operator hold changed during resolution")
+    task.requires_approval = False
+    task.latest_status_message = (
+        f"Operator verified CI rerun {disposition} on PR "
+        f"#{journal.get('pr_number')} - resuming CI reconciliation"
+    )
+    flag_modified(task, "context")
+    return dict((task.context or {})[_CI_RERUN_JOURNAL_KEY])
 
 
 def _arm_ci_rerun_recheck(
@@ -412,6 +515,7 @@ async def _execute_ci_rerun(
         or not isinstance(preflight_journal, dict)
         or preflight_journal.get("id") != journal_id
         or preflight_journal.get("state") != "reserved"
+        or not _ci_rerun_sender_lease_active(preflight_journal)
     ):
         await session.commit()
         return preflight_task, "held"

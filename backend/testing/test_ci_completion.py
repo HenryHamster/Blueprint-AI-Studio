@@ -7875,6 +7875,149 @@ async def test_ci_rerun_journal_expiry_requires_operator_verification(
 
 
 @pytest.mark.asyncio
+async def test_ci_rerun_live_reservation_survives_peer_observation(
+    db_session, mocker
+):
+    """A peer observing the post-commit send window cannot cancel the sender."""
+    from app.ci_completion import (
+        _ci_rerun_journal_disposition,
+        handle_ci_completion,
+    )
+    from app.database import AsyncSessionLocal
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task")
+
+    project = Project(name="Rerun live reservation", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    task_id = task.id
+    head_sha = "live-reservation-head"
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x",
+        "failed_run_ids": [12345],
+        "failed_run_attempts": {"12345": 1},
+        "failed_run_ids_complete": True,
+        "setup_phase_failure": False,
+    }
+
+    async def _peer_observes_then_sender_posts(*_args, **_kwargs):
+        async with AsyncSessionLocal() as peer_session:
+            peer_task = await peer_session.get(Task, task_id)
+            assert peer_task is not None
+            assert (
+                _ci_rerun_journal_disposition(
+                    peer_task,
+                    ci_result,
+                    ci_pr_number=42,
+                    checked_head_sha=head_sha,
+                )
+                == "hold"
+            )
+            assert peer_task.context["ci_rerun_journal"]["state"] == "reserved"
+            peer_session.add(peer_task)
+            await peer_session.commit()
+        return "accepted"
+
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs_outcome",
+        side_effect=_peer_observes_then_sender_posts,
+    )
+    result = await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
+    )
+
+    assert result is False
+    rerun_mock.assert_awaited_once_with("fake-token", "owner", "repo", 12345)
+    spawn_mock.assert_not_called()
+    refreshed = await db_session.get(Task, task_id, populate_existing=True)
+    assert refreshed.context["ci_rerun_journal"]["state"] == "accepted"
+
+
+def test_ci_rerun_partial_failed_run_projection_preserves_fence():
+    """Best-effort omissions are not evidence that a rerun attempt changed."""
+    from datetime import timedelta
+
+    from app.ci_completion import _ci_rerun_journal_disposition
+    from app.models import _utcnow
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="Partial rerun projection",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "task"}],
+        context={
+            "review_loop": {"pr_number": 42, "head_sha": "projection-head"},
+            "ci_rerun_journal": {
+                "id": "projection-journal",
+                "state": "ambiguous",
+                "kind": "general",
+                "pr_number": 42,
+                "head_sha": "projection-head",
+                "failure_run_ids": [101, 202],
+                "run_attempts": {"101": 1, "202": 1},
+                "deadline_at": (_utcnow() + timedelta(minutes=5)).isoformat(),
+            },
+        },
+    )
+
+    disposition = _ci_rerun_journal_disposition(
+        task,
+        {
+            "failed_run_ids": [202],
+            "failed_run_attempts": {"202": 1},
+            "failed_run_ids_complete": False,
+        },
+        ci_pr_number=42,
+        checked_head_sha="projection-head",
+    )
+    assert disposition == "hold"
+    assert task.context["ci_rerun_journal"]["state"] == "ambiguous"
+
+    fenced_context = dict(task.context)
+    disposition = _ci_rerun_journal_disposition(
+        task,
+        {
+            "failed_run_ids": [202, 303],
+            "failed_run_attempts": {"202": 1, "303": 1},
+            "failed_run_ids_complete": False,
+        },
+        ci_pr_number=42,
+        checked_head_sha="projection-head",
+    )
+    assert disposition == "distinct"
+    assert "ci_rerun_journal" not in task.context
+
+    task.context = fenced_context
+    disposition = _ci_rerun_journal_disposition(
+        task,
+        {
+            "failed_run_ids": [202],
+            "failed_run_attempts": {"202": 1},
+            "failed_run_ids_complete": True,
+        },
+        ci_pr_number=42,
+        checked_head_sha="projection-head",
+    )
+    assert disposition == "distinct"
+    assert "ci_rerun_journal" not in task.context
+
+
+@pytest.mark.asyncio
 async def test_ci_rerun_crash_after_send_is_not_replayed(db_session, mocker):
     """A process death after the POST leaves a reservation that recovers held."""
     from app.ci_completion import handle_ci_completion
@@ -7920,6 +8063,19 @@ async def test_ci_rerun_crash_after_send_is_not_replayed(db_session, mocker):
     await db_session.refresh(task)
     assert task.context["ci_rerun_journal"]["state"] == "reserved"
     assert task.context.get("ci_rerun_consumed") == 1
+
+    # A fresh peer preserves the live sender lease. Model restart recovery only
+    # after that bounded lease has elapsed.
+    from sqlalchemy.orm.attributes import flag_modified
+
+    crash_context = dict(task.context or {})
+    crash_journal = dict(crash_context["ci_rerun_journal"])
+    crash_journal["sender_lease_until"] = "2000-01-01T00:00:00"
+    crash_context["ci_rerun_journal"] = crash_journal
+    task.context = crash_context
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
 
     result = await handle_ci_completion(
         task,
@@ -7998,6 +8154,17 @@ async def test_ci_rerun_post_send_commit_failure_is_not_replayed(
     await db_session.rollback()
     task = await db_session.get(Task, task_id, populate_existing=True)
     assert task is not None
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    recovery_context = dict(task.context or {})
+    recovery_journal = dict(recovery_context["ci_rerun_journal"])
+    recovery_journal["sender_lease_until"] = "2000-01-01T00:00:00"
+    recovery_context["ci_rerun_journal"] = recovery_journal
+    task.context = recovery_context
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
 
     result = await handle_ci_completion(
         task,
