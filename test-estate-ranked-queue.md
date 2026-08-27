@@ -18,7 +18,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 
 | Priority | Area | File | LOC | Tests | Threshold class | Cost signal | Workday protection |
 |:--------:|------|------|----:|------:|------------------|-------------|---------------------|
-| P2 | backend | `backend/testing/test_strategic_completion.py` | 21,914 | 629 | critical (>5000 LOC) | 603.712s measured | — |
+| P2 | backend | `backend/testing/test_strategic_completion.py` | 22,105 | 631 | critical (>5000 LOC) | 603.712s measured | — |
 | P2 | backend | `backend/testing/test_release_qualifier__compute_composite.py` | 5,968 | 264 | critical (>5000 LOC) | 400.868s measured | — |
 | P2 | backend | `backend/testing/test_pipeline.py` | 6,841 | 277 | critical (>5000 LOC) | 318.896s measured | — |
 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,894 | 437 | critical (>5000 LOC) | 300.644s measured | — |
@@ -51,7 +51,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_rollup_management.py` | 6,226 | 106 | critical (>5000 LOC) | 26.818s measured | — |
 | P2 | backend | `backend/testing/test_direction_outcomes.py` | 10,397 | 191 | critical (>5000 LOC) | 26.802s measured | — |
 | P2 | backend | `backend/testing/test_github.py` | 5,931 | 187 | critical (>5000 LOC) | 17.135s measured | — |
-| P2 | backend | `backend/testing/test_direction_lifecycle.py` | 5,517 | 89 | critical (>5000 LOC) | 13.910s measured | — |
+| P2 | backend | `backend/testing/test_direction_lifecycle.py` | 5,745 | 100 | critical (>5000 LOC) | 13.910s measured | — |
 | P2 | agent | `agent/src/handlers/strategic-resident.test.ts` | 9,165 | 135 | critical (>5000 LOC) | 13.729s measured | protected; declared floor 135 |
 | P2 | backend | `backend/testing/test_salvage_bundle_standalone.py` | 7,775 | 239 | critical (>5000 LOC) | 8.485s measured | — |
 | P2 | backend | `backend/testing/test_digest_metrics.py` | 8,216 | 251 | critical (>5000 LOC) | 8.434s measured | — |
@@ -667,6 +667,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_migration_0714_strategic_conversation_correctness.py` | 414 | 3 | under 1500 LOC | 0.238s measured | — |
 | G | admin-ui | `admin-ui/src/components/VersionLifecyclePanelPrimitives.test.tsx` | 1,063 | 107 | under 1500 LOC | 0.237s measured | — |
 | G | agent | `agent/src/handlers/verify-tests.test.ts` | 1,356 | 62 | under 1500 LOC | 0.234s measured | — |
+| G | backend | `backend/testing/test_release_activation_approval.py` | 128 | 6 | under 1500 LOC | 0.233s measured | — |
 | G | admin-ui | `admin-ui/src/components/ProjectBuildConfigSection.test.tsx` | 129 | 2 | under 1500 LOC | 0.229s measured | — |
 | G | admin-ui | `admin-ui/src/components/NullBranchDiagnosticsPanel.test.tsx` | 147 | 10 | under 1500 LOC | 0.228s measured | — |
 | G | admin-ui | `admin-ui/src/components/ProjectMembers.test.tsx` | 111 | 7 | under 1500 LOC | 0.226s measured | — |
@@ -689,6 +690,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_filter_malformed_payload.py` | 159 | 8 | under 1500 LOC | 0.186s measured | — |
 | G | admin-ui | `admin-ui/src/components/ProblemModelViewer.test.tsx` | 418 | 13 | under 1500 LOC | 0.180s measured | — |
 | G | backend | `backend/testing/test_verification_toolchain.py` | 203 | 5 | under 1500 LOC | 0.179s measured | — |
+| G | backend | `backend/testing/test_resident_supersession_livelock.py` | 395 | 19 | under 1500 LOC | 0.178s measured | — |
 | G | backend | `backend/testing/test_runbook_drift.py` | 103 | 5 | under 1500 LOC | 0.177s measured | — |
 | G | backend | `backend/testing/test_migration_0716_strategic_memory_source_control_plane.py` | 112 | 2 | under 1500 LOC | 0.176s measured | — |
 | G | admin-ui | `admin-ui/src/hooks/useConversation.test.tsx` | 1,218 | 36 | under 1500 LOC | 0.174s measured | protected; declared floor 36 |
