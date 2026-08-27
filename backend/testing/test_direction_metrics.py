@@ -16,11 +16,16 @@ import pytest
 from app.direction_metrics import (
     _PROOF_WEIGHT_DECLARED_UNPROVEN,
     _PROOF_WEIGHT_UNDECLARED,
+    PRODUCTIVITY_REASON_CODES,
+    PRODUCTIVITY_REASON_DETAIL_MAX,
+    PRODUCTIVITY_REASON_HISTORY_MAX,
     _agg_proof_weighted_merged,
     _compute_direction_quality_score,
     _fold_evicted_into_aggregate,
     _weight_merged,
     proof_weighted_merged,
+    record_direction_productivity,
+    unproductive_streak_summary,
 )
 from app.direction_outcomes import verified_merged_count
 
@@ -246,3 +251,160 @@ class TestComputeDirectionQualityScoreQualityGrader:
         # Malformed entry is skipped; only the valid entry contributes.
         score = _compute_direction_quality_score(d)
         assert 0.0 <= score <= 1.0
+# ─────────────────────────────────────────────────────────────────────────────
+# record_direction_productivity — a productivity judgment always carries its WHY
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestRecordDirectionProductivity:
+    """A bare ``last_cycle_productive: false`` is unactionable: it cannot
+    distinguish a direction that spawned nothing from one that spawned plenty and
+    merged nothing, and the two want opposite responses. Every writer records the
+    reason alongside the boolean."""
+
+    def test_productivity_reason_bounds_are_pinned(self):
+        # LITERAL pins. The ring is persisted inside the project's directions
+        # JSONB and rendered into the strategist's bounded per-direction stat
+        # block, so growing either bound is a payload-size decision, not an
+        # implementation detail.
+        assert PRODUCTIVITY_REASON_HISTORY_MAX == 10
+        assert PRODUCTIVITY_REASON_DETAIL_MAX == 300
+        assert PRODUCTIVITY_REASON_CODES == (
+            "spawned_children",
+            "non_spawn_findings",
+            "no_children_no_findings",
+            "no_actionable_findings",
+            "research_cycle_failed",
+        )
+
+    def test_unproductive_cycle_records_reason_and_advances_counter(self):
+        d: dict = {}
+        consecutive = record_direction_productivity(
+            d,
+            productive=False,
+            reason_code="no_actionable_findings",
+            detail="research cycle completed with zero actionable findings",
+            task_id="11111111-2222-3333-4444-555555555555",
+            at_iso="2026-08-26T00:00:00+00:00",
+        )
+        assert consecutive == 1
+        assert d["last_cycle_productive"] is False
+        assert d["consecutive_unproductive_cycles"] == 1
+        reason = d["last_productivity_reason"]
+        assert reason["productive"] is False
+        assert reason["reason_code"] == "no_actionable_findings"
+        assert "zero actionable findings" in reason["detail"]
+        assert reason["consecutive_unproductive_cycles"] == 1
+        assert reason["task_id"] == "11111111-2222-3333-4444-555555555555"
+        assert reason["at"] == "2026-08-26T00:00:00+00:00"
+        assert d["productivity_reason_history"] == [reason]
+
+    def test_productive_cycle_resets_the_counter_and_records_why(self):
+        d = {"consecutive_unproductive_cycles": 4}
+        consecutive = record_direction_productivity(
+            d,
+            productive=True,
+            reason_code="spawned_children",
+            detail="research cycle spawned 2 child task(s)",
+        )
+        assert consecutive == 0
+        assert d["consecutive_unproductive_cycles"] == 0
+        assert d["last_cycle_productive"] is True
+        assert d["last_productivity_reason"]["productive"] is True
+        assert d["last_productivity_reason"]["reason_code"] == "spawned_children"
+        # No task id / timestamp supplied → the optional keys stay absent rather
+        # than being written as null.
+        assert "task_id" not in d["last_productivity_reason"]
+        assert "at" not in d["last_productivity_reason"]
+
+    def test_bump_false_records_the_reason_without_double_counting(self):
+        """An idempotent re-stamp of the SAME research task must not advance the
+        streak, but must still leave a stated cause behind."""
+        d: dict = {}
+        record_direction_productivity(
+            d, productive=False, reason_code="no_actionable_findings", detail="first"
+        )
+        assert d["consecutive_unproductive_cycles"] == 1
+        consecutive = record_direction_productivity(
+            d,
+            productive=False,
+            reason_code="no_actionable_findings",
+            detail="re-stamp of the same cycle",
+            bump=False,
+        )
+        assert consecutive == 1
+        assert d["consecutive_unproductive_cycles"] == 1
+        assert d["last_productivity_reason"]["detail"] == "re-stamp of the same cycle"
+        assert d["productivity_reason_history"] == [d["last_productivity_reason"]]
+
+    def test_history_ring_is_bounded_and_detail_truncated(self):
+        d: dict = {}
+        for i in range(PRODUCTIVITY_REASON_HISTORY_MAX + 5):
+            record_direction_productivity(
+                d,
+                productive=False,
+                reason_code="no_children_no_findings",
+                detail=f"cycle {i} " + ("x" * 500),
+            )
+        history = d["productivity_reason_history"]
+        assert len(history) == PRODUCTIVITY_REASON_HISTORY_MAX
+        # The ring keeps the MOST RECENT judgments.
+        assert history[-1]["consecutive_unproductive_cycles"] == (
+            PRODUCTIVITY_REASON_HISTORY_MAX + 5
+        )
+        assert all(
+            len(record["detail"]) <= PRODUCTIVITY_REASON_DETAIL_MAX
+            for record in history
+        )
+
+    def test_legacy_direction_with_non_list_history_is_repaired(self):
+        d = {"productivity_reason_history": "not-a-list"}
+        record_direction_productivity(
+            d, productive=False, reason_code="research_cycle_failed", detail="boom"
+        )
+        assert d["productivity_reason_history"] == [d["last_productivity_reason"]]
+
+
+class TestUnproductiveStreakSummary:
+    def test_zero_streak_has_no_summary(self):
+        assert unproductive_streak_summary({}) is None
+        assert unproductive_streak_summary({"consecutive_unproductive_cycles": 0}) is None
+
+    def test_summary_names_the_streak_and_its_distinct_reasons(self):
+        d: dict = {}
+        record_direction_productivity(
+            d, productive=False, reason_code="no_children_no_findings", detail="a"
+        )
+        record_direction_productivity(
+            d, productive=False, reason_code="no_actionable_findings", detail="b"
+        )
+        record_direction_productivity(
+            d, productive=False, reason_code="no_actionable_findings", detail="c"
+        )
+        summary = unproductive_streak_summary(d)
+        assert summary is not None
+        assert "3 consecutive unproductive cycle(s)" in summary
+        # Most-recent-first, de-duplicated.
+        assert "reasons: no_actionable_findings, no_children_no_findings" in summary
+
+    def test_summary_stops_at_the_last_productive_cycle(self):
+        d: dict = {}
+        record_direction_productivity(
+            d, productive=False, reason_code="research_cycle_failed", detail="old"
+        )
+        record_direction_productivity(
+            d, productive=True, reason_code="spawned_children", detail="recovered"
+        )
+        record_direction_productivity(
+            d, productive=False, reason_code="no_actionable_findings", detail="new"
+        )
+        summary = unproductive_streak_summary(d)
+        assert summary is not None
+        assert "1 consecutive unproductive cycle(s)" in summary
+        assert "no_actionable_findings" in summary
+        # The pre-recovery failure is NOT part of the current streak.
+        assert "research_cycle_failed" not in summary
+
+    def test_legacy_direction_with_counter_but_no_ring_still_summarizes(self):
+        summary = unproductive_streak_summary({"consecutive_unproductive_cycles": 7})
+        assert summary == "7 consecutive unproductive cycle(s)"

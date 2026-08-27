@@ -138,6 +138,7 @@ from app.compute_experiment_contract import (
 )
 from app.resource_envelope import resolve_project_require_local_runner
 from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
+    record_direction_productivity,
     _HISTORY_AGG_DEFAULTS,
     _DECOMP_AGG_DEFAULTS,
     _fold_evicted_into_aggregate,
@@ -836,11 +837,26 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
             return
         _task_id_str = str(task.id)
         target["last_researched_at"] = now_iso
-        target["last_cycle_productive"] = False
-        if target.get("_last_productivity_task_id") != _task_id_str:
+        # Idempotent re-stamp of the SAME research task must not double-count one
+        # cycle, so the counter bump is gated on the task-id dedupe — but the
+        # REASON is recorded either way, so a re-stamp never leaves the direction
+        # carrying ``last_cycle_productive: false`` with no stated cause.
+        _first_stamp = target.get("_last_productivity_task_id") != _task_id_str
+        new_consec = record_direction_productivity(
+            target,
+            productive=False,
+            reason_code="no_actionable_findings",
+            detail=(
+                "research cycle completed with zero actionable findings — no "
+                "child task was spawned and no verification/metadata finding was "
+                "recorded for this direction"
+            ),
+            task_id=_task_id_str,
+            at_iso=now_iso,
+            bump=_first_stamp,
+        )
+        if _first_stamp:
             target["_last_productivity_task_id"] = _task_id_str
-            new_consec = int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
-            target["consecutive_unproductive_cycles"] = new_consec
             # Only mark saturated after 3+ consecutive unproductive cycles, consistent
             # with _compute_saturation's history-based threshold.
             target["possibly_saturated"] = new_consec >= 3
@@ -7128,13 +7144,34 @@ async def _handle_research_completion(
                     productive = _compute_direction_productivity(
                         did, tasks_by_dir, current_direction_id, _has_non_spawn_findings
                     )
-                    d["last_cycle_productive"] = productive
-                    if productive:
-                        d["consecutive_unproductive_cycles"] = 0
-                    else:
-                        d["consecutive_unproductive_cycles"] = (
-                            int(d.get("consecutive_unproductive_cycles", 0) or 0) + 1
+                    _spawned = tasks_by_dir.get(did, 0)
+                    if _spawned > 0:
+                        _code = "spawned_children"
+                        _detail = (
+                            f"research cycle spawned {_spawned} child task(s) "
+                            "attributed to this direction"
                         )
+                    elif productive:
+                        _code = "non_spawn_findings"
+                        _detail = (
+                            "research cycle spawned no child tasks but recorded "
+                            "verification/metadata findings (notes, proposals or "
+                            "design-doc observations) for this direction"
+                        )
+                    else:
+                        _code = "no_children_no_findings"
+                        _detail = (
+                            "research cycle attributed neither a child task nor a "
+                            "finding to this direction"
+                        )
+                    record_direction_productivity(
+                        d,
+                        productive=productive,
+                        reason_code=_code,
+                        detail=_detail,
+                        task_id=_productivity_task_id,
+                        at_iso=_utcnow().isoformat(),
+                    )
 
         await with_directions_locked(session, task.project_id, _update_productivity)
         await session.commit()
@@ -7369,13 +7406,24 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
                     _evicted_snaps[str(_tid)] = build_evicted_cycle_snapshot(_ev)
         target["research_history"] = new_history[-10:]
         target["last_researched_at"] = now_iso
-        target["last_cycle_productive"] = productive
-        if productive:
-            target["consecutive_unproductive_cycles"] = 0
-        else:
-            target["consecutive_unproductive_cycles"] = (
-                int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
-            )
+        record_direction_productivity(
+            target,
+            productive=productive,
+            reason_code=(
+                "spawned_children" if productive else "research_cycle_failed"
+            ),
+            detail=(
+                f"research task completed productively despite failure category "
+                f"{failure_category!r}"
+                if productive
+                else (
+                    f"research task FAILED ({failure_category!r}) — the cycle "
+                    "produced no landed work for this direction"
+                )
+            ),
+            task_id=str(task.id),
+            at_iso=now_iso,
+        )
         stamp_direction_refractory(target)
 
     await with_directions_locked(session, task.project_id, _record_failure)

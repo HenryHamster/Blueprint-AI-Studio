@@ -6485,7 +6485,7 @@
   "testing/test_direction_event_trail.py::test_extract_actor_none": 0.001569750000271597,
   "testing/test_direction_event_trail.py::test_extract_actor_paused_by": 0.001593019999745593,
   "testing/test_direction_event_trail.py::test_extract_actor_retired_by": 0.0018378919994574971,
-  "testing/test_direction_event_trail.py::test_extract_reason_last_note": 0.0016201369999180315,
+  "testing/test_direction_event_trail.py::test_extract_reason_notes_are_not_transition_reasons": 0.0016201369999180315,
   "testing/test_direction_event_trail.py::test_extract_reason_none": 0.001587396999639168,
   "testing/test_direction_event_trail.py::test_extract_reason_paused_reason": 0.0016634760004308191,
   "testing/test_direction_event_trail.py::test_extract_reason_retirement_reason": 0.0016295670002364204,
