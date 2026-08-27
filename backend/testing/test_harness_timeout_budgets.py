@@ -40,10 +40,12 @@ Runs under --noconftest (no DB, no conftest fixtures).
 """
 
 import ast
+import io
 import os
 import re
 import shutil
 import subprocess
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -429,15 +431,53 @@ _HISTORICAL_LANE_CITATIONS: dict[str, str] = {
     ),
 }
 
-# Prove the scanner reached a real corpus. test-backend.sh carries the lane's
-# own EXECUTABLE --timeout=<LANE_HANG_DETECTOR_SECONDS>, so it is always
-# present: if this anchor goes missing the scan is looking at the wrong tree and
-# a clean result proves nothing.
-_CITATION_ANCHOR = "test-backend.sh"
+# Match only the mechanically unambiguous literal form. Corpus reachability is
+# proved independently by the file-count floor below, while the focused unit
+# test mutation-proves that comments are admitted and code/strings are not.
+_LANE_TIMEOUT_CITATION_RE = re.compile(r"--timeout=(\d+)\b")
+
+
+def _comment_timeout_citations(path: Path, text: str) -> list[tuple[int, str]]:
+    """Return timeout literals from comments, never executable code or strings."""
+    if path.suffix == ".py":
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+            return [
+                (token.start[0], value)
+                for token in tokens
+                if token.type == tokenize.COMMENT
+                for value in _LANE_TIMEOUT_CITATION_RE.findall(token.string)
+            ]
+        except (IndentationError, SyntaxError, tokenize.TokenError) as exc:
+            raise AssertionError(f"could not tokenize {path}: {exc}") from exc
+
+    # The only non-Python target is scripts/test-backend.sh. Restrict this to
+    # full-line shell comments: parsing inline shell comments correctly needs a
+    # shell parser, and treating executable arguments as prose is the defect
+    # this helper exists to prevent.
+    return [
+        (lineno, value)
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if line.lstrip().startswith("#")
+        for value in _LANE_TIMEOUT_CITATION_RE.findall(line)
+    ]
+
+
+def test_timeout_citation_scanner_only_reads_comments() -> None:
+    source = (
+        'literal = "--timeout=30"\n'
+        'subprocess.run(["pytest", "--timeout=30"])\n'
+        '"""A docstring containing --timeout=30."""\n'
+        "# The old lane passed --timeout=30.\n"
+    )
+    assert _comment_timeout_citations(Path("synthetic.py"), source) == [(4, "30")]
+
+    shell = "pytest --timeout=30\n# The old lane passed --timeout=30.\n"
+    assert _comment_timeout_citations(Path("synthetic.sh"), shell) == [(2, "30")]
 
 
 def test_no_comment_cites_a_superseded_lane_timeout() -> None:
-    """Prose must not state a lane budget that disagrees with the live one.
+    """Comments must not state a lane budget that disagrees with the live one.
 
     THE DEFECT CLASS: when the lane budget moved 30 -> 300, it left ~40 comments
     across ~25 files still asserting the superseded 30-second value. A comment
@@ -458,9 +498,7 @@ def test_no_comment_cites_a_superseded_lane_timeout() -> None:
     would be an unfixable wedge) and docs/ (dated point-in-time records, whose
     numbers are correct AS OF their date).
     """
-    citation = re.compile(r"--timeout=(\d+)\b")
     offenders: list[str] = []
-    seen_anchor = False
     scanned = 0
 
     targets: list[Path] = []
@@ -481,35 +519,21 @@ def test_no_comment_cites_a_superseded_lane_timeout() -> None:
         except OSError:
             continue
         scanned += 1
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            for value in citation.findall(line):
-                if path.name == _CITATION_ANCHOR:
-                    seen_anchor = seen_anchor or int(value) == (
-                        LANE_HANG_DETECTOR_SECONDS
-                    )
-                if int(value) == LANE_HANG_DETECTOR_SECONDS:
-                    continue
-                if path.name in _HISTORICAL_LANE_CITATIONS:
-                    continue
-                offenders.append(
-                    f"{path.relative_to(REPO_ROOT) if REPO_ROOT in path.parents else path}"
-                    f":{lineno} cites --timeout={value}"
-                )
+        for lineno, value in _comment_timeout_citations(path, text):
+            if int(value) == LANE_HANG_DETECTOR_SECONDS:
+                continue
+            if path.name in _HISTORICAL_LANE_CITATIONS:
+                continue
+            offenders.append(
+                f"{path.relative_to(REPO_ROOT) if REPO_ROOT in path.parents else path}"
+                f":{lineno} cites --timeout={value}"
+            )
 
     assert scanned >= 400, (
         f"only {scanned} files scanned; the corpus is not being reached, so a "
         f"clean result proves nothing. Looked under {BACKEND_TESTING}, "
         f"{REPO_ROOT / 'backend' / 'app'} and {SCRIPTS_DIR}."
     )
-    if lane_script.is_file():
-        assert seen_anchor, (
-            f"{_CITATION_ANCHOR} no longer carries an executable lane timeout "
-            f"equal to LANE_HANG_DETECTOR_SECONDS ({LANE_HANG_DETECTOR_SECONDS})."
-            f" Either the lane stopped passing one -- which "
-            f"test_declared_lane_budget_matches_the_pin should have caught -- or "
-            f"this scanner has stopped recognising the form it polices."
-        )
-
     assert not offenders, (
         f"{len(offenders)} comment(s) cite a lane timeout that disagrees with "
         f"LANE_HANG_DETECTOR_SECONDS ({LANE_HANG_DETECTOR_SECONDS}):\n  "

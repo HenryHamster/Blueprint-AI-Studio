@@ -28,6 +28,7 @@ from app.release_activation_approval import (
     RESIDENT_ACTOR_PREFIX,
     ActivationApprover,
 )
+from testing.fixgate_attribution import format_offender_marker
 
 _APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 
@@ -121,8 +122,12 @@ def test_activation_requested_at_has_exactly_one_write_site():
         "activation_requested_at must be written in exactly one place "
         "(app/release_activation_approval.py) so every approval passes the "
         f"same gates; found write sites: {sites}"
+        + "\n"
+        + format_offender_marker(sites)
     )
     assert len(sites) == 1, (
         "expected a single assignment inside the approval helper; "
         f"found: {sites}"
+        + "\n"
+        + format_offender_marker(sites)
     )
