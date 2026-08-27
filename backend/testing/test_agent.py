@@ -1750,14 +1750,13 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
 async def test_agent_heartbeat_records_active_tool_subprogress_after_status_override(
     client: AsyncClient, db_session, mocker
 ):
-    """A productive long command is not stalled when status prose changes.
+    """An in-flight long command renews its lease when provider output is quiet.
 
-    Regression: task 90e7f3c8 kept heartbeating during ``./check test`` and
-    reported recent sub-progress, but task-authored prose had replaced the
-    literal ``Using tool: Bash`` prefix.  Its tool_trace invocation timestamp
-    therefore stayed eight minutes old and the reaper killed healthy work.
-    The explicit active-tool stamp must advance both the task-scoped and shared
-    progress clocks independently of display text.
+    Regression: task 45364a8f kept heartbeating during ``./check test``, but the
+    Codex JSONL stream buffered command output for longer than the medium-scope
+    progress budget. The explicit active-tool field remains present while the
+    command is in flight, so heartbeat receipt must renew both task-scoped and
+    shared progress clocks independently of the stale output timestamp.
     """
     from app.models import TaskContact, VmContact
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -1786,8 +1785,9 @@ async def test_agent_heartbeat_records_active_tool_subprogress_after_status_over
     await db_session.refresh(task)
 
     headers = {"x-agent-token": create_agent_token(str(task.id), vm_id)}
-    invocation_at = _utcnow() - timedelta(minutes=9)
-    subprogress_at = _utcnow() - timedelta(seconds=20)
+    invocation_at = _utcnow() - timedelta(minutes=15)
+    subprogress_at = _utcnow() - timedelta(minutes=14)
+    heartbeat_started_at = _utcnow()
     resp = await client.post(
         "/api/agent/heartbeat",
         json={
@@ -1813,32 +1813,75 @@ async def test_agent_heartbeat_records_active_tool_subprogress_after_status_over
     shared = await db_session.get(VmContact, vm_id)
     scoped = await db_session.get(TaskContact, task.id)
     assert task.last_tool_use_at is not None
-    assert abs((task.last_tool_use_at - subprogress_at).total_seconds()) < 1
+    assert task.last_tool_use_at >= heartbeat_started_at
     assert shared is not None
     assert shared.last_tool_use_at is not None
-    assert abs((shared.last_tool_use_at - subprogress_at).total_seconds()) < 1
+    assert shared.last_tool_use_at >= heartbeat_started_at
     assert scoped is not None
     assert scoped.last_tool_use_at is not None
-    assert abs((scoped.last_tool_use_at - subprogress_at).total_seconds()) < 1
+    assert scoped.last_tool_use_at >= heartbeat_started_at
 
 
-def test_latest_heartbeat_progress_ignores_implausible_future_active_stamp():
-    """A producer clock bug cannot pin the monotonic reaper clock in future."""
+def test_latest_heartbeat_progress_renews_active_tool_lease_from_receipt(mocker):
+    """A stale output stamp still proves a tool is actively in flight."""
+    from app.routers.agent import _latest_heartbeat_progress_at
+
+    received_at = datetime(2026, 8, 27, 9, 10, 10)
+    mocker.patch("app.routers.agent._utcnow", return_value=received_at)
+
+    result = _latest_heartbeat_progress_at(
+        tool_trace=None,
+        active_tool_progress_at=received_at - timedelta(minutes=14),
+    )
+
+    assert result == received_at
+
+
+@pytest.mark.parametrize("trace_case", ["absent", "stale", "future"])
+def test_latest_heartbeat_progress_normalizes_future_active_stamp_to_receipt(
+    mocker, trace_case
+):
+    """Active presence renews the lease without trusting either producer clock."""
     from app.routers.agent import _latest_heartbeat_progress_at
     from app.schemas import ToolTraceEntry
 
-    trace_at = _utcnow() - timedelta(seconds=10)
-    trace = [
-        ToolTraceEntry(
-            t=trace_at.isoformat(), tool="Bash", input_preview="./check test"
+    received_at = datetime(2026, 8, 27, 9, 10, 10)
+    mocker.patch("app.routers.agent._utcnow", return_value=received_at)
+    trace = None
+    if trace_case != "absent":
+        trace_at = received_at + (
+            timedelta(hours=1) if trace_case == "future" else -timedelta(minutes=14)
         )
-    ]
+        trace = [
+            ToolTraceEntry(
+                t=trace_at.isoformat(), tool="Bash", input_preview="./check test"
+            )
+        ]
+
     result = _latest_heartbeat_progress_at(
         trace,
-        _utcnow() + timedelta(hours=1),
+        received_at + timedelta(hours=1),
     )
-    assert result is not None
-    assert abs((result - trace_at).total_seconds()) < 1
+
+    assert result == received_at
+
+
+def test_latest_heartbeat_progress_rejects_future_trace_without_active_lease(mocker):
+    """A future trace alone cannot pin Task/VmContact/TaskContact progress."""
+    from app.routers.agent import _latest_heartbeat_progress_at
+    from app.schemas import ToolTraceEntry
+
+    received_at = datetime(2026, 8, 27, 9, 10, 10)
+    mocker.patch("app.routers.agent._utcnow", return_value=received_at)
+    trace = [
+        ToolTraceEntry(
+            t=(received_at + timedelta(hours=1)).isoformat(),
+            tool="Bash",
+            input_preview="./check test",
+        )
+    ]
+
+    assert _latest_heartbeat_progress_at(trace, None) is None
 
 
 @pytest.mark.asyncio

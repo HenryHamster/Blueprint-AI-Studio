@@ -1120,6 +1120,65 @@ async def test_in_progress_stalled_but_fresh_offrow_tool_use_not_reaped(
 
 
 @pytest.mark.asyncio
+async def test_active_long_tool_lease_survives_stale_output_while_dead_task_reaps(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A live long tool lease wins over stale output, without masking death.
+
+    Regression for task 45364a8f: a medium-scope ``./check test`` remained in
+    flight and heartbeated every 30 seconds, but provider-buffered output left
+    its last visible progress 764 seconds old. The task-scoped active-tool lease
+    must prevent that progress-only reap. A peer with a stale heartbeat and no
+    lease remains a genuine orphan and must still be reaped.
+    """
+    from app.models import TaskContact
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    live = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "scope": "medium"}],
+        vm_instance_id="runner:active-long-tool",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=now - timedelta(minutes=20),
+        last_heartbeat=now - timedelta(seconds=15),
+        last_tool_use_at=now - timedelta(minutes=14),
+        context={"scope": "medium", "llm_provider": "openai"},
+    )
+    dead = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "scope": "medium"}],
+        vm_instance_id="vm-dead-long-tool-control",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=now - timedelta(minutes=20),
+        last_heartbeat=now - timedelta(minutes=10),
+        last_tool_use_at=now - timedelta(minutes=14),
+        context={"scope": "medium", "llm_provider": "openai"},
+    )
+    reaper_db.add_all([live, dead])
+    await reaper_db.flush()
+    reaper_db.add(
+        TaskContact(
+            task_id=live.id,
+            last_contact_at=now - timedelta(seconds=15),
+            last_tool_use_at=now - timedelta(seconds=15),
+        )
+    )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(live)
+    await reaper_db.refresh(dead)
+
+    assert live.status == TaskStatus.IN_PROGRESS
+    assert live.attempt_count == 0
+    assert dead.status == TaskStatus.QUEUED
+    assert dead.attempt_count == 1
+
+
+@pytest.mark.asyncio
 async def test_in_progress_stalled_with_stale_offrow_tool_use_still_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
