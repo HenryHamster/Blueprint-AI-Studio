@@ -5042,6 +5042,16 @@ export async function handleStrategicResident(
           'waiting',
           'Operator turn was claimed by another Resident worker',
         );
+        // A conflicting/stale Workday claim is retryable. Pace the retry and
+        // renew this exact Resident process incarnation before re-polling; the
+        // previous immediate return could hot-loop /messages/claim indefinitely,
+        // starving the authoritative session heartbeat until the live worker was
+        // fenced as stale.
+        await sleep(Math.max(cfg.messagePollMs, 1_500));
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested || !residentIncarnationHeld) return 'stop';
+        }
         return 'continue';
       }
       try {

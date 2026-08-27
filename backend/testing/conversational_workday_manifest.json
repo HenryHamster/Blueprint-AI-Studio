@@ -435,6 +435,10 @@
         "test_continuous_hydration_ensure_succeeds",
         "test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_start_works",
         "test_start_adopts_task_and_liveness_heartbeat_renews_lease",
+        "test_repeated_start_uplifts_only_unstarted_canonical_resident",
+        "test_repeated_start_does_not_rewrite_started_resident_priority",
+        "test_priority_uplift_rejects_exact_identity_from_another_project",
+        "test_repeated_start_does_not_uplift_cross_project_vision_pointer",
         "test_member_started_resident_spawn_persists_launcher",
         "test_failed_start_compensation_reconciles_cycle_and_emits_receipt",
         "test_retry_wait_is_persisted_reload_idempotent_and_heartbeat_clears",
@@ -508,7 +512,7 @@
         "test_autonomous_turn_flag_cannot_rescue_committed_chat_mode",
         "test_autonomous_working_turn_renews_freshness_without_mutation"
       ],
-      "test_count": 85
+      "test_count": 89
     },
     {
       "path": "agent/src/workspacePrep.test.ts",
@@ -660,6 +664,7 @@
         "handleStrategicResident \u2014 typed Fast lease lifecycle > keeps the shared private Workday boundary replyless, silent, and serialized",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > paces a transient Fast claim conflict and retries the same client identity",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > paces every released cold Fast claim before retrying the still-open message",
+        "handleStrategicResident \u2014 typed Fast lease lifecycle > paces legacy Workday claim conflicts while renewing the Resident incarnation",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > preempts a Workday continuation at message-poll cadence for new operator input",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > preserves a newer Workday status when concurrent Fast completes",
         "handleStrategicResident \u2014 typed Fast lease lifecycle > preserves autonomous Ready when Workday settles after Fast pending but before dispatch",
@@ -704,7 +709,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 135
+      "test_count": 136
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
