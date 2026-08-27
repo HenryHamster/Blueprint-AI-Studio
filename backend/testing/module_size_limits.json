@@ -178,7 +178,8 @@
     "size_limit_policy.py": 3000,
     "schemas.py": 2400,
     "release_commit_authorship.py": 1800,
-    "approved_pr_stranding.py": 3000
+    "approved_pr_stranding.py": 3000,
+    "strategic_cycle.py": 1950
   },
   "agent": {
     "index.ts": 6650,
@@ -443,6 +444,7 @@
     "test_discovery_review_packet_budget.py": 2450,
     "test_test_durations_freshness.py": 1950,
     "test_workday_resident_invariants.py": 1900,
+    "test_strategic_cycle.py": 1850,
     "test_check_gate_fail_closed.py": 1750
   },
   "scripts": {

@@ -23,7 +23,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P2 | backend | `backend/testing/test_pipeline.py` | 6,841 | 277 | critical (>5000 LOC) | 318.896s measured | — |
 | P2 | backend | `backend/testing/test_review_pipeline.py` | 20,894 | 437 | critical (>5000 LOC) | 300.644s measured | — |
 | P2 | backend | `backend/testing/test_task_lifecycle.py` | 13,145 | 323 | critical (>5000 LOC) | 207.992s measured | — |
-| P2 | backend | `backend/testing/test_reaper.py` | 21,675 | 499 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 499 |
+| P2 | backend | `backend/testing/test_reaper.py` | 21,855 | 502 | critical (>5000 LOC) | 154.118s measured | protected; declared floor 502 |
 | P2 | backend | `backend/testing/test_research_completion.py` | 24,174 | 534 | critical (>5000 LOC) | 137.469s measured | — |
 | P2 | backend | `backend/testing/test_autonomous_research.py` | 20,308 | 393 | critical (>5000 LOC) | 124.505s measured | — |
 | P2 | backend | `backend/testing/test_invariants.py` | 15,832 | 279 | critical (>5000 LOC) | 120.389s measured | — |
@@ -123,6 +123,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P5 | backend | `backend/testing/test_admin_approval_authority.py` | 1,510 | 16 | moderate (1500–2999 LOC) | 36.201s measured | — |
 | P5 | backend | `backend/testing/test_admin_runners.py` | 1,826 | 62 | moderate (1500–2999 LOC) | 34.994s measured | — |
 | P5 | backend | `backend/testing/test_alerts.py` | 2,287 | 60 | moderate (1500–2999 LOC) | 33.602s measured | — |
+| P5 | backend | `backend/testing/test_strategic_cycle.py` | 1,602 | 65 | moderate (1500–2999 LOC) | 31.970s measured | — |
 | P5 | agent | `agent/src/prompts/check-helper.test.ts` | 2,350 | 69 | moderate (1500–2999 LOC) | 30.009s measured | — |
 | P5 | backend | `backend/testing/test_staged_directions.py` | 1,694 | 40 | moderate (1500–2999 LOC) | 29.493s measured | — |
 | P5 | agent | `agent/src/prompt.guidance.test.ts` | 2,153 | 176 | moderate (1500–2999 LOC) | 28.990s measured | — |
@@ -241,7 +242,6 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_runner_progress_protocol.py` | 467 | 19 | under 1500 LOC | 35.190s measured | — |
 | G | backend | `backend/testing/test_strategic_trigger.py` | 809 | 52 | under 1500 LOC | 33.716s measured | — |
 | G | backend | `backend/testing/test_migration_0722_discovery_controller.py` | 147 | 1 | under 1500 LOC | 32.526s measured | — |
-| G | backend | `backend/testing/test_strategic_cycle.py` | 1,472 | 60 | under 1500 LOC | 31.970s measured | — |
 | G | backend | `backend/testing/test_release_readiness.py` | 1,345 | 48 | under 1500 LOC | 31.104s measured | — |
 | G | backend | `backend/testing/test_admin_routers__problem_model.py` | 1,230 | 39 | under 1500 LOC | 31.084s measured | — |
 | G | backend | `backend/testing/test_durations_measurability.py` | 280 | 10 | under 1500 LOC | 30.756s measured | — |

@@ -487,12 +487,8 @@ async def sweep_stalled_strategic_cycles(
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
     from app.task_locking import project_lock, task_lock
 
-    # Pause-aware: a cycle whose completion handler simply could not run while
-    # the pipeline was paused must not be force-terminated as "stalled". Passing
-    # the deploy state makes find_stalled's 3h deadline exclude pause time.
     from app.models import DeploymentState
 
-    _deploy_state = await session.get(DeploymentState, 1)
     # Converge old residue first: a linked task that is already FAILED or
     # CANCELLED is a terminal lifecycle fact, not an age-based stall.  This
     # must run while paused too; only the time-based path below is pause-aware.
@@ -565,6 +561,44 @@ async def sweep_stalled_strategic_cycles(
             "[REAPER] Reconciled %s already-terminal strategic phase task(s)",
             reconciled_terminal_cycles,
         )
+
+    # A stall deadline is a MEASUREMENT, and a measurement needs a start. Repair
+    # active cycles that have lost one BEFORE the scan, so this same tick can
+    # measure them honestly — instead of skipping them forever (a permanent lane
+    # wedge, because an active cycle keeps the admission guard closed) or
+    # borrowing another phase's clock (a stall declared off a duration nothing
+    # measured, which since the consecutive-stall cutoff landed also consumes
+    # the project's retry budget). See strategic_cycle.repair_missing_phase_starts.
+    try:
+        _phase_start_repairs = await strategic_cycle.repair_missing_phase_starts(
+            session, now=_utcnow()
+        )
+        if _phase_start_repairs:
+            await session.commit()
+            for _repair in _phase_start_repairs:
+                logger.warning(
+                    "[REAPER] Repaired missing %s start on strategic cycle %s "
+                    "(project %s) to %s from %s — its stall deadline is now "
+                    "measured from that instant, not from another phase's clock",
+                    _repair["phase"],
+                    _repair["cycle_id"],
+                    _repair["project_id"],
+                    _repair["value"],
+                    _repair["source"],
+                )
+    except Exception:
+        # Degrade, don't abort: the stall sweep's other work (and the rows that
+        # DO carry a start) must still run. Unrepaired rows are retried next tick.
+        await session.rollback()
+        logger.exception("[REAPER] Strategic phase-start repair pass failed")
+
+    # Pause-aware: a cycle whose completion handler simply could not run while
+    # the pipeline was paused must not be force-terminated as "stalled". Passing
+    # the deploy state makes find_stalled's 3h deadline exclude pause time.
+    # Loaded HERE, after the passes above have committed — a row fetched before
+    # a commit is expired by it, and refreshing an expired ORM attribute from
+    # async code raises MissingGreenlet.
+    _deploy_state = await session.get(DeploymentState, 1)
 
     stalled = await strategic_cycle.find_stalled(session, deploy_state=_deploy_state)
     _step7_now = _utcnow()
@@ -656,17 +690,38 @@ async def sweep_stalled_strategic_cycles(
         ):
             stalled_phase = "phase1"
             linked_task_id = c.phase1_task_id
+            if c.phase1_started_at is None:
+                # Should be unreachable (NOT NULL since 0047). Say so out loud
+                # rather than skipping silently forever: the repair pass above
+                # stamps a real start, so a row still here next tick is a
+                # standing schema violation someone has to see.
+                logger.warning(
+                    f"[REAPER] Cycle {c.id} is {c.outcome} with no phase1 start "
+                    f"timestamp — deferring its stall decision to the next tick, "
+                    f"after the phase-start repair pass"
+                )
+                continue
             if (
-                c.phase1_started_at is None
-                or c.phase1_started_at >= _phase_cutoff
+                c.phase1_started_at >= _phase_cutoff
                 or c.phase2_started_at is not None
             ):
                 continue
         elif c.outcome == strategic_cycle.OUTCOME_PHASE2_RUNNING:
             stalled_phase = "phase2"
             linked_task_id = c.phase2_task_id
-            _phase_ref = c.phase2_started_at or c.phase1_started_at
-            if _phase_ref is None or _phase_ref >= _phase_cutoff:
+            # Phase 2's deadline comes from phase 2's own start. The former
+            # ``c.phase2_started_at or c.phase1_started_at`` reported phase 1's
+            # age as ">3h in phase2" and force-terminated the phase-2 task on
+            # the strength of it; the repair pass above supplies a real value
+            # instead, so a NULL here means "repaired this tick or contended" —
+            # wait one tick rather than measure with the wrong clock.
+            if c.phase2_started_at is None:
+                logger.info(
+                    f"[REAPER] Cycle {c.id} has no phase2 start timestamp yet "
+                    f"— deferring its stall decision to the next tick"
+                )
+                continue
+            if c.phase2_started_at >= _phase_cutoff:
                 continue
         else:
             continue
@@ -786,6 +841,12 @@ async def sweep_stalled_strategic_cycles(
                 linked_task, phase=stalled_phase, now=_step7_now
             )
         )
+        # A cycle whose phase start had to be repaired can stall on the first
+        # sweep that ever measured it. Say where the clock came from, or that
+        # reads as the reaper inventing a deadline.
+        _repair_note = strategic_cycle.phase_start_repair_note(c, stalled_phase)
+        if _repair_note:
+            stall_reason_text = f"{stall_reason_text}. {_repair_note}"
         # Consecutive same-cause stalls, counting this one. The prior run is
         # read with this cycle excluded so the count does not depend on whether
         # the outcome write below has been flushed yet.

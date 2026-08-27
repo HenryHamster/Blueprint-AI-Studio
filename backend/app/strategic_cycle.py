@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Mapping, Optional
 
 from sqlalchemy import and_, desc, func, or_, select
@@ -43,7 +43,7 @@ from app.orchestrator_runner_placement import (
 from app.problem_model import sanitize_problem_model_raw
 from app.strategic_constants import CYCLE_SUMMARY_MAX
 from app.strategic_runtime_work import task_is_strategic_local_runner_hold
-from app.time_utils import _utcnow
+from app.time_utils import _strip_tz_assume_utc, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,26 @@ STALLED_OUTCOMES: frozenset[str] = frozenset(
 # ``CYCLE_META_STALL_REASON`` is the human-readable sentence built alongside it.
 CYCLE_META_STALL_SIGNATURE = "stall_signature"
 CYCLE_META_STALL_REASON = "stall_reason"
+
+# Cycle metadata recording a REPAIRED phase-start timestamp: which phase, the
+# value written, and the evidence it came from.
+#
+# A stall deadline is a MEASUREMENT, and a measurement needs a start.  When the
+# row has lost one, the sweep repairs it from evidence and writes down what it
+# used, instead of silently borrowing another phase's clock — see
+# :func:`phase_start_evidence` and :func:`repair_missing_phase_starts`.
+CYCLE_META_PHASE_START_REPAIR = "phase_start_repair"
+
+#: Evidence sources for a repaired phase start, strongest first.
+PHASE_START_FROM_LINKED_TASK = "linked_task_created_at"
+PHASE_START_FROM_PHASE1_COMPLETED = "phase1_completed_at"
+PHASE_START_FROM_CYCLE_CREATED = "cycle_created_at"
+PHASE_START_FROM_OBSERVATION = "observed_at_repair"
+
+#: Rows repaired per sweep tick.  A missing phase start is residue, not a
+#: steady-state population, so a bound keeps one corrupt batch from dominating a
+#: reaper tick; the remainder is picked up on the next one.
+_PHASE_START_REPAIR_LIMIT = 50
 
 #: Prefix of the cadence-gate skip reason written when the consecutive-stall
 #: cutoff holds re-minting. A skip carrying this is a BLOCKED strategist, the
@@ -1108,6 +1128,211 @@ def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
     return out
 
 
+# ── Missing phase-start repair ──────────────────────────────────────────────
+
+
+def phase_start_evidence(
+    cycle: StrategicCycle,
+    *,
+    phase: str,
+    linked_task: Optional[Task] = None,
+    now: Optional[datetime] = None,
+) -> tuple[datetime, str]:
+    """Best available START timestamp for ``phase``, plus the evidence used.
+
+    Only consulted when the row's own ``phase{1,2}_started_at`` is NULL.  What
+    the ordering deliberately EXCLUDES matters more than what it includes:
+    ``phase1_started_at`` is never evidence for phase 2.  Substituting it (the
+    historical ``phase2_started_at or phase1_started_at`` behaviour) makes the
+    sweep measure phase 1's age and then report the number as "in phase2 for
+    >3h" — a duration it never measured, off a clock that can be arbitrarily
+    older than the phase it is judging.
+
+    A phase task is created AT phase start, so its ``created_at`` is the true
+    start; failing that, phase 2 begins when phase 1 completed and phase 1
+    begins when the cycle row was created.
+
+    Last resort is the observation itself: with no evidence at all the phase
+    clock starts NOW.  That costs at most one extra stall window before the
+    ordinary ``no_linked_task`` stall fires, and it is the only option that both
+    DECIDES (no operator is asked for a fact the row simply lost) and refuses to
+    assert an age nothing measured.
+    """
+    resolved_now = _strip_tz_assume_utc(now) or _utcnow()
+    if phase == "phase2":
+        candidates = (
+            (getattr(linked_task, "created_at", None), PHASE_START_FROM_LINKED_TASK),
+            (cycle.phase1_completed_at, PHASE_START_FROM_PHASE1_COMPLETED),
+        )
+    else:
+        candidates = (
+            (getattr(linked_task, "created_at", None), PHASE_START_FROM_LINKED_TASK),
+            (cycle.created_at, PHASE_START_FROM_CYCLE_CREATED),
+        )
+    for value, source in candidates:
+        naive = _strip_tz_assume_utc(value)
+        if naive is not None:
+            return naive, source
+    return resolved_now, PHASE_START_FROM_OBSERVATION
+
+
+def phase_start_repair_note(cycle: StrategicCycle, phase: str) -> str:
+    """One clause naming a repaired phase start, or ``""``.
+
+    Appended to the stall reason so an operator reading "stalled after >3h" can
+    see that the 3h was measured from a REPAIRED start and from which evidence —
+    otherwise a cycle that stalls on the first sweep that ever saw it looks like
+    the reaper inventing a deadline.
+    """
+    record = (cycle.cycle_metadata or {}).get(CYCLE_META_PHASE_START_REPAIR)
+    if not isinstance(record, dict) or record.get("phase") != phase:
+        return ""
+    return (
+        f"NOTE: this cycle's {phase} start timestamp was missing and was "
+        f"repaired to {record.get('value')} from {record.get('source')}; the "
+        f"deadline above is measured from that instant, not from another "
+        f"phase's clock"
+    )
+
+
+async def repair_missing_phase_starts(
+    session: AsyncSession,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = _PHASE_START_REPAIR_LIMIT,
+) -> list[dict[str, Any]]:
+    """Stamp a real start timestamp on active cycles that have lost one.
+
+    A missing phase start is missing EVIDENCE, and both things a sweep can do
+    with missing evidence are wrong:
+
+    * **Skip the row.**  ``find_stalled``'s ``if ref and ...`` did this.  An
+      active cycle that can never be declared stalled also never releases the
+      project's strategic lane — ``ACTIVE_OUTCOMES`` keeps the admission guard
+      closed — so the project silently stops minting cycles with no alert at
+      all.  "Never stalls" is a permanent wedge, not a safe default.
+    * **Substitute another phase's clock.**  The phase-2 branches did this
+      (``phase2_started_at or phase1_started_at``).  Migration
+      ``0047_add_strategic_cycle_table`` inserts exactly that shape: it
+      backfills ``outcome`` straight from the legacy JSONB (``'phase2_running'``
+      included) while leaving ``phase2_started_at`` NULL whenever the entry had
+      no parseable ``phase1_completed_at``, and COALESCEs ``phase1_started_at``
+      to the migration's own ``NOW()``.  The borrowed clock then declares the
+      cycle stalled on the first sweep that ever sees it and force-terminates
+      its phase task — and since the consecutive-stall cutoff landed, such a
+      stall also consumes the project's retry budget toward
+      ``MAX_CONSECUTIVE_STALLS``, so a lost timestamp can now suppress a whole
+      project's strategic lane.
+
+    So repair rather than guess: derive the start from evidence
+    (:func:`phase_start_evidence`), write it down with its provenance, and let
+    the ordinary deadline do the measuring.  Idempotent — a repaired row no
+    longer matches the predicate.  Bounded, and lock-skipping so a contended row
+    is simply retried on the next tick.
+
+    Returns one record per repaired row (for the caller's log); the caller owns
+    the commit.
+    """
+    from app import pause_clock  # noqa: PLC0415 — local import avoids load cycle
+
+    resolved_now = _strip_tz_assume_utc(now) or _utcnow()
+    stmt = (
+        select(StrategicCycle)
+        .where(
+            or_(
+                and_(
+                    StrategicCycle.outcome == OUTCOME_PHASE2_RUNNING,
+                    StrategicCycle.phase2_started_at.is_(None),
+                ),
+                # ``phase1_started_at`` is NOT NULL in both the model and 0047,
+                # so this arm should never match. It is kept because the cost is
+                # one OR branch and the alternative — the silent ``continue``
+                # this replaces — is the wedge above with no way to notice it.
+                and_(
+                    StrategicCycle.outcome.in_(
+                        [
+                            OUTCOME_IN_PROGRESS,
+                            OUTCOME_PHASE1_RUNNING,
+                            OUTCOME_PHASE1_DONE,
+                        ]
+                    ),
+                    StrategicCycle.phase1_started_at.is_(None),
+                ),
+            )
+        )
+        .order_by(StrategicCycle.id.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    if not rows:
+        return []
+
+    linked_task_ids = {
+        task_id
+        for cycle in rows
+        for task_id in (
+            (
+                cycle.phase2_task_id
+                if cycle.outcome == OUTCOME_PHASE2_RUNNING
+                else cycle.phase1_task_id
+            ),
+        )
+        if task_id is not None
+    }
+    tasks_by_id: dict[Any, Task] = {}
+    if linked_task_ids:
+        task_rows = (
+            (await session.execute(select(Task).where(Task.id.in_(linked_task_ids))))
+            .scalars()
+            .all()
+        )
+        tasks_by_id = {task.id: task for task in task_rows}
+
+    # One read for the whole batch: the repaired clock starts counting pause
+    # windows from HERE, so already-closed historical windows are not
+    # retroactively credited to a row that never recorded a baseline.
+    pause_baseline = await pause_clock.current_baseline(session)
+
+    repairs: list[dict[str, Any]] = []
+    for cycle in rows:
+        phase = "phase2" if cycle.outcome == OUTCOME_PHASE2_RUNNING else "phase1"
+        linked_task_id = (
+            cycle.phase2_task_id if phase == "phase2" else cycle.phase1_task_id
+        )
+        linked_task = (
+            tasks_by_id.get(linked_task_id) if linked_task_id is not None else None
+        )
+        value, source = phase_start_evidence(
+            cycle, phase=phase, linked_task=linked_task, now=resolved_now
+        )
+        if phase == "phase2":
+            cycle.phase2_started_at = value
+        else:
+            cycle.phase1_started_at = value
+        meta = dict(cycle.cycle_metadata or {})
+        meta[CYCLE_META_PHASE_START_REPAIR] = {
+            "phase": phase,
+            "source": source,
+            "value": value.isoformat(),
+            "repaired_at": resolved_now.isoformat(),
+        }
+        meta[f"{phase}_pause_baseline"] = pause_baseline
+        cycle.cycle_metadata = meta
+        flag_modified(cycle, "cycle_metadata")
+        session.add(cycle)
+        repairs.append(
+            {
+                "cycle_id": cycle.id,
+                "project_id": str(cycle.project_id),
+                "phase": phase,
+                "source": source,
+                "value": value.isoformat(),
+            }
+        )
+    return repairs
+
+
 async def find_stalled(
     session: AsyncSession,
     *,
@@ -1195,12 +1420,16 @@ async def find_stalled(
                 stalled.append(c)
         elif c.outcome == OUTCOME_PHASE2_RUNNING:
             _meta = c.cycle_metadata or {}
-            ref = c.phase2_started_at or c.phase1_started_at
-            _ref_baseline = (
-                _meta.get("phase2_pause_baseline")
-                if c.phase2_started_at is not None
-                else _meta.get("phase1_pause_baseline")
-            )
+            # Phase 2's deadline is measured from phase 2's own start, and from
+            # nothing else. This used to fall back to ``phase1_started_at``,
+            # which reports phase 1's age as "in phase2 for >3h" — a duration
+            # this function never measured, off a clock that predates the phase
+            # being judged (see repair_missing_phase_starts for the row shape
+            # that produces it). A row that still has no phase-2 start is left
+            # alone for exactly one tick: the reaper's repair pass stamps a real
+            # one from evidence, and the next scan measures it honestly.
+            ref = c.phase2_started_at
+            _ref_baseline = _meta.get("phase2_pause_baseline")
             if (
                 ref
                 and pause_clock.active_elapsed_seconds(
