@@ -343,6 +343,7 @@ from app.reaper_sweeps import (
     sweep_decay_stale_open_bug_messages,
     sweep_decay_stale_unlinked_blocker_messages,
     sweep_fail_stranded_pending_conversation_messages,
+    sweep_release_expired_activity_claims,
     sweep_release_expired_conversation_claims,
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
@@ -3740,6 +3741,30 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         "[REAPER] Expired-conversation-claim release sweep error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 25b: Activity rows share immutable Resident claims with
+                # conversation turns, but are outside Step 25a. Release only
+                # whole Activity groups whose lease is stale and whose owning
+                # task/generation is authoritatively dead or superseded.
+                _mark_reaper_progress()
+                try:
+                    _activity_claims_released = (
+                        await sweep_release_expired_activity_claims(session, now)
+                    )
+                    if _activity_claims_released:
+                        logger.info(
+                            "[REAPER] Step 25b: released %d expired Activity "
+                            "claim message(s)",
+                            _activity_claims_released,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "[REAPER] Expired-Activity-claim release sweep error: %s",
                         e,
                         exc_info=True,
                     )

@@ -23,16 +23,23 @@ from app.models import (
     Project,
     ProjectMessage,
     Task,
+    TaskStatus,
 )
+from app.conversation_coordinator import claim_operator_messages
 from app.reaper_bug_message_sweeps import (
+    EXPIRED_ACTIVITY_CLAIM_RELEASE_AFTER_MINUTES,
     EXPIRED_CONVERSATION_CLAIM_RELEASE_AFTER_MINUTES,
     STRANDED_CONVERSATION_MESSAGE_AFTER_MINUTES,
     STRANDED_DEFERRED_CONVERSATION_MESSAGE_AFTER_MINUTES,
     sweep_fail_stranded_pending_conversation_messages,
+    sweep_release_expired_activity_claims,
     sweep_release_expired_conversation_claims,
 )
 from app.project_message_projection import WAKEUP_STATE_CONTEXT_KEY
-from app.session_message_handoff import RESIDENT_HANDOFF_AT_CONTEXT_KEY
+from app.session_message_handoff import (
+    RESIDENT_HANDOFF_AT_CONTEXT_KEY,
+    RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY,
+)
 from app.strategic_resident_session import RESIDENT_ACTIVATION_PROMPT_CONTEXT_KEY
 from app.time_utils import _utcnow
 
@@ -725,3 +732,293 @@ async def test_released_claim_then_ages_out_through_step_25(sweep_db):
     await sweep_db.refresh(msg)
     assert msg.handling_state == MessageHandlingState.FAILED
     assert msg.resolution == "stranded (no runner claim within the window)"
+
+
+# --- Step 25b: expired Activity-claim release -----------------------------
+
+
+async def _add_resident_task(
+    db: AsyncSession,
+    project: Project,
+    *,
+    session_id: str,
+    generation: int,
+    status: TaskStatus,
+) -> Task:
+    task = Task(
+        project_id=project.id,
+        title=f"Resident {session_id}",
+        payloads=[],
+        status=status,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": generation,
+        },
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+    return task
+
+
+def _set_resident_authority(
+    project: Project,
+    task: Task,
+    *,
+    session_id: str,
+    generation: int,
+) -> None:
+    project.vision = {
+        **dict(project.vision or {}),
+        "_resident_strategic_session": {
+            "status": "active",
+            "stop_requested": False,
+            "task_id": str(task.id),
+            "session_id": session_id,
+            "worker_generation": generation,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_dead_activity_claim_release_recovers_mixed_membership(sweep_db):
+    """A dead claimed Activity head can join its unclaimed sibling again."""
+    project = await _make_project(sweep_db)
+    dead_task = await _add_resident_task(
+        sweep_db,
+        project,
+        session_id="resident-old",
+        generation=1,
+        status=TaskStatus.FAILED,
+    )
+    live_task = await _add_resident_task(
+        sweep_db,
+        project,
+        session_id="resident-current",
+        generation=2,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    _set_resident_authority(
+        project,
+        live_task,
+        session_id="resident-current",
+        generation=2,
+    )
+    sweep_db.add(project)
+    await sweep_db.commit()
+
+    stale = _minutes_ago(EXPIRED_ACTIVITY_CLAIM_RELEASE_AFTER_MINUTES + 5)
+    claimed = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        message_type=MessageType.QUESTION,
+        content="old claimed Activity question",
+        handled_by_task_id=dead_task.id,
+        resident_session_id="resident-old",
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        sequence=1,
+    )
+    sibling = await _add_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        message_type=MessageType.NOTE,
+        content="unclaimed Activity sibling",
+        resident_session_id=None,
+        sequence=2,
+    )
+
+    assert await sweep_release_expired_activity_claims(sweep_db, _utcnow()) == 1
+    await sweep_db.refresh(claimed)
+    assert claimed.handling_state == MessageHandlingState.PENDING
+    assert claimed.conversation_claim_id is None
+    assert claimed.handled_by_task_id is None
+    assert claimed.resident_session_id is None
+    assert (
+        claimed.context.get(RESIDENT_HANDOFF_FROM_SESSION_CONTEXT_KEY)
+        == "resident-old"
+    )
+    assert "terminal (failed)" in (
+        claimed.context.get("_conversation_claim_release_reason") or ""
+    )
+
+    replacement_claim = await claim_operator_messages(
+        sweep_db,
+        project_id=project.id,
+        session_id="resident-current",
+        task_id=live_task.id,
+        worker_generation=2,
+        incarnation_id=uuid.uuid4(),
+        message_ids=[claimed.id, sibling.id],
+        lease_seconds=45,
+    )
+    assert replacement_claim is not None
+    assert {row.id for row in replacement_claim.rows} == {claimed.id, sibling.id}
+
+
+@pytest.mark.asyncio
+async def test_expired_activity_claim_current_authority_is_preserved(sweep_db):
+    """Clock staleness alone never steals from the authoritative Resident."""
+    project = await _make_project(sweep_db)
+    task = await _add_resident_task(
+        sweep_db,
+        project,
+        session_id="resident-current",
+        generation=4,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    _set_resident_authority(
+        project,
+        task,
+        session_id="resident-current",
+        generation=4,
+    )
+    sweep_db.add(project)
+    await sweep_db.commit()
+    stale = _minutes_ago(EXPIRED_ACTIVITY_CLAIM_RELEASE_AFTER_MINUTES + 5)
+    msg = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        handled_by_task_id=task.id,
+        conversation_claim_generation=4,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+    )
+
+    assert await sweep_release_expired_activity_claims(sweep_db, _utcnow()) == 0
+    await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.CLAIMED
+    assert msg.conversation_claim_id is not None
+
+
+@pytest.mark.asyncio
+async def test_expired_activity_claim_superseded_generation_is_released(sweep_db):
+    """Current Project authority fences an older still-IN_PROGRESS task."""
+    project = await _make_project(sweep_db)
+    old_task = await _add_resident_task(
+        sweep_db,
+        project,
+        session_id="resident-old",
+        generation=6,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    current_task = await _add_resident_task(
+        sweep_db,
+        project,
+        session_id="resident-current",
+        generation=7,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    _set_resident_authority(
+        project,
+        current_task,
+        session_id="resident-current",
+        generation=7,
+    )
+    sweep_db.add(project)
+    await sweep_db.commit()
+    stale = _minutes_ago(EXPIRED_ACTIVITY_CLAIM_RELEASE_AFTER_MINUTES + 5)
+    msg = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        handled_by_task_id=old_task.id,
+        conversation_claim_generation=6,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+    )
+
+    assert await sweep_release_expired_activity_claims(sweep_db, _utcnow()) == 1
+    await sweep_db.refresh(msg)
+    assert msg.handling_state == MessageHandlingState.PENDING
+    assert "superseded by" in (
+        msg.context.get("_conversation_claim_release_reason") or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_activity_sweep_preserves_live_nonresident_and_conversation_claims(
+    sweep_db,
+):
+    """Ambiguous live owners and every conversation-surface group fail closed."""
+    project = await _make_project(sweep_db)
+    live_nonresident = Task(
+        project_id=project.id,
+        title="live non-Resident task",
+        payloads=[],
+        status=TaskStatus.IN_PROGRESS,
+        context={},
+    )
+    dead_resident = Task(
+        project_id=project.id,
+        title="dead Resident task",
+        payloads=[],
+        status=TaskStatus.FAILED,
+        context={"_resident_session": True},
+    )
+    sweep_db.add_all([live_nonresident, dead_resident])
+    await sweep_db.commit()
+    stale = _minutes_ago(EXPIRED_ACTIVITY_CLAIM_RELEASE_AFTER_MINUTES + 5)
+    activity = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        handled_by_task_id=live_nonresident.id,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        sequence=1,
+    )
+    conversation = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.CONVERSATION,
+        handled_by_task_id=dead_resident.id,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        sequence=2,
+    )
+    mixed_claim_id = uuid.uuid4()
+    mixed_incarnation = uuid.uuid4()
+    mixed_activity = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        handled_by_task_id=dead_resident.id,
+        conversation_claim_id=mixed_claim_id,
+        conversation_claim_incarnation=mixed_incarnation,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        sequence=3,
+    )
+    mixed_conversation = await _add_claimed_message(
+        sweep_db,
+        project,
+        surface=MessageSurface.CONVERSATION,
+        handled_by_task_id=dead_resident.id,
+        conversation_claim_id=mixed_claim_id,
+        conversation_claim_incarnation=mixed_incarnation,
+        conversation_claim_expires_at=stale,
+        created_at=stale,
+        updated_at=stale,
+        sequence=4,
+    )
+
+    assert await sweep_release_expired_activity_claims(sweep_db, _utcnow()) == 0
+    await sweep_db.refresh(activity)
+    await sweep_db.refresh(conversation)
+    await sweep_db.refresh(mixed_activity)
+    await sweep_db.refresh(mixed_conversation)
+    assert activity.handling_state == MessageHandlingState.CLAIMED
+    assert conversation.handling_state == MessageHandlingState.CLAIMED
+    assert mixed_activity.handling_state == MessageHandlingState.CLAIMED
+    assert mixed_conversation.handling_state == MessageHandlingState.CLAIMED
