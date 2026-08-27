@@ -24,9 +24,12 @@ from websocket_event_inventory import (
 from testing.fixgate_attribution import format_offender_marker
 
 # These are source-inventory tests that AST-scan the entire backend/app tree
-# (twice over, in the regen round-trip) — legitimately slow and prone to tripping
-# the 30s global pytest-timeout on a loaded CI shard. Give the file headroom; this
-# is a timeout accommodation for a correct-but-slow scan, not a weakened assertion.
+# (twice over, in the regen round-trip) — legitimately slow, and they tripped the
+# then-30s global pytest-timeout on a loaded CI shard. Give the file headroom;
+# this is a timeout accommodation for a correct-but-slow scan, not a weakened
+# assertion. The lane catch-all is now LANE_HANG_DETECTOR_SECONDS
+# (backend/testing/test_harness_timeout_budgets.py); this marker stays because it
+# bounds the scan as ITSELF rather than as an anonymous lane kill.
 pytestmark = pytest.mark.timeout(120)
 
 

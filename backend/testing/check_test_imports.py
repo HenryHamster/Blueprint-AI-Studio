@@ -270,7 +270,8 @@ def frozen_app_tree() -> Iterator[None]:
     syscall count is the whole point. Over the Docker-on-Windows bind mount the
     standalone lane runs on, where ``stat`` is ~100x slower, that count is the
     cost, and it is the difference between a guard that reports its assertion
-    and one that dies on the lane's 30s ``pytest-timeout``.
+    and one that dies on the lane's ``pytest-timeout`` catch-all
+    (``LANE_HANG_DETECTOR_SECONDS``, then 30s) instead.
 
     Inside the context a cached module is returned without the stat, so the
     sweep costs one stat per distinct module instead of one per reference.

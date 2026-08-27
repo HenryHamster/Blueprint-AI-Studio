@@ -909,11 +909,13 @@ if [ "${1:-}" = "--standalone" ]; then
     # corpus lane is the only lane a diff carrying no backend Python reaches.
     # It is a corpus scan, and its cost is file I/O: ~2.6s with the repo on a
     # Linux filesystem (CI), but 78-103s across a Docker-on-Windows bind mount
-    # -- both measured 3x. So it fits this lane's --timeout=30 in CI and blows
-    # through it on a Windows dev box, which is why the module carries an
-    # explicit @pytest.mark.timeout(120) -- the same house budget
-    # test_string_patch_targets_resolve uses for the same reason. Never remove
-    # that marker without re-measuring on BOTH: a corpus scan killed at 30s
+    # -- both measured 3x. The module carries an explicit
+    # @pytest.mark.timeout(120) -- the same house budget
+    # test_string_patch_targets_resolve uses -- so the bind-mount case reds as
+    # ITSELF rather than as an anonymous lane kill. (When this lane's
+    # LANE_HANG_DETECTOR_SECONDS was 30 the marker was also what kept the
+    # Windows figure from failing outright.) Never remove that marker without
+    # re-measuring on BOTH: a corpus scan killed by a bare lane timeout
     # reports a slow filesystem as a size defect.
     testing/test_module_size_live_tree.py
     )

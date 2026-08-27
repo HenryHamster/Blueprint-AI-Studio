@@ -123,11 +123,12 @@ def _run_child(source: str, *, io_encoding: str) -> subprocess.CompletedProcess[
         part for part in (str(SCRIPTS_DIR), environment.get("PYTHONPATH", "")) if part
     )
     # 20s, not 30+: this is a helper, so no caller's @pytest.mark.timeout can
-    # cover it, and the CI lane budget is 30s (backend/testing/
-    # test_harness_timeout_budgets.py). An inner timeout at or above the lane
-    # budget can never fire -- the harness kills the child first and the run
-    # reds as an unreproducible flake. A one-line `python -c` child has orders
-    # of magnitude of headroom at 20s.
+    # cover it, and MAX_INNER_OPERATION_SECONDS (backend/testing/
+    # test_harness_timeout_budgets.py) is the ceiling at or above which an
+    # inner timeout must declare a marker it cannot have. Sized against that
+    # ceiling, NOT the lane's LANE_HANG_DETECTOR_SECONDS -- an uncoverable
+    # helper has to fit under the smaller of the two. A one-line `python -c`
+    # child has orders of magnitude of headroom at 20s.
     return subprocess.run(
         [sys.executable, "-c", source],
         capture_output=True,
@@ -235,9 +236,9 @@ def legacy_byte_repository(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """
     repository = tmp_path_factory.mktemp("legacy-bytes")
 
-    # 20s for the same reason as _run_child(): a fixture-local helper sits
-    # under the 30s lane budget with no marker of its own, so the inner timeout
-    # has to stay strictly below it to be reachable at all.
+    # 20s for the same reason as _run_child(): a fixture-local helper carries
+    # no marker of its own, so its inner timeout has to stay strictly below
+    # MAX_INNER_OPERATION_SECONDS to be reachable at all.
     def git(*args: str) -> None:
         subprocess.run(
             ["git", *args], cwd=repository, capture_output=True, check=True, timeout=20
