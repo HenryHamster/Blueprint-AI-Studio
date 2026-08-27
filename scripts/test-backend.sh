@@ -61,6 +61,7 @@ USE_TESTMON=1
 REQUIRE_TESTMON=0
 SANDBOX_POSTGRES=0
 INVENTORY_ONLY=0
+STANDALONE=0
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
@@ -69,6 +70,7 @@ for arg in "$@"; do
     --no-postgres) USE_POSTGRES=0 ;;
     --no-testmon) USE_TESTMON=0 ;;
     --require-testmon) REQUIRE_TESTMON=1 ;;
+    --standalone) STANDALONE=1 ;;
     --standalone-inventory) INVENTORY_ONLY=1 ;;
     *)
       case "$arg" in
@@ -79,6 +81,87 @@ for arg in "$@"; do
   esac
 done
 if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
+STATIC_GUARD_SELECTORS_RAW=()
+STATIC_GUARD_SELECTORS_IS_SET=0
+if [ "${BLUEPRINT_STATIC_GUARD_SELECTORS+x}" = "x" ]; then
+  STATIC_GUARD_SELECTORS_IS_SET=1
+  [ "$STANDALONE" = "1" ] || {
+    echo "ERROR: BLUEPRINT_STATIC_GUARD_SELECTORS requires --standalone" >&2
+    exit 2
+  }
+  [ "$#" -eq 0 ] || {
+    echo "ERROR: BLUEPRINT_STATIC_GUARD_SELECTORS cannot be combined with explicit pytest arguments" >&2
+    exit 2
+  }
+  if ! STATIC_GUARD_SELECTORS_DECODED=$(printf '%s\n' "$BLUEPRINT_STATIC_GUARD_SELECTORS" | base64 --decode 2>/dev/null); then
+    echo "ERROR: static guard selector list is not valid base64" >&2
+    exit 2
+  fi
+  while IFS= read -r selector; do
+    [ -n "$selector" ] || continue
+    case "$selector" in
+      -*)
+        echo "ERROR: static guard selector entries must be positional test selectors, not pytest options: '$selector'" >&2
+        exit 2
+        ;;
+    esac
+    STATIC_GUARD_SELECTORS_RAW+=("$selector")
+  done <<< "$STATIC_GUARD_SELECTORS_DECODED"
+  [ "${#STATIC_GUARD_SELECTORS_RAW[@]}" -gt 0 ] || {
+    echo "ERROR: static guard selector list is empty or invalid" >&2
+    exit 2
+  }
+fi
+if [ "$INVENTORY_ONLY" = "1" ]; then
+  [ "$STANDALONE" = "1" ] || {
+    echo "ERROR: --standalone-inventory requires --standalone" >&2
+    exit 2
+  }
+  if [ "$#" -gt 0 ] || [ "$STATIC_GUARD_SELECTORS_IS_SET" = "1" ]; then
+    echo "ERROR: --standalone-inventory does not accept explicit pytest arguments or selectors" >&2
+    exit 2
+  fi
+fi
+
+# A standalone invocation with only pytest modifiers still owns the canonical
+# corpus. Identify actual positional selectors so flags such as -q or -k do not
+# accidentally replace that corpus with an unconstrained backend collection.
+STANDALONE_HAS_EXPLICIT_SELECTOR=0
+if [ "$STANDALONE" = "1" ] && [ "$#" -gt 0 ]; then
+  STANDALONE_EXPECTS_VALUE=""
+  for arg in "$@"; do
+    if [ -n "$STANDALONE_EXPECTS_VALUE" ]; then
+      STANDALONE_EXPECTS_VALUE=""
+      continue
+    fi
+    case "$arg" in
+      --)
+        echo "ERROR: standalone pytest arguments cannot include '--' because the harness appends required pytest options" >&2
+        exit 2
+        ;;
+      --collect-only|--collect-only=*|--co|--co=*|--fixtures|--fixtures=*|--fixtures-per-test|--fixtures-per-test=*|--setup-only|--setup-only=*|--setup-plan|--setup-plan=*)
+        echo "ERROR: standalone pytest evidence must execute test bodies; '$arg' is not allowed" >&2
+        exit 2
+        ;;
+      -k|--keyword|-m|--markexpr|-o|--override-ini|-p|--maxfail|--tb|--capture|--basetemp|--confcutdir|--rootdir|--ignore|--ignore-glob|--deselect|--junitxml|--junit-prefix|--durations|--durations-min|--color|--code-highlight|--assert|--verbosity|--import-mode|--doctest-glob|--doctest-report|--timeout|--timeout-method)
+        STANDALONE_EXPECTS_VALUE="$arg"
+        ;;
+      --*=*|-k?*|-m?*|-o?*|-q|-qq|-v|-vv|-vvv|-s|-x|-l|--quiet|--verbose|--no-header|--no-summary|--exitfirst|--showlocals|--full-trace|--pdb|--trace|--last-failed|--lf|--failed-first|--ff|--new-first|--nf|--cache-clear|--setup-show|--keep-duplicates|--disable-warnings|--strict-config|--strict-markers|--continue-on-collection-errors|--doctest-modules|--doctest-continue-on-failure|--runxfail|--noconftest)
+        ;;
+      -*)
+        echo "ERROR: unsupported standalone pytest modifier '$arg'; use a supported modifier or an explicit selector" >&2
+        exit 2
+        ;;
+      *)
+        STANDALONE_HAS_EXPLICIT_SELECTOR=1
+        ;;
+    esac
+  done
+  [ -z "$STANDALONE_EXPECTS_VALUE" ] || {
+    echo "ERROR: standalone pytest modifier '$STANDALONE_EXPECTS_VALUE' requires a value" >&2
+    exit 2
+  }
+fi
 
 # --- Memory guard: refuse the full Docker+Postgres suite on memory-constrained
 # hosts (Blueprint's agent VM is e2-standard-2 = 8 GB and cannot fit the
@@ -90,6 +173,7 @@ if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
 if [ -r /proc/meminfo ] && [ -z "${ALLOW_LOW_MEM:-}" ]; then
   AVAIL_MB=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)
   IS_FULL_SUITE=1
+  [ "$STANDALONE" = "1" ] && IS_FULL_SUITE=0
   for arg in "$@"; do
     case "$arg" in
       --standalone|-k|*.py|*::*) IS_FULL_SUITE=0 ;;
@@ -851,9 +935,8 @@ for infra_root in "${INFRA_TEST_ROOTS[@]}"; do
 done
 
 STATIC_GUARD_SELECTORS_ARGS=()
-if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ]; then
-  while IFS= read -r selector; do
-    [ -n "$selector" ] || continue
+if [ "${#STATIC_GUARD_SELECTORS_RAW[@]}" -gt 0 ]; then
+  for selector in "${STATIC_GUARD_SELECTORS_RAW[@]}"; do
     case "$selector" in
       scripts/*)
         if [ "$USE_DOCKER" = "1" ]; then
@@ -864,21 +947,23 @@ if [ -n "${BLUEPRINT_STATIC_GUARD_SELECTORS:-}" ]; then
         ;;
     esac
     STATIC_GUARD_SELECTORS_ARGS+=("$selector")
-  done < <(printf '%s\n' "$BLUEPRINT_STATIC_GUARD_SELECTORS" | base64 --decode)
-  [ "${#STATIC_GUARD_SELECTORS_ARGS[@]}" -gt 0 ] || {
-    echo "ERROR: static guard selector list is empty or invalid" >&2
-    exit 2
-  }
+  done
 fi
 
-if [ "${1:-}" = "--standalone" ]; then
+if [ "$STANDALONE" = "1" ]; then
   if [ "${#STATIC_GUARD_SELECTORS_ARGS[@]}" -gt 0 ]; then
     STANDALONE_ARGS=("${STATIC_GUARD_SELECTORS_ARGS[@]}")
+  elif [ "$STANDALONE_HAS_EXPLICIT_SELECTOR" = "1" ]; then
+    # Harness flags have already been consumed. Preserve the remaining pytest
+    # arguments exactly: a file::node selector must not expand to this lane's
+    # default corpus merely because --standalone appeared before it.
+    STANDALONE_ARGS=("$@")
   else
     STANDALONE_ARGS=(
     testing/test_security.py
     testing/test_pipeline.py
     testing/test_invariants.py
+    testing/test_backend_harness_selector_parsing.py
     testing/test_impacted_tests.py
     testing/test_audit_finding_class_guards.py
     testing/test_admin_auth_invariant.py
@@ -928,6 +1013,9 @@ if [ "${1:-}" = "--standalone" ]; then
     # and receipt retry behavior that pytest backend shards do not collect.
     STANDALONE_ARGS+=("${STANDALONE_RELEASE_TEST_ARGS[@]}")
     STANDALONE_ARGS+=("${STANDALONE_INFRA_TEST_ARGS[@]}")
+    if [ "$#" -gt 0 ]; then
+      STANDALONE_ARGS+=("$@")
+    fi
   fi
 fi
 
@@ -937,10 +1025,6 @@ fi
 # per-file roster. Normalize mount paths back to checkout-relative identities so
 # Docker and direct execution produce the same inventory.
 if [ "$INVENTORY_ONLY" = "1" ]; then
-  [ "${1:-}" = "--standalone" ] || {
-    echo "ERROR: --standalone-inventory requires --standalone" >&2
-    exit 2
-  }
   echo "BLUEPRINT_STANDALONE_CORPUS_V1"
   for corpus_entry in "${STANDALONE_ARGS[@]}"; do
     case "$corpus_entry" in
@@ -1015,7 +1099,7 @@ fi
 echo "=== Verify app imports ==="
 _run python3 -c "from app.main import app; print(f'OK: {len(app.routes)} routes')"
 
-if [ "${1:-}" = "--standalone" ]; then
+if [ "$STANDALONE" = "1" ]; then
   echo "=== Standalone tests (no DB) ==="
   STANDALONE_JUNIT_ARGS=()
   if [ -n "${BLUEPRINT_STATIC_GUARD_JUNIT:-}" ]; then

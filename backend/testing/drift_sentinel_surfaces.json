@@ -180,6 +180,11 @@
       "glob": "scripts/**/*.py",
       "sentinels": ["backend/testing/test_module_size_live_tree.py"],
       "why": "scripts/ is the 'scripts' section's source root, with 17 capped modules and release-critical logic. A scripts/**-shaped glob is safe here where the older conversational-workday entries deliberately used exact filenames: scripts/ is ALREADY a static_release_guard STATIC_PATH_PREFIXES member derived from conversational_workday_manifest.json (test_static_scope_matches_path_boundaries asserts scripts/test-backend.sh.bak is in scope), so this widens nothing there. Registering these three non-backend surfaces is what makes impacted_tests.corpus_lane_required_sentinels demand a STANDALONE_ARGS seat for this sentinel -- deliberate, and paid for honestly: the scan is a corpus walk whose cost is file I/O, measured 3x on each filesystem it runs on -- ~2.6s with the repo on a Linux filesystem (what CI does) but 78-103s across a Docker-on-Windows bind mount (what ./check test does on a Windows dev box). It therefore carries an explicit @pytest.mark.timeout(120) so its budget is stated at the test rather than inherited from whatever the lane happens to pass -- LANE_HANG_DETECTOR_SECONDS (backend/testing/test_harness_timeout_budgets.py) is a hang detector for the lane as a whole, not a performance budget for this scan, and the marker keeps a slow filesystem from being reported as a size defect either way. See the module docstring for both measurements."
+    },
+    {
+      "glob": "scripts/test-backend.sh",
+      "sentinels": ["backend/testing/test_backend_harness_selector_parsing.py"],
+      "why": "test_backend_harness_selector_parsing.py copies and executes this exact shell harness against a synthetic checkout, then records the pytest argv to enforce selector ownership, executable evidence modes, and inventory fail-closed behavior. It imports no module from the shell script, so the reverse-dependency resolver has no edge that could select it for a harness-only change. This exact-file registration makes the parser regression mandatory in the impacted-test lane whenever the harness changes; the module also has a scripts/test-backend.sh STANDALONE_ARGS seat because this is a non-backend surface."
     }
   ]
 }
