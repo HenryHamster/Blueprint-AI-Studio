@@ -33,6 +33,7 @@ export const FIXTURE_SHARED_FILES: readonly string[] = [
   'backend/testing/drift_sentinel_surfaces.json', 'backend/testing/check_size_limits.py',
   'backend/testing/module_size_limits.json', 'backend/testing/cap_bump_history.json',
   'backend/app/__init__.py', 'backend/app/size_limit_policy.py',
+  'backend/app/size_limit_justification.py',
 ];
 
 /** `from testing.<mod> import ...` / `import testing.<mod>`, at statement

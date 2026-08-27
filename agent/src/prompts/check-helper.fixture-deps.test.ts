@@ -37,6 +37,10 @@ describe('check fixture dependency manifest', () => {
     expect(missing, 'FIXTURE_SHARED_FILES entry has no production file; copyFileSync would throw').toEqual([]);
   });
 
+  it('stages the size policy justification dependency used by the static guard', () => {
+    expect(FIXTURE_SHARED_FILES).toContain('backend/app/size_limit_justification.py');
+  });
+
   it('stages every backend/testing module the staged guards import', () => {
     const staged = stagedPython();
     // Non-vacuity: an empty scan would satisfy the loop below trivially.
