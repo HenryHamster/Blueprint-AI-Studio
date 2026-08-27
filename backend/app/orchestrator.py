@@ -855,6 +855,7 @@ async def _project_resource_dispatch_defer_message(
     project_cache: dict[uuid.UUID, Project | None] | None = None,
     spend_cache: dict[uuid.UUID, tuple[float, float, int]] | None = None,
     budget_exhausted: bool = False,
+    enforce_vm_cap: bool = True,
 ) -> str | None:
     """Return an operator-readable resource-envelope deferral reason, if any."""
     if project_cache is not None and task.project_id in project_cache:
@@ -894,7 +895,7 @@ async def _project_resource_dispatch_defer_message(
         )
 
     vm_cap = resolve_project_vm_cap(project)
-    if vm_cap is not None:
+    if enforce_vm_cap and vm_cap is not None:
         active_for_project = project_active_counts.get(task.project_id, 0)
         if active_for_project >= vm_cap:
             return (
@@ -954,9 +955,13 @@ async def _filter_project_resource_dispatch_eligible(
     *,
     budget_exhausted: bool = False,
 ) -> list[uuid.UUID]:
-    """Drop resource-deferred tasks before the global slot slice."""
+    """Drop budget-deferred tasks before the global slot slice.
+
+    VM capacity is enforced under the per-task dispatch lock below. Reserving
+    project slots here would let candidates that later hold, block, or fail
+    preparation phantom-consume capacity and starve later backfill candidates.
+    """
     task_by_id = {task.id: task for task in candidate_tasks}
-    projected_counts = dict(project_active_counts)
     project_cache: dict[uuid.UUID, Project | None] = {}
     spend_cache: dict[uuid.UUID, tuple[float, float, int]] = {}
     filtered: list[uuid.UUID] = []
@@ -973,10 +978,11 @@ async def _filter_project_resource_dispatch_eligible(
             defer_msg = await _project_resource_dispatch_defer_message(
                 session,
                 task,
-                projected_counts,
+                project_active_counts,
                 project_cache=project_cache,
                 spend_cache=spend_cache,
                 budget_exhausted=budget_exhausted,
+                enforce_vm_cap=False,
             )
         except Exception as exc:
             logger.exception(
@@ -1007,7 +1013,6 @@ async def _filter_project_resource_dispatch_eligible(
                 )
             continue
         filtered.append(task_id)
-        projected_counts[task.project_id] = projected_counts.get(task.project_id, 0) + 1
 
     # Broadcast per-project spend-ceiling state transitions for caller
     # (admin-ui) to surface ceiling-deferred indicators without waiting
@@ -3645,6 +3650,10 @@ async def orchestrator_worker():
                             )
                             if _ce_outcome in ("launched", "failed"):
                                 _cycle_dispatched += 1
+                            if _ce_outcome == "launched":
+                                project_active_counts[task.project_id] = (
+                                    project_active_counts.get(task.project_id, 0) + 1
+                                )
                             continue
 
                         # Pull-based fleet runner routing. Checked BEFORE the
@@ -3666,6 +3675,9 @@ async def orchestrator_worker():
                             )
                         ):
                             _cycle_dispatched += 1
+                            project_active_counts[task.project_id] = (
+                                project_active_counts.get(task.project_id, 0) + 1
+                            )
                             continue
 
                         if await _hold_task_for_learned_execution_capabilities(
@@ -4121,6 +4133,9 @@ async def orchestrator_worker():
                                     # top. Bounded only by pool size — i.e. by the very
                                     # GCE quota the cap exists to respect.
                                     _cycle_dispatched += 1
+                                    project_active_counts[task.project_id] = (
+                                        project_active_counts.get(task.project_id, 0) + 1
+                                    )
                                     record_pool_lease_hit(
                                         account=(
                                             runtime_selection.account.get("id")

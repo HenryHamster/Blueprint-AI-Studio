@@ -303,8 +303,16 @@ async def test_dispatch_resource_cache_refreshes_project_expired_by_rollback(db_
 
 
 @pytest.mark.asyncio
-async def test_dispatch_projected_count_stops_double_admit(db_session, mocker):
-    """With cap=1 and active=0, only the first of two queued tasks is admitted."""
+async def test_prefilter_does_not_reserve_slots_for_unlaunched_candidates(
+    db_session, mocker
+):
+    """The prefilter cannot let merely eligible rows consume project VM slots.
+
+    The locked dispatch loop owns the same-cycle cap because it can distinguish
+    a durable dispatch from a candidate that later holds, blocks, or fails
+    preparation. Both rows must reach that loop so the second can backfill when
+    the first consumes nothing.
+    """
     project = make_project(
         build_config={"resource_envelope": {"max_concurrent_vms": 1}}
     )
@@ -328,8 +336,9 @@ async def test_dispatch_projected_count_stops_double_admit(db_session, mocker):
         broadcast,
     )
 
-    # Only the first task is admitted; second is deferred by projected count
-    assert result == [task1.id]
+    assert result == [task1.id, task2.id]
+    assert task1.latest_status_message is None
+    assert task2.latest_status_message is None
 
 
 @pytest.mark.asyncio
@@ -487,32 +496,30 @@ async def test_dispatch_missing_project_returns_sentinel(db_session):
 @pytest.mark.asyncio
 async def test_filter_broadcasts_on_new_defer_message(db_session, mocker):
     """Deferred task with a new status message triggers broadcast_to_project."""
-    project = make_project(
-        build_config={"resource_envelope": {"max_concurrent_vms": 1}}
-    )
+    project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task1 = make_task(project_id=project.id)
-    task2 = make_task(project_id=project.id, latest_status_message=None)
-    db_session.add(task1)
-    db_session.add(task2)
+    task = make_task(project_id=project.id, latest_status_message=None)
+    db_session.add(task)
     await db_session.commit()
 
     broadcast = AsyncMock()
     await _filter_project_resource_dispatch_eligible(
         db_session,
-        [task1.id, task2.id],
-        [task1, task2],
-        {project.id: 0},
+        [task.id],
+        [task],
+        {},
         broadcast,
+        budget_exhausted=True,
     )
 
-    # task2 is deferred (projected count from task1 fills the cap)
-    # broadcast should be called for task2's new deferral message
-    broadcast.assert_called_once()
-    call_args = broadcast.call_args
+    task_update_calls = [
+        call for call in broadcast.await_args_list if call.args[1] == "task_updated"
+    ]
+    assert len(task_update_calls) == 1
+    call_args = task_update_calls[0]
     assert str(project.id) == call_args[0][0]
     assert call_args[0][1] == "task_updated"
 
@@ -520,34 +527,32 @@ async def test_filter_broadcasts_on_new_defer_message(db_session, mocker):
 @pytest.mark.asyncio
 async def test_filter_no_broadcast_when_message_unchanged(db_session, mocker):
     """No broadcast when the deferred task already has the same status message."""
-    project = make_project(
-        build_config={"resource_envelope": {"max_concurrent_vms": 1}}
-    )
+    project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task1 = make_task(project_id=project.id)
-    # Pre-set task2's message to match the deferral message it will receive
     expected_msg = (
-        "Waiting for project VM capacity — 1/1 project VM slots are already in use"
+        "Waiting for monthly budget — "
+        "fleet-wide spend has exceeded the monthly budget target"
     )
-    task2 = make_task(project_id=project.id, latest_status_message=expected_msg)
-    db_session.add(task1)
-    db_session.add(task2)
+    task = make_task(project_id=project.id, latest_status_message=expected_msg)
+    db_session.add(task)
     await db_session.commit()
 
     broadcast = AsyncMock()
     await _filter_project_resource_dispatch_eligible(
         db_session,
-        [task1.id, task2.id],
-        [task1, task2],
-        {project.id: 0},
+        [task.id],
+        [task],
+        {},
         broadcast,
+        budget_exhausted=True,
     )
 
-    # task2 is deferred but message is unchanged — no broadcast
-    broadcast.assert_not_called()
+    assert not [
+        call for call in broadcast.await_args_list if call.args[1] == "task_updated"
+    ]
 
 
 @pytest.mark.asyncio
