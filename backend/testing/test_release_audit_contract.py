@@ -481,6 +481,9 @@ async def test_spawn_release_audit_challenge_defaults_to_opus_quality_tier(db_se
         "Spawned release_audit_challenge must explicitly carry quality_tier='opus' "
         "— regression guard against silent downgrade"
     )
+    assert task.priority == 100, (
+        "release_audit_challenge is a blocking qualifier gate and must be urgent"
+    )
     # Provenance: qualification_attempt_id must propagate through payload + context.
     assert task.first_payload.get("qualification_attempt_id") == str(attempt_id), (
         "qualification_attempt_id must be propagated in the payload"
@@ -528,6 +531,9 @@ async def test_spawn_release_audit_task_defaults_to_opus_quality_tier(db_session
     assert (task.first_payload or {}).get("quality_tier") == "opus", (
         "Spawned release_audit must explicitly carry quality_tier='opus' "
         "— regression guard against silent downgrade"
+    )
+    assert task.priority == 100, (
+        "release_audit is a blocking qualifier gate and must be urgent"
     )
     # Provenance: qualification_attempt_id must propagate through payload + context.
     assert task.first_payload.get("qualification_attempt_id") == str(attempt_id), (

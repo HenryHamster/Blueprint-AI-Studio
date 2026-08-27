@@ -5591,9 +5591,11 @@ class TestHealthAwareDispatch:
     # _health_score_task) descending with a stable sort, so by injecting a
     # constant predict_fn the confidence component is uniform and
     # _health_score_task becomes the sole differentiator — isolating exactly the
-    # health-score ordering the originals meant to assert.  A single degradation
-    # signal (slots_available below 50% of max) is forced so the reorder
-    # activates; the confidence floor is set to 0 so nothing is dropped.
+    # health-score ordering the originals meant to assert. All Task instances use
+    # the same default task priority, so priority remains the primary key without
+    # masking the health-score behavior. A single degradation signal
+    # (slots_available below 50% of max) is forced so the reorder activates; the
+    # confidence floor is set to 0 so nothing is dropped.
 
     @staticmethod
     async def _reorder(ids, task_by_id, session):
@@ -10685,6 +10687,263 @@ class TestWarmVMSkipProvision:
             assert capped_row.status == TaskStatus.QUEUED
             assert "project VM capacity" in (capped_row.latest_status_message or "")
             assert open_row.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_project_vm_cap_counts_only_durable_same_cycle_dispatches(
+        self, orch_warm_db, mocker
+    ):
+        """A non-dispatching row cannot reserve capacity from a release audit.
+
+        This exercises all three boundaries behind the production starvation:
+        an EVALUATING research parent consumes no project slot, a malformed
+        higher-ranked candidate consumes no projected slot, and the first
+        durable audit dispatch consumes the sole same-cycle project slot so the
+        second audit remains queued.
+        """
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+        from app.failure_classification import MALFORMED_TASK_PAYLOAD
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        mocker.patch("app.managed_compute.is_managed_compute_enabled", return_value=True)
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Durable Project Slot Accounting",
+                    user_id=_TEST_USER,
+                    github_owner="owner",
+                    github_repo="repo",
+                    build_config={"resource_envelope": {"max_concurrent_vms": 1}},
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                now = self._naive_utcnow()
+                evaluating_parent = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.EVALUATING,
+                    payloads=[{"type": "research", "prompt": "waiting on findings"}],
+                    created_at=now - timedelta(minutes=20),
+                )
+                malformed = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    priority=100,
+                    payloads=[{"type": "fix", "prompt": "cannot dispatch"}],
+                    created_at=now - timedelta(minutes=10),
+                )
+
+                def _audit_payload(attempt: str) -> dict:
+                    return {
+                        "type": "release_audit",
+                        "prompt": "qualify the pinned candidate",
+                        "base_branch": "automain",
+                        "diff_range": "base...candidate",
+                        "goal_category_diff_range": "base...candidate",
+                        "candidate_sha": "a" * 40,
+                        "qualification_attempt_id": attempt,
+                        "quality_tier": "opus",
+                        "categories": [],
+                        "release_evidence": {},
+                    }
+
+                audit_one = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    priority=100,
+                    payloads=[_audit_payload("attempt-one")],
+                    created_at=now - timedelta(minutes=5),
+                )
+                audit_two = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    priority=100,
+                    payloads=[_audit_payload("attempt-two")],
+                    created_at=now - timedelta(minutes=4),
+                )
+                session.add_all(
+                    [evaluating_parent, malformed, audit_one, audit_two]
+                )
+                await session.commit()
+                malformed_id = malformed.id
+                audit_one_id = audit_one.id
+                audit_two_id = audit_two.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_warm_db() as verify:
+            rows = {
+                row.id: row
+                for row in (
+                    await verify.execute(
+                        _select(Task).where(
+                            Task.id.in_([malformed_id, audit_one_id, audit_two_id])
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            }
+
+        malformed_row = rows[malformed_id]
+        assert malformed_row.status == TaskStatus.FAILED
+        assert MALFORMED_TASK_PAYLOAD in (malformed_row.latest_status_message or "")
+        assert rows[audit_one_id].status == TaskStatus.PROVISIONING
+        assert rows[audit_two_id].status == TaskStatus.QUEUED
+        assert "1/1 project VM slots" in (
+            rows[audit_two_id].latest_status_message or ""
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dispatch_path", ["runner", "warm_pool", "compute"])
+    async def test_project_vm_cap_tracks_each_durable_dispatch_path_same_cycle(
+        self, orch_warm_db, mocker, dispatch_path
+    ):
+        """Every non-cold durable dispatch reserves the project slot immediately."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+
+        if dispatch_path == "runner":
+            dispatch_mock = mocker.patch(
+                "app.orchestrator._try_runner_dispatch",
+                new_callable=AsyncMock,
+                return_value=True,
+            )
+            mocker.patch(
+                "app.warm_pool.try_pool_dispatch",
+                new_callable=AsyncMock,
+                return_value=None,
+            )
+            task_type = "fix"
+        elif dispatch_path == "warm_pool":
+
+            class _Member:
+                vm_instance_id = "agent-vm-project-cap-lease"
+
+            dispatch_mock = mocker.patch(
+                "app.warm_pool.try_pool_dispatch",
+                new_callable=AsyncMock,
+                return_value=_Member(),
+            )
+            task_type = "fix"
+        else:
+            mocker.patch(
+                "app.warm_pool.try_pool_dispatch",
+                new_callable=AsyncMock,
+                return_value=None,
+            )
+            dispatch_mock = mocker.patch(
+                "app.orchestrator._dispatch_compute_experiment_directly",
+                new_callable=AsyncMock,
+                return_value="launched",
+            )
+            task_type = "compute_experiment"
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 2
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name=f"Same-Cycle {dispatch_path}",
+                    user_id=_TEST_USER,
+                    build_config={"resource_envelope": {"max_concurrent_vms": 1}},
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                now = self._naive_utcnow()
+
+                def _payload(index: int) -> dict:
+                    if task_type == "compute_experiment":
+                        return {
+                            "type": task_type,
+                            "prompt": f"compute {index}",
+                        }
+                    return {
+                        "type": task_type,
+                        "prompt": f"dispatch {index}",
+                        "branch": _DISPATCHABLE_BRANCH,
+                        "pr_number": _next_dispatchable_pr(),
+                    }
+
+                first = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    payloads=[_payload(1)],
+                    created_at=now - timedelta(minutes=2),
+                )
+                second = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    vm_instance_id=None,
+                    payloads=[_payload(2)],
+                    created_at=now - timedelta(minutes=1),
+                )
+                session.add_all([first, second])
+                await session.commit()
+                second_id = second.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        assert dispatch_mock.await_count == 1
+        async with orch_warm_db() as verify:
+            second_row = (
+                await verify.execute(_select(Task).where(Task.id == second_id))
+            ).scalar_one()
+        assert second_row.status == TaskStatus.QUEUED
+        assert "1/1 project VM slots" in (second_row.latest_status_message or "")
 
     @pytest.mark.asyncio
     async def test_malformed_payload_never_preempts_a_reversible_deferral(
