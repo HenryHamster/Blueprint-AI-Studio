@@ -662,6 +662,7 @@ def test_human_output_states_coverage_before_the_rate():
     assert "NOT A RESULT" in text
     assert "(FLOOR)" in text, "a sub-floor rate must be labelled as a floor"
     assert "AGENT_TIMEOUT" in text
+    assert "[AGENT_TIMEOUT=1]" in text
     assert "proxy-dated" in text, "the trend must warn that day assignment is proxied"
 
 

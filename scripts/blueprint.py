@@ -5135,9 +5135,17 @@ def _render_analytics_platform_kills(data: dict) -> None:
     if daily:
         print("  --- per day (kills / terminal) ---")
         for row in daily:
+            causes = ", ".join(
+                f"{kill_class}={count}"
+                for kill_class, count in sorted(
+                    (row.get("platform_kills_by_class") or {}).items()
+                )
+            )
+            cause_suffix = f"  [{causes}]" if causes else ""
             print(
                 f"  {row.get('date','?')}  {row.get('platform_kills',0):4d}"
                 f" / {row.get('terminal_tasks',0):4d}"
+                f"{cause_suffix}"
             )
 
     reasons = data.get("unclassified_reasons") or []
