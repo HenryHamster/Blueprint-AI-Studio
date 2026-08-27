@@ -1420,7 +1420,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       ...(classified ? { classified } : {}),
     };
   };
-  const flags: { timedOut: boolean; outputLimited: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; llmNoProgressHang: boolean; agentKillIssued: boolean } = { timedOut: false, outputLimited: false, providerKilledByOOM: false, stalledMidStream: false, llmNoProgressHang: false, agentKillIssued: false };
+  const flags: { timedOut: boolean; outputLimited: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; stalledMidStreamBudgetMs: number | null; llmNoProgressHang: boolean; agentKillIssued: boolean } = { timedOut: false, outputLimited: false, providerKilledByOOM: false, stalledMidStream: false, stalledMidStreamBudgetMs: null, llmNoProgressHang: false, agentKillIssued: false };
   let lastToolUseAt: number | null = null;
   let toolInFlight = false;
   // True while the in-flight top-level tool is a workflow / sub-agent fan-out
@@ -1659,6 +1659,16 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       if (stallWatchdog) clearTimeout(stallWatchdog);
       stallWatchdog = setTimeout(() => {
         if (!processGroupStillOwned()) return;
+        // Structured providers can buffer a healthy foreground command's child
+        // output until the top-level tool completes. In that state raw stdout
+        // silence is not evidence of a dead provider: toolInFlight is the
+        // authoritative state bit, and the 30/45-minute tool-use watchdog below
+        // owns its bounded silence window. Keep this shorter watchdog armed for
+        // the first period after the tool settles instead of racing that owner.
+        if (toolInFlight) {
+          resetStallWatchdog();
+          return;
+        }
         sendLog(ws, `\n[runtime] stream-stall: no stdout for >${CLAUDE_STREAM_STALL_MS / 1000}s — sending SIGTERM so wrapper can proceed to commit/push.\n`);
         const pid = originalPid;
         if (pid !== undefined) {
@@ -1706,6 +1716,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       ) {
         sendLog(ws, `\n[runtime] tool_use stall: ${workflowToolInFlight ? 'workflow ' : ''}tool in-flight with no sub-progress for >${stallBudget / 60000} min — sending SIGTERM\n`);
         flags.stalledMidStream = true;
+        flags.stalledMidStreamBudgetMs = stallBudget;
         if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
         const pid = originalPid;
         if (pid !== undefined) {
@@ -1758,10 +1769,9 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       // rate_limit).
       //
       // A genuinely hung instance is still caught: (1) the raw-stdout stall
-      // watchdog SIGTERMs after CLAUDE_STREAM_STALL_MS of ZERO bytes regardless
-      // of tool state; (2) the tool-use/workflow stall watchdog owns the
-      // in-flight case; (3) the wall-clock killTimer is the final backstop. So
-      // disabling this kill while toolInFlight cannot mask a real hang.
+      // watchdog owns provider silence when no tool is in flight; (2) the
+      // tool-use/workflow stall watchdog owns the in-flight case at its 30/45-min
+      // budget; (3) the wall-clock killTimer is the final backstop.
       const contentStale = Date.now() - lastStreamEventAt > LLM_NO_PROGRESS_STALL_MS;
       if (
         !toolInFlight &&
@@ -2428,7 +2438,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   }
   if (flags.stalledMidStream) {
     recordRunErrorReport(exitCode, 'tool_stall');
-    throw new ClaudeTimeoutError(`${runner.displayName} mid-stream tool-use stall: tool in-flight for >${TOOL_USE_STALL_TIMEOUT_MS / 60000} min without result`);
+    const firedBudgetMs = flags.stalledMidStreamBudgetMs ?? TOOL_USE_STALL_TIMEOUT_MS;
+    throw new ClaudeTimeoutError(`${runner.displayName} mid-stream tool-use stall: tool in-flight for >${firedBudgetMs / 60000} min without result`);
   }
   // Computed up here (before the no-progress branch) so the no-progress watchdog
   // can consult it: only a CONFIRMED rate-limit message blocks the account.
