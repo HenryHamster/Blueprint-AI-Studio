@@ -51,9 +51,18 @@ _UNSET: object = object()  # sentinel for unset prior_status_snapshot
 # Maximum length for the captured reason string.
 _REASON_MAX = 512
 
-
 def _extract_reason(direction: Dict[str, Any], prior_status: str | None, new_status: str | None) -> str | None:
-    """Best-effort extraction of a human-readable change reason from the dict."""
+    """Extract a human-readable reason for THIS status transition.
+
+    Only canonical reason fields written by the transition qualify.  This function
+    used to fall back to ``notes[-1]`` unconditionally, which made ``active ->
+    paused`` rows read "Auto-activated: v32 promoted - staged work resumed" (the
+    note from the direction's LAST activation, written days earlier by
+    ``directions_repo`` staged activation).  The event trail then actively
+    misdirected anyone reading it to find out why directions were parked.  A
+    nearby timestamp cannot prove causality, so ``None`` is the honest answer
+    when the transition writer recorded no reason.
+    """
     # paused_reason is the canonical field for pause-family transitions.
     if direction.get("paused_reason"):
         return str(direction["paused_reason"])[:_REASON_MAX]
@@ -61,10 +70,6 @@ def _extract_reason(direction: Dict[str, Any], prior_status: str | None, new_sta
     for key in ("retirement_reason", "retired_reason", "retire_reason"):
         if direction.get(key):
             return str(direction[key])[:_REASON_MAX]
-    # Fall back to the last note's text as the most recent change annotation.
-    notes = direction.get("notes") or []
-    if notes and isinstance(notes[-1], dict):
-        return str(notes[-1].get("text", ""))[:_REASON_MAX] or None
     return None
 
 
