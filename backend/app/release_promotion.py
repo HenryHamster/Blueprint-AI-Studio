@@ -29,6 +29,7 @@ unchanged.
 from __future__ import annotations
 
 
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -243,6 +244,13 @@ def _parse_iso_dt(raw: Any) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _coerce_verdict_detail(raw: Any) -> str | None:
+    """Normalize structured gate detail for the verdict history TEXT columns."""
+    if raw is None or isinstance(raw, str):
+        return raw
+    return json.dumps(raw, sort_keys=True, separators=(",", ":"))
 
 
 def _recover_confidence_from_ci_unresolved(
@@ -524,10 +532,12 @@ async def _record_qualification_verdict(
             # findings, and gate detail.  Keys match _finalize_qualification's
             # base_record exactly.
             migration_safety=base_record.get("migration_safety"),
-            migration_safety_detail=base_record.get("migration_safety_detail"),
+            migration_safety_detail=_coerce_verdict_detail(
+                base_record.get("migration_safety_detail")
+            ),
             migration_apply_safety=base_record.get("migration_apply_safety"),
-            migration_apply_safety_detail=base_record.get(
-                "migration_apply_safety_detail"
+            migration_apply_safety_detail=_coerce_verdict_detail(
+                base_record.get("migration_apply_safety_detail")
             ),
             audit_findings=base_record.get("audit_findings"),
             excluded_audit_findings=base_record.get("excluded_audit_findings"),

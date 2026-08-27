@@ -2273,6 +2273,7 @@ __all__ = [
     '_dimension_rows_by_dim',
     '_REUSE_PATH_PRE_GATES',
     '_live_rubric_projection',
+    '_declare_test_authorship_budget',
     '_retract_default_authorship_criterion',
     '_delete_default_authorship_criterion',
     '_clean_finalize_pre_gates',
