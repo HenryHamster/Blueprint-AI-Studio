@@ -2048,8 +2048,10 @@ class TestProjectVerificationRuntimeContract:
             [bash_executable, str(_PROJECT_VERIFICATION_PROBE), "docker-postgres"],
             capture_output=True,
             text=True,
-            # 20s, not 60: a 60s budget under the 30s lane --timeout could
-            # never fire. The probe short-circuits on the stub interpreter.
+            # 20s, not 60: 60 sits above MAX_INNER_OPERATION_SECONDS
+            # (backend/testing/test_harness_timeout_budgets.py), the ceiling at
+            # which an inner budget must declare its own marker. The probe
+            # short-circuits on the stub interpreter.
             timeout=20,
             env=env,
         )
@@ -2486,8 +2488,8 @@ def _eval_in_helper_shell(
         [bash, "-c", script],
         capture_output=True,
         text=True,
-        # Well under the 30s lane budget: this sources one small helper and
-        # echoes a single expansion.
+        # Well under MAX_INNER_OPERATION_SECONDS: this sources one small helper
+        # and echoes a single expansion.
         timeout=10,
         env=env,
     )

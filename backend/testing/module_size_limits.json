@@ -444,7 +444,8 @@
     "test_discovery_review_packet_budget.py": 2450,
     "test_test_durations_freshness.py": 1950,
     "test_workday_resident_invariants.py": 1900,
-    "test_strategic_cycle.py": 1850
+    "test_strategic_cycle.py": 1850,
+    "test_check_gate_fail_closed.py": 1750
   },
   "scripts": {
     "test_local_runner.py": 16650,

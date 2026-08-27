@@ -87,7 +87,8 @@ HISTORICALLY_LEAKING_MODULES = (
 
 AMBIENT_KEY = "ambient-operator-key"
 
-# Strictly below the 30s lane budget in test_harness_timeout_budgets.py.
+# Strictly below MAX_INNER_OPERATION_SECONDS in test_harness_timeout_budgets.py
+# -- the inner-operation ceiling, not the lane's LANE_HANG_DETECTOR_SECONDS.
 PROBE_TIMEOUT_SECONDS = 20
 
 
@@ -335,10 +336,12 @@ def test_lane_subprocess_environment_defeats_an_ambient_operator_config(
             env=env,
             capture_output=True,
             text=True,
-            # Must stay strictly under the 30s CI lane budget enforced by
-            # test_harness_timeout_budgets.py: an inner timeout at or above the
-            # outer budget means the harness kills a healthy call before this
-            # one can fire, turning a real failure into an unreproducible flake.
+            # Must stay strictly under MAX_INNER_OPERATION_SECONDS, the
+            # inner-operation ceiling enforced by test_harness_timeout_budgets.py
+            # -- NOT the lane's much larger LANE_HANG_DETECTOR_SECONDS. An inner
+            # timeout at or above the outer budget means the harness kills a
+            # healthy call before this one can fire, turning a real failure into
+            # an unreproducible flake.
             # The probe only imports blueprint_api and resolves a config; it
             # runs in well under a second.
             timeout=PROBE_TIMEOUT_SECONDS,

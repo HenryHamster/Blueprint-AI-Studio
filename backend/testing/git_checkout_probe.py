@@ -30,9 +30,11 @@ from __future__ import annotations
 import os
 import subprocess
 
-# Two orders of magnitude under the lanes' --timeout=30: this reads one ref. A
-# budget that cannot fire before the harness kills the test is the defect class
-# backend/testing/test_harness_timeout_budgets.py guards.
+# Comfortably under MAX_INNER_OPERATION_SECONDS (backend/testing/
+# test_harness_timeout_budgets.py), the ceiling at which an inner call must
+# declare its own @pytest.mark.timeout: this reads one ref. A budget that cannot
+# fire before the harness kills the test is the defect class that module guards.
+# The CEILING binds here, not the lane's far larger LANE_HANG_DETECTOR_SECONDS.
 _PROBE_TIMEOUT_SECONDS = 10
 
 

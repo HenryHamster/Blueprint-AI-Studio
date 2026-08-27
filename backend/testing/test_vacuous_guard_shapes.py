@@ -498,9 +498,9 @@ _COLLECTED: tuple[dict[str, list[str]], dict[str, dict[str, int]]] | None = None
 def _collect() -> tuple[dict[str, list[str]], dict[str, dict[str, int]]]:
     """Scan the corpus once; the three rules share the result.
 
-    Independent per-rule walks cost a multiple of the budget against a 30s lane
-    timeout. One walk per file, memoised across the three rule tests, is what
-    the ``@pytest.mark.timeout`` below is sized for.
+    Independent per-rule walks cost a multiple of the budget. One walk per file,
+    memoised across the three rule tests, is what the ``@pytest.mark.timeout``
+    below is sized for.
     """
     global _COLLECTED
     if _COLLECTED is not None:
@@ -648,11 +648,13 @@ def test_the_corpus_reaches_the_guard_implementations() -> None:
 
 # The whole backend/testing + scripts corpus (767 files) is read and AST-walked
 # once here; the two rule tests below reuse the memoised result and cost nothing.
-# Measured at 32.2s on a Windows checkout (Python 3.13), against the lanes' own
-# --timeout=30 -- so this guard CANNOT run without an explicit marker, and a
-# marker at or near the lane budget would kill a healthy run rather than a hung
-# one. 300s is ~9x the measurement, matching the headroom
-# test_size_offender_governance uses for its own corpus guard.
+# Measured at 32.2s on a Windows checkout (Python 3.13). That is above
+# MAX_INNER_OPERATION_SECONDS and was above the then-30s lane budget, so this
+# guard needs an explicit marker sized on the real cost; a marker at or near the
+# measurement would kill a healthy run rather than a hung one. 300s is ~9x the
+# measurement, matching the headroom test_size_offender_governance uses for its
+# own corpus guard. See LANE_HANG_DETECTOR_SECONDS and
+# MAX_INNER_OPERATION_SECONDS in test_harness_timeout_budgets.py.
 @pytest.mark.timeout(300)
 def test_no_corpus_scan_is_rooted_at_a_cwd_relative_literal() -> None:
     """Rule 1: a scan root must come from __file__, not from the CWD."""
@@ -882,9 +884,11 @@ def test_the_three_way_truth_table_behind_rule_2_actually_holds(tmp_path) -> Non
         "GIT_COMMITTER_EMAIL": "t@example.invalid",
     }
 
-    # 20s, not 30s: the lanes run pytest with --timeout=30, and an inner
-    # timeout AT the outer budget is the harness-budget-inversion class that
-    # testing/test_harness_timeout_budgets.py exists to catch (#17674, #17681).
+    # 20s, not 30s: 30 is MAX_INNER_OPERATION_SECONDS in
+    # testing/test_harness_timeout_budgets.py, the ceiling at or above which an
+    # inner timeout must declare its own marker -- the harness-budget-inversion
+    # class that module exists to catch (#17674, #17681). Sized against that
+    # ceiling, not against the lane's LANE_HANG_DETECTOR_SECONDS.
     # These calls touch a two-file tmp repo and finish in milliseconds.
     _GIT_STEP_TIMEOUT = 20
 

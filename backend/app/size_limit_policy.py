@@ -648,9 +648,9 @@ _CACHE_TTL_SECONDS: float = 60.0
 # ``rev-parse --verify`` for the mainline candidates, 1 ``merge-base
 # --is-ancestor``).  288 serial process spawns inside one
 # ``asyncio.to_thread``: 9.3s on an idle dev box, 16.1s inside a CI shard
-# container against that lane's 30s per-test budget, which red-lit promotion
-# PR #17977 when ordinary host jitter pushed it over.  With the memo the same
-# sweep spawns 6 processes total.
+# container against that lane's then-30s per-test budget, which red-lit
+# promotion PR #17977 when ordinary host jitter pushed it over.  With the memo
+# the same sweep spawns 6 processes total.
 #
 # The RESOLVED root is the key (never the caller's ``None``): ``_REPO_ROOT`` is
 # monkeypatched by tests and by ``--fix --repo-root``, so keying on the raw
@@ -2328,8 +2328,8 @@ def phantom_ledger_records(
     # apiece: the ancestry probe plus its nested ref lookup, the shallow-file
     # resolve, the parent count, and the diff render.  At the current ledger
     # size that is thousands of forks inside one guard call, which is what
-    # pushed this check past CI's 30s pytest-timeout (run 32805982004, backend
-    # shard 8, inside _commit_in_mainline_ancestry).  Answer all of them up
+    # pushed this check past CI's then-30s pytest-timeout (run 32805982004,
+    # backend shard 8, inside _commit_in_mainline_ancestry).  Answer all of them up
     # front in three forks instead.  Each batch falls back to its per-SHA
     # helper when git cannot read it, so no verdict — and no polarity — moves.
     beyond_log_shas = sorted(
