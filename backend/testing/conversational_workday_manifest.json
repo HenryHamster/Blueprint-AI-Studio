@@ -43,7 +43,7 @@
         "test_resident_poll_rejects_query_identity_spoof",
         "test_stale_resident_poll_is_rejected_without_generation_query"
       ],
-      "test_count": 42
+      "test_count": 48
     },
     {
       "path": "backend/testing/test_strategic_fast_live_work.py",
@@ -164,7 +164,7 @@
         "TestNotificationConfigSettings::test_strategic_session_settings",
         "TestEvergreenFillSettingsPersist::test_strategic_session_settings_persist_across_sync"
       ],
-      "test_count": 455
+      "test_count": 456
     },
     {
       "path": "backend/testing/test_agent_strategic_fetch.py",
@@ -342,7 +342,7 @@
       "test_ids": [
         "TestLlmCliBackendProbe::test_bwrap_backend_probes_the_exact_agent_plan_when_available"
       ],
-      "test_count": 710
+      "test_count": 711
     },
     {
       "path": "agent/src/index.provider-runner.test.ts",
@@ -719,7 +719,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 136
+      "test_count": 139
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
