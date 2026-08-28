@@ -67,6 +67,42 @@ export BLUEPRINT_ACTIONS_VM_STATE="$HOME/.blueprint/github-actions-vm"
 ./scripts/install-github-actions-vm.sh guest-status
 ```
 
+### Durable host control
+
+An existing prepared guest can be bound to a user systemd service without
+rebuilding or replacing its overlay. Select the canonical state directory and
+the dedicated guest key, then install the control profile from the durable
+Blueprint checkout:
+
+```bash
+export BLUEPRINT_ACTIONS_VM_STATE=/srv/data/containers/blueprint/github-actions-vm
+export BLUEPRINT_ACTIONS_VM_SSH_KEY="$HOME/.ssh/blueprint-actions-vm.pub"
+export BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY="$HOME/.ssh/blueprint-actions-vm"
+./scripts/install-github-actions-vm.sh install-control
+```
+
+`install-control` verifies the existing state, host image identity, KVM device,
+and non-symlinked key files. It writes only paths and resource settings to the
+mode-0600 `~/.blueprint/github-actions-vm-control.env`, installs and enables the
+user unit, and deliberately does not start or restart the guest. The invoking
+checkout path is recorded in the profile, so run it from the durable checkout,
+not an expendable worktree.
+
+After proving that no Actions job is active, the installed control surface is:
+
+```bash
+systemctl --user start blueprint-actions-vm.service
+systemctl --user status blueprint-actions-vm.service
+systemctl --user stop blueprint-actions-vm.service
+```
+
+The service uses the launcher's `recover` action. Recovery is idempotent when
+both containers are running. It can remove and recreate only stopped known
+containers; a running guest without its firewall sidecar, or any paused,
+restarting, or removing state, fails closed for operator diagnosis. The
+overlay, seed, and base image remain regular-file-only inputs under the
+canonical state root.
+
 The guest checks storage pressure every 15 minutes. Below 70% filesystem usage
 and with at least 30 GiB free it makes no changes. Under pressure it handles
 only the four allowlisted runner daemons. For each slot it freezes the runner
