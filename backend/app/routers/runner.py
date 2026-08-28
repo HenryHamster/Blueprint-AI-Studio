@@ -2646,7 +2646,7 @@ async def next_compute_job(
         except Exception:
             logger.warning(
                 "[RUNNERS] Failed to mint repo token for compute job %s; "
-                "runner will execute without a repo checkout",
+                "runner will fail closed before checkout or command execution",
                 job.id,
             )
 
