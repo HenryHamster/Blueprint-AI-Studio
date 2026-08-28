@@ -2688,10 +2688,14 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
-  it('abandons once after the replacement also omits receipt-bound completion', async () => {
+  it('hands the same batch to Workday after replacement omits receipt-bound completion', async () => {
     const operatorMessage = {
       id: 'typed-fast-missing-completion-twice', content: 'Can you answer now?',
       created_at: new Date().toISOString(), from_type: 'user',
+    };
+    const legacyMessage = {
+      id: 'activity-row-in-same-page', content: 'Include this separate activity row.',
+      created_at: new Date().toISOString(), from_type: 'system',
     };
     let abandoned = false;
     let workdayAlive = true;
@@ -2709,7 +2713,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       messagePolls += 1;
       return Promise.resolve(messagePolls === 1
         ? { messages: [], fast_message_ids: [] }
-        : { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
+        : { messages: [operatorMessage, legacyMessage], fast_message_ids: [operatorMessage.id] });
     });
     mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
       if (url.includes('/strategic-session/heartbeat')) return Promise.resolve({ authority_held: true });
@@ -2726,7 +2730,6 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       }
       if (url.endsWith('/conversation/turns/abandon')) {
         abandoned = true;
-        workdayAlive = false;
         return Promise.resolve({ status: 'abandoned', legacy_fallback_admissible: true });
       }
       if (url.endsWith('/typed-fast-lease/release')) {
@@ -2738,10 +2741,19 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
       receipt, result: turnResult(), completion: null, workdayRequests: [],
     }));
-    mockStartSession.mockReturnValue(makeSession(
-      () => Promise.resolve(turnResult()),
+    const workday = makeSession(
+      (prompt) => {
+        expect(JSON.stringify(prompt)).toContain(operatorMessage.content);
+        expect(JSON.stringify(prompt)).toContain(legacyMessage.content);
+        workdayAlive = false;
+        return Promise.resolve(turnResult({
+          resultText: 'Legacy Workday answered after Fast released ownership.',
+          sentOperatorMessage: true,
+        }));
+      },
       () => workdayAlive,
-    ));
+    );
+    mockStartSession.mockReturnValue(workday);
 
     await run('typed-fast-missing-completion-twice', qualifiedPayload(), statusRef);
 
@@ -2757,11 +2769,73 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       url.endsWith('/conversation/turns/complete'))).toHaveLength(0);
     expect(mockApiPost.mock.calls.filter(([url]) =>
       url.endsWith('/conversation/turns/abandon'))).toHaveLength(1);
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    const replyPost = mockApiPost.mock.calls.find(([, body]) => body?.op === 'create_message');
+    expect((replyPost?.[1]?.data as Record<string, unknown>).covered_message_ids).toEqual([
+      operatorMessage.id,
+      legacyMessage.id,
+    ]);
     const respondingIndex = statusChanges.indexOf('Responding to operator...');
     expect(respondingIndex).toBeGreaterThanOrEqual(0);
-    expect(statusChanges.slice(respondingIndex + 1)).not.toContain(
-      'Resident ready — waiting for operator input',
+  });
+
+  it('keeps Workday fenced when Fast abandonment is not confirmed fallback-admissible', async () => {
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'typed-fast-unconfirmed-abandon', content: 'Do not create a competing reply owner.',
+      created_at: new Date().toISOString(), from_type: 'user',
+    };
+    let abandonAttempted = false;
+    let workdayAlive = true;
+    let claimCount = 0;
+    let messagePolls = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (!url.includes('/messages?') || abandonAttempted) return Promise.resolve({ messages: [] });
+      messagePolls += 1;
+      return Promise.resolve(messagePolls === 1
+        ? { messages: [], fast_message_ids: [] }
+        : { messages: [operatorMessage], fast_message_ids: [operatorMessage.id] });
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('/strategic-session/heartbeat')) return Promise.resolve({ authority_held: true });
+      if (url.endsWith('/typed-fast-lease/acquire')) {
+        return Promise.resolve({ acquired: true, lease: { lease_id: 'lease-unconfirmed', generation: 1 } });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        claimCount += 1;
+        return Promise.resolve({
+          claim_id: 'claim-unconfirmed', owner: 'fast',
+          message_ids: [operatorMessage.id],
+          envelope: typedEnvelope(operatorMessage.content, 203, operatorMessage.id),
+        });
+      }
+      if (url.endsWith('/conversation/turns/abandon')) {
+        abandonAttempted = true;
+        workdayAlive = false;
+        return Promise.resolve({ status: 'abandoned', legacy_fallback_admissible: false });
+      }
+      if (url.endsWith('/typed-fast-lease/release')) return Promise.resolve({ released: true });
+      return Promise.resolve({});
+    });
+    typedFastMocks.abandonDispositionWithConfirmation.mockReturnValue('deferred');
+    typedFastMocks.dispatch.mockImplementation((receipt: unknown) => Promise.resolve({
+      receipt, result: turnResult(), completion: null, workdayRequests: [],
+    }));
+    const workday = makeSession(
+      () => Promise.resolve(turnResult({ sentOperatorMessage: true })),
+      () => workdayAlive,
     );
+    mockStartSession.mockReturnValue(workday);
+
+    const done = run('typed-fast-unconfirmed-abandon');
+    await vi.advanceTimersByTimeAsync(2_000);
+    await done;
+
+    expect(claimCount).toBe(1);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    expect(mockApiPost.mock.calls.filter(([url]) =>
+      url.endsWith('/conversation/turns/abandon'))).toHaveLength(1);
+    expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
   it('replaces invalid Fast staging and completes the same exact claim', async () => {

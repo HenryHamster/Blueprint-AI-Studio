@@ -4317,6 +4317,7 @@ export async function handleStrategicResident(
   type TypedFastTurnOutcome =
     | 'completed'
     | 'completed_with_workday_request'
+    | 'fallback_admissible'
     | 'deferred'
     | 'not_available'
     | 'displaced_workday_claim_lost';
@@ -4602,6 +4603,7 @@ export async function handleStrategicResident(
     typedFastDispatching = true;
     let claimId = '';
     let claimReleased = false;
+    let fastProviderDispatchAttempted = false;
     try {
       const claimed = await apiPost(
         `/api/agent/projects/${projectId}/conversation/turns/claim`,
@@ -4708,6 +4710,7 @@ export async function handleStrategicResident(
         activeTypedReplyStreamer = replyStreamer;
         let terminal: 'failed' | 'abandoned' | undefined = 'failed';
         try {
+          fastProviderDispatchAttempted = true;
           const turnPromise = typedController.dispatch(receipt, prompt).then(
             value => ({ status: 'fulfilled' as const, value }),
             (reason: unknown) => ({ status: 'rejected' as const, reason }),
@@ -4857,9 +4860,12 @@ export async function handleStrategicResident(
       }
       if (claimReleased) {
         clearTypedConversationClaim(false);
-        return displacedWorkdayClaimLost
-          ? 'displaced_workday_claim_lost'
-          : 'not_available';
+        if (displacedWorkdayClaimLost) return 'displaced_workday_claim_lost';
+        if (fastProviderDispatchAttempted) {
+          typedFastPreviousStatus = null;
+          return 'fallback_admissible';
+        }
+        return 'not_available';
       }
       return 'deferred';
     } finally {
@@ -4882,14 +4888,20 @@ export async function handleStrategicResident(
   ): Promise<'stop' | 'continue'> => {
     const partition = partitionInboundMessages(msgs);
     const fastMessages = partition.fast;
-    const workdayMessages = partition.workday;
     // Fast is the typed public-reply owner.  Do not silently fall through to
     // the ordinary Workday reply path if it is unavailable or needs research:
     // that would reintroduce two competing conversational owners.
     const typedOutcome = fastMessages.length > 0
       ? await tryHandleTypedFastTurn(fastMessages)
       : 'not_available';
-    if (typedOutcome !== 'not_available') {
+    // Once Coordinator confirms the exact Fast claim was abandoned and legacy
+    // fallback is admissible, there is no competing public owner. Hand the
+    // whole originally admitted page to Workday so a mixed page cannot strand
+    // rows outside Fast when the admission cursor advances.
+    const workdayMessages = typedOutcome === 'fallback_admissible'
+      ? msgs
+      : partition.workday;
+    if (typedOutcome !== 'not_available' && typedOutcome !== 'fallback_admissible') {
       if (typedFastTurnCompleted(typedOutcome)) {
         const completedMessageIds = new Set(lastTypedFastCompletedMessageIds);
         const newerFastMessages = fastMessages.filter(message => (
@@ -4948,7 +4960,7 @@ export async function handleStrategicResident(
         return 'continue';
       }
     }
-    if (fastMessages.length > 0) {
+    if (fastMessages.length > 0 && typedOutcome !== 'fallback_admissible') {
       // Fast is the sole public owner for canonical conversation.  Falling
       // through to the broad Workday process here lets a greeting become a
       // project-tool/autonomy turn — exactly the split-brain behavior the
