@@ -24,6 +24,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from sqlalchemy import select
+
 from app import release_drift_sentinel_alerts as drift_alerts
 from app import release_version
 from app.database import AsyncSessionLocal
@@ -59,6 +61,225 @@ _DRIFT_SENTINEL_RERUN_BUDGET = 1
 _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY = "_drift_sentinel_cancelled_redispatch"
 _DRIFT_SENTINEL_CANCELLED_REDISPATCH_COOLDOWN_SECONDS = 30 * 60
 _DRIFT_SENTINEL_TERMINAL_DISPATCH_KEY = "_drift_sentinel_terminal_dispatch"
+_DRIFT_SENTINEL_INHERITED_TREE_KEY = "_drift_sentinel_inherited_tree"
+
+
+def _inherited_tree_receipt_active(
+    receipt: dict | None,
+    *,
+    version,
+    predecessor,
+    integration_branch: str,
+    promotion_target: str,
+    github_owner: str,
+    github_repo: str,
+    head_sha: str,
+) -> bool:
+    """Return whether a durable receipt exactly covers this sentinel HEAD."""
+
+    if not isinstance(receipt, dict):
+        return False
+    return (
+        receipt.get("kind") == "drift_sentinel_inherited_tree"
+        and receipt.get("open_version_id") == str(version.id)
+        and receipt.get("promoted_version_id") == str(predecessor.id)
+        and receipt.get("promoted_version_number") == predecessor.version_number
+        and receipt.get("integration_branch") == integration_branch
+        and receipt.get("promotion_target") == promotion_target
+        and receipt.get("github_owner") == github_owner
+        and receipt.get("github_repo") == github_repo
+        and receipt.get("head_sha") == head_sha
+        and receipt.get("candidate_sha") == predecessor.candidate_sha
+        and receipt.get("promoted_sha") == predecessor.promoted_sha
+        and receipt.get("head_parents")
+        == [predecessor.candidate_sha, predecessor.promoted_sha]
+        and isinstance(receipt.get("tree_sha"), str)
+        and len(receipt["tree_sha"]) == 40
+        and receipt.get("promotion_pr_merge_commit_sha") == predecessor.promoted_sha
+        and receipt.get("promotion_pr_empty_diff") is False
+        and receipt.get("promotion_ci_event") == "pull_request"
+        and receipt.get("promotion_ci_head_sha") == predecessor.candidate_sha
+        and receipt.get("promotion_ci_head_branch")
+        == f"release-v{predecessor.version_number}"
+        and receipt.get("promotion_ci_status") == "completed"
+        and receipt.get("promotion_ci_conclusion") == "success"
+        and type(receipt.get("promotion_pr_number")) is int
+        and receipt["promotion_pr_number"] > 0
+        and type(receipt.get("promotion_ci_run_id")) is int
+        and receipt["promotion_ci_run_id"] > 0
+    )
+
+
+async def _resolve_inherited_tree_receipt(
+    session,
+    *,
+    project,
+    version,
+    integration_branch: str,
+    promotion_target: str,
+    head_sha: str,
+) -> dict | None:
+    """Prove an exact automatic back-merge inherited qualified Git trees.
+
+    This is sentinel-only evidence.  It never participates in qualification or
+    promotion and returns ``None`` on every missing, malformed, or ambiguous
+    input so the caller falls through to the established full-CI dispatch.
+    """
+    from app import github, release_qualifier
+    from app.project_telemetry import read_telemetry
+
+    if not github.is_full_commit_sha(head_sha) or version.version_number <= 1:
+        return None
+    predecessor = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion).where(
+                    release_version.ReleaseVersion.project_id == version.project_id,
+                    release_version.ReleaseVersion.version_number
+                    == version.version_number - 1,
+                    release_version.ReleaseVersion.status == "promoted",
+                )
+            )
+        )
+        .scalars()
+        .one_or_none()
+    )
+    if predecessor is None:
+        return None
+    candidate_sha = predecessor.candidate_sha or ""
+    promoted_sha = predecessor.promoted_sha or ""
+    if not (
+        github.is_full_commit_sha(candidate_sha)
+        and github.is_full_commit_sha(promoted_sha)
+    ):
+        return None
+
+    resolved = await release_qualifier._resolve_github_with_session(session, project)
+    if resolved is None:
+        return None
+    token, owner, repo = resolved
+
+    prior_receipt = await read_telemetry(
+        session,
+        version.project_id,
+        _DRIFT_SENTINEL_INHERITED_TREE_KEY,
+    )
+    if _inherited_tree_receipt_active(
+        prior_receipt,
+        version=version,
+        predecessor=predecessor,
+        integration_branch=integration_branch,
+        promotion_target=promotion_target,
+        github_owner=owner,
+        github_repo=repo,
+        head_sha=head_sha,
+    ) and github.is_full_commit_sha(prior_receipt.get("tree_sha")):
+        return prior_receipt
+
+    head_identity = await github.get_git_commit_identity(
+        token,
+        owner,
+        repo,
+        head_sha,
+        project_id=str(version.project_id),
+    )
+    if (
+        head_identity is None
+        or head_identity.get("sha") != head_sha
+        or head_identity.get("parents") != [candidate_sha, promoted_sha]
+    ):
+        return None
+    candidate_identity = await github.get_git_commit_identity(
+        token,
+        owner,
+        repo,
+        candidate_sha,
+        project_id=str(version.project_id),
+    )
+    promoted_identity = await github.get_git_commit_identity(
+        token,
+        owner,
+        repo,
+        promoted_sha,
+        project_id=str(version.project_id),
+    )
+    tree_sha = head_identity.get("tree_sha")
+    if (
+        candidate_identity is None
+        or promoted_identity is None
+        or candidate_identity.get("sha") != candidate_sha
+        or promoted_identity.get("sha") != promoted_sha
+        or not github.is_full_commit_sha(tree_sha)
+        or candidate_identity.get("tree_sha") != tree_sha
+        or promoted_identity.get("tree_sha") != tree_sha
+    ):
+        return None
+
+    promotion_receipt = await release_qualifier._resolve_exact_promotion_receipt(
+        token,
+        owner,
+        repo,
+        candidate_sha,
+        predecessor,
+        project=project,
+    )
+    if (
+        not isinstance(promotion_receipt, dict)
+        or promotion_receipt.get("empty_diff") is not False
+        or promotion_receipt.get("merge_commit_sha") != promoted_sha
+        or type(promotion_receipt.get("pr_number")) is not int
+        or promotion_receipt["pr_number"] <= 0
+    ):
+        return None
+
+    release_branch = f"release-v{predecessor.version_number}"
+    promotion_ci = await github.get_workflow_run_for_sha(
+        token,
+        owner,
+        repo,
+        candidate_sha,
+        workflow_file="ci.yml",
+        project_id=str(version.project_id),
+    )
+    if (
+        not isinstance(promotion_ci, dict)
+        or promotion_ci.get("head_sha") != candidate_sha
+        or promotion_ci.get("event") != "pull_request"
+        or promotion_ci.get("head_branch") != release_branch
+        or promotion_ci.get("status") != "completed"
+        or promotion_ci.get("conclusion") != "success"
+        or type(promotion_ci.get("run_id")) is not int
+        or promotion_ci["run_id"] <= 0
+    ):
+        return None
+
+    return {
+        "kind": "drift_sentinel_inherited_tree",
+        "open_version_id": str(version.id),
+        "promoted_version_id": str(predecessor.id),
+        "promoted_version_number": predecessor.version_number,
+        "integration_branch": integration_branch,
+        "promotion_target": promotion_target,
+        "github_owner": owner,
+        "github_repo": repo,
+        "head_sha": head_sha,
+        "head_parents": [candidate_sha, promoted_sha],
+        "candidate_sha": candidate_sha,
+        "promoted_sha": promoted_sha,
+        "tree_sha": tree_sha,
+        "promotion_pr_number": promotion_receipt["pr_number"],
+        "promotion_pr_url": promotion_receipt.get("pr_url") or "",
+        "promotion_pr_merge_commit_sha": promoted_sha,
+        "promotion_pr_empty_diff": False,
+        "promotion_ci_run_id": promotion_ci["run_id"],
+        "promotion_ci_url": promotion_ci.get("html_url") or "",
+        "promotion_ci_event": "pull_request",
+        "promotion_ci_head_sha": candidate_sha,
+        "promotion_ci_head_branch": release_branch,
+        "promotion_ci_status": "completed",
+        "promotion_ci_conclusion": "success",
+        "recorded_at": _utcnow().isoformat(),
+    }
 
 
 def _drift_sentinel_cancelled_redispatch_due(
@@ -139,7 +360,10 @@ async def _check_full_suite_drift_sentinel(
         terminal_promotion_ci_dispatch_receipt,
         terminal_promotion_ci_dispatch_receipt_active,
     )
-    from app.release_readiness import PROMOTION_CI_GREEN_STATES, compute_promotion_ci_green_gate
+    from app.release_readiness import (
+        PROMOTION_CI_GREEN_STATES,
+        compute_promotion_ci_green_gate,
+    )
     from app.release_reconciliation import _harvest_promotion_ci_failures
 
     factory = session_factory or AsyncSessionLocal
@@ -189,7 +413,9 @@ async def _check_full_suite_drift_sentinel(
                 await session.commit()
                 return True
 
-            integration_branch, _ = release_qualifier._lts_branch_names(project)
+            integration_branch, promotion_target = release_qualifier._lts_branch_names(
+                project
+            )
             expected_suppression_key = (
                 f"{project.github_owner or ''}/{project.github_repo or ''}:"
                 f"ci.yml:{integration_branch}:{head_sha}"
@@ -225,6 +451,81 @@ async def _check_full_suite_drift_sentinel(
                         ),
                     }
                     gate_state = "dispatch_rejected"
+
+            if gate_state in {"no_signal", "cancelled"}:
+                # A promotion back-merge can make the new integration HEAD a
+                # different commit with the exact tree already covered by
+                # canonical promotion CI. Accept that inheritance only after
+                # every lineage, tree, PR, and CI identity is proven; any
+                # absence or ambiguity falls through to the established
+                # initial or post-cancellation full-suite dispatch below.
+                inherited_receipt = None
+                try:
+                    inherited_receipt = await _resolve_inherited_tree_receipt(
+                        session,
+                        project=project,
+                        version=version,
+                        integration_branch=integration_branch,
+                        promotion_target=promotion_target,
+                        head_sha=head_sha,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[DRIFT_SENTINEL] inherited-tree proof failed for "
+                        "project %s HEAD %s",
+                        version.project_id,
+                        head_sha[:8] if head_sha else "?",
+                    )
+                if inherited_receipt is not None:
+                    try:
+                        await upsert_telemetry(
+                            session,
+                            version.project_id,
+                            _DRIFT_SENTINEL_INHERITED_TREE_KEY,
+                            inherited_receipt,
+                        )
+                        await session.commit()
+                    except Exception:
+                        logger.exception(
+                            "[DRIFT_SENTINEL] inherited-tree receipt persist "
+                            "failed for project %s HEAD %s",
+                            version.project_id,
+                            head_sha[:8] if head_sha else "?",
+                        )
+                        await session.rollback()
+                        # Rollback expires every ORM object in the async session.
+                        # Re-load both rows before falling through to the normal
+                        # full-suite dispatch path; an early return here would
+                        # suppress the fail-closed evidence fallback.
+                        version = await session.get(
+                            release_version.ReleaseVersion, version_id
+                        )
+                        if version is None or version.status != "open":
+                            return False
+                        project = await session.get(Project, version.project_id)
+                        if project is None:
+                            return False
+                    else:
+                        await _retire_sentinel_incidents(
+                            session,
+                            version.project_id,
+                            states=drift_alerts.ALL_STATES,
+                            reason=(
+                                "integration HEAD inherited the canonical "
+                                "qualified promotion tree at "
+                                f"{head_sha[:12]}"
+                            ),
+                        )
+                        logger.info(
+                            "[DRIFT_SENTINEL] accepted exact qualified-tree "
+                            "inheritance for project %s HEAD %s from v%s "
+                            "promotion CI run %s",
+                            version.project_id,
+                            head_sha[:8],
+                            inherited_receipt["promoted_version_number"],
+                            inherited_receipt["promotion_ci_run_id"],
+                        )
+                        return False
 
             if gate_state == "no_signal":
                 if gate.get("gate_state") == "no_signal":
@@ -308,7 +609,10 @@ async def _check_full_suite_drift_sentinel(
                             head_sha[:8] if head_sha else "?",
                         )
                         return True
-                    if gate_state in PROMOTION_CI_GREEN_STATES or gate_state == "pending":
+                    if (
+                        gate_state in PROMOTION_CI_GREEN_STATES
+                        or gate_state == "pending"
+                    ):
                         # A full matrix passed for the HEAD, or one is in flight —
                         # nothing left to do; the sentinel reads it next sweep.
                         if gate_state in PROMOTION_CI_GREEN_STATES:
@@ -355,8 +659,7 @@ async def _check_full_suite_drift_sentinel(
                             "cancels in-flight integration-branch runs). "
                             "A fresh run will be re-dispatched after the "
                             "cooldown window, so a quiet HEAD can still "
-                            "reach green."
-                            + (f" Run: {run_url}." if run_url else "")
+                            "reach green." + (f" Run: {run_url}." if run_url else "")
                         ),
                     )
                     await session.commit()
