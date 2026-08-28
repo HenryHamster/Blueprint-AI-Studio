@@ -703,6 +703,7 @@
   "testing/test_admin_compute_jobs.py::test_viewable_artifacts_descriptor_preserves_pdf_and_svg_kinds": 0.0021340390012483113,
   "testing/test_admin_create_task.py::test_ambiguous_repo_prefers_writable_project_over_viewer_one": 0.7475789229993097,
   "testing/test_admin_create_task.py::test_compute_experiment_rejected_at_creation": 0.22377042500193056,
+  "testing/test_admin_create_task.py::test_exact_admission_rejects_payload_and_dependency_retargeting": 0.7622650000266731,
   "testing/test_admin_create_task.py::test_explicit_base_branch_preserved": 0.34968689900051686,
   "testing/test_admin_create_task.py::test_hotfix_create_task_rejected_with_400": 0.18848035199880542,
   "testing/test_admin_create_task.py::test_hotfix_fix_task_rejected_with_400": 0.1851945850012271,

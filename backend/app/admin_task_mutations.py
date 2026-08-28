@@ -1337,6 +1337,30 @@ async def modify_task_apply(
             task = locked_task
             task_locked_for_generic_mutation = True
 
+    creation_authority = (task.context or {}).get(
+        OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY
+    )
+    if isinstance(creation_authority, dict):
+        exact_authority_changes: list[str] = []
+        if "payloads" in payload and payload["payloads"] != task.payloads:
+            exact_authority_changes.append("payloads")
+        if "depends_on" in payload:
+            proposed_depends_on = (
+                payload["depends_on"]
+                if isinstance(payload["depends_on"], list)
+                else []
+            )
+            if proposed_depends_on != list(task.depends_on or []):
+                exact_authority_changes.append("depends_on")
+        if exact_authority_changes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Generic task mutation cannot rewrite exact operator "
+                    "admission authority: " + ", ".join(exact_authority_changes)
+                ),
+            )
+
     # A backend sidecar is an independent grader only while its frozen prompt,
     # delivery topology, and complete context remain backend-authored. Blocking
     # only the obvious source/verdict keys is insufficient: a project member
