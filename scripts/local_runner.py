@@ -4376,9 +4376,12 @@ def _reap_loop(
                     # periodic inactive-workspace sweep below retains a bounded
                     # 60s grace and remains the single cleanup authority.
 
-                # Wall-clock deadline: an agent that never exits (wedged tool, runaway
-                # loop) must not hold a capacity permit forever. Mirror the compute
-                # deadline machinery. Remove under the lock; terminate outside it
+                # Wall-clock deadline: an ordinary agent that never exits (wedged
+                # tool, runaway loop) must not hold a capacity permit forever. A
+                # Resident is intentionally process-lifetime-bound and uses its
+                # server-authoritative session lease/heartbeat for liveness, so its
+                # start marker is None and the generic task ceiling does not apply.
+                # Remove under the lock; terminate outside it
                 # (terminate_process_tree can block up to its SIGTERM→SIGKILL grace).
                 if agent_started_at is not None and agent_max_seconds:
                     for tid, proc in list(active_tasks.items()):
@@ -10013,7 +10016,12 @@ def _spawn_agent_task(
 
     with lock:
         active_tasks[task_id] = proc
-        agent_started_at[task_id] = time.monotonic()
+        # Resident sessions are deliberately long-lived. Their server-vended
+        # identity is authoritative and their lease/heartbeat path owns failure
+        # detection and fenced recovery, so the ordinary per-task wall-clock
+        # ceiling must not terminate them. None is an explicit exemption marker
+        # consumed by _reap_loop; every ordinary task retains its monotonic start.
+        agent_started_at[task_id] = None if resident_session else time.monotonic()
         # Parallel map keyed by task_id: the reaper/shutdown teardown needs the
         # backend + container_name to issue `docker stop` for the docker backend
         # (bwrap → container_name None → group-signal only). Mirrors compute.
@@ -10357,8 +10365,10 @@ def main() -> None:
 
     # Shared state
     active_tasks: dict[str, subprocess.Popen] = {}
-    # Per-agent monotonic start time, for the reaper's wall-clock deadline (I4).
-    agent_started_at: dict[str, float] = {}
+    # Per-agent monotonic start time for the ordinary task wall-clock deadline
+    # (I4). Server-authorized Resident sessions use None: their persisted
+    # session lease/heartbeat and generation fencing own liveness and recovery.
+    agent_started_at: dict[str, float | None] = {}
     # Per-agent (backend, container_name) so the reaper/shutdown teardown can issue
     # `docker stop` for the docker backend instead of leaking the container (bwrap
     # tasks map to (BACKEND_BWRAP, None) → group-signal only). Keyed by task_id.
