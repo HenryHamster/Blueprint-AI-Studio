@@ -5411,7 +5411,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         });
       }
       if (url.endsWith('/messages/claim')) {
-        const messageIds = body.message_ids as string[];
+        const messageIds = body?.message_ids as string[];
         return Promise.resolve({
           claim_id: messageIds.includes(fastMessage.id)
             ? 'claim-fast-workday-fallback'
@@ -8523,7 +8523,7 @@ describe('handleStrategicResident - failed-turn recovery', () => {
         if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
         return Promise.resolve(null);
       });
-      mockApiPost.mockImplementation((url: string, body: Record<string, unknown> = {}) => {
+      mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
         if (url.includes('/heartbeat')) {
           heartbeatCount += 1;
           if (heartbeatCount === 1) {
