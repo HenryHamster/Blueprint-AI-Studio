@@ -434,6 +434,41 @@ async def test_has_active_strategic_task_false_with_no_tasks(tl_db):
     assert await _has_active_strategic_task(project.id, session) is False
 
 
+@pytest.mark.asyncio
+async def test_paused_override_does_not_weaken_default_or_archive_guard(tl_db):
+    """Only the explicit override bypasses pause; archive always blocks."""
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.paused = True
+    session.add(project)
+    await session.commit()
+    project_id = project.id
+
+    assert await _has_active_strategic_task(project_id, session) is True
+    await session.rollback()
+    assert (
+        await _has_active_strategic_task(
+            project_id,
+            session,
+            allow_paused_project=True,
+        )
+        is False
+    )
+    await session.rollback()
+
+    project.archived = True
+    session.add(project)
+    await session.commit()
+    assert (
+        await _has_active_strategic_task(
+            project_id,
+            session,
+            allow_paused_project=True,
+        )
+        is True
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _increment_research_spawn_count
 # ══════════════════════════════════════════════════════════════════════════════

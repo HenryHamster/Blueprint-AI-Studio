@@ -2941,6 +2941,7 @@ async def _spawn_resident_strategic_task(
     session_summary: str | None = None,
     decisions_register: str | None = None,
     blacklisted_accounts: list[str] | None = None,
+    allow_paused_project: bool = False,
 ) -> Task | None:
     """Spawn a fresh ``strategic_review`` task via the canonical spawn path.
 
@@ -3010,6 +3011,7 @@ async def _spawn_resident_strategic_task(
         resident_minimal=True,
         task_priority=RESIDENT_TASK_PRIORITY,
         launched_by_user_id=str(operator_user_id),
+        allow_paused_project=allow_paused_project,
     )
     # Recover ONLY the task born from this exact session/generation claim. A
     # cadence task can appear after the pre-claim adoption hint and make the
@@ -3549,6 +3551,7 @@ def _arm_and_finalize_vision(
     finalized["worker_state"] = "ready"
     finalized["updated_at"] = _utcnow().isoformat()
     vision[RESIDENT_SESSION_KEY] = finalized
+    vision.pop(RESIDENT_SESSION_REASON_KEY, None)
     return True
 
 
@@ -3583,6 +3586,7 @@ def _arm_and_finalize_vision_no_runner(
     finalized = dict(current)
     finalized["updated_at"] = _utcnow().isoformat()
     vision[RESIDENT_SESSION_KEY] = finalized
+    vision.pop(RESIDENT_SESSION_REASON_KEY, None)
     return True
 
 
@@ -3834,6 +3838,7 @@ async def start_resident_session(
     expected_recovery_identity: tuple[str, str, int] | None = None,
     expected_interaction_mode: str | None = None,
     allow_no_runner: bool = False,
+    allow_paused_project: bool = False,
 ) -> dict[str, Any]:
     """Start (or return the already-running) resident strategic session.
 
@@ -3878,7 +3883,23 @@ async def start_resident_session(
     # still live is returned as-is (no new session, no spawn). Correctness still
     # rests on the atomic claim below; this only spares the row lock for the
     # common "operator re-opens a running session" case.
-    existing = read_resident_session(project.vision)
+    initial_vision = dict(project.vision or {})
+    existing = read_resident_session(initial_vision)
+    had_reason_at_start = RESIDENT_SESSION_REASON_KEY in initial_vision
+    reason_at_start = initial_vision.get(RESIDENT_SESSION_REASON_KEY)
+    existing_identity_at_start: tuple[str, str | None, int] | None = None
+    if isinstance(existing, dict):
+        try:
+            existing_generation_at_start = int(
+                existing.get("worker_generation") or 1
+            )
+        except (TypeError, ValueError):
+            existing_generation_at_start = 1
+        existing_identity_at_start = (
+            str(existing.get("session_id")),
+            str(existing.get("task_id")) if existing.get("task_id") else None,
+            existing_generation_at_start,
+        )
     stale_predecessor: tuple[str, str | None, int] | None = None
     # Carry the persisted exam ledger forward across a session restart. A real
     # restart ENDS the prior resident task and starts a NEW session on a fresh
@@ -3937,6 +3958,7 @@ async def start_resident_session(
         if (
             expected_interaction_mode is None
             and _resident_worker_task_is_healthy(live, existing, now)
+            and not had_reason_at_start
         ):
             existing_runner_id = str(existing.get("runner_id") or "").strip()
             requested_runner_id = str(runner_id or "").strip()
@@ -4044,7 +4066,11 @@ async def start_resident_session(
             )
         vision = dict(locked_project.vision or {})
         fresh = read_resident_session(vision)
-        if expected_interaction_mode is not None:
+        if locked_project.archived:
+            decision["mode"] = "project_archived"
+        elif locked_project.paused and not allow_paused_project:
+            decision["mode"] = "project_paused"
+        if decision["mode"] is None and expected_interaction_mode is not None:
             if expected_interaction_mode != "continuous":
                 raise ValueError(
                     "expected_interaction_mode only supports 'continuous'"
@@ -4175,11 +4201,31 @@ async def start_resident_session(
                         worker_generation=fresh_generation,
                     )
 
+        if (
+            decision["mode"] == "existing"
+            and had_reason_at_start
+            and fresh_identity == existing_identity_at_start
+            and RESIDENT_SESSION_REASON_KEY in vision
+            and vision.get(RESIDENT_SESSION_REASON_KEY) == reason_at_start
+        ):
+            # Compare-and-clear only the reason observed by this successful
+            # idempotent start. A reason written or changed by a concurrent
+            # blocked attempt remains authoritative.
+            vision.pop(RESIDENT_SESSION_REASON_KEY, None)
+            await with_vision_locked(
+                session,
+                project.id,
+                lambda current: _replace_vision(current, vision),
+                _locked_project=locked_project,
+            )
+
         if decision["mode"] in {
             "existing",
             "recovery_superseded",
             "ensure_mode_changed",
             "runner_mismatch",
+            "project_archived",
+            "project_paused",
         }:
             pass
         elif runner_block is not None:
@@ -4343,6 +4389,13 @@ async def start_resident_session(
         # A concurrent start owns (or is mid-starting) the session — return it.
         await _repair_stale_message_handoffs_after_ensure(session, project.id)
         return snapshot
+
+    if decision["mode"] in {"project_archived", "project_paused"}:
+        state = "archived" if decision["mode"] == "project_archived" else "paused"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Project is {state}; Resident start is blocked",
+        )
 
     if decision["mode"] == "blocked":
         # The selected/auto-picked device is unavailable and we are not backing
@@ -4595,11 +4648,16 @@ async def start_resident_session(
                 session_summary=carried_session_summary,
                 decisions_register=carried_decisions_register,
                 blacklisted_accounts=carried_blacklisted_accounts,
+                allow_paused_project=allow_paused_project,
             )
             if task is None:
                 from app.task_lifecycle import _has_active_strategic_task
 
-                if await _has_active_strategic_task(project.id, session):
+                if await _has_active_strategic_task(
+                    project.id,
+                    session,
+                    allow_paused_project=allow_paused_project,
+                ):
                     raise _ResidentCycleInFlight()
                 raise HTTPException(status_code=409, detail="No strategic_review task available to host a resident session")
             spawned_task_id = task.id
