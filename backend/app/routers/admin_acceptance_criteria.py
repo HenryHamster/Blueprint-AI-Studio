@@ -3,17 +3,19 @@
 Provides:
   GET    /api/admin/projects/{project_id}/acceptance-criteria                          — list criteria for open version
   POST   /api/admin/projects/{project_id}/acceptance-criteria                          — create a criterion
+  PATCH  /api/admin/projects/{project_id}/acceptance-criteria/{key}/text               — exact-text in-place rewrite
   DELETE /api/admin/projects/{project_id}/acceptance-criteria/{key}                    — delete a criterion
   POST   /api/admin/projects/{project_id}/acceptance-criteria/link-direction           — link criteria keys to a direction
   POST   /api/admin/projects/{project_id}/acceptance-criteria/{criterion_key}/attest   — operator attestation waiver
 """
 
+import hashlib
 import logging
 import uuid
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +31,7 @@ from app.models import CriterionEvidence, Direction
 
 router = APIRouter(prefix="/api/admin")
 logger = logging.getLogger(__name__)
+_CRITERION_TEXT_OPERATOR_MAX = 20_000
 
 
 def _is_machine_contract(raw: object) -> bool:
@@ -65,6 +68,119 @@ class CreateCriterionRequest(BaseModel):
 
 class UpdateEvidenceContractRequest(BaseModel):
     evidence_contract: dict | None = None
+
+
+class RewriteCriterionTextRequest(BaseModel):
+    """Exact-text CAS body shared by owner and scoped operator routes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_text: str = Field(min_length=1, max_length=_CRITERION_TEXT_OPERATOR_MAX)
+    text: str = Field(min_length=1, max_length=_CRITERION_TEXT_OPERATOR_MAX)
+
+    @model_validator(mode="after")
+    def validate_rewrite(self) -> "RewriteCriterionTextRequest":
+        if not self.expected_text.strip():
+            raise ValueError("expected_text must not be blank")
+        if not self.text.strip():
+            raise ValueError("text must not be blank")
+        if self.expected_text == self.text:
+            raise ValueError("expected_text and text must differ")
+        return self
+
+
+def _criterion_text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+async def _rewrite_acceptance_criterion_text_impl(
+    *,
+    project_id: uuid.UUID,
+    criterion_key: str,
+    body: RewriteCriterionTextRequest,
+    current_user: dict,
+    session: AsyncSession,
+) -> dict:
+    """Apply and receipt one exact active-row text rewrite."""
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    try:
+        criterion, prior_text, changed = await ac.compare_and_set_criterion_text(
+            session,
+            project_id=project_id,
+            release_version_id=open_version.id,
+            criterion_key=criterion_key,
+            expected_text=body.expected_text,
+            replacement_text=body.text,
+        )
+    except ac.CriterionTextCompareMismatchError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "criterion_text_changed",
+                "criterion_key": criterion_key,
+            },
+        ) from exc
+    except ac.CriterionTextInactiveError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "criterion_not_active",
+                "criterion_key": criterion_key,
+            },
+        ) from exc
+    except ac.CriterionTextDuplicateError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "criterion_text_duplicate",
+                "criterion_key": criterion_key,
+            },
+        ) from exc
+    if criterion is None:
+        raise HTTPException(status_code=404, detail="Criterion not found")
+
+    await session.commit()
+    await session.refresh(criterion)
+    expected_sha256 = _criterion_text_sha256(body.expected_text)
+    prior_sha256 = _criterion_text_sha256(prior_text)
+    replacement_sha256 = _criterion_text_sha256(body.text)
+    logger.info(
+        "[AC AUDIT] action=criterion_text_compare_and_set project_id=%s "
+        "release_version_id=%s criterion_key=%s criterion_id=%s actor_user_id=%s "
+        "service_credential_id=%s expected_sha256=%s prior_sha256=%s "
+        "replacement_sha256=%s changed=%s",
+        project_id,
+        open_version.id,
+        criterion.criterion_key,
+        criterion.id,
+        current_user.get("user_id"),
+        current_user.get("service_credential_id"),
+        expected_sha256,
+        prior_sha256,
+        replacement_sha256,
+        changed,
+    )
+    return {
+        "status": "ok",
+        "criterion_key": criterion.criterion_key,
+        "text": criterion.text,
+        "changed": changed,
+        "compare_state": "expected" if changed else "replacement",
+        "expected_text_sha256": expected_sha256,
+        "previous_text_sha256": prior_sha256,
+        "text_sha256": replacement_sha256,
+        "release_version_id": str(open_version.id),
+        "lineage": {
+            "criterion_id": str(criterion.id),
+            "created_by": criterion.created_by,
+            "created_at": utc_iso(criterion.created_at),
+        },
+    }
 
 
 @router.post("/projects/{project_id}/acceptance-criteria")
@@ -131,6 +247,27 @@ async def create_acceptance_criterion(
         "evidence_contract_updated_by": criterion.evidence_contract_updated_by,
         "release_version_id": str(open_version.id),
     }
+
+
+@router.patch("/projects/{project_id}/acceptance-criteria/{criterion_key}/text")
+async def rewrite_acceptance_criterion_text(
+    project_id: uuid.UUID,
+    criterion_key: str,
+    body: RewriteCriterionTextRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Owner-authorized same-key criterion text compare-and-set."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    return await _rewrite_acceptance_criterion_text_impl(
+        project_id=project_id,
+        criterion_key=criterion_key,
+        body=body,
+        current_user=current_user,
+        session=session,
+    )
 
 
 @router.patch(

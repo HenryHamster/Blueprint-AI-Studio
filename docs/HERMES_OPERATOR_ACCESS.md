@@ -107,6 +107,23 @@ Cancellation first retrieves its exact child/dependent impact. If the impact
 is non-empty, inspect it and repeat with `--confirm-cascade`; the backend also
 requires that acknowledgement. This is not a bulk-cancel capability.
 
+One active criterion on the open version may be corrected without changing its
+key or references. The caller must supply the exact current and replacement
+text; both files are read as raw UTF-8, including newlines. The backend locks
+the exact project/version/key row, rejects a stale compare or duplicate text,
+and returns hashes plus the preserved row lineage for CLI verification.
+
+```powershell
+.\blueprint.ps1 criteria rewrite c-1234abcd `
+  --project-id PROJECT-UUID `
+  --expected-text-file .\criterion-old.txt `
+  --text-file .\criterion-new.txt --yes
+```
+
+The scoped route cannot change the criterion key, lifecycle status, evidence
+contract, authorship, release version, or direction mappings. The equivalent
+admin route requires project-owner membership.
+
 Directions support strict create/update and staged lifecycle actions:
 
 ```powershell

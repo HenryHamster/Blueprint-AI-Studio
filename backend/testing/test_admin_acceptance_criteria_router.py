@@ -3,6 +3,7 @@
 Exercises:
   GET    /api/admin/projects/{project_id}/acceptance-criteria
   POST   /api/admin/projects/{project_id}/acceptance-criteria
+  PATCH  /api/admin/projects/{project_id}/acceptance-criteria/{criterion_key}/text
   DELETE /api/admin/projects/{project_id}/acceptance-criteria/{criterion_key}
   POST   /api/admin/projects/{project_id}/acceptance-criteria/link-direction
 
@@ -171,6 +172,100 @@ async def test_update_existing_evidence_contract_is_canonical_audited_and_scoped
     by_key = {item["criterion_key"]: item for item in readback.json()["criteria"]}
     assert by_key[target.criterion_key]["evidence_contract"] == contract
     assert by_key[unrelated.criterion_key]["evidence_contract"] is None
+
+
+@pytest.mark.asyncio
+async def test_owner_criterion_text_rewrite_rejects_duplicate_and_inactive_targets(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-cas",
+        text="Owner old text",
+        status="active",
+        created_by="operator",
+    )
+    duplicate = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-duplicate",
+        text="Already owned text",
+        status="active",
+        created_by="strategist",
+    )
+    inactive = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-inactive",
+        text="Inactive text",
+        status="retracted",
+        created_by="strategist",
+    )
+    db_session.add_all([target, duplicate, inactive])
+    await db_session.commit()
+
+    rewritten = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}/text",
+        json={"expected_text": "Owner old text", "text": "Owner corrected text"},
+    )
+    duplicate_response = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}/text",
+        json={"expected_text": "Owner corrected text", "text": duplicate.text},
+    )
+    inactive_response = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{inactive.criterion_key}/text",
+        json={"expected_text": inactive.text, "text": "Reactivated by rewrite"},
+    )
+
+    assert rewritten.status_code == 200, rewritten.text
+    assert rewritten.json()["lineage"]["criterion_id"] == str(target.id)
+    assert duplicate_response.status_code == 409
+    assert (
+        duplicate_response.json()["error"]["message"]["error"]
+        == "criterion_text_duplicate"
+    )
+    assert inactive_response.status_code == 409
+    assert (
+        inactive_response.json()["error"]["message"]["error"]
+        == "criterion_not_active"
+    )
+    await db_session.refresh(target)
+    await db_session.refresh(inactive)
+    assert target.text == "Owner corrected text"
+    assert inactive.text == "Inactive text"
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_use_owner_criterion_text_rewrite(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-owner-only-cas",
+        text="Owner controlled text",
+        status="active",
+        created_by="strategist",
+    )
+    db_session.add(target)
+    await db_session.commit()
+
+    response = await client.patch(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{target.criterion_key}/text",
+        json={
+            "expected_text": "Owner controlled text",
+            "text": "Member attempted rewrite",
+        },
+    )
+
+    assert response.status_code == 403
+    await db_session.refresh(target)
+    assert target.text == "Owner controlled text"
 
 
 @pytest.mark.asyncio

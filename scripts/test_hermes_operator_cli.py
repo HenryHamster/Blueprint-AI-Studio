@@ -9,6 +9,7 @@ filesystem access, or subprocess execution.
 from __future__ import annotations
 
 from collections.abc import Callable
+import hashlib
 
 import blueprint
 import blueprint_api
@@ -19,6 +20,7 @@ PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 TASK_ID = "22222222-2222-4222-8222-222222222222"
 MESSAGE_ID = "33333333-3333-4333-8333-333333333333"
 DIRECTION_ID = "d-hermes-1"
+CRITERION_KEY = "c-hermes-1"
 
 # The catalog ``validate_project_id`` checks ``--project-id`` against. Every
 # test here passes ``--project-id PROJECT_ID``, so the id has to be present or
@@ -278,6 +280,131 @@ def test_project_operator_uses_exact_task_routes_and_bodies(
 
     assert _main_json(*argv) == 0
     assert calls[1:] == expected_calls
+
+
+def test_project_operator_criterion_rewrite_uses_exact_cas_body_and_receipt(
+    monkeypatch
+):
+    expected_text = "Old exact criterion"
+    replacement_text = "Corrected exact criterion"
+
+    def responder(_method: str, path: str, body: dict | None) -> dict:
+        if path.endswith(f"/acceptance-criteria/{CRITERION_KEY}/text"):
+            assert body is not None
+            return {
+                "status": "ok",
+                "criterion_key": CRITERION_KEY,
+                "text": body["text"],
+                "changed": True,
+                "compare_state": "expected",
+                "expected_text_sha256": hashlib.sha256(
+                    body["expected_text"].encode("utf-8")
+                ).hexdigest(),
+                "previous_text_sha256": hashlib.sha256(
+                    body["expected_text"].encode("utf-8")
+                ).hexdigest(),
+                "text_sha256": hashlib.sha256(body["text"].encode("utf-8")).hexdigest(),
+                "release_version_id": "44444444-4444-4444-8444-444444444444",
+                "lineage": {
+                    "criterion_id": "55555555-5555-4555-8555-555555555555",
+                    "created_by": "strategist",
+                    "created_at": "2026-08-28T00:00:00Z",
+                },
+            }
+        return {}
+
+    calls = _install_scoped_cli(monkeypatch, responder=responder)
+
+    assert (
+        _main_json(
+            "criteria",
+            "rewrite",
+            CRITERION_KEY,
+            "--expected-text",
+            expected_text,
+            "--text",
+            replacement_text,
+            "--yes",
+        )
+        == 0
+    )
+    assert calls[1:] == [
+        (
+            "PATCH",
+            f"/api/operator-access/v1/projects/{PROJECT_ID}/acceptance-criteria/"
+            f"{CRITERION_KEY}/text",
+            {"expected_text": expected_text, "text": replacement_text},
+        )
+    ]
+
+
+def test_project_operator_criterion_rewrite_preserves_raw_file_text(
+    monkeypatch, tmp_path
+):
+    expected_path = tmp_path / "expected.txt"
+    replacement_path = tmp_path / "replacement.txt"
+    expected_path.write_text("Old text\nwith exact newline", encoding="utf-8")
+    replacement_path.write_text("New text\nwith exact newline", encoding="utf-8")
+
+    def responder(_method: str, path: str, body: dict | None) -> dict:
+        assert body is not None
+        return {
+            "status": "ok",
+            "criterion_key": CRITERION_KEY,
+            "text": body["text"],
+            "changed": True,
+            "compare_state": "expected",
+            "expected_text_sha256": hashlib.sha256(
+                body["expected_text"].encode("utf-8")
+            ).hexdigest(),
+            "previous_text_sha256": hashlib.sha256(
+                body["expected_text"].encode("utf-8")
+            ).hexdigest(),
+            "text_sha256": hashlib.sha256(body["text"].encode("utf-8")).hexdigest(),
+            "release_version_id": "44444444-4444-4444-8444-444444444444",
+            "lineage": {"criterion_id": "55555555-5555-4555-8555-555555555555"},
+        }
+
+    calls = _install_scoped_cli(monkeypatch, responder=responder)
+
+    assert (
+        _main_json(
+            "criteria",
+            "rewrite",
+            CRITERION_KEY,
+            "--expected-text-file",
+            str(expected_path),
+            "--text-file",
+            str(replacement_path),
+            "--yes",
+        )
+        == 0
+    )
+    assert calls[1:][0][2] == {
+        "expected_text": "Old text\nwith exact newline",
+        "text": "New text\nwith exact newline",
+    }
+
+
+def test_project_operator_criterion_rewrite_fails_ambiguous_readback(
+    monkeypatch, capsys
+):
+    calls = _install_scoped_cli(monkeypatch, responder=lambda *_args: {"status": "ok"})
+
+    result = _main_json(
+        "criteria",
+        "rewrite",
+        CRITERION_KEY,
+        "--expected-text",
+        "Old text",
+        "--text",
+        "New text",
+        "--yes",
+    )
+
+    assert result == 1
+    assert calls[1:][0][0] == "PATCH"
+    assert "ambiguous or contradictory receipt" in capsys.readouterr().err
 
 
 def test_project_operator_requeue_requires_explicit_guidance(monkeypatch, capsys):

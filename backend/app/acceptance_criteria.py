@@ -282,6 +282,19 @@ class OperatorAuthoredRetractionError(Exception):
             f"autonomous loop; operator action is required"
         )
 
+
+class CriterionTextCompareMismatchError(Exception):
+    """Raised when a criterion text CAS observes neither expected nor replacement."""
+
+
+class CriterionTextInactiveError(Exception):
+    """Raised when an in-place rewrite targets an inactive criterion."""
+
+
+class CriterionTextDuplicateError(Exception):
+    """Raised when replacement text already belongs to another criterion."""
+
+
 #: ``source_kind`` for metric-derived acceptance-window coverage evidence. Written
 #: only by :func:`record_acceptance_window_coverage_evidence` when the version's
 #: acceptance-window aggregate re-scores non-zero; recognised as covering by
@@ -1075,6 +1088,74 @@ async def update_criterion_evidence_contract(
     session.add(criterion)
     await session.flush()
     return criterion
+
+
+async def compare_and_set_criterion_text(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+    expected_text: str,
+    replacement_text: str,
+) -> tuple[VersionAcceptanceCriterion | None, str, bool]:
+    """Rewrite one active criterion in place under an exact-text CAS.
+
+    The row identity and every field other than ``text`` are retained, so
+    criterion evidence, authorship provenance, and Direction/Task references
+    keep pointing at the same stable key. A current value equal to the
+    replacement is treated as an idempotent replay; any other value that does
+    not exactly equal ``expected_text`` fails closed.
+
+    Returns ``(criterion, prior_text, changed)``. The caller owns the commit.
+    """
+    result = await session.execute(
+        select(VersionAcceptanceCriterion)
+        .where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+        .with_for_update()
+    )
+    criterion = result.scalar_one_or_none()
+    if criterion is None:
+        return None, "", False
+    if criterion.status != "active":
+        raise CriterionTextInactiveError(
+            f"criterion '{criterion_key}' is not active (status={criterion.status})"
+        )
+
+    prior_text = criterion.text
+    if prior_text not in {expected_text, replacement_text}:
+        raise CriterionTextCompareMismatchError(
+            f"criterion '{criterion_key}' changed since it was read"
+        )
+
+    duplicate_result = await session.execute(
+        select(VersionAcceptanceCriterion)
+        .where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.text == replacement_text,
+            VersionAcceptanceCriterion.id != criterion.id,
+            VersionAcceptanceCriterion.status == "active",
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    duplicate = duplicate_result.scalar_one_or_none()
+    if duplicate is not None:
+        raise CriterionTextDuplicateError(
+            f"replacement text already belongs to criterion '{duplicate.criterion_key}'"
+        )
+    if prior_text == replacement_text:
+        return criterion, prior_text, False
+
+    criterion.text = replacement_text
+    session.add(criterion)
+    await session.flush()
+    return criterion, prior_text, True
 
 
 async def get_criterion_by_key(
