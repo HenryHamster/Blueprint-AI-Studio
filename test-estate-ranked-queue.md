@@ -402,6 +402,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_anomaly_proposals.py` | 527 | 13 | under 1500 LOC | 4.142s measured | — |
 | G | backend | `backend/testing/test_project_message_creation_latency.py` | 708 | 15 | under 1500 LOC | 4.130s measured | — |
 | G | admin-ui | `admin-ui/src/components/OperatorWorkspaces.test.tsx` | 580 | 18 | under 1500 LOC | 4.024s measured | — |
+| G | backend | `backend/testing/test_explicit_criterion_propagation.py` | 256 | 3 | under 1500 LOC | 4.019s measured | — |
 | G | backend | `backend/testing/test_project_telemetry.py` | 508 | 18 | under 1500 LOC | 4.010s measured | — |
 | G | backend | `backend/testing/test_parent_terminal_parity.py` | 315 | 4 | under 1500 LOC | 4.003s measured | — |
 | G | backend | `backend/testing/test_message_convergence.py` | 434 | 21 | under 1500 LOC | 3.954s measured | — |
@@ -515,6 +516,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_migration_0682_workday_repair.py` | 600 | 6 | under 1500 LOC | 1.768s measured | — |
 | G | backend | `backend/testing/test_filter_file_conflicts.py` | 1,153 | 42 | under 1500 LOC | 1.767s measured | — |
 | G | admin-ui | `admin-ui/src/components/ProjectResourceEnvelopeSection.test.tsx` | 555 | 16 | under 1500 LOC | 1.725s measured | — |
+| G | backend | `backend/testing/test_guard_suppression_escalation_fence.py` | 284 | 4 | under 1500 LOC | 1.718s measured | — |
 | G | backend | `backend/testing/test_terminal_rollup_pr_sweep.py` | 219 | 5 | under 1500 LOC | 1.700s measured | — |
 | G | backend | `backend/testing/test_digest_shared_cache.py` | 251 | 11 | under 1500 LOC | 1.699s measured | — |
 | G | backend | `backend/testing/test_strategic_memory_governance.py` | 245 | 5 | under 1500 LOC | 1.697s measured | — |
@@ -1084,11 +1086,9 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui-viewport | `admin-ui/src/components/MetricsDashboard.viewport.test.tsx` | 291 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
 | G | admin-ui-viewport | `admin-ui/src/components/DirectionsPanel.viewport.test.tsx` | 290 | 6 | under 1500 LOC | unknown (no committed measurement) | — |
 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawer.viewport.test.tsx` | 285 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
-| G | backend | `backend/testing/test_guard_suppression_escalation_fence.py` | 284 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
 | G | admin-ui-viewport | `admin-ui/src/components/RunningUpdatePanel.viewport.test.tsx` | 277 | 9 | under 1500 LOC | unknown (no committed measurement) | — |
 | G | admin-ui-viewport | `admin-ui/src/components/MessageBubble.viewport.test.tsx` | 272 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
 | G | admin-ui-viewport | `admin-ui/src/components/TaskDetailDrawerFailureDetail.viewport.test.tsx` | 272 | 11 | under 1500 LOC | unknown (no committed measurement) | — |
-| G | backend | `backend/testing/test_explicit_criterion_propagation.py` | 256 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
 | G | admin-ui-viewport | `admin-ui/src/components/StrategicContextWorkspace.viewport.test.tsx` | 254 | 3 | under 1500 LOC | unknown (no committed measurement) | — |
 | G | admin-ui-viewport | `admin-ui/src/components/NotesTool.viewport.test.tsx` | 253 | 7 | under 1500 LOC | unknown (no committed measurement) | — |
 | G | admin-ui-viewport | `admin-ui/src/components/RemediationFunnelSection.viewport.test.tsx` | 246 | 4 | under 1500 LOC | unknown (no committed measurement) | — |
