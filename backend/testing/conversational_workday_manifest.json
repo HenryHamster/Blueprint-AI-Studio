@@ -434,6 +434,14 @@
         "test_operator_message_preensure_treats_mode_change_as_chat_safe",
         "test_continuous_hydration_ensure_succeeds",
         "test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_start_works",
+        "test_owner_pinned_start_spawns_while_paused_and_clears_stale_reason",
+        "test_existing_healthy_manual_start_clears_same_stale_reason",
+        "test_member_pinned_start_cannot_bypass_owner_pause",
+        "test_blank_runner_id_cannot_bypass_paused_start",
+        "test_unpinned_resident_start_remains_blocked_while_paused",
+        "test_pinned_background_ensure_remains_blocked_while_paused",
+        "test_explicit_pinned_start_remains_blocked_when_project_archived",
+        "test_paused_pinned_start_still_fences_true_active_one_shot",
         "test_start_adopts_task_and_liveness_heartbeat_renews_lease",
         "test_repeated_start_uplifts_only_unstarted_canonical_resident",
         "test_repeated_start_does_not_rewrite_started_resident_priority",
@@ -512,7 +520,7 @@
         "test_autonomous_turn_flag_cannot_rescue_committed_chat_mode",
         "test_autonomous_working_turn_renews_freshness_without_mutation"
       ],
-      "test_count": 89
+      "test_count": 97
     },
     {
       "path": "agent/src/workspacePrep.test.ts",
