@@ -530,6 +530,152 @@ async def test_message_after_workday_lease_lapse_rearms_once_and_rebinds_exact_i
 
 
 @pytest.mark.asyncio
+async def test_paused_project_send_adopts_exact_active_resident_without_restart(
+    client: AsyncClient,
+    db_session,
+):
+    """Paused mode blocks new work, not a turn for the exact active Resident."""
+
+    from app.strategic_resident_session import read_resident_session
+
+    runner_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    resident = _ended_resident_fixture(
+        "ss-paused-active-send",
+        runner_id=str(runner_id),
+        include_runner=True,
+        version=2,
+    )
+    resident.update(
+        task_id=str(task_id),
+        worker_generation=1,
+        status="active",
+        stop_requested=False,
+        ended_at=None,
+        worker_state="ready",
+        worker_heartbeat_at=_utcnow().isoformat(),
+        last_progress_at=_utcnow().isoformat(),
+    )
+    project = await _make_resident_test_project(
+        db_session,
+        name="Paused exact active Resident send",
+        resident=resident,
+        interaction_mode="continuous",
+        preferred_runner_id=runner_id,
+        runner_specs=((runner_id, 0),),
+        resident_task_status=TaskStatus.IN_PROGRESS,
+    )
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "message_type": "NOTE",
+            "content": "Deliver this turn to the already-active paused Resident.",
+            "idempotency_key": "paused-active-resident-send-1",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (body["status"], body["arming"], body["wakeup_state"]) == (
+        "created",
+        "resident_session",
+        "queued",
+    )
+    await db_session.rollback()
+    fresh = await _fresh_project(db_session, project.id)
+    stored = await db_session.get(ProjectMessage, uuid.UUID(body["id"]))
+    tasks = await _project_rows(db_session, Task, project.id)
+    current = read_resident_session(fresh.vision)
+    assert fresh.paused is True
+    assert current is not None
+    assert (current["session_id"], current["task_id"], current["worker_generation"]) == (
+        resident["session_id"],
+        str(task_id),
+        1,
+    )
+    assert stored is not None
+    assert stored.resident_session_id == resident["session_id"]
+    assert stored.handling_state == MessageHandlingState.PENDING
+    assert stored.handled_by_task_id is None
+    assert [(row.id, row.status) for row in tasks] == [
+        (task_id, TaskStatus.IN_PROGRESS)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_paused_project_send_cannot_replace_terminal_resident(
+    client: AsyncClient,
+    db_session,
+):
+    """A paused send cannot turn a stale Resident identity into new work."""
+
+    from app.strategic_resident_session import read_resident_session
+
+    runner_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    resident = _ended_resident_fixture(
+        "ss-paused-terminal-send",
+        runner_id=str(runner_id),
+        include_runner=True,
+        version=2,
+    )
+    resident.update(
+        task_id=str(task_id),
+        worker_generation=3,
+        status="active",
+        stop_requested=False,
+        ended_at=None,
+        worker_state="ready",
+        worker_heartbeat_at=_utcnow().isoformat(),
+        last_progress_at=_utcnow().isoformat(),
+    )
+    project = await _make_resident_test_project(
+        db_session,
+        name="Paused terminal Resident send",
+        resident=resident,
+        interaction_mode="continuous",
+        preferred_runner_id=runner_id,
+        runner_specs=((runner_id, 0),),
+        resident_task_status=TaskStatus.COMPLETED,
+    )
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "message_type": "NOTE",
+            "content": "Do not restart this terminal Resident while paused.",
+            "idempotency_key": "paused-terminal-resident-send-1",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "paused" in response.json()["error"]["message"].lower()
+    await db_session.rollback()
+    fresh = await _fresh_project(db_session, project.id)
+    tasks = await _project_rows(db_session, Task, project.id)
+    messages = await _project_rows(db_session, ProjectMessage, project.id)
+    current = read_resident_session(fresh.vision)
+    assert fresh.paused is True
+    assert current is not None
+    assert (current["session_id"], current["task_id"], current["worker_generation"]) == (
+        resident["session_id"],
+        str(task_id),
+        3,
+    )
+    assert [(row.id, row.status) for row in tasks] == [
+        (task_id, TaskStatus.COMPLETED)
+    ]
+    assert messages == []
+
+
+@pytest.mark.asyncio
 async def test_chat_send_does_not_bind_active_resident_left_by_mode_leave(
     client: AsyncClient, db_session
 ):

@@ -4068,7 +4068,15 @@ async def start_resident_session(
         fresh = read_resident_session(vision)
         if locked_project.archived:
             decision["mode"] = "project_archived"
-        elif locked_project.paused and not allow_paused_project:
+        elif (
+            locked_project.paused
+            and not allow_paused_project
+            and not resident_session_is_active(fresh)
+        ):
+            # A paused project still forbids creating a Resident. An already-active
+            # Resident must reach the health/idempotency check below, though: the
+            # operator-message preflight adopts that exact worker before inserting
+            # the turn and must not mistake the no-new-work guard for a restart.
             decision["mode"] = "project_paused"
         if decision["mode"] is None and expected_interaction_mode is not None:
             if expected_interaction_mode != "continuous":
@@ -4200,6 +4208,15 @@ async def start_resident_session(
                         session_id=str(fresh.get("session_id")),
                         worker_generation=fresh_generation,
                     )
+
+        if (
+            decision["mode"] is None
+            and locked_project.paused
+            and not allow_paused_project
+        ):
+            # The active blob was stale enough to require a replacement. Preserve
+            # Project.paused as the no-new-work authority instead of restarting it.
+            decision["mode"] = "project_paused"
 
         if (
             decision["mode"] == "existing"
