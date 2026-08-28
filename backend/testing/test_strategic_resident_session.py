@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
@@ -1425,6 +1426,281 @@ async def test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_
         await db_session.execute(select(Task).where(Task.project_id == project.id))
     ).scalars().all()
     assert [row.id for row in tasks] == [task_id]
+
+
+@pytest.mark.asyncio
+async def test_owner_pinned_start_spawns_while_paused_and_clears_stale_reason(
+    db_session,
+):
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    project.paused = True
+    project.vision = {
+        **(project.vision or {}),
+        resident_session_module.RESIDENT_SESSION_REASON_KEY: {
+            "reason": resident_session_module.RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+            "recorded_at": _utcnow().isoformat(),
+            "operator_user_id": TEST_USER_ID,
+        },
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await unwrap(start_project_strategic_resident_session)(
+        request=None,
+        project_id=project.id,
+        payload=StrategicResidentSessionStart(runner_id=str(runner.id)),
+        session=db_session,
+        current_user={"user_id": TEST_USER_ID},
+    )
+
+    assert response["ensure_outcome"] == "ensured"
+    assert response["session"]["status"] == "active"
+    task = await db_session.get(Task, uuid.UUID(response["session"]["task_id"]))
+    await db_session.refresh(project)
+    assert task is not None
+    assert task.status == TaskStatus.PROVISIONING
+    assert task.vm_instance_id == f"runner:{runner.id}"
+    assert task.context["_resident_session"] is True
+    assert project.paused is True
+    assert resident_session_module.RESIDENT_SESSION_REASON_KEY not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_existing_healthy_manual_start_clears_same_stale_reason(db_session):
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    handler = unwrap(start_project_strategic_resident_session)
+    started = await handler(
+        request=None,
+        project_id=project.id,
+        payload=StrategicResidentSessionStart(runner_id=str(runner.id)),
+        session=db_session,
+        current_user={"user_id": TEST_USER_ID},
+    )
+    reason = {
+        "reason": resident_session_module.RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+        "recorded_at": _utcnow().isoformat(),
+        "operator_user_id": TEST_USER_ID,
+    }
+    project.vision = {
+        **(project.vision or {}),
+        resident_session_module.RESIDENT_SESSION_REASON_KEY: reason,
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    repeated = await handler(
+        request=None,
+        project_id=project.id,
+        payload=StrategicResidentSessionStart(runner_id=str(runner.id)),
+        session=db_session,
+        current_user={"user_id": TEST_USER_ID},
+    )
+
+    assert repeated["session"]["session_id"] == started["session"]["session_id"]
+    assert repeated["session"]["task_id"] == started["session"]["task_id"]
+    await db_session.refresh(project)
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert len(tasks) == 1
+    assert resident_session_module.RESIDENT_SESSION_REASON_KEY not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_member_pinned_start_cannot_bypass_owner_pause(db_session):
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    member_user_id = "resident-member-user"
+    db_session.add(
+        ProjectMember(
+            project_id=project.id,
+            user_id=member_user_id,
+            role="member",
+        )
+    )
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as blocked:
+        await unwrap(start_project_strategic_resident_session)(
+            request=None,
+            project_id=project.id,
+            payload=StrategicResidentSessionStart(runner_id=str(runner.id)),
+            session=db_session,
+            current_user={"user_id": member_user_id},
+        )
+
+    assert blocked.value.status_code in {403, 409}
+    await db_session.refresh(project)
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert tasks == []
+    assert read_resident_session(project.vision) is None
+    assert resident_session_module.RESIDENT_SESSION_REASON_KEY not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_blank_runner_id_cannot_bypass_paused_start(db_session):
+    project = await _make_project(db_session)
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(ValidationError):
+        StrategicResidentSessionStart(runner_id="")
+
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert tasks == []
+    assert read_resident_session(project.vision) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enroll_runner", "allow_no_runner"),
+    [(True, False), (False, True)],
+)
+async def test_unpinned_resident_start_remains_blocked_while_paused(
+    db_session,
+    enroll_runner,
+    allow_no_runner,
+):
+    project = await _make_project(db_session)
+    if enroll_runner:
+        await _make_runner(db_session, project)
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as blocked:
+        await unwrap(start_project_strategic_resident_session)(
+            request=None,
+            project_id=project.id,
+            payload=StrategicResidentSessionStart(allow_no_runner=allow_no_runner),
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+    assert blocked.value.status_code == 409
+    assert "paused" in str(blocked.value.detail).lower()
+    await db_session.refresh(project)
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert tasks == []
+    assert read_resident_session(project.vision) is None
+    assert resident_session_module.RESIDENT_SESSION_REASON_KEY not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_pinned_background_ensure_remains_blocked_while_paused(db_session):
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as blocked:
+        await unwrap(start_project_strategic_resident_session)(
+            request=None,
+            project_id=project.id,
+            payload=StrategicResidentSessionStart(
+                runner_id=str(runner.id),
+                expected_interaction_mode="continuous",
+            ),
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+    assert blocked.value.status_code == 409
+    assert "paused" in str(blocked.value.detail).lower()
+    await db_session.refresh(project)
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert tasks == []
+    assert read_resident_session(project.vision) is None
+    assert resident_session_module.RESIDENT_SESSION_REASON_KEY not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_explicit_pinned_start_remains_blocked_when_project_archived(db_session):
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    project.archived = True
+    db_session.add(project)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as blocked:
+        await unwrap(start_project_strategic_resident_session)(
+            request=None,
+            project_id=project.id,
+            payload=StrategicResidentSessionStart(runner_id=str(runner.id)),
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+    assert blocked.value.status_code == 409
+    assert "archived" in str(blocked.value.detail).lower()
+    await db_session.refresh(project)
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert tasks == []
+    assert read_resident_session(project.vision) is None
+    assert resident_session_module.RESIDENT_SESSION_REASON_KEY not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_paused_pinned_start_still_fences_true_active_one_shot(db_session):
+    project = await _make_project(db_session)
+    runner = await _make_runner(db_session, project)
+    project.paused = True
+    one_shot = Task(
+        project_id=project.id,
+        title="Active one-shot strategy",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        started_at=_utcnow(),
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    db_session.add_all([project, one_shot])
+    await db_session.commit()
+    project_id = project.id
+    one_shot_id = one_shot.id
+    factory = _test_session_factory(db_session)
+
+    with pytest.raises(HTTPException) as blocked:
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            runner_id=str(runner.id),
+            session_factory=factory,
+            allow_paused_project=True,
+        )
+
+    assert blocked.value.status_code == 409
+    assert "cycle" in str(blocked.value.detail).lower()
+    async with factory() as verify:
+        fresh = await verify.get(Project, project_id)
+        tasks = (
+            await verify.execute(select(Task).where(Task.project_id == project_id))
+        ).scalars().all()
+    assert [task.id for task in tasks] == [one_shot_id]
+    assert not resident_session_is_active(read_resident_session(fresh.vision))
+    reason = fresh.vision[resident_session_module.RESIDENT_SESSION_REASON_KEY]
+    assert reason["reason"] == (
+        resident_session_module.RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT
+    )
 
 
 async def test_explicit_runner_change_rejects_active_session(db_session):

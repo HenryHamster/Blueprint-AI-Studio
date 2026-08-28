@@ -5647,6 +5647,7 @@ async def _finalize_strategic_review_spawn(
     expected_legacy_generation: int | None = None,
     cadence_accepted_count: object | None = None,
     automatic_creation: bool = True,
+    allow_paused_project: bool = False,
     suppression_reason_out: dict[str, str] | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail for the cadence spawn path.
@@ -5726,7 +5727,11 @@ async def _finalize_strategic_review_spawn(
             project_id,
         )
         return False
-    if await _has_active_strategic_task(project_id, session):
+    if await _has_active_strategic_task(
+        project_id,
+        session,
+        allow_paused_project=allow_paused_project,
+    ):
         await session.rollback()
         logger.warning(
             "[STRATEGIC] Aborting strategic review spawn for project %s — a "
@@ -5908,6 +5913,7 @@ async def _spawn_strategic_review(
     task_priority: int | None = None,
     *,
     launched_by_user_id: str | None = None,
+    allow_paused_project: bool = False,
     apply_spawn_budget_guard: bool = False,
     expected_legacy_generation: int | None = None,
     cadence_accepted_count: object | None = None,
@@ -5967,6 +5973,11 @@ async def _spawn_strategic_review(
     the Phase 1 task context. It is captured by the caller before any retry or
     rollback-prone work so this function does not need to re-read mutable
     project ORM attributes in the post-build finalize path.
+
+    ``allow_paused_project`` is reserved for an explicit operator Resident
+    start. It bypasses only the Project.pause half of the shared locked guard;
+    archived projects and live one-shot strategic tasks still block, and every
+    cadence caller retains the default ``False`` behavior.
     """
     from app.task_lifecycle import _has_active_strategic_task
 
@@ -6009,7 +6020,11 @@ async def _spawn_strategic_review(
             return False
 
     # Guard: no design_doc_update or strategic_review already running
-    if await _has_active_strategic_task(project.id, session):
+    if await _has_active_strategic_task(
+        project.id,
+        session,
+        allow_paused_project=allow_paused_project,
+    ):
         logger.warning(
             f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}"
         )
@@ -6430,6 +6445,7 @@ async def _spawn_strategic_review(
             expected_legacy_generation=expected_legacy_generation,
             cadence_accepted_count=cadence_accepted_count,
             automatic_creation=apply_spawn_budget_guard,
+            allow_paused_project=allow_paused_project,
             suppression_reason_out=suppression_reason_out,
         )
 
@@ -8754,6 +8770,7 @@ async def _spawn_strategic_review(
         expected_legacy_generation=expected_legacy_generation,
         cadence_accepted_count=cadence_accepted_count,
         automatic_creation=apply_spawn_budget_guard,
+        allow_paused_project=allow_paused_project,
         suppression_reason_out=suppression_reason_out,
     )
 

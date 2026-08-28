@@ -837,7 +837,12 @@ from app.task_lifecycle_github_helpers import (  # noqa: E402, F401, RUF100
 )
 
 
-async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
+async def _has_active_strategic_task(
+    project_id,
+    session: AsyncSession,
+    *,
+    allow_paused_project: bool = False,
+) -> bool:
     """Return True if any QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING task is a design_doc_update or strategic_review.
 
     Takes a FOR NO KEY UPDATE lock on the project row so the check+spawn is transactionally
@@ -879,12 +884,16 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
         # Row missing or held — fail safe. The other holder will spawn (or
         # already has); our caller will skip and re-evaluate next cycle.
         return True
-    if bool(project_row.paused) or bool(project_row.archived):
+    if bool(project_row.archived) or (
+        bool(project_row.paused) and not allow_paused_project
+    ):
         # This helper is the Project-before-child admission point shared by the
         # design-doc and strategic-review spawners.  Treat the universal pause
         # (and archive) authority exactly like an active strategic task: no
         # automatic child may be authored, including a Phase 1 -> Phase 2
         # continuation that would otherwise sit latent until resume.
+        # An explicit operator Resident start may opt out of the pause half only;
+        # archive and the live-task query below remain authoritative.
         return True
     # Phase B4 (H-P6): we only need first_payload.type per row to filter, so
     # drop status_log/plan_output JSONB. Loading payloads keeps first_payload
