@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type WebSocket from 'ws';
 import {
   apiGet, apiPost, sanitize, sendLog,
@@ -146,15 +146,55 @@ export function selectTypedFastClaimMessages(
 }
 
 /** Build the exact restricted Fast prompt without consulting the checkout. */
+export function assertSelectedMessagesMatchEnvelope(
+  verified: ReturnType<typeof verifyStrategicContextEnvelope>,
+  selectedMessages: ResidentInboundMessage[],
+): void {
+  const rows = verified.envelope.recent_conversation;
+  const selectedIds = new Set<string>();
+  let priorSequence = -1;
+  for (const message of selectedMessages) {
+    const messageId = typeof message.id === 'string' ? message.id.trim() : '';
+    if (!messageId || selectedIds.has(messageId)) {
+      throw new Error('active operator input has an invalid or duplicate message id');
+    }
+    selectedIds.add(messageId);
+    const matches = rows.filter((item) => (
+      item !== null
+      && typeof item === 'object'
+      && !Array.isArray(item)
+      && (item as Record<string, unknown>).message_id === messageId
+    ));
+    if (matches.length !== 1) {
+      throw new Error('active operator input is not bound exactly once in the canonical envelope');
+    }
+    const row = matches[0] as Record<string, unknown>;
+    const sequence = row.sequence;
+    if (!Number.isSafeInteger(sequence) || Number(sequence) <= priorSequence) {
+      throw new Error('active operator input order does not match the canonical envelope');
+    }
+    priorSequence = Number(sequence);
+    const content = message.content ?? '';
+    const bytes = Buffer.from(content, 'utf8');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    if (row.content_bytes !== bytes.length || row.content_sha256 !== sha256) {
+      throw new Error('active operator input content does not match the canonical envelope');
+    }
+  }
+}
+
 export async function buildTypedFastDispatchPrompt(
   verified: ReturnType<typeof verifyStrategicContextEnvelope>,
   selectedMessages: ResidentInboundMessage[],
   transcriptSequence: number,
 ): Promise<string | Array<Record<string, unknown>>> {
-  // The signed envelope already carries the terminal message text.
-  const attachmentOnlyMessages = selectedMessages.map(message => ({ ...message, content: '' }));
-  const attachmentBlocks = await materializeContentBlocks(
-    combineOperatorMessages(attachmentOnlyMessages),
+  assertSelectedMessagesMatchEnvelope(verified, selectedMessages);
+  // The canonical envelope deliberately keeps each historical transcript row
+  // to a small preview. Once the selected poll rows match its server-projected
+  // ids, ordering, full byte counts, and digests, deliver the claimed rows in
+  // full instead of replacing valid API-sized input with the bounded prefix.
+  const activeTurnBlocks = await materializeContentBlocks(
+    combineOperatorMessages(selectedMessages),
   );
   const artifactDeliveryDeferred = selectedMessages.some(message => (
     message.context?._server_artifact_delivery_deferred === true
@@ -164,9 +204,9 @@ export async function buildTypedFastDispatchPrompt(
     '',
     '## Active operator turn',
     `The canonical context ends at the active operator input (sequence ${verified.envelope.transcript_sequence}).`,
-    attachmentBlocks.length > 0
-      ? 'The model input following this text contains the active turn attachments.'
-      : 'There are no separate attachment blocks for this turn.',
+    activeTurnBlocks.length > 0
+      ? 'The model input following this text is the exact, complete active operator turn accepted by the server. A bounded recent_conversation row may contain only a prefix; never treat that historical preview as the complete active input.'
+      : 'There is no deliverable content in the active operator turn.',
     ...(artifactDeliveryDeferred ? [
       'Recovery notice: attachments from this interrupted turn exceeded the safe delivery limit and were not included. Ask the operator to resend the relevant artifact if it is needed to answer accurately.',
     ] : []),
@@ -176,10 +216,10 @@ export async function buildTypedFastDispatchPrompt(
     'If the operator requests code, configuration, branch, deployment, or other managed-state execution, request Workday to route it through supported Blueprint task tooling. Never promise that Fast will perform the mutation itself.',
     'Do not make a public promise to route, create, or hand off a Blueprint/Workday task. Stage the exact request with mcp__call__request_workday and let the server-owned receipt communicate that it was requested.',
   ].join('\n');
-  if (attachmentBlocks.length === 0) return promptText;
+  if (activeTurnBlocks.length === 0) return promptText;
   return [
     { type: 'text', text: promptText },
-    ...attachmentBlocks.map(block => block as unknown as Record<string, unknown>),
+    ...activeTurnBlocks.map(block => block as unknown as Record<string, unknown>),
   ];
 }
 

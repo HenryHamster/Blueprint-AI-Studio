@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'crypto';
 import type { ResidentSessionEvent } from '../providers/resident-session.js';
 import { ConversationMessageStreamer, STREAM_DELTA_MAX_CHARS } from './conversation-message-streamer.js';
 
@@ -64,7 +65,11 @@ vi.mock('./typed-fast-resident.js', async (importOriginal) => ({
   typedFastFailureBackoffMs: () => 1,
 }));
 
-import { runCheckoutIndependentFastStartup } from './strategic-resident-cold-fast.js';
+import {
+  assertSelectedMessagesMatchEnvelope,
+  buildTypedFastDispatchPrompt,
+  runCheckoutIndependentFastStartup,
+} from './strategic-resident-cold-fast.js';
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 const MESSAGE_ID = 'msg-1';
@@ -83,6 +88,13 @@ const envelope = {
   transcript_sequence: 7,
   context_authority_generation: 1,
   privacy_generation: 1,
+  recent_conversation: [{
+    sequence: 7,
+    message_id: MESSAGE_ID,
+    content: 'hi',
+    content_bytes: 2,
+    content_sha256: createHash('sha256').update('hi').digest('hex'),
+  }],
 };
 
 const startOptions = (ws: unknown) => ({
@@ -150,6 +162,60 @@ const waitForDone = async (): Promise<void> => {
     expect(sessionFrames().some(frame => frame.status === 'done')).toBe(true);
   }, { timeout: 5_000, interval: 20 });
 };
+
+describe('typed Fast active-input integrity', () => {
+  const row = (id: string, sequence: number, content: string) => ({
+    sequence,
+    message_id: id,
+    content: content.slice(0, 2_048),
+    content_truncated: content.length > 2_048,
+    content_bytes: Buffer.byteLength(content, 'utf8'),
+    content_sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
+  });
+  const verified = (rows: Array<Record<string, unknown>>, sequence: number) => ({
+    envelope: { recent_conversation: rows, transcript_sequence: sequence },
+  }) as never;
+
+  it('delivers an API-sized claimed message in full after verifying its bounded envelope row', async () => {
+    const tail = 'TASK-2-TAIL';
+    const content = `${'x'.repeat(20_000 - tail.length)}${tail}`;
+    const message = { id: 'long-message', content, from_type: 'user' };
+
+    const prompt = await buildTypedFastDispatchPrompt(
+      verified([row(message.id, 41, content)], 41),
+      [message],
+      0,
+    );
+
+    expect(JSON.stringify(prompt)).toContain(tail);
+    expect(JSON.stringify(prompt)).toContain(content);
+  });
+
+  it('rejects altered claimed content', () => {
+    const original = { id: 'message-1', content: 'exact original', from_type: 'user' };
+    expect(() => assertSelectedMessagesMatchEnvelope(
+      verified([row(original.id, 1, original.content)], 1),
+      [{ ...original, content: 'altered original' }],
+    )).toThrow('content does not match');
+  });
+
+  it('rejects selected messages whose order differs from the signed sequence', () => {
+    const first = { id: 'message-1', content: 'first', from_type: 'user' };
+    const second = { id: 'message-2', content: 'second', from_type: 'user' };
+    expect(() => assertSelectedMessagesMatchEnvelope(
+      verified([row(first.id, 1, first.content), row(second.id, 2, second.content)], 2),
+      [second, first],
+    )).toThrow('order does not match');
+  });
+
+  it('rejects selected messages whose identity is absent from the envelope', () => {
+    const content = 'same bytes are not the same message';
+    expect(() => assertSelectedMessagesMatchEnvelope(
+      verified([row('canonical-id', 1, content)], 1),
+      [{ id: 'different-id', content, from_type: 'user' }],
+    )).toThrow('not bound exactly once');
+  });
+});
 
 describe('cold-start Fast lane — live strategic_session stream', () => {
   it('coalesces typed deltas into bounded conversation-message chunks', async () => {
