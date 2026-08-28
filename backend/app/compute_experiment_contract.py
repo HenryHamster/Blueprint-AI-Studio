@@ -36,6 +36,7 @@ ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # Safe charset for metric keys: allows common patterns like val/loss, top-1
 # while excluding shell metacharacters (", $, ;, backticks, spaces).
 METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+MAX_DECLARED_METRIC_LENGTH = 128
 
 # Env var names must be valid shell identifiers. The GCP startup script emits
 # `export {key}=...` with the key interpolated BARE, and it runs without
@@ -281,8 +282,6 @@ def _validate_compute_launch_contract(
     command = contract.get("command")
 
     if arms is not None:
-        if isinstance(command, str) and command.strip():
-            return False, "command and arms are mutually exclusive"
         # Arms-based multi-arm experiment: validate each arm and synthesize command.
         if not isinstance(arms, list) or len(arms) == 0:
             return False, "arms must be a non-empty list of {name, command} objects"
@@ -314,60 +313,64 @@ def _validate_compute_launch_contract(
         declared_metric = contract.get("declared_metric")
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric is required and must be a non-empty string when arms are specified"
+        if len(declared_metric) > MAX_DECLARED_METRIC_LENGTH:
+            return False, (
+                f"declared_metric must be at most {MAX_DECLARED_METRIC_LENGTH} characters"
+            )
         if not METRIC_KEY_RE.fullmatch(declared_metric):
             return (
                 False,
                 f"declared_metric {declared_metric!r} contains invalid characters — "
                 "metric keys must match ^[A-Za-z0-9_./-]+$",
             )
-        if not (isinstance(command, str) and command.strip()):
-            # Synthesize a per-arm isolation script. Each arm runs in its own
-            # subshell with BLUEPRINT_RESULT_FILE pointed to a private path so
-            # arms cannot overwrite each other's metric (no last-arm-wins).
-            # A subshell failure is captured as an exit_code file and does NOT
-            # abort the remaining arms.  After all arms finish, the aggregator
-            # script (embedded as a base64 blob) combines each arm's result into
-            # the canonical {"arms": {name: {declared_metric: value}}} block and
-            # writes it to the real BLUEPRINT_RESULT_FILE.
-            lines: list[str] = [
-                '_BRF_MAIN="${BLUEPRINT_RESULT_FILE:-/tmp/blueprint_result.json}"',
-                '_BRF_BASE="$(dirname "${_BRF_MAIN}")/.blueprint_arm_results"',
-                'mkdir -p "${_BRF_BASE}"',
-            ]
-            arm_result_specs: list[str] = []
-            arm_exit_specs: list[str] = []
-            arm_stderr_specs: list[str] = []
-            arm_duration_specs: list[str] = []
-            for arm in arms:
-                aname = arm["name"]
-                acmd = arm["command"].strip()
-                lines += [
-                    f'mkdir -p "${{_BRF_BASE}}/{aname}"',
-                    '_BRF_T1=$(date +%s)',
-                    f'(export BLUEPRINT_RESULT_FILE="${{_BRF_BASE}}/{aname}/result.json"; {acmd})'
-                    f' 2>"${{_BRF_BASE}}/{aname}/stderr"',
-                    f'echo $? > "${{_BRF_BASE}}/{aname}/exit_code"',
-                    f'echo $(($(date +%s) - _BRF_T1)) > "${{_BRF_BASE}}/{aname}/elapsed"',
-                ]
-                arm_result_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/result.json"')
-                arm_exit_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/exit_code"')
-                arm_stderr_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/stderr"')
-                arm_duration_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/elapsed"')
-            arm_specs_arg = " ".join(arm_result_specs)
-            exit_specs_arg = " ".join(arm_exit_specs)
-            stderr_specs_arg = " ".join(arm_stderr_specs)
-            duration_specs_arg = " ".join(arm_duration_specs)
+        # Synthesize the canonical per-arm isolation script on every validation.
+        # A normalized contract legitimately carries both ``arms`` and this exact
+        # generated command; accepting it makes validation idempotent. Any other
+        # simultaneous command remains user-authored dual mode and is rejected.
+        lines: list[str] = [
+            '_BRF_MAIN="${BLUEPRINT_RESULT_FILE:-/tmp/blueprint_result.json}"',
+            '_BRF_BASE="$(dirname "${_BRF_MAIN}")/.blueprint_arm_results"',
+            'mkdir -p "${_BRF_BASE}"',
+        ]
+        arm_result_specs: list[str] = []
+        arm_exit_specs: list[str] = []
+        arm_stderr_specs: list[str] = []
+        arm_duration_specs: list[str] = []
+        for arm in arms:
+            aname = arm["name"]
+            acmd = arm["command"].strip()
             lines += [
-                f"echo {_AGGREGATOR_B64} | base64 -d > /tmp/blueprint_arm_agg.py",
-                f'python3 /tmp/blueprint_arm_agg.py --arms {arm_specs_arg}'
-                f' --declared-metric "{declared_metric}" --output "${{_BRF_MAIN}}"'
-                f' --exit-codes {exit_specs_arg}'
-                f' --stderr {stderr_specs_arg}'
-                f' --durations {duration_specs_arg}',
+                f'mkdir -p "${{_BRF_BASE}}/{aname}"',
+                '_BRF_T1=$(date +%s)',
+                f'(export BLUEPRINT_RESULT_FILE="${{_BRF_BASE}}/{aname}/result.json"; {acmd})'
+                f' 2>"${{_BRF_BASE}}/{aname}/stderr"',
+                f'echo $? > "${{_BRF_BASE}}/{aname}/exit_code"',
+                f'echo $(($(date +%s) - _BRF_T1)) > "${{_BRF_BASE}}/{aname}/elapsed"',
             ]
-            script = "\n".join(lines)
-            encoded = base64.b64encode(script.encode()).decode()
-            contract["command"] = f"echo {encoded} | base64 -d | bash"
+            arm_result_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/result.json"')
+            arm_exit_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/exit_code"')
+            arm_stderr_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/stderr"')
+            arm_duration_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/elapsed"')
+        arm_specs_arg = " ".join(arm_result_specs)
+        exit_specs_arg = " ".join(arm_exit_specs)
+        stderr_specs_arg = " ".join(arm_stderr_specs)
+        duration_specs_arg = " ".join(arm_duration_specs)
+        lines += [
+            f"echo {_AGGREGATOR_B64} | base64 -d > /tmp/blueprint_arm_agg.py",
+            f'python3 /tmp/blueprint_arm_agg.py --arms {arm_specs_arg}'
+            f' --declared-metric "{declared_metric}" --output "${{_BRF_MAIN}}"'
+            f' --exit-codes {exit_specs_arg}'
+            f' --stderr {stderr_specs_arg}'
+            f' --durations {duration_specs_arg}',
+        ]
+        script = "\n".join(lines)
+        encoded = base64.b64encode(script.encode()).decode()
+        normalized_command = f"echo {encoded} | base64 -d | bash"
+        if isinstance(command, str) and command.strip():
+            if command != normalized_command:
+                return False, "command and arms are mutually exclusive"
+        else:
+            contract["command"] = normalized_command
     elif not (isinstance(command, str) and command.strip()):
         return False, "missing or empty command"
 
@@ -383,6 +386,10 @@ def _validate_compute_launch_contract(
     if declared_metric is not None:
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric must be a non-empty string"
+        if len(declared_metric) > MAX_DECLARED_METRIC_LENGTH:
+            return False, (
+                f"declared_metric must be at most {MAX_DECLARED_METRIC_LENGTH} characters"
+            )
         if not METRIC_KEY_RE.fullmatch(declared_metric):
             return (
                 False,

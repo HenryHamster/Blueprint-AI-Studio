@@ -1528,6 +1528,8 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
     await db_session.commit()
     await db_session.refresh(task)
 
+    predecessor_id = uuid.uuid4()
+
     job = ComputeJob(
         project_id=project.id,
         task_id=task.id,
@@ -1535,7 +1537,13 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
         status=ComputeJobStatus.RUNNING,
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
-        polling_metadata={"command": "python train.py", "env": {}, "runtime_deadline_seconds": 300, "runner_target_id": str(runner.id)},
+        polling_metadata={
+            "command": "python train.py",
+            "env": {},
+            "runtime_deadline_seconds": 300,
+            "runner_target_id": str(runner.id),
+            "input_artifact_job_id": str(predecessor_id),
+        },
     )
     db_session.add(job)
     await db_session.commit()
@@ -1548,6 +1556,16 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
             "exit_code": 0,
             "result_metrics": {"accuracy": 0.99, "loss": 0.01},
             "command_log": {"text": "Training complete", "truncated": False},
+            "progress": {
+                "records": [{"metric": "accuracy", "value": 0.99, "step": 1}],
+                "count": 1,
+            },
+            "resume_hydration": {
+                "resumed_from_job_id": str(predecessor_id),
+                "ok": True,
+                "file_count": 2,
+                "bytes": 64,
+            },
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -1567,6 +1585,43 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
         "source": "runner",
     }
     assert meta.get("runner_finished_at") is not None
+    assert "runner_terminal_reason" not in meta
+    assert "artifact_delivery" not in meta
+
+    # A same-outcome replay may enrich fields the first terminal report omitted.
+    enrichment = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "succeeded",
+            "terminal_reason": "command completed",
+            "artifact_delivery": {
+                "status": "delivered",
+                "protocol": "direct",
+                "command_exec_status": "succeeded",
+                "verified": True,
+                "file_count": 2,
+                "total_bytes": 64,
+                "archive_size": 80,
+                "crc32c": "AAAAAA==",
+                "generation": "7",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert enrichment.status_code == 200
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    assert meta.get("runner_terminal_reason") == "command completed"
+
+    immutable_terminal_fields = {
+        key: json.loads(json.dumps(meta[key]))
+        for key in (
+            "runner_command_log",
+            "progress",
+            "resume_provenance",
+            "artifact_delivery",
+        )
+    }
 
     # poll_status must now return SUCCEEDED so the monitor can finalize.
     backend = RunnerSubprocessBackend()
@@ -1578,10 +1633,57 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
     # stale initial "queued for compute-job launch" status_message.
     assert status_result.message == "compute job succeeded"
 
+    # A same-outcome replay may fill fields omitted by the first terminal report,
+    # but it cannot replace already-recorded execution evidence with conflicts.
+    finished_at = meta["runner_finished_at"]
+    replay = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "succeeded",
+            "exit_code": 17,
+            "result_metrics": {"accuracy": 0.2},
+            "command_log": {"text": "conflicting terminal log", "truncated": True},
+            "terminal_reason": "conflicting reason",
+            "progress": {
+                "records": [{"metric": "accuracy", "value": 0.2, "step": 2}],
+                "count": 2,
+            },
+            "resume_hydration": {
+                "resumed_from_job_id": str(predecessor_id),
+                "ok": False,
+                "file_count": 0,
+                "bytes": 0,
+                "reason": "conflicting replay",
+            },
+            "artifact_delivery": {
+                "status": "failed",
+                "protocol": "legacy",
+                "command_exec_status": "failed",
+                "reason": "conflicting replay",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert replay.status_code == 200
+
+    # An opposite terminal outcome is wholly conflicting and cannot enrich even
+    # a missing terminal field.
+    conflict = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "failed",
+            "exit_code": 1,
+            "result_metrics": {"accuracy": 0.0},
+            "command_log": {"text": "opposite outcome", "truncated": False},
+            "terminal_reason": "opposite outcome",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert conflict.status_code == 200
+
     # The runner's heartbeat thread may have prepared a ``running`` report
     # before the command thread sent its terminal outcome. Receiving that stale
-    # heartbeat after success must not make the monitor see RUNNING again.
-    finished_at = meta["runner_finished_at"]
+    # heartbeat after success must not mutate live/progress evidence either.
     stale = await client.post(
         f"/api/runner/compute-job/{job.id}/report",
         json={
@@ -1589,6 +1691,11 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
             "exit_code": 99,
             "result_metrics": {"accuracy": 0.1},
             "command_log": {"text": "stale live tail", "truncated": False},
+            "progress": {
+                "records": [{"metric": "accuracy", "value": 0.1, "step": 3}],
+                "count": 3,
+            },
+            "viewable_omissions": {"size_cap": 9},
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -1603,6 +1710,11 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
         "loss": 0.01,
     }
     assert latched_meta["runner_finished_at"] == finished_at
+    assert latched_meta["runner_terminal_reason"] == "command completed"
+    for key, original_value in immutable_terminal_fields.items():
+        assert latched_meta[key] == original_value
+    assert "live_output" not in latched_meta
+    assert "viewable_live_omissions" not in latched_meta
     latched_status = await backend.poll_status(job)
     assert latched_status.status == ComputeJobStatus.SUCCEEDED
 

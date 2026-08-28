@@ -75,6 +75,7 @@ from app.task_capabilities import (
     USER_LAUNCHABLE_TASK_TYPES,
 )
 from app.compute_experiment_contract import (
+    MAX_DECLARED_METRIC_LENGTH,
     _validate_compute_launch_contract,
     resolve_compute_spend_decision,
     validate_compute_runner_target_enrollment,
@@ -2600,7 +2601,9 @@ class ComputeExperimentTaskPayload(BaseModel):
     )
     command: str | None = None
     arms: list[dict[str, str]] | None = None
-    declared_metric: str | None = None
+    declared_metric: str | None = Field(
+        default=None, max_length=MAX_DECLARED_METRIC_LENGTH
+    )
     spend_cap_usd: float
     deadline_seconds: int
     accelerator: str | None = None

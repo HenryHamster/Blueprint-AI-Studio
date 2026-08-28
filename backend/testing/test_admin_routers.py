@@ -10140,6 +10140,19 @@ class TestComputeExperimentTaskLaunch:
         assert "mutually exclusive" in resp.text
 
     @pytest.mark.asyncio
+    async def test_declared_metric_uses_agent_launch_length_cap(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(declared_metric="m" * 129),
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert "128" in resp.text
+
+    @pytest.mark.asyncio
     async def test_neither_command_nor_arms_rejected(
         self, client: AsyncClient, db_session
     ):

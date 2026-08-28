@@ -2797,10 +2797,21 @@ async def report_compute_job(
     # reporting thread must not roll ``succeeded``/``failed`` back to ``running``.
     # The row lock above serializes competing reports, so this JSONB latch needs
     # no schema migration or client-supplied sequence number.
-    runner_outcome_latched = meta.get("runner_exec_status") in {
+    latched_runner_status = meta.get("runner_exec_status")
+    runner_outcome_latched = latched_runner_status in {
         "succeeded",
         "failed",
     }
+    same_terminal_replay = (
+        runner_outcome_latched and payload.exec_status == latched_runner_status
+    )
+
+    def _report_field_can_fill(key: str) -> bool:
+        """Accept first evidence, or fill one missing field on a same-outcome replay."""
+        if not runner_outcome_latched:
+            return True
+        return same_terminal_replay and key not in meta
+
     runtime_provenance = dict(job.runtime_provenance or {})
     runtime_provenance.update(
         {
@@ -2820,7 +2831,11 @@ async def report_compute_job(
     # key (or discard a final report altogether).  Keep the legacy key too so
     # older readers remain compatible.
     terminal_runner_log: dict[str, Any] | None = None
-    if payload.command_log is not None and payload.exec_status != "running":
+    if (
+        payload.command_log is not None
+        and payload.exec_status != "running"
+        and _report_field_can_fill("runner_command_log")
+    ):
         if isinstance(payload.command_log, dict):
             log_text = payload.command_log.get("text", "")
             log_truncated = payload.command_log.get("truncated") is True
@@ -2849,13 +2864,13 @@ async def report_compute_job(
         if payload.exec_status in valid_statuses and not runner_outcome_latched:
             meta["runner_exec_status"] = payload.exec_status
         if (
-            not runner_outcome_latched
+            _report_field_can_fill("runner_exit_code")
             and payload.exit_code is not None
             and isinstance(payload.exit_code, int)
         ):
             meta["runner_exit_code"] = payload.exit_code
         if (
-            not runner_outcome_latched
+            _report_field_can_fill("runner_terminal_reason")
             and payload.exec_status in ("succeeded", "failed")
             and isinstance(payload.terminal_reason, str)
         ):
@@ -2869,12 +2884,16 @@ async def report_compute_job(
             if reason_text:
                 meta["runner_terminal_reason"] = reason_text
         if (
-            not runner_outcome_latched
+            _report_field_can_fill("runner_result_metrics")
             and payload.result_metrics is not None
             and isinstance(payload.result_metrics, dict)
         ):
             meta["runner_result_metrics"] = _filter_result_metrics(payload.result_metrics)
-        if payload.command_log is not None and payload.exec_status == "running":
+        if (
+            not runner_outcome_latched
+            and payload.command_log is not None
+            and payload.exec_status == "running"
+        ):
             # Interim live tail → polling_metadata["live_output"] (fixed shape,
             # bounded). runner_command_log stays terminal-only so the durable
             # full log is never overwritten by a mid-run window.
@@ -2901,7 +2920,7 @@ async def report_compute_job(
             if terminal_runner_log is not None:
                 meta["runner_command_log"] = terminal_runner_log
                 meta = normalize_terminal_command_log(meta)
-        if payload.progress is not None:
+        if payload.progress is not None and _report_field_can_fill("progress"):
             merged_progress, new_progress_records = _merge_progress_report(
                 meta.get("progress"), payload.progress, now
             )
@@ -2919,7 +2938,11 @@ async def report_compute_job(
                         t=rec.get("ts") or now.isoformat(),  # utc-iso-ok: persisted JSON round-trip, not a wire field
                         received_at=now,
                     )
-        if payload.exec_status == "running" and isinstance(payload.viewable_omissions, dict):
+        if (
+            not runner_outcome_latched
+            and payload.exec_status == "running"
+            and isinstance(payload.viewable_omissions, dict)
+        ):
             omissions: Dict[str, Any] = {}
             for key in ("size_cap", "count_cap"):
                 val = payload.viewable_omissions.get(key)
@@ -2928,11 +2951,14 @@ async def report_compute_job(
             if omissions:
                 meta["viewable_live_omissions"] = omissions
         if (
-            not runner_outcome_latched
+            _report_field_can_fill("runner_finished_at")
             and payload.exec_status in ("succeeded", "failed")
         ):
             meta["runner_finished_at"] = now.isoformat()  # utc-iso-ok: persisted JSON round-trip, not a wire field
-        if isinstance(payload.resume_hydration, dict):
+        if (
+            isinstance(payload.resume_hydration, dict)
+            and _report_field_can_fill("resume_provenance")
+        ):
             # Whitelist known provenance keys so a runner cannot bloat the row.
             raw = payload.resume_hydration
             provenance: Dict[str, Any] = {}
@@ -2966,6 +2992,7 @@ async def report_compute_job(
         if (
             payload.exec_status in ("succeeded", "failed")
             and isinstance(payload.artifact_delivery, dict)
+            and _report_field_can_fill("artifact_delivery")
         ):
             raw_delivery = payload.artifact_delivery
             delivery: Dict[str, Any] = {}

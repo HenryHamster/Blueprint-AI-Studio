@@ -2824,6 +2824,55 @@ def test_arms_contract_rejects_simultaneous_command():
     assert "mutually exclusive" in reason
 
 
+def test_arms_contract_normalize_validate_and_preview_are_idempotent():
+    from app.compute_experiment_contract import build_compute_contract_preview
+
+    contract = {
+        "arms": [
+            {"name": "a", "command": "python a.py"},
+            {"name": "b", "command": "python b.py"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+
+    first_ok, first_reason = _validate_compute_launch_contract(
+        contract, require_smoke=False
+    )
+    assert first_ok is True, first_reason
+    normalized_command = contract["command"]
+
+    second_ok, second_reason = _validate_compute_launch_contract(
+        contract, require_smoke=False
+    )
+    assert second_ok is True, second_reason
+    assert contract["command"] == normalized_command
+
+    preview = build_compute_contract_preview(
+        contract,
+        runtime_config={"compute_experiment_spend_threshold_usd": 5.0},
+    )
+    assert preview["ok"] is True
+    assert preview["normalized_contract"]["command"] == normalized_command
+    assert preview["effective_launcher"] == normalized_command
+
+
+def test_declared_metric_length_matches_launch_api_cap():
+    ok, reason = _validate_compute_launch_contract(
+        {
+            "command": "python run.py",
+            "declared_metric": "m" * 129,
+            "spend_cap_usd": 2.0,
+            "deadline_seconds": 600,
+        },
+        require_smoke=False,
+    )
+
+    assert ok is False
+    assert "at most 128" in reason
+
+
 def test_arms_contract_validation_empty_declared_metric():
     """declared_metric that is an empty string is rejected."""
     contract = {

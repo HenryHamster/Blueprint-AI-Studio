@@ -7,6 +7,7 @@ Covers:
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import tarfile
@@ -6297,6 +6298,63 @@ async def test_create_compute_job_reuses_matching_active_job_for_task(db_session
     jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
     assert first.id == second.id
     assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_reuses_old_persisted_fingerprint(db_session):
+    """Absent new semantics must reproduce the pre-rollout fingerprint exactly."""
+    project = Project(name="Legacy Compute Fingerprint", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    first = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo legacy-idempotent",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    legacy_payload = {
+        "accelerator": None,
+        "accelerator_count": None,
+        "backend": first.backend,
+        "command": "echo legacy-idempotent",
+        "container_image": None,
+        "cwd": None,
+        "deadline_seconds": 300,
+        "env": {},
+        "machine_type": "e2-standard-2",
+        "provisioning_model": "STANDARD",
+        "spend_cap_usd": 1.0,
+        "live_proof_requirement": None,
+        "no_progress_timeout_seconds": None,
+        "input_artifact_job_id": None,
+    }
+    legacy_fingerprint = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    first_meta = dict(first.polling_metadata or {})
+    first_meta["launch_request_fingerprint"] = legacy_fingerprint
+    first.polling_metadata = first_meta
+    db_session.add(first)
+    await db_session.commit()
+
+    retried = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo legacy-idempotent",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert retried.id == first.id
 
 
 @pytest.mark.parametrize(

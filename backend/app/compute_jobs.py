@@ -1354,7 +1354,6 @@ def _build_launch_request_fingerprint(
         "backend": backend_name,
         "command": command,
         "container_image": container_image,
-        "container_registry_auth": container_registry_auth,
         "cwd": cwd,
         "deadline_seconds": deadline_seconds,
         "env": {str(k): str(v) for k, v in (env or {}).items()},
@@ -1362,11 +1361,20 @@ def _build_launch_request_fingerprint(
         "provisioning_model": provisioning_model,
         "spend_cap_usd": float(spend_cap_usd),
         "live_proof_requirement": live_proof_requirement,
-        "setup_step": setup_step,
-        "declared_metric": declared_metric,
         "no_progress_timeout_seconds": no_progress_timeout_seconds,
         "input_artifact_job_id": input_artifact_job_id,
     }
+    # These fields joined the fingerprint after launch idempotency was already
+    # deployed. Omit them when absent so an exact retry of an active job created
+    # by the previous version reproduces its persisted legacy digest. When
+    # present they remain full execution semantics and therefore distinguish
+    # requests as intended.
+    if container_registry_auth:
+        payload["container_registry_auth"] = container_registry_auth
+    if setup_step is not None:
+        payload["setup_step"] = setup_step
+    if declared_metric is not None:
+        payload["declared_metric"] = declared_metric
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
