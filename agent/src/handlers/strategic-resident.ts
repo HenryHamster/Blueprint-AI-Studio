@@ -4768,17 +4768,11 @@ export async function handleStrategicResident(
       if (
         dispatchAttempt.status === 'rejected'
         || dispatchAttempt.value.result.processGone
-        || dispatchAttempt.value.completion === null
       ) {
         if (dispatchAttempt.status === 'rejected') {
           sendLog(
             ws,
             `[resident] typed Fast rejected local staging; replacing child and retrying exact claim once: ${sanitize(String(dispatchAttempt.reason))}\n`,
-          );
-        } else if (dispatchAttempt.value.completion === null) {
-          sendLog(
-            ws,
-            '[resident] typed Fast omitted receipt-bound completion; replacing child and retrying exact claim once\n',
           );
         }
         typedController.replaceAfterCrash();
@@ -5022,9 +5016,17 @@ export async function handleStrategicResident(
       return 'continue';
     }
     const pickupLagMs = computePickupLagMs(workdayMessages);
-    const directExecution = workdayMessages.some(
-      message => message.context?._direct_workday_execution === true,
-    );
+    // A server-confirmed Fast abandon is itself qualification for the deeper
+    // Workday lane: Fast proved it could not produce the receipt-bound public
+    // response, so imposing the ordinary interactive hard cap here can kill
+    // the research/tool turn that fallback exists to perform. Keep normal chat
+    // on the responsive budget and grant only this exact coordinator-confirmed
+    // fallback (or an explicitly qualified direct request) the bounded deeper
+    // allowance.
+    const directExecution = typedOutcome === 'fallback_admissible'
+      || workdayMessages.some(
+        message => message.context?._direct_workday_execution === true,
+      );
     setResidentActivity(
       'working',
       `Responding to ${workdayMessages.length} operator message${workdayMessages.length === 1 ? '' : 's'}`,

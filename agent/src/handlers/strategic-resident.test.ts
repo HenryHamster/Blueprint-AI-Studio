@@ -2688,7 +2688,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
-  it('hands the same batch to Workday after replacement omits receipt-bound completion', async () => {
+  it('hands the same batch to deep Workday after Fast omits receipt-bound completion', async () => {
     const operatorMessage = {
       id: 'typed-fast-missing-completion-twice', content: 'Can you answer now?',
       created_at: new Date().toISOString(), from_type: 'user',
@@ -2758,11 +2758,8 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await run('typed-fast-missing-completion-twice', qualifiedPayload(), statusRef);
 
     expect(claimCount).toBe(1);
-    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
-    expect(typedFastMocks.dispatch.mock.calls[1]?.[0]).toBe(
-      typedFastMocks.dispatch.mock.calls[0]?.[0],
-    );
-    expect(typedFastMocks.replaceAfterCrash).toHaveBeenCalledTimes(1);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
+    expect(typedFastMocks.replaceAfterCrash).not.toHaveBeenCalled();
     expect(typedFastMocks.close).toHaveBeenCalledTimes(1);
     expect(releaseReasons).toContain('receipt_protocol_failure');
     expect(mockApiPost.mock.calls.filter(([url]) =>
@@ -2770,6 +2767,10 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(mockApiPost.mock.calls.filter(([url]) =>
       url.endsWith('/conversation/turns/abandon'))).toHaveLength(1);
     expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(workday.sendTurn).toHaveBeenCalledWith(expect.anything(), {
+      stallTimeoutMs: 300_000,
+      hardTimeoutMs: 360_000,
+    });
     const replyPost = mockApiPost.mock.calls.find(([, body]) => body?.op === 'create_message');
     expect((replyPost?.[1]?.data as Record<string, unknown>).covered_message_ids).toEqual([
       operatorMessage.id,
@@ -2832,7 +2833,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await done;
 
     expect(claimCount).toBe(1);
-    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
     expect(mockApiPost.mock.calls.filter(([url]) =>
       url.endsWith('/conversation/turns/abandon'))).toHaveLength(1);
     expect(workday.sendTurn).not.toHaveBeenCalled();
@@ -5473,7 +5474,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     });
     await vi.advanceTimersByTimeAsync(3_000);
 
-    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
     expect(workday.sendTurn).toHaveBeenCalledTimes(1);
     expect(workday.interrupt).not.toHaveBeenCalled();
 
@@ -5484,7 +5485,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await done;
 
-    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(2);
+    expect(typedFastMocks.dispatch).toHaveBeenCalledTimes(1);
     expect(workday.sendTurn).toHaveBeenCalledTimes(2);
     expect(replyCoveredIds).toContainEqual([fastMessage.id]);
   });
