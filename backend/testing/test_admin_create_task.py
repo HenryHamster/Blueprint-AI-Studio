@@ -15,7 +15,16 @@ with an HTTP 400.
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, ProjectMember, ProjectStatus, Task, TaskStatus
+from app.models import (
+    Direction,
+    Project,
+    ProjectMember,
+    ProjectStatus,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+    VersionAcceptanceCriterion,
+)
 
 # Code-producing tasks now require an acceptance_evidence declaration at
 # validation (validate_task_payload). These tests exercise the operator
@@ -217,6 +226,230 @@ async def test_explicit_base_branch_preserved(client: AsyncClient, db_session):
     assert stored_base_branch == "main", (
         f"Expected explicit 'main' but got {stored_base_branch!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_paused_create_atomically_persists_exact_task_authority(
+    client: AsyncClient, db_session
+):
+    """A paused project can stage one exact, dependency-gated task row."""
+    project = await _make_project_with_member(db_session, "acme/atomic-admission")
+    project.paused = True
+    project.integration_branch = "automain"
+    project.promotion_target = "automain"
+    project.directions = [
+        {"id": "d-atomic", "text": "Atomic admission", "status": "active"}
+    ]
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=54,
+        status="open",
+        phase="build",
+    )
+    db_session.add_all([project, version])
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion_ids = ["c-duration", "c-retention"]
+    db_session.add_all(
+        [
+            Direction(
+                project_id=project.id,
+                direction_key="d-atomic",
+                status="active",
+                text="Atomic admission",
+                data={
+                    "id": "d-atomic",
+                    "status": "active",
+                    "criterion_release_version_id": str(version.id),
+                },
+                # The direction owns a third key; an explicit task assignment
+                # must remain the requested two-key subset.
+                criterion_keys=[*criterion_ids, "c-unrelated"],
+            ),
+            *[
+                VersionAcceptanceCriterion(
+                    project_id=project.id,
+                    release_version_id=version.id,
+                    criterion_key=key,
+                    status="active",
+                    text=key,
+                )
+                for key in [*criterion_ids, "c-unrelated"]
+            ],
+        ]
+    )
+    predecessor = Task(
+        project_id=project.id,
+        title="Corpus prerequisite",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "freeze", "base_branch": "automain"}],
+    )
+    db_session.add(predecessor)
+    await db_session.commit()
+    await db_session.refresh(predecessor)
+
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/atomic-admission",
+            "project_id": str(project.id),
+            "title": "Budget consumer",
+            "prompt": "Enforce the selected-test budget after the corpus lands.",
+            "task_type": "create",
+            "direction_id": "d-atomic",
+            "criterion_ids": criterion_ids,
+            "depends_on": [str(predecessor.id)],
+            "require_deps_landed_on": "automain",
+            "release_base_branch": "automain",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_atomic_admission.py::test_budget",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    created = await db_session.get(Task, response.json()["id"])
+    assert created is not None
+    assert created.status == TaskStatus.QUEUED
+    assert created.depends_on == [str(predecessor.id)]
+    assert created.criterion_ids == criterion_ids
+    assert created.context["direction_id"] == "d-atomic"
+    assert created.context["criterion_ids_explicit"] is True
+    assert created.context["criterion_release_version_id"] == str(version.id)
+    assert created.context["_structural_depends_on_ids"] == [str(predecessor.id)]
+    assert created.first_payload["require_deps_landed_on"] == "automain"
+    assert created.first_payload["release_base_branch"] == "automain"
+    await db_session.refresh(project)
+    assert project.paused is True
+
+    # Exercise the final cold-dispatch claim fence, not merely the row state:
+    # the fully-authored QUEUED task cannot be claimed while paused. Once the
+    # same project is explicitly unpaused, the pause fence releases it (the
+    # dependency gate remains a separate downstream admission check).
+    from app.orchestrator import _lock_dispatchable_task_for_mutation
+
+    project_id = project.id
+    created_task_id = created.id
+    assert (
+        await _lock_dispatchable_task_for_mutation(db_session, created_task_id) is None
+    )
+    await db_session.rollback()
+    project = await db_session.get(Project, project_id)
+    assert project is not None
+    project.paused = False
+    db_session.add(project)
+    await db_session.commit()
+    claimable_after_unpause = await _lock_dispatchable_task_for_mutation(
+        db_session, created_task_id
+    )
+    assert claimable_after_unpause is not None
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_atomic_create_rejects_invalid_criterion_and_cross_project_dependency(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_with_member(db_session, "acme/admission-guards")
+    foreign = await _make_project_with_member(db_session, "acme/admission-foreign")
+    version = ReleaseVersion(project_id=project.id, version_number=54, status="open")
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-guards",
+        status="active",
+        data={"id": "d-guards", "status": "active"},
+    )
+    staged_direction = Direction(
+        project_id=project.id,
+        direction_key="d-staged",
+        status="staged",
+        data={"id": "d-staged", "status": "staged"},
+    )
+    foreign_task = Task(
+        project_id=foreign.id,
+        title="Foreign prerequisite",
+        payloads=[{"type": "create", "prompt": "foreign", "base_branch": "main"}],
+    )
+    cancelled_task = Task(
+        project_id=project.id,
+        title="Cancelled prerequisite",
+        status=TaskStatus.CANCELLED,
+        payloads=[{"type": "create", "prompt": "cancelled", "base_branch": "main"}],
+    )
+    db_session.add_all(
+        [version, direction, staged_direction, foreign_task, cancelled_task]
+    )
+    await db_session.commit()
+    await db_session.refresh(foreign_task)
+    initial_project_task_count = await _count_tasks(db_session, project.id)
+
+    body = {
+        "github_repo": "acme/admission-guards",
+        "project_id": str(project.id),
+        "title": "Rejected task",
+        "prompt": "Must not persist.",
+        "task_type": "create",
+        "direction_id": "d-guards",
+        "criterion_ids": ["c-missing"],
+        "acceptance_evidence": {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_atomic_admission.py",
+        },
+    }
+    invalid_criterion = await client.post("/api/admin/tasks", json=body)
+    assert invalid_criterion.status_code == 400, invalid_criterion.text
+
+    staged_body = {
+        **body,
+        "direction_id": "d-staged",
+    }
+    staged_body.pop("criterion_ids")
+    staged_direction_response = await client.post(
+        "/api/admin/tasks", json=staged_body
+    )
+    assert staged_direction_response.status_code == 400
+    assert "requires an active direction" in staged_direction_response.text
+
+    body.pop("criterion_ids")
+    body["depends_on"] = [str(foreign_task.id)]
+    foreign_dependency = await client.post("/api/admin/tasks", json=body)
+    assert foreign_dependency.status_code == 400, foreign_dependency.text
+
+    body["depends_on"] = [str(cancelled_task.id)]
+    cancelled_dependency = await client.post("/api/admin/tasks", json=body)
+    assert cancelled_dependency.status_code == 400, cancelled_dependency.text
+    assert "terminal non-success" in cancelled_dependency.text
+    assert await _count_tasks(db_session, project.id) == initial_project_task_count
+
+
+@pytest.mark.asyncio
+async def test_idempotency_replay_rejects_different_task_authority(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_with_member(db_session, "acme/idempotent-authority")
+    body = {
+        "github_repo": "acme/idempotent-authority",
+        "project_id": str(project.id),
+        "title": "Stable request",
+        "prompt": "Create exactly once.",
+        "task_type": "create",
+        "idempotency_key": "exact-authority-replay",
+        "acceptance_evidence": _CODE_EVIDENCE,
+    }
+    first = await client.post("/api/admin/tasks", json=body)
+    assert first.status_code == 200, first.text
+
+    changed = {
+        **body,
+        "depends_on": ["11111111-1111-4111-8111-111111111111"],
+    }
+    replay = await client.post("/api/admin/tasks", json=changed)
+
+    assert replay.status_code == 409, replay.text
+    assert "different authority" in replay.text
+    assert await _count_tasks(db_session, project.id) == 1
 
 
 @pytest.mark.asyncio

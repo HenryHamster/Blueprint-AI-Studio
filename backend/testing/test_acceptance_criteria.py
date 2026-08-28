@@ -6526,6 +6526,70 @@ async def test_record_task_merge_evidence_direction_with_criterion_keys_records_
     assert coverage == "covered"
 
 
+@pytest.mark.asyncio
+async def test_explicit_task_criterion_ids_are_not_widened_from_direction(
+    db_session,
+):
+    """An operator-authored subset proves only that subset at merge time."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "ExactOperatorCriterionSubset")
+    version = await _make_version(db_session, project)
+    selected = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Selected operator criterion",
+        created_by="operator",
+    )
+    unrelated = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Unrelated direction criterion",
+        created_by="operator",
+    )
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key="d-broad",
+            data={
+                "id": "d-broad",
+                "status": "active",
+                "criterion_release_version_id": str(version.id),
+            },
+            status="active",
+            criterion_keys=[selected.criterion_key, unrelated.criterion_key],
+        )
+    )
+    task = Task(
+        project_id=project.id,
+        title="Exact subset",
+        payloads=[{"type": "create", "prompt": "prove one criterion"}],
+        context={
+            "direction_id": "d-broad",
+            "criterion_ids_explicit": True,
+            "criterion_release_version_id": str(version.id),
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "the declared test passed",
+            },
+        },
+        criterion_ids=[selected.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert recorded == 2
+    assert await ac.get_evidence_for_criterion(db_session, selected.id)
+    assert await ac.get_evidence_for_criterion(db_session, unrelated.id) == []
+
+
 # ---------------------------------------------------------------------------
 # record_acceptance_window_coverage_evidence
 # ---------------------------------------------------------------------------

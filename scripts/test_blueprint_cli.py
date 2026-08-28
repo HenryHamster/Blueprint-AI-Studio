@@ -7042,6 +7042,83 @@ def test_tasks_create_posts_task(mock_api, monkeypatch, capsys):
     )
 
 
+def test_tasks_create_posts_atomic_authority_fields(mock_api, monkeypatch):
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {
+            "api_url": "x",
+            "api_key": "y",
+            "default_repo": "owner/repo",
+        },
+    )
+    prerequisite = "11111111-1111-4111-8111-111111111111"
+
+    rc = blueprint.main(
+        [
+            "tasks",
+            "create",
+            "Exact task",
+            "Implement the bounded contract.",
+            "--direction-id",
+            "d-exact",
+            "--criterion-id",
+            "c-duration",
+            "--criterion-id",
+            "c-retention",
+            "--depends-on",
+            prerequisite,
+            "--require-deps-landed-on",
+            "automain",
+            "--release-base-branch",
+            "automain",
+            "--acceptance-test",
+            "backend/testing/test_exact.py::test_contract",
+            "--yes",
+        ]
+    )
+
+    assert rc == 0
+    body = next(
+        body
+        for method, path, body in mock_api
+        if method == "POST" and path == "/api/admin/tasks"
+    )
+    assert body["direction_id"] == "d-exact"
+    assert body["criterion_ids"] == ["c-duration", "c-retention"]
+    assert body["depends_on"] == [prerequisite]
+    assert body["require_deps_landed_on"] == "automain"
+    assert body["release_base_branch"] == "automain"
+
+
+def test_tasks_create_criterion_id_requires_named_test(
+    mock_api, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {"api_url": "x", "api_key": "y", "default_repo": "owner/repo"},
+    )
+
+    rc = blueprint.main(
+        [
+            "tasks",
+            "create",
+            "Bad criterion evidence",
+            "Do not submit.",
+            "--criterion-id",
+            "c-duration",
+            "--acceptance-behavior",
+            "The change appears to work.",
+            "--yes",
+        ]
+    )
+
+    assert rc == 1
+    assert "--criterion-id requires --acceptance-test" in capsys.readouterr().err
+    assert not any(method == "POST" for method, _path, _body in mock_api)
+
+
 def test_tasks_create_custom_type_and_repo(mock_api, monkeypatch, capsys):
     """tasks create respects --type, --repo, and --base-branch overrides."""
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {
