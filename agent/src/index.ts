@@ -4029,10 +4029,34 @@ export async function main() {
     stopHeartbeat();
     // Workspace teardown happens once at process exit, not per-role —
     // warm continuity DEPENDS on the workspace surviving across roles.
-    try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
+    cleanupWorkspaceOnProcessExit();
     log('Agent shutdown complete.');
   }
   if (_pendingExitCode !== 0) process.exit(_pendingExitCode);
+}
+
+export function cleanupWorkspaceOnProcessExit(
+  workspace = WORKSPACE,
+  vmInstanceId = process.env.VM_INSTANCE_ID,
+  remove: (
+    file: string,
+    args: string[],
+    options: { encoding: 'utf-8'; timeout: number },
+  ) => unknown = execFileSync,
+): boolean {
+  // The local-runner daemon owns its stable per-task workspace and keeps it
+  // through a bounded grace after wrapper exit. Deleting /workspace/agent here
+  // defeats that contract before a same-task Resident retry can reuse it.
+  if (vmInstanceId?.startsWith('runner:')) {
+    log(`Local runner owns workspace cleanup; preserving ${workspace} for same-task recovery`);
+    return false;
+  }
+  try {
+    remove('rm', ['-rf', workspace], { encoding: 'utf-8', timeout: 30_000 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ── Per-role lifecycle (extracted so warm roles re-enter cleanly) ────────────
