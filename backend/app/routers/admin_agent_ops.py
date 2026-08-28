@@ -6081,12 +6081,13 @@ async def strategic_operation(
 
     elif payload.op == "set_acceptance_criteria":
         # Author criteria for the open release version and optionally map
-        # directions to them.  Restricted to strategic_review agents (enforced
-        # above by the task_type guard).  Deduplicates by text within the
+        # directions to them. A criterion_key lets the strategist correct its
+        # own active criterion in place without breaking stable references.
+        # Restricted to strategic_review agents (enforced above by the
+        # task_type guard). Deduplicates by text within the
         # (project_id, release_version_id) scope so repeated calls are safe.
         from app.acceptance_criteria import (
             count_active_criteria_for_version as _count_active_criteria,
-            get_criteria_by_keys as _get_criteria_by_keys,
             get_criterion_by_text as _get_criterion_by_text,
             normalize_evidence_contract as _normalize_evidence_contract,
             update_criterion_evidence_contract as _update_evidence_contract,
@@ -6126,6 +6127,18 @@ async def strategic_operation(
                     status_code=400,
                     detail="set_acceptance_criteria: each criterion must have a non-empty 'text' string",
                 )
+            criterion_key = item.get("criterion_key")
+            if criterion_key is not None:
+                if not isinstance(criterion_key, str) or not criterion_key.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="set_acceptance_criteria: 'criterion_key' must be a non-empty string when provided",
+                    )
+                if not isinstance(item.get("expected_text"), str):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="set_acceptance_criteria: 'expected_text' is required for an in-place rewrite",
+                    )
             if "evidence_contract" in item:
                 contract = item.get("evidence_contract")
                 if contract is not None and not isinstance(contract, dict):
@@ -6204,20 +6217,95 @@ async def strategic_operation(
         # a single query instead of N individual _get_criterion_by_key() calls
         # across three separate loops (finding 1: 3N → 1 + N).
         _retract_keys: list[str] = [item["criterion_key"].strip() for item in retract_input]
+        _update_keys: list[str] = [
+            item["criterion_key"].strip()
+            for item in criteria_input
+            if isinstance(item.get("criterion_key"), str)
+            and item["criterion_key"].strip()
+        ]
+        if len(_update_keys) != len(set(_update_keys)):
+            raise HTTPException(
+                status_code=400,
+                detail="set_acceptance_criteria: each criterion_key may be updated at most once per request",
+            )
+        _overlapping_keys = set(_update_keys) & set(_retract_keys)
+        if _overlapping_keys:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "set_acceptance_criteria: a criterion cannot be updated and "
+                    f"retracted in the same request: {sorted(_overlapping_keys)}"
+                ),
+            )
         _supersession_keys: list[str] = [
             item["superseded_by_key"].strip()
             for item in retract_input
             if isinstance(item.get("superseded_by_key"), str) and item["superseded_by_key"].strip()
         ]
-        _all_crit_keys = list(set(_retract_keys + _supersession_keys))
+        _all_crit_keys = list(
+            set(_retract_keys + _update_keys + _supersession_keys)
+        )
         _criteria_by_key: dict[str, _VAC] = {}
         if _all_crit_keys:
-            _rows = await _get_criteria_by_keys(
-                session, project.id, _all_crit_keys, release_version_id=open_version.id
+            _rows_result = await session.execute(
+                select(_VAC)
+                .where(
+                    _VAC.project_id == project.id,
+                    _VAC.release_version_id == open_version.id,
+                    _VAC.criterion_key.in_(_all_crit_keys),
+                )
+                .with_for_update()
             )
+            _rows = list(_rows_result.scalars().all())
             _criteria_by_key = {r.criterion_key: r for r in _rows}
 
         pre_status_by_key: dict[str, str | None] = {}
+        _updates_by_key = {
+            item["criterion_key"].strip(): item
+            for item in criteria_input
+            if isinstance(item.get("criterion_key"), str)
+            and item["criterion_key"].strip()
+        }
+        for criterion_key, update_item in _updates_by_key.items():
+            existing = _criteria_by_key.get(criterion_key)
+            if existing is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"set_acceptance_criteria: criterion '{criterion_key}' "
+                        "does not exist on the open release version"
+                    ),
+                )
+            if existing.status != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"set_acceptance_criteria: criterion '{criterion_key}' "
+                        f"is not active (status={existing.status})"
+                    ),
+                )
+            if (
+                existing.created_by != "strategist"
+                or _is_owner_controlled_machine_contract(existing)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"set_acceptance_criteria: criterion '{criterion_key}' is "
+                        "not strategist-controlled and cannot be rewritten by the "
+                        "autonomous loop"
+                    ),
+                )
+            requested_text = update_item["text"].strip()
+            expected_text = update_item["expected_text"]
+            if existing.text not in {expected_text, requested_text}:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"set_acceptance_criteria: criterion '{criterion_key}' "
+                        "changed since it was read"
+                    ),
+                )
         for item in retract_input:
             criterion_key = item["criterion_key"].strip()
             existing = _criteria_by_key.get(criterion_key)
@@ -6380,13 +6468,40 @@ async def strategic_operation(
         for item in criteria_input:
             text = item["text"].strip()
             direction_keys_input: list[str] = list(item.get("direction_keys") or [])
+            requested_key = (
+                item.get("criterion_key", "").strip()
+                if isinstance(item.get("criterion_key"), str)
+                else ""
+            )
+            text_updated = False
 
-            try:
-                existing = await _get_criterion_by_text(
-                    session, project.id, open_version.id, text
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if requested_key:
+                existing = _criteria_by_key[requested_key]
+                try:
+                    text_match = await _get_criterion_by_text(
+                        session, project.id, open_version.id, text
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if text_match is not None and text_match.id != existing.id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"set_acceptance_criteria: text already belongs to "
+                            f"criterion '{text_match.criterion_key}'"
+                        ),
+                    )
+                text_updated = existing.text != text
+                if text_updated:
+                    existing.text = text
+                    session.add(existing)
+            else:
+                try:
+                    existing = await _get_criterion_by_text(
+                        session, project.id, open_version.id, text
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
             if existing is not None:
                 criterion_key = existing.criterion_key
                 is_new = False
@@ -6480,6 +6595,7 @@ async def strategic_operation(
                     "criterion_key": criterion_key,
                     "text": text,
                     "is_new": is_new,
+                    "text_updated": text_updated,
                     "direction_keys": mapped_keys,
                 }
             )
