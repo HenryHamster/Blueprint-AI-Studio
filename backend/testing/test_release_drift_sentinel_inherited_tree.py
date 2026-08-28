@@ -179,6 +179,69 @@ async def test_exact_qualified_tree_inheritance_skips_dispatch_and_retires_incid
 
 
 @pytest.mark.asyncio
+async def test_force_promoted_predecessor_uses_durable_candidate_when_column_is_null(
+    db_session, mocker
+):
+    """Live v51 shape: bypass promotion had no qualifier attempt or column stamp."""
+    _project, predecessor, version = await _promoted_predecessor(db_session)
+    predecessor.candidate_sha = None
+    predecessor.qualification_attempts = 0
+    predecessor.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": _CANDIDATE,
+        "promoted_sha": _PROMOTED,
+        "forced_promote": True,
+    }
+    db_session.add(predecessor)
+    await db_session.commit()
+    gate, promotion_receipt, ci_mock, identity_mock = _proof_mocks(mocker)
+
+    assert await _run(db_session, version.id) is False
+    assert predecessor.qualification_attempts == 0
+    assert gate.await_count == 1
+    assert promotion_receipt.await_count == 1
+    assert ci_mock.await_count == 1
+    assert identity_mock.await_count == 3
+
+
+@pytest.mark.parametrize(
+    ("candidate_column", "record_candidate", "record_promoted", "forced_marker"),
+    [
+        pytest.param(_CANDIDATE, "4" * 40, _PROMOTED, True, id="candidate-mismatch"),
+        pytest.param(None, int(_CANDIDATE), _PROMOTED, True, id="numeric-candidate"),
+        pytest.param(None, _CANDIDATE, int(_PROMOTED), True, id="numeric-promoted"),
+        pytest.param(None, _CANDIDATE, _PROMOTED, "true", id="string-bypass-marker"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_promoted_candidate_ambiguity_fails_closed_to_dispatch(
+    db_session,
+    mocker,
+    candidate_column,
+    record_candidate,
+    record_promoted,
+    forced_marker,
+):
+    _project, predecessor, version = await _promoted_predecessor(db_session)
+    predecessor.candidate_sha = candidate_column
+    predecessor.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": record_candidate,
+        "promoted_sha": record_promoted,
+        "forced_promote": forced_marker,
+    }
+    db_session.add(predecessor)
+    await db_session.commit()
+    gate, promotion_receipt, ci_mock, identity_mock = _proof_mocks(mocker)
+
+    assert await _run(db_session, version.id) is True
+    assert gate.await_count == 2
+    promotion_receipt.assert_not_awaited()
+    ci_mock.assert_not_awaited()
+    identity_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inherited_receipt_is_not_reused_after_repository_repoint(
     db_session, mocker
 ):

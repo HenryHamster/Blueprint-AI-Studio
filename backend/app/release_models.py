@@ -183,11 +183,12 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(40), nullable=True),
     )
 
-    # candidate_sha: the candidate this qualification attempt evaluates, stamped
-    # by ``run_qualification`` from the integration-branch HEAD it resolved live
-    # for that run — on a new attempt AND on a continued one, which re-resolves
-    # HEAD and scores that fresher candidate everywhere else.  Never written by
-    # unrelated ``last_qualification`` paths; it is the authoritative source for
+    # candidate_sha: the canonical candidate selected by qualification or a
+    # bypass promotion. ``run_qualification`` stamps the integration-branch HEAD
+    # it resolved live on every new or continued attempt; promotion success
+    # re-asserts the exact promoted candidate so force/hotfix paths that skip the
+    # qualifier cannot leave it NULL. Never written by unrelated
+    # ``last_qualification`` paths; it is the authoritative source for
     # ``candidate_authorship_range()``, since a mutable JSONB fallback let those
     # writes silently substitute a different candidate into the authorship gate.
     candidate_sha: str | None = Field(
