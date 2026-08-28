@@ -444,6 +444,7 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
     assert response.json()["criterion_ids"] == criterion_ids
     assert response.json()["criterion_ids_explicit"] is True
     assert response.json()["criterion_release_version_id"] == str(version.id)
+    assert response.json()["creation_priority"] == 100
     assert response.json()["priority"] == 100
     assert response.json()["base_branch"] == "automain"
     assert response.json()["depends_on"] == [str(predecessor.id)]
@@ -457,7 +458,10 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
     assert created.depends_on == [str(predecessor.id)]
     assert created.context["direction_id"] == "d-exact"
     assert created.context["criterion_ids_explicit"] is True
-    assert created.context["_operator_task_creation_authority"]["priority"] == 100
+    assert (
+        created.context["_operator_task_creation_authority"]["creation_priority"]
+        == 100
+    )
     assert created.context["_operator_task_creation_authority"]["base_branch"] == (
         "automain"
     )
@@ -484,6 +488,11 @@ async def test_task_create_priority_is_exact_idempotency_authority(
             json=body,
             headers=_auth(token),
         )
+        created_task = await db_session.get(Task, uuid.UUID(created.json()["id"]))
+        assert created_task is not None
+        # This is the live-row mutation performed by set_task_priority.
+        created_task.priority = 0
+        await db_session.commit()
         duplicate = await client.post(
             f"{OPERATOR_URL}/projects/{project.id}/tasks",
             json=body,
@@ -496,10 +505,12 @@ async def test_task_create_priority_is_exact_idempotency_authority(
         )
 
     assert created.status_code == 201, created.text
+    assert created.json()["creation_priority"] == 100
     assert created.json()["priority"] == 100
     assert duplicate.status_code == 201, duplicate.text
     assert duplicate.json()["is_duplicate"] is True
-    assert duplicate.json()["priority"] == 100
+    assert duplicate.json()["creation_priority"] == 100
+    assert duplicate.json()["priority"] == 0
     assert mismatch.status_code == 409, mismatch.text
     assert "priority" in mismatch.text
     assert (

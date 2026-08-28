@@ -320,6 +320,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
     assert response.json()["base_branch"] == "automain"
     assert response.json()["depends_on"] == [str(predecessor.id)]
     assert response.json()["criterion_release_version_id"] == str(version.id)
+    assert response.json()["creation_priority"] == 100
     assert response.json()["priority"] == 100
     created = await db_session.get(Task, response.json()["id"])
     assert created is not None
@@ -338,7 +339,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
             "criterion_ids",
             "criterion_ids_explicit",
             "criterion_release_version_id",
-            "priority",
+            "creation_priority",
             "base_branch",
             "depends_on",
             "require_deps_landed_on",
@@ -349,7 +350,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
         "criterion_ids": criterion_ids,
         "criterion_ids_explicit": True,
         "criterion_release_version_id": str(version.id),
-        "priority": 100,
+        "creation_priority": 100,
         "base_branch": "automain",
         "depends_on": [str(predecessor.id)],
         "require_deps_landed_on": "automain",
@@ -837,6 +838,7 @@ async def test_non_hotfix_create_task_still_works(client: AsyncClient, db_sessio
     )
 
     assert resp.status_code == 200, resp.text
+    assert resp.json()["creation_priority"] == 50
     assert resp.json()["priority"] == 50
     task_id = resp.json()["id"]
 

@@ -374,6 +374,7 @@ def _operator_task_receipt(value: Any) -> dict[str, Any]:
             "criterion_ids",
             "criterion_ids_explicit",
             "criterion_release_version_id",
+            "creation_priority",
             "priority",
             "base_branch",
             "depends_on",
