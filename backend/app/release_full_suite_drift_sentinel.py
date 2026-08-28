@@ -69,6 +69,7 @@ def _inherited_tree_receipt_active(
     *,
     version,
     predecessor,
+    candidate_sha: str,
     integration_branch: str,
     promotion_target: str,
     github_owner: str,
@@ -89,16 +90,16 @@ def _inherited_tree_receipt_active(
         and receipt.get("github_owner") == github_owner
         and receipt.get("github_repo") == github_repo
         and receipt.get("head_sha") == head_sha
-        and receipt.get("candidate_sha") == predecessor.candidate_sha
+        and receipt.get("candidate_sha") == candidate_sha
         and receipt.get("promoted_sha") == predecessor.promoted_sha
         and receipt.get("head_parents")
-        == [predecessor.candidate_sha, predecessor.promoted_sha]
+        == [candidate_sha, predecessor.promoted_sha]
         and isinstance(receipt.get("tree_sha"), str)
         and len(receipt["tree_sha"]) == 40
         and receipt.get("promotion_pr_merge_commit_sha") == predecessor.promoted_sha
         and receipt.get("promotion_pr_empty_diff") is False
         and receipt.get("promotion_ci_event") == "pull_request"
-        and receipt.get("promotion_ci_head_sha") == predecessor.candidate_sha
+        and receipt.get("promotion_ci_head_sha") == candidate_sha
         and receipt.get("promotion_ci_head_branch")
         == f"release-v{predecessor.version_number}"
         and receipt.get("promotion_ci_status") == "completed"
@@ -108,6 +109,48 @@ def _inherited_tree_receipt_active(
         and type(receipt.get("promotion_ci_run_id")) is int
         and receipt["promotion_ci_run_id"] > 0
     )
+
+
+def _canonical_promoted_candidate_sha(predecessor) -> str | None:
+    """Resolve one unambiguous candidate for a promoted release.
+
+    The dedicated column is authoritative when present.  Force/hotfix releases
+    created before promotion success stamped that column may fall back to their
+    durable promoted record, but only when its exact bypass provenance and
+    promoted outcome agree with the release row.  Any malformed or conflicting
+    evidence fails closed.
+    """
+    from app import github
+
+    column_sha = predecessor.candidate_sha
+    record = predecessor.last_qualification
+    record_sha = record.get("candidate_sha") if isinstance(record, dict) else None
+
+    if column_sha is not None:
+        if not isinstance(column_sha, str) or not github.is_full_commit_sha(column_sha):
+            return None
+        if record_sha is not None and (
+            not isinstance(record_sha, str)
+            or not github.is_full_commit_sha(record_sha)
+            or record_sha != column_sha
+        ):
+            return None
+        return column_sha
+
+    if not isinstance(record, dict) or record.get("status") != "promoted":
+        return None
+    bypass_markers = sum(
+        record.get(key) is True for key in ("forced_promote", "hotfix_promote")
+    )
+    if bypass_markers != 1:
+        return None
+    if (
+        not isinstance(record_sha, str)
+        or not github.is_full_commit_sha(record_sha)
+        or record.get("promoted_sha") != predecessor.promoted_sha
+    ):
+        return None
+    return record_sha
 
 
 async def _resolve_inherited_tree_receipt(
@@ -146,7 +189,7 @@ async def _resolve_inherited_tree_receipt(
     )
     if predecessor is None:
         return None
-    candidate_sha = predecessor.candidate_sha or ""
+    candidate_sha = _canonical_promoted_candidate_sha(predecessor) or ""
     promoted_sha = predecessor.promoted_sha or ""
     if not (
         github.is_full_commit_sha(candidate_sha)
@@ -168,6 +211,7 @@ async def _resolve_inherited_tree_receipt(
         prior_receipt,
         version=version,
         predecessor=predecessor,
+        candidate_sha=candidate_sha,
         integration_branch=integration_branch,
         promotion_target=promotion_target,
         github_owner=owner,

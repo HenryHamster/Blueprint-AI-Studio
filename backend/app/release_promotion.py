@@ -2343,6 +2343,11 @@ async def _record_promotion_success(
         record["already_landed"] = True
     version.last_qualification = record
     flag_modified(version, "last_qualification")
+    # Promotion success is the common transactional boundary for normal,
+    # force, and hotfix lanes.  Re-assert the exact landed candidate here so a
+    # bypass that skipped run_qualification cannot leave the canonical column
+    # NULL while the durable promoted record names the candidate.
+    version.candidate_sha = candidate_sha
     version.status = "promoted"
     version.promoted_at = now
     version.promoted_sha = effective_sha
