@@ -3708,8 +3708,8 @@ class TestReaperLoop(unittest.TestCase):
         self.assertNotIn("task-done", active_tasks)
         self.assertTrue(capacity.acquire(blocking=False))
 
-    def test_reap_cleans_up_finished_workspace(self):
-        """A reaped agent's per-task workspace is removed (auto-clean wiring)."""
+    def test_reap_defers_finished_workspace_cleanup_for_same_task_retry(self):
+        """Wrapper exit must not erase a checkout from a bootstrapping retry."""
         import tempfile
 
         done_proc = MagicMock()
@@ -3736,7 +3736,49 @@ class TestReaperLoop(unittest.TestCase):
                     local_runner._shutdown_event.clear()
 
                 self.assertNotIn("task-done", active_tasks)
+                self.assertTrue(os.path.isdir(workspace))
+
+                # Once the grace has elapsed and no replacement is active, the
+                # existing stale sweep remains the bounded cleanup authority.
+                removed = local_runner._cleanup_stale_workspaces(
+                    set(), max_age_seconds=0
+                )
+                self.assertEqual(removed, 1)
                 self.assertFalse(os.path.exists(workspace))
+
+    def test_reap_refreshes_old_workspace_before_immediate_stale_sweep(self):
+        """A long-running task gets its full exit grace even on sweep tick 30."""
+        import tempfile
+
+        done_proc = MagicMock()
+        done_proc.poll.return_value = 0
+        done_proc.returncode = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                workspace = local_runner._agent_workspace_for_task("task-old")
+                old = time.time() - 3_600
+                os.utime(workspace, (old, old))
+
+                active_tasks = {"task-old": done_proc}
+                sleep_calls = 0
+
+                def stop_on_sweep(_secs):
+                    nonlocal sleep_calls
+                    sleep_calls += 1
+                    if sleep_calls >= 30:
+                        local_runner._shutdown_event.set()
+
+                local_runner._shutdown_event.clear()
+                try:
+                    with patch("time.sleep", stop_on_sweep):
+                        local_runner._reap_loop(active_tasks, threading.Lock())
+                finally:
+                    local_runner._shutdown_event.clear()
+
+                self.assertEqual(sleep_calls, 30)
+                self.assertTrue(os.path.isdir(workspace))
+                self.assertGreater(os.stat(workspace).st_mtime, old)
 
 
 # ── Exit-code 42 (runtime_unavailable) does not increment failure streak ─────

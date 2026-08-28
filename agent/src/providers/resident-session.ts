@@ -9,7 +9,10 @@ import {
   recordNumTurns, sanitize,
 } from '../index.js';
 import { writeAgentTokenFile } from '../token-file.js';
-import { PROCESS_KILL_GRACE_MS } from '../constants.js';
+import {
+  DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS,
+  PROCESS_KILL_GRACE_MS,
+} from '../constants.js';
 import {
   parseResidentLine, splitStreamChunk, encodeUserTurn, encodeUserTurnBlocks,
   isStrategicMutation, type ResidentStreamEvent,
@@ -56,7 +59,6 @@ const RESIDENT_COOPERATIVE_INTERRUPT_SETTLE_MS = 10_000;
 // and settles the turn with `hardTimedOut` so the handler posts terminal FAILED
 // instead of spinning silently. Default is a generous backstop — legitimate
 // operator-reply and bounded autonomous turns finish well within it.
-const DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS = 15 * 60_000;
 const OPERATOR_REPLY_TYPES = new Set(['NOTE', 'QUESTION', 'FEEDBACK', 'BUG_REPORT', 'BLOCKER']);
 
 /**

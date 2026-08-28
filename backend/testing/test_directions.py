@@ -6491,6 +6491,7 @@ async def test_strategic_api_set_memory(db_session):
         assert body["source_kind"] == "strategic_memory"
         assert body["entry_count"] == 1
         assert body["doc_id"]
+        assert body["duplicate"] is False
 
         # The KnowledgeDocument row is the store; the legacy JSONB column is
         # frozen (dual-write leg cut).
@@ -6502,6 +6503,247 @@ async def test_strategic_api_set_memory(db_session):
 
         await db_session.refresh(project)
         assert (project.strategic_memory_notes or []) == []
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_memory_exact_normalized_replay_is_idempotent(
+    db_session,
+):
+    """A crash-after-commit retry returns the original memory document."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.knowledge_query import list_knowledge_documents
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    first_data = {
+        "body": "  Keep the selected-test budget provenance pinned.  ",
+        "title": "  Selected-test budget evidence  ",
+        "summary": "Measured budget\nwith retained historical selectors.",
+        "topic": " technical_constraint ",
+        "tags": [" v54 ", "selected-tests"],
+    }
+    normalized_replay = {
+        "body": "Keep the selected-test budget provenance pinned.",
+        "title": "Selected-test budget evidence",
+        "summary": "Measured budget with retained historical selectors.",
+        "topic": "technical_constraint",
+        "tags": ["v54", "selected-tests"],
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            first = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "set_memory", "task_id": task_id, "data": first_data},
+            )
+            replay = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": normalized_replay,
+                },
+            )
+
+        assert first.status_code == 200, first.text
+        assert replay.status_code == 200, replay.text
+        first_body = first.json()
+        replay_body = replay.json()
+        assert first_body["duplicate"] is False
+        assert replay_body["duplicate"] is True
+        assert replay_body["doc_id"] == first_body["doc_id"]
+        assert replay_body["entry_count"] == 1
+
+        listed = await list_knowledge_documents(
+            db_session, project.id, source_kind="strategic_memory"
+        )
+        assert listed["total"] == 1
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_memory_near_duplicate_remains_distinct(db_session):
+    """The replay fence must not collapse a materially changed memory fact."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.knowledge_query import list_knowledge_documents
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            first = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"title": "Budget evidence", "body": "p95 is 477.8s"},
+                },
+            )
+            changed = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"title": "Budget evidence", "body": "p95 is 478.1s"},
+                },
+            )
+
+        assert first.status_code == 200, first.text
+        assert changed.status_code == 200, changed.text
+        assert first.json()["duplicate"] is False
+        assert changed.json()["duplicate"] is False
+        assert changed.json()["doc_id"] != first.json()["doc_id"]
+        listed = await list_knowledge_documents(
+            db_session, project.id, source_kind="strategic_memory"
+        )
+        assert listed["total"] == 2
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_memory_replay_requires_active_fact_and_exact_supersession(
+    db_session,
+):
+    """Supersession replays require the old row's exact durable inverse edge."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.models import KnowledgeDocument
+
+    _project, task_id = await _make_strategic_project_and_task(db_session)
+    exact_data = {"title": "Budget evidence", "body": "p95 is 477.8s"}
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            first = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "set_memory", "task_id": task_id, "data": exact_data},
+            )
+            assert first.status_code == 200, first.text
+            first_doc = await db_session.get(
+                KnowledgeDocument, uuid.UUID(first.json()["doc_id"])
+            )
+            assert first_doc is not None
+            first_doc.lifecycle_status = "dismissed"
+            first_doc.dismissed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            first_doc.dismissed_reason = "obsolete evidence"
+            db_session.add(first_doc)
+            await db_session.commit()
+
+            after_dismissal = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "set_memory", "task_id": task_id, "data": exact_data},
+            )
+            assert after_dismissal.status_code == 200, after_dismissal.text
+            assert after_dismissal.json()["duplicate"] is False
+            assert after_dismissal.json()["doc_id"] != first.json()["doc_id"]
+
+            first_target = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"title": "Old constraint", "body": "p95 is 600s"},
+                },
+            )
+            assert first_target.status_code == 200, first_target.text
+            first_supersession = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {
+                        **exact_data,
+                        "supersedes_id": first_target.json()["doc_id"],
+                    },
+                },
+            )
+            assert first_supersession.status_code == 200, first_supersession.text
+            assert first_supersession.json()["duplicate"] is False
+            assert (
+                first_supersession.json()["doc_id"]
+                != after_dismissal.json()["doc_id"]
+            )
+
+            # Crash-after-commit replay: the exact requested target proves the
+            # supersession already landed, so return the original new document.
+            replayed_supersession = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {
+                        **exact_data,
+                        "supersedes_id": first_target.json()["doc_id"],
+                    },
+                },
+            )
+            assert replayed_supersession.status_code == 200, replayed_supersession.text
+            assert replayed_supersession.json()["duplicate"] is True
+            assert (
+                replayed_supersession.json()["doc_id"]
+                == first_supersession.json()["doc_id"]
+            )
+
+            # An exact candidate superseded a different old row. This target
+            # has no inverse edge to that candidate, so it must create a new
+            # document and apply this requested supersession normally.
+            second_target = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"title": "Older constraint", "body": "p95 is 900s"},
+                },
+            )
+            assert second_target.status_code == 200, second_target.text
+            mismatched_target = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {
+                        **exact_data,
+                        "supersedes_id": second_target.json()["doc_id"],
+                    },
+                },
+            )
+
+        assert mismatched_target.status_code == 200, mismatched_target.text
+        assert mismatched_target.json()["duplicate"] is False
+        assert (
+            mismatched_target.json()["doc_id"]
+            != first_supersession.json()["doc_id"]
+        )
+        first_old_doc = await db_session.get(
+            KnowledgeDocument, uuid.UUID(first_target.json()["doc_id"])
+        )
+        assert first_old_doc is not None
+        assert first_old_doc.lifecycle_status == "dismissed"
+        assert first_old_doc.dismissed_reason == (
+            f"superseded by {first_supersession.json()['doc_id']}"
+        )
+        second_old_doc = await db_session.get(
+            KnowledgeDocument, uuid.UUID(second_target.json()["doc_id"])
+        )
+        assert second_old_doc is not None
+        assert second_old_doc.lifecycle_status == "dismissed"
+        assert second_old_doc.dismissed_reason == (
+            f"superseded by {mismatched_target.json()['doc_id']}"
+        )
     finally:
         _cleanup_strategic_overrides()
 

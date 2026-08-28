@@ -20,6 +20,10 @@ export const STDERR_TAIL_BYTES = 50_000;
 // Subprocess lifecycle: grace window between SIGTERM and SIGKILL escalation.
 export const PROCESS_KILL_GRACE_MS = 5_000;
 
+// Absolute ceiling for one turn in the persistent Resident provider session.
+// Output and tool activity never extend it.
+export const DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS = 15 * 60_000;
+
 // After Claude Code emits the structured `result` event (model finished its
 // turn), the subprocess should exit promptly. If it doesn't, send SIGTERM after
 // this grace window so the agent wrapper can proceed to commit/push/PR rather
