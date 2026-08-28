@@ -7919,12 +7919,132 @@ print(json.dumps(result))
 PYEOF"""
 
 
+def _load_compute_arms(
+    path_value: str | None,
+) -> tuple[list[dict[str, str]] | None, str | None]:
+    """Load a multi-arm launch from JSON without shell-delimited parsing.
+
+    The file may be either the arms array itself or an object containing
+    ``arms`` plus an optional ``declared_metric``. Commands therefore remain
+    exact JSON strings even when they contain spaces, quotes, or newlines.
+    """
+    if not path_value:
+        return None, None
+    path = Path(path_value).expanduser()
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(f"ERROR: cannot read --arms-file {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except UnicodeDecodeError as exc:
+        print(f"ERROR: --arms-file {path} is not valid UTF-8: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: --arms-file {path} is not valid JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    declared_metric: str | None = None
+    if isinstance(parsed, dict):
+        unknown = sorted(set(parsed) - {"arms", "declared_metric"})
+        if unknown:
+            print(
+                "ERROR: --arms-file object has unsupported field(s): "
+                + ", ".join(unknown),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        declared_metric = parsed.get("declared_metric")
+        parsed = parsed.get("arms")
+    if not isinstance(parsed, list) or not parsed:
+        print(
+            "ERROR: --arms-file must contain a non-empty JSON array of "
+            "{name, command} objects.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    arms: list[dict[str, str]] = []
+    for index, raw_arm in enumerate(parsed):
+        if not isinstance(raw_arm, dict) or set(raw_arm) != {"name", "command"}:
+            print(
+                f"ERROR: --arms-file arms[{index}] must contain exactly name and command.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        name = raw_arm.get("name")
+        command = raw_arm.get("command")
+        if not isinstance(name, str) or not name.strip():
+            print(
+                f"ERROR: --arms-file arms[{index}].name must be non-empty.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not isinstance(command, str) or not command.strip():
+            print(
+                f"ERROR: --arms-file arms[{index}].command must be non-empty.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        arms.append({"name": name.strip(), "command": command})
+    if declared_metric is not None and (
+        not isinstance(declared_metric, str) or not declared_metric.strip()
+    ):
+        print(
+            "ERROR: --arms-file declared_metric must be a non-empty string.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return arms, declared_metric.strip() if isinstance(declared_metric, str) else None
+
+
+_COMPUTE_TASK_TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+
+
+def _watch_compute_task(
+    args: argparse.Namespace,
+    task_id: str,
+    *,
+    timeout_seconds: float,
+    interval_seconds: float,
+) -> dict:
+    """Poll one launched task to terminal state with a bounded operator wait."""
+    deadline = time.monotonic() + timeout_seconds
+    last_status: str | None = None
+    while True:
+        task = api("GET", f"/api/admin/tasks/{task_id}")
+        status = str((task or {}).get("status") or "UNKNOWN").upper()
+        if not _json_mode(args) and status != last_status:
+            print(f"  watch: {status}")
+        last_status = status
+        if status in _COMPUTE_TASK_TERMINAL_STATUSES:
+            return {"timed_out": False, "status": status, "task": task}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {
+                "timed_out": True,
+                "status": status,
+                "task": task,
+                "timeout_seconds": timeout_seconds,
+            }
+        time.sleep(min(interval_seconds, remaining))
+
+
 def _compute_launch(args: argparse.Namespace) -> None:
-    _require_write_config("compute launch")
+    preview_only = bool(getattr(args, "preview_only", False))
+    if not preview_only:
+        _require_write_config("compute launch")
     dud = getattr(args, "dud", False)
+    arms, file_declared_metric = _load_compute_arms(
+        getattr(args, "arms_file", None)
+    )
     command = _COMPUTE_DUD_COMMAND if dud else getattr(args, "experiment_command", None)
-    if not command:
-        print("ERROR: provide --dud or --command.", file=sys.stderr)
+    if arms is not None and (dud or command):
+        print(
+            "ERROR: --arms-file cannot be combined with --dud or --command.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not command and arms is None:
+        print("ERROR: provide --dud, --command, or --arms-file.", file=sys.stderr)
         sys.exit(1)
     cfg = load_config()
     github_repo = getattr(args, "repo", None) or cfg.get("default_repo", "")
@@ -7941,7 +8061,28 @@ def _compute_launch(args: argparse.Namespace) -> None:
     operator = getattr(args, "operator", ">=")
     raw_threshold = getattr(args, "threshold", None)
     threshold = (raw_threshold if raw_threshold is not None else 1.0) if dud else raw_threshold
-    if not _confirm(f"Launch compute experiment: {title[:60]}?", getattr(args, "yes", False)):
+    declared_metric = getattr(args, "declared_metric", None) or file_declared_metric
+    if arms is not None and not declared_metric:
+        print(
+            "ERROR: multi-arm launch requires --declared-metric or declared_metric in --arms-file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    watch = bool(getattr(args, "watch", False))
+    if preview_only and watch:
+        print("ERROR: --watch cannot be combined with --preview.", file=sys.stderr)
+        sys.exit(1)
+    watch_interval = float(getattr(args, "watch_interval", 5.0))
+    if watch_interval <= 0:
+        print("ERROR: --watch-interval must be positive.", file=sys.stderr)
+        sys.exit(1)
+    watch_timeout = getattr(args, "watch_timeout", None)
+    if watch_timeout is not None and watch_timeout <= 0:
+        print("ERROR: --watch-timeout must be positive.", file=sys.stderr)
+        sys.exit(1)
+    if not preview_only and not _confirm(
+        f"Launch compute experiment: {title[:60]}?", getattr(args, "yes", False)
+    ):
         print("Aborted.")
         return
     body: dict = {
@@ -7949,10 +8090,16 @@ def _compute_launch(args: argparse.Namespace) -> None:
         "title": title,
         "prompt": prompt,
         "base_branch": base_branch,
-        "command": command,
         "spend_cap_usd": spend_cap,
         "deadline_seconds": deadline,
     }
+    if arms is not None:
+        body["arms"] = arms
+        body["declared_metric"] = declared_metric
+    else:
+        body["command"] = command
+        if declared_metric:
+            body["declared_metric"] = declared_metric
     if metric:
         body["success_criterion"] = {
             "metric": metric,
@@ -7961,11 +8108,70 @@ def _compute_launch(args: argparse.Namespace) -> None:
         }
     if getattr(args, "machine_type", None):
         body["machine_type"] = args.machine_type
+    if getattr(args, "runner_target", None):
+        body["runner_target_id"] = args.runner_target
+    if getattr(args, "idempotency_key", None):
+        body["idempotency_key"] = args.idempotency_key
+    if getattr(args, "require_durable_artifact", False):
+        body["require_durable_artifact"] = True
+    if getattr(args, "no_progress_timeout", None) is not None:
+        body["no_progress_timeout_seconds"] = args.no_progress_timeout
+    if getattr(args, "stop_condition", None):
+        body["stop_or_pivot_condition"] = args.stop_condition
+    spawn_followup = getattr(args, "spawn_followup", None)
+    if spawn_followup is not None:
+        body["spawn_followup"] = spawn_followup
+    if preview_only:
+        body["preview_only"] = True
     result = api("POST", "/api/admin/tasks/compute-experiment", body)
-    _emit(args, result, lambda r: print(
-        f"  compute experiment created: {r.get('task_id', r.get('id', '?'))}"
-        + (f"  job_id={r.get('compute_job_id', '')}" if r.get("compute_job_id") else "")
-    ))
+
+    def _render_created(r: dict) -> None:
+        print(
+            f"  compute experiment created: {r.get('task_id', r.get('id', '?'))}"
+            + (
+                f"  job_id={r.get('compute_job_id', '')}"
+                if r.get("compute_job_id")
+                else ""
+            )
+        )
+
+    if watch:
+        task_id = str(result.get("task_id") or result.get("id") or "")
+        if not task_id:
+            print(
+                "ERROR: launch response did not include a task id to watch.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not _json_mode(args):
+            _render_created(result)
+        effective_timeout = float(watch_timeout or max(deadline + 300, 600))
+        result = {
+            **result,
+            "watch": _watch_compute_task(
+                args,
+                task_id,
+                timeout_seconds=effective_timeout,
+                interval_seconds=watch_interval,
+            ),
+        }
+
+    def _render(r: dict) -> None:
+        if preview_only:
+            preview = r.get("preview") or {}
+            verdict = "valid" if preview.get("ok") is True else "invalid"
+            print(f"  compute experiment preview: {verdict} (nothing created)")
+            return
+        if not watch:
+            _render_created(r)
+        watched = r.get("watch")
+        if isinstance(watched, dict) and watched.get("timed_out"):
+            print(
+                f"  watch timed out in {watched.get('status', 'UNKNOWN')} after "
+                f"{watched.get('timeout_seconds')}s"
+            )
+
+    _emit(args, result, _render)
 
 
 # ── argument parser ──────────────────────────────────────────────────────────
@@ -9235,6 +9441,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--command", dest="experiment_command", default=None,
         help="Bash command string for the experiment (ignored when --dud).")
     p_compute_launch.add_argument(
+        "--arms-file", dest="arms_file", default=None, metavar="PATH",
+        help="Read a UTF-8 JSON multi-arm contract: either an array of "
+             "{name, command} objects or {arms: [...], declared_metric: '...'}.")
+    p_compute_launch.add_argument(
+        "--declared-metric", dest="declared_metric", default=None, metavar="METRIC",
+        help="Declared result metric (required for --arms-file unless included there).")
+    p_compute_launch.add_argument(
         "--title", default=None, help="Task title (default: 'operator substrate probe' for --dud).")
     p_compute_launch.add_argument(
         "--prompt", default=None, help="Task prompt / description.")
@@ -9259,6 +9472,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_compute_launch.add_argument(
         "--machine-type", dest="machine_type", default=None,
         help="GCP machine type override (e.g. n1-standard-4).")
+    p_compute_launch.add_argument(
+        "--runner-target", "--strict-runner-target",
+        dest="runner_target", default=None,
+        metavar="UUID_OR_HOST",
+        help="Hard-pin execution to one enrolled runner UUID or hostname; never fall back.")
+    p_compute_launch.add_argument(
+        "--idempotency-key", dest="idempotency_key", default=None, metavar="KEY",
+        help="Project-scoped launch idempotency key for safe retries.")
+    p_compute_launch.add_argument(
+        "--require-durable-artifact", action="store_true",
+        help="Fail completion unless a durable compute-result artifact is linked.")
+    p_compute_launch.add_argument(
+        "--no-progress-timeout", dest="no_progress_timeout", type=int, default=None,
+        metavar="SECONDS",
+        help="Stop a job whose BLUEPRINT_PROGRESS_FILE stops advancing for this long.")
+    p_compute_launch.add_argument(
+        "--stop-condition", dest="stop_condition", default=None, metavar="TEXT",
+        help="Explicit empirical stop-or-pivot condition recorded in the contract.")
+    p_compute_launch.add_argument(
+        "--follow-up", dest="spawn_followup", action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or explicitly disable the bounded completion follow-up task.")
+    p_compute_launch.add_argument(
+        "--preview", "--preview-only", dest="preview_only", action="store_true",
+        help="Validate and inspect the exact launch without creating any state "
+             "or confirming.")
+    p_compute_launch.add_argument(
+        "--watch", dest="watch", action=argparse.BooleanOptionalAction, default=False,
+        help="Poll the created task to terminal state after launch (default: no watch).")
+    p_compute_launch.add_argument(
+        "--watch-timeout", dest="watch_timeout", type=float, default=None,
+        metavar="SECONDS",
+        help="Bound --watch (default: max(deadline + 300, 600)).")
+    p_compute_launch.add_argument(
+        "--watch-interval", dest="watch_interval", type=float, default=5.0,
+        metavar="SECONDS",
+        help="Polling interval for --watch (default 5).")
     p_compute_launch.add_argument(
         "--yes", action="store_true", help="Skip the confirmation prompt.")
 

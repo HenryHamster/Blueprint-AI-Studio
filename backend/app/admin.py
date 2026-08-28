@@ -77,6 +77,7 @@ from app.task_capabilities import (
 from app.compute_experiment_contract import (
     MAX_DECLARED_METRIC_LENGTH,
     _validate_compute_launch_contract,
+    build_compute_contract_preview,
     resolve_compute_spend_decision,
     validate_compute_runner_target_enrollment,
 )
@@ -2665,6 +2666,11 @@ class ComputeExperimentTaskPayload(BaseModel):
     # Absent/False preserves the terminal result and knowledge record without
     # creating an implicit task chain.
     spawn_followup: bool | None = None
+    # Validate and explain the exact launch contract without creating a project,
+    # task, history row, or any other durable state. This deliberately shares the
+    # write-authorized endpoint so a preview cannot be used to inspect a project
+    # the caller could not launch against.
+    preview_only: bool = False
 
     @model_validator(mode="after")
     def validate_command_or_arms(self) -> "ComputeExperimentTaskPayload":
@@ -3770,7 +3776,16 @@ async def create_compute_experiment_task(
         session, current_user["user_id"], github_owner, github_repo
     )
 
-    if not project:
+    if project is None and payload.preview_only:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "compute preview requires an existing writable Blueprint project; "
+                "preview_only never auto-creates one"
+            ),
+        )
+
+    if project is None:
         # Mark the auto-created project as bootstrap-complete and non-autonomous:
         # compute_experiment is a one-off operator job and does not need repo
         # bootstrapping or autonomous research cycles.  Without these flags the
@@ -3801,7 +3816,17 @@ async def create_compute_experiment_task(
         )
         await session.commit()
 
-    await backfill_branch_columns(session, project_id=project.id)
+    # A pause is a hard admission fence for real compute spend. Preview remains
+    # available so an operator can repair and inspect the next launch while the
+    # project is deliberately frozen. Keep this before backfill_branch_columns:
+    # a rejected launch must not make even incidental branch-column writes.
+    if project.paused and not payload.preview_only:
+        raise HTTPException(
+            status_code=409,
+            detail="project is paused; compute experiment spawning is disabled",
+        )
+    if not payload.preview_only:
+        await backfill_branch_columns(session, project_id=project.id)
 
     # Resolve an operator HARD runner pin (UUID or hostname) against this project's
     # allow-listed runners BEFORE persisting the task. A 422 here means the target
@@ -3860,6 +3885,12 @@ async def create_compute_experiment_task(
             launch_contract[opt_key] = val
     if payload.runner_target is not None:
         launch_contract["runner_target"] = payload.runner_target.model_dump()
+    if payload.require_live_release:
+        launch_contract["live_proof"] = True
+    if payload.require_durable_artifact:
+        launch_contract["require_durable_artifact"] = True
+    if payload.spawn_followup is not None:
+        launch_contract["spawn_followup"] = payload.spawn_followup
 
     ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
@@ -4011,6 +4042,33 @@ async def create_compute_experiment_task(
         raise HTTPException(
             status_code=422, detail=format_payload_validation_error(exc)
         )
+
+    if payload.preview_only:
+        preview = build_compute_contract_preview(
+            launch_contract,
+            runtime_config=_runtime_config,
+            require_local_runner=resolve_project_require_local_runner(project),
+            task_context=(
+                {"forced_runner_target_id": forced_runner_id}
+                if forced_runner_id
+                else {}
+            ),
+        )
+        # The canonical preview intentionally carries the normalized contract.
+        # Apply the same task-payload secret redaction used by admin task reads so
+        # registry credentials and env values remain write-only.
+        normalized = preview.get("normalized_contract")
+        if isinstance(normalized, dict):
+            preview["normalized_contract"] = redact_task_payloads([normalized])[0]
+        return {
+            "status": "ok",
+            "preview_only": True,
+            "project_id": str(project.id),
+            "title": payload.title,
+            "base_branch": resolved_base_branch,
+            "forced_runner_target_id": forced_runner_id,
+            "preview": preview,
+        }
 
     active_count = (
         await session.execute(

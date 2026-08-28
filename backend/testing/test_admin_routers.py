@@ -9339,6 +9339,94 @@ class TestComputeExperimentTaskLaunch:
         return payload
 
     @pytest.mark.asyncio
+    async def test_paused_project_allows_side_effect_free_preview(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        project.paused = True
+        project.integration_branch = None
+        project.promotion_target = None
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                preview_only=True,
+                env={"PRIVATE_TOKEN": "do-not-echo"},
+                container_image="example.invalid/bench@sha256:" + "a" * 64,
+                container_registry_auth={
+                    "server": "example.invalid",
+                    "username": "operator",
+                    "password": "do-not-echo",
+                },
+                require_durable_artifact=True,
+                no_progress_timeout_seconds=120,
+                stop_or_pivot_condition="Stop after the acceptance floor is measured.",
+                spawn_followup=False,
+            ),
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["preview_only"] is True
+        assert data["project_id"] == str(project.id)
+        preview = data["preview"]
+        assert preview["ok"] is True
+        normalized = preview["normalized_contract"]
+        assert normalized["require_durable_artifact"] is True
+        assert normalized["no_progress_timeout_seconds"] == 120
+        assert normalized["spawn_followup"] is False
+        assert "env" not in normalized
+        assert "container_registry_auth" not in normalized
+
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+        await db_session.refresh(project)
+        assert project.paused is True
+        assert project.integration_branch is None
+        assert project.promotion_target is None
+
+    @pytest.mark.asyncio
+    async def test_paused_project_rejects_real_launch_before_incidental_writes(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        project.paused = True
+        project.integration_branch = None
+        project.promotion_target = None
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(),
+        )
+
+        assert resp.status_code == 409, resp.text
+        assert "project is paused" in resp.text
+        assert (await db_session.execute(select(Task))).scalars().all() == []
+        await db_session.refresh(project)
+        assert project.integration_branch is None
+        assert project.promotion_target is None
+
+    @pytest.mark.asyncio
+    async def test_preview_never_auto_creates_missing_project(
+        self, client: AsyncClient, db_session
+    ):
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(repo="preview-missing", preview_only=True),
+        )
+
+        assert resp.status_code == 404, resp.text
+        assert "never auto-creates" in resp.text
+        projects = (
+            await db_session.execute(
+                select(Project).where(Project.github_repo == "preview-missing")
+            )
+        ).scalars().all()
+        assert projects == []
+
+    @pytest.mark.asyncio
     async def test_valid_launch_persists_compute_experiment_contract(
         self, client: AsyncClient, db_session
     ):

@@ -7519,6 +7519,137 @@ def test_compute_launch_custom_command(mock_api, monkeypatch, capsys):
     assert body["title"] == "Train run"
 
 
+def test_compute_launch_structured_preview_exposes_full_operator_contract(
+    mock_api, monkeypatch, tmp_path, capsys
+):
+    arms_file = tmp_path / "arms.json"
+    arms_file.write_text(
+        json.dumps(
+            {
+                "declared_metric": "accuracy",
+                "arms": [
+                    {"name": "baseline", "command": "python train.py --seed 1"},
+                    {"name": "candidate", "command": "python train.py --seed 2"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    read_only_config = {
+        "read_only": True,
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: read_only_config)
+    monkeypatch.setattr(blueprint, "load_config", lambda: read_only_config)
+    monkeypatch.setattr(
+        blueprint,
+        "_confirm",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preview must not confirm")
+        ),
+    )
+
+    rc = blueprint.main(
+        [
+            "compute",
+            "launch",
+            "--arms-file",
+            str(arms_file),
+            "--runner-target",
+            "gpu-runner-1",
+            "--idempotency-key",
+            "sweep-2026-08-28",
+            "--require-durable-artifact",
+            "--no-progress-timeout",
+            "180",
+            "--stop-condition",
+            "Stop after both arms report accuracy.",
+            "--no-follow-up",
+            "--preview",
+        ]
+    )
+
+    assert rc == 0
+    launch_calls = [
+        (method, path, body)
+        for method, path, body in mock_api
+        if method == "POST" and "compute-experiment" in path
+    ]
+    assert len(launch_calls) == 1
+    body = launch_calls[0][2]
+    assert body["preview_only"] is True
+    assert body["arms"] == [
+        {"name": "baseline", "command": "python train.py --seed 1"},
+        {"name": "candidate", "command": "python train.py --seed 2"},
+    ]
+    assert body["declared_metric"] == "accuracy"
+    assert "command" not in body
+    assert body["runner_target_id"] == "gpu-runner-1"
+    assert body["idempotency_key"] == "sweep-2026-08-28"
+    assert body["require_durable_artifact"] is True
+    assert body["no_progress_timeout_seconds"] == 180
+    assert body["stop_or_pivot_condition"].startswith("Stop after")
+    assert body["spawn_followup"] is False
+
+
+def test_compute_launch_watch_polls_created_task_to_terminal(
+    mock_api, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        blueprint_api,
+        "load_config",
+        lambda: {
+            "api_url": "x",
+            "api_key": "y",
+            "default_repo": "owner/repo",
+            "default_base_branch": "main",
+        },
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "load_config",
+        lambda: {
+            "api_url": "x",
+            "api_key": "y",
+            "default_repo": "owner/repo",
+            "default_base_branch": "main",
+        },
+    )
+    original_api = blueprint.api
+    statuses = iter(["QUEUED", "IN_PROGRESS", "COMPLETED"])
+
+    def watch_api(method, path, body=None, timeout=30):
+        if method == "POST" and path == "/api/admin/tasks/compute-experiment":
+            return {"id": "compute-task-1", "status": "QUEUED"}
+        if method == "GET" and path == "/api/admin/tasks/compute-task-1":
+            return {"id": "compute-task-1", "status": next(statuses)}
+        return original_api(method, path, body, timeout)
+
+    monkeypatch.setattr(blueprint, "api", watch_api)
+    monkeypatch.setattr(blueprint.time, "sleep", lambda _seconds: None)
+
+    rc = blueprint.main(
+        [
+            "compute",
+            "launch",
+            "--dud",
+            "--yes",
+            "--watch",
+            "--watch-timeout",
+            "10",
+        ]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "watch: QUEUED" in out
+    assert "watch: IN_PROGRESS" in out
+    assert "watch: COMPLETED" in out
+
+
 def test_compute_launch_read_only_refused(mock_api, monkeypatch):
     """compute launch refuses under a read-only config."""
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
