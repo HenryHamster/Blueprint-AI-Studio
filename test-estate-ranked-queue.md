@@ -158,7 +158,6 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | P5 | backend | `backend/testing/test_cost_telemetry_reconciliation.py` | 1,694 | 42 | moderate (1500–2999 LOC) | 7.868s measured | — |
 | P5 | backend | `backend/testing/test_check_gate_fail_closed.py` | 1,503 | 35 | moderate (1500–2999 LOC) | 7.637s measured | — |
 | P5 | backend | `backend/testing/test_strategic_spawning_outcome_evaluation.py` | 2,605 | 48 | moderate (1500–2999 LOC) | 6.466s measured | — |
-| P5 | backend | `backend/testing/test_admin_create_task.py` | 1,534 | 30 | moderate (1500–2999 LOC) | 6.437s measured | — |
 | P5 | backend | `backend/testing/test_evergreen_backlog.py` | 1,539 | 50 | moderate (1500–2999 LOC) | 6.364s measured | — |
 | P5 | backend | `backend/testing/test_compute_gcp_startup.py` | 1,991 | 62 | moderate (1500–2999 LOC) | 5.984s measured | — |
 | P5 | backend | `backend/testing/test_warm_backlog_reuse.py` | 2,019 | 53 | moderate (1500–2999 LOC) | 5.982s measured | — |
@@ -365,6 +364,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_test_imports_checker.py` | 764 | 21 | under 1500 LOC | 5.849s measured | — |
 | G | backend | `backend/testing/test_monthly_budget_alerts.py` | 644 | 18 | under 1500 LOC | 5.812s measured | — |
 | G | backend | `backend/testing/test_strategic_autonomous_handoff.py` | 416 | 3 | under 1500 LOC | 5.800s measured | — |
+| G | backend | `backend/testing/test_admin_create_task.py` | 1,454 | 29 | under 1500 LOC | 5.675s measured | — |
 | G | backend | `backend/testing/test_strategic_memory_envelope.py` | 1,166 | 22 | under 1500 LOC | 5.674s measured | — |
 | G | backend | `backend/testing/test_publication_gate_receipt.py` | 618 | 17 | under 1500 LOC | 5.652s measured | — |
 | G | admin-ui | `admin-ui/src/test/mock-factory-export-coverage.test.ts` | 1,173 | 17 | under 1500 LOC | 5.549s measured | — |
@@ -585,6 +585,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/components/SettingsDeploySection.test.tsx` | 233 | 13 | under 1500 LOC | 0.809s measured | — |
 | G | backend | `backend/testing/test_strategic_cycle_cost_projection.py` | 1,143 | 46 | under 1500 LOC | 0.761s measured | — |
 | G | admin-ui | `admin-ui/src/components/PrimaryTabNav.test.tsx` | 257 | 12 | under 1500 LOC | 0.759s measured | — |
+| G | backend | `backend/testing/test_exact_task_admission_immutability.py` | 90 | 1 | under 1500 LOC | 0.754s measured | — |
 | G | backend | `backend/testing/test_research_deferred_carry.py` | 62 | 1 | under 1500 LOC | 0.738s measured | — |
 | G | admin-ui | `admin-ui/src/components/TaskDetailDrawerSections.test.tsx` | 1,016 | 81 | under 1500 LOC | 0.737s measured | — |
 | G | admin-ui | `admin-ui/src/components/DirectionAutoPauseWidget.test.tsx` | 102 | 4 | under 1500 LOC | 0.737s measured | — |
