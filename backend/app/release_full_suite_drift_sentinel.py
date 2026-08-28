@@ -419,6 +419,8 @@ async def _check_full_suite_drift_sentinel(
             project = await session.get(Project, version.project_id)
             if project is None:
                 return False
+            if project.paused or project.archived:
+                return False
             # Only an explicit ``False`` disables the sentinel; the key's
             # absence (the canonical default) and ``True`` both keep it armed.
             if not (project.build_config or {}).get(
