@@ -7321,6 +7321,31 @@ class TestAgentWallClockDeadline(_LocalRunnerTestCase):
         term.assert_not_called()
         self.assertIn("t1", active_tasks)
 
+    def test_reaper_exempts_resident_from_ordinary_task_deadline(self):
+        """A Resident's None start marker delegates liveness to its session lease."""
+        proc = MagicMock()
+        proc.poll.return_value = None
+
+        active_tasks = {"resident-1": proc}
+        agent_started_at = {"resident-1": None}
+
+        def stop_sleep(_secs):
+            local_runner._shutdown_event.set()
+
+        with patch.object(local_runner.iso, "terminate_process_tree") as term, \
+             patch("time.sleep", stop_sleep):
+            local_runner._reap_loop(
+                active_tasks,
+                threading.Lock(),
+                None,
+                agent_started_at=agent_started_at,
+                agent_max_seconds=10,
+            )
+
+        term.assert_not_called()
+        self.assertIn("resident-1", active_tasks)
+        self.assertIsNone(agent_started_at["resident-1"])
+
 
 class TestComputeJobTelemetry(_LocalRunnerTestCase):
     def setUp(self):
@@ -8992,6 +9017,7 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
             pkw["injected_env"]["BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION"],
             "1",
         )
+        self.assertIsNone(r["started"]["task-xyz"])
 
         ordinary = self._spawn(
             backend=iso.BACKEND_BWRAP,
@@ -9007,6 +9033,7 @@ class TestDockerAgentBackend(_LocalRunnerTestCase):
             "BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION",
             ordinary_kw["injected_env"],
         )
+        self.assertIsInstance(ordinary["started"]["task-xyz"], float)
 
     def test_real_iso_interface_docker_plan_and_container_name(self):
         """Integration guard against interface drift: drive _spawn_agent_task with the

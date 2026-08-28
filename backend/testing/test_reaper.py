@@ -76,6 +76,7 @@ from app.reaper_orphan_classify import (
 )
 from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
+from app.strategic_resident_session import RESIDENT_SESSION_KEY
 import app.reaper_sweeps as _rs
 import app.strategic_cycle as _strategic_cycle
 from app.reaper_sweeps import event_driven_unblock_on_knowledge
@@ -694,6 +695,113 @@ async def test_in_progress_heartbeat_timeout_reaped(
     # Reaper retries (attempt_count < class budget), so status flips to QUEUED.
     assert t.status == TaskStatus.QUEUED
     assert t.attempt_count == 1
+    assert str(t.vm_instance_id).startswith("agent-vm-")
+    assert "runner_target_id" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_orphan_reaped_resident_restores_authoritative_runner_binding(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A silent Resident death retries on its exact session runner identity."""
+    project = await _make_project(reaper_db)
+    runner_id = str(_uuid_mod.uuid4())
+    session_id = "ss-orphan-retry"
+    worker_generation = 7
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-dead-resident",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": worker_generation,
+        },
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "version": 2,
+            "session_id": session_id,
+            "task_id": str(task.id),
+            "worker_generation": worker_generation,
+            "runner_id": runner_id,
+            "status": "active",
+            "stop_requested": False,
+        }
+    }
+    reaper_db.add(project)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(task)
+
+    assert task.status == TaskStatus.PROVISIONING
+    assert task.attempt_count == 1
+    assert task.vm_instance_id == f"runner:{runner_id}"
+    assert task.vm_provisioned_at is not None
+    assert task.retry_after_until is not None
+    assert task.context["_resident_session"] is True
+    assert task.context["strategic_session_id"] == session_id
+    assert task.context["_resident_worker_generation"] == worker_generation
+    assert task.context["runner_target_id"] == runner_id
+    assert task.context["preferred_runner_target_id"] == runner_id
+
+
+@pytest.mark.asyncio
+async def test_orphan_reaped_superseded_resident_does_not_restore_old_binding(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A newer persisted generation fences an orphan retry from its old runner."""
+    project = await _make_project(reaper_db)
+    runner_id = str(_uuid_mod.uuid4())
+    session_id = "ss-superseded-orphan"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-dead-resident",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": 7,
+        },
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "version": 2,
+            "session_id": session_id,
+            "task_id": str(task.id),
+            "worker_generation": 8,
+            "runner_id": runner_id,
+            "status": "active",
+            "stop_requested": False,
+        }
+    }
+    reaper_db.add(project)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(task)
+
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
+    assert str(task.vm_instance_id).startswith("agent-vm-")
+    assert task.vm_instance_id != f"runner:{runner_id}"
+    assert "runner_target_id" not in task.context
+    assert "preferred_runner_target_id" not in task.context
 
 
 @pytest.mark.asyncio

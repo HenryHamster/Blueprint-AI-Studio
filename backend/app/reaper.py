@@ -2408,6 +2408,35 @@ async def reaper_service():
                                         )
                                 task.context = reaper_ctx
                                 set_retry_after(task, delay_minutes)
+                                # A Resident orphan reaches this path without an
+                                # agent-status callback. Re-apply the same
+                                # session/generation-validated hard runner binding
+                                # used by callback-driven retries; otherwise the
+                                # generic reset above leaves it QUEUED on a random
+                                # agent-vm identity and no Resident worker can
+                                # reclaim it. The helper fails closed when the
+                                # session was stopped or superseded, so an old
+                                # generation can never create a duplicate worker.
+                                from app.resident_retry_binding import (
+                                    restore_resident_retry_binding,
+                                )
+
+                                if await restore_resident_retry_binding(
+                                    task,
+                                    session,
+                                    _pre_strip_reaper_ctx,
+                                ):
+                                    logger.info(
+                                        "[REAPER] Restored Resident runner binding "
+                                        "for orphan retry %s (session %s, generation %s)",
+                                        task.id,
+                                        _pre_strip_reaper_ctx.get(
+                                            "strategic_session_id"
+                                        ),
+                                        _pre_strip_reaper_ctx.get(
+                                            "_resident_worker_generation"
+                                        ),
+                                    )
                                 session.add(task)
 
                             await broadcast_to_project(
