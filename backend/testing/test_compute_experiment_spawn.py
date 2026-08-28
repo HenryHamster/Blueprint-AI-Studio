@@ -552,6 +552,23 @@ def test_validate_contract_rejects_malformed(contract, needle):
     assert needle in reason
 
 
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["success_criterion", "success_criteria"])
+def test_validate_contract_rejects_nonfinite_criterion_threshold(field, threshold):
+    criterion = {"metric": "score", "operator": ">=", "threshold": threshold}
+    contract = {
+        "command": "run",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 60,
+        field: criterion if field == "success_criterion" else [criterion],
+    }
+
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+
+    assert ok is False
+    assert "threshold must be finite" in reason
+
+
 # --- runner_target (operator/agent runner pin) -----------------------------
 
 

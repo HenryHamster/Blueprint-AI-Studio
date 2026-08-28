@@ -421,6 +421,8 @@ def _validate_compute_launch_contract(
             threshold = item.get("threshold")
             if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
                 return False, f"success_criteria[{index}].threshold must be numeric"
+            if not math.isfinite(threshold):
+                return False, f"success_criteria[{index}].threshold must be finite"
         if declared_metric is not None:
             criterion_metric_names = {
                 str(item.get("metric")).strip()
@@ -443,6 +445,18 @@ def _validate_compute_launch_contract(
                 "declared_metric must match success_criterion.metric "
                 f"({declared_metric!r} != {singular.get('metric')!r})"
             )
+    singular = contract.get("success_criterion")
+    if (
+        isinstance(singular, dict)
+        and str(singular.get("kind") or "metric") == "metric"
+    ):
+        threshold = singular.get("threshold")
+        if (
+            isinstance(threshold, (int, float))
+            and not isinstance(threshold, bool)
+            and not math.isfinite(threshold)
+        ):
+            return False, "success_criterion.threshold must be finite"
     try:
         spend = float(contract.get("spend_cap_usd"))
     except (TypeError, ValueError, OverflowError):
