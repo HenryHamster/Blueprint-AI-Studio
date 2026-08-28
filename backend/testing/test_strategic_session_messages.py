@@ -2459,6 +2459,119 @@ async def test_resident_poll_fast_marks_conversation_rows_with_server_qualificat
 
 
 @pytest.mark.asyncio
+async def test_resident_poll_routes_explicit_direct_strategic_ops_to_workday(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """Mutation-only recovery must reach the lane that owns ./strategic."""
+
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
+    project, task = await _make_resident_poll_worker(db_session)
+    first = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content=(
+            "GENERATION-7 MUTATION-ONLY RECOVERY. The project is paused. "
+            "Use direct strategic ops only: do not consult/delegate, "
+            "spawn/cancel/retry tasks, request qualification, promote, or "
+            "unpause. Refetch the live problem-model revision. Directly call "
+            "patch-problem-model with patch={} and return the raw JSON receipt."
+        ),
+        sequence=1,
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    correction = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content=(
+            "CANONICAL READBACK CONTRADICTS YOUR CLAIM. You used zero tools "
+            "and persisted nothing. Execute the four direct ops from operator "
+            "message 002f852f now. Do not consult, summarize, claim staging, "
+            "or reply until you have actual raw JSON receipts. Then refetch "
+            "goal and qualification and quote exact canonical readback."
+        ),
+        sequence=2,
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=1),
+    )
+    ordinary = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="Explain whether a private consultation would help this plan.",
+        sequence=3,
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=2),
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["messages"]] == [
+        str(first.id),
+        str(correction.id),
+        str(ordinary.id),
+    ]
+    assert body["fast_message_ids"] == [str(ordinary.id)]
+
+
+@pytest.mark.asyncio
+async def test_resident_poll_honors_structured_workday_execution_intent(
+    client: AsyncClient, db_session, monkeypatch
+):
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
+    project, task = await _make_resident_poll_worker(db_session)
+    row = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="Apply the bounded state correction.",
+        sequence=1,
+        resident_session_id="resident-session",
+        context={
+            "operator_intent": {
+                "kind": "strategic_mutation",
+                "action": "execute",
+                "lane_owner": "workday",
+            }
+        },
+        created_at=_BASE,
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["messages"]] == [str(row.id)]
+    assert body["fast_message_ids"] == []
+
+
+@pytest.mark.asyncio
 async def test_resident_claim_is_durable_and_idempotent_for_same_generation(
     client: AsyncClient, db_session
 ):

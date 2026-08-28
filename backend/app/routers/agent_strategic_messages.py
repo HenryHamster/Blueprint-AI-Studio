@@ -109,11 +109,66 @@ _LOWERCASE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _WORKDAY_MAX_IMAGE_DOWNLOAD_BYTES = 9_750_000
 _WORKDAY_MAX_REQUIRED_IMAGES = 8
 
+# Typed Fast is the low-latency conversational owner, but it deliberately has
+# no Blueprint token or checkout. An operator can explicitly keep a supported
+# strategic mutation on the tool-capable Workday turn; marking that row Fast-
+# owned would otherwise force the restricted child to recast the command as a
+# private consultation. Keep this predicate deliberately narrow so ordinary
+# conversation and ordinary requests for research retain the Fast path.
+_DIRECT_STRATEGIC_OP_PHRASE_RE = re.compile(
+    r"\b(?:direct\s+(?:strategic\s+)?ops?|strategic\s+ops?\s+directly)\b",
+    re.IGNORECASE,
+)
+_DIRECT_STRATEGIC_HELPER_RE = re.compile(
+    r"(?:^|[\s`])(?:\./)?strategic\s+[a-z][a-z0-9-]*\b",
+    re.IGNORECASE,
+)
+_DIRECT_EXECUTION_VERB_RE = re.compile(
+    r"\b(?:apply|call|execute|perform|run|use)\b",
+    re.IGNORECASE,
+)
+_DIRECT_EXECUTION_BOUNDARY_RE = re.compile(
+    r"\b(?:directly|same\s+(?:surface|turn)|do\s+not\s+consult|"
+    r"without\s+(?:a\s+)?consultation)\b",
+    re.IGNORECASE,
+)
+
 _RESIDENT_POLL_INTERVAL_SECONDS = 0.75
 _RESIDENT_POLL_EXPECTED_PER_MINUTE = 80
 _RESIDENT_POLL_REPLACEMENT_OVERLAP = 2
 _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE = 240
 _RESIDENT_POLL_RATE_LIMIT = f"{_RESIDENT_POLL_RATE_LIMIT_PER_MINUTE}/minute"
+
+
+def _operator_requests_direct_workday_execution(message: ProjectMessage) -> bool:
+    """Return whether an operator explicitly chose the tool-capable lane."""
+
+    context = message.context if isinstance(message.context, dict) else {}
+    intent = context.get("operator_intent")
+    if isinstance(intent, dict):
+        lane_owner = str(intent.get("lane_owner") or "").strip().lower()
+        action = str(intent.get("action") or "").strip().lower()
+        kind = str(intent.get("kind") or "").strip().lower()
+        if lane_owner == "workday" and (
+            action in {"apply", "execute", "mutate", "run"}
+            or kind in {
+                "direct_strategic_ops",
+                "managed_execution",
+                "strategic_mutation",
+            }
+        ):
+            return True
+
+    content = str(message.content or "")
+    has_direct_op_reference = bool(
+        _DIRECT_STRATEGIC_OP_PHRASE_RE.search(content)
+        or _DIRECT_STRATEGIC_HELPER_RE.search(content)
+    )
+    return bool(
+        has_direct_op_reference
+        and _DIRECT_EXECUTION_VERB_RE.search(content)
+        and _DIRECT_EXECUTION_BOUNDARY_RE.search(content)
+    )
 
 
 class FinalizedCallTranscript(BaseModel):
@@ -3413,6 +3468,7 @@ async def agent_poll_messages(
             str(row.id)
             for row in remaining_rows
             if row.id in canonical_ids
+            and not _operator_requests_direct_workday_execution(row)
             and (
                 row.conversation_claim_id is None
                 or (row.context or {}).get("_conversation_public_reply_owner")

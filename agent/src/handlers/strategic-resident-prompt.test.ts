@@ -35,5 +35,14 @@ describe('STRATEGIC_RESIDENT_SYSTEM_PROMPT', () => {
     expect(STRATEGIC_RESIDENT_SYSTEM_PROMPT).toContain('durable decisions register');
     expect(STRATEGIC_RESIDENT_SYSTEM_PROMPT).toContain('send the substantive answer or plan first');
     expect(STRATEGIC_RESIDENT_SYSTEM_PROMPT).toContain('not heartbeats or routine cadence');
+    expect(STRATEGIC_RESIDENT_SYSTEM_PROMPT).toContain(
+      'explicitly requests supported direct strategic operations',
+    );
+    expect(STRATEGIC_RESIDENT_SYSTEM_PROMPT).toContain(
+      'exact successful ./strategic response and a canonical ./fetch readback',
+    );
+    expect(STRATEGIC_RESIDENT_SYSTEM_PROMPT).toContain(
+      'missing receipt, or mismatched readback is failure',
+    );
   });
 });
