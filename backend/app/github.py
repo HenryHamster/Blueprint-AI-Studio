@@ -1573,6 +1573,7 @@ from app.github_refs import (  # noqa: F401
     ensure_repo_initialized,
     delete_branch,
     list_branches,
+    get_git_commit_identity,
     get_commit_date,
     list_pull_requests_for_commit,
     is_ancestor_of,

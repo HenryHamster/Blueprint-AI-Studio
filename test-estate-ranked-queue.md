@@ -350,6 +350,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | backend | `backend/testing/test_review_loop_operator_park.py` | 563 | 25 | under 1500 LOC | 6.620s measured | — |
 | G | backend | `backend/testing/test_strategic_pipeline_actions.py` | 795 | 22 | under 1500 LOC | 6.594s measured | — |
 | G | backend | `backend/testing/test_project_tool_context.py` | 361 | 14 | under 1500 LOC | 6.589s measured | — |
+| G | backend | `backend/testing/test_release_drift_sentinel_inherited_tree.py` | 380 | 9 | under 1500 LOC | 6.561s measured | — |
 | G | backend | `backend/testing/test_resolve_dialect_name.py` | 115 | 5 | under 1500 LOC | 6.508s measured | — |
 | G | backend | `backend/testing/test_sr_compute_wiring.py` | 710 | 12 | under 1500 LOC | 6.277s measured | — |
 | G | backend | `backend/testing/test_sr_catch_rate_statistics.py` | 248 | 7 | under 1500 LOC | 6.254s measured | — |

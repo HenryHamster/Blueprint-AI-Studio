@@ -95,6 +95,7 @@ from app.release_full_suite_drift_sentinel import (
     # ruff --fix sweep from dropping them as "unused".
     _DRIFT_SENTINEL_CANCELLED_REDISPATCH_COOLDOWN_SECONDS,  # noqa: F401
     _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY,  # noqa: F401 -- re-exported for tests
+    _DRIFT_SENTINEL_INHERITED_TREE_KEY,  # noqa: F401 -- re-exported for tests
     _DRIFT_SENTINEL_RERUN_BUDGET,  # noqa: F401 -- re-exported for tests
     _DRIFT_SENTINEL_RERUN_KEY,  # noqa: F401 -- re-exported for tests
     _DRIFT_SENTINEL_TERMINAL_DISPATCH_KEY,  # noqa: F401 -- re-exported for tests

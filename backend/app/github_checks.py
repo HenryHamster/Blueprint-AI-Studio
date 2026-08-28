@@ -928,7 +928,7 @@ async def get_workflow_run_for_sha(
     Returns a small status dict for the newest matching run::
 
         {"run_id": int, "status": str, "conclusion": str | None, "html_url": str,
-         "event": str | None, "head_branch": str | None}
+         "head_sha": str | None, "event": str | None, "head_branch": str | None}
 
     ``status`` is one of GitHub's run statuses (``queued`` / ``in_progress`` /
     ``completed``); ``conclusion`` is ``success`` / ``failure`` / ``cancelled`` /
@@ -1000,6 +1000,7 @@ async def get_workflow_run_for_sha(
         "status": run.get("status"),
         "conclusion": run.get("conclusion"),
         "html_url": run.get("html_url", ""),
+        "head_sha": run.get("head_sha"),
         # See the docstring: dropping these made the run's SHAPE invisible, so a
         # dispatch rehearsal and a merge-gating pull_request run were reported
         # to callers as the same evidence.
