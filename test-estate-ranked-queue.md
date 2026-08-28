@@ -534,6 +534,7 @@ The queue includes every currently collected backend, admin-ui unit, admin-ui vi
 | G | admin-ui | `admin-ui/src/components/SettingsNotificationsSection.test.tsx` | 384 | 15 | under 1500 LOC | 1.546s measured | — |
 | G | backend | `backend/testing/test_runner_enroll_docs_accuracy.py` | 599 | 19 | under 1500 LOC | 1.546s measured | — |
 | G | backend | `backend/testing/test_strategic_memory_knowledge.py` | 245 | 4 | under 1500 LOC | 1.537s measured | — |
+| G | backend | `backend/testing/test_ci_rerun_operator_resolution.py` | 186 | 3 | under 1500 LOC | 1.493s measured | — |
 | G | backend | `backend/testing/test_issue_implementation.py` | 693 | 15 | under 1500 LOC | 1.493s measured | — |
 | G | backend | `backend/testing/test_compute_zone_health.py` | 1,251 | 94 | under 1500 LOC | 1.492s measured | — |
 | G | admin-ui | `admin-ui/src/components/TaskContextRail.test.tsx` | 469 | 18 | under 1500 LOC | 1.488s measured | — |

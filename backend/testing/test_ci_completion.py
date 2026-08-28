@@ -7677,8 +7677,7 @@ async def test_merge_auto_resolve_no_orig_no_keys_writes_no_rows(db_session, moc
 @pytest.mark.asyncio
 async def test_ci_failure_general_rerun_fires(db_session, mocker):
     """CI failure with rerun budget remaining calls rerun_failed_jobs,
-    increments ci_rerun_consumed in task context, updates latest_status_message,
-    and returns False (defers fix spawn to next sweep)."""
+    fences the accepted attempt, and ignores the same stale red on re-entry."""
     from app.ci_completion import handle_ci_completion
 
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
@@ -7686,12 +7685,19 @@ async def test_ci_failure_general_rerun_fires(db_session, mocker):
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     rerun_mock = mocker.patch(
-        "app.github_checks.rerun_failed_jobs",
-        return_value=True,
+        "app.github_checks.rerun_failed_jobs_outcome",
+        return_value="accepted",
+    )
+    invalidate_mock = mocker.patch(
+        "app.github_checks.invalidate_check_runs_cache"
     )
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
         return_value=(type("FT", (), {"id": uuid.uuid4()})(), True),
+    )
+    mocker.patch(
+        "app.review_pipeline.build_ci_failure_fix_prompt",
+        return_value="fix prompt",
     )
 
     project = Project(name="General rerun test", user_id="test-user")
@@ -7699,7 +7705,13 @@ async def test_ci_failure_general_rerun_fires(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = _make_task(db_session, project)
+    old_poll = "2026-01-01T00:00:00+00:00"
+    head_sha = "test-head-42"
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"ci_last_polled": old_poll, "ci_poll_interval": 120},
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -7708,10 +7720,18 @@ async def test_ci_failure_general_rerun_fires(db_session, mocker):
         "conclusion": "failure",
         "failed_logs": "FAILED test_x",
         "failed_run_ids": [12345],
+        "failed_run_attempts": {"12345": 1},
         "setup_phase_failure": False,
     }
     result = await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
     )
 
     # Must return False — no fix spawned, deferring to next sweep
@@ -7719,6 +7739,8 @@ async def test_ci_failure_general_rerun_fires(db_session, mocker):
 
     # rerun_failed_jobs must have been called with the failed run ID
     rerun_mock.assert_called_once_with("fake-token", "owner", "repo", 12345)
+    assert invalidate_mock.call_count == 2
+    invalidate_mock.assert_called_with("owner", "repo", head_sha)
 
     # spawn_pipeline_task must NOT have been called
     spawn_mock.assert_not_called()
@@ -7728,10 +7750,439 @@ async def test_ci_failure_general_rerun_fires(db_session, mocker):
     assert task.context.get("ci_rerun_consumed") == 1, (
         f"Expected ci_rerun_consumed=1, got {task.context.get('ci_rerun_consumed')}"
     )
+    review_loop = task.context.get("review_loop", {})
+    assert review_loop.get("ci_poll_interval") == 15
+    assert review_loop.get("ci_last_polled") != old_poll
     # latest_status_message must reflect the rerun
-    assert "re-ran failed jobs" in (task.latest_status_message or ""), (
+    assert "rerun accepted" in (task.latest_status_message or ""), (
         f"Expected status message to mention rerun, got {task.latest_status_message!r}"
     )
+    journal = task.context.get("ci_rerun_journal", {})
+    assert journal.get("state") == "accepted"
+    assert journal.get("pr_number") == 42
+    assert journal.get("head_sha") == head_sha
+    assert journal.get("failure_run_ids") == [12345]
+    assert journal.get("run_attempts") == {"12345": 1}
+    assert journal.get("run_outcomes") == {"12345": "accepted"}
+
+    # A stale cache/API read of the same failed attempt is non-actionable: it
+    # cannot spend another rerun or spawn a fix while the acceptance fence holds.
+    stale_result = await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
+    )
+    assert stale_result is False
+    rerun_mock.assert_called_once_with("fake-token", "owner", "repo", 12345)
+    spawn_mock.assert_not_called()
+    assert invalidate_mock.call_count == 3
+    await db_session.refresh(task)
+    assert task.context.get("ci_rerun_consumed") == 1
+    assert task.context.get("ci_rerun_journal", {}).get(
+        "run_attempts"
+    ) == {"12345": 1}
+
+    # The same workflow run at a higher GitHub run_attempt is new evidence.
+    distinct_attempt = {**ci_result, "failed_run_attempts": {"12345": 2}}
+    await handle_ci_completion(
+        task,
+        distinct_attempt,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
+    )
+    rerun_mock.assert_called_once_with("fake-token", "owner", "repo", 12345)
+    spawn_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_rerun_journal_expiry_requires_operator_verification(
+    db_session, mocker
+):
+    """An unconfirmed mutation expires into a durable manual hold, not a fix."""
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    comment_mock = mocker.patch("app.github.create_pr_comment", return_value=None)
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs_outcome", return_value="accepted"
+    )
+    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task")
+
+    project = Project(name="Expired rerun journal", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    head_sha = "fenced-head"
+    task = _make_task(db_session, project)
+    task.context = {
+        **(task.context or {}),
+        "ci_rerun_consumed": 1,
+        "ci_rerun_journal": {
+            "id": "expired-journal",
+            "state": "ambiguous",
+            "kind": "general",
+            "pr_number": 42,
+            "head_sha": head_sha,
+            "failure_run_ids": [12345],
+            "run_attempts": {"12345": 1},
+            "deadline_at": "2000-01-01T00:00:00+00:00",
+        },
+    }
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await handle_ci_completion(
+        task,
+        {
+            "status": "completed",
+            "conclusion": "failure",
+            "failed_logs": "FAILED test_x",
+            "failed_run_ids": [12345],
+            "failed_run_attempts": {"12345": 1},
+            "setup_phase_failure": False,
+        },
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
+    )
+
+    assert result is True
+    rerun_mock.assert_not_called()
+    spawn_mock.assert_not_called()
+    comment_mock.assert_not_called()
+    alert_mock.assert_awaited_once()
+    await db_session.refresh(task)
+    assert task.requires_approval is True
+    assert task.context["ci_rerun_journal"]["state"] == "timed_out"
+    assert "manual GitHub verification" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_ci_rerun_live_reservation_survives_peer_observation(
+    db_session, mocker
+):
+    """A peer observing the post-commit send window cannot cancel the sender."""
+    from app.ci_completion import (
+        _ci_rerun_journal_disposition,
+        handle_ci_completion,
+    )
+    from app.database import AsyncSessionLocal
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task")
+
+    project = Project(name="Rerun live reservation", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    task_id = task.id
+    head_sha = "live-reservation-head"
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x",
+        "failed_run_ids": [12345],
+        "failed_run_attempts": {"12345": 1},
+        "failed_run_ids_complete": True,
+        "setup_phase_failure": False,
+    }
+
+    async def _peer_observes_then_sender_posts(*_args, **_kwargs):
+        async with AsyncSessionLocal() as peer_session:
+            peer_task = await peer_session.get(Task, task_id)
+            assert peer_task is not None
+            assert (
+                _ci_rerun_journal_disposition(
+                    peer_task,
+                    ci_result,
+                    ci_pr_number=42,
+                    checked_head_sha=head_sha,
+                )
+                == "hold"
+            )
+            assert peer_task.context["ci_rerun_journal"]["state"] == "reserved"
+            peer_session.add(peer_task)
+            await peer_session.commit()
+        return "accepted"
+
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs_outcome",
+        side_effect=_peer_observes_then_sender_posts,
+    )
+    result = await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
+    )
+
+    assert result is False
+    rerun_mock.assert_awaited_once_with("fake-token", "owner", "repo", 12345)
+    spawn_mock.assert_not_called()
+    refreshed = await db_session.get(Task, task_id, populate_existing=True)
+    assert refreshed.context["ci_rerun_journal"]["state"] == "accepted"
+
+
+def test_ci_rerun_partial_failed_run_projection_preserves_fence():
+    """Best-effort omissions are not evidence that a rerun attempt changed."""
+    from datetime import timedelta
+
+    from app.ci_completion import _ci_rerun_journal_disposition
+    from app.models import _utcnow
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="Partial rerun projection",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "task"}],
+        context={
+            "review_loop": {"pr_number": 42, "head_sha": "projection-head"},
+            "ci_rerun_journal": {
+                "id": "projection-journal",
+                "state": "ambiguous",
+                "kind": "general",
+                "pr_number": 42,
+                "head_sha": "projection-head",
+                "failure_run_ids": [101, 202],
+                "run_attempts": {"101": 1, "202": 1},
+                "deadline_at": (_utcnow() + timedelta(minutes=5)).isoformat(),
+            },
+        },
+    )
+
+    disposition = _ci_rerun_journal_disposition(
+        task,
+        {
+            "failed_run_ids": [202],
+            "failed_run_attempts": {"202": 1},
+            "failed_run_ids_complete": False,
+        },
+        ci_pr_number=42,
+        checked_head_sha="projection-head",
+    )
+    assert disposition == "hold"
+    assert task.context["ci_rerun_journal"]["state"] == "ambiguous"
+
+    fenced_context = dict(task.context)
+    disposition = _ci_rerun_journal_disposition(
+        task,
+        {
+            "failed_run_ids": [202, 303],
+            "failed_run_attempts": {"202": 1, "303": 1},
+            "failed_run_ids_complete": False,
+        },
+        ci_pr_number=42,
+        checked_head_sha="projection-head",
+    )
+    assert disposition == "distinct"
+    assert "ci_rerun_journal" not in task.context
+
+    task.context = fenced_context
+    disposition = _ci_rerun_journal_disposition(
+        task,
+        {
+            "failed_run_ids": [202],
+            "failed_run_attempts": {"202": 1},
+            "failed_run_ids_complete": True,
+        },
+        ci_pr_number=42,
+        checked_head_sha="projection-head",
+    )
+    assert disposition == "distinct"
+    assert "ci_rerun_journal" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_ci_rerun_crash_after_send_is_not_replayed(db_session, mocker):
+    """A process death after the POST leaves a reservation that recovers held."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs_outcome",
+        side_effect=SystemExit("simulated crash after send"),
+    )
+    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task")
+
+    project = Project(name="Rerun crash recovery", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    head_sha = "crash-after-send-head"
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x",
+        "failed_run_ids": [12345],
+        "failed_run_attempts": {"12345": 1},
+        "setup_phase_failure": False,
+    }
+    with pytest.raises(SystemExit, match="simulated crash after send"):
+        await handle_ci_completion(
+            task,
+            ci_result,
+            "fake-token",
+            "owner",
+            "repo",
+            db_session,
+            source="poll",
+            checked_head_sha=head_sha,
+        )
+
+    await db_session.refresh(task)
+    assert task.context["ci_rerun_journal"]["state"] == "reserved"
+    assert task.context.get("ci_rerun_consumed") == 1
+
+    # A fresh peer preserves the live sender lease. Model restart recovery only
+    # after that bounded lease has elapsed.
+    from sqlalchemy.orm.attributes import flag_modified
+
+    crash_context = dict(task.context or {})
+    crash_journal = dict(crash_context["ci_rerun_journal"])
+    crash_journal["sender_lease_until"] = "2000-01-01T00:00:00"
+    crash_context["ci_rerun_journal"] = crash_journal
+    task.context = crash_context
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
+    )
+
+    assert result is False
+    rerun_mock.assert_awaited_once()
+    spawn_mock.assert_not_called()
+    await db_session.refresh(task)
+    assert task.context["ci_rerun_journal"]["state"] == "ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_ci_rerun_post_send_commit_failure_is_not_replayed(
+    db_session, mocker
+):
+    """If outcome persistence fails, the earlier reservation still fences replay."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs_outcome", return_value="accepted"
+    )
+    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task")
+
+    project = Project(name="Rerun commit recovery", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    real_commit = db_session.commit
+    commit_count = 0
+
+    async def fail_outcome_commit():
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 3:
+            raise RuntimeError("simulated outcome commit failure")
+        await real_commit()
+
+    mocker.patch.object(db_session, "commit", side_effect=fail_outcome_commit)
+    head_sha = "commit-failure-head"
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x",
+        "failed_run_ids": [12345],
+        "failed_run_attempts": {"12345": 1},
+        "setup_phase_failure": False,
+    }
+
+    with pytest.raises(RuntimeError, match="simulated outcome commit failure"):
+        await handle_ci_completion(
+            task,
+            ci_result,
+            "fake-token",
+            "owner",
+            "repo",
+            db_session,
+            source="poll",
+            checked_head_sha=head_sha,
+        )
+    await db_session.rollback()
+    task = await db_session.get(Task, task_id, populate_existing=True)
+    assert task is not None
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    recovery_context = dict(task.context or {})
+    recovery_journal = dict(recovery_context["ci_rerun_journal"])
+    recovery_journal["sender_lease_until"] = "2000-01-01T00:00:00"
+    recovery_context["ci_rerun_journal"] = recovery_journal
+    task.context = recovery_context
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
+    )
+
+    assert result is False
+    rerun_mock.assert_awaited_once()
+    spawn_mock.assert_not_called()
+    await db_session.refresh(task)
+    assert task.context["ci_rerun_journal"]["state"] == "ambiguous"
+    assert task.context.get("ci_rerun_consumed") == 1
 
 
 @pytest.mark.asyncio
@@ -7745,8 +8196,8 @@ async def test_ci_failure_general_rerun_already_consumed(db_session, mocker):
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     rerun_mock = mocker.patch(
-        "app.github_checks.rerun_failed_jobs",
-        return_value=True,
+        "app.github_checks.rerun_failed_jobs_outcome",
+        return_value="accepted",
     )
     fake_fix = type("FT", (), {"id": uuid.uuid4()})()
     spawn_mock = mocker.patch(
@@ -7796,6 +8247,73 @@ async def test_ci_failure_general_rerun_already_consumed(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_ci_failure_general_rerun_rejected_preserves_poll_state(
+    db_session, mocker
+):
+    """A rejected general rerun falls through without consuming retry state."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs_outcome", return_value="rejected"
+    )
+    invalidate_mock = mocker.patch(
+        "app.github_checks.invalidate_check_runs_cache"
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(type("FT", (), {"id": uuid.uuid4()})(), True),
+    )
+    mocker.patch(
+        "app.review_pipeline.build_ci_failure_fix_prompt",
+        return_value="fix prompt",
+    )
+
+    project = Project(name="General rerun rejected", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_poll = "2026-01-01T00:00:00+00:00"
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"ci_last_polled": old_poll, "ci_poll_interval": 120},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await handle_ci_completion(
+        task,
+        {
+            "status": "completed",
+            "conclusion": "failure",
+            "failed_logs": "FAILED test_x",
+            "failed_run_ids": [12345],
+            "setup_phase_failure": False,
+        },
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha="test-head-42",
+    )
+
+    rerun_mock.assert_called_once_with("fake-token", "owner", "repo", 12345)
+    invalidate_mock.assert_called_once_with("owner", "repo", "test-head-42")
+    spawn_mock.assert_called_once()
+    await db_session.refresh(task)
+    assert task.context.get("ci_rerun_consumed", 0) == 0
+    assert task.context.get("ci_rerun_journal", {}).get("state") == "rejected"
+    review_loop = task.context.get("review_loop", {})
+    assert review_loop.get("ci_last_polled") == old_poll
+    assert review_loop.get("ci_poll_interval") == 120
+
+
+@pytest.mark.asyncio
 async def test_ci_failure_general_rerun_no_failed_run_ids(db_session, mocker):
     """CI failure with empty failed_run_ids (API failure or quota active) does
     NOT call rerun_failed_jobs and falls through to spawn a fix task."""
@@ -7806,8 +8324,8 @@ async def test_ci_failure_general_rerun_no_failed_run_ids(db_session, mocker):
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     rerun_mock = mocker.patch(
-        "app.github_checks.rerun_failed_jobs",
-        return_value=True,
+        "app.github_checks.rerun_failed_jobs_outcome",
+        return_value="accepted",
     )
     fake_fix = type("FT", (), {"id": uuid.uuid4()})()
     spawn_mock = mocker.patch(
@@ -7857,8 +8375,11 @@ async def test_ci_failure_general_rerun_infra_takes_priority(db_session, mocker)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     rerun_mock = mocker.patch(
-        "app.github_checks.rerun_failed_jobs",
-        return_value=True,
+        "app.github_checks.rerun_failed_jobs_outcome",
+        return_value="accepted",
+    )
+    invalidate_mock = mocker.patch(
+        "app.github_checks.invalidate_check_runs_cache"
     )
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
@@ -7870,7 +8391,13 @@ async def test_ci_failure_general_rerun_infra_takes_priority(db_session, mocker)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = _make_task(db_session, project)
+    old_poll = "2026-01-01T00:00:00+00:00"
+    head_sha = "test-head-42"
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"ci_last_polled": old_poll, "ci_poll_interval": 120},
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -7879,14 +8406,24 @@ async def test_ci_failure_general_rerun_infra_takes_priority(db_session, mocker)
         "conclusion": "failure",
         "failed_logs": "FAILED test_x",
         "failed_run_ids": [12345],
+        "failed_run_attempts": {"12345": 1},
         "setup_phase_failure": True,
     }
     await handle_ci_completion(
-        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha=head_sha,
     )
 
     # rerun_failed_jobs must have been called (infra rerun path)
     rerun_mock.assert_called_once_with("fake-token", "owner", "repo", 12345)
+    assert invalidate_mock.call_count == 2
+    invalidate_mock.assert_called_with("owner", "repo", head_sha)
 
     # No fix spawned
     spawn_mock.assert_not_called()
@@ -7896,6 +8433,79 @@ async def test_ci_failure_general_rerun_infra_takes_priority(db_session, mocker)
     assert task.context.get("ci_rerun_consumed", 0) == 0, (
         "General rerun gate must NOT consume its budget when infra rerun fires"
     )
+    assert task.context.get("ci_infra_rerun_done") is True
+    assert task.context.get("ci_rerun_journal", {}).get("state") == "accepted"
+    review_loop = task.context.get("review_loop", {})
+    assert review_loop.get("ci_poll_interval") == 15
+    assert review_loop.get("ci_last_polled") != old_poll
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_infra_rerun_rejected_preserves_poll_state(
+    db_session, mocker
+):
+    """A rejected infra rerun makes one POST despite general budget remaining."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs_outcome", return_value="rejected"
+    )
+    invalidate_mock = mocker.patch(
+        "app.github_checks.invalidate_check_runs_cache"
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(type("FT", (), {"id": uuid.uuid4()})(), True),
+    )
+    mocker.patch(
+        "app.review_pipeline.build_ci_failure_fix_prompt",
+        return_value="fix prompt",
+    )
+
+    project = Project(name="Infra rerun rejected", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_poll = "2026-01-01T00:00:00+00:00"
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"ci_last_polled": old_poll, "ci_poll_interval": 120},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await handle_ci_completion(
+        task,
+        {
+            "status": "completed",
+            "conclusion": "failure",
+            "failed_logs": "setup failure",
+            "failed_run_ids": [12345],
+            "setup_phase_failure": True,
+        },
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+        checked_head_sha="test-head-42",
+    )
+
+    rerun_mock.assert_called_once_with("fake-token", "owner", "repo", 12345)
+    invalidate_mock.assert_called_once_with("owner", "repo", "test-head-42")
+    spawn_mock.assert_called_once()
+    await db_session.refresh(task)
+    assert task.context.get("ci_infra_rerun_done") is not True
+    assert task.context.get("ci_rerun_consumed", 0) == 0
+    assert task.context.get("ci_rerun_journal", {}).get("state") == "rejected"
+    review_loop = task.context.get("review_loop", {})
+    assert review_loop.get("ci_last_polled") == old_poll
+    assert review_loop.get("ci_poll_interval") == 120
 
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,12 @@ router.include_router(_hotfix_promote_router)
 _MAX_QUEUED_WAVE_EDGE_REPAIR_SCAN = 500
 
 
+class CiRerunResolutionRequest(BaseModel):
+    journal_id: str = Field(min_length=1, max_length=64)
+    disposition: Literal["accepted", "rejected"]
+    note: str = Field(min_length=3, max_length=500)
+
+
 async def _clear_manual_rollup_create_claim(
     session: AsyncSession,
     *,
@@ -591,6 +597,72 @@ async def clear_wave_deps(
         "truncated": truncated,
         "skipped_queued": skipped_queued,
     }
+
+
+@router.post("/tasks/{task_id}/ci-rerun-resolution")
+async def resolve_ci_rerun(
+    task_id: uuid.UUID,
+    body: CiRerunResolutionRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Record an operator's exact verdict for a timed-out rerun mutation."""
+    from app.ci_completion import resolve_timed_out_ci_rerun
+    from app.github import invalidate_check_runs_cache
+    from app.task_locking import lock_project_then_task
+
+    cached_task = await _get_user_task_with_role(
+        task_id, current_user["user_id"], session, "member"
+    )
+    async with lock_project_then_task(
+        session,
+        cached_task.project_id,
+        task_id,
+        skip_locked=False,
+    ) as (project, task):
+        if project is None or task is None:
+            await session.rollback()
+            raise HTTPException(status_code=404, detail="Task not found")
+        try:
+            journal = resolve_timed_out_ci_rerun(
+                task,
+                journal_id=body.journal_id,
+                disposition=body.disposition,
+                resolved_by=str(current_user["user_id"]),
+                note=body.note,
+            )
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        head_sha = str(journal.get("head_sha") or "")
+        if project.github_owner and project.github_repo and head_sha:
+            invalidate_check_runs_cache(
+                project.github_owner,
+                project.github_repo,
+                head_sha,
+            )
+        session.add(task)
+        session.add(
+            TaskHistory(
+                task_id=task.id,
+                action="MODIFIED",
+                details={
+                    "changes": {
+                        "ci_rerun_resolution": body.disposition,
+                        "ci_rerun_journal_id": body.journal_id,
+                    },
+                    "modified_by": str(current_user["user_id"]),
+                },
+            )
+        )
+        await session.commit()
+        return {
+            "task_id": str(task.id),
+            "journal_id": body.journal_id,
+            "disposition": body.disposition,
+            "state": journal["state"],
+        }
 
 
 @router.post("/tasks/{task_id}/rollup")

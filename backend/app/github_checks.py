@@ -131,6 +131,27 @@ def _job_failed_only_at_setup(job: dict) -> bool:
     return bool(failed_steps) and all(s in _GITHUB_SETUP_STEPS for s in failed_steps)
 
 
+def _jobs_projection_complete(result: object) -> bool:
+    """Whether one Actions jobs response contains its full paginated set."""
+    if isinstance(result, Exception) or getattr(result, "status_code", None) != 200:
+        return False
+    json_method = getattr(result, "json", None)
+    if not callable(json_method):
+        return False
+    try:
+        data = json_method()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    total_count = data.get("total_count") if isinstance(data, dict) else None
+    return bool(
+        isinstance(jobs, list)
+        and isinstance(total_count, int)
+        and not isinstance(total_count, bool)
+        and total_count <= len(jobs)
+    )
+
+
 async def update_commit_status(
     token: str,
     owner: str,
@@ -341,6 +362,8 @@ async def get_check_runs(
          "conclusion": "success"|"failure"|None,
          "details": [{"name": str, "status": str, "conclusion": str|None}],
          "failed_logs": str,
+         "failed_run_attempts": {str(run_id): int},
+         "failed_run_ids_complete": bool,
          "genuine_failure": bool}
 
     ``genuine_failure`` (additive — consumers use ``.get``): whether the
@@ -397,6 +420,8 @@ async def get_check_runs(
                 "conclusion": None,
                 "details": [],
                 "failed_logs": "",
+                "failed_run_attempts": {},
+                "failed_run_ids_complete": False,
                 "genuine_failure": False,
                 "_from_api_error": True,
             }
@@ -419,6 +444,8 @@ async def get_check_runs(
                 "conclusion": None,
                 "details": [],
                 "failed_logs": "",
+                "failed_run_attempts": {},
+                "failed_run_ids_complete": True,
                 "genuine_failure": False,
             }
         # No CI configured on this repo — treat as passed so the
@@ -428,6 +455,8 @@ async def get_check_runs(
             "conclusion": "success",
             "details": [],
             "failed_logs": "",
+            "failed_run_attempts": {},
+            "failed_run_ids_complete": True,
             "genuine_failure": False,
         }
 
@@ -472,6 +501,8 @@ async def get_check_runs(
     # setup steps (infra flake). failed_run_ids: the workflow run(s) to re-run.
     setup_phase_failure = False
     failed_run_ids: list[int] = []
+    failed_run_attempts: dict[str, int] = {}
+    failed_run_ids_complete = False
     if failed_names and not include_failed_logs:
         # Caller reads only status/conclusion/details (e.g. the agent check-runs
         # proxy, which discards failed_logs) — skip the 3-10+ call failure fan-out
@@ -483,6 +514,8 @@ async def get_check_runs(
             "failed_logs": "",
             "setup_phase_failure": False,
             "failed_run_ids": [],
+            "failed_run_attempts": {},
+            "failed_run_ids_complete": False,
             "genuine_failure": _details_have_genuine_failure(details),
         }
     if failed_names and _deferrable_quota_active():
@@ -497,6 +530,8 @@ async def get_check_runs(
             "failed_logs": "",
             "setup_phase_failure": False,
             "failed_run_ids": [],
+            "failed_run_attempts": {},
+            "failed_run_ids_complete": False,
             "genuine_failure": _details_have_genuine_failure(details),
         }
     if failed_names:
@@ -512,17 +547,30 @@ async def get_check_runs(
                 timeout=5.0,
             )
             if runs_resp.status_code == 200:
-                wf_runs = runs_resp.json().get("workflow_runs", [])
+                runs_data = runs_resp.json()
+                wf_runs = runs_data.get("workflow_runs", [])
                 jobs_coros = [
                     _github_request(
                         "GET",
-                        f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{wf_run['id']}/jobs?filter=latest&per_page=30",
+                        (
+                            f"https://api.github.com/repos/{owner}/{repo}/actions/"
+                            f"runs/{wf_run['id']}/jobs?filter=latest&per_page=100"
+                        ),
                         headers,
                         timeout=5.0,
                     )
                     for wf_run in wf_runs
                 ]
                 jobs_results = await asyncio.gather(*jobs_coros, return_exceptions=True)
+                total_count = runs_data.get("total_count")
+                failed_run_ids_complete = bool(
+                    isinstance(total_count, int)
+                    and not isinstance(total_count, bool)
+                    and total_count <= len(wf_runs)
+                    and all(
+                        _jobs_projection_complete(result) for result in jobs_results
+                    )
+                )
                 for wf_run, result in zip(wf_runs, jobs_results, strict=True):
                     if isinstance(result, Exception) or result.status_code != 200:
                         continue
@@ -535,7 +583,13 @@ async def get_check_runs(
                         if _job_failed_only_at_setup(job):
                             setup_phase_failure = True
                     if run_has_failed_job:
-                        failed_run_ids.append(wf_run["id"])
+                        run_id = wf_run["id"]
+                        failed_run_ids.append(run_id)
+                        run_attempt = wf_run.get("run_attempt")
+                        if isinstance(run_attempt, int) and not isinstance(
+                            run_attempt, bool
+                        ):
+                            failed_run_attempts[str(run_id)] = run_attempt
             else:
                 logger.warning(
                     f"[CI LOGS] workflow runs fetch for {ref[:8] if ref else ref} returned "
@@ -650,6 +704,8 @@ async def get_check_runs(
         "failed_logs": failed_logs,
         "setup_phase_failure": setup_phase_failure,
         "failed_run_ids": failed_run_ids,
+        "failed_run_attempts": failed_run_attempts,
+        "failed_run_ids_complete": failed_run_ids_complete,
         "genuine_failure": _details_have_genuine_failure(details),
     }
 
@@ -1081,13 +1137,13 @@ async def get_latest_inflight_workflow_run_for_branch(
     }
 
 
-async def rerun_failed_jobs(token: str, owner: str, repo: str, run_id: int) -> bool:
-    """Re-run only the failed jobs of a workflow run (GitHub Actions API).
+async def rerun_failed_jobs_outcome(
+    token: str, owner: str, repo: str, run_id: int
+) -> str:
+    """Return ``accepted``, ``rejected``, or ``ambiguous`` for a rerun POST.
 
-    Used to absorb transient setup-phase infra failures (container/runner init)
-    without spawning a fix task. Returns True when GitHub accepts the request
-    (HTTP 201/202); False on any non-accept or error (caller falls back to the
-    normal fix path).
+    A timeout or server-side response cannot prove that GitHub did not accept
+    the mutation, so callers with durable journals must not replay those cases.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -1101,16 +1157,37 @@ async def rerun_failed_jobs(token: str, owner: str, repo: str, run_id: int) -> b
             headers,
             timeout=10.0,
         )
-        if resp.status_code in (201, 202):
-            return True
-        logger.warning(
-            f"[CI] rerun-failed-jobs for run {run_id} returned "
-            f"{resp.status_code}: {resp.text[:200]}"
-        )
-        return False
     except Exception:  # noqa: BLE001
         logger.exception(f"[CI] rerun-failed-jobs request failed for run {run_id}")
-        return False
+        return "ambiguous"
+
+    if resp.status_code in (201, 202):
+        return "accepted"
+    logger.warning(
+        f"[CI] rerun-failed-jobs for run {run_id} returned "
+        f"{resp.status_code}: {resp.text[:200]}"
+    )
+    if 400 <= resp.status_code < 500 and resp.status_code not in {
+        408,
+        409,
+        425,
+        429,
+    }:
+        return "rejected"
+    return "ambiguous"
+
+
+async def rerun_failed_jobs(token: str, owner: str, repo: str, run_id: int) -> bool:
+    """Re-run only the failed jobs of a workflow run (GitHub Actions API).
+
+    Used to absorb transient setup-phase infra failures (container/runner init)
+    without spawning a fix task. Returns True when GitHub accepts the request
+    (HTTP 201/202); False on any non-accept or error (caller falls back to the
+    normal fix path).
+    """
+    return (
+        await rerun_failed_jobs_outcome(token, owner, repo, run_id) == "accepted"
+    )
 
 
 # ─── Short-lived dedup cache for check-runs lookups ─────────────────────────
@@ -1123,6 +1200,24 @@ async def rerun_failed_jobs(token: str, owner: str, repo: str, run_id: int) -> b
 _CHECK_RUNS_CACHE_TTL_S = 30
 _CHECK_RUNS_CACHE_MAX = 500  # entries; cheap eviction when oversized
 _check_runs_cache: dict[tuple[str, str, str, bool, bool], tuple[dict, float]] = {}
+_check_runs_cache_generations: dict[tuple[str, str, str], int] = {}
+_check_runs_cache_inflight: dict[tuple[str, str, str], int] = {}
+_CHECK_RUNS_CACHE_GENERATION_MAX = _CHECK_RUNS_CACHE_MAX * 4
+
+
+def _prune_check_runs_cache_generations() -> None:
+    while len(_check_runs_cache_generations) > _CHECK_RUNS_CACHE_GENERATION_MAX:
+        stale_key = next(
+            (
+                key
+                for key in _check_runs_cache_generations
+                if not _check_runs_cache_inflight.get(key)
+            ),
+            None,
+        )
+        if stale_key is None:
+            return
+        _check_runs_cache_generations.pop(stale_key, None)
 
 
 def invalidate_check_runs_cache(owner: str, repo: str, head_sha: str) -> None:
@@ -1133,6 +1228,12 @@ def invalidate_check_runs_cache(owner: str, repo: str, head_sha: str) -> None:
     Drops EVERY variant cached for the SHA (lenient/strict x with/without
     failure logs) — a key dimension added later must never leave a stale entry
     behind an invalidation."""
+    generation_key = (owner, repo, head_sha)
+    # Refresh insertion order so bounded pruning drops the oldest tombstone.
+    generation = _check_runs_cache_generations.pop(generation_key, 0) + 1
+    _check_runs_cache_generations[generation_key] = generation
+    _prune_check_runs_cache_generations()
+
     for key in [
         k
         for k in _check_runs_cache
@@ -1171,6 +1272,7 @@ async def get_check_runs_cached(
     from app import github as _gh
 
     key = (owner, repo, head_sha, treat_missing_as_success, include_failed_logs)
+    generation_key = (owner, repo, head_sha)
     now = time.time()
     cached = _check_runs_cache.get(key)
     if cached is not None and (now - cached[1]) < ttl:
@@ -1178,23 +1280,54 @@ async def get_check_runs_cached(
             _ss.github_cache_hits.get("check_runs", 0) + 1
         )
         return cached[0]
-    result = await _gh.get_check_runs(
-        token,
-        owner,
-        repo,
-        head_sha,
-        project_id=project_id,
-        treat_missing_as_success=treat_missing_as_success,
-        include_failed_logs=include_failed_logs,
-    )
-    # Do NOT cache API-error results — ``get_check_runs`` tags them with
-    # ``_from_api_error=True`` when a non-200 response was received.  Caching
-    # them would poison the 30 s dedup window with a fake 'pending' verdict
-    # during GitHub 5xx / rate-limit storms, delaying CI-completion detection
-    # for every task watching that SHA.  The next call will retry the real
-    # lookup instead of serving a stale fake-pending.
-    if result.get("_from_api_error"):
-        return result
+    for attempt in range(2):
+        request_generation = _check_runs_cache_generations.get(generation_key, 0)
+        _check_runs_cache_inflight[generation_key] = (
+            _check_runs_cache_inflight.get(generation_key, 0) + 1
+        )
+        try:
+            result = await _gh.get_check_runs(
+                token,
+                owner,
+                repo,
+                head_sha,
+                project_id=project_id,
+                treat_missing_as_success=treat_missing_as_success,
+                include_failed_logs=include_failed_logs,
+            )
+        finally:
+            remaining = _check_runs_cache_inflight.get(generation_key, 1) - 1
+            if remaining:
+                _check_runs_cache_inflight[generation_key] = remaining
+            else:
+                _check_runs_cache_inflight.pop(generation_key, None)
+
+        # Do NOT cache API-error results. They are already a nonterminal,
+        # fail-closed verdict and the next caller should retry GitHub.
+        if result.get("_from_api_error"):
+            _prune_check_runs_cache_generations()
+            return result
+        if request_generation == _check_runs_cache_generations.get(
+            generation_key, 0
+        ):
+            _prune_check_runs_cache_generations()
+            break
+        if attempt == 1:
+            _prune_check_runs_cache_generations()
+            return {
+                "status": "pending",
+                "conclusion": None,
+                "details": [],
+                "failed_logs": "",
+                "setup_phase_failure": False,
+                "failed_run_ids": [],
+                "failed_run_attempts": {},
+                "failed_run_ids_complete": False,
+                "genuine_failure": False,
+                "_from_cache_generation_race": True,
+            }
+
+    now = time.time()
     _check_runs_cache[key] = (result, now)
     # Lazy eviction: when the dict gets oversized, drop anything older than
     # 2x TTL.  Cheap, avoids unbounded growth across long-lived processes.
