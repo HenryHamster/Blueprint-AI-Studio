@@ -330,6 +330,33 @@ async def test_promotion_api_ambiguity_fails_closed_to_full_ci_dispatch(
     assert identity_mock.await_count == 3
 
 
+@pytest.mark.asyncio
+async def test_inherited_receipt_persist_failure_fails_closed_to_full_ci_dispatch(
+    db_session, mocker
+):
+    from app import project_telemetry
+    from app.release_qualifier_sweep import _DRIFT_SENTINEL_INHERITED_TREE_KEY
+
+    _project, _predecessor, version = await _promoted_predecessor(db_session)
+    gate, _promotion_receipt, _ci, identity_mock = _proof_mocks(mocker)
+    real_upsert = project_telemetry.upsert_telemetry
+
+    async def _fail_inherited_receipt(session, project_id, key, value):
+        if key == _DRIFT_SENTINEL_INHERITED_TREE_KEY:
+            raise RuntimeError("receipt persistence unavailable")
+        return await real_upsert(session, project_id, key, value)
+
+    mocker.patch(
+        "app.project_telemetry.upsert_telemetry",
+        new=AsyncMock(side_effect=_fail_inherited_receipt),
+    )
+
+    assert await _run(db_session, version.id) is True
+    assert gate.await_count == 2
+    assert gate.await_args.kwargs["dispatch"] is True
+    assert identity_mock.await_count == 3
+
+
 @pytest.mark.parametrize(
     "api_body",
     [

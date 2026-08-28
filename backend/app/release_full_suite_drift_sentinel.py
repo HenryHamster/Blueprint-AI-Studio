@@ -493,6 +493,18 @@ async def _check_full_suite_drift_sentinel(
                             head_sha[:8] if head_sha else "?",
                         )
                         await session.rollback()
+                        # Rollback expires every ORM object in the async session.
+                        # Re-load both rows before falling through to the normal
+                        # full-suite dispatch path; an early return here would
+                        # suppress the fail-closed evidence fallback.
+                        version = await session.get(
+                            release_version.ReleaseVersion, version_id
+                        )
+                        if version is None or version.status != "open":
+                            return False
+                        project = await session.get(Project, version.project_id)
+                        if project is None:
+                            return False
                     else:
                         await _retire_sentinel_incidents(
                             session,
