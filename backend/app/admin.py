@@ -3924,7 +3924,7 @@ async def create_compute_experiment_task(
         # contracts, catalog names with shape mismatches) stays strict.
         _raw_accel = str(launch_contract.get("accelerator") or "").strip()
         _pinned_noncatalog_accel = (
-            payload.runner_target is not None
+            (payload.runner_target is not None or forced_runner_id is not None)
             and bool(_raw_accel)
             and resolve_accelerator_spec(_raw_accel) is None
         )
@@ -4096,6 +4096,29 @@ async def create_compute_experiment_task(
         if payload.idempotency_key
         else None
     )
+
+    def _idempotent_response(existing: Task) -> dict[str, Any]:
+        if existing.first_payload != task_payload:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "idempotency_key_mismatch",
+                    "message": (
+                        "idempotency_key already names an active compute experiment "
+                        "with a different launch contract"
+                    ),
+                    "existing_task_id": str(existing.id),
+                },
+            )
+        return {
+            "id": str(existing.id),
+            "project_id": str(existing.project_id),
+            "title": existing.title,
+            "status": existing.status,
+            "vm_instance_id": existing.vm_instance_id,
+            "is_duplicate": True,
+        }
+
     if scoped_idempotency_key:
         existing = (
             (
@@ -4119,14 +4142,7 @@ async def create_compute_experiment_task(
             .first()
         )
         if existing:
-            return {
-                "id": str(existing.id),
-                "project_id": str(existing.project_id),
-                "title": existing.title,
-                "status": existing.status,
-                "vm_instance_id": existing.vm_instance_id,
-                "is_duplicate": True,
-            }
+            return _idempotent_response(existing)
 
     spend_decision = resolve_compute_spend_decision(
         runtime_config=_runtime_config,
@@ -4195,14 +4211,7 @@ async def create_compute_experiment_task(
                 .first()
             )
             if existing:
-                return {
-                    "id": str(existing.id),
-                    "project_id": str(existing.project_id),
-                    "title": existing.title,
-                    "status": existing.status,
-                    "vm_instance_id": existing.vm_instance_id,
-                    "is_duplicate": True,
-                }
+                return _idempotent_response(existing)
         raise
     await session.refresh(new_task)
 

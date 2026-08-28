@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -444,16 +445,18 @@ def _validate_compute_launch_contract(
             )
     try:
         spend = float(contract.get("spend_cap_usd"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return (
             False,
             f"spend_cap_usd is not a number ({contract.get('spend_cap_usd')!r})",
         )
+    if not math.isfinite(spend):
+        return False, f"spend_cap_usd must be finite (got {spend})"
     if not spend > 0:
         return False, f"spend_cap_usd must be positive (got {spend})"
     try:
         deadline = int(contract.get("deadline_seconds"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return (
             False,
             f"deadline_seconds is not an integer ({contract.get('deadline_seconds')!r})",
@@ -465,7 +468,7 @@ def _validate_compute_launch_contract(
     if no_progress_timeout is not None:
         try:
             npt = int(no_progress_timeout)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return (
                 False,
                 f"no_progress_timeout_seconds is not an integer "

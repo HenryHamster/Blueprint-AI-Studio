@@ -502,11 +502,45 @@ def test_validate_contract_accepts_without_smoke_when_require_smoke_false():
         ({"command": "run", "spend_cap_usd": 0, "deadline_seconds": 60}, "spend_cap"),
         ({"command": "run", "spend_cap_usd": -2, "deadline_seconds": 60}, "spend_cap"),
         ({"command": "run", "spend_cap_usd": "x", "deadline_seconds": 60}, "spend_cap"),
+        (
+            {"command": "run", "spend_cap_usd": float("nan"), "deadline_seconds": 60},
+            "spend_cap",
+        ),
+        (
+            {"command": "run", "spend_cap_usd": float("inf"), "deadline_seconds": 60},
+            "spend_cap",
+        ),
         ({"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": 0}, "deadline"),
         ({"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": -5}, "deadline"),
         (
+            {"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": float("nan")},
+            "deadline",
+        ),
+        (
+            {"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": float("inf")},
+            "deadline",
+        ),
+        (
             {"command": "run", "spend_cap_usd": 1.0, "deadline_seconds": None},
             "deadline",
+        ),
+        (
+            {
+                "command": "run",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 60,
+                "no_progress_timeout_seconds": float("nan"),
+            },
+            "no_progress_timeout_seconds",
+        ),
+        (
+            {
+                "command": "run",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 60,
+                "no_progress_timeout_seconds": float("inf"),
+            },
+            "no_progress_timeout_seconds",
         ),
     ],
 )

@@ -9492,6 +9492,33 @@ class TestComputeExperimentTaskLaunch:
         }
 
     @pytest.mark.asyncio
+    async def test_idempotency_reuses_exact_contract_and_rejects_mismatch(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload(idempotency_key="operator-retry")
+
+        first = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+        duplicate = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+        mismatch = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={**payload, "command": "python different.py"},
+        )
+
+        assert first.status_code == 200, first.text
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["id"] == first.json()["id"]
+        assert duplicate.json()["is_duplicate"] is True
+        assert mismatch.status_code == 409, mismatch.text
+        detail = mismatch.json()["error"]["message"]
+        assert detail["error"] == "idempotency_key_mismatch"
+        assert detail["existing_task_id"] == first.json()["id"]
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert len(tasks) == 1
+
+    @pytest.mark.asyncio
     async def test_container_fields_persist_for_runner_experiments(
         self, client: AsyncClient, db_session
     ):
@@ -9994,6 +10021,31 @@ class TestComputeExperimentTaskLaunch:
             "runner_id": str(runner.id),
             "strict": True,
         }
+
+    @pytest.mark.asyncio
+    async def test_hard_runner_pin_accepts_noncatalog_accelerator(
+        self, client: AsyncClient, db_session
+    ):
+        """The operator hard-pin surface has the same runner-hardware contract
+        as the nested runner_target surface."""
+        project = await self._project_with_repo(db_session)
+        runner = await self._enrolled_runner(db_session, project.id)
+        payload = self._valid_payload(
+            runner_target_id=str(runner.id),
+            accelerator="RTX 5080",
+        )
+        payload.pop("machine_type", None)
+
+        resp = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["accelerator"] == "RTX 5080"
+        assert (task.context or {})["forced_runner_target_id"] == str(runner.id)
 
     @pytest.mark.asyncio
     async def test_unpinned_contract_still_rejects_noncatalog_accelerator(

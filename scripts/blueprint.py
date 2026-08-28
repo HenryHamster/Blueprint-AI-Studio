@@ -53,6 +53,7 @@ import contextlib
 import hashlib
 import importlib.util
 import json
+import math
 import ntpath
 import os
 import re
@@ -8047,6 +8048,7 @@ def _load_compute_contract(path_value: str | None) -> dict:
         if value is not None and (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
             or value <= 0
         ):
             print(
@@ -8289,14 +8291,39 @@ def _compute_launch(args: argparse.Namespace) -> None:
     spend_cap = getattr(args, "spend_cap", None)
     if spend_cap is None:
         spend_cap = contract.get("spend_cap_usd", 0.50)
+    if not math.isfinite(float(spend_cap)) or spend_cap <= 0:
+        print("ERROR: --spend-cap must be a positive finite number.", file=sys.stderr)
+        sys.exit(1)
     deadline = getattr(args, "deadline", None)
     if deadline is None:
         deadline = contract.get("deadline_seconds", 600)
     raw_metric = getattr(args, "metric", None)
-    metric = (raw_metric or "dud_ok") if dud else raw_metric
-    operator = getattr(args, "operator", ">=")
+    raw_operator = getattr(args, "operator", None)
     raw_threshold = getattr(args, "threshold", None)
-    threshold = (raw_threshold if raw_threshold is not None else 1.0) if dud else raw_threshold
+    raw_criterion = contract.get("success_criterion")
+    success_criterion = (
+        dict(raw_criterion) if isinstance(raw_criterion, dict) else None
+    )
+    if dud:
+        success_criterion = {
+            "metric": raw_metric or "dud_ok",
+            "operator": raw_operator or ">=",
+            "threshold": raw_threshold if raw_threshold is not None else 1.0,
+        }
+    elif any(
+        value is not None for value in (raw_metric, raw_operator, raw_threshold)
+    ):
+        success_criterion = dict(success_criterion or {})
+        if raw_metric is not None:
+            success_criterion["metric"] = raw_metric
+        if raw_operator is not None:
+            success_criterion["operator"] = raw_operator
+        elif raw_metric is not None and "operator" not in success_criterion:
+            # Preserve the historical default when a new criterion is authored
+            # from CLI flags, without overwriting a contract-file operator.
+            success_criterion["operator"] = ">="
+        if raw_threshold is not None:
+            success_criterion["threshold"] = raw_threshold
     declared_metric = (
         getattr(args, "declared_metric", None)
         or file_declared_metric
@@ -8341,12 +8368,8 @@ def _compute_launch(args: argparse.Namespace) -> None:
         body["command"] = command
         if declared_metric:
             body["declared_metric"] = declared_metric
-    if metric:
-        body["success_criterion"] = {
-            "metric": metric,
-            "operator": operator,
-            "threshold": threshold,
-        }
+    if success_criterion is not None:
+        body["success_criterion"] = success_criterion
     for arg_name, body_name in (
         ("accelerator", "accelerator"),
         ("machine_type", "machine_type"),
@@ -8387,8 +8410,10 @@ def _compute_launch(args: argparse.Namespace) -> None:
     result = api("POST", "/api/admin/tasks/compute-experiment", body)
 
     def _render_created(r: dict) -> None:
+        disposition = "reused" if r.get("is_duplicate") else "created"
         print(
-            f"  compute experiment created: {r.get('task_id', r.get('id', '?'))}"
+            f"  compute experiment {disposition}: "
+            f"{r.get('task_id', r.get('id', '?'))}"
             + (
                 f"  job_id={r.get('compute_job_id', '')}"
                 if r.get("compute_job_id")
@@ -9730,8 +9755,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--metric", default=None,
         help="Success-criterion metric name (default 'dud_ok' for --dud).")
     p_compute_launch.add_argument(
-        "--operator", default=">=",
-        help="Success-criterion operator: >= <= > < == != (default >=).")
+        "--operator", default=None,
+        help=(
+            "Success-criterion operator: >= <= > < == != "
+            "(default >= for a new criterion)."
+        ))
     p_compute_launch.add_argument(
         "--threshold", type=float, default=None,
         help="Success-criterion threshold (default 1.0 for --dud).")

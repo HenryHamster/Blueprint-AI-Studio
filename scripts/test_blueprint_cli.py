@@ -7687,6 +7687,204 @@ def test_compute_launch_contract_file_forwards_full_backend_contract(
     assert body["preview_only"] is True
 
 
+@pytest.mark.parametrize(
+    ("file_criterion", "flag_args", "expected"),
+    [
+        (
+            {"metric": "file_metric", "operator": "<=", "threshold": 5.0},
+            ["--metric", "cli_metric"],
+            {"metric": "cli_metric", "operator": "<=", "threshold": 5.0},
+        ),
+        (
+            {"metric": "file_metric", "operator": "<=", "threshold": 5.0},
+            ["--operator", ">"],
+            {"metric": "file_metric", "operator": ">", "threshold": 5.0},
+        ),
+        (
+            {"metric": "file_metric", "operator": "<=", "threshold": 5.0},
+            ["--threshold", "7"],
+            {"metric": "file_metric", "operator": "<=", "threshold": 7.0},
+        ),
+        (
+            {"metric": "file_metric", "operator": "<=", "threshold": 5.0},
+            ["--metric", "cli_metric", "--operator", "==", "--threshold", "1"],
+            {"metric": "cli_metric", "operator": "==", "threshold": 1.0},
+        ),
+        (
+            None,
+            ["--metric", "cli_metric", "--threshold", "2"],
+            {"metric": "cli_metric", "operator": ">=", "threshold": 2.0},
+        ),
+    ],
+)
+def test_compute_launch_criterion_flags_merge_field_by_field(
+    mock_api, monkeypatch, tmp_path, file_criterion, flag_args, expected
+):
+    contract = {
+        "command": "python evaluate.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+    }
+    if file_criterion is not None:
+        contract["success_criterion"] = file_criterion
+    contract_file = tmp_path / "criterion-contract.json"
+    contract_file.write_text(json.dumps(contract), encoding="utf-8")
+    cfg = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
+
+    rc = blueprint.main(
+        [
+            "compute",
+            "launch",
+            "--contract-file",
+            str(contract_file),
+            *flag_args,
+            "--preview",
+        ]
+    )
+
+    assert rc == 0
+    body = next(
+        body
+        for method, path, body in mock_api
+        if method == "POST" and path == "/api/admin/tasks/compute-experiment"
+    )
+    assert body["success_criterion"] == expected
+
+
+@pytest.mark.parametrize(
+    ("file_value", "flag_args", "expected"),
+    [
+        (
+            True,
+            [
+                "--no-require-durable-artifact",
+                "--no-require-live-release",
+                "--no-follow-up",
+            ],
+            False,
+        ),
+        (
+            False,
+            ["--require-durable-artifact", "--require-live-release", "--follow-up"],
+            True,
+        ),
+    ],
+)
+def test_compute_launch_boolean_flags_override_contract_values(
+    mock_api, monkeypatch, tmp_path, file_value, flag_args, expected
+):
+    contract_file = tmp_path / "boolean-contract.json"
+    contract_file.write_text(
+        json.dumps(
+            {
+                "command": "python evaluate.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "require_durable_artifact": file_value,
+                "require_live_release": file_value,
+                "spawn_followup": file_value,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
+
+    rc = blueprint.main(
+        [
+            "compute",
+            "launch",
+            "--contract-file",
+            str(contract_file),
+            *flag_args,
+            "--preview",
+        ]
+    )
+
+    assert rc == 0
+    body = next(
+        body
+        for method, path, body in mock_api
+        if method == "POST" and path == "/api/admin/tasks/compute-experiment"
+    )
+    assert body["require_durable_artifact"] is expected
+    assert body["require_live_release"] is expected
+    assert body["spawn_followup"] is expected
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "needle"),
+    [
+        ("spend_cap_usd", float("nan"), "positive number"),
+        ("spend_cap_usd", float("inf"), "positive number"),
+        ("deadline_seconds", float("nan"), "positive integer"),
+        ("deadline_seconds", float("inf"), "positive integer"),
+        ("no_progress_timeout_seconds", float("nan"), "positive integer"),
+        ("no_progress_timeout_seconds", float("inf"), "positive integer"),
+    ],
+)
+def test_compute_launch_contract_rejects_nonfinite_numbers(
+    mock_api, monkeypatch, tmp_path, capsys, field, value, needle
+):
+    contract = {
+        "command": "python evaluate.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+    }
+    contract[field] = value
+    contract_file = tmp_path / "nonfinite-contract.json"
+    contract_file.write_text(json.dumps(contract), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            ["compute", "launch", "--contract-file", str(contract_file), "--preview"]
+        )
+
+    assert exc.value.code == 1
+    assert needle in capsys.readouterr().err
+    assert not [call for call in mock_api if call[0] == "POST"]
+
+
+def test_compute_launch_renders_idempotent_reuse(monkeypatch, capsys):
+    cfg = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        blueprint,
+        "api",
+        lambda *_args, **_kwargs: {
+            "id": "existing-task-id",
+            "status": "QUEUED",
+            "is_duplicate": True,
+        },
+    )
+
+    rc = blueprint.main(
+        ["compute", "launch", "--command", "python evaluate.py", "--yes"]
+    )
+
+    assert rc == 0
+    assert "compute experiment reused: existing-task-id" in capsys.readouterr().out
+
+
 def test_compute_launch_explicit_resume_and_result_metadata_forwarded(
     mock_api, monkeypatch
 ):
