@@ -3624,6 +3624,73 @@ async def test_explicit_runner_replaces_a_genuinely_stale_active_worker(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_terminal_worker_restart_preserves_checkpoint_and_single_generation(
+    db_session,
+):
+    """A terminal backing task restarts from the persisted Resident authority."""
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    old_task = await db_session.get(Task, uuid.UUID(started["task_id"]))
+    assert old_task is not None
+    old_task.status = TaskStatus.FAILED
+
+    checkpoint = {
+        "_exam_ledger": '{"tick":179,"records":[]}',
+        "_message_cursor": "2026-08-28T14:03:01.801065+00:00",
+        "_session_summary": "Keep the corrected v54 two-task dependency packet.",
+        "_decisions_reg": '{"entries":[{"atTick":178}]}',
+    }
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob.update(checkpoint)
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    replaced = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert replaced["session_id"] == started["session_id"]
+    assert replaced["worker_generation"] == started["worker_generation"] + 1
+    assert replaced["task_id"] != started["task_id"]
+    replacement = await db_session.get(Task, uuid.UUID(replaced["task_id"]))
+    assert replacement is not None
+    assert replacement.context["_exam_ledger"] == checkpoint["_exam_ledger"]
+    assert replacement.context["message_cursor"] == checkpoint["_message_cursor"]
+    assert replacement.context["_session_summary"] == checkpoint["_session_summary"]
+    assert replacement.context["_decisions_reg"] == checkpoint["_decisions_reg"]
+
+    await db_session.refresh(project)
+    replacement_blob = project.vision[RESIDENT_SESSION_KEY]
+    for key, value in checkpoint.items():
+        assert replacement_blob[key] == value
+
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    live_residents = [
+        row
+        for row in tasks
+        if (row.context or {}).get("_resident_session") is True
+        and row.status
+        in {
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        }
+    ]
+    assert [str(row.id) for row in live_residents] == [replaced["task_id"]]
+
+
+@pytest.mark.asyncio
 async def test_reload_ensure_replaces_worker_after_task_corroboration_grace(
     db_session,
 ):
