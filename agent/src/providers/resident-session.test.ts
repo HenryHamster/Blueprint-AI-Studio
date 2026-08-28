@@ -41,6 +41,7 @@ vi.mock('../token-file.js', () => ({
 }));
 
 vi.mock('../constants.js', () => ({
+  DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS: 15 * 60_000,
   PROCESS_KILL_GRACE_MS: 2000,
   OUTPUT_TAIL_AFTER_CAP_BYTES: 2_000_000,
 }));
