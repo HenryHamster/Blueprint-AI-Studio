@@ -164,7 +164,7 @@
         "TestNotificationConfigSettings::test_strategic_session_settings",
         "TestEvergreenFillSettingsPersist::test_strategic_session_settings_persist_across_sync"
       ],
-      "test_count": 456
+      "test_count": 468
     },
     {
       "path": "backend/testing/test_agent_strategic_fetch.py",
@@ -723,7 +723,7 @@
         "selectTypedFastClaimMessages > uses the retained M1 input while its stable claim is leased",
         "selectTypedFastClaimMessages > waits for authoritative stale claim membership instead of claiming a partial page"
       ],
-      "test_count": 139
+      "test_count": 141
     },
     {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
