@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import inspect as sa_inspect, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -316,14 +317,14 @@ async def _post_guard_suppression_escalation(
     owner: Task | None = None,
     *,
     unowned_reason: str | None = None,
-) -> None:
+) -> bool:
     """Emit one immutable, versioned aggregate escalation.
 
     The claim must track reality without rewriting governed conversation bytes.
     A content rewrite is treated as a privacy mutation and invalidates private
-    Workday handoffs for the whole project. Give each rendered ownership state
-    a deterministic message identity instead, then resolve older versions using
-    status-only fields that do not participate in the privacy fence.
+    Workday handoffs for the whole project. Fence each state transition through
+    the chain's persisted monotonic version, give it an immutable message, then
+    resolve older versions using fields outside the privacy fence.
     """
     if owner is None and not unowned_reason:
         raise ValueError(
@@ -332,24 +333,103 @@ async def _post_guard_suppression_escalation(
     if not hasattr(session, "scalar"):
         # Lightweight unit-test sessions exercise ledger semantics without the
         # message table; production AsyncSession always owns this method.
-        return
+        chain.remediation_task_id = owner.id if owner is not None else None
+        if owner is not None:
+            session.add(owner)
+        session.add(chain)
+        return True
     from app.notification_dispatch import post_event_message
 
     summary = guard_suppression_escalation_summary(owner, unowned_reason)
     owner_id = str(owner.id) if owner is not None else ""
+    expected_version = int(chain.escalation_version or 0)
+    expected_owner_id = chain.remediation_task_id
+
+    # The chain row is the canonical aggregate authority. PostgreSQL's row lock
+    # serializes publishers, while the compare-and-swap below is the durable
+    # stale-reader fence (and remains effective on databases without FOR UPDATE).
+    with session.no_autoflush:
+        authority = (
+            await session.execute(
+                select(
+                    ModuleFindingChain.escalation_version,
+                    ModuleFindingChain.escalation_state_fingerprint,
+                    ModuleFindingChain.remediation_task_id,
+                    ModuleFindingChain.status,
+                    ModuleFindingChain.occurrences,
+                )
+                .where(ModuleFindingChain.id == chain.id)
+                .with_for_update()
+            )
+        ).one_or_none()
+    if authority is None:
+        return False
+    current_version = int(authority.escalation_version or 0)
+    current_owner_id = authority.remediation_task_id
+    if (
+        authority.status != "open"
+        or current_version != expected_version
+        or current_owner_id != expected_owner_id
+    ):
+        if sa_inspect(chain).persistent:
+            await session.refresh(chain)
+        return False
+
     version_fingerprint = hashlib.sha256(
         "\0".join(
             (
                 summary,
-                str(chain.occurrences),
+                str(authority.occurrences),
                 owner_id,
                 unowned_reason or "",
             )
         ).encode()
     ).hexdigest()
+    desired_owner_id = owner.id if owner is not None else None
+    if (
+        authority.escalation_state_fingerprint == version_fingerprint
+        and current_owner_id == desired_owner_id
+    ):
+        publication_version = current_version
+    else:
+        owner_was_unpersisted = False
+        if owner is not None:
+            owner_state = sa_inspect(owner)
+            owner_was_unpersisted = owner_state.transient or owner_state.pending
+            if owner_state.transient:
+                session.add(owner)
+            if owner_was_unpersisted:
+                await session.flush([owner])
+
+        publication_version = current_version + 1
+        with session.no_autoflush:
+            claimed = await session.execute(
+                update(ModuleFindingChain)
+                .where(
+                    ModuleFindingChain.id == chain.id,
+                    ModuleFindingChain.status == "open",
+                    ModuleFindingChain.escalation_version == expected_version,
+                    ModuleFindingChain.remediation_task_id == expected_owner_id,
+                )
+                .values(
+                    escalation_version=publication_version,
+                    escalation_state_fingerprint=version_fingerprint,
+                    remediation_task_id=desired_owner_id,
+                )
+                .execution_options(synchronize_session=False)
+            )
+        if claimed.rowcount != 1:
+            if owner is not None and owner_was_unpersisted:
+                await session.delete(owner)
+                await session.flush()
+            if sa_inspect(chain).persistent:
+                await session.refresh(chain)
+            return False
+        await session.refresh(chain)
+
     idempotency_key = (
-        f"guard-suppression:{chain.project_id}:{chain.finding_key}:"
-        f"escalation:{version_fingerprint}"
+        f"guard-suppression:{chain.id}:escalation:"
+        f"v{publication_version}:{version_fingerprint}"
     )
     message = await post_event_message(
         session,
@@ -360,7 +440,8 @@ async def _post_guard_suppression_escalation(
             "finding_key": chain.finding_key,
             "lane": chain.suppression_lane,
             "failure_identity": chain.failure_identity,
-            "occurrences": chain.occurrences,
+            "occurrences": authority.occurrences,
+            "escalation_version": publication_version,
             "remediation_task_id": owner_id or None,
             "remediation_unowned_reason": unowned_reason,
         },
@@ -368,11 +449,10 @@ async def _post_guard_suppression_escalation(
         idempotency_key=idempotency_key,
     )
     if message is None:
-        return
+        return True
     if message.status == "resolved":
-        # The stable idempotency key is the aggregate's identity. Reopen that
-        # one message for a new lifecycle instead of emitting a per-recurrence
-        # operator notification.
+        # Repair an exact-version retry only while the chain still declares
+        # this state authoritative. A resolved chain cannot reach this branch.
         message.status = "open"
         message.resolution = None
         message.resolved_at = None
@@ -398,6 +478,7 @@ async def _post_guard_suppression_escalation(
         previous.resolution = f"superseded by escalation version {message.id}"
         previous.resolved_at = resolved_at
         session.add(previous)
+    return True
 
 
 async def ingest_guard_suppression_receipt(task: Task, session: AsyncSession) -> list[ModuleFindingChain]:
@@ -504,6 +585,7 @@ async def _ingest_guard_suppression_receipt_once(
                 # resolved owner/escalation cannot own a new recurrence.
                 chain.status = "open"
                 chain.remediation_task_id = None
+                chain.escalation_state_fingerprint = None
                 chain.resolved_by_task_id = None
                 chain.resolved_at = None
                 chain.source_task_ids = []
@@ -566,7 +648,6 @@ async def _release_terminal_remediation_owner(
     if owner is None:
         # The owner row is gone entirely — nothing can resolve the chain
         # through it, so re-election is strictly better than staying stuck.
-        chain.remediation_task_id = None
         await _post_guard_suppression_escalation(
             session,
             chain,
@@ -584,7 +665,6 @@ async def _release_terminal_remediation_owner(
             owner_id,
             owner.status,
         )
-        chain.remediation_task_id = None
         # Correct the operator record in the same breath. The escalation was
         # written as an ownership claim; leaving it standing after the owner
         # terminated tells the operator the problem is handled when nothing is
@@ -756,10 +836,11 @@ async def elect_guard_suppression_owners(
                     ),
                 )
                 continue
-            chain.remediation_task_id = owner.id
-            session.add(owner)
-            session.add(chain)
-            await _post_guard_suppression_escalation(session, chain, owner)
+            published = await _post_guard_suppression_escalation(
+                session, chain, owner
+            )
+            if not published:
+                continue
             elected.append(owner)
     return elected
 
@@ -779,7 +860,7 @@ async def resolve_landed_guard_suppression_remediation(
                 select(ModuleFindingChain).where(
                     ModuleFindingChain.project_id == task.project_id,
                     ModuleFindingChain.finding_key.in_(keys),
-                )
+                ).with_for_update()
             )
         ).scalars().all()
     )
@@ -797,28 +878,30 @@ async def resolve_landed_guard_suppression_remediation(
             session.add(chain)
             resolved.append(chain)
     if resolved:
-        await _resolve_guard_suppression_escalations(session, resolved)
         await session.flush(resolved)
+        await _resolve_guard_suppression_escalations(session, resolved)
     return resolved
 
 
 async def _resolve_guard_suppression_escalations(
     session: AsyncSession, chains: Iterable[ModuleFindingChain]
 ) -> None:
-    """Close the one aggregate action message when its owner proves clean."""
+    """Close every open version of the aggregate when its owner proves clean."""
     if not hasattr(session, "scalar"):
         # Ledger-only test sessions intentionally have no message persistence.
         return
     now = _utcnow()
     for chain in chains:
-        key = f"guard-suppression:{chain.project_id}:{chain.finding_key}:escalation"
         messages = list(
             (
                 await session.execute(
                     select(ProjectMessage).where(
                         ProjectMessage.project_id == chain.project_id,
-                        ProjectMessage.idempotency_key == key,
                         ProjectMessage.status == "open",
+                        ProjectMessage.context["event_type"].as_string()
+                        == "remediation_escalated",
+                        ProjectMessage.context["finding_key"].as_string()
+                        == chain.finding_key,
                     )
                 )
             ).scalars().all()
