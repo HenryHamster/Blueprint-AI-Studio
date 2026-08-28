@@ -9387,6 +9387,56 @@ class TestComputeExperimentTaskLaunch:
         assert project.promotion_target is None
 
     @pytest.mark.asyncio
+    async def test_preview_and_launch_share_effective_resource_limits(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.compute_jobs import (
+            MIN_COMPUTE_JOB_DEADLINE_SECONDS,
+            MIN_COMPUTE_JOB_SPEND_CAP_USD,
+        )
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = (
+            MIN_COMPUTE_JOB_SPEND_CAP_USD / 2
+        )
+        payload = self._valid_payload(
+            spend_cap_usd=MIN_COMPUTE_JOB_SPEND_CAP_USD / 10,
+            deadline_seconds=1,
+        )
+        try:
+            preview_resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json={**payload, "preview_only": True},
+            )
+            launch_resp = await client.post(
+                "/api/admin/tasks/compute-experiment", json=payload
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert preview_resp.status_code == 200, preview_resp.text
+        preview = preview_resp.json()["preview"]
+        normalized = preview["normalized_contract"]
+        assert normalized["spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert normalized["deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
+        assert preview["monetary_decision"]["requires_monetary_approval"] is True
+
+        assert launch_resp.status_code == 200, launch_resp.text
+        launched = launch_resp.json()
+        assert launched["effective_spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert launched["effective_deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
+        assert launched["requires_approval"] is True
+        task = await db_session.get(Task, uuid.UUID(launched["id"]))
+        assert task is not None
+        assert task.first_payload["spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert task.first_payload["deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
+
+    @pytest.mark.asyncio
     async def test_paused_project_rejects_real_launch_before_incidental_writes(
         self, client: AsyncClient, db_session
     ):
@@ -9501,7 +9551,7 @@ class TestComputeExperimentTaskLaunch:
         first = await client.post("/api/admin/tasks/compute-experiment", json=payload)
         duplicate = await client.post(
             "/api/admin/tasks/compute-experiment",
-            json={**payload, "runner_target_id": first_runner.hostname},
+            json=payload,
         )
         mismatch = await client.post(
             "/api/admin/tasks/compute-experiment",
@@ -10564,6 +10614,32 @@ class TestRerunComputeExperiment:
         assert child.payloads[0]["spend_cap_usd"] == 2.5
         assert child.payloads[0]["deadline_seconds"] == 600
         assert child.payloads[0]["success_criterion"]["threshold"] == 150.0
+
+    @pytest.mark.asyncio
+    async def test_rerun_persists_effective_resource_limits(
+        self, client: AsyncClient, db_session
+    ):
+        _, source = await self._project_with_task(db_session)
+        from app.compute_jobs import (
+            MIN_COMPUTE_JOB_DEADLINE_SECONDS,
+            MIN_COMPUTE_JOB_SPEND_CAP_USD,
+        )
+
+        resp = await client.post(
+            f"/api/admin/tasks/{source.id}/rerun",
+            json={
+                "spend_cap_usd": MIN_COMPUTE_JOB_SPEND_CAP_USD / 10,
+                "deadline_seconds": 1,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["effective_spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert data["effective_deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
+        child = await db_session.get(Task, uuid.UUID(data["id"]))
+        assert child is not None
+        assert child.first_payload["spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert child.first_payload["deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
 
     @pytest.mark.asyncio
     async def test_rerun_non_compute_task_returns_422(

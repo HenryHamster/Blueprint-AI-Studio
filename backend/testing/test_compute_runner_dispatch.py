@@ -1350,6 +1350,95 @@ async def test_next_compute_job_delivers_repo_clone_from_launch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raise_token_error", [False, True])
+async def test_repo_intent_survives_token_failure_until_runner_claim(
+    client, db_session, monkeypatch, raise_token_error
+):
+    """A launch-time token outage must not turn a repo job into a bare command."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(
+        name="Repo Token Failure",
+        user_id="u",
+        github_owner="acme",
+        github_repo="private-ml",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment", "base_branch": "experiment/ref"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    async def _token_unavailable(project, session):
+        if raise_token_error:
+            raise RuntimeError("installation token service unavailable")
+        return None
+
+    import app.branch_cleanup as branch_cleanup_mod
+
+    monkeypatch.setattr(
+        branch_cleanup_mod, "_get_project_github_token", _token_unavailable
+    )
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+
+    expected_repo = {
+        "owner": "acme",
+        "repo": "private-ml",
+        "ref": "experiment/ref",
+    }
+    assert (job.polling_metadata or {}).get("repo_clone") == expected_repo
+
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["repo_clone"] == expected_repo
+    assert body["repo_token"] is None
+
+
+@pytest.mark.asyncio
 async def test_next_compute_job_scoped_to_pinned_runner(client, db_session, monkeypatch):
     """Within ONE project, a job pinned (polling_metadata['runner_target_id']) to
     runner A must NOT be claimable by a different runner B — even a second poll by

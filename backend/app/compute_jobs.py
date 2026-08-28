@@ -87,9 +87,12 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app import compute_experiment_contract as compute_contract
 from app.compute_experiment_contract import (
     ComputeSpendDecision,
     build_compute_contract_preview,
+    clamp_deadline_seconds,
+    clamp_spend_cap_usd,
     resolve_compute_spend_decision,
     resolve_compute_spend_direction,
 )
@@ -106,18 +109,11 @@ from app.vm_cost_rates import (
 
 logger = logging.getLogger(__name__)
 
-MIN_COMPUTE_JOB_SPEND_CAP_USD = float(
-    os.getenv("COMPUTE_JOB_MIN_SPEND_CAP_USD", "0.01")
-)
-MAX_COMPUTE_JOB_SPEND_CAP_USD = float(
-    os.getenv("COMPUTE_JOB_MAX_SPEND_CAP_USD", "100.0")
-)
-MIN_COMPUTE_JOB_DEADLINE_SECONDS = int(
-    os.getenv("COMPUTE_JOB_MIN_DEADLINE_SECONDS", "60")
-)
-MAX_COMPUTE_JOB_DEADLINE_SECONDS = int(
-    os.getenv("COMPUTE_JOB_MAX_DEADLINE_SECONDS", "86400")
-)
+MIN_COMPUTE_JOB_SPEND_CAP_USD = compute_contract.MIN_COMPUTE_JOB_SPEND_CAP_USD
+MAX_COMPUTE_JOB_SPEND_CAP_USD = compute_contract.MAX_COMPUTE_JOB_SPEND_CAP_USD
+MIN_COMPUTE_JOB_DEADLINE_SECONDS = compute_contract.MIN_COMPUTE_JOB_DEADLINE_SECONDS
+MAX_COMPUTE_JOB_DEADLINE_SECONDS = compute_contract.MAX_COMPUTE_JOB_DEADLINE_SECONDS
+
 COMPUTE_JOB_MONITOR_INTERVAL_SECONDS = float(
     os.getenv("COMPUTE_JOB_MONITOR_INTERVAL_SECONDS", "15")
 )
@@ -496,20 +492,6 @@ def _has_verified_resume_provenance(job: Any) -> bool:
         and str(provenance.get("resumed_from_job_id") or "") == str(input_job_id)
         and isinstance(provenance.get("file_count"), int)
         and provenance["file_count"] > 0
-    )
-
-
-def clamp_spend_cap_usd(raw_value: float) -> float:
-    return max(
-        MIN_COMPUTE_JOB_SPEND_CAP_USD,
-        min(float(raw_value), MAX_COMPUTE_JOB_SPEND_CAP_USD),
-    )
-
-
-def clamp_deadline_seconds(raw_value: int) -> int:
-    return max(
-        MIN_COMPUTE_JOB_DEADLINE_SECONDS,
-        min(int(raw_value), MAX_COMPUTE_JOB_DEADLINE_SECONDS),
     )
 
 
@@ -4344,10 +4326,11 @@ async def _attach_repo_clone(
     by research/plan/operator authoring) → ``context.original_base`` → the
     project's promotion target → ``main``.
 
-    Defensive by contract: a project with no repo, a token-mint failure, or any
-    other error degrades to NO checkout (legacy behavior) — it NEVER blocks the
-    launch. A genuinely repo-dependent command then fails the same way it does
-    today, no worse.
+    Defensive by contract: a project with no repo or an unrelated lookup error
+    degrades to NO checkout (legacy behavior). For runner-subprocess jobs, once
+    repo intent is known it survives a token-mint failure without the credential:
+    the claim endpoint retries the mint, and the runner fails closed before
+    command execution if no token is available then either.
     """
     if not job.project_id:
         return spec
@@ -4370,18 +4353,43 @@ async def _attach_repo_clone(
                     ctx = _task.context if isinstance(_task.context, dict) else {}
                     ref = payload.get("base_branch") or ctx.get("original_base")
             ref = ref or getattr(project, "promotion_target", None) or "main"
+            repo_clone = {
+                "owner": str(project.github_owner),
+                "repo": str(project.github_repo),
+                "ref": str(ref),
+            }
             # Reuses the shared, cached install-token path (50-min TTL) so launches
             # don't drain the App-JWT bucket.
             from app.branch_cleanup import _get_project_github_token
 
-            token = await _get_project_github_token(project, session)
-            if not token:
+            try:
+                token = await _get_project_github_token(project, session)
+            except Exception:
+                # Claim time retries the token mint before the runner executes.
                 logger.warning(
-                    "[COMPUTE_JOB] no GitHub token for project=%s; launching job=%s "
-                    "without a repo checkout",
+                    "[COMPUTE_JOB] GitHub token mint failed for project=%s job=%s",
                     job.project_id,
                     job.id,
+                    exc_info=True,
                 )
+                token = None
+            if not token:
+                if job.backend == RUNNER_SUBPROCESS_BACKEND_NAME:
+                    spec.repo_clone = repo_clone
+                    spec.repo_token = None
+                    logger.warning(
+                        "[COMPUTE_JOB] no GitHub token for project=%s job=%s; "
+                        "preserving repo intent for claim-time remint",
+                        job.project_id,
+                        job.id,
+                    )
+                else:
+                    logger.warning(
+                        "[COMPUTE_JOB] no GitHub token for project=%s; launching "
+                        "job=%s without a repo checkout",
+                        job.project_id,
+                        job.id,
+                    )
                 return spec
             # staging branches are deleted after the plan rolls up to integration.
             # If the resolved ref is a staging branch that no longer exists, degrade
@@ -4406,11 +4414,7 @@ async def _attach_repo_clone(
                         fallback,
                     )
                     ref = fallback
-            spec.repo_clone = {
-                "owner": str(project.github_owner),
-                "repo": str(project.github_repo),
-                "ref": str(ref),
-            }
+            spec.repo_clone = {**repo_clone, "ref": str(ref)}
             spec.repo_token = token
             return spec
     except Exception:  # noqa: BLE001 — repo checkout is best-effort, never fatal

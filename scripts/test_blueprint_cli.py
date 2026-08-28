@@ -8156,6 +8156,79 @@ def test_compute_launch_watch_polls_created_task_to_terminal(
     assert "watch: COMPLETED" in out
 
 
+@pytest.mark.parametrize(
+    "watched",
+    [
+        {"timed_out": False, "status": "FAILED", "task": {}},
+        {"timed_out": False, "status": "CANCELLED", "task": {}},
+        {"timed_out": True, "status": "IN_PROGRESS", "task": {}},
+    ],
+)
+def test_compute_launch_watch_returns_nonzero_for_unsuccessful_outcome(
+    mock_api, monkeypatch, watched
+):
+    config = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: config)
+    monkeypatch.setattr(blueprint, "load_config", lambda: config)
+    monkeypatch.setattr(
+        blueprint,
+        "api",
+        lambda method, path, body=None, timeout=30: {
+            "id": "compute-task-1",
+            "status": "QUEUED",
+            "effective_deadline_seconds": 600,
+        },
+    )
+    monkeypatch.setattr(blueprint, "_watch_compute_task", lambda *args, **kwargs: watched)
+
+    rc = blueprint.main(
+        ["compute", "launch", "--dud", "--yes", "--watch", "--watch-timeout", "10"]
+    )
+
+    assert rc == 1
+
+
+def test_compute_launch_watch_uses_server_effective_deadline(
+    mock_api, monkeypatch
+):
+    config = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: config)
+    monkeypatch.setattr(blueprint, "load_config", lambda: config)
+    monkeypatch.setattr(
+        blueprint,
+        "api",
+        lambda method, path, body=None, timeout=30: {
+            "id": "compute-task-1",
+            "status": "QUEUED",
+            "effective_deadline_seconds": 1200,
+        },
+    )
+    captured: dict[str, float] = {}
+
+    def _watch(args, task_id, *, timeout_seconds, interval_seconds):
+        captured["timeout_seconds"] = timeout_seconds
+        return {"timed_out": False, "status": "COMPLETED", "task": {}}
+
+    monkeypatch.setattr(blueprint, "_watch_compute_task", _watch)
+
+    rc = blueprint.main(
+        ["compute", "launch", "--dud", "--yes", "--deadline", "1", "--watch"]
+    )
+
+    assert rc == 0
+    assert captured["timeout_seconds"] == 1500
+
+
 def test_compute_launch_read_only_refused(mock_api, monkeypatch):
     """compute launch refuses under a read-only config."""
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})

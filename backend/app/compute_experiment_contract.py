@@ -10,6 +10,7 @@ import base64
 import hashlib
 import logging
 import math
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -38,6 +39,59 @@ ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # while excluding shell metacharacters (", $, ;, backticks, spaces).
 METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 MAX_DECLARED_METRIC_LENGTH = 128
+
+MIN_COMPUTE_JOB_SPEND_CAP_USD = float(
+    os.getenv("COMPUTE_JOB_MIN_SPEND_CAP_USD", "0.01")
+)
+MAX_COMPUTE_JOB_SPEND_CAP_USD = float(
+    os.getenv("COMPUTE_JOB_MAX_SPEND_CAP_USD", "100.0")
+)
+MIN_COMPUTE_JOB_DEADLINE_SECONDS = int(
+    os.getenv("COMPUTE_JOB_MIN_DEADLINE_SECONDS", "60")
+)
+MAX_COMPUTE_JOB_DEADLINE_SECONDS = int(
+    os.getenv("COMPUTE_JOB_MAX_DEADLINE_SECONDS", "86400")
+)
+
+
+def clamp_spend_cap_usd(raw_value: float) -> float:
+    return max(
+        MIN_COMPUTE_JOB_SPEND_CAP_USD,
+        min(float(raw_value), MAX_COMPUTE_JOB_SPEND_CAP_USD),
+    )
+
+
+def clamp_deadline_seconds(raw_value: int) -> int:
+    return max(
+        MIN_COMPUTE_JOB_DEADLINE_SECONDS,
+        min(int(raw_value), MAX_COMPUTE_JOB_DEADLINE_SECONDS),
+    )
+
+
+def normalize_compute_resource_limits(contract: dict[str, Any]) -> dict[str, Any]:
+    """Return the effective resource limits used by compute-job creation."""
+    normalized = dict(contract)
+    if normalized.get("spend_cap_usd") is not None:
+        normalized["spend_cap_usd"] = clamp_spend_cap_usd(
+            normalized["spend_cap_usd"]
+        )
+    if normalized.get("deadline_seconds") is not None:
+        normalized["deadline_seconds"] = clamp_deadline_seconds(
+            normalized["deadline_seconds"]
+        )
+    if (
+        normalized.get("no_progress_timeout_seconds") is not None
+        and normalized.get("deadline_seconds") is not None
+    ):
+        normalized["no_progress_timeout_seconds"] = max(
+            60,
+            min(
+                int(normalized["no_progress_timeout_seconds"]),
+                int(normalized["deadline_seconds"]),
+            ),
+        )
+    return normalized
+
 
 # Env var names must be valid shell identifiers. The GCP startup script emits
 # `export {key}=...` with the key interpolated BARE, and it runs without
@@ -885,6 +939,8 @@ def build_compute_contract_preview(
                 "hint": "spend_cap_usd must be a positive number",
             },
         }
+    normalized = normalize_compute_resource_limits(normalized)
+    declared_cap = float(normalized["spend_cap_usd"])
     decision = resolve_compute_spend_decision(
         runtime_config=runtime_config,
         direction=direction,

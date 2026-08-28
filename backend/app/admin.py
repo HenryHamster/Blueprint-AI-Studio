@@ -78,6 +78,7 @@ from app.compute_experiment_contract import (
     MAX_DECLARED_METRIC_LENGTH,
     _validate_compute_launch_contract,
     build_compute_contract_preview,
+    normalize_compute_resource_limits,
     resolve_compute_spend_decision,
     validate_compute_runner_target_enrollment,
 )
@@ -3895,6 +3896,7 @@ async def create_compute_experiment_task(
     ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
+    launch_contract = normalize_compute_resource_limits(launch_contract)
 
     # A runner pin must name one of THIS project's allow-listed runners — reject
     # unknown and unauthorized runner ids at authoring time with a clear 422
@@ -4102,6 +4104,12 @@ async def create_compute_experiment_task(
             "status": existing.status,
             "vm_instance_id": existing.vm_instance_id,
             "is_duplicate": True,
+            "effective_spend_cap_usd": existing.first_payload.get(
+                "spend_cap_usd"
+            ),
+            "effective_deadline_seconds": existing.first_payload.get(
+                "deadline_seconds"
+            ),
         }
 
     if scoped_idempotency_key:
@@ -4242,6 +4250,8 @@ async def create_compute_experiment_task(
         "vm_instance_id": new_task.vm_instance_id,
         "requires_approval": new_task.requires_approval,
         "monetary_decision": spend_decision.as_dict(),
+        "effective_spend_cap_usd": launch_contract["spend_cap_usd"],
+        "effective_deadline_seconds": launch_contract["deadline_seconds"],
     }
 
 
@@ -4309,6 +4319,7 @@ async def rerun_compute_experiment(
     ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
+    new_payload_raw = normalize_compute_resource_limits(new_payload_raw)
 
     try:
         task_payload = validate_task_payload(new_payload_raw)
@@ -4392,6 +4403,8 @@ async def rerun_compute_experiment(
         "vm_instance_id": new_task.vm_instance_id,
         "requires_approval": new_task.requires_approval,
         "parent_task_id": str(source.id),
+        "effective_spend_cap_usd": new_payload_raw["spend_cap_usd"],
+        "effective_deadline_seconds": new_payload_raw["deadline_seconds"],
     }
 
 

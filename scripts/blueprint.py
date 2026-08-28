@@ -6091,7 +6091,7 @@ def cmd_compute(args: argparse.Namespace) -> int | None:
         # Propagate the local run's exit contract to the process exit code.
         return _compute_run_local(args)
     elif sub == "launch":
-        _compute_launch(args)
+        return _compute_launch(args)
     else:
         _compute_list(args)
 
@@ -8253,7 +8253,7 @@ def _watch_compute_task(
         time.sleep(min(interval_seconds, remaining))
 
 
-def _compute_launch(args: argparse.Namespace) -> None:
+def _compute_launch(args: argparse.Namespace) -> int | None:
     preview_only = bool(getattr(args, "preview_only", False))
     if not preview_only:
         _require_write_config("compute launch")
@@ -8455,7 +8455,8 @@ def _compute_launch(args: argparse.Namespace) -> None:
             sys.exit(1)
         if not _json_mode(args):
             _render_created(result)
-        effective_timeout = float(watch_timeout or max(deadline + 300, 600))
+        effective_deadline = int(result.get("effective_deadline_seconds") or deadline)
+        effective_timeout = float(watch_timeout or max(effective_deadline + 300, 600))
         result = {
             **result,
             "watch": _watch_compute_task(
@@ -8482,6 +8483,13 @@ def _compute_launch(args: argparse.Namespace) -> None:
             )
 
     _emit(args, result, _render)
+    watched = result.get("watch") if isinstance(result, dict) else None
+    if isinstance(watched, dict) and (
+        watched.get("timed_out") is True
+        or watched.get("status") in {"FAILED", "CANCELLED"}
+    ):
+        return 1
+    return None
 
 
 # ── argument parser ──────────────────────────────────────────────────────────
