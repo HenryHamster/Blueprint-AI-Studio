@@ -5411,7 +5411,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
         });
       }
       if (url.endsWith('/messages/claim')) {
-        const messageIds = body.message_ids as string[];
+        const messageIds = body?.message_ids as string[];
         return Promise.resolve({
           claim_id: messageIds.includes(fastMessage.id)
             ? 'claim-fast-workday-fallback'
