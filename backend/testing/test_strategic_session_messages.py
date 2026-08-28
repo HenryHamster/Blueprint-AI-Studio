@@ -33,6 +33,7 @@ from app.routers.agent_strategic_messages import (
     _RESIDENT_POLL_EXPECTED_PER_MINUTE,
     _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE,
     _RESIDENT_POLL_REPLACEMENT_OVERLAP,
+    _canonical_delivery_attachment_manifests,
     _ordered_delivery_attachments,
     _resident_poll_rate_limit_key,
     WorkdayArtifactBatchLimit,
@@ -90,6 +91,43 @@ def test_delivery_attachment_order_matches_signed_manifest_and_degradation():
     )
     assert degraded == []
     assert canonical_attachment_manifest(degraded) == []
+
+
+@pytest.mark.asyncio
+async def test_claim_manifest_replays_poll_materialization_and_degradation(monkeypatch):
+    row_id = uuid.uuid4()
+    ordinary = [{"attachment_id": "ordinary-1"}]
+    artifacts = [{"artifact_ref_id": "artifact-1"}]
+    row = ProjectMessage(id=row_id, context={"attachments": ordinary})
+    observed_exemptions: list[frozenset[uuid.UUID]] = []
+
+    async def _materialize(*args, image_budget_exempt_message_ids=frozenset()):
+        observed_exemptions.append(image_budget_exempt_message_ids)
+        if len(observed_exemptions) == 2:
+            raise WorkdayArtifactBatchLimit(row_id)
+        return {row_id: artifacts}
+
+    monkeypatch.setattr(
+        "app.routers.agent_strategic_messages._materialize_workday_artifact_attachments",
+        _materialize,
+    )
+    delivered = await _canonical_delivery_attachment_manifests(
+        None,
+        uuid.uuid4(),
+        [row],
+    )
+    assert observed_exemptions == [frozenset()]
+    assert delivered[str(row_id)] == canonical_attachment_manifest(
+        ordinary + artifacts
+    )
+
+    degraded = await _canonical_delivery_attachment_manifests(
+        None,
+        uuid.uuid4(),
+        [row],
+    )
+    assert observed_exemptions == [frozenset(), frozenset()]
+    assert degraded[str(row_id)] == []
 
 
 async def _make_project_task(db_session, *, vm="agent-vm-msgpoll"):

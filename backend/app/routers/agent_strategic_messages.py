@@ -2485,6 +2485,7 @@ async def _materialize_workday_artifact_attachments(
     session: AsyncSession,
     project_id: uuid.UUID,
     messages: list[ProjectMessage],
+    image_budget_exempt_message_ids: frozenset[uuid.UUID] = frozenset(),
 ) -> dict[uuid.UUID, list[dict[str, Any]]]:
     """Resolve message-granted immutable tool revisions into model attachments."""
     refs_by_message: dict[uuid.UUID, tuple[uuid.UUID, ...]] = {}
@@ -2565,12 +2566,13 @@ async def _materialize_workday_artifact_attachments(
             raise PermanentWorkdayArtifactError(
                 message_id, "required image attachment limit exceeded"
             )
-        if (
-            delivered_required_images + required_image_count
-            > _WORKDAY_MAX_REQUIRED_IMAGES
-        ):
-            raise WorkdayArtifactBatchLimit(message_id)
-        delivered_required_images += required_image_count
+        if message_id not in image_budget_exempt_message_ids:
+            if (
+                delivered_required_images + required_image_count
+                > _WORKDAY_MAX_REQUIRED_IMAGES
+            ):
+                raise WorkdayArtifactBatchLimit(message_id)
+            delivered_required_images += required_image_count
         attachments: list[dict[str, Any]] = []
         for ref_id in message_ref_ids:
             ref = refs[ref_id]
@@ -3279,6 +3281,15 @@ async def agent_poll_messages(
                 session,
                 project_id,
                 remaining_rows,
+                image_budget_exempt_message_ids=frozenset(
+                    row.id
+                    for row in remaining_rows
+                    if (
+                        not resident_claim_group_selected
+                        and since_dt is not None
+                        and row.created_at <= since_dt
+                    )
+                ),
             )
             break
         except WorkdayArtifactBatchLimit as batch_limit:
