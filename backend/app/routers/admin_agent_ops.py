@@ -5472,6 +5472,103 @@ async def strategic_operation(
         if isinstance(task.context, dict):
             direction_id = task.context.get("direction_id")
 
+        # Crash-after-commit replay fence. Public Workday turns keep their
+        # durable operator message open until the native reply is committed, so
+        # a process death after this mutation can replay the same set_memory
+        # request. The endpoint already holds Project -> Task row locks, making
+        # this exact-content lookup serial with every strategic write for the
+        # project without a new schema constraint. Keep the match deliberately
+        # strict: a changed body, title, summary, topic, or ordered tag set is a
+        # new fact, while differently padded inputs that normalize identically
+        # return the original document.
+        superseded_doc = None
+        if superseded_id is not None:
+            superseded_doc = (
+                await session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.id == superseded_id,
+                        KnowledgeDocument.project_id == project.id,
+                        KnowledgeDocument.source_kind
+                        == SourceKind.STRATEGIC_MEMORY.value,
+                    )
+                )
+            ).scalar_one_or_none()
+
+        existing_memory_docs = (
+            (
+                await session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.project_id == project.id,
+                        KnowledgeDocument.source_task_id == task.id,
+                        KnowledgeDocument.source_kind
+                        == SourceKind.STRATEGIC_MEMORY.value,
+                        KnowledgeDocument.lifecycle_status == "consumed",
+                        KnowledgeDocument.title == fact_title,
+                        KnowledgeDocument.summary == fact_summary,
+                        KnowledgeDocument.body == fact_body,
+                        KnowledgeDocument.topic == fact_topic,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        replayed_doc = next(
+            (
+                candidate
+                for candidate in existing_memory_docs
+                if list(candidate.tags or []) == fact_tags
+                and (
+                    superseded_id is None
+                    or (
+                        superseded_doc is not None
+                        and superseded_doc.lifecycle_status == "dismissed"
+                        and superseded_doc.dismissed_reason
+                        == f"superseded by {candidate.id}"
+                    )
+                )
+            ),
+            None,
+        )
+        if replayed_doc is not None:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await _record_workday_entity(
+                "knowledge_document", replayed_doc.id, "replayed"
+            )
+            await session.commit()
+            entry_count = (
+                await session.execute(
+                    select(_func.count())
+                    .select_from(KnowledgeDocument)
+                    .where(
+                        KnowledgeDocument.project_id == project.id,
+                        KnowledgeDocument.source_kind
+                        == SourceKind.STRATEGIC_MEMORY.value,
+                        KnowledgeDocument.lifecycle_status == "consumed",
+                    )
+                )
+            ).scalar_one()
+            logger.info(
+                f"[STRATEGIC API] Replayed strategic_memory KnowledgeDocument "
+                f"{replayed_doc.id} for project {project.id}"
+            )
+            return _resp(
+                {
+                    "status": "ok",
+                    "op": "set_memory",
+                    "doc_id": str(replayed_doc.id),
+                    "source_kind": SourceKind.STRATEGIC_MEMORY.value,
+                    "superseded_id": (
+                        str(superseded_id) if superseded_id is not None else None
+                    ),
+                    "entry_count": int(entry_count),
+                    "duplicate": True,
+                }
+            )
+
         doc = KnowledgeDocument(
             project_id=project.id,
             source_task_id=task.id,
@@ -5493,21 +5590,11 @@ async def strategic_operation(
         )
         session.add(doc)
 
-        if superseded_id is not None:
-            old = (
-                await session.execute(
-                    select(KnowledgeDocument).where(
-                        KnowledgeDocument.id == superseded_id,
-                        KnowledgeDocument.project_id == project.id,
-                        KnowledgeDocument.source_kind == SourceKind.STRATEGIC_MEMORY.value,
-                    )
-                )
-            ).scalar_one_or_none()
-            if old is not None:
-                old.lifecycle_status = "dismissed"
-                old.dismissed_at = _utcnow()
-                old.dismissed_reason = f"superseded by {doc.id}"
-                session.add(old)
+        if superseded_doc is not None:
+            superseded_doc.lifecycle_status = "dismissed"
+            superseded_doc.dismissed_at = _utcnow()
+            superseded_doc.dismissed_reason = f"superseded by {doc.id}"
+            session.add(superseded_doc)
 
         # The KnowledgeDocument row is now the SOLE write path for strategic
         # memory. The legacy Project.strategic_memory_notes JSONB list is no
@@ -5547,6 +5634,7 @@ async def strategic_operation(
                 "source_kind": SourceKind.STRATEGIC_MEMORY.value,
                 "superseded_id": str(superseded_id) if superseded_id is not None else None,
                 "entry_count": int(entry_count),
+                "duplicate": False,
             }
         )
 
