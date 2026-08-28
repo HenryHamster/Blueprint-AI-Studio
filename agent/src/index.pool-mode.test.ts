@@ -105,6 +105,7 @@ import {
   _captureBootProviderConfigPresenceForTesting,
   _materializeClaimCredentialStateForTesting,
   _getActiveCredentialStateSourceForTesting,
+  cleanupWorkspaceOnProcessExit,
   main,
   WORKSPACE,
   type SecretManifest,
@@ -118,6 +119,34 @@ import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspaceP
 import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
+
+describe('process-exit workspace ownership', () => {
+  it('preserves a local-runner checkout for same-task Resident recovery', () => {
+    const remove = vi.fn();
+
+    expect(cleanupWorkspaceOnProcessExit(
+      '/workspace/agent',
+      'runner:707de5fb-7b6e-406a-9105-774b28ea23be',
+      remove,
+    )).toBe(false);
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('retains process-owned cleanup for non-runner agents', () => {
+    const remove = vi.fn();
+
+    expect(cleanupWorkspaceOnProcessExit(
+      '/workspace/agent',
+      'agent-vm-cloud-1',
+      remove,
+    )).toBe(true);
+    expect(remove).toHaveBeenCalledWith(
+      'rm',
+      ['-rf', '/workspace/agent'],
+      { encoding: 'utf-8', timeout: 30_000 },
+    );
+  });
+});
 
 /** fetch-shaped vi.fn: Promise-returning implementations satisfy
  *  @typescript-eslint/no-misused-promises (a bare vi.fn() infers a
@@ -2599,4 +2628,3 @@ describe('pool-mode scheduler — sustained-30-task starvation regression', () =
     }
   });
 });
-
