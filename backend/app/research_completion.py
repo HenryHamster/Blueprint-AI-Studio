@@ -5311,6 +5311,8 @@ async def _handle_research_completion(
                             "declared_metric",
                             "arms",
                             "smoke_sample",
+                            "runner_target",
+                            "spawn_followup",
                         )
                         if _cc.get(k) is not None
                     },

@@ -9339,6 +9339,144 @@ class TestComputeExperimentTaskLaunch:
         return payload
 
     @pytest.mark.asyncio
+    async def test_paused_project_allows_side_effect_free_preview(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        project.paused = True
+        project.integration_branch = None
+        project.promotion_target = None
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                preview_only=True,
+                env={"PRIVATE_TOKEN": "do-not-echo"},
+                container_image="example.invalid/bench@sha256:" + "a" * 64,
+                container_registry_auth={
+                    "server": "example.invalid",
+                    "username": "operator",
+                    "password": "do-not-echo",
+                },
+                require_durable_artifact=True,
+                no_progress_timeout_seconds=120,
+                stop_or_pivot_condition="Stop after the acceptance floor is measured.",
+                spawn_followup=False,
+            ),
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["preview_only"] is True
+        assert data["project_id"] == str(project.id)
+        preview = data["preview"]
+        assert preview["ok"] is True
+        normalized = preview["normalized_contract"]
+        assert normalized["require_durable_artifact"] is True
+        assert normalized["no_progress_timeout_seconds"] == 120
+        assert normalized["spawn_followup"] is False
+        assert "env" not in normalized
+        assert "container_registry_auth" not in normalized
+
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+        await db_session.refresh(project)
+        assert project.paused is True
+        assert project.integration_branch is None
+        assert project.promotion_target is None
+
+    @pytest.mark.asyncio
+    async def test_preview_and_launch_share_effective_resource_limits(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        from app.compute_jobs import (
+            MIN_COMPUTE_JOB_DEADLINE_SECONDS,
+            MIN_COMPUTE_JOB_SPEND_CAP_USD,
+        )
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = (
+            MIN_COMPUTE_JOB_SPEND_CAP_USD / 2
+        )
+        payload = self._valid_payload(
+            spend_cap_usd=MIN_COMPUTE_JOB_SPEND_CAP_USD / 10,
+            deadline_seconds=1,
+        )
+        try:
+            preview_resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json={**payload, "preview_only": True},
+            )
+            launch_resp = await client.post(
+                "/api/admin/tasks/compute-experiment", json=payload
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert preview_resp.status_code == 200, preview_resp.text
+        preview = preview_resp.json()["preview"]
+        normalized = preview["normalized_contract"]
+        assert normalized["spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert normalized["deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
+        assert preview["monetary_decision"]["requires_monetary_approval"] is True
+
+        assert launch_resp.status_code == 200, launch_resp.text
+        launched = launch_resp.json()
+        assert launched["effective_spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert launched["effective_deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
+        assert launched["requires_approval"] is True
+        task = await db_session.get(Task, uuid.UUID(launched["id"]))
+        assert task is not None
+        assert task.first_payload["spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert task.first_payload["deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_paused_project_rejects_real_launch_before_incidental_writes(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        project.paused = True
+        project.integration_branch = None
+        project.promotion_target = None
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(),
+        )
+
+        assert resp.status_code == 409, resp.text
+        assert "project is paused" in resp.text
+        assert (await db_session.execute(select(Task))).scalars().all() == []
+        await db_session.refresh(project)
+        assert project.integration_branch is None
+        assert project.promotion_target is None
+
+    @pytest.mark.asyncio
+    async def test_preview_never_auto_creates_missing_project(
+        self, client: AsyncClient, db_session
+    ):
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(repo="preview-missing", preview_only=True),
+        )
+
+        assert resp.status_code == 404, resp.text
+        assert "never auto-creates" in resp.text
+        projects = (
+            await db_session.execute(
+                select(Project).where(Project.github_repo == "preview-missing")
+            )
+        ).scalars().all()
+        assert projects == []
+
+    @pytest.mark.asyncio
     async def test_valid_launch_persists_compute_experiment_contract(
         self, client: AsyncClient, db_session
     ):
@@ -9404,6 +9542,110 @@ class TestComputeExperimentTaskLaunch:
         }
 
     @pytest.mark.asyncio
+    async def test_idempotency_reuses_exact_contract_and_rejects_mismatch(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload(idempotency_key="operator-retry")
+
+        first = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+        duplicate = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=payload,
+        )
+        mismatch = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={**payload, "command": "python different.py"},
+        )
+
+        assert first.status_code == 200, first.text
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["id"] == first.json()["id"]
+        assert duplicate.json()["is_duplicate"] is True
+        assert mismatch.status_code == 409, mismatch.text
+        detail = mismatch.json()["error"]["message"]
+        assert detail["error"] == "idempotency_key_mismatch"
+        assert detail["existing_task_id"] == first.json()["id"]
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert len(tasks) == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotency_includes_hard_runner_pin(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        first_runner = await self._enrolled_runner(
+            db_session, project.id, hostname="runner-one"
+        )
+        second_runner = await self._enrolled_runner(
+            db_session, project.id, hostname="runner-two"
+        )
+        payload = self._valid_payload(
+            idempotency_key="hard-pin-retry",
+            runner_target_id=str(first_runner.id),
+        )
+
+        first = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+        duplicate = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+        mismatch = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={**payload, "runner_target_id": str(second_runner.id)},
+        )
+
+        assert first.status_code == 200, first.text
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["id"] == first.json()["id"]
+        assert duplicate.json()["is_duplicate"] is True
+        assert mismatch.status_code == 409, mismatch.text
+        assert (
+            mismatch.json()["error"]["message"]["error"]
+            == "idempotency_key_mismatch"
+        )
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(first.json()["id"]))
+            )
+        ).scalar_one()
+        assert (task.context or {})["forced_runner_target_id"] == str(
+            first_runner.id
+        )
+
+    @pytest.mark.asyncio
+    async def test_idempotent_retry_precedes_active_task_limit(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        payload = self._valid_payload(idempotency_key="retry-at-cap")
+        first = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+        assert first.status_code == 200, first.text
+        db_session.add_all(
+            [
+                Task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "create", "prompt": f"filler-{index}"}],
+                )
+                for index in range(199)
+            ]
+        )
+        await db_session.commit()
+
+        duplicate = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+        novel = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={**payload, "idempotency_key": "novel-at-cap"},
+        )
+
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["id"] == first.json()["id"]
+        assert duplicate.json()["is_duplicate"] is True
+        assert novel.status_code == 429, novel.text
+
+    @pytest.mark.asyncio
     async def test_container_fields_persist_for_runner_experiments(
         self, client: AsyncClient, db_session
     ):
@@ -9439,6 +9681,35 @@ class TestComputeExperimentTaskLaunch:
             "password": "nvapi-SECRET",
         }
         assert payload["setup_step"] == "echo host-prep"
+
+    @pytest.mark.asyncio
+    async def test_single_command_resume_fields_persist(
+        self, client: AsyncClient, db_session
+    ):
+        """Operator resume inputs must survive into the stored task contract."""
+        await self._project_with_repo(db_session)
+        predecessor = str(uuid.uuid4())
+
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                declared_metric="tokens_per_second",
+                input_artifact_job_id=predecessor,
+                no_progress_timeout_seconds=180,
+            ),
+        )
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        stored = task.payloads[0]
+        assert stored["command"] == "python bench.py --json result.json"
+        assert stored["input_artifact_job_id"] == predecessor
+        assert stored["declared_metric"] == "tokens_per_second"
+        assert stored["no_progress_timeout_seconds"] == 180
 
     @pytest.mark.parametrize(
         ("override", "expected_detail"),
@@ -9879,6 +10150,31 @@ class TestComputeExperimentTaskLaunch:
         }
 
     @pytest.mark.asyncio
+    async def test_hard_runner_pin_accepts_noncatalog_accelerator(
+        self, client: AsyncClient, db_session
+    ):
+        """The operator hard-pin surface has the same runner-hardware contract
+        as the nested runner_target surface."""
+        project = await self._project_with_repo(db_session)
+        runner = await self._enrolled_runner(db_session, project.id)
+        payload = self._valid_payload(
+            runner_target_id=str(runner.id),
+            accelerator="RTX 5080",
+        )
+        payload.pop("machine_type", None)
+
+        resp = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["accelerator"] == "RTX 5080"
+        assert (task.context or {})["forced_runner_target_id"] == str(runner.id)
+
+    @pytest.mark.asyncio
     async def test_unpinned_contract_still_rejects_noncatalog_accelerator(
         self, client: AsyncClient, db_session
     ):
@@ -10095,6 +10391,35 @@ class TestComputeExperimentTaskLaunch:
         assert "declared_metric" in resp.text
 
     @pytest.mark.asyncio
+    async def test_command_and_arms_are_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                arms=[{"name": "arm-a", "command": "python other.py"}],
+                declared_metric="tokens_per_second",
+            ),
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert "mutually exclusive" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_declared_metric_uses_agent_launch_length_cap(
+        self, client: AsyncClient, db_session
+    ):
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(declared_metric="m" * 129),
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert "128" in resp.text
+
+    @pytest.mark.asyncio
     async def test_neither_command_nor_arms_rejected(
         self, client: AsyncClient, db_session
     ):
@@ -10289,6 +10614,32 @@ class TestRerunComputeExperiment:
         assert child.payloads[0]["spend_cap_usd"] == 2.5
         assert child.payloads[0]["deadline_seconds"] == 600
         assert child.payloads[0]["success_criterion"]["threshold"] == 150.0
+
+    @pytest.mark.asyncio
+    async def test_rerun_persists_effective_resource_limits(
+        self, client: AsyncClient, db_session
+    ):
+        _, source = await self._project_with_task(db_session)
+        from app.compute_jobs import (
+            MIN_COMPUTE_JOB_DEADLINE_SECONDS,
+            MIN_COMPUTE_JOB_SPEND_CAP_USD,
+        )
+
+        resp = await client.post(
+            f"/api/admin/tasks/{source.id}/rerun",
+            json={
+                "spend_cap_usd": MIN_COMPUTE_JOB_SPEND_CAP_USD / 10,
+                "deadline_seconds": 1,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["effective_spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert data["effective_deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
+        child = await db_session.get(Task, uuid.UUID(data["id"]))
+        assert child is not None
+        assert child.first_payload["spend_cap_usd"] == MIN_COMPUTE_JOB_SPEND_CAP_USD
+        assert child.first_payload["deadline_seconds"] == MIN_COMPUTE_JOB_DEADLINE_SECONDS
 
     @pytest.mark.asyncio
     async def test_rerun_non_compute_task_returns_422(

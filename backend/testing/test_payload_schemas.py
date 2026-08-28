@@ -713,6 +713,21 @@ def test_compute_experiment_metric_criterion_requires_metric_operator_threshold(
         _invalid(raw)
 
 
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf")])
+def test_compute_experiment_metric_criterion_rejects_nonfinite_threshold(threshold):
+    _invalid(
+        {
+            "type": "compute_experiment",
+            "command": "run-eval",
+            "success_criterion": {
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": threshold,
+            },
+        }
+    )
+
+
 def test_compute_experiment_artifact_produced_criterion_no_numeric_fields():
     # kind="artifact_produced" does NOT require metric/operator/threshold; the
     # value of the experiment is its durable output, not a scalar. min_file_count

@@ -25,7 +25,7 @@ from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
-from app.field_encryption import encrypt_field
+from app.field_encryption import decrypt_field, encrypt_field
 from app.managed_compute import (
     ManagedComputeDisabled,
     LocalOnlyExecutionPlacement,
@@ -87,9 +87,12 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app import compute_experiment_contract as compute_contract
 from app.compute_experiment_contract import (
     ComputeSpendDecision,
     build_compute_contract_preview,
+    clamp_deadline_seconds,
+    clamp_spend_cap_usd,
     resolve_compute_spend_decision,
     resolve_compute_spend_direction,
 )
@@ -106,18 +109,11 @@ from app.vm_cost_rates import (
 
 logger = logging.getLogger(__name__)
 
-MIN_COMPUTE_JOB_SPEND_CAP_USD = float(
-    os.getenv("COMPUTE_JOB_MIN_SPEND_CAP_USD", "0.01")
-)
-MAX_COMPUTE_JOB_SPEND_CAP_USD = float(
-    os.getenv("COMPUTE_JOB_MAX_SPEND_CAP_USD", "100.0")
-)
-MIN_COMPUTE_JOB_DEADLINE_SECONDS = int(
-    os.getenv("COMPUTE_JOB_MIN_DEADLINE_SECONDS", "60")
-)
-MAX_COMPUTE_JOB_DEADLINE_SECONDS = int(
-    os.getenv("COMPUTE_JOB_MAX_DEADLINE_SECONDS", "86400")
-)
+MIN_COMPUTE_JOB_SPEND_CAP_USD = compute_contract.MIN_COMPUTE_JOB_SPEND_CAP_USD
+MAX_COMPUTE_JOB_SPEND_CAP_USD = compute_contract.MAX_COMPUTE_JOB_SPEND_CAP_USD
+MIN_COMPUTE_JOB_DEADLINE_SECONDS = compute_contract.MIN_COMPUTE_JOB_DEADLINE_SECONDS
+MAX_COMPUTE_JOB_DEADLINE_SECONDS = compute_contract.MAX_COMPUTE_JOB_DEADLINE_SECONDS
+
 COMPUTE_JOB_MONITOR_INTERVAL_SECONDS = float(
     os.getenv("COMPUTE_JOB_MONITOR_INTERVAL_SECONDS", "15")
 )
@@ -499,20 +495,6 @@ def _has_verified_resume_provenance(job: Any) -> bool:
     )
 
 
-def clamp_spend_cap_usd(raw_value: float) -> float:
-    return max(
-        MIN_COMPUTE_JOB_SPEND_CAP_USD,
-        min(float(raw_value), MAX_COMPUTE_JOB_SPEND_CAP_USD),
-    )
-
-
-def clamp_deadline_seconds(raw_value: int) -> int:
-    return max(
-        MIN_COMPUTE_JOB_DEADLINE_SECONDS,
-        min(int(raw_value), MAX_COMPUTE_JOB_DEADLINE_SECONDS),
-    )
-
-
 def normalize_provisioning_model(raw_value: str | None) -> str:
     value = (raw_value or "STANDARD").upper()
     if value not in {"STANDARD", "SPOT"}:
@@ -597,6 +579,10 @@ async def create_compute_job(
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
+    if container_registry_auth is not None and not (
+        isinstance(container_image, str) and container_image.strip()
+    ):
+        raise ValueError("container_registry_auth requires container_image")
     resolved_machine_type = resolve_compute_machine_type(
         accelerator=accelerator,
         machine_type=machine_type,
@@ -811,7 +797,7 @@ async def create_compute_job(
                     ),
                 }
             )
-    launch_request_fingerprint = _build_launch_request_fingerprint(
+    fingerprint_args: dict[str, Any] = dict(
         command=command,
         machine_type=resolved_machine_type,
         spend_cap_usd=capped_spend,
@@ -824,15 +810,67 @@ async def create_compute_job(
         accelerator_count=persisted_accelerator_count,
         live_proof_requirement=live_proof_requirement,
         container_image=container_image,
+        container_registry_auth=container_registry_auth,
+        setup_step=setup_step,
+        declared_metric=declared_metric,
+        allow_host_fallback=allow_host_fallback,
         no_progress_timeout_seconds=capped_np_timeout,
         input_artifact_job_id=resolved_input_artifact_job_id,
     )
+    launch_request_fingerprint = _build_launch_request_fingerprint(
+        **fingerprint_args
+    )
+    legacy_request_fingerprint = _build_launch_request_fingerprint(
+        **fingerprint_args,
+        _include_rollout_fields=False,
+    )
+    pre_host_fallback_fingerprint = _build_launch_request_fingerprint(
+        **fingerprint_args,
+        _include_host_fallback=False,
+    )
     existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
     if existing is not None:
-        if _launch_request_matches(existing, launch_request_fingerprint):
+        stored_matches_current = _launch_request_matches(
+            existing, launch_request_fingerprint
+        )
+        stored_matches_legacy = any(
+            _launch_request_matches(existing, candidate)
+            for candidate in {
+                legacy_request_fingerprint,
+                pre_host_fallback_fingerprint,
+            }
+        )
+        legacy_semantics_match = (
+            stored_matches_legacy
+            and _legacy_fingerprint_semantics_match(
+                existing,
+                setup_step=setup_step,
+                declared_metric=declared_metric,
+                container_registry_auth=container_registry_auth,
+                allow_host_fallback=allow_host_fallback,
+            )
+        )
+        # If current and legacy digests are equal (all rollout fields absent),
+        # the stored value could still be a coarse old digest for a job where
+        # those fields were populated. Treat it as legacy-ambiguous and consult
+        # the persisted semantics instead of accepting the hash alone.
+        exact_fingerprint_match = stored_matches_current and (
+            not stored_matches_legacy or legacy_semantics_match
+        )
+        legacy_fingerprint_match = legacy_semantics_match and not stored_matches_current
+        if exact_fingerprint_match or legacy_fingerprint_match:
+            metadata = dict(existing.polling_metadata or {})
+            metadata_changed = False
+            if legacy_fingerprint_match:
+                # The task row and active compute row are locked by this
+                # transaction. Upgrade the coarse pre-rollout digest only after
+                # verifying every semantic it omitted against the persisted job.
+                metadata["launch_request_fingerprint"] = launch_request_fingerprint
+                metadata_changed = True
             if live_release_evidence is not None:
-                metadata = dict(existing.polling_metadata or {})
                 metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
+                metadata_changed = True
+            if metadata_changed:
                 existing.polling_metadata = metadata
                 existing.updated_at = _utcnow()
                 session.add(existing)
@@ -1321,6 +1359,7 @@ async def _get_active_compute_job_for_task(
             ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES),
         )
         .order_by(ComputeJob.created_at)
+        .with_for_update()
     )
     return result.scalars().first()
 
@@ -1339,8 +1378,14 @@ def _build_launch_request_fingerprint(
     accelerator_count: int | None = None,
     live_proof_requirement: dict[str, str] | None = None,
     container_image: str | None = None,
+    container_registry_auth: dict | None = None,
+    setup_step: str | None = None,
+    declared_metric: str | None = None,
+    allow_host_fallback: bool = False,
     no_progress_timeout_seconds: int | None = None,
     input_artifact_job_id: str | None = None,
+    _include_rollout_fields: bool = True,
+    _include_host_fallback: bool = True,
 ) -> str:
     payload = {
         "accelerator": accelerator,
@@ -1358,6 +1403,20 @@ def _build_launch_request_fingerprint(
         "no_progress_timeout_seconds": no_progress_timeout_seconds,
         "input_artifact_job_id": input_artifact_job_id,
     }
+    # These fields joined the fingerprint after launch idempotency was already
+    # deployed. Omit absent values so the common legacy retry remains an exact
+    # digest match. The explicit legacy mode is used only with a persisted-
+    # semantics check before an old digest is accepted and upgraded.
+    if _include_rollout_fields:
+        normalized_registry_auth = _normalize_registry_auth(container_registry_auth)
+        if normalized_registry_auth:
+            payload["container_registry_auth"] = normalized_registry_auth
+        if setup_step is not None:
+            payload["setup_step"] = setup_step
+        if declared_metric is not None:
+            payload["declared_metric"] = declared_metric
+        if _include_host_fallback and allow_host_fallback:
+            payload["allow_host_fallback"] = True
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1368,6 +1427,63 @@ def _launch_request_matches(job: ComputeJob, request_fingerprint: str) -> bool:
         (job.polling_metadata or {}).get("launch_request_fingerprint") or ""
     ).strip()
     return bool(existing) and existing == request_fingerprint
+
+
+def _normalize_registry_auth(auth: dict | None) -> dict[str, str]:
+    if not isinstance(auth, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for key in ("server", "username", "password"):
+        if auth.get(key):
+            normalized[key] = str(auth[key])
+    return normalized
+
+
+def _persisted_registry_auth(job: ComputeJob) -> dict[str, str] | None:
+    meta = job.polling_metadata or {}
+    if "container_registry_auth" not in meta:
+        return {}
+    raw = meta.get("container_registry_auth")
+    if not isinstance(raw, dict):
+        return None
+    normalized = _normalize_registry_auth(raw)
+    if "password" not in normalized:
+        return normalized
+    try:
+        normalized["password"] = str(decrypt_field(normalized["password"]) or "")
+    except Exception:
+        # Compatibility must fail closed if persisted secret semantics cannot be
+        # established under the current encryption configuration.
+        return None
+    return normalized
+
+
+def _legacy_fingerprint_semantics_match(
+    job: ComputeJob,
+    *,
+    setup_step: str | None,
+    declared_metric: str | None,
+    container_registry_auth: dict | None,
+    allow_host_fallback: bool,
+) -> bool:
+    """Verify semantics omitted by pre-rollout launch fingerprints."""
+    meta = job.polling_metadata or {}
+    normalized_metric = (
+        declared_metric.strip()
+        if isinstance(declared_metric, str) and declared_metric.strip()
+        else None
+    )
+    persisted_auth = _persisted_registry_auth(job)
+    persisted_host_fallback = meta.get("allow_host_fallback", False)
+    if not isinstance(persisted_host_fallback, bool):
+        return False
+    return (
+        meta.get("setup_step") == setup_step
+        and meta.get("declared_metric") == normalized_metric
+        and persisted_auth is not None
+        and persisted_auth == _normalize_registry_auth(container_registry_auth)
+        and persisted_host_fallback == bool(allow_host_fallback)
+    )
 
 
 def _requested_deadline_seconds(job: ComputeJob) -> int | None:
@@ -4210,10 +4326,11 @@ async def _attach_repo_clone(
     by research/plan/operator authoring) → ``context.original_base`` → the
     project's promotion target → ``main``.
 
-    Defensive by contract: a project with no repo, a token-mint failure, or any
-    other error degrades to NO checkout (legacy behavior) — it NEVER blocks the
-    launch. A genuinely repo-dependent command then fails the same way it does
-    today, no worse.
+    Defensive by contract: a project with no repo or an unrelated lookup error
+    degrades to NO checkout (legacy behavior). For runner-subprocess jobs, once
+    repo intent is known it survives a token-mint failure without the credential:
+    the claim endpoint retries the mint, and the runner fails closed before
+    command execution if no token is available then either.
     """
     if not job.project_id:
         return spec
@@ -4236,18 +4353,43 @@ async def _attach_repo_clone(
                     ctx = _task.context if isinstance(_task.context, dict) else {}
                     ref = payload.get("base_branch") or ctx.get("original_base")
             ref = ref or getattr(project, "promotion_target", None) or "main"
+            repo_clone = {
+                "owner": str(project.github_owner),
+                "repo": str(project.github_repo),
+                "ref": str(ref),
+            }
             # Reuses the shared, cached install-token path (50-min TTL) so launches
             # don't drain the App-JWT bucket.
             from app.branch_cleanup import _get_project_github_token
 
-            token = await _get_project_github_token(project, session)
-            if not token:
+            try:
+                token = await _get_project_github_token(project, session)
+            except Exception:
+                # Claim time retries the token mint before the runner executes.
                 logger.warning(
-                    "[COMPUTE_JOB] no GitHub token for project=%s; launching job=%s "
-                    "without a repo checkout",
+                    "[COMPUTE_JOB] GitHub token mint failed for project=%s job=%s",
                     job.project_id,
                     job.id,
+                    exc_info=True,
                 )
+                token = None
+            if not token:
+                if job.backend == RUNNER_SUBPROCESS_BACKEND_NAME:
+                    spec.repo_clone = repo_clone
+                    spec.repo_token = None
+                    logger.warning(
+                        "[COMPUTE_JOB] no GitHub token for project=%s job=%s; "
+                        "preserving repo intent for claim-time remint",
+                        job.project_id,
+                        job.id,
+                    )
+                else:
+                    logger.warning(
+                        "[COMPUTE_JOB] no GitHub token for project=%s; launching "
+                        "job=%s without a repo checkout",
+                        job.project_id,
+                        job.id,
+                    )
                 return spec
             # staging branches are deleted after the plan rolls up to integration.
             # If the resolved ref is a staging branch that no longer exists, degrade
@@ -4272,11 +4414,7 @@ async def _attach_repo_clone(
                         fallback,
                     )
                     ref = fallback
-            spec.repo_clone = {
-                "owner": str(project.github_owner),
-                "repo": str(project.github_repo),
-                "ref": str(ref),
-            }
+            spec.repo_clone = {**repo_clone, "ref": str(ref)}
             spec.repo_token = token
             return spec
     except Exception:  # noqa: BLE001 — repo checkout is best-effort, never fatal

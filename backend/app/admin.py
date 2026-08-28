@@ -75,7 +75,10 @@ from app.task_capabilities import (
     USER_LAUNCHABLE_TASK_TYPES,
 )
 from app.compute_experiment_contract import (
+    MAX_DECLARED_METRIC_LENGTH,
     _validate_compute_launch_contract,
+    build_compute_contract_preview,
+    normalize_compute_resource_limits,
     resolve_compute_spend_decision,
     validate_compute_runner_target_enrollment,
 )
@@ -2600,7 +2603,9 @@ class ComputeExperimentTaskPayload(BaseModel):
     )
     command: str | None = None
     arms: list[dict[str, str]] | None = None
-    declared_metric: str | None = None
+    declared_metric: str | None = Field(
+        default=None, max_length=MAX_DECLARED_METRIC_LENGTH
+    )
     spend_cap_usd: float
     deadline_seconds: int
     accelerator: str | None = None
@@ -2662,6 +2667,11 @@ class ComputeExperimentTaskPayload(BaseModel):
     # Absent/False preserves the terminal result and knowledge record without
     # creating an implicit task chain.
     spawn_followup: bool | None = None
+    # Validate and explain the exact launch contract without creating a project,
+    # task, history row, or any other durable state. This deliberately shares the
+    # write-authorized endpoint so a preview cannot be used to inspect a project
+    # the caller could not launch against.
+    preview_only: bool = False
 
     @model_validator(mode="after")
     def validate_command_or_arms(self) -> "ComputeExperimentTaskPayload":
@@ -2669,6 +2679,8 @@ class ComputeExperimentTaskPayload(BaseModel):
         has_arms = bool(self.arms)
         if not has_command and not has_arms:
             raise ValueError("Either 'command' or 'arms' (with 'declared_metric') must be provided")
+        if has_command and has_arms:
+            raise ValueError("'command' and 'arms' are mutually exclusive")
         if has_arms and not (self.declared_metric and self.declared_metric.strip()):
             raise ValueError("'declared_metric' is required when 'arms' is specified")
         return self
@@ -3766,7 +3778,16 @@ async def create_compute_experiment_task(
         session, current_user["user_id"], github_owner, github_repo
     )
 
-    if not project:
+    if project is None and payload.preview_only:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "compute preview requires an existing writable Blueprint project; "
+                "preview_only never auto-creates one"
+            ),
+        )
+
+    if project is None:
         # Mark the auto-created project as bootstrap-complete and non-autonomous:
         # compute_experiment is a one-off operator job and does not need repo
         # bootstrapping or autonomous research cycles.  Without these flags the
@@ -3797,7 +3818,17 @@ async def create_compute_experiment_task(
         )
         await session.commit()
 
-    await backfill_branch_columns(session, project_id=project.id)
+    # A pause is a hard admission fence for real compute spend. Preview remains
+    # available so an operator can repair and inspect the next launch while the
+    # project is deliberately frozen. Keep this before backfill_branch_columns:
+    # a rejected launch must not make even incidental branch-column writes.
+    if project.paused and not payload.preview_only:
+        raise HTTPException(
+            status_code=409,
+            detail="project is paused; compute experiment spawning is disabled",
+        )
+    if not payload.preview_only:
+        await backfill_branch_columns(session, project_id=project.id)
 
     # Resolve an operator HARD runner pin (UUID or hostname) against this project's
     # allow-listed runners BEFORE persisting the task. A 422 here means the target
@@ -3820,6 +3851,8 @@ async def create_compute_experiment_task(
         launch_contract["declared_metric"] = payload.declared_metric
     else:
         launch_contract["command"] = payload.command
+        if payload.declared_metric is not None:
+            launch_contract["declared_metric"] = payload.declared_metric
     if payload.success_criterion is not None:
         launch_contract["success_criterion"] = payload.success_criterion.model_dump()
     provenance: dict[str, Any] = {}
@@ -3854,10 +3887,17 @@ async def create_compute_experiment_task(
             launch_contract[opt_key] = val
     if payload.runner_target is not None:
         launch_contract["runner_target"] = payload.runner_target.model_dump()
+    if payload.require_live_release:
+        launch_contract["live_proof"] = True
+    if payload.require_durable_artifact:
+        launch_contract["require_durable_artifact"] = True
+    if payload.spawn_followup is not None:
+        launch_contract["spawn_followup"] = payload.spawn_followup
 
     ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
+    launch_contract = normalize_compute_resource_limits(launch_contract)
 
     # A runner pin must name one of THIS project's allow-listed runners — reject
     # unknown and unauthorized runner ids at authoring time with a clear 422
@@ -3887,7 +3927,7 @@ async def create_compute_experiment_task(
         # contracts, catalog names with shape mismatches) stays strict.
         _raw_accel = str(launch_contract.get("accelerator") or "").strip()
         _pinned_noncatalog_accel = (
-            payload.runner_target is not None
+            (payload.runner_target is not None or forced_runner_id is not None)
             and bool(_raw_accel)
             and resolve_accelerator_spec(_raw_accel) is None
         )
@@ -4006,32 +4046,73 @@ async def create_compute_experiment_task(
             status_code=422, detail=format_payload_validation_error(exc)
         )
 
-    active_count = (
-        await session.execute(
-            select(func.count(Task.id)).where(
-                Task.project_id == project.id,
-                Task.status.in_(
-                    [
-                        TaskStatus.QUEUED,
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                ),
-            )
+    if payload.preview_only:
+        preview = build_compute_contract_preview(
+            launch_contract,
+            runtime_config=_runtime_config,
+            require_local_runner=resolve_project_require_local_runner(project),
+            task_context=(
+                {"forced_runner_target_id": forced_runner_id}
+                if forced_runner_id
+                else {}
+            ),
         )
-    ).scalar() or 0
-    if active_count >= 200:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Project has {active_count} active tasks (limit: 200)",
-        )
+        # The canonical preview intentionally carries the normalized contract.
+        # Apply the same task-payload secret redaction used by admin task reads so
+        # registry credentials and env values remain write-only.
+        normalized = preview.get("normalized_contract")
+        if isinstance(normalized, dict):
+            preview["normalized_contract"] = redact_task_payloads([normalized])[0]
+        return {
+            "status": "ok",
+            "preview_only": True,
+            "project_id": str(project.id),
+            "title": payload.title,
+            "base_branch": resolved_base_branch,
+            "forced_runner_target_id": forced_runner_id,
+            "preview": preview,
+        }
 
     scoped_idempotency_key = (
         f"admin_compute_launcher:{project.id}:{payload.idempotency_key}"
         if payload.idempotency_key
         else None
     )
+
+    def _idempotent_response(existing: Task) -> dict[str, Any]:
+        existing_forced_runner_id = (existing.context or {}).get(
+            "forced_runner_target_id"
+        )
+        if (
+            existing.first_payload != task_payload
+            or existing_forced_runner_id != forced_runner_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "idempotency_key_mismatch",
+                    "message": (
+                        "idempotency_key already names an active compute experiment "
+                        "with a different launch contract"
+                    ),
+                    "existing_task_id": str(existing.id),
+                },
+            )
+        return {
+            "id": str(existing.id),
+            "project_id": str(existing.project_id),
+            "title": existing.title,
+            "status": existing.status,
+            "vm_instance_id": existing.vm_instance_id,
+            "is_duplicate": True,
+            "effective_spend_cap_usd": existing.first_payload.get(
+                "spend_cap_usd"
+            ),
+            "effective_deadline_seconds": existing.first_payload.get(
+                "deadline_seconds"
+            ),
+        }
+
     if scoped_idempotency_key:
         existing = (
             (
@@ -4055,14 +4136,28 @@ async def create_compute_experiment_task(
             .first()
         )
         if existing:
-            return {
-                "id": str(existing.id),
-                "project_id": str(existing.project_id),
-                "title": existing.title,
-                "status": existing.status,
-                "vm_instance_id": existing.vm_instance_id,
-                "is_duplicate": True,
-            }
+            return _idempotent_response(existing)
+
+    active_count = (
+        await session.execute(
+            select(func.count(Task.id)).where(
+                Task.project_id == project.id,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                ),
+            )
+        )
+    ).scalar() or 0
+    if active_count >= 200:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Project has {active_count} active tasks (limit: 200)",
+        )
 
     spend_decision = resolve_compute_spend_decision(
         runtime_config=_runtime_config,
@@ -4131,14 +4226,7 @@ async def create_compute_experiment_task(
                 .first()
             )
             if existing:
-                return {
-                    "id": str(existing.id),
-                    "project_id": str(existing.project_id),
-                    "title": existing.title,
-                    "status": existing.status,
-                    "vm_instance_id": existing.vm_instance_id,
-                    "is_duplicate": True,
-                }
+                return _idempotent_response(existing)
         raise
     await session.refresh(new_task)
 
@@ -4163,6 +4251,8 @@ async def create_compute_experiment_task(
         "vm_instance_id": new_task.vm_instance_id,
         "requires_approval": new_task.requires_approval,
         "monetary_decision": spend_decision.as_dict(),
+        "effective_spend_cap_usd": launch_contract["spend_cap_usd"],
+        "effective_deadline_seconds": launch_contract["deadline_seconds"],
     }
 
 
@@ -4230,6 +4320,7 @@ async def rerun_compute_experiment(
     ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
     if not ok:
         raise HTTPException(status_code=422, detail=reason)
+    new_payload_raw = normalize_compute_resource_limits(new_payload_raw)
 
     try:
         task_payload = validate_task_payload(new_payload_raw)
@@ -4313,6 +4404,8 @@ async def rerun_compute_experiment(
         "vm_instance_id": new_task.vm_instance_id,
         "requires_approval": new_task.requires_approval,
         "parent_task_id": str(source.id),
+        "effective_spend_cap_usd": new_payload_raw["spend_cap_usd"],
+        "effective_deadline_seconds": new_payload_raw["deadline_seconds"],
     }
 
 

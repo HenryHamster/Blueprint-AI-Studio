@@ -13701,6 +13701,24 @@ class TestComputeLaunchContractAuthoring:
         assert contract["command"] == "y.py"
         assert contract["deadline_seconds"] == 120
 
+    def test_operator_placement_and_followup_collected(self):
+        from app.research_completion import _author_compute_launch_contract
+
+        runner_target = {"runner_id": str(uuid.uuid4()), "strict": True}
+        contract = _author_compute_launch_contract(
+            {
+                "compute_experiment": {
+                    "command": "run.sh",
+                    "spend_cap_usd": 1,
+                    "deadline_seconds": 60,
+                    "runner_target": runner_target,
+                    "spawn_followup": True,
+                }
+            }
+        )
+        assert contract["runner_target"] == runner_target
+        assert contract["spawn_followup"] is True
+
     def test_optional_fields_omitted_when_absent(self):
         from app.research_completion import _author_compute_launch_contract
 
@@ -14085,6 +14103,50 @@ class TestComputeExperimentSpawn:
         payload = children[0].first_payload or {}
         assert payload["accelerator"] == "V100"
         assert payload["provisioning_model"] == "spot"
+
+    async def test_runner_target_and_followup_survive_admission(
+        self, db_session, mocker
+    ):
+        from app.task_completion import _compute_followup_is_opted_in
+        from test_autonomous_research import _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-cx-placement-followup"
+        )
+        runner_id = str(uuid.uuid4())
+        finding = _compute_finding(
+            direction["id"],
+            spend_cap_usd=1.5,
+            deadline_seconds=240,
+            nested_key="compute_experiment",
+        )
+        finding["compute_experiment"].update(
+            {
+                "runner_target": {"runner_id": runner_id, "strict": True},
+                "spawn_followup": True,
+            }
+        )
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        mocker.patch.dict(
+            "app.shared_state.runtime_config",
+            {"compute_experiment_spend_threshold_usd": 5.0},
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = await _children_of(db_session, task)
+        assert len(children) == 1
+        child = children[0]
+        payload = child.first_payload or {}
+        assert payload["runner_target"] == {
+            "runner_id": runner_id,
+            "strict": True,
+        }
+        assert payload["spawn_followup"] is True
+        assert _compute_followup_is_opted_in(child) is True
 
     async def test_malformed_missing_command_defers_no_task(
         self, db_session, mocker, caplog

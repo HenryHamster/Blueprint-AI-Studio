@@ -9,6 +9,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import math
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -36,6 +38,60 @@ ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # Safe charset for metric keys: allows common patterns like val/loss, top-1
 # while excluding shell metacharacters (", $, ;, backticks, spaces).
 METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+MAX_DECLARED_METRIC_LENGTH = 128
+
+MIN_COMPUTE_JOB_SPEND_CAP_USD = float(
+    os.getenv("COMPUTE_JOB_MIN_SPEND_CAP_USD", "0.01")
+)
+MAX_COMPUTE_JOB_SPEND_CAP_USD = float(
+    os.getenv("COMPUTE_JOB_MAX_SPEND_CAP_USD", "100.0")
+)
+MIN_COMPUTE_JOB_DEADLINE_SECONDS = int(
+    os.getenv("COMPUTE_JOB_MIN_DEADLINE_SECONDS", "60")
+)
+MAX_COMPUTE_JOB_DEADLINE_SECONDS = int(
+    os.getenv("COMPUTE_JOB_MAX_DEADLINE_SECONDS", "86400")
+)
+
+
+def clamp_spend_cap_usd(raw_value: float) -> float:
+    return max(
+        MIN_COMPUTE_JOB_SPEND_CAP_USD,
+        min(float(raw_value), MAX_COMPUTE_JOB_SPEND_CAP_USD),
+    )
+
+
+def clamp_deadline_seconds(raw_value: int) -> int:
+    return max(
+        MIN_COMPUTE_JOB_DEADLINE_SECONDS,
+        min(int(raw_value), MAX_COMPUTE_JOB_DEADLINE_SECONDS),
+    )
+
+
+def normalize_compute_resource_limits(contract: dict[str, Any]) -> dict[str, Any]:
+    """Return the effective resource limits used by compute-job creation."""
+    normalized = dict(contract)
+    if normalized.get("spend_cap_usd") is not None:
+        normalized["spend_cap_usd"] = clamp_spend_cap_usd(
+            normalized["spend_cap_usd"]
+        )
+    if normalized.get("deadline_seconds") is not None:
+        normalized["deadline_seconds"] = clamp_deadline_seconds(
+            normalized["deadline_seconds"]
+        )
+    if (
+        normalized.get("no_progress_timeout_seconds") is not None
+        and normalized.get("deadline_seconds") is not None
+    ):
+        normalized["no_progress_timeout_seconds"] = max(
+            60,
+            min(
+                int(normalized["no_progress_timeout_seconds"]),
+                int(normalized["deadline_seconds"]),
+            ),
+        )
+    return normalized
+
 
 # Env var names must be valid shell identifiers. The GCP startup script emits
 # `export {key}=...` with the key interpolated BARE, and it runs without
@@ -312,60 +368,64 @@ def _validate_compute_launch_contract(
         declared_metric = contract.get("declared_metric")
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric is required and must be a non-empty string when arms are specified"
+        if len(declared_metric) > MAX_DECLARED_METRIC_LENGTH:
+            return False, (
+                f"declared_metric must be at most {MAX_DECLARED_METRIC_LENGTH} characters"
+            )
         if not METRIC_KEY_RE.fullmatch(declared_metric):
             return (
                 False,
                 f"declared_metric {declared_metric!r} contains invalid characters — "
                 "metric keys must match ^[A-Za-z0-9_./-]+$",
             )
-        if not (isinstance(command, str) and command.strip()):
-            # Synthesize a per-arm isolation script. Each arm runs in its own
-            # subshell with BLUEPRINT_RESULT_FILE pointed to a private path so
-            # arms cannot overwrite each other's metric (no last-arm-wins).
-            # A subshell failure is captured as an exit_code file and does NOT
-            # abort the remaining arms.  After all arms finish, the aggregator
-            # script (embedded as a base64 blob) combines each arm's result into
-            # the canonical {"arms": {name: {declared_metric: value}}} block and
-            # writes it to the real BLUEPRINT_RESULT_FILE.
-            lines: list[str] = [
-                '_BRF_MAIN="${BLUEPRINT_RESULT_FILE:-/tmp/blueprint_result.json}"',
-                '_BRF_BASE="$(dirname "${_BRF_MAIN}")/.blueprint_arm_results"',
-                'mkdir -p "${_BRF_BASE}"',
-            ]
-            arm_result_specs: list[str] = []
-            arm_exit_specs: list[str] = []
-            arm_stderr_specs: list[str] = []
-            arm_duration_specs: list[str] = []
-            for arm in arms:
-                aname = arm["name"]
-                acmd = arm["command"].strip()
-                lines += [
-                    f'mkdir -p "${{_BRF_BASE}}/{aname}"',
-                    '_BRF_T1=$(date +%s)',
-                    f'(export BLUEPRINT_RESULT_FILE="${{_BRF_BASE}}/{aname}/result.json"; {acmd})'
-                    f' 2>"${{_BRF_BASE}}/{aname}/stderr"',
-                    f'echo $? > "${{_BRF_BASE}}/{aname}/exit_code"',
-                    f'echo $(($(date +%s) - _BRF_T1)) > "${{_BRF_BASE}}/{aname}/elapsed"',
-                ]
-                arm_result_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/result.json"')
-                arm_exit_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/exit_code"')
-                arm_stderr_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/stderr"')
-                arm_duration_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/elapsed"')
-            arm_specs_arg = " ".join(arm_result_specs)
-            exit_specs_arg = " ".join(arm_exit_specs)
-            stderr_specs_arg = " ".join(arm_stderr_specs)
-            duration_specs_arg = " ".join(arm_duration_specs)
+        # Synthesize the canonical per-arm isolation script on every validation.
+        # A normalized contract legitimately carries both ``arms`` and this exact
+        # generated command; accepting it makes validation idempotent. Any other
+        # simultaneous command remains user-authored dual mode and is rejected.
+        lines: list[str] = [
+            '_BRF_MAIN="${BLUEPRINT_RESULT_FILE:-/tmp/blueprint_result.json}"',
+            '_BRF_BASE="$(dirname "${_BRF_MAIN}")/.blueprint_arm_results"',
+            'mkdir -p "${_BRF_BASE}"',
+        ]
+        arm_result_specs: list[str] = []
+        arm_exit_specs: list[str] = []
+        arm_stderr_specs: list[str] = []
+        arm_duration_specs: list[str] = []
+        for arm in arms:
+            aname = arm["name"]
+            acmd = arm["command"].strip()
             lines += [
-                f"echo {_AGGREGATOR_B64} | base64 -d > /tmp/blueprint_arm_agg.py",
-                f'python3 /tmp/blueprint_arm_agg.py --arms {arm_specs_arg}'
-                f' --declared-metric "{declared_metric}" --output "${{_BRF_MAIN}}"'
-                f' --exit-codes {exit_specs_arg}'
-                f' --stderr {stderr_specs_arg}'
-                f' --durations {duration_specs_arg}',
+                f'mkdir -p "${{_BRF_BASE}}/{aname}"',
+                '_BRF_T1=$(date +%s)',
+                f'(export BLUEPRINT_RESULT_FILE="${{_BRF_BASE}}/{aname}/result.json"; {acmd})'
+                f' 2>"${{_BRF_BASE}}/{aname}/stderr"',
+                f'echo $? > "${{_BRF_BASE}}/{aname}/exit_code"',
+                f'echo $(($(date +%s) - _BRF_T1)) > "${{_BRF_BASE}}/{aname}/elapsed"',
             ]
-            script = "\n".join(lines)
-            encoded = base64.b64encode(script.encode()).decode()
-            contract["command"] = f"echo {encoded} | base64 -d | bash"
+            arm_result_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/result.json"')
+            arm_exit_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/exit_code"')
+            arm_stderr_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/stderr"')
+            arm_duration_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/elapsed"')
+        arm_specs_arg = " ".join(arm_result_specs)
+        exit_specs_arg = " ".join(arm_exit_specs)
+        stderr_specs_arg = " ".join(arm_stderr_specs)
+        duration_specs_arg = " ".join(arm_duration_specs)
+        lines += [
+            f"echo {_AGGREGATOR_B64} | base64 -d > /tmp/blueprint_arm_agg.py",
+            f'python3 /tmp/blueprint_arm_agg.py --arms {arm_specs_arg}'
+            f' --declared-metric "{declared_metric}" --output "${{_BRF_MAIN}}"'
+            f' --exit-codes {exit_specs_arg}'
+            f' --stderr {stderr_specs_arg}'
+            f' --durations {duration_specs_arg}',
+        ]
+        script = "\n".join(lines)
+        encoded = base64.b64encode(script.encode()).decode()
+        normalized_command = f"echo {encoded} | base64 -d | bash"
+        if isinstance(command, str) and command.strip():
+            if command != normalized_command:
+                return False, "command and arms are mutually exclusive"
+        else:
+            contract["command"] = normalized_command
     elif not (isinstance(command, str) and command.strip()):
         return False, "missing or empty command"
 
@@ -381,6 +441,10 @@ def _validate_compute_launch_contract(
     if declared_metric is not None:
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric must be a non-empty string"
+        if len(declared_metric) > MAX_DECLARED_METRIC_LENGTH:
+            return False, (
+                f"declared_metric must be at most {MAX_DECLARED_METRIC_LENGTH} characters"
+            )
         if not METRIC_KEY_RE.fullmatch(declared_metric):
             return (
                 False,
@@ -411,6 +475,8 @@ def _validate_compute_launch_contract(
             threshold = item.get("threshold")
             if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
                 return False, f"success_criteria[{index}].threshold must be numeric"
+            if not math.isfinite(threshold):
+                return False, f"success_criteria[{index}].threshold must be finite"
         if declared_metric is not None:
             criterion_metric_names = {
                 str(item.get("metric")).strip()
@@ -433,18 +499,32 @@ def _validate_compute_launch_contract(
                 "declared_metric must match success_criterion.metric "
                 f"({declared_metric!r} != {singular.get('metric')!r})"
             )
+    singular = contract.get("success_criterion")
+    if (
+        isinstance(singular, dict)
+        and str(singular.get("kind") or "metric") == "metric"
+    ):
+        threshold = singular.get("threshold")
+        if (
+            isinstance(threshold, (int, float))
+            and not isinstance(threshold, bool)
+            and not math.isfinite(threshold)
+        ):
+            return False, "success_criterion.threshold must be finite"
     try:
         spend = float(contract.get("spend_cap_usd"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return (
             False,
             f"spend_cap_usd is not a number ({contract.get('spend_cap_usd')!r})",
         )
+    if not math.isfinite(spend):
+        return False, f"spend_cap_usd must be finite (got {spend})"
     if not spend > 0:
         return False, f"spend_cap_usd must be positive (got {spend})"
     try:
         deadline = int(contract.get("deadline_seconds"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return (
             False,
             f"deadline_seconds is not an integer ({contract.get('deadline_seconds')!r})",
@@ -456,7 +536,7 @@ def _validate_compute_launch_contract(
     if no_progress_timeout is not None:
         try:
             npt = int(no_progress_timeout)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return (
                 False,
                 f"no_progress_timeout_seconds is not an integer "
@@ -511,10 +591,12 @@ def _validate_compute_launch_contract(
                 )
 
     container_image = contract.get("container_image")
+    registry_auth = contract.get("container_registry_auth")
+    if registry_auth is not None and container_image is None:
+        return False, "container_registry_auth requires container_image"
     if container_image is not None:
         if not isinstance(container_image, str) or not container_image.strip():
             return False, "container_image must be a non-empty string URI when specified"
-        registry_auth = contract.get("container_registry_auth")
         if registry_auth is not None:
             if not isinstance(registry_auth, dict):
                 return False, "container_registry_auth must be an object with server/username/password"
@@ -857,6 +939,8 @@ def build_compute_contract_preview(
                 "hint": "spend_cap_usd must be a positive number",
             },
         }
+    normalized = normalize_compute_resource_limits(normalized)
+    declared_cap = float(normalized["spend_cap_usd"])
     decision = resolve_compute_spend_decision(
         runtime_config=runtime_config,
         direction=direction,

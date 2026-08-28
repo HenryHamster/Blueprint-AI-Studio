@@ -199,6 +199,8 @@ function buildLaunchBody(payload: Record<string, unknown>): Record<string, unkno
   // jobs without a declared metric are byte-for-byte unchanged.
   const declaredMetric = strVal(payload.declared_metric);
   if (declaredMetric) body.declared_metric = declaredMetric;
+  const inputArtifactJobId = strVal(payload.input_artifact_job_id);
+  if (inputArtifactJobId) body.input_artifact_job_id = inputArtifactJobId;
   // Forward optional container image and registry auth when present.
   const containerImage = strVal(payload.container_image);
   if (containerImage) body.container_image = containerImage;
