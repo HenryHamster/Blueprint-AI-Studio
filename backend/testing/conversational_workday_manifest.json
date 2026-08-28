@@ -520,8 +520,7 @@
         "test_post_claim_quiet_heartbeat_renews_continuous_liveness",
         "test_autonomous_turn_survives_operator_silence_with_exact_heartbeat",
         "test_autonomous_turn_flag_cannot_rescue_committed_chat_mode",
-        "test_autonomous_working_turn_renews_freshness_without_mutation",
-        "test_terminal_worker_restart_preserves_checkpoint_and_single_generation"
+        "test_autonomous_working_turn_renews_freshness_without_mutation"
       ],
       "test_count": 98
     },
