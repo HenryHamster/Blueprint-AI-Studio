@@ -1931,7 +1931,12 @@ def _tasks_create(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         raise APIError("PR task metadata is required")
-    body: dict = {"title": title, "prompt": prompt, "task_type": task_type}
+    body: dict = {
+        "title": title,
+        "prompt": prompt,
+        "task_type": task_type,
+        "priority": getattr(args, "priority", 50),
+    }
     if not scoped:
         body["github_repo"] = github_repo
         body["project_id"] = target_project_id
@@ -8536,6 +8541,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--effort", default=None,
         choices=["low", "medium", "high", "max"],
         help="Effort/reasoning level override.")
+    p_tasks_create.add_argument(
+        "--priority", type=int, choices=range(0, 101), default=50,
+        help="Immutable scheduling priority from 0 to 100 (default: 50).")
     p_tasks_create.add_argument(
         "--hotfix", action="store_true", help="Mark task as hotfix priority.")
     p_tasks_create.add_argument("--pr-number", type=int, default=None,

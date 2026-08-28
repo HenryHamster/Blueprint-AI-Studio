@@ -7030,6 +7030,7 @@ def test_tasks_create_posts_task(mock_api, monkeypatch, capsys):
     assert body["github_repo"] == "owner/repo"
     assert body["project_id"] == "proj-1"
     assert body["task_type"] == "create"
+    assert body["priority"] == 50
     assert "base_branch" not in body
     assert body["acceptance_evidence"] == {
         "kind": "named_test",
@@ -7062,6 +7063,8 @@ def test_tasks_create_posts_atomic_authority_fields(mock_api, monkeypatch):
             "Implement the bounded contract.",
             "--direction-id",
             "d-exact",
+            "--priority",
+            "100",
             "--criterion-id",
             "c-duration",
             "--criterion-id",
@@ -7085,6 +7088,7 @@ def test_tasks_create_posts_atomic_authority_fields(mock_api, monkeypatch):
         if method == "POST" and path == "/api/admin/tasks"
     )
     assert body["direction_id"] == "d-exact"
+    assert body["priority"] == 100
     assert body["criterion_ids"] == ["c-duration", "c-retention"]
     assert body["depends_on"] == [prerequisite]
     assert body["require_deps_landed_on"] == "automain"
@@ -7140,6 +7144,8 @@ def test_scoped_tasks_create_sends_explicit_integration_base(monkeypatch):
             "The requested behavior is present.",
             "--base-branch",
             "automain",
+            "--priority",
+            "100",
             "--yes",
         ]
     )
@@ -7152,8 +7158,26 @@ def test_scoped_tasks_create_sends_explicit_integration_base(monkeypatch):
         and path == f"/api/operator-access/v1/projects/{project_id}/tasks"
     )
     assert create_body["base_branch"] == "automain"
+    assert create_body["priority"] == 100
     assert "github_repo" not in create_body
     assert "project_id" not in create_body
+
+
+@pytest.mark.parametrize("priority", ["-1", "101"])
+def test_tasks_create_rejects_out_of_range_priority(priority):
+    with pytest.raises(SystemExit) as exc:
+        blueprint.build_parser().parse_args(
+            [
+                "tasks",
+                "create",
+                "Invalid priority",
+                "Do not launch.",
+                "--priority",
+                priority,
+            ]
+        )
+
+    assert exc.value.code == 2
 
 
 def test_tasks_create_criterion_id_requires_named_test(

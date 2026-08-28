@@ -31,6 +31,7 @@ _CANONICAL_REQUEST_FIELD_FINGERPRINTS_KEY = "canonical_request_field_sha256"
 DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS = frozenset(
     {
         "task_type",
+        "priority",
         "base_branch",
         "pr_number",
         "branch",
@@ -94,6 +95,7 @@ def build_task_creation_authority_snapshot(
             if authority.criterion_release_version_id is not None
             else None
         ),
+        "priority": canonical_request.get("priority", 50),
         "base_branch": canonical_request.get("base_branch"),
         "depends_on": list(authority.depends_on),
         "require_deps_landed_on": require_deps_landed_on,
@@ -126,6 +128,7 @@ def task_creation_authority_receipt(task: Task) -> dict[str, object]:
             "criterion_release_version_id": context.get(
                 CRITERION_RELEASE_VERSION_CONTEXT_KEY
             ),
+            "priority": task.priority,
             "base_branch": first_payload.get("base_branch"),
             "depends_on": list(task.depends_on or []),
             "require_deps_landed_on": first_payload.get(
@@ -140,6 +143,7 @@ def task_creation_authority_receipt(task: Task) -> dict[str, object]:
         "criterion_release_version_id": authority.get(
             "criterion_release_version_id"
         ),
+        "priority": authority.get("priority", task.priority),
         "base_branch": authority.get("base_branch"),
         "depends_on": list(authority.get("depends_on") or []),
         "require_deps_landed_on": authority.get("require_deps_landed_on"),
@@ -182,6 +186,11 @@ def reject_idempotent_task_authority_mismatch(
         else None
     )
     if isinstance(stored_fields, dict):
+        stored_fields = dict(stored_fields)
+        # Compatibility for authority snapshots written before priority joined
+        # the canonical request. The dedicated immutable row is authoritative.
+        if "priority" in expected_fields and "priority" not in stored_fields:
+            stored_fields["priority"] = _request_value_fingerprint(existing.priority)
         if comparison_fields is not None:
             stored_fields = {
                 key: value
@@ -210,6 +219,7 @@ def reject_idempotent_task_authority_mismatch(
             "branch": first_payload.get("branch"),
             "model": first_payload.get("model"),
             "effort": first_payload.get("effort"),
+            "priority": existing.priority,
             "hotfix": bool(first_payload.get("hotfix")),
             "direction_id": authority["direction_id"],
             "criterion_ids": authority["criterion_ids"],

@@ -299,6 +299,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
             "title": "Budget consumer",
             "prompt": "Enforce the selected-test budget after the corpus lands.",
             "task_type": "create",
+            "priority": 100,
             "base_branch": "automain",
             "direction_id": "d-atomic",
             "criterion_ids": criterion_ids,
@@ -319,9 +320,11 @@ async def test_paused_create_atomically_persists_exact_task_authority(
     assert response.json()["base_branch"] == "automain"
     assert response.json()["depends_on"] == [str(predecessor.id)]
     assert response.json()["criterion_release_version_id"] == str(version.id)
+    assert response.json()["priority"] == 100
     created = await db_session.get(Task, response.json()["id"])
     assert created is not None
     assert created.status == TaskStatus.QUEUED
+    assert created.priority == 100
     assert created.depends_on == [str(predecessor.id)]
     assert created.criterion_ids == criterion_ids
     assert created.context["direction_id"] == "d-atomic"
@@ -335,6 +338,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
             "criterion_ids",
             "criterion_ids_explicit",
             "criterion_release_version_id",
+            "priority",
             "base_branch",
             "depends_on",
             "require_deps_landed_on",
@@ -345,6 +349,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
         "criterion_ids": criterion_ids,
         "criterion_ids_explicit": True,
         "criterion_release_version_id": str(version.id),
+        "priority": 100,
         "base_branch": "automain",
         "depends_on": [str(predecessor.id)],
         "require_deps_landed_on": "automain",
@@ -353,6 +358,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
     assert len(creation_authority["canonical_request_sha256"]) == 64
     assert set(creation_authority["canonical_request_field_sha256"]) >= {
         "task_type",
+        "priority",
         "base_branch",
         "title",
         "prompt",
@@ -619,6 +625,7 @@ async def test_idempotency_replay_rejects_different_task_authority(
     ("changed_fields", "mismatch_field"),
     [
         pytest.param({"task_type": "refactor"}, "task_type", id="task-type"),
+        pytest.param({"priority": 100}, "priority", id="priority"),
         pytest.param({"base_branch": "automain"}, "base_branch", id="base-branch"),
         pytest.param({"title": "Changed title"}, "title", id="title"),
         pytest.param({"prompt": "Changed prompt"}, "prompt", id="prompt"),
@@ -799,6 +806,17 @@ def test_direct_review_reuse_keeps_authority_check_without_display_text_identity
     assert mismatch.value.status_code == 409
     assert "base_branch" in mismatch.value.detail
 
+    wrong_priority = {**display_only_replay, "priority": 100}
+    with pytest.raises(HTTPException) as priority_mismatch:
+        reject_idempotent_task_authority_mismatch(
+            existing,
+            canonical_request=wrong_priority,
+            conflict_label="active review reuse",
+            comparison_fields=DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS,
+        )
+    assert priority_mismatch.value.status_code == 409
+    assert "priority" in priority_mismatch.value.detail
+
 
 @pytest.mark.asyncio
 async def test_non_hotfix_create_task_still_works(client: AsyncClient, db_session):
@@ -819,6 +837,7 @@ async def test_non_hotfix_create_task_still_works(client: AsyncClient, db_sessio
     )
 
     assert resp.status_code == 200, resp.text
+    assert resp.json()["priority"] == 50
     task_id = resp.json()["id"]
 
     get_resp = await client.get(f"/api/admin/tasks/{task_id}")
