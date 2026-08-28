@@ -253,7 +253,9 @@ async def test_dead_owner_release_preserves_dirty_ingestion_exactly_once(db_sess
     chain.source_task_ids = [str(uuid.uuid4()) for _ in range(3)]
     chain.last_seen_at = _utcnow() - timedelta(days=1)
     previous_seen_at = chain.last_seen_at
-    db_session.add_all([project, dead_owner, source, chain])
+    db_session.add_all([project, dead_owner, source])
+    await db_session.flush()
+    db_session.add(chain)
     await db_session.commit()
 
     touched = await ingest_guard_suppression_receipt(source, db_session)
