@@ -2516,6 +2516,47 @@ async def test_resident_poll_routes_explicit_direct_strategic_ops_to_workday(
         resident_session_id="resident-session",
         created_at=_BASE + timedelta(seconds=2),
     )
+    informational = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="Explain why we should not perform direct ops without consultation.",
+        sequence=4,
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=3),
+    )
+    negated = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content=(
+            "Do not run ./strategic promote directly; explain what it would do."
+        ),
+        sequence=5,
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=4),
+    )
+    quoted = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content=(
+            'Explain this instruction: "Use direct strategic ops only; do not '
+            'consult; return raw JSON receipts."'
+        ),
+        sequence=6,
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(seconds=5),
+    )
 
     response = await client.get(
         f"/api/agent/projects/{project.id}/messages?limit=20",
@@ -2528,8 +2569,16 @@ async def test_resident_poll_routes_explicit_direct_strategic_ops_to_workday(
         str(first.id),
         str(correction.id),
         str(ordinary.id),
+        str(informational.id),
+        str(negated.id),
+        str(quoted.id),
     ]
-    assert body["fast_message_ids"] == [str(ordinary.id)]
+    assert body["fast_message_ids"] == [
+        str(ordinary.id),
+        str(informational.id),
+        str(negated.id),
+        str(quoted.id),
+    ]
 
 
 @pytest.mark.asyncio
@@ -2569,6 +2618,61 @@ async def test_resident_poll_honors_structured_workday_execution_intent(
     body = response.json()
     assert [item["id"] for item in body["messages"]] == [str(row.id)]
     assert body["fast_message_ids"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_is_live", [True, False])
+async def test_resident_poll_preserves_fast_owned_direct_op_claim(
+    client: AsyncClient, db_session, monkeypatch, claim_is_live
+):
+    """A rolling deploy cannot hand a Fast-owned row to legacy Workday."""
+
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
+    project, task = await _make_resident_poll_worker(db_session)
+    claim_id = uuid.uuid4()
+    row = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content=(
+            "Use direct strategic ops only: do not consult/delegate. Execute "
+            "the bounded mutation and return the raw JSON receipt."
+        ),
+        sequence=1,
+        resident_session_id="resident-session",
+        handling_state=MessageHandlingState.CLAIMED,
+        handled_by_task_id=task.id,
+        conversation_claim_id=claim_id,
+        conversation_claim_generation=2 if claim_is_live else 1,
+        conversation_claim_incarnation=uuid.uuid4(),
+        conversation_claim_expires_at=(
+            _utcnow() + timedelta(minutes=1)
+            if claim_is_live
+            else _utcnow() - timedelta(minutes=1)
+        ),
+        conversation_claim_attempt=1,
+        context={
+            "_conversation_public_reply_owner": "fast",
+            "_conversation_claim_idempotency_key": "direct-op-fast-turn",
+        },
+        created_at=_BASE,
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["messages"]] == [str(row.id)]
+    assert body["fast_message_ids"] == [str(row.id)]
+    assert body["fast_claim_groups"][0]["message_ids"] == [str(row.id)]
 
 
 @pytest.mark.asyncio

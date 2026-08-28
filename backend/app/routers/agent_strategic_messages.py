@@ -110,26 +110,26 @@ _WORKDAY_MAX_IMAGE_DOWNLOAD_BYTES = 9_750_000
 _WORKDAY_MAX_REQUIRED_IMAGES = 8
 
 # Typed Fast is the low-latency conversational owner, but it deliberately has
-# no Blueprint token or checkout. An operator can explicitly keep a supported
-# strategic mutation on the tool-capable Workday turn; marking that row Fast-
-# owned would otherwise force the restricted child to recast the command as a
-# private consultation. Keep this predicate deliberately narrow so ordinary
-# conversation and ordinary requests for research retain the Fast path.
-_DIRECT_STRATEGIC_OP_PHRASE_RE = re.compile(
-    r"\b(?:direct\s+(?:strategic\s+)?ops?|strategic\s+ops?\s+directly)\b",
+# no Blueprint token or checkout. The prose fallback is an intentionally
+# explicit operator sentinel, not a general intent classifier: ordinary,
+# quoted, negative, and informational mentions of direct operations stay Fast.
+_DIRECT_WORKDAY_RECOVERY_PREFIX_RE = re.compile(
+    r"\A(?:GENERATION-[0-9]+\s+MUTATION-ONLY\s+RECOVERY\.|"
+    r"CANONICAL\s+READBACK\s+CONTRADICTS\s+YOUR\s+CLAIM\.)",
     re.IGNORECASE,
 )
-_DIRECT_STRATEGIC_HELPER_RE = re.compile(
-    r"(?:^|[\s`])(?:\./)?strategic\s+[a-z][a-z0-9-]*\b",
+_DIRECT_WORKDAY_IMPERATIVE_RE = re.compile(
+    r"\b(?:use\s+direct\s+strategic\s+ops?\s+only|"
+    r"execute\s+(?:the\s+)?(?:[a-z0-9-]+\s+){0,4}direct\s+"
+    r"(?:strategic\s+)?ops?)\b",
     re.IGNORECASE,
 )
-_DIRECT_EXECUTION_VERB_RE = re.compile(
-    r"\b(?:apply|call|execute|perform|run|use)\b",
+_DIRECT_WORKDAY_NO_CONSULT_RE = re.compile(
+    r"\bdo\s+not\s+consult(?:/delegate)?\b",
     re.IGNORECASE,
 )
-_DIRECT_EXECUTION_BOUNDARY_RE = re.compile(
-    r"\b(?:directly|same\s+(?:surface|turn)|do\s+not\s+consult|"
-    r"without\s+(?:a\s+)?consultation)\b",
+_DIRECT_WORKDAY_RECEIPT_RE = re.compile(
+    r"\b(?:actual\s+)?raw\s+json\s+receipts?\b",
     re.IGNORECASE,
 )
 
@@ -141,7 +141,13 @@ _RESIDENT_POLL_RATE_LIMIT = f"{_RESIDENT_POLL_RATE_LIMIT_PER_MINUTE}/minute"
 
 
 def _operator_requests_direct_workday_execution(message: ProjectMessage) -> bool:
-    """Return whether an operator explicitly chose the tool-capable lane."""
+    """Return whether an operator explicitly chose the tool-capable lane.
+
+    This is routing, not authorization. The conversation endpoint already
+    requires project-member access; every later strategic mutation still needs
+    the Resident task token, current process/lease, and project-scoped backend
+    authorization enforced by ``POST /api/agent/strategic``.
+    """
 
     context = message.context if isinstance(message.context, dict) else {}
     intent = context.get("operator_intent")
@@ -149,9 +155,10 @@ def _operator_requests_direct_workday_execution(message: ProjectMessage) -> bool
         lane_owner = str(intent.get("lane_owner") or "").strip().lower()
         action = str(intent.get("action") or "").strip().lower()
         kind = str(intent.get("kind") or "").strip().lower()
-        if lane_owner == "workday" and (
-            action in {"apply", "execute", "mutate", "run"}
-            or kind in {
+        if (
+            lane_owner == "workday"
+            and action == "execute"
+            and kind in {
                 "direct_strategic_ops",
                 "managed_execution",
                 "strategic_mutation",
@@ -160,14 +167,11 @@ def _operator_requests_direct_workday_execution(message: ProjectMessage) -> bool
             return True
 
     content = str(message.content or "")
-    has_direct_op_reference = bool(
-        _DIRECT_STRATEGIC_OP_PHRASE_RE.search(content)
-        or _DIRECT_STRATEGIC_HELPER_RE.search(content)
-    )
     return bool(
-        has_direct_op_reference
-        and _DIRECT_EXECUTION_VERB_RE.search(content)
-        and _DIRECT_EXECUTION_BOUNDARY_RE.search(content)
+        _DIRECT_WORKDAY_RECOVERY_PREFIX_RE.search(content)
+        and _DIRECT_WORKDAY_IMPERATIVE_RE.search(content)
+        and _DIRECT_WORKDAY_NO_CONSULT_RE.search(content)
+        and _DIRECT_WORKDAY_RECEIPT_RE.search(content)
     )
 
 
@@ -3468,11 +3472,13 @@ async def agent_poll_messages(
             str(row.id)
             for row in remaining_rows
             if row.id in canonical_ids
-            and not _operator_requests_direct_workday_execution(row)
             and (
-                row.conversation_claim_id is None
-                or (row.context or {}).get("_conversation_public_reply_owner")
+                (row.context or {}).get("_conversation_public_reply_owner")
                 == "fast"
+                or (
+                    row.conversation_claim_id is None
+                    and not _operator_requests_direct_workday_execution(row)
+                )
             )
         ]
 
