@@ -7667,12 +7667,7 @@ def test_compute_launch_contract_file_forwards_full_backend_contract(
         ),
         encoding="utf-8",
     )
-    cfg = {
-        "api_url": "x",
-        "api_key": "y",
-        "default_repo": "owner/repo",
-        "default_base_branch": "main",
-    }
+    cfg = dict(api_url="x", api_key="y", default_repo="owner/repo", default_base_branch="main")
     monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
     monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
 
@@ -7753,12 +7748,7 @@ def test_compute_launch_criterion_flags_merge_field_by_field(
         contract["success_criterion"] = file_criterion
     contract_file = tmp_path / "criterion-contract.json"
     contract_file.write_text(json.dumps(contract), encoding="utf-8")
-    cfg = {
-        "api_url": "x",
-        "api_key": "y",
-        "default_repo": "owner/repo",
-        "default_base_branch": "main",
-    }
+    cfg = dict(api_url="x", api_key="y", default_repo="owner/repo", default_base_branch="main")
     monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
     monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
 
@@ -7800,12 +7790,9 @@ def test_compute_launch_rejects_metric_override_of_artifact_criterion(
         ),
         encoding="utf-8",
     )
-    cfg = {
-        "api_url": "x",
-        "api_key": "y",
-        "default_repo": "owner/repo",
-        "default_base_branch": "main",
-    }
+    cfg = dict(
+        api_url="x", api_key="y", default_repo="owner/repo", default_base_branch="main"
+    )
     monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
     monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
 
@@ -7863,12 +7850,9 @@ def test_compute_launch_boolean_flags_override_contract_values(
         ),
         encoding="utf-8",
     )
-    cfg = {
-        "api_url": "x",
-        "api_key": "y",
-        "default_repo": "owner/repo",
-        "default_base_branch": "main",
-    }
+    cfg = dict(
+        api_url="x", api_key="y", default_repo="owner/repo", default_base_branch="main"
+    )
     monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
     monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
 
@@ -8191,12 +8175,9 @@ def test_compute_launch_watch_polls_created_task_to_terminal(
 def test_compute_launch_watch_returns_nonzero_for_unsuccessful_outcome(
     mock_api, monkeypatch, watched
 ):
-    config = {
-        "api_url": "x",
-        "api_key": "y",
-        "default_repo": "owner/repo",
-        "default_base_branch": "main",
-    }
+    config = dict(
+        api_url="x", api_key="y", default_repo="owner/repo", default_base_branch="main"
+    )
     monkeypatch.setattr(blueprint_api, "load_config", lambda: config)
     monkeypatch.setattr(blueprint, "load_config", lambda: config)
     monkeypatch.setattr(
