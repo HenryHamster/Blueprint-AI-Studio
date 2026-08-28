@@ -317,14 +317,13 @@ async def _post_guard_suppression_escalation(
     *,
     unowned_reason: str | None = None,
 ) -> None:
-    """Emit or refresh one aggregate, audience-classified escalation.
+    """Emit one immutable, versioned aggregate escalation.
 
-    The claim must track reality. ``post_event_message`` returns an existing
-    row *unchanged* on an idempotency hit, so a message first written while a
-    task owned the chain would otherwise keep asserting that ownership after
-    the owner failed, was cancelled, or was never creatable at all. Refresh the
-    rendered content and the context on every call so the operator is never
-    left reading a claim that a corpse owns the problem.
+    The claim must track reality without rewriting governed conversation bytes.
+    A content rewrite is treated as a privacy mutation and invalidates private
+    Workday handoffs for the whole project. Give each rendered ownership state
+    a deterministic message identity instead, then resolve older versions using
+    status-only fields that do not participate in the privacy fence.
     """
     if owner is None and not unowned_reason:
         raise ValueError(
@@ -337,6 +336,21 @@ async def _post_guard_suppression_escalation(
     from app.notification_dispatch import post_event_message
 
     summary = guard_suppression_escalation_summary(owner, unowned_reason)
+    owner_id = str(owner.id) if owner is not None else ""
+    version_fingerprint = hashlib.sha256(
+        "\0".join(
+            (
+                summary,
+                str(chain.occurrences),
+                owner_id,
+                unowned_reason or "",
+            )
+        ).encode()
+    ).hexdigest()
+    idempotency_key = (
+        f"guard-suppression:{chain.project_id}:{chain.finding_key}:"
+        f"escalation:{version_fingerprint}"
+    )
     message = await post_event_message(
         session,
         chain.project_id,
@@ -347,11 +361,11 @@ async def _post_guard_suppression_escalation(
             "lane": chain.suppression_lane,
             "failure_identity": chain.failure_identity,
             "occurrences": chain.occurrences,
-            "remediation_task_id": str(owner.id) if owner is not None else None,
+            "remediation_task_id": owner_id or None,
             "remediation_unowned_reason": unowned_reason,
         },
         task_id=owner.id if owner is not None else None,
-        idempotency_key=f"guard-suppression:{chain.project_id}:{chain.finding_key}:escalation",
+        idempotency_key=idempotency_key,
     )
     if message is None:
         return
@@ -362,17 +376,28 @@ async def _post_guard_suppression_escalation(
         message.status = "open"
         message.resolution = None
         message.resolved_at = None
-    message.content = summary
-    context = dict(message.context or {})
-    context.update(
-        {
-            "occurrences": chain.occurrences,
-            "remediation_task_id": str(owner.id) if owner is not None else None,
-            "remediation_unowned_reason": unowned_reason,
-        }
-    )
-    message.context = context
     session.add(message)
+
+    previous_versions = (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == chain.project_id,
+                ProjectMessage.id != message.id,
+                ProjectMessage.context["event_type"].as_string()
+                == "remediation_escalated",
+                ProjectMessage.context["finding_key"].as_string()
+                == chain.finding_key,
+            )
+        )
+    ).scalars().all()
+    resolved_at = _utcnow()
+    for previous in previous_versions:
+        if previous.status == "resolved":
+            continue
+        previous.status = "resolved"
+        previous.resolution = f"superseded by escalation version {message.id}"
+        previous.resolved_at = resolved_at
+        session.add(previous)
 
 
 async def ingest_guard_suppression_receipt(task: Task, session: AsyncSession) -> list[ModuleFindingChain]:
