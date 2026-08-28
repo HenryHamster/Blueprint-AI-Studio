@@ -6967,6 +6967,76 @@ describe('handleStrategicResident — operator-turn responsiveness', () => {
     await handlerDone;
   });
 
+  it.each([
+    {
+      label: 'default direct-execution allowance',
+      autonomousTimeoutSeconds: 300,
+      expectedHardTimeoutMs: 360_000,
+    },
+    {
+      label: 'configured allowance above the provider absolute ceiling',
+      autonomousTimeoutSeconds: 3_600,
+      expectedHardTimeoutMs: 900_000,
+    },
+  ])('gives only a server-qualified direct Workday execution the bounded $label', async ({
+    autonomousTimeoutSeconds,
+    expectedHardTimeoutMs,
+  }) => {
+    const OPERATOR_MSG = {
+      id: 'msg-direct-execution',
+      content: 'Apply the bounded strategic correction and return its receipts.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+      context: { _direct_workday_execution: true },
+    };
+    let pollCount = 0;
+    let heartbeatCount = 0;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: true,
+          stop_requested: heartbeatCount > 1,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ sentOperatorMessage: true })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-direct-execution-budget',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_turn_timeout_seconds: 120,
+        strategic_session_autonomous_turn_timeout_seconds: autonomousTimeoutSeconds,
+      },
+      { project_metadata: { project_id: 'proj-direct-execution-budget' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(session.sendTurn).toHaveBeenCalledWith(expect.anything(), {
+      stallTimeoutMs: autonomousTimeoutSeconds * 1_000,
+      hardTimeoutMs: expectedHardTimeoutMs,
+    });
+  });
+
   it('does not post an early ack when the turn completes before the threshold elapses', async () => {
     vi.useFakeTimers();
 

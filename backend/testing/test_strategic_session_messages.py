@@ -2579,6 +2579,14 @@ async def test_resident_poll_routes_explicit_direct_strategic_ops_to_workday(
         str(negated.id),
         str(quoted.id),
     ]
+    projected_by_id = {item["id"]: item for item in body["messages"]}
+    assert projected_by_id[str(first.id)]["context"]["_direct_workday_execution"] is True
+    assert (
+        projected_by_id[str(correction.id)]["context"]["_direct_workday_execution"]
+        is True
+    )
+    for row in (ordinary, informational, negated, quoted):
+        assert "_direct_workday_execution" not in projected_by_id[str(row.id)]["context"]
 
 
 @pytest.mark.asyncio
@@ -2618,6 +2626,42 @@ async def test_resident_poll_honors_structured_workday_execution_intent(
     body = response.json()
     assert [item["id"] for item in body["messages"]] == [str(row.id)]
     assert body["fast_message_ids"] == []
+    assert body["messages"][0]["context"]["_direct_workday_execution"] is True
+
+
+@pytest.mark.asyncio
+async def test_resident_poll_rejects_caller_supplied_direct_execution_budget(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """Only the server routing predicate may grant the deeper Workday budget."""
+
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
+    project, task = await _make_resident_poll_worker(db_session)
+    row = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="Explain what the bounded correction would do.",
+        sequence=1,
+        resident_session_id="resident-session",
+        context={"_direct_workday_execution": True},
+        created_at=_BASE,
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["fast_message_ids"] == [str(row.id)]
+    assert "_direct_workday_execution" not in body["messages"][0]["context"]
 
 
 @pytest.mark.asyncio

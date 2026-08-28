@@ -3416,6 +3416,17 @@ async def agent_poll_messages(
     projected_messages: list[dict[str, Any]] = []
     for row in remaining_rows:
         projected = _poll_message_dict(row)
+        # Carry the server-qualified lane choice into the agent projection.  A
+        # direct Workday execution can legitimately spend several minutes in
+        # authenticated strategic tools before it can publish its receipt-bound
+        # reply; the agent uses this marker only to select that deeper turn
+        # budget.  Always remove any caller-supplied value first so ordinary
+        # conversation cannot self-upgrade its execution allowance.
+        projected_context = dict(projected.get("context") or {})
+        projected_context.pop("_direct_workday_execution", None)
+        if _operator_requests_direct_workday_execution(row):
+            projected_context["_direct_workday_execution"] = True
+        projected["context"] = projected_context
         if resident_claim_artifacts_degraded:
             projected["content"] = (
                 f"{projected.get('content') or ''}\n\n"

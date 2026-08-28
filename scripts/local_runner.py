@@ -3079,18 +3079,20 @@ def _agent_workspace_for_task(task_id: str) -> str:
     """
     workspace = _agent_workspace_path(task_id)
     os.makedirs(workspace, exist_ok=True)
+    # Refresh the directory age at admission. The reaper deliberately defers
+    # deletion to the stale sweep so an agent wrapper exit cannot erase the
+    # checkout from a same-task retry that is already bootstrapping.
+    os.utime(workspace, None)
     return workspace
 
 
 def _cleanup_agent_workspace(task_id: str) -> None:
-    """Best-effort removal of a finished task's per-task workspace.
+    """Best-effort immediate removal of a task's per-task workspace.
 
-    Unlike compute-job scratch dirs (rmtree'd after each job), per-task agent
-    workspaces are never reused once the agent exits. Leaving them behind on a
-    long-lived runner silently exhausts disk, which then trips the disk-based
-    degraded-runner health path and takes the runner offline. Reap the workspace
-    when the agent finishes. Set BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 to retain
-    them for post-mortem debugging.
+    The live reaper intentionally uses the grace-bounded stale sweep instead,
+    because a same-task retry can reuse this stable path after a wrapper exit.
+    This helper remains available for explicit cleanup and focused tests. Set
+    BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 to retain workspaces for debugging.
     """
     if os.environ.get("BLUEPRINT_RUNNER_KEEP_WORKSPACES", "").strip().lower() in (
         "1", "true", "yes",
@@ -3100,6 +3102,26 @@ def _cleanup_agent_workspace(task_id: str) -> None:
         shutil.rmtree(_agent_workspace_path(task_id), ignore_errors=True)
     except Exception as exc:  # noqa: BLE001 — cleanup is strictly best-effort
         print(f"[runner] workspace cleanup error for task {task_id}: {exc}", flush=True)
+
+
+def _defer_agent_workspace_cleanup(task_id: str) -> None:
+    """Start the stale-sweep grace when the tracked process actually exits.
+
+    A resident can run for hours, so its workspace directory mtime may already
+    be older than the sweep threshold when the wrapper exits. Refresh it before
+    removing the task from ``active_tasks``; otherwise a sweep in this same
+    reaper iteration can still delete the checkout immediately and race a
+    same-task retry.
+    """
+    workspace = _agent_workspace_path(task_id)
+    try:
+        if os.path.isdir(workspace):
+            os.utime(workspace, None)
+    except OSError as exc:
+        print(
+            f"[runner] workspace cleanup deferral error for task {task_id}: {exc}",
+            flush=True,
+        )
 
 
 def _min_free_disk_bytes() -> int:
@@ -4317,6 +4339,7 @@ def _reap_loop(
                 for tid in done:
                     proc = active_tasks[tid]
                     code = proc.returncode
+                    _defer_agent_workspace_cleanup(tid)
                     # Release the durable resource permit while this task ID is
                     # still visible as active.  Otherwise a fresh dispatch of
                     # the same ID could install a new permit between `del` and
@@ -4346,10 +4369,12 @@ def _reap_loop(
                         print(f"[DONE] task_id={tid} exit_code=42 (runtime_unavailable — not a failure)", flush=True)
                     else:
                         print(f"[DONE] task_id={tid} exit_code={code}", flush=True)
-                    # Reap the per-task workspace so stale dirs don't accumulate
-                    # and silently exhaust the runner's disk (unlike compute-job
-                    # scratch dirs, these are never otherwise removed).
-                    _cleanup_agent_workspace(tid)
+                    # Do not delete the workspace synchronously with wrapper
+                    # exit. A same-task retry may already be bootstrapping in the
+                    # stable per-task path; deleting here races that process and
+                    # leaves its warm continuation without WORKSPACE/.git. The
+                    # periodic inactive-workspace sweep below retains a bounded
+                    # 60s grace and remains the single cleanup authority.
 
                 # Wall-clock deadline: an agent that never exits (wedged tool, runaway
                 # loop) must not hold a capacity permit forever. Mirror the compute
@@ -4364,6 +4389,7 @@ def _reap_loop(
                             )
                             overdue.append((tid, proc, backend, cname))
                     for tid, _proc, _b, _c in overdue:
+                        _defer_agent_workspace_cleanup(tid)
                         if resource_ledger is not None:
                             resource_ledger.release(f"agent:{tid}")
                         del active_tasks[tid]
@@ -4389,8 +4415,8 @@ def _reap_loop(
                 _release_capacity(capacity)
                 if telemetry is not None:
                     telemetry.record_failure()
-                # Terminated overdue agent is done too — reap its workspace.
-                _cleanup_agent_workspace(tid)
+                # The periodic inactive-workspace sweep owns cleanup. The grace
+                # also protects an orchestrator retry after this forced exit.
 
             # Periodic stale workspace cleanup (every ~60 s).
             _cleanup_tick += 1
@@ -8680,10 +8706,11 @@ def _workspace_writable(root: str) -> bool:
         return False
 
 
-# Stale-workspace sweep grace: a clean agent exit already reaps its workspace
-# via _cleanup_agent_workspace, so the periodic sweep only catches workspaces
-# stranded by a crashed agent subprocess. 60 s (down from 300 s) never races a
-# freshly-created workspace but keeps a stranded dir from lingering.
+# Stale-workspace sweep grace: cleanup is intentionally deferred after every
+# agent exit so a same-task retry cannot lose its checkout while bootstrapping.
+# Admission refreshes the directory mtime; the active-task filter protects it
+# after registration. 60 s keeps abandoned workspaces bounded without racing a
+# freshly-admitted replacement.
 def _cleanup_stale_workspaces(active_task_ids: set, max_age_seconds: float = 60.0) -> int:
     """Remove per-task workspace dirs that are not in *active_task_ids* and older than *max_age_seconds*."""
     root = _workspace_root()
@@ -8718,13 +8745,13 @@ def _cleanup_all_workspaces() -> int:
     """Remove every per-task workspace dir under the workspace root.
 
     Last-resort teardown registered with ``atexit`` in ``main()``. A crashed
-    runner never runs the per-task cleanup (agent exit) nor the stale sweep
-    (the reap loop died), so every workspace it held would otherwise leak until
+    runner never runs the grace-bounded stale sweep (the reap loop died), so
+    every workspace it held would otherwise leak until
     a future runner's sweep — and this process is gone, so no active-set check
     can know those dirs are orphaned. Removing everything at shutdown closes
     that gap. Safe because each runner owns its workspace root (the runbook's
     multi-runner setup requires non-overlapping BLUEPRINT_RUNNER_WORKSPACE_ROOT
-    dirs). Honors BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 like the per-task cleanup.
+    dirs). Honors BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 like the stale sweep.
     """
     if os.environ.get("BLUEPRINT_RUNNER_KEEP_WORKSPACES", "").strip().lower() in (
         "1", "true", "yes",
@@ -10473,9 +10500,9 @@ def main() -> None:
         caps
     ) or _docker_agent_possible(caps, agent_image)
 
-    # Last-resort teardown: a crashed runner never runs the per-task cleanup
-    # (agent exit) nor the stale sweep (the reap loop died), so every workspace
-    # it held would leak. Registered only once the runner is operating (workspaces
+    # Last-resort teardown: a crashed runner never runs the stale sweep (the reap
+    # loop died), so every workspace it held would leak. Registered only once the
+    # runner is operating (workspaces
     # are created below), so --check and setup failures never touch the root.
     atexit.register(_cleanup_all_workspaces)
 

@@ -9,7 +9,11 @@ import {
   recordResidentTurnLatency, getResidentTurnLatencyTelemetry,
   recordOperatorDecisionCapture, getOperatorDecisionCaptureTelemetry,
 } from '../index.js';
-import { HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT } from '../constants.js';
+import {
+  DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS,
+  HEARTBEAT_API_MAX_RETRIES,
+  HEARTBEAT_API_TIMEOUT,
+} from '../constants.js';
 import { restoreOperatorDecisionCaptureTelemetry } from '../telemetry.js';
 import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
@@ -1509,6 +1513,10 @@ export async function handleStrategicResident(
     60_000,
     cfg.turnTimeoutMs + OPERATOR_HARD_TIMEOUT_GRACE_MS,
   );
+  const directExecutionHardTimeoutMs = Math.min(
+    DEFAULT_RESIDENT_TURN_HARD_TIMEOUT_MS,
+    consultationAbandonDeadlineMs(cfg.autonomousTurnTimeoutMs),
+  );
   let residentReplyTool = provisionResidentReplyTool(WORKSPACE, {
     receiptPath: RESIDENT_REPLY_RECEIPT_PATH,
     stagedReplyPath: RESIDENT_STAGED_REPLY_PATH,
@@ -1682,6 +1690,7 @@ export async function handleStrategicResident(
     pickupLagMs?: number | null,
     repoSnapshot?: ResidentRepoSnapshot,
     privateTurn = false,
+    directExecution = false,
   ): Promise<ResidentTurnResult> => {
     const repoPrefix = repoSnapshot
       ? `${formatResidentRepoSnapshot(repoSnapshot)}\n\n---\n\n`
@@ -1717,7 +1726,7 @@ export async function handleStrategicResident(
       streamer.working();
     }
     const stallTimeoutMs = operator
-      ? cfg.turnTimeoutMs
+      ? (directExecution ? cfg.autonomousTurnTimeoutMs : cfg.turnTimeoutMs)
       : cfg.autonomousTurnTimeoutMs;
     let residentInput: string | Array<Record<string, unknown>>;
     if (Array.isArray(full)) {
@@ -1734,11 +1743,15 @@ export async function handleStrategicResident(
     try {
       const r = await session.sendTurn(residentInput, {
         stallTimeoutMs,
-        // Interactive work must never inherit the session provider's fifteen
-        // minute absolute ceiling. Deep work belongs in the private/autonomous
-        // lane; a foreground worker that cannot finish within this bound is
-        // fenced and replaced with the durable message still open.
-        ...(operator ? { hardTimeoutMs: operatorHardTimeoutMs } : {}),
+        // Ordinary interactive work must never inherit the provider's fifteen
+        // minute ceiling. The server-qualified direct-execution lane gets the
+        // same bounded allowance as autonomous Workday; every other foreground
+        // turn is fenced at the responsive operator deadline.
+        ...(operator ? {
+          hardTimeoutMs: directExecution
+            ? directExecutionHardTimeoutMs
+            : operatorHardTimeoutMs,
+        } : {}),
       });
       recordResidentTurnLatency({
         kind: operator ? 'operator' : 'autonomous',
@@ -4974,6 +4987,9 @@ export async function handleStrategicResident(
       return 'continue';
     }
     const pickupLagMs = computePickupLagMs(workdayMessages);
+    const directExecution = workdayMessages.some(
+      message => message.context?._direct_workday_execution === true,
+    );
     setResidentActivity(
       'working',
       `Responding to ${workdayMessages.length} operator message${workdayMessages.length === 1 ? '' : 's'}`,
@@ -5098,7 +5114,14 @@ export async function handleStrategicResident(
           });
         }, cfg.operatorAckThresholdMs);
       }
-      const turnPromise = runTurn(operatorBlocks, true, pickupLagMs, repoSnapshot);
+      const turnPromise = runTurn(
+        operatorBlocks,
+        true,
+        pickupLagMs,
+        repoSnapshot,
+        false,
+        directExecution,
+      );
       const watch = await watchOperatorTurn(
         turnPromise,
         handlePureFastMessagesDuringWorkday,
