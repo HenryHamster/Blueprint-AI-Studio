@@ -3203,6 +3203,24 @@ def test_validate_contract_rejects_non_dict_container_registry_auth():
     assert "container_registry_auth" in reason
 
 
+def test_validate_contract_rejects_container_registry_auth_without_image():
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_registry_auth": {
+            "server": "registry.example.com",
+            "username": "runner",
+            "password": "secret",
+        },
+    }
+
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+
+    assert ok is False
+    assert reason == "container_registry_auth requires container_image"
+
+
 def test_validate_contract_rejects_non_string_field_in_container_registry_auth():
     """_validate_compute_launch_contract rejects container_registry_auth with a non-string field."""
     contract = {

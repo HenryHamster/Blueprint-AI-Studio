@@ -6300,6 +6300,64 @@ async def test_create_compute_job_reuses_matching_active_job_for_task(db_session
 
 
 @pytest.mark.asyncio
+async def test_create_compute_job_reuses_registry_authenticated_image_job(db_session):
+    project = Project(name="Registry Auth Idempotent Create", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    launch_args = {
+        "command": "echo idempotent",
+        "machine_type": "e2-standard-2",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "backend_name": compute_jobs.RUNNER_SUBPROCESS_BACKEND_NAME,
+        "container_image": "registry.example.com/train:1",
+        "container_registry_auth": {
+            "server": "registry.example.com",
+            "username": "runner",
+            "password": "secret",
+        },
+    }
+
+    first = await compute_jobs.create_compute_job(db_session, task, **launch_args)
+    second = await compute_jobs.create_compute_job(db_session, task, **launch_args)
+
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert second.id == first.id
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_registry_auth_without_image(db_session):
+    project = Project(name="Registry Auth Requires Image", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with pytest.raises(ValueError, match="container_registry_auth requires container_image"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="echo invalid",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            container_registry_auth={"server": "registry.example.com"},
+        )
+
+    jobs = (await db_session.execute(select(ComputeJob))).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
 async def test_create_compute_job_reuses_old_persisted_fingerprint(db_session):
     """An exact populated legacy retry is verified and upgraded in place."""
     project = Project(name="Legacy Compute Fingerprint", user_id="test-user")

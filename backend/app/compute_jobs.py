@@ -597,6 +597,10 @@ async def create_compute_job(
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
+    if container_registry_auth is not None and not (
+        isinstance(container_image, str) and container_image.strip()
+    ):
+        raise ValueError("container_registry_auth requires container_image")
     resolved_machine_type = resolve_compute_machine_type(
         accelerator=accelerator,
         machine_type=machine_type,

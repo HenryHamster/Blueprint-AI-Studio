@@ -520,10 +520,12 @@ def _validate_compute_launch_contract(
                 )
 
     container_image = contract.get("container_image")
+    registry_auth = contract.get("container_registry_auth")
+    if registry_auth is not None and container_image is None:
+        return False, "container_registry_auth requires container_image"
     if container_image is not None:
         if not isinstance(container_image, str) or not container_image.strip():
             return False, "container_image must be a non-empty string URI when specified"
-        registry_auth = contract.get("container_registry_auth")
         if registry_auth is not None:
             if not isinstance(registry_auth, dict):
                 return False, "container_registry_auth must be an object with server/username/password"
