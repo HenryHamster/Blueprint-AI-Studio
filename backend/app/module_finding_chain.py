@@ -230,7 +230,9 @@ def _guard_remediation_task(chain: ModuleFindingChain, *, base_branch: str) -> T
     The active-task idempotency key is the same task-admission primitive used
     elsewhere. Persisting the selected task id on the chain makes retries and
     concurrent heartbeats converge on one owner rather than notifying per
-    source task.
+    source task. The election boundary also rechecks project autonomy so a
+    disabled automatic lane cannot publish the owner while direct Strategic
+    work remains available.
 
     The payload is a ``create`` cut from *base_branch*, not a ``fix``. Guard
     suppression is new work off the project's integration trunk: there is no
@@ -603,7 +605,8 @@ async def elect_guard_suppression_owners(
 
     Bounded per invocation and idempotent: a chain that already has an owner is
     no longer an election candidate, and a project that is paused, archived, or
-    momentarily lock-contended is simply skipped until the next sweep.
+    autonomy-disabled, or momentarily lock-contended is simply skipped until
+    the next sweep.
 
     A second bounded pass releases owners that already terminated. Ingestion
     releases those too, but only when a *new* receipt happens to arrive; a
@@ -670,7 +673,11 @@ async def elect_guard_suppression_owners(
 
     elected: list[Task] = []
     for project_id, chains in by_project.items():
-        decision = await acquire_automatic_task_creation_authority(session, project_id)
+        decision = await acquire_automatic_task_creation_authority(
+            session,
+            project_id,
+            require_autonomous_enabled=True,
+        )
         if decision != AUTOMATIC_TASK_CREATION_ALLOWED:
             logger.info(
                 "guard-suppression owner election held for project %s: %s",

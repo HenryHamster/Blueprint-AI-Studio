@@ -939,11 +939,19 @@ async def test_owner_election_honours_real_project_authority(db_session):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked", ["paused", "archived"])
+@pytest.mark.parametrize(
+    "blocked_state",
+    [
+        {"paused": True},
+        {"archived": True},
+        {"autonomous_enabled": False},
+    ],
+    ids=["paused", "archived", "autonomy-disabled"],
+)
 async def test_owner_election_refuses_a_project_that_cannot_take_new_work(
-    db_session, blocked
+    db_session, blocked_state
 ):
-    """A paused or archived project must not accumulate latent queued work.
+    """A project without automatic-work authority cannot gain a latent owner.
 
     This is exactly the invariant the earlier heartbeat-side election could not
     hold: it ran behind the reporting task's row lock and so never consulted the
@@ -951,9 +959,9 @@ async def test_owner_election_refuses_a_project_that_cannot_take_new_work(
     remediation owner an ordinary admitted automatic task.
     """
     project = Project(
-        name=f"guard election {blocked}",
+        name=f"guard election {next(iter(blocked_state))}",
         user_id="test-user-123",
-        **{blocked: True},
+        **blocked_state,
     )
     db_session.add(project)
     await db_session.flush()

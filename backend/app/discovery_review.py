@@ -912,8 +912,8 @@ async def maybe_close_and_spawn_discovery_review(
     )
     # Resolve the parent project without a child lock, then take the universal
     # automatic-task admission lock before locking/mutating the DiscoveryCycle.
-    # This preserves Project -> child order and makes pause linearizable with
-    # the decision-task INSERT below.
+    # This preserves Project -> child order and makes pause/autonomy changes
+    # linearizable with the decision-task INSERT below.
     cycle_project_id = (
         await session.execute(
             select(DiscoveryCycle.project_id).where(
@@ -926,7 +926,10 @@ async def maybe_close_and_spawn_discovery_review(
             parsed_cycle_id, None, False, False, "cycle_missing"
         )
     admission = await acquire_automatic_task_creation_authority(
-        session, cycle_project_id, skip_locked=True
+        session,
+        cycle_project_id,
+        skip_locked=True,
+        require_autonomous_enabled=True,
     )
     if admission not in {
         AUTOMATIC_TASK_CREATION_ALLOWED,
