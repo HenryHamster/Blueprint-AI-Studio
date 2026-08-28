@@ -9683,6 +9683,57 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         return 1
 
 
+def _resolve_windows_cli(name: str) -> str:
+    """Resolve a required CLI, including standard Windows install locations."""
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    if sys.platform == "win32":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        candidates = {
+            "gh": (
+                program_files / "GitHub CLI" / "gh.exe",
+                Path(os.environ.get("LOCALAPPDATA", ""))
+                / "Programs"
+                / "GitHub CLI"
+                / "gh.exe",
+            ),
+            "ssh": (
+                Path(os.environ.get("SystemRoot", r"C:\Windows"))
+                / "System32"
+                / "OpenSSH"
+                / "ssh.exe",
+                program_files / "Git" / "usr" / "bin" / "ssh.exe",
+            ),
+        }
+        for candidate in candidates.get(name, ()):
+            if candidate.is_file():
+                return str(candidate)
+    raise APIError(
+        f"{name} executable not found on PATH or in standard Windows install locations"
+    )
+
+
+def _deploy_temporary_directory() -> tempfile.TemporaryDirectory:
+    """Create a child-process-accessible directory for deploy artifacts.
+
+    Sandboxed Windows sessions can grant the Python process access to its
+    profile temp directory without granting the same ACL to ``gh``.  A source
+    checkout is already an operator-approved write root, so prefer it for the
+    short-lived manifest download and fall back to the current directory.
+    """
+    kwargs = {"prefix": ".blueprint-deploy-", "ignore_cleanup_errors": True}
+    if sys.platform != "win32":
+        return tempfile.TemporaryDirectory(**kwargs)
+    candidates = (Path(__file__).resolve().parents[1], Path.cwd())
+    for candidate in candidates:
+        try:
+            return tempfile.TemporaryDirectory(dir=str(candidate), **kwargs)
+        except OSError:
+            continue
+    return tempfile.TemporaryDirectory(**kwargs)
+
+
 def _gh(*gh_args: str) -> str:
     """Run gh and return stdout, mapping failure to APIError for main().
 
@@ -9692,7 +9743,7 @@ def _gh(*gh_args: str) -> str:
     """
     try:
         proc = subprocess.run(
-            ["gh", *gh_args], capture_output=True, check=False,
+            [_resolve_windows_cli("gh"), *gh_args], capture_output=True, check=False,
             encoding="utf-8", errors="replace", timeout=120,
         )
     except subprocess.TimeoutExpired:
@@ -9834,7 +9885,7 @@ def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
               + (f" for sha {requested}" if requested else "."))
         raise APIError("no successful deploy run")
     sha = run["headSha"]
-    with tempfile.TemporaryDirectory() as temporary:
+    with _deploy_temporary_directory() as temporary:
         _gh(
             "run", "download", str(run["databaseId"]), "--repo", _DEPLOY_REPO,
             "-n", f"local-app-release-{sha}", "-D", temporary,
@@ -9868,7 +9919,9 @@ def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> boo
     if host is None:
         return _request_release_socket(digest, revision)
     client_path = Path(__file__).resolve().with_name("release_socket_submit.py")
-    command = ["ssh", host, "python3", "-", digest, revision]
+    command = [
+        _resolve_windows_cli("ssh"), host, "python3", "-", digest, revision
+    ]
     with open(client_path, "rb") as client_source:
         proc = subprocess.run(command, check=False, stdin=client_source)
     if proc.returncode == 3:

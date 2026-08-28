@@ -7811,6 +7811,43 @@ def test_fetch_deploy_manifest_accepts_abbreviated_sha(monkeypatch):
     assert calls[0][:2] == ("run", "list")
 
 
+def test_deploy_temp_directory_uses_source_tree_on_windows(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    script = repo / "scripts" / "blueprint.py"
+    script.parent.mkdir(parents=True)
+    script.touch()
+    monkeypatch.setattr(blueprint.sys, "platform", "win32")
+    monkeypatch.setattr(blueprint, "__file__", str(script))
+
+    with blueprint._deploy_temporary_directory() as temporary:
+        temp_path = Path(temporary)
+        assert temp_path.parent == repo
+        (temp_path / "child-process-artifact").write_text("ok", encoding="utf-8")
+
+    assert not temp_path.exists()
+
+
+def test_windows_cli_resolution_uses_standard_install_locations(
+    monkeypatch, tmp_path
+):
+    program_files = tmp_path / "Program Files"
+    system_root = tmp_path / "Windows"
+    gh = program_files / "GitHub CLI" / "gh.exe"
+    ssh = system_root / "System32" / "OpenSSH" / "ssh.exe"
+    gh.parent.mkdir(parents=True)
+    ssh.parent.mkdir(parents=True)
+    gh.touch()
+    ssh.touch()
+    monkeypatch.setattr(blueprint.sys, "platform", "win32")
+    monkeypatch.setattr(blueprint.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.setenv("SystemRoot", str(system_root))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+
+    assert blueprint._resolve_windows_cli("gh") == str(gh)
+    assert blueprint._resolve_windows_cli("ssh") == str(ssh)
+
+
 def _deploy_api_fake(calls, *, promoted=None, post_failure=None):
     """Fake blueprint.api for deploy: promoted-version lookup + receipt POST."""
     if promoted is None:
@@ -7873,6 +7910,7 @@ def _deploy_env(
         lambda: {"api_url": "http://orchestrator", "api_key": "k", "read_only": False},
     )
     monkeypatch.setattr(blueprint, "_require_write_config", lambda action: None)
+    monkeypatch.setattr(blueprint, "_resolve_windows_cli", lambda name: name)
 
     def fake_run(cmd, **kwargs):
         class R:
@@ -8357,6 +8395,7 @@ def test_invoke_release_shim_remote_exit_codes(monkeypatch, capsys):
     0 = completed, 3 = accepted-but-unverified (parked, no receipt), else error."""
     digest = "sha256:" + "a" * 64
     revision = "b" * 40
+    monkeypatch.setattr(blueprint, "_resolve_windows_cli", lambda name: name)
 
     def run_with(code):
         return lambda command, **kwargs: type("R", (), {"returncode": code})()
