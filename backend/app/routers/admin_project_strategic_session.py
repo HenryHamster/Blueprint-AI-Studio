@@ -58,6 +58,7 @@ from app.models import (
 from app.auth import get_current_user
 from app.task_locking import lock_project_or_429
 from app.admin import _get_user_project_with_role
+from app.admin_helpers import _get_user_project_role, _project_role_allows
 from app import strategic_cycle
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
 from app.operator_attention import build_operator_attention
@@ -611,7 +612,7 @@ class StrategicSessionCommandExecute(BaseModel):
 
 
 class StrategicResidentSessionStart(BaseModel):
-    runner_id: str | None = None
+    runner_id: uuid.UUID | None = None
     expected_interaction_mode: Literal["continuous"] | None = None
     allow_no_runner: bool = False
 
@@ -3691,14 +3692,36 @@ async def start_project_strategic_resident_session(
         project_id, current_user["user_id"], session, "member"
     )
     data = payload or StrategicResidentSessionStart()
+    explicit_manual_runner = (
+        str(data.runner_id)
+        if data.runner_id is not None
+        and data.expected_interaction_mode is None
+        else None
+    )
+    can_override_pause = False
+    if explicit_manual_runner is not None:
+        caller_role = await _get_user_project_role(
+            project_id,
+            current_user["user_id"],
+            session,
+        )
+        can_override_pause = _project_role_allows(caller_role, "owner")
     try:
         snapshot = await start_resident_session(
             session,
             project,
             operator_user_id=current_user["user_id"],
-            runner_id=data.runner_id,
+            runner_id=str(data.runner_id) if data.runner_id is not None else None,
             expected_interaction_mode=data.expected_interaction_mode,
             allow_no_runner=data.allow_no_runner,
+            # Only an explicitly selected device on an intentional manual start
+            # gets the pause override. Hydration/background ensures supply an
+            # expected mode, while auto-picked/no-runner starts and cadence
+            # callers keep the default pause fence. Archive and active one-shot
+            # writers remain blocking even for a pinned manual start.
+            allow_paused_project=(
+                explicit_manual_runner is not None and can_override_pause
+            ),
         )
     except _ResidentEnsureModeChanged:
         snapshot = await authoritative_resident_session_snapshot(session, project)
