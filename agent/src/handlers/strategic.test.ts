@@ -90,6 +90,7 @@ const {
     'clearLogBuffer',
     'clearToolTrace',
     'cloneWithRetry',
+    'cleanupWorkspaceOnProcessExit',
     'codexStreamHasTurnCompleted',
     'collectFixLoopEventsForFlush',
     'computePromptFingerprint',

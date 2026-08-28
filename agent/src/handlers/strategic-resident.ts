@@ -4768,17 +4768,11 @@ export async function handleStrategicResident(
       if (
         dispatchAttempt.status === 'rejected'
         || dispatchAttempt.value.result.processGone
-        || dispatchAttempt.value.completion === null
       ) {
         if (dispatchAttempt.status === 'rejected') {
           sendLog(
             ws,
             `[resident] typed Fast rejected local staging; replacing child and retrying exact claim once: ${sanitize(String(dispatchAttempt.reason))}\n`,
-          );
-        } else if (dispatchAttempt.value.completion === null) {
-          sendLog(
-            ws,
-            '[resident] typed Fast omitted receipt-bound completion; replacing child and retrying exact claim once\n',
           );
         }
         typedController.replaceAfterCrash();
@@ -4909,13 +4903,23 @@ export async function handleStrategicResident(
   ): Promise<'stop' | 'continue'> => {
     const partition = partitionInboundMessages(msgs);
     const fastMessages = partition.fast;
+    const freshFastMessages = fastMessages.filter((message) => (
+      typeof message.id !== 'string'
+      || !pendingTypedFastFallbackMessageIds.has(message.id.trim())
+    ));
     // Fast is the typed public-reply owner.  Do not silently fall through to
     // the ordinary Workday reply path if it is unavailable or needs research:
     // that would reintroduce two competing conversational owners.
-    const typedOutcome = fastMessages.length > 0
-      ? hasPendingTypedFastFallback(fastMessages)
+    // A fallback handoff is exact to the abandoned claim's message ids. If a
+    // newer canonical row joined the poll while Workday was busy, dispatch only
+    // that fresh subset through Fast first; the completed-row path below rolls
+    // admission back so the older fallback is re-polled on its own. Treating an
+    // existential match as permission for the whole page would silently hand a
+    // never-abandoned Fast row to Workday.
+    const typedOutcome = freshFastMessages.length > 0
+      ? await tryHandleTypedFastTurn(freshFastMessages)
+      : fastMessages.length > 0
         ? 'fallback_admissible'
-        : await tryHandleTypedFastTurn(fastMessages)
       : 'not_available';
     // Once Coordinator confirms the exact Fast claim was abandoned and legacy
     // fallback is admissible, there is no competing public owner. Hand the
@@ -5022,9 +5026,17 @@ export async function handleStrategicResident(
       return 'continue';
     }
     const pickupLagMs = computePickupLagMs(workdayMessages);
-    const directExecution = workdayMessages.some(
-      message => message.context?._direct_workday_execution === true,
-    );
+    // A server-confirmed Fast abandon is itself qualification for the deeper
+    // Workday lane: Fast proved it could not produce the receipt-bound public
+    // response, so imposing the ordinary interactive hard cap here can kill
+    // the research/tool turn that fallback exists to perform. Keep normal chat
+    // on the responsive budget and grant only this exact coordinator-confirmed
+    // fallback (or an explicitly qualified direct request) the bounded deeper
+    // allowance.
+    const directExecution = typedOutcome === 'fallback_admissible'
+      || workdayMessages.some(
+        message => message.context?._direct_workday_execution === true,
+      );
     setResidentActivity(
       'working',
       `Responding to ${workdayMessages.length} operator message${workdayMessages.length === 1 ? '' : 's'}`,
