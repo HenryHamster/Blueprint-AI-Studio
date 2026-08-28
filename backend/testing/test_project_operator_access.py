@@ -408,6 +408,13 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
         )
 
     assert response.status_code == 201, response.text
+    assert response.json()["direction_id"] == "d-exact"
+    assert response.json()["criterion_ids"] == criterion_ids
+    assert response.json()["criterion_ids_explicit"] is True
+    assert response.json()["criterion_release_version_id"] == str(version.id)
+    assert response.json()["depends_on"] == [str(predecessor.id)]
+    assert response.json()["require_deps_landed_on"] == "automain"
+    assert response.json()["release_base_branch"] == "automain"
     created = await db_session.get(Task, uuid.UUID(response.json()["id"]))
     assert created is not None
     assert created.status == TaskStatus.QUEUED

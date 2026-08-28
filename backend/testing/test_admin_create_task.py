@@ -310,6 +310,11 @@ async def test_paused_create_atomically_persists_exact_task_authority(
     )
 
     assert response.status_code == 200, response.text
+    assert response.json()["direction_id"] == "d-atomic"
+    assert response.json()["criterion_ids"] == criterion_ids
+    assert response.json()["criterion_ids_explicit"] is True
+    assert response.json()["depends_on"] == [str(predecessor.id)]
+    assert response.json()["criterion_release_version_id"] == str(version.id)
     created = await db_session.get(Task, response.json()["id"])
     assert created is not None
     assert created.status == TaskStatus.QUEUED
@@ -318,6 +323,15 @@ async def test_paused_create_atomically_persists_exact_task_authority(
     assert created.context["direction_id"] == "d-atomic"
     assert created.context["criterion_ids_explicit"] is True
     assert created.context["criterion_release_version_id"] == str(version.id)
+    assert created.context["_operator_task_creation_authority"] == {
+        "direction_id": "d-atomic",
+        "criterion_ids": criterion_ids,
+        "criterion_ids_explicit": True,
+        "criterion_release_version_id": str(version.id),
+        "depends_on": [str(predecessor.id)],
+        "require_deps_landed_on": "automain",
+        "release_base_branch": "automain",
+    }
     assert created.context["_structural_depends_on_ids"] == [str(predecessor.id)]
     assert created.first_payload["require_deps_landed_on"] == "automain"
     assert created.first_payload["release_base_branch"] == "automain"
@@ -360,6 +374,14 @@ async def test_atomic_create_rejects_invalid_criterion_and_cross_project_depende
         direction_key="d-guards",
         status="active",
         data={"id": "d-guards", "status": "active"},
+        criterion_keys=[],
+    )
+    other_direction = Direction(
+        project_id=project.id,
+        direction_key="d-other",
+        status="active",
+        data={"id": "d-other", "status": "active"},
+        criterion_keys=["c-other-direction"],
     )
     staged_direction = Direction(
         project_id=project.id,
@@ -379,10 +401,41 @@ async def test_atomic_create_rejects_invalid_criterion_and_cross_project_depende
         payloads=[{"type": "create", "prompt": "cancelled", "base_branch": "main"}],
     )
     db_session.add_all(
-        [version, direction, staged_direction, foreign_task, cancelled_task]
+        [
+            version,
+            direction,
+            other_direction,
+            VersionAcceptanceCriterion(
+                project_id=project.id,
+                release_version_id=version.id,
+                criterion_key="c-other-direction",
+                status="active",
+                text="Owned by another direction",
+            ),
+            staged_direction,
+            foreign_task,
+            cancelled_task,
+        ]
     )
     await db_session.commit()
     await db_session.refresh(foreign_task)
+    cycle_a = Task(
+        project_id=project.id,
+        title="Cycle A",
+        payloads=[{"type": "create", "prompt": "a", "base_branch": "main"}],
+    )
+    cycle_b = Task(
+        project_id=project.id,
+        title="Cycle B",
+        payloads=[{"type": "create", "prompt": "b", "base_branch": "main"}],
+    )
+    db_session.add_all([cycle_a, cycle_b])
+    await db_session.commit()
+    await db_session.refresh(cycle_a)
+    await db_session.refresh(cycle_b)
+    cycle_a.depends_on = [str(cycle_b.id)]
+    cycle_b.depends_on = [str(cycle_a.id)]
+    await db_session.commit()
     initial_project_task_count = await _count_tasks(db_session, project.id)
 
     body = {
@@ -400,6 +453,11 @@ async def test_atomic_create_rejects_invalid_criterion_and_cross_project_depende
     }
     invalid_criterion = await client.post("/api/admin/tasks", json=body)
     assert invalid_criterion.status_code == 400, invalid_criterion.text
+
+    body["criterion_ids"] = ["c-other-direction"]
+    wrong_direction_criterion = await client.post("/api/admin/tasks", json=body)
+    assert wrong_direction_criterion.status_code == 400
+    assert "criterion_ids_outside_direction" in wrong_direction_criterion.text
 
     staged_body = {
         **body,
@@ -421,6 +479,11 @@ async def test_atomic_create_rejects_invalid_criterion_and_cross_project_depende
     cancelled_dependency = await client.post("/api/admin/tasks", json=body)
     assert cancelled_dependency.status_code == 400, cancelled_dependency.text
     assert "terminal non-success" in cancelled_dependency.text
+
+    body["depends_on"] = [str(cycle_a.id)]
+    cyclic_dependency = await client.post("/api/admin/tasks", json=body)
+    assert cyclic_dependency.status_code == 400, cyclic_dependency.text
+    assert "cyclic prerequisite set" in cyclic_dependency.text
     assert await _count_tasks(db_session, project.id) == initial_project_task_count
 
 
@@ -450,6 +513,50 @@ async def test_idempotency_replay_rejects_different_task_authority(
     assert replay.status_code == 409, replay.text
     assert "different authority" in replay.text
     assert await _count_tasks(db_session, project.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotency_replay_uses_immutable_creation_authority(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_with_member(db_session, "acme/idempotent-snapshot")
+    original_dep = Task(
+        project_id=project.id,
+        title="Original dependency",
+        payloads=[{"type": "create", "prompt": "original", "base_branch": "main"}],
+    )
+    replacement_dep = Task(
+        project_id=project.id,
+        title="Replacement dependency",
+        payloads=[{"type": "create", "prompt": "replacement", "base_branch": "main"}],
+    )
+    db_session.add_all([original_dep, replacement_dep])
+    await db_session.commit()
+    body = {
+        "github_repo": "acme/idempotent-snapshot",
+        "project_id": str(project.id),
+        "title": "Stable dependency request",
+        "prompt": "Create exactly once.",
+        "task_type": "create",
+        "idempotency_key": "stable-dependency-authority",
+        "depends_on": [str(original_dep.id)],
+        "acceptance_evidence": _CODE_EVIDENCE,
+    }
+    first = await client.post("/api/admin/tasks", json=body)
+    assert first.status_code == 200, first.text
+    created = await db_session.get(Task, first.json()["id"])
+    assert created is not None
+
+    # Runtime dependency remapping must not change what an idempotency replay
+    # compares against: the request identity is the admitted snapshot.
+    created.depends_on = [str(replacement_dep.id)]
+    await db_session.commit()
+
+    replay = await client.post("/api/admin/tasks", json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["is_duplicate"] is True
+    assert replay.json()["id"] == first.json()["id"]
+    assert replay.json()["depends_on"] == [str(original_dep.id)]
 
 
 @pytest.mark.asyncio

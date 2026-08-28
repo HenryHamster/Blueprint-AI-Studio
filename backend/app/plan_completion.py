@@ -673,18 +673,38 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # record_task_merge_evidence falls back to direction lookup at merge time.
     _plan_criterion_ids: list[str] = []
     from app.acceptance_criteria import (
+        EXPLICIT_CRITERION_IDS_CONTEXT_KEY as _EXPLICIT_CRITERION_IDS_KEY,
         direction_criterion_release_version_id as _direction_criterion_version,
+        filter_active_criterion_keys as _filter_active,
         resolve_task_criterion_release_version_id as _resolve_criterion_version,
         task_criterion_release_version_id as _task_criterion_version,
     )
 
+    _plan_criteria_are_explicit = (
+        (task.context or {}).get(_EXPLICIT_CRITERION_IDS_KEY) is True
+    )
     _plan_criterion_release_version_id = _task_criterion_version(task)
     _plan_version_was_explicit = _plan_criterion_release_version_id is not None
     if _plan_criterion_release_version_id is None:
         _plan_criterion_release_version_id = await _resolve_criterion_version(
             session, task, task.project_id
         )
-    if parent_direction_id:
+    if _plan_criteria_are_explicit:
+        _plan_criterion_ids = list(task.criterion_ids or [])
+        try:
+            if _plan_criterion_release_version_id is not None:
+                _plan_criterion_ids = await _filter_active(
+                    session,
+                    task.project_id,
+                    list(task.criterion_ids or []),
+                    release_version_id=_plan_criterion_release_version_id,
+                )
+        except Exception:  # noqa: BLE001, TRY400 - preserve admitted exact scope
+            logger.debug(
+                "[PLAN] explicit criterion_ids filtering failed for task %s",
+                task.id,
+            )
+    elif parent_direction_id:
         try:
             from app.directions_repo import get_direction_row as _get_dir_row
 
@@ -701,9 +721,6 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                     )
                 )
             ):
-                from app.acceptance_criteria import (
-                    filter_active_criterion_keys as _filter_active,
-                )
                 if _plan_criterion_release_version_id is not None:
                     _cached_ids = await _filter_active(
                         session,
@@ -1221,6 +1238,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                         )
                     }
                     if _plan_criterion_release_version_id is not None
+                    else {}
+                ),
+                **(
+                    {_EXPLICIT_CRITERION_IDS_KEY: True}
+                    if _plan_criteria_are_explicit
                     else {}
                 ),
                 **(

@@ -55,6 +55,11 @@ CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
 # broader direction.
 EXPLICIT_CRITERION_IDS_CONTEXT_KEY = "criterion_ids_explicit"
 
+# Server-owned immutable snapshot of operator task-creation authority. Runtime
+# task mutation may change scheduling fields, but replay and receipt semantics
+# remain anchored to this request-time record.
+OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY = "_operator_task_creation_authority"
+
 
 def normalize_evidence_contract(raw: Any) -> dict[str, Any] | None:
     """Return a supported closed machine-contract shape for qualification."""

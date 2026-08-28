@@ -10,13 +10,77 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.acceptance_criteria import (
+    CRITERION_RELEASE_VERSION_CONTEXT_KEY,
     EXPLICIT_CRITERION_IDS_CONTEXT_KEY,
+    OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY,
     filter_active_criterion_keys,
 )
 from app.directions_repo import get_direction_row
 from app.models import Project, Task, TASK_OUTCOME_TERMINAL_STATUSES, TaskStatus
 from app.orchestrator_health import _same_base_branch_value
 from app.release_version import current_open_version
+
+
+def build_task_creation_authority_snapshot(
+    authority: "TaskCreationAuthority",
+    *,
+    criterion_ids_explicit: bool,
+    require_deps_landed_on: str | None,
+    release_base_branch: str | None,
+) -> dict[str, object]:
+    """Return the immutable request authority used by idempotent replays."""
+
+    return {
+        "direction_id": authority.direction_id,
+        "criterion_ids": list(authority.criterion_ids),
+        "criterion_ids_explicit": criterion_ids_explicit,
+        "criterion_release_version_id": (
+            str(authority.criterion_release_version_id)
+            if authority.criterion_release_version_id is not None
+            else None
+        ),
+        "depends_on": list(authority.depends_on),
+        "require_deps_landed_on": require_deps_landed_on,
+        "release_base_branch": release_base_branch,
+    }
+
+
+def task_creation_authority_receipt(task: Task) -> dict[str, object]:
+    """Return creation-time authority, falling back for pre-snapshot rows."""
+
+    context = task.context or {}
+    stored = context.get(OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY)
+    if isinstance(stored, dict):
+        authority = dict(stored)
+    else:
+        first_payload = task.first_payload or {}
+        authority = {
+            "direction_id": context.get("direction_id")
+            or first_payload.get("direction_id"),
+            "criterion_ids": list(task.criterion_ids or []),
+            "criterion_ids_explicit": (
+                context.get(EXPLICIT_CRITERION_IDS_CONTEXT_KEY) is True
+            ),
+            "criterion_release_version_id": context.get(
+                CRITERION_RELEASE_VERSION_CONTEXT_KEY
+            ),
+            "depends_on": list(task.depends_on or []),
+            "require_deps_landed_on": first_payload.get(
+                "require_deps_landed_on"
+            ),
+            "release_base_branch": first_payload.get("release_base_branch"),
+        }
+    return {
+        "direction_id": authority.get("direction_id"),
+        "criterion_ids": list(authority.get("criterion_ids") or []),
+        "criterion_ids_explicit": authority.get("criterion_ids_explicit") is True,
+        "criterion_release_version_id": authority.get(
+            "criterion_release_version_id"
+        ),
+        "depends_on": list(authority.get("depends_on") or []),
+        "require_deps_landed_on": authority.get("require_deps_landed_on"),
+        "release_base_branch": authority.get("release_base_branch"),
+    }
 
 
 @dataclass(frozen=True)
@@ -40,24 +104,21 @@ def reject_idempotent_task_authority_mismatch(
 ) -> None:
     """Reject an idempotency replay that names different task authority."""
 
-    first_payload = existing.first_payload or {}
-    context = existing.context or {}
+    authority = task_creation_authority_receipt(existing)
     expected_depends_on = [str(dep_id) for dep_id in depends_on]
     expected_criteria = list(criterion_ids or [])
     mismatches: list[str] = []
-    if first_payload.get("direction_id") != direction_id:
+    if authority["direction_id"] != direction_id:
         mismatches.append("direction_id")
-    if list(existing.criterion_ids or []) != expected_criteria:
+    if authority["criterion_ids"] != expected_criteria:
         mismatches.append("criterion_ids")
-    if (
-        context.get(EXPLICIT_CRITERION_IDS_CONTEXT_KEY) is True
-    ) != (criterion_ids is not None):
+    if authority["criterion_ids_explicit"] != (criterion_ids is not None):
         mismatches.append("criterion_ids_mode")
-    if list(existing.depends_on or []) != expected_depends_on:
+    if authority["depends_on"] != expected_depends_on:
         mismatches.append("depends_on")
-    if first_payload.get("require_deps_landed_on") != require_deps_landed_on:
+    if authority["require_deps_landed_on"] != require_deps_landed_on:
         mismatches.append("require_deps_landed_on")
-    if first_payload.get("release_base_branch") != release_base_branch:
+    if authority["release_base_branch"] != release_base_branch:
         mismatches.append("release_base_branch")
     if mismatches:
         raise HTTPException(
@@ -86,6 +147,7 @@ async def prepare_task_creation_authority(
     subset of a broader direction without claiming unrelated acceptance work.
     """
 
+    direction = None
     if direction_id is not None:
         direction = await get_direction_row(session, project.id, direction_id)
         if direction is None:
@@ -133,6 +195,22 @@ async def prepare_task_creation_authority(
                         "reason": "criterion is unknown or inactive for the open version",
                     },
                 )
+            if direction is not None:
+                direction_keys = set(direction.criterion_keys or [])
+                outside_direction = [
+                    key
+                    for key in normalized_criterion_ids
+                    if key not in direction_keys
+                ]
+                if outside_direction:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": "criterion_ids_outside_direction",
+                            "direction_id": direction_id,
+                            "keys": outside_direction,
+                        },
+                    )
 
     normalized_depends_on = [str(dep_id) for dep_id in depends_on]
     if len(set(normalized_depends_on)) != len(normalized_depends_on):
@@ -193,6 +271,13 @@ async def prepare_task_creation_authority(
                         "Align the base branches or declare require_deps_landed_on."
                     ),
                 )
+        await _reject_dependency_cycles(
+            session,
+            project_id=project.id,
+            foundations=[
+                dependencies_by_id[dep_id] for dep_id in normalized_depends_on
+            ],
+        )
 
     return TaskCreationAuthority(
         direction_id=direction_id,
@@ -200,3 +285,67 @@ async def prepare_task_creation_authority(
         criterion_release_version_id=criterion_release_version_id,
         depends_on=normalized_depends_on,
     )
+
+
+async def _reject_dependency_cycles(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    foundations: list[Task],
+) -> None:
+    """Reject a dependency set that already contains a reachable cycle."""
+
+    if not foundations:
+        return
+    cache: dict[str, Task] = {str(task.id): task for task in foundations}
+
+    async def _has_cycle(task: Task, path: set[str]) -> bool:
+        task_id = str(task.id)
+        if task_id in path:
+            return True
+        path.add(task_id)
+        for raw_dep_id in task.depends_on or []:
+            try:
+                dep_id = str(uuid.UUID(str(raw_dep_id)))
+            except (ValueError, AttributeError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "depends_on prerequisite graph contains an invalid task "
+                        f"ID: {raw_dep_id!r}"
+                    ),
+                ) from None
+            dependency = cache.get(dep_id)
+            if dependency is None:
+                dependency = (
+                    await session.execute(
+                        select(Task).where(
+                            Task.id == uuid.UUID(dep_id),
+                            Task.project_id == project_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if dependency is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "depends_on prerequisite graph contains a missing or "
+                            f"cross-project task: {dep_id}"
+                        ),
+                    )
+                cache[dep_id] = dependency
+            if await _has_cycle(dependency, path):
+                return True
+        path.discard(task_id)
+        return False
+
+    for foundation in foundations:
+        if await _has_cycle(foundation, set()):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "depends_on declares a cyclic prerequisite set (a "
+                    "prerequisite transitively depends on itself); remove the "
+                    "cyclic edges"
+                ),
+            )

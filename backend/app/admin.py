@@ -127,12 +127,15 @@ from app.admin_task_mutations import (
 )
 from app.admin_task_contracts import CreateTaskPayload
 from app.admin_task_admission import (
+    build_task_creation_authority_snapshot,
     prepare_task_creation_authority,
     reject_idempotent_task_authority_mismatch,
+    task_creation_authority_receipt,
 )
 from app.acceptance_criteria import (
     CRITERION_RELEASE_VERSION_CONTEXT_KEY,
     EXPLICIT_CRITERION_IDS_CONTEXT_KEY,
+    OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY,
 )
 from app.depends_on_provenance import remember_structural_depends_on
 from app.direct_research_spawn import enrich_direct_research_payload
@@ -3059,6 +3062,7 @@ async def create_task_manually(
                 "task_type": _task_payload_dict(existing).get("type", "create"),
                 "vm_instance_id": existing.vm_instance_id,
                 "is_duplicate": True,
+                **task_creation_authority_receipt(existing),
             }
 
     # Guard: cap active tasks per project to prevent queue explosion. This is
@@ -3140,6 +3144,14 @@ async def create_task_manually(
             )
             if admission.existing_task is not None:
                 existing = admission.existing_task
+                reject_idempotent_task_authority_mismatch(
+                    existing,
+                    direction_id=payload.direction_id,
+                    criterion_ids=payload.criterion_ids,
+                    depends_on=payload.depends_on,
+                    require_deps_landed_on=payload.require_deps_landed_on,
+                    release_base_branch=payload.release_base_branch,
+                )
                 await session.commit()
                 return {
                     "id": str(existing.id),
@@ -3149,6 +3161,7 @@ async def create_task_manually(
                     "task_type": _task_payload_dict(existing).get("type", "review"),
                     "vm_instance_id": existing.vm_instance_id,
                     "is_duplicate": True,
+                    **task_creation_authority_receipt(existing),
                 }
             if admission.allowed and admission.review_target is not None:
                 direct_review_loop = {
@@ -3177,6 +3190,14 @@ async def create_task_manually(
         authority_context[CRITERION_RELEASE_VERSION_CONTEXT_KEY] = str(
             creation_authority.criterion_release_version_id
         )
+    authority_context[OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY] = (
+        build_task_creation_authority_snapshot(
+            creation_authority,
+            criterion_ids_explicit=payload.criterion_ids is not None,
+            require_deps_landed_on=payload.require_deps_landed_on,
+            release_base_branch=payload.release_base_branch,
+        )
+    )
 
     new_task = Task(
         id=new_task_id,
@@ -3259,6 +3280,7 @@ async def create_task_manually(
                     "task_type": _task_payload_dict(existing).get("type", "create"),
                     "vm_instance_id": existing.vm_instance_id,
                     "is_duplicate": True,
+                    **task_creation_authority_receipt(existing),
                 }
         raise
     await session.refresh(new_task)
@@ -3284,6 +3306,7 @@ async def create_task_manually(
         "status": new_task.status,
         "task_type": payload.task_type.value,
         "vm_instance_id": new_task.vm_instance_id,
+        **task_creation_authority_receipt(new_task),
     }
 
 

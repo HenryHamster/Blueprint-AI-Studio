@@ -363,6 +363,13 @@ def _operator_task_receipt(value: Any) -> dict[str, Any]:
             "requires_approval",
             "is_duplicate",
             "idempotent",
+            "direction_id",
+            "criterion_ids",
+            "criterion_ids_explicit",
+            "criterion_release_version_id",
+            "depends_on",
+            "require_deps_landed_on",
+            "release_base_branch",
         )
         if key in source
     }
