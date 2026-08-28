@@ -3300,6 +3300,178 @@ async def test_set_acceptance_criteria_op_retracts_criterion(
 
 
 @pytest.mark.asyncio
+async def test_set_acceptance_criteria_op_rewrites_strategist_text_in_place(
+    client: AsyncClient, db_session
+):
+    """A strategist can correct its active criterion without changing its key."""
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "RewriteStrategicCriterion")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Stale measurable contract",
+        created_by="strategist",
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-rewrite-op",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-rewrite-op", task_type="strategic_review"
+    )
+    payload = {
+        "task_id": str(task.id),
+        "op": "set_acceptance_criteria",
+        "data": {
+            "criteria": [
+                {
+                    "criterion_key": criterion.criterion_key,
+                    "expected_text": "Stale measurable contract",
+                    "text": "Corrected measurable duration contract",
+                }
+            ]
+        },
+    }
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=payload,
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["criteria"][0]
+    assert item["criterion_key"] == criterion.criterion_key
+    assert item["is_new"] is False
+    assert item["text_updated"] is True
+
+    await db_session.refresh(criterion)
+    assert criterion.text == "Corrected measurable duration contract"
+    rows = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.release_version_id == version.id
+            )
+        )
+    ).scalars().all()
+    assert [row.criterion_key for row in rows] == [criterion.criterion_key]
+
+    replay = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=payload,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["criteria"][0]["text_updated"] is False
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_op_refuses_non_strategist_rewrite(
+    client: AsyncClient, db_session
+):
+    """The rewrite path preserves operator ownership of criterion prose."""
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "RefuseOperatorCriterionRewrite")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Operator-owned contract",
+        created_by="operator",
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-refuse-rewrite",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(
+        str(task.id), "agent-vm-refuse-rewrite", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "expected_text": "Operator-owned contract",
+                        "text": "Loop attempted replacement",
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    await db_session.refresh(criterion)
+    assert criterion.text == "Operator-owned contract"
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_op_fences_stale_rewrite(
+    client: AsyncClient, db_session
+):
+    """A stale strategist read cannot overwrite a newer criterion revision."""
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "FenceStaleCriterionRewrite")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Current contract",
+        created_by="strategist",
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-stale-rewrite",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(
+        str(task.id), "agent-vm-stale-rewrite", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "expected_text": "Older contract",
+                        "text": "Late replacement",
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    await db_session.refresh(criterion)
+    assert criterion.text == "Current contract"
+
+
+@pytest.mark.asyncio
 async def test_loop_cannot_retract_operator_authored_criterion(
     client: AsyncClient, db_session
 ):
