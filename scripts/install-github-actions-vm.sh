@@ -75,6 +75,16 @@ validate_ssh_key_files() {
   [[ "$key_mode" == "600" || "$key_mode" == "400" ]] || die "SSH private key mode must be 0600 or 0400"
 }
 
+verify_user_lingering() {
+  local linger_state user_name
+  user_name="$(id -un)"
+  if ! linger_state="$(loginctl show-user "$user_name" --property=Linger --value 2>/dev/null)"; then
+    die "unable to verify systemd user lingering; run 'sudo loginctl enable-linger $user_name' and retry"
+  fi
+  [[ "$linger_state" == yes ]] \
+    || die "systemd user lingering is $linger_state; run 'sudo loginctl enable-linger $user_name' and retry"
+}
+
 ssh_arguments() {
   validate_ssh_key_files
   [[ "$BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY" != *","* ]] \
@@ -315,7 +325,19 @@ status() {
 }
 
 container_status() {
-  docker inspect --format '{{.State.Status}}' "$1" 2>/dev/null || printf 'absent\n'
+  local name="$1" status listing listed_name
+  if status="$(docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null)"; then
+    printf '%s\n' "$status"
+    return 0
+  fi
+  if ! listing="$(docker container ls --all --format '{{.Names}}')"; then
+    die "unable to list containers while resolving state for $name"
+  fi
+  while IFS= read -r listed_name; do
+    [[ "$listed_name" != "$name" ]] \
+      || die "unable to inspect existing container state: $name"
+  done <<< "$listing"
+  printf 'absent\n'
 }
 
 container_is_stopped() {
@@ -374,6 +396,8 @@ install_control() {
   validate_control_path control_environment "$CONTROL_ENV_PATH"
   validate_control_path control_unit "$CONTROL_UNIT_PATH"
   require_command systemctl
+  require_command loginctl
+  verify_user_lingering
 
   [[ ! -L "$CONTROL_ENV_PATH" ]] || die "refusing symlinked control environment file"
   [[ ! -L "$CONTROL_UNIT_PATH" ]] || die "refusing symlinked control unit"

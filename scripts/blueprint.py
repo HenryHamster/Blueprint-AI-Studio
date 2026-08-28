@@ -276,7 +276,15 @@ def _projects_set_paused(args: argparse.Namespace, *, paused: bool) -> None:
         f"/api/admin/projects/{project_id}/pause",
         {"paused": paused},
     )
-    result = result if isinstance(result, dict) else {}
+    if not isinstance(result, dict) or result.get("paused") is not paused:
+        observed = result.get("paused") if isinstance(result, dict) else None
+        print(
+            f"ERROR: server did not confirm projects {action}; "
+            f"expected paused={json.dumps(paused)}, "
+            f"received paused={json.dumps(observed)}.",
+            file=sys.stderr,
+        )
+        raise APIError(f"projects {action} readback mismatch")
     output = {
         "project_id": project_id,
         "paused": result.get("paused"),
@@ -9698,14 +9706,14 @@ def _resolve_windows_cli(name: str) -> str:
         return executable
     if sys.platform == "win32":
         program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        gh_candidates = [program_files / "GitHub CLI" / "gh.exe"]
+        if local_app_data and Path(local_app_data).is_absolute():
+            gh_candidates.append(
+                Path(local_app_data) / "Programs" / "GitHub CLI" / "gh.exe"
+            )
         candidates = {
-            "gh": (
-                program_files / "GitHub CLI" / "gh.exe",
-                Path(os.environ.get("LOCALAPPDATA", ""))
-                / "Programs"
-                / "GitHub CLI"
-                / "gh.exe",
-            ),
+            "gh": tuple(gh_candidates),
             "ssh": (
                 Path(os.environ.get("SystemRoot", r"C:\Windows"))
                 / "System32"

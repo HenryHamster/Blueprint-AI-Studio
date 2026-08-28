@@ -82,9 +82,12 @@ export BLUEPRINT_ACTIONS_VM_SSH_PRIVATE_KEY="$HOME/.ssh/blueprint-actions-vm"
 ```
 
 `install-control` verifies the existing state, host image identity, KVM device,
-and non-symlinked key files. It writes only paths and resource settings to the
-mode-0600 `~/.blueprint/github-actions-vm-control.env`, installs and enables the
-user unit, and deliberately does not start or restart the guest. The invoking
+non-symlinked key files, and `Linger=yes` for the invoking systemd user. If
+lingering is disabled, run `sudo loginctl enable-linger "$USER"` and retry;
+without it the user manager cannot recover the guest at boot before login. The
+command writes only paths and resource settings to the mode-0600
+`~/.blueprint/github-actions-vm-control.env`, installs and enables the user
+unit, and deliberately does not start or restart the guest. The invoking
 checkout path is recorded in the profile, so run it from the durable checkout,
 not an expendable worktree.
 

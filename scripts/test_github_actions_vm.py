@@ -186,6 +186,11 @@ class AssetSecurityTests(unittest.TestCase):
                 #!/usr/bin/env bash
                 set -euo pipefail
                 printf '%s\n' "$*" >> "$BLUEPRINT_TEST_DOCKER_LOG"
+                if [[ "${BLUEPRINT_TEST_DOCKER_UNAVAILABLE:-0}" == 1 ]] \
+                    && { [[ "${1:-}" == inspect ]] \
+                      || [[ "${1:-} ${2:-}" == "container ls" ]]; }; then
+                  exit 125
+                fi
                 state_of() {
                   local path="$BLUEPRINT_TEST_DOCKER_STATE/$1"
                   if [[ -f "$path" ]]; then cat "$path"; else printf 'absent\n'; fi
@@ -199,9 +204,20 @@ class AssetSecurityTests(unittest.TestCase):
                     printf 'sha256:test\n'
                     ;;
                   container)
-                    [[ "${2:-}" == inspect ]] || exit 2
-                    name="${@: -1}"
-                    [[ "$(state_of "$name")" != absent ]]
+                    case "${2:-}" in
+                      inspect)
+                        name="${@: -1}"
+                        [[ "$(state_of "$name")" != absent ]]
+                        ;;
+                      ls)
+                        for path in "$BLUEPRINT_TEST_DOCKER_STATE"/*; do
+                          [[ -f "$path" ]] || continue
+                          name="$(basename -- "$path")"
+                          [[ "$(state_of "$name")" == absent ]] || printf '%s\n' "$name"
+                        done
+                        ;;
+                      *) exit 2 ;;
+                    esac
                     ;;
                   inspect)
                     name="${@: -1}"
@@ -251,6 +267,19 @@ class AssetSecurityTests(unittest.TestCase):
             encoding="utf-8",
         )
         systemctl.chmod(0o755)
+        loginctl = mock_bin / "loginctl"
+        loginctl.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env bash
+                [[ "${1:-}" == show-user ]] || exit 2
+                [[ "${BLUEPRINT_TEST_LINGER_STATE:-yes}" != unavailable ]] || exit 1
+                printf '%s\n' "${BLUEPRINT_TEST_LINGER_STATE:-yes}"
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        loginctl.chmod(0o755)
 
         environment = os.environ.copy()
         environment.update(
@@ -344,6 +373,29 @@ class AssetSecurityTests(unittest.TestCase):
                 self.assertNotRegex(calls, r"(?m)^(run|stop|rm) ")
 
     @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_recover_and_stop_fail_closed_when_docker_state_probe_is_unavailable(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        for command in ("recover", "stop"):
+            with tempfile.TemporaryDirectory() as temporary:
+                environment, docker_log, _systemctl_log, _state_root = (
+                    self._host_control_harness(
+                        temporary, firewall_status="running", qemu_status="running"
+                    )
+                )
+                environment["BLUEPRINT_TEST_DOCKER_UNAVAILABLE"] = "1"
+                result = subprocess.run(
+                    ["bash", str(installer), command],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unable to list containers", result.stderr)
+                calls = docker_log.read_text(encoding="utf-8")
+                self.assertNotRegex(calls, r"(?m)^(run|stop|rm) ")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
     def test_install_control_persists_exact_profile_without_starting(self):
         installer = Path(__file__).parent / "install-github-actions-vm.sh"
         with tempfile.TemporaryDirectory() as temporary:
@@ -352,6 +404,7 @@ class AssetSecurityTests(unittest.TestCase):
                     temporary, firewall_status="absent", qemu_status="absent"
                 )
             )
+            environment["BLUEPRINT_TEST_LINGER_STATE"] = "yes"
             result = subprocess.run(
                 ["bash", str(installer), "install-control"],
                 env=environment,
@@ -385,6 +438,34 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertNotIn(" start ", f" {systemctl_calls} ")
             docker_calls = docker_log.read_text(encoding="utf-8")
             self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX file modes and Bash")
+    def test_install_control_requires_verified_user_lingering(self):
+        installer = Path(__file__).parent / "install-github-actions-vm.sh"
+        for linger_state, expected_error in (
+            ("no", "systemd user lingering is no"),
+            ("unavailable", "unable to verify systemd user lingering"),
+        ):
+            with tempfile.TemporaryDirectory() as temporary:
+                environment, docker_log, systemctl_log, _state_root = (
+                    self._host_control_harness(
+                        temporary, firewall_status="absent", qemu_status="absent"
+                    )
+                )
+                environment["BLUEPRINT_TEST_LINGER_STATE"] = linger_state
+                result = subprocess.run(
+                    ["bash", str(installer), "install-control"],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertIn("sudo loginctl enable-linger", result.stderr)
+                self.assertFalse(systemctl_log.exists())
+                docker_calls = docker_log.read_text(encoding="utf-8")
+                self.assertNotRegex(docker_calls, r"(?m)^(run|stop|rm) ")
 
     @unittest.skipIf(os.name == "nt", "requires POSIX symlink semantics and Bash")
     def test_install_control_rejects_symlinked_profile_destination(self):

@@ -7872,6 +7872,26 @@ def test_windows_cli_resolution_uses_standard_install_locations(
     assert blueprint._resolve_windows_cli("ssh") == str(ssh)
 
 
+@pytest.mark.parametrize("local_app_data", [None, "relative-local-app-data"])
+def test_windows_cli_resolution_never_uses_cwd_for_local_app_data(
+    monkeypatch, tmp_path, local_app_data
+):
+    checkout_executable = tmp_path / "Programs" / "GitHub CLI" / "gh.exe"
+    checkout_executable.parent.mkdir(parents=True)
+    checkout_executable.touch()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(blueprint.sys, "platform", "win32")
+    monkeypatch.setattr(blueprint.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "MissingProgramFiles"))
+    if local_app_data is None:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    else:
+        monkeypatch.setenv("LOCALAPPDATA", local_app_data)
+
+    with pytest.raises(blueprint.APIError, match="gh executable not found"):
+        blueprint._resolve_windows_cli("gh")
+
+
 def _deploy_api_fake(calls, *, promoted=None, post_failure=None):
     """Fake blueprint.api for deploy: promoted-version lookup + receipt POST."""
     if promoted is None:
@@ -9214,6 +9234,26 @@ def test_projects_resume_sends_only_paused_and_preserves_autonomy(
     assert f"project_id:             {PAUSE_PROJECT_ID}" in out
     assert "paused:                 false" in out
     assert "resident_wakeup_state:  null" in out
+
+
+@pytest.mark.parametrize(
+    "readback",
+    [None, {}, {"paused": False}, {"paused": 1}],
+    ids=["non-dict", "missing", "contradictory", "non-boolean"],
+)
+def test_projects_pause_rejects_unverified_server_readback(
+    project_pause_api, monkeypatch, capsys, readback
+):
+    monkeypatch.setattr(blueprint, "api", lambda *_args, **_kwargs: readback)
+
+    rc = blueprint.main(
+        ["projects", "pause", "--project-id", PAUSE_PROJECT_ID, "--yes"]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "server did not confirm projects pause" in err
+    assert "expected paused=true" in err
 
 
 def test_projects_pause_confirms_before_patch(
