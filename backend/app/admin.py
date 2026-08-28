@@ -4070,27 +4070,6 @@ async def create_compute_experiment_task(
             "preview": preview,
         }
 
-    active_count = (
-        await session.execute(
-            select(func.count(Task.id)).where(
-                Task.project_id == project.id,
-                Task.status.in_(
-                    [
-                        TaskStatus.QUEUED,
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                ),
-            )
-        )
-    ).scalar() or 0
-    if active_count >= 200:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Project has {active_count} active tasks (limit: 200)",
-        )
-
     scoped_idempotency_key = (
         f"admin_compute_launcher:{project.id}:{payload.idempotency_key}"
         if payload.idempotency_key
@@ -4098,7 +4077,13 @@ async def create_compute_experiment_task(
     )
 
     def _idempotent_response(existing: Task) -> dict[str, Any]:
-        if existing.first_payload != task_payload:
+        existing_forced_runner_id = (existing.context or {}).get(
+            "forced_runner_target_id"
+        )
+        if (
+            existing.first_payload != task_payload
+            or existing_forced_runner_id != forced_runner_id
+        ):
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -4143,6 +4128,27 @@ async def create_compute_experiment_task(
         )
         if existing:
             return _idempotent_response(existing)
+
+    active_count = (
+        await session.execute(
+            select(func.count(Task.id)).where(
+                Task.project_id == project.id,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                ),
+            )
+        )
+    ).scalar() or 0
+    if active_count >= 200:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Project has {active_count} active tasks (limit: 200)",
+        )
 
     spend_decision = resolve_compute_spend_decision(
         runtime_config=_runtime_config,

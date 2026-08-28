@@ -8117,6 +8117,20 @@ def _load_compute_contract(path_value: str | None) -> dict:
             file=sys.stderr,
         )
         sys.exit(1)
+    criterion = contract.get("success_criterion")
+    if isinstance(criterion, dict) and criterion.get("threshold") is not None:
+        criterion_threshold = criterion["threshold"]
+        if (
+            isinstance(criterion_threshold, bool)
+            or not isinstance(criterion_threshold, (int, float))
+            or not math.isfinite(float(criterion_threshold))
+        ):
+            print(
+                "ERROR: --contract-file success_criterion.threshold must be "
+                "a finite number.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     if "runner_target" in contract:
         runner_target = contract["runner_target"]
         if not isinstance(runner_target, dict):
@@ -8300,6 +8314,9 @@ def _compute_launch(args: argparse.Namespace) -> None:
     raw_metric = getattr(args, "metric", None)
     raw_operator = getattr(args, "operator", None)
     raw_threshold = getattr(args, "threshold", None)
+    if raw_threshold is not None and not math.isfinite(raw_threshold):
+        print("ERROR: --threshold must be a finite number.", file=sys.stderr)
+        sys.exit(1)
     raw_criterion = contract.get("success_criterion")
     success_criterion = (
         dict(raw_criterion) if isinstance(raw_criterion, dict) else None
@@ -8313,6 +8330,13 @@ def _compute_launch(args: argparse.Namespace) -> None:
     elif any(
         value is not None for value in (raw_metric, raw_operator, raw_threshold)
     ):
+        if (success_criterion or {}).get("kind") == "artifact_produced":
+            print(
+                "ERROR: --metric, --operator, and --threshold cannot override an "
+                "artifact_produced success criterion.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         success_criterion = dict(success_criterion or {})
         if raw_metric is not None:
             success_criterion["metric"] = raw_metric

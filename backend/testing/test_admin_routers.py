@@ -9500,7 +9500,8 @@ class TestComputeExperimentTaskLaunch:
 
         first = await client.post("/api/admin/tasks/compute-experiment", json=payload)
         duplicate = await client.post(
-            "/api/admin/tasks/compute-experiment", json=payload
+            "/api/admin/tasks/compute-experiment",
+            json={**payload, "runner_target_id": first_runner.hostname},
         )
         mismatch = await client.post(
             "/api/admin/tasks/compute-experiment",
@@ -9517,6 +9518,82 @@ class TestComputeExperimentTaskLaunch:
         assert detail["existing_task_id"] == first.json()["id"]
         tasks = (await db_session.execute(select(Task))).scalars().all()
         assert len(tasks) == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotency_includes_hard_runner_pin(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        first_runner = await self._enrolled_runner(
+            db_session, project.id, hostname="runner-one"
+        )
+        second_runner = await self._enrolled_runner(
+            db_session, project.id, hostname="runner-two"
+        )
+        payload = self._valid_payload(
+            idempotency_key="hard-pin-retry",
+            runner_target_id=str(first_runner.id),
+        )
+
+        first = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+        duplicate = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+        mismatch = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={**payload, "runner_target_id": str(second_runner.id)},
+        )
+
+        assert first.status_code == 200, first.text
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["id"] == first.json()["id"]
+        assert duplicate.json()["is_duplicate"] is True
+        assert mismatch.status_code == 409, mismatch.text
+        assert (
+            mismatch.json()["error"]["message"]["error"]
+            == "idempotency_key_mismatch"
+        )
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(first.json()["id"]))
+            )
+        ).scalar_one()
+        assert (task.context or {})["forced_runner_target_id"] == str(
+            first_runner.id
+        )
+
+    @pytest.mark.asyncio
+    async def test_idempotent_retry_precedes_active_task_limit(
+        self, client: AsyncClient, db_session
+    ):
+        project = await self._project_with_repo(db_session)
+        payload = self._valid_payload(idempotency_key="retry-at-cap")
+        first = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+        assert first.status_code == 200, first.text
+        db_session.add_all(
+            [
+                Task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "create", "prompt": f"filler-{index}"}],
+                )
+                for index in range(199)
+            ]
+        )
+        await db_session.commit()
+
+        duplicate = await client.post(
+            "/api/admin/tasks/compute-experiment", json=payload
+        )
+        novel = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={**payload, "idempotency_key": "novel-at-cap"},
+        )
+
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["id"] == first.json()["id"]
+        assert duplicate.json()["is_duplicate"] is True
+        assert novel.status_code == 429, novel.text
 
     @pytest.mark.asyncio
     async def test_container_fields_persist_for_runner_experiments(

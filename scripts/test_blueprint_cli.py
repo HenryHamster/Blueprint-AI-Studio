@@ -7758,6 +7758,51 @@ def test_compute_launch_criterion_flags_merge_field_by_field(
     assert body["success_criterion"] == expected
 
 
+def test_compute_launch_rejects_metric_override_of_artifact_criterion(
+    mock_api, monkeypatch, tmp_path, capsys
+):
+    contract_file = tmp_path / "artifact-criterion.json"
+    contract_file.write_text(
+        json.dumps(
+            {
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "success_criterion": {
+                    "kind": "artifact_produced",
+                    "min_file_count": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            [
+                "compute",
+                "launch",
+                "--contract-file",
+                str(contract_file),
+                "--metric",
+                "accuracy",
+                "--preview",
+            ]
+        )
+
+    assert exc.value.code == 1
+    assert "cannot override an artifact_produced" in capsys.readouterr().err
+    assert not [call for call in mock_api if call[0] == "POST"]
+
+
 @pytest.mark.parametrize(
     ("file_value", "flag_args", "expected"),
     [
@@ -7855,6 +7900,73 @@ def test_compute_launch_contract_rejects_nonfinite_numbers(
 
     assert exc.value.code == 1
     assert needle in capsys.readouterr().err
+    assert not [call for call in mock_api if call[0] == "POST"]
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf")])
+def test_compute_launch_contract_rejects_nonfinite_criterion_threshold(
+    mock_api, tmp_path, capsys, threshold
+):
+    contract_file = tmp_path / "nonfinite-criterion.json"
+    contract_file.write_text(
+        json.dumps(
+            {
+                "command": "python evaluate.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "success_criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": threshold,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            ["compute", "launch", "--contract-file", str(contract_file), "--preview"]
+    )
+
+    assert exc.value.code == 1
+    assert (
+        "success_criterion.threshold must be a finite number"
+        in capsys.readouterr().err
+    )
+    assert not [call for call in mock_api if call[0] == "POST"]
+
+
+@pytest.mark.parametrize("threshold", ["nan", "inf"])
+def test_compute_launch_rejects_nonfinite_threshold_flag(
+    mock_api, monkeypatch, capsys, threshold
+):
+    cfg = {
+        "api_url": "x",
+        "api_key": "y",
+        "default_repo": "owner/repo",
+        "default_base_branch": "main",
+    }
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: cfg)
+    monkeypatch.setattr(blueprint, "load_config", lambda: cfg)
+
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(
+            [
+                "compute",
+                "launch",
+                "--command",
+                "python evaluate.py",
+                "--metric",
+                "accuracy",
+                "--threshold",
+                threshold,
+                "--preview",
+            ]
+        )
+
+    assert exc.value.code == 1
+    assert "--threshold must be a finite number" in capsys.readouterr().err
     assert not [call for call in mock_api if call[0] == "POST"]
 
 
