@@ -1917,7 +1917,10 @@ def _read_exact_criterion_text(
     if file_name:
         path = Path(file_name).expanduser()
         try:
-            value = path.read_text(encoding="utf-8")
+            # Text mode performs universal-newline translation, including on
+            # Windows. Decode bytes explicitly so an exact CRLF compare fence
+            # and replacement remain byte-for-byte stable after UTF-8 decode.
+            value = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeError) as exc:
             print(f"ERROR: cannot read {label} file {path}: {exc}", file=sys.stderr)
             raise APIError(f"cannot read {label} file") from exc

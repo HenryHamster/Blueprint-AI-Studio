@@ -343,8 +343,8 @@ def test_project_operator_criterion_rewrite_preserves_raw_file_text(
 ):
     expected_path = tmp_path / "expected.txt"
     replacement_path = tmp_path / "replacement.txt"
-    expected_path.write_text("Old text\nwith exact newline", encoding="utf-8")
-    replacement_path.write_text("New text\nwith exact newline", encoding="utf-8")
+    expected_path.write_bytes(b"Old text\r\nwith exact newline")
+    replacement_path.write_bytes(b"New text\r\nwith exact newline")
 
     def responder(_method: str, path: str, body: dict | None) -> dict:
         assert body is not None
@@ -381,8 +381,8 @@ def test_project_operator_criterion_rewrite_preserves_raw_file_text(
         == 0
     )
     assert calls[1:][0][2] == {
-        "expected_text": "Old text\nwith exact newline",
-        "text": "New text\nwith exact newline",
+        "expected_text": "Old text\r\nwith exact newline",
+        "text": "New text\r\nwith exact newline",
     }
 
 

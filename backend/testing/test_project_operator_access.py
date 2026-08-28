@@ -204,6 +204,11 @@ def test_project_operator_scope_has_exact_positive_and_negative_matrix():
         ("POST", "/api/admin/runners"),
         ("PUT", f"/api/admin/projects/{project_id}/directions"),
         ("PATCH", f"/api/admin/projects/{project_id}/directions/{direction_id}"),
+        (
+            "PATCH",
+            f"/api/admin/projects/{project_id}/acceptance-criteria/"
+            f"{criterion_key}/text",
+        ),
         ("POST", f"/api/admin/projects/{project_id}/strategic-session/start"),
         ("POST", f"{OPERATOR_URL}/tasks/{task_id}/complete"),
         (
@@ -565,8 +570,54 @@ async def test_project_operator_rewrites_criterion_under_exact_cas_without_losin
     assert any(
         "action=criterion_text_compare_and_set" in record.message
         and _credential.principal_user_id in record.message
+        and str(_credential.id) in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_project_operator_criterion_rewrite_is_member_scoped(
+    override_get_session, db_session
+):
+    authorized = await _persist_project(db_session, name="Criterion authorized")
+    foreign = await _persist_project(
+        db_session, name="Criterion foreign", owner="foreign-owner"
+    )
+    version = ReleaseVersion(
+        project_id=foreign.id, version_number=54, status="open", phase="build"
+    )
+    criterion = VersionAcceptanceCriterion(
+        project_id=foreign.id,
+        release_version_id=version.id,
+        criterion_key="c-foreign-cas",
+        text="Foreign exact text",
+        status="active",
+        created_by="strategist",
+    )
+    db_session.add_all([version, criterion])
+    await db_session.commit()
+    _member_credential, member_token = await _seed_operator(db_session, authorized)
+    _viewer_credential, viewer_token = await _seed_operator(
+        db_session, foreign, role="viewer"
+    )
+    url = (
+        f"{OPERATOR_URL}/projects/{foreign.id}/acceptance-criteria/"
+        f"{criterion.criterion_key}/text"
+    )
+    body = {"expected_text": criterion.text, "text": "Unauthorized correction"}
+
+    async with _real_auth_client() as client:
+        foreign_denied = await client.patch(
+            url, json=body, headers=_auth(member_token)
+        )
+        viewer_denied = await client.patch(
+            url, json=body, headers=_auth(viewer_token)
+        )
+
+    assert foreign_denied.status_code == 404, foreign_denied.text
+    assert viewer_denied.status_code == 403, viewer_denied.text
+    await db_session.refresh(criterion)
+    assert criterion.text == "Foreign exact text"
 
 
 @pytest.mark.asyncio

@@ -12,13 +12,19 @@ Role-enforcement, happy path, 400/404/409 branches.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
+from sqlalchemy import text as sa_text
+from sqlalchemy.exc import DBAPIError
 from sqlmodel import select
 
 from app import acceptance_criteria as ac
+from app import release_version as release_version_module
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.models import (
     CriterionEvidence,
     Direction,
@@ -28,6 +34,10 @@ from app.models import (
     Task,
     TaskStatus,
     VersionAcceptanceCriterion,
+)
+from app.routers.admin_acceptance_criteria import (
+    RewriteCriterionTextRequest,
+    _rewrite_acceptance_criterion_text_impl,
 )
 
 TEST_USER_ID = "test-user-123"
@@ -236,6 +246,161 @@ async def test_owner_criterion_text_rewrite_rejects_duplicate_and_inactive_targe
     await db_session.refresh(inactive)
     assert target.text == "Owner corrected text"
     assert inactive.text == "Inactive text"
+
+
+@pytest.mark.asyncio
+async def test_criterion_text_rewrite_holds_open_version_lock_through_mutation(
+    db_session, monkeypatch
+):
+    if resolve_dialect_name(db_session) != "postgresql":
+        pytest.skip("release-version lock race requires PostgreSQL")
+
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-version-lock",
+        text="Text before promotion race",
+        status="active",
+        created_by="strategist",
+    )
+    db_session.add(target)
+    await db_session.commit()
+
+    compare_entered = asyncio.Event()
+    continue_compare = asyncio.Event()
+    original_compare = ac.compare_and_set_criterion_text
+
+    async def paused_compare(*args, **kwargs):
+        compare_entered.set()
+        await continue_compare.wait()
+        return await original_compare(*args, **kwargs)
+
+    monkeypatch.setattr(ac, "compare_and_set_criterion_text", paused_compare)
+
+    async def run_rewrite():
+        async with AsyncSessionLocal() as rewrite_session:
+            return await _rewrite_acceptance_criterion_text_impl(
+                project_id=project.id,
+                criterion_key=target.criterion_key,
+                body=RewriteCriterionTextRequest(
+                    expected_text="Text before promotion race",
+                    text="Text after promotion race",
+                ),
+                current_user={"user_id": TEST_USER_ID},
+                session=rewrite_session,
+            )
+
+    rewrite_task = asyncio.create_task(run_rewrite())
+    await asyncio.wait_for(compare_entered.wait(), timeout=5)
+    try:
+        async with AsyncSessionLocal() as promotion_session:
+            await promotion_session.execute(
+                sa_text("SET LOCAL lock_timeout = '250ms'")
+            )
+            with pytest.raises(DBAPIError):
+                await promotion_session.execute(
+                    select(ReleaseVersion)
+                    .where(ReleaseVersion.id == version.id)
+                    .with_for_update()
+                )
+            await promotion_session.rollback()
+    finally:
+        continue_compare.set()
+
+    receipt = await asyncio.wait_for(rewrite_task, timeout=5)
+    assert receipt["changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_criterion_text_rewrite_rejects_version_closed_before_relock(
+    db_session, monkeypatch
+):
+    if resolve_dialect_name(db_session) != "postgresql":
+        pytest.skip("independent release-version race requires PostgreSQL")
+
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-version-closed",
+        text="Text before version closes",
+        status="active",
+        created_by="strategist",
+    )
+    db_session.add(target)
+    await db_session.commit()
+
+    original_current_open_version = release_version_module.current_open_version
+
+    async def close_after_lookup(session, project_id):
+        stale_open_version = await original_current_open_version(session, project_id)
+        async with AsyncSessionLocal() as promotion_session:
+            promoted = await promotion_session.get(ReleaseVersion, version.id)
+            promoted.status = "promoted"
+            promotion_session.add(promoted)
+            await promotion_session.commit()
+        return stale_open_version
+
+    monkeypatch.setattr(
+        release_version_module, "current_open_version", close_after_lookup
+    )
+
+    async with AsyncSessionLocal() as rewrite_session:
+        with pytest.raises(HTTPException) as exc_info:
+            await _rewrite_acceptance_criterion_text_impl(
+                project_id=project.id,
+                criterion_key=target.criterion_key,
+                body=RewriteCriterionTextRequest(
+                    expected_text="Text before version closes",
+                    text="Text after version closes",
+                ),
+                current_user={"user_id": TEST_USER_ID},
+                session=rewrite_session,
+            )
+
+    assert exc_info.value.status_code == 409
+    await db_session.refresh(target)
+    assert target.text == "Text before version closes"
+
+
+@pytest.mark.asyncio
+async def test_criterion_text_rewrite_receipt_does_not_reread_after_commit(
+    db_session, monkeypatch
+):
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    target = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-receipt-snapshot",
+        text="Receipt source text",
+        status="active",
+        created_by="strategist",
+    )
+    db_session.add(target)
+    await db_session.commit()
+
+    async with AsyncSessionLocal() as rewrite_session:
+        async def fail_post_commit_refresh(*_args, **_kwargs):
+            raise AssertionError("receipt must not reread the row after releasing locks")
+
+        monkeypatch.setattr(rewrite_session, "refresh", fail_post_commit_refresh)
+        receipt = await _rewrite_acceptance_criterion_text_impl(
+            project_id=project.id,
+            criterion_key=target.criterion_key,
+            body=RewriteCriterionTextRequest(
+                expected_text="Receipt source text",
+                text="Receipt committed text",
+            ),
+            current_user={"user_id": TEST_USER_ID},
+            session=rewrite_session,
+        )
+
+    assert receipt["text"] == "Receipt committed text"
+    assert receipt["lineage"]["criterion_id"] == str(target.id)
 
 
 @pytest.mark.asyncio

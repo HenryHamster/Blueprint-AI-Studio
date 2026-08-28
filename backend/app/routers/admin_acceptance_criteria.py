@@ -102,10 +102,27 @@ async def _rewrite_acceptance_criterion_text_impl(
     session: AsyncSession,
 ) -> dict:
     """Apply and receipt one exact active-row text rewrite."""
-    from app.release_version import current_open_version
+    from app.release_version import ReleaseVersion, current_open_version
 
     open_version = await current_open_version(session, project_id)
     if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    # Keep the open-version decision and criterion mutation in one lock order.
+    # Promotion re-locks this same row before changing its status, so either the
+    # rewrite commits while the version is still open or it observes the closed
+    # status and fails. The shared version lock also serializes duplicate-text
+    # checks across concurrent rewrites of different criteria.
+    open_version_id = open_version.id
+    session.expire(open_version)
+    open_version = (
+        await session.execute(
+            select(ReleaseVersion)
+            .where(ReleaseVersion.id == open_version_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if open_version is None or open_version.status != "open":
         raise HTTPException(status_code=409, detail="No open release version")
 
     try:
@@ -144,8 +161,12 @@ async def _rewrite_acceptance_criterion_text_impl(
     if criterion is None:
         raise HTTPException(status_code=404, detail="Criterion not found")
 
+    release_version_id = open_version.id
+    criterion_id = criterion.id
+    canonical_criterion_key = criterion.criterion_key
+    criterion_created_by = criterion.created_by
+    criterion_created_at = criterion.created_at
     await session.commit()
-    await session.refresh(criterion)
     expected_sha256 = _criterion_text_sha256(body.expected_text)
     prior_sha256 = _criterion_text_sha256(prior_text)
     replacement_sha256 = _criterion_text_sha256(body.text)
@@ -155,9 +176,9 @@ async def _rewrite_acceptance_criterion_text_impl(
         "service_credential_id=%s expected_sha256=%s prior_sha256=%s "
         "replacement_sha256=%s changed=%s",
         project_id,
-        open_version.id,
-        criterion.criterion_key,
-        criterion.id,
+        release_version_id,
+        canonical_criterion_key,
+        criterion_id,
         current_user.get("user_id"),
         current_user.get("service_credential_id"),
         expected_sha256,
@@ -167,18 +188,18 @@ async def _rewrite_acceptance_criterion_text_impl(
     )
     return {
         "status": "ok",
-        "criterion_key": criterion.criterion_key,
-        "text": criterion.text,
+        "criterion_key": canonical_criterion_key,
+        "text": body.text,
         "changed": changed,
         "compare_state": "expected" if changed else "replacement",
         "expected_text_sha256": expected_sha256,
         "previous_text_sha256": prior_sha256,
         "text_sha256": replacement_sha256,
-        "release_version_id": str(open_version.id),
+        "release_version_id": str(release_version_id),
         "lineage": {
-            "criterion_id": str(criterion.id),
-            "created_by": criterion.created_by,
-            "created_at": utc_iso(criterion.created_at),
+            "criterion_id": str(criterion_id),
+            "created_by": criterion_created_by,
+            "created_at": utc_iso(criterion_created_at),
         },
     }
 
