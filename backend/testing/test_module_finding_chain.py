@@ -1319,6 +1319,7 @@ async def test_escalation_version_preserves_claimed_workday_packet(db_session):
 
     chain.occurrences += 1
     db_session.add(chain)
+    await db_session.flush([chain])
     await _post_guard_suppression_escalation(
         db_session, chain, replacement_owner
     )

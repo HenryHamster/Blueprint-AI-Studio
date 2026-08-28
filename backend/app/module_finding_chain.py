@@ -12,7 +12,7 @@ from sqlalchemy import inspect as sa_inspect, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm.attributes import flag_modified, set_committed_value
 
 from app.branch_resolution import get_project_integration_branch
 from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
@@ -311,6 +311,23 @@ def guard_suppression_escalation_summary(
     return f"{head}; NO remediation task owns it: {unowned_reason}"
 
 
+def _sync_escalation_authority(
+    chain: ModuleFindingChain,
+    *,
+    version: int,
+    state_fingerprint: str | None,
+    remediation_task_id: Any,
+    status: str,
+) -> None:
+    """Synchronize only publisher-owned fields without clobbering dirty evidence."""
+    set_committed_value(chain, "escalation_version", version)
+    set_committed_value(
+        chain, "escalation_state_fingerprint", state_fingerprint
+    )
+    set_committed_value(chain, "remediation_task_id", remediation_task_id)
+    set_committed_value(chain, "status", status)
+
+
 async def _post_guard_suppression_escalation(
     session: AsyncSession,
     chain: ModuleFindingChain,
@@ -372,7 +389,13 @@ async def _post_guard_suppression_escalation(
         or current_owner_id != expected_owner_id
     ):
         if sa_inspect(chain).persistent:
-            await session.refresh(chain)
+            _sync_escalation_authority(
+                chain,
+                version=current_version,
+                state_fingerprint=authority.escalation_state_fingerprint,
+                remediation_task_id=current_owner_id,
+                status=authority.status,
+            )
         return False
 
     version_fingerprint = hashlib.sha256(
@@ -423,9 +446,33 @@ async def _post_guard_suppression_escalation(
                 await session.delete(owner)
                 await session.flush()
             if sa_inspect(chain).persistent:
-                await session.refresh(chain)
+                with session.no_autoflush:
+                    winner = (
+                        await session.execute(
+                            select(
+                                ModuleFindingChain.escalation_version,
+                                ModuleFindingChain.escalation_state_fingerprint,
+                                ModuleFindingChain.remediation_task_id,
+                                ModuleFindingChain.status,
+                            ).where(ModuleFindingChain.id == chain.id)
+                        )
+                    ).one_or_none()
+                if winner is not None:
+                    _sync_escalation_authority(
+                        chain,
+                        version=int(winner.escalation_version or 0),
+                        state_fingerprint=winner.escalation_state_fingerprint,
+                        remediation_task_id=winner.remediation_task_id,
+                        status=winner.status,
+                    )
             return False
-        await session.refresh(chain)
+        _sync_escalation_authority(
+            chain,
+            version=publication_version,
+            state_fingerprint=version_fingerprint,
+            remediation_task_id=desired_owner_id,
+            status="open",
+        )
 
     idempotency_key = (
         f"guard-suppression:{chain.id}:escalation:"
@@ -543,9 +590,13 @@ async def _ingest_guard_suppression_receipt_once(
         rows = list(
             (
                 await session.execute(
-                    select(ModuleFindingChain).where(
-                        ModuleFindingChain.project_id == task.project_id
+                    select(ModuleFindingChain)
+                    .where(
+                        ModuleFindingChain.project_id == task.project_id,
+                        ModuleFindingChain.finding_key.in_(identity_keys),
                     )
+                    .order_by(ModuleFindingChain.finding_key.asc())
+                    .with_for_update()
                 )
             ).scalars().all()
         )
@@ -606,6 +657,11 @@ async def _ingest_guard_suppression_receipt_once(
                 # elect a new owner. Without this the chain is stuck open
                 # forever behind a dead owner and its aggregate operator message
                 # can never close.
+                # The receipt fields and the escalation state share this locked
+                # chain row. Flush the new evidence before publication reads its
+                # CAS authority; whole-row refresh must never erase a receipt
+                # whose source-task replay fence is committed in this transaction.
+                await session.flush([chain])
                 await _release_terminal_remediation_owner(session, chain)
             # Owner election deliberately does NOT happen here; see
             # ``elect_guard_suppression_owners``. This runs inside

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
-from app.models import ModuleFindingChain, Project, ProjectMessage, Task
+from app.models import ModuleFindingChain, Project, ProjectMessage, Task, TaskStatus
 from app.module_finding_chain import (
     CHAIN_ESCALATION_THRESHOLD,
     _guard_chain_key,
     _post_guard_suppression_escalation,
+    ingest_guard_suppression_receipt,
     resolve_landed_guard_suppression_remediation,
 )
 from app.time_utils import _utcnow
@@ -74,6 +76,23 @@ def _passing_gate_receipt() -> dict:
         "authoritative_ci_required": False,
         "recorded_at": _utcnow().isoformat(),
     }
+
+
+def _suppressed_gate_receipt() -> dict:
+    receipt = _passing_gate_receipt()
+    receipt["guard_suppressions"] = {
+        "backend-pytest": {
+            "state": "preexisting_test_failure",
+            "suppressed": {
+                "backend/testing/test_x.py::test_x::AssertionError": "inherited"
+            },
+        }
+    }
+    receipt["guard_suppressions_counts"] = {
+        "observed_lanes": 1,
+        "kept_lanes": 1,
+    }
+    return receipt
 
 
 async def _alerts(db_session, project_id: uuid.UUID) -> list[ProjectMessage]:
@@ -211,3 +230,53 @@ async def test_stale_replay_cannot_resurrect_superseded_owner(db_session):
     assert len(alerts) == 3
     assert len(open_alerts) == 1
     assert open_alerts[0].context["remediation_task_id"] == str(current_owner.id)
+
+
+@pytest.mark.asyncio
+async def test_dead_owner_release_preserves_dirty_ingestion_exactly_once(db_session):
+    project = Project(name="guard dirty ingestion", user_id="test-user-123")
+    dead_owner = Task(
+        project_id=project.id,
+        title="dead owner",
+        payloads=[],
+        status=TaskStatus.FAILED,
+        latest_status_message="remediation failed",
+    )
+    source = Task(
+        project_id=project.id,
+        title="new suppression evidence",
+        payloads=[],
+        context={"publication_gate_receipt": _suppressed_gate_receipt()},
+    )
+    chain = _mature_chain(project.id)
+    chain.remediation_task_id = dead_owner.id
+    chain.source_task_ids = [str(uuid.uuid4()) for _ in range(3)]
+    chain.last_seen_at = _utcnow() - timedelta(days=1)
+    previous_seen_at = chain.last_seen_at
+    db_session.add_all([project, dead_owner, source, chain])
+    await db_session.commit()
+
+    touched = await ingest_guard_suppression_receipt(source, db_session)
+    await db_session.commit()
+
+    assert [row.id for row in touched] == [chain.id]
+    await db_session.refresh(chain)
+    await db_session.refresh(source)
+    assert chain.occurrences == CHAIN_ESCALATION_THRESHOLD + 1
+    assert chain.verified_occurrences == CHAIN_ESCALATION_THRESHOLD + 1
+    assert chain.source_task_ids.count(str(source.id)) == 1
+    assert chain.last_seen_at > previous_seen_at
+    assert chain.remediation_task_id is None
+    assert chain.escalation_version == 1
+    alerts = await _alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].context["occurrences"] == CHAIN_ESCALATION_THRESHOLD + 1
+    assert alerts[0].context["remediation_task_id"] is None
+
+    assert await ingest_guard_suppression_receipt(source, db_session) == []
+    await db_session.commit()
+    await db_session.refresh(chain)
+    assert chain.occurrences == CHAIN_ESCALATION_THRESHOLD + 1
+    assert chain.verified_occurrences == CHAIN_ESCALATION_THRESHOLD + 1
+    assert chain.source_task_ids.count(str(source.id)) == 1
+    assert len(await _alerts(db_session, project.id)) == 1
