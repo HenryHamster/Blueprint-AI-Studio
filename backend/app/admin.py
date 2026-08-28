@@ -127,7 +127,9 @@ from app.admin_task_mutations import (
 )
 from app.admin_task_contracts import CreateTaskPayload
 from app.admin_task_admission import (
+    DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS,
     build_task_creation_authority_snapshot,
+    canonical_task_creation_request,
     prepare_task_creation_authority,
     reject_idempotent_task_authority_mismatch,
     task_creation_authority_receipt,
@@ -3010,6 +3012,10 @@ async def create_task_manually(
         raise HTTPException(
             status_code=422, detail=format_payload_validation_error(exc)
         )
+    canonical_creation_request = canonical_task_creation_request(
+        payload,
+        resolved_base_branch=resolved_base_branch,
+    )
 
     # Idempotency check: if client supplied an idempotency_key, check for
     # existing active task with that key and return it instead of creating a duplicate.
@@ -3048,11 +3054,7 @@ async def create_task_manually(
         if existing:
             reject_idempotent_task_authority_mismatch(
                 existing,
-                direction_id=payload.direction_id,
-                criterion_ids=payload.criterion_ids,
-                depends_on=payload.depends_on,
-                require_deps_landed_on=payload.require_deps_landed_on,
-                release_base_branch=payload.release_base_branch,
+                canonical_request=canonical_creation_request,
             )
             return {
                 "id": str(existing.id),
@@ -3146,11 +3148,9 @@ async def create_task_manually(
                 existing = admission.existing_task
                 reject_idempotent_task_authority_mismatch(
                     existing,
-                    direction_id=payload.direction_id,
-                    criterion_ids=payload.criterion_ids,
-                    depends_on=payload.depends_on,
-                    require_deps_landed_on=payload.require_deps_landed_on,
-                    release_base_branch=payload.release_base_branch,
+                    canonical_request=canonical_creation_request,
+                    conflict_label="active review reuse",
+                    comparison_fields=DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS,
                 )
                 await session.commit()
                 return {
@@ -3193,6 +3193,7 @@ async def create_task_manually(
     authority_context[OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY] = (
         build_task_creation_authority_snapshot(
             creation_authority,
+            canonical_request=canonical_creation_request,
             criterion_ids_explicit=payload.criterion_ids is not None,
             require_deps_landed_on=payload.require_deps_landed_on,
             release_base_branch=payload.release_base_branch,
@@ -3266,11 +3267,7 @@ async def create_task_manually(
             if existing:
                 reject_idempotent_task_authority_mismatch(
                     existing,
-                    direction_id=payload.direction_id,
-                    criterion_ids=payload.criterion_ids,
-                    depends_on=payload.depends_on,
-                    require_deps_landed_on=payload.require_deps_landed_on,
-                    release_base_branch=payload.release_base_branch,
+                    canonical_request=canonical_creation_request,
                 )
                 return {
                     "id": str(existing.id),

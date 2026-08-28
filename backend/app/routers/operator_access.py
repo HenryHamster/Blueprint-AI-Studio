@@ -121,6 +121,12 @@ class OperatorTaskCreate(_StrictModel):
         max_length=255,
         pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$",
     )
+    base_branch: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$",
+    )
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
@@ -367,6 +373,7 @@ def _operator_task_receipt(value: Any) -> dict[str, Any]:
             "criterion_ids",
             "criterion_ids_explicit",
             "criterion_release_version_id",
+            "base_branch",
             "depends_on",
             "require_deps_landed_on",
             "release_base_branch",
@@ -475,7 +482,11 @@ async def create_operator_task(
     if not github_owner or not github_repo:
         raise HTTPException(status_code=409, detail="Project repository is not configured")
     integration_branch = get_project_integration_branch(project)
-    for field_name in ("require_deps_landed_on", "release_base_branch"):
+    for field_name in (
+        "base_branch",
+        "require_deps_landed_on",
+        "release_base_branch",
+    ):
         declared_branch = getattr(payload, field_name)
         if declared_branch is not None and declared_branch != integration_branch:
             raise HTTPException(
@@ -485,10 +496,12 @@ async def create_operator_task(
                     f"{integration_branch!r}"
                 ),
             )
+    canonical_fields = payload.model_dump(exclude_none=True)
+    canonical_fields["base_branch"] = payload.base_branch or integration_branch
     canonical = CreateTaskPayload(
         github_repo=f"{github_owner}/{github_repo}",
         project_id=project.id,
-        **payload.model_dump(exclude_none=True),
+        **canonical_fields,
     )
     result = await create_task_manually(
         request=request,

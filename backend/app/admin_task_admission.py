@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +17,7 @@ from app.acceptance_criteria import (
     CRITERION_RELEASE_VERSION_CONTEXT_KEY,
     EXPLICIT_CRITERION_IDS_CONTEXT_KEY,
     OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY,
+    direction_criterion_release_version_id,
     filter_active_criterion_keys,
 )
 from app.directions_repo import get_direction_row
@@ -21,9 +26,59 @@ from app.orchestrator_health import _same_base_branch_value
 from app.release_version import current_open_version
 
 
+_CANONICAL_REQUEST_FINGERPRINT_KEY = "canonical_request_sha256"
+_CANONICAL_REQUEST_FIELD_FINGERPRINTS_KEY = "canonical_request_field_sha256"
+DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS = frozenset(
+    {
+        "task_type",
+        "base_branch",
+        "pr_number",
+        "branch",
+        "acceptance_evidence",
+        "direction_id",
+        "criterion_ids",
+        "depends_on",
+        "require_deps_landed_on",
+        "release_base_branch",
+    }
+)
+
+
+def canonical_task_creation_request(
+    payload: Any,
+    *,
+    resolved_base_branch: str,
+) -> dict[str, object]:
+    """Return the normalized request identity admitted for task creation."""
+
+    request = dict(payload.model_dump(mode="json"))
+    request["base_branch"] = resolved_base_branch
+    return request
+
+
+def _request_value_fingerprint(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _request_field_fingerprints(
+    request: Mapping[str, object],
+) -> dict[str, str]:
+    return {
+        key: _request_value_fingerprint(value)
+        for key, value in sorted(request.items())
+    }
+
+
 def build_task_creation_authority_snapshot(
     authority: "TaskCreationAuthority",
     *,
+    canonical_request: Mapping[str, object],
     criterion_ids_explicit: bool,
     require_deps_landed_on: str | None,
     release_base_branch: str | None,
@@ -39,9 +94,16 @@ def build_task_creation_authority_snapshot(
             if authority.criterion_release_version_id is not None
             else None
         ),
+        "base_branch": canonical_request.get("base_branch"),
         "depends_on": list(authority.depends_on),
         "require_deps_landed_on": require_deps_landed_on,
         "release_base_branch": release_base_branch,
+        _CANONICAL_REQUEST_FINGERPRINT_KEY: _request_value_fingerprint(
+            dict(canonical_request)
+        ),
+        _CANONICAL_REQUEST_FIELD_FINGERPRINTS_KEY: _request_field_fingerprints(
+            canonical_request
+        ),
     }
 
 
@@ -64,6 +126,7 @@ def task_creation_authority_receipt(task: Task) -> dict[str, object]:
             "criterion_release_version_id": context.get(
                 CRITERION_RELEASE_VERSION_CONTEXT_KEY
             ),
+            "base_branch": first_payload.get("base_branch"),
             "depends_on": list(task.depends_on or []),
             "require_deps_landed_on": first_payload.get(
                 "require_deps_landed_on"
@@ -77,6 +140,7 @@ def task_creation_authority_receipt(task: Task) -> dict[str, object]:
         "criterion_release_version_id": authority.get(
             "criterion_release_version_id"
         ),
+        "base_branch": authority.get("base_branch"),
         "depends_on": list(authority.get("depends_on") or []),
         "require_deps_landed_on": authority.get("require_deps_landed_on"),
         "release_base_branch": authority.get("release_base_branch"),
@@ -96,36 +160,80 @@ class TaskCreationAuthority:
 def reject_idempotent_task_authority_mismatch(
     existing: Task,
     *,
-    direction_id: str | None,
-    criterion_ids: list[str] | None,
-    depends_on: list[uuid.UUID],
-    require_deps_landed_on: str | None,
-    release_base_branch: str | None,
+    canonical_request: Mapping[str, object],
+    conflict_label: str = "idempotency_key",
+    comparison_fields: frozenset[str] | None = None,
 ) -> None:
-    """Reject an idempotency replay that names different task authority."""
+    """Reject reuse when the complete canonical creation request differs."""
 
-    authority = task_creation_authority_receipt(existing)
-    expected_depends_on = [str(dep_id) for dep_id in depends_on]
-    expected_criteria = list(criterion_ids or [])
-    mismatches: list[str] = []
-    if authority["direction_id"] != direction_id:
-        mismatches.append("direction_id")
-    if authority["criterion_ids"] != expected_criteria:
-        mismatches.append("criterion_ids")
-    if authority["criterion_ids_explicit"] != (criterion_ids is not None):
-        mismatches.append("criterion_ids_mode")
-    if authority["depends_on"] != expected_depends_on:
-        mismatches.append("depends_on")
-    if authority["require_deps_landed_on"] != require_deps_landed_on:
-        mismatches.append("require_deps_landed_on")
-    if authority["release_base_branch"] != release_base_branch:
-        mismatches.append("release_base_branch")
+    stored = (existing.context or {}).get(
+        OPERATOR_TASK_CREATION_AUTHORITY_CONTEXT_KEY
+    )
+    expected_fields = _request_field_fingerprints(canonical_request)
+    if comparison_fields is not None:
+        expected_fields = {
+            key: value
+            for key, value in expected_fields.items()
+            if key in comparison_fields
+        }
+    stored_fields = (
+        stored.get(_CANONICAL_REQUEST_FIELD_FINGERPRINTS_KEY)
+        if isinstance(stored, dict)
+        else None
+    )
+    if isinstance(stored_fields, dict):
+        if comparison_fields is not None:
+            stored_fields = {
+                key: value
+                for key, value in stored_fields.items()
+                if key in comparison_fields
+            }
+        mismatches = sorted(
+            key
+            for key in set(stored_fields) | set(expected_fields)
+            if stored_fields.get(key) != expected_fields.get(key)
+        )
+    else:
+        # Compatibility for pre-fingerprint tasks. New admissions always use
+        # the complete field fingerprints above; legacy rows can only compare
+        # fields recoverable from their bounded task row and payload.
+        first_payload = existing.first_payload or {}
+        authority = task_creation_authority_receipt(existing)
+        legacy_request = {
+            "project_id": str(existing.project_id),
+            "title": existing.title,
+            "prompt": first_payload.get("prompt"),
+            "task_type": first_payload.get("type", "create"),
+            "base_branch": first_payload.get("base_branch"),
+            "acceptance_evidence": first_payload.get("acceptance_evidence"),
+            "pr_number": first_payload.get("pr_number"),
+            "branch": first_payload.get("branch"),
+            "model": first_payload.get("model"),
+            "effort": first_payload.get("effort"),
+            "hotfix": bool(first_payload.get("hotfix")),
+            "direction_id": authority["direction_id"],
+            "criterion_ids": authority["criterion_ids"],
+            "depends_on": authority["depends_on"],
+            "require_deps_landed_on": authority["require_deps_landed_on"],
+            "release_base_branch": authority["release_base_branch"],
+            "work_class": first_payload.get("work_class"),
+            "stop_or_pivot_condition": first_payload.get(
+                "stop_or_pivot_condition"
+            ),
+        }
+        mismatches = sorted(
+            key
+            for key, value in legacy_request.items()
+            if key in canonical_request
+            and (comparison_fields is None or key in comparison_fields)
+            and _request_value_fingerprint(value) != expected_fields[key]
+        )
     if mismatches:
         raise HTTPException(
             status_code=409,
             detail=(
-                "idempotency_key already belongs to a task with different "
-                "authority: " + ", ".join(mismatches)
+                f"{conflict_label} resolves to a task with different authority "
+                "in canonical request fields: " + ", ".join(mismatches)
             ),
         )
 
@@ -175,6 +283,27 @@ async def prepare_task_creation_authority(
             )
         if open_version is not None:
             criterion_release_version_id = open_version.id
+        if direction is not None:
+            if open_version is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="exact direction criteria require an open release version",
+                )
+            direction_version_id = direction_criterion_release_version_id(direction)
+            if direction_version_id != open_version.id:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "criterion_direction_version_mismatch",
+                        "direction_id": direction_id,
+                        "direction_release_version_id": (
+                            str(direction_version_id)
+                            if direction_version_id is not None
+                            else None
+                        ),
+                        "open_release_version_id": str(open_version.id),
+                    },
+                )
         if normalized_criterion_ids:
             active = await filter_active_criterion_keys(
                 session,

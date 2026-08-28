@@ -7091,6 +7091,71 @@ def test_tasks_create_posts_atomic_authority_fields(mock_api, monkeypatch):
     assert body["release_base_branch"] == "automain"
 
 
+def test_scoped_tasks_create_sends_explicit_integration_base(monkeypatch):
+    project_id = "11111111-1111-4111-8111-111111111111"
+    calls = []
+    config = {
+        "api_url": "x",
+        "api_key": "bpsc_project_operator_token",
+        "project_id": project_id,
+        "read_only": False,
+    }
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and path == "/api/agent-access/v1/me":
+            return {"credential": {"scopes": ["project-operator"]}}
+        if method == "GET" and path == "/api/operator-access/v1/task-capabilities":
+            return {
+                "task_capabilities": {
+                    "create": {
+                        "user_launchable": True,
+                        "requires_acceptance_evidence": True,
+                    }
+                }
+            }
+        if method == "POST" and path == (
+            f"/api/operator-access/v1/projects/{project_id}/tasks"
+        ):
+            return {
+                "id": "task-scoped",
+                "title": "Scoped exact base",
+                "task_type": "create",
+                "base_branch": "automain",
+            }
+        raise AssertionError((method, path, body))
+
+    monkeypatch.setattr(blueprint, "load_config", lambda: config)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: config)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "_SCOPED_PROFILE_CACHE", None)
+
+    rc = blueprint.main(
+        [
+            "tasks",
+            "create",
+            "Scoped exact base",
+            "Implement against the integration branch.",
+            "--acceptance-behavior",
+            "The requested behavior is present.",
+            "--base-branch",
+            "automain",
+            "--yes",
+        ]
+    )
+
+    assert rc == 0
+    create_body = next(
+        body
+        for method, path, body in calls
+        if method == "POST"
+        and path == f"/api/operator-access/v1/projects/{project_id}/tasks"
+    )
+    assert create_body["base_branch"] == "automain"
+    assert "github_repo" not in create_body
+    assert "project_id" not in create_body
+
+
 def test_tasks_create_criterion_id_requires_named_test(
     mock_api, monkeypatch, capsys
 ):

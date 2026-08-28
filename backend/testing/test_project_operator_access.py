@@ -345,7 +345,7 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
     )
     project.paused = True
     project.integration_branch = "automain"
-    project.promotion_target = "automain"
+    project.promotion_target = "main"
     version = ReleaseVersion(
         project_id=project.id, version_number=54, status="open", phase="build"
     )
@@ -394,6 +394,7 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
             json=_operator_task_body(
                 task_type="create",
                 prompt="Implement only the bounded budget consumers.",
+                base_branch="automain",
                 direction_id="d-exact",
                 criterion_ids=criterion_ids,
                 depends_on=[str(predecessor.id)],
@@ -406,12 +407,30 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
             ),
             headers=_auth(token),
         )
+        server_defaulted = await client.post(
+            f"{OPERATOR_URL}/projects/{project.id}/tasks",
+            json=_operator_task_body(
+                title="Server-selected integration base",
+                prompt="Let the server select the current integration branch.",
+            ),
+            headers=_auth(token),
+        )
+        wrong_base = await client.post(
+            f"{OPERATOR_URL}/projects/{project.id}/tasks",
+            json=_operator_task_body(base_branch="main"),
+            headers=_auth(token),
+        )
 
     assert response.status_code == 201, response.text
+    assert server_defaulted.status_code == 201, server_defaulted.text
+    assert server_defaulted.json()["base_branch"] == "automain"
+    assert wrong_base.status_code == 400, wrong_base.text
+    assert "project integration branch 'automain'" in wrong_base.text
     assert response.json()["direction_id"] == "d-exact"
     assert response.json()["criterion_ids"] == criterion_ids
     assert response.json()["criterion_ids_explicit"] is True
     assert response.json()["criterion_release_version_id"] == str(version.id)
+    assert response.json()["base_branch"] == "automain"
     assert response.json()["depends_on"] == [str(predecessor.id)]
     assert response.json()["require_deps_landed_on"] == "automain"
     assert response.json()["release_base_branch"] == "automain"
@@ -422,6 +441,10 @@ async def test_task_create_can_atomically_stage_exact_authority_while_paused(
     assert created.depends_on == [str(predecessor.id)]
     assert created.context["direction_id"] == "d-exact"
     assert created.context["criterion_ids_explicit"] is True
+    assert created.context["_operator_task_creation_authority"]["base_branch"] == (
+        "automain"
+    )
+    assert created.first_payload["base_branch"] == "automain"
     assert created.first_payload["require_deps_landed_on"] == "automain"
     await db_session.refresh(project)
     assert project.paused is True

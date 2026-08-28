@@ -1727,7 +1727,6 @@ def _tasks_create(args: argparse.Namespace) -> None:
     if scoped:
         forbidden = {
             "--repo": getattr(args, "repo", None),
-            "--base-branch": getattr(args, "base_branch", None),
             "--model": getattr(args, "model", None),
             "--effort": getattr(args, "effort", None),
             "--hotfix": getattr(args, "hotfix", False),
@@ -1740,8 +1739,9 @@ def _tasks_create(args: argparse.Namespace) -> None:
             print(
                 "ERROR: project-operator task creation does not authorize "
                 + ", ".join(requested)
-                + ". Project/repository/base/provider authority is derived "
-                "server-side, and scoped commands cannot read local evidence files.",
+                + ". Project/repository/provider authority is derived server-side, "
+                "the base branch is constrained to the project integration branch, "
+                "and scoped commands cannot read local evidence files.",
                 file=sys.stderr,
             )
             raise APIError("task creation authority flag is not permitted")
@@ -1864,7 +1864,7 @@ def _tasks_create(args: argparse.Namespace) -> None:
     if not scoped:
         body["github_repo"] = github_repo
         body["project_id"] = target_project_id
-    if not scoped and base_branch is not None:
+    if base_branch is not None:
         body["base_branch"] = base_branch
     if not scoped and getattr(args, "model", None):
         body["model"] = args.model

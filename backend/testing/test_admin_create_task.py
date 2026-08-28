@@ -12,6 +12,8 @@ two branches and breaking the next promotion.
 with an HTTP 400.
 """
 
+import uuid
+
 import pytest
 from httpx import AsyncClient
 
@@ -236,7 +238,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
     project = await _make_project_with_member(db_session, "acme/atomic-admission")
     project.paused = True
     project.integration_branch = "automain"
-    project.promotion_target = "automain"
+    project.promotion_target = "main"
     project.directions = [
         {"id": "d-atomic", "text": "Atomic admission", "status": "active"}
     ]
@@ -297,6 +299,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
             "title": "Budget consumer",
             "prompt": "Enforce the selected-test budget after the corpus lands.",
             "task_type": "create",
+            "base_branch": "automain",
             "direction_id": "d-atomic",
             "criterion_ids": criterion_ids,
             "depends_on": [str(predecessor.id)],
@@ -313,6 +316,7 @@ async def test_paused_create_atomically_persists_exact_task_authority(
     assert response.json()["direction_id"] == "d-atomic"
     assert response.json()["criterion_ids"] == criterion_ids
     assert response.json()["criterion_ids_explicit"] is True
+    assert response.json()["base_branch"] == "automain"
     assert response.json()["depends_on"] == [str(predecessor.id)]
     assert response.json()["criterion_release_version_id"] == str(version.id)
     created = await db_session.get(Task, response.json()["id"])
@@ -323,18 +327,44 @@ async def test_paused_create_atomically_persists_exact_task_authority(
     assert created.context["direction_id"] == "d-atomic"
     assert created.context["criterion_ids_explicit"] is True
     assert created.context["criterion_release_version_id"] == str(version.id)
-    assert created.context["_operator_task_creation_authority"] == {
+    creation_authority = created.context["_operator_task_creation_authority"]
+    assert {
+        key: creation_authority[key]
+        for key in (
+            "direction_id",
+            "criterion_ids",
+            "criterion_ids_explicit",
+            "criterion_release_version_id",
+            "base_branch",
+            "depends_on",
+            "require_deps_landed_on",
+            "release_base_branch",
+        )
+    } == {
         "direction_id": "d-atomic",
         "criterion_ids": criterion_ids,
         "criterion_ids_explicit": True,
         "criterion_release_version_id": str(version.id),
+        "base_branch": "automain",
         "depends_on": [str(predecessor.id)],
         "require_deps_landed_on": "automain",
         "release_base_branch": "automain",
     }
+    assert len(creation_authority["canonical_request_sha256"]) == 64
+    assert set(creation_authority["canonical_request_field_sha256"]) >= {
+        "task_type",
+        "base_branch",
+        "title",
+        "prompt",
+        "acceptance_evidence",
+        "direction_id",
+        "criterion_ids",
+        "depends_on",
+    }
     assert created.context["_structural_depends_on_ids"] == [str(predecessor.id)]
     assert created.first_payload["require_deps_landed_on"] == "automain"
     assert created.first_payload["release_base_branch"] == "automain"
+    assert created.first_payload["base_branch"] == "automain"
     await db_session.refresh(project)
     assert project.paused is True
 
@@ -373,7 +403,11 @@ async def test_atomic_create_rejects_invalid_criterion_and_cross_project_depende
         project_id=project.id,
         direction_key="d-guards",
         status="active",
-        data={"id": "d-guards", "status": "active"},
+        data={
+            "id": "d-guards",
+            "status": "active",
+            "criterion_release_version_id": str(version.id),
+        },
         criterion_keys=[],
     )
     other_direction = Direction(
@@ -488,6 +522,72 @@ async def test_atomic_create_rejects_invalid_criterion_and_cross_project_depende
 
 
 @pytest.mark.asyncio
+async def test_atomic_create_rejects_stale_direction_criterion_version(
+    client: AsyncClient, db_session
+):
+    project = await _make_project_with_member(db_session, "acme/stale-direction")
+    stale_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=53,
+        status="promoted",
+    )
+    open_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=54,
+        status="open",
+        phase="build",
+    )
+    db_session.add_all([stale_version, open_version])
+    await db_session.commit()
+    criterion_key = "c-current"
+    db_session.add_all(
+        [
+            Direction(
+                project_id=project.id,
+                direction_key="d-stale",
+                status="active",
+                data={
+                    "id": "d-stale",
+                    "status": "active",
+                    "criterion_release_version_id": str(stale_version.id),
+                },
+                criterion_keys=[criterion_key],
+            ),
+            VersionAcceptanceCriterion(
+                project_id=project.id,
+                release_version_id=open_version.id,
+                criterion_key=criterion_key,
+                status="active",
+                text="Current-version criterion",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/stale-direction",
+            "project_id": str(project.id),
+            "title": "Do not admit stale direction authority",
+            "prompt": "This direction is bound to the previous release.",
+            "task_type": "create",
+            "direction_id": "d-stale",
+            "criterion_ids": [criterion_key],
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_stale_direction.py::test_current",
+            },
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "criterion_direction_version_mismatch" in response.text
+    assert str(stale_version.id) in response.text
+    assert str(open_version.id) in response.text
+
+
+@pytest.mark.asyncio
 async def test_idempotency_replay_rejects_different_task_authority(
     client: AsyncClient, db_session
 ):
@@ -512,6 +612,61 @@ async def test_idempotency_replay_rejects_different_task_authority(
 
     assert replay.status_code == 409, replay.text
     assert "different authority" in replay.text
+    assert await _count_tasks(db_session, project.id) == 1
+
+
+@pytest.mark.parametrize(
+    ("changed_fields", "mismatch_field"),
+    [
+        pytest.param({"task_type": "refactor"}, "task_type", id="task-type"),
+        pytest.param({"base_branch": "automain"}, "base_branch", id="base-branch"),
+        pytest.param({"title": "Changed title"}, "title", id="title"),
+        pytest.param({"prompt": "Changed prompt"}, "prompt", id="prompt"),
+        pytest.param(
+            {
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_idempotency.py::test_changed",
+                }
+            },
+            "acceptance_evidence",
+            id="acceptance-evidence",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_idempotency_replay_rejects_changed_canonical_request_field(
+    client: AsyncClient,
+    db_session,
+    changed_fields,
+    mismatch_field,
+):
+    project = await _make_project_with_member(
+        db_session, f"acme/idempotent-{mismatch_field.replace('_', '-')}"
+    )
+    body = {
+        "github_repo": f"acme/idempotent-{mismatch_field.replace('_', '-')}",
+        "project_id": str(project.id),
+        "title": "Canonical request",
+        "prompt": "Create this exact task.",
+        "task_type": "create",
+        "base_branch": "main",
+        "idempotency_key": "canonical-request-replay",
+        "acceptance_evidence": {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_idempotency.py::test_original",
+        },
+    }
+    first = await client.post("/api/admin/tasks", json=body)
+    assert first.status_code == 200, first.text
+
+    replay = await client.post(
+        "/api/admin/tasks",
+        json={**body, **changed_fields},
+    )
+
+    assert replay.status_code == 409, replay.text
+    assert mismatch_field in replay.text
     assert await _count_tasks(db_session, project.id) == 1
 
 
@@ -557,6 +712,92 @@ async def test_idempotency_replay_uses_immutable_creation_authority(
     assert replay.json()["is_duplicate"] is True
     assert replay.json()["id"] == first.json()["id"]
     assert replay.json()["depends_on"] == [str(original_dep.id)]
+
+
+def test_direct_review_reuse_keeps_authority_check_without_display_text_identity():
+    from fastapi import HTTPException
+
+    from app.admin_task_admission import (
+        DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS,
+        TaskCreationAuthority,
+        build_task_creation_authority_snapshot,
+        canonical_task_creation_request,
+        reject_idempotent_task_authority_mismatch,
+    )
+    from app.admin_task_contracts import CreateTaskPayload
+
+    project_id = uuid.uuid4()
+    payload = CreateTaskPayload(
+        github_repo="acme/direct-review",
+        project_id=project_id,
+        title="Review PR 42",
+        prompt="Review the exact pull request head.",
+        task_type="review",
+        pr_number=42,
+        branch="feature/pr-42",
+        base_branch="automain",
+    )
+    canonical = canonical_task_creation_request(
+        payload,
+        resolved_base_branch="automain",
+    )
+    authority = TaskCreationAuthority(
+        direction_id=None,
+        criterion_ids=[],
+        criterion_release_version_id=None,
+        depends_on=[],
+    )
+    existing = Task(
+        project_id=project_id,
+        title=payload.title,
+        payloads=[
+            {
+                "type": "review",
+                "prompt": payload.prompt,
+                "pr_number": 42,
+                "branch": "feature/pr-42",
+                "base_branch": "automain",
+            }
+        ],
+        context={
+            "_operator_task_creation_authority": (
+                build_task_creation_authority_snapshot(
+                    authority,
+                    canonical_request=canonical,
+                    criterion_ids_explicit=False,
+                    require_deps_landed_on=None,
+                    release_base_branch=None,
+                )
+            )
+        },
+    )
+
+    display_only_replay = canonical_task_creation_request(
+        payload.model_copy(
+            update={
+                "title": "Different operator label",
+                "prompt": "Different display prompt for the same review owner.",
+            }
+        ),
+        resolved_base_branch="automain",
+    )
+    reject_idempotent_task_authority_mismatch(
+        existing,
+        canonical_request=display_only_replay,
+        conflict_label="active review reuse",
+        comparison_fields=DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS,
+    )
+
+    wrong_base = {**display_only_replay, "base_branch": "main"}
+    with pytest.raises(HTTPException) as mismatch:
+        reject_idempotent_task_authority_mismatch(
+            existing,
+            canonical_request=wrong_base,
+            conflict_label="active review reuse",
+            comparison_fields=DIRECT_REVIEW_REUSE_AUTHORITY_REQUEST_FIELDS,
+        )
+    assert mismatch.value.status_code == 409
+    assert "base_branch" in mismatch.value.detail
 
 
 @pytest.mark.asyncio
